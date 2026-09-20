@@ -82,6 +82,28 @@ jobs:
           assert sorted(output('git', 'diff', '--cached', '--name-only').splitlines()) == sorted(expected)
           for path, sha in expected.items():
               assert output('git', 'hash-object', path) == sha, 'concurrent edit: ' + path
+          # The first run exposed E0716 in the independently landed application-
+          # head test: the admission capability borrows its base environment.
+          # Preserve that lifetime instead of bypassing the new regression suite.
+          test = 'crates/fln-elab/tests/native_unification_application_head.rs'
+          assert output('git', 'hash-object', test) == 'fb6738ae7cb9c07cc57cf0e396bb76aed047dce6'
+          repair = '\n'.join([
+              'diff --git a/' + test + ' b/' + test,
+              '--- a/' + test, '+++ b/' + test,
+              '@@ -50,8 +50,9 @@ fn budget() -> UnificationBudget {',
+              ' fn transaction() -> ElabTxn {',
+              '     // The opaque Nat bootstrap supports literals, not constructor names.',
+              '     // These tests need the real inductive block, admitted through K1.',
+              '+    let environment = Environment::new();',
+              '     let Outcome::Complete(admitted) = admit(',
+              '-        &Environment::new(),', '+        &environment,',
+              '         fln_elab::seed::nat_inductive_seed_declaration(),',
+              '         budget().kernel,', '     ) else {', '',
+          ])
+          (evidence / 'lifetime.patch').write_text(repair)
+          run('git', 'apply', '--index', '--whitespace=error', str(evidence / 'lifetime.patch'))
+          expected[test] = output('git', 'hash-object', test)
+          assert sorted(output('git', 'diff', '--cached', '--name-only').splitlines()) == sorted(expected)
           def validate(prefix):
               checked(prefix + 'frontend-and-engine', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '--no-fail-fast')
               checked(prefix + 'installed', 'cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check', 'installed_local_recursion_checks_runs_and_replays_without_partial_publication')
@@ -92,7 +114,7 @@ jobs:
           validate('')
           run('git', 'config', 'user.name', 'github-actions[bot]')
           run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
-          run('git', 'commit', '-m', 'feat(source): support checked local structural recursion and native execution', '-m', 'Recover the previously local implementation with lexical captures, nested helpers, dependent results, structural-column retries and newline syntax. Includes source/VM/FLBC and scope-refusal regressions. Full parser/elaborator/engine package tests, installed regression, scoped all-target Clippy and workspace compilation passed before publication. No new axiom or kernel rule; fln-qb5 remains open.')
+          run('git', 'commit', '-m', 'feat(source): support checked local structural recursion and native execution', '-m', 'Recover lexical captures, nested helpers, dependent results, structural-column retries and newline syntax. Includes source/VM/FLBC and scope-refusal regressions. Preserve the borrowed base lifetime in the concurrent application-head test. Parser/elaborator/engine tests, installed regression, scoped Clippy and workspace compilation passed before publication. No new axiom or kernel rule; fln-qb5 remains open.')
           for attempt in range(4):
               if subprocess.run(['git', 'push', 'origin', 'HEAD:main']).returncode == 0:
                   (evidence / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
