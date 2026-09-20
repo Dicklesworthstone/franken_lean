@@ -1593,6 +1593,11 @@ fn preflight_candidate_next_batch_council_admission() {
             continue;
         }
 
+        let mut check_consts = available_consts.clone();
+        for c in &m.constants {
+            check_consts.insert(c.name().clone());
+        }
+
         let mut missing_consts = std::collections::BTreeSet::new();
         for c in &m.constants {
             let mut exprs = vec![c.constant_val().type_.clone()];
@@ -1607,7 +1612,7 @@ fn preflight_candidate_next_batch_council_admission() {
                 while let Some(cur) = stack.pop() {
                     match cur.node() {
                         fln_core::expr::ExprNode::Const { name: cname, .. } => {
-                            if !available_consts.contains(cname) {
+                            if !check_consts.contains(cname) {
                                 missing_consts.insert(cname.clone());
                             }
                         }
