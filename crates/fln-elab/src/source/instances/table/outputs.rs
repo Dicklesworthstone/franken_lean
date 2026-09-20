@@ -1,6 +1,7 @@
 //! Canonical keys for structured outputs and bare semi-output holes.
 //! Hole alias patterns, declared types, binders and sharing remain explicit.
-//! Opaque/delayed holes, open declared types and foreign scopes are not guessed.
+//! Dependent hole types are part of the same canonical, cycle-checked graph.
+//! Opaque/delayed holes, unknown universes and foreign scopes are not guessed.
 use super::*;
 
 mod syntax;

@@ -2,9 +2,19 @@
 //! raised under each binder; templates never enter the unifier or the kernel.
 use super::*;
 
+struct HoleSlot {
+    position: u32,
+    complete: bool,
+}
+
+enum HoleStep {
+    Ready(Expr),
+    CheckType(Expr),
+}
+
 #[derive(Default)]
 pub(super) struct Templates {
-    holes: HashMap<MVarId, u32>,
+    holes: HashMap<MVarId, HoleSlot>,
     pub types: Vec<Expr>,
     done: HashMap<(Expr, u32), Expr>,
 }
@@ -14,27 +24,50 @@ impl Templates {
         self.done.len()
     }
 
-    fn hole(&mut self, frame: &Frame, id: &MVarId, depth: u32) -> Option<Expr> {
-        let position = if let Some(position) = self.holes.get(id) {
-            *position
-        } else {
-            let decl = frame.base.txn.mvars.get_decl(id)?;
-            if decl.kind != MetavarKind::Natural
-                || decl.depth != 0
-                || decl.delayed.is_some()
-                || frame.base.txn.mvars.is_assigned(id)
-                || decl.lctx != frame.base.txn.lctx
-                || !ground(&decl.type_)
-                || decl.type_.has_loose_bvars()
-            {
+    // Hole types belong to the frame's saved context, not to any lexical binder
+    // in the expression currently being traversed. Check their complete graph
+    // at depth zero on the same heap worklist. An unfinished slot is a cycle,
+    // not a usable forward declaration. Nothing is assigned in either context.
+    fn hole(&mut self, frame: &Frame, id: &MVarId, depth: u32, finish: bool) -> Option<HoleStep> {
+        if finish {
+            let slot = self.holes.get_mut(id)?;
+            let original_type = &frame.base.txn.mvars.get_decl(id)?.type_;
+            let type_ = self.done.get(&(original_type.clone(), 0))?;
+            self.types[slot.position as usize - 1] = type_.clone();
+            slot.complete = true;
+            return Some(HoleStep::Ready(
+                Expr::bvar(depth.checked_add(slot.position)?).ok()?,
+            ));
+        }
+        if let Some(slot) = self.holes.get(id) {
+            if !slot.complete {
                 return None;
             }
-            let position = u32::try_from(self.types.len() + 1).ok()?;
-            self.types.push(decl.type_.clone());
-            self.holes.insert(id.clone(), position);
-            position
-        };
-        Expr::bvar(depth.checked_add(position)?).ok()
+            return Some(HoleStep::Ready(
+                Expr::bvar(depth.checked_add(slot.position)?).ok()?,
+            ));
+        }
+        let decl = frame.base.txn.mvars.get_decl(id)?;
+        if decl.kind != MetavarKind::Natural
+            || decl.depth != 0
+            || decl.delayed.is_some()
+            || frame.base.txn.mvars.is_assigned(id)
+            || decl.lctx != frame.base.txn.lctx
+            || decl.type_.has_level_mvar()
+            || decl.type_.has_loose_bvars()
+        {
+            return None;
+        }
+        let position = u32::try_from(self.types.len() + 1).ok()?;
+        self.types.push(decl.type_.clone());
+        self.holes.insert(
+            id.clone(),
+            HoleSlot {
+                position,
+                complete: false,
+            },
+        );
+        Some(HoleStep::CheckType(decl.type_.clone()))
     }
 
     /// Every expression container is traversed by heap continuation. Memoization
@@ -53,7 +86,7 @@ impl Templates {
             if self.done.contains_key(&key) {
                 continue;
             }
-            if self.done.len() + pending.len() >= MAX_KEY_UNITS {
+            if self.done.len() + self.holes.len() + pending.len() >= MAX_KEY_UNITS {
                 return Ok(None);
             }
             if ground(&expr) {
@@ -61,10 +94,16 @@ impl Templates {
                 continue;
             }
             if let ExprNode::MVar { id } = expr.node() {
-                let Some(value) = self.hole(frame, id, depth) else {
-                    return Ok(None);
-                };
-                self.done.insert(key, value);
+                match self.hole(frame, id, depth, finish) {
+                    Some(HoleStep::Ready(value)) => {
+                        self.done.insert(key, value);
+                    }
+                    Some(HoleStep::CheckType(type_)) => {
+                        pending.push((expr, depth, true));
+                        pending.push((type_, 0, false));
+                    }
+                    None => return Ok(None),
+                }
                 continue;
             }
             if !finish {
@@ -357,5 +396,169 @@ mod tests {
             Expr::mvar(MVarId(Name::from_components(["foreign"]))),
         ));
         assert!(canonical(&mut context, &input).unwrap().is_none());
+    }
+
+    fn declare(input: &mut Frame, name: &str, type_: Expr) -> Expr {
+        let id = MVarId(Name::from_components([name]));
+        input.base.txn.mvars.declare(
+            id.clone(),
+            id.0.clone(),
+            type_,
+            input.base.txn.lctx.clone(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        Expr::mvar(id)
+    }
+
+    fn dependent_pattern(type_name: &str, value_name: &str) -> Frame {
+        let mut input = frame(constant("unused"));
+        let type_ = declare(&mut input, type_name, Expr::sort(Level::one()));
+        let value = declare(&mut input, value_name, type_.clone());
+        input.expected = Expr::app(Expr::app(constant("D"), type_), value);
+        input.target = input.expected.clone();
+        input.key = Expr::app(
+            Expr::app(constant("D"), Expr::bvar(0).unwrap()),
+            Expr::bvar(0).unwrap(),
+        );
+        input
+    }
+
+    #[test]
+    fn dependent_keys_share_exact_typed_graphs_not_generated_hole_names() {
+        let first = dependent_pattern("A", "a");
+        let second = dependent_pattern("B", "b");
+        let mut context = context();
+        let left = canonical(&mut context, &first).unwrap().unwrap();
+        let right = canonical(&mut context, &second).unwrap().unwrap();
+        assert_eq!(left.expected, right.expected);
+        assert_eq!(left.types, right.types);
+        assert_eq!(
+            left.types,
+            vec![Expr::sort(Level::one()), Expr::bvar(1).unwrap()]
+        );
+        // Same apparent goal shape, but a is declared in a different type.
+        let mut other = dependent_pattern("A", "a");
+        let foreign_type = declare(&mut other, "B", Expr::sort(Level::one()));
+        declare(&mut other, "a", foreign_type);
+        let other = canonical(&mut context, &other).unwrap().unwrap();
+        assert_eq!(left.expected, other.expected);
+        assert_ne!(left.types, other.types);
+        assert_eq!(other.types.len(), 3);
+    }
+
+    #[test]
+    fn type_dependencies_are_discovered_even_when_only_the_value_is_visible() {
+        let mut input = frame(constant("unused"));
+        let type_ = declare(&mut input, "A", Expr::sort(Level::one()));
+        let value = declare(&mut input, "a", type_);
+        let pattern = Expr::lam(
+            Name::anonymous(),
+            constant("Nat"),
+            value,
+            BinderInfo::Default,
+        );
+        input.expected = Expr::app(constant("C"), pattern);
+        let result = canonical(&mut context(), &input).unwrap().unwrap();
+        assert_eq!(
+            result.types,
+            vec![Expr::bvar(2).unwrap(), Expr::sort(Level::one())]
+        );
+        // The value placeholder is raised under the lambda, its saved type is not.
+        assert_eq!(
+            result.expected,
+            Expr::app(
+                constant("C"),
+                Expr::lam(
+                    Name::anonymous(),
+                    constant("Nat"),
+                    Expr::bvar(2).unwrap(),
+                    BinderInfo::Default,
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn cyclic_hole_typing_dependencies_are_not_accepted_as_forward_declarations() {
+        for mutual in [false, true] {
+            let mut input = frame(hole());
+            let next = if mutual { "y" } else { "x" };
+            declare(
+                &mut input,
+                "x",
+                Expr::mvar(MVarId(Name::from_components([next]))),
+            );
+            if mutual {
+                declare(&mut input, "y", hole());
+            }
+            let before = input.base.txn.mvars.clone();
+            let mut context = context();
+            context.txn.budget.max_heartbeats = 100;
+            assert!(canonical(&mut context, &input).unwrap().is_none());
+            assert_eq!(input.base.txn.mvars, before);
+            assert!(context.txn.mvars.is_empty());
+        }
+    }
+
+    #[test]
+    fn dependency_holes_keep_kind_depth_scope_and_universe_refusals() {
+        for (kind, depth, foreign_scope) in [
+            (MetavarKind::SyntheticOpaque, 0, false),
+            (MetavarKind::Natural, 1, false),
+            (MetavarKind::Natural, 0, true),
+        ] {
+            let mut input = dependent_pattern("A", "a");
+            let id = MVarId(Name::from_components(["A"]));
+            let mut locals = LocalContext::new();
+            if foreign_scope {
+                let fvar = FVarId(Name::from_components(["private"]));
+                locals.add_param(fvar.clone(), fvar.0, constant("Nat"), BinderInfo::Default);
+            }
+            input.base.txn.mvars.declare(
+                id.clone(),
+                id.0,
+                Expr::sort(Level::one()),
+                locals,
+                kind,
+                depth,
+                None,
+            );
+            assert!(canonical(&mut context(), &input).unwrap().is_none());
+        }
+        let mut input = dependent_pattern("A", "a");
+        declare(&mut input, "A", Expr::bvar(1).unwrap());
+        assert!(canonical(&mut context(), &input).unwrap().is_none());
+    }
+
+    #[test]
+    fn deep_and_shared_hole_type_graphs_are_heap_bound_and_metered() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut input = frame(hole());
+                let mut current = Expr::sort(Level::one());
+                for n in 0..2000 {
+                    current = declare(&mut input, &format!("T{n}"), current);
+                }
+                declare(&mut input, "x", current);
+                let original = input.base.txn.mvars.clone();
+                let mut context = context();
+                context.txn.budget.max_heartbeats = 20_000;
+                let result = canonical(&mut context, &input).unwrap().unwrap();
+                assert_eq!(result.types.len(), 2001);
+                assert!(result.units < 5000);
+                assert!(result.types.iter().all(|type_| !type_.has_expr_mvar()));
+                assert_eq!(input.base.txn.mvars, original);
+                // Term and typing walks share one budget, rather than restarting
+                // it for every declaration in the dependency graph.
+                context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 20;
+                assert!(canonical(&mut context, &input).is_err());
+                assert_eq!(input.base.txn.mvars, original);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
