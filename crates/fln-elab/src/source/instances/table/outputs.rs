@@ -1,7 +1,8 @@
 //! Canonical keys for structured outputs and bare semi-output holes.
 //! Hole alias patterns, declared types, binders and sharing remain explicit.
 //! Dependent hole types are part of the same canonical, cycle-checked graph.
-//! Opaque/delayed holes, unknown universes and foreign scopes are not guessed.
+//! Answer keys may retain independent universe variants; cycle keys preserve
+//! the existing universe identity rules. Neither operation assigns a hole.
 use super::*;
 
 mod syntax;
@@ -12,14 +13,23 @@ pub(super) struct Canonical {
     pub units: usize,
 }
 
+#[cfg(test)]
 pub(super) fn canonical(
     context: &mut Context,
     frame: &Frame,
 ) -> Result<Option<Canonical>, NatDefinitionElabError> {
+    canonical_with_ancestors(context, frame, &[])
+}
+
+pub(super) fn canonical_with_ancestors(
+    context: &mut Context,
+    frame: &Frame,
+    ancestors: &[Frame],
+) -> Result<Option<Canonical>, NatDefinitionElabError> {
     if frame.expected.has_loose_bvars() {
         return Ok(None);
     }
-    pattern(context, frame, &frame.expected)
+    pattern(context, frame, &frame.expected, Some(ancestors))
 }
 
 /// Prepared keys contain top-level output wildcards, never proof terms.
@@ -28,15 +38,16 @@ pub(super) fn cycle_key(
     context: &mut Context,
     frame: &Frame,
 ) -> Result<Option<Canonical>, NatDefinitionElabError> {
-    pattern(context, frame, &frame.key)
+    pattern(context, frame, &frame.key, None)
 }
 
 fn pattern(
     context: &mut Context,
     frame: &Frame,
     expression: &Expr,
+    ancestors: Option<&[Frame]>,
 ) -> Result<Option<Canonical>, NatDefinitionElabError> {
-    if expression.has_level_mvar() {
+    if expression.has_level_mvar() && ancestors.is_none() {
         return Ok(None);
     }
     if ground(expression) {
@@ -61,19 +72,26 @@ fn pattern(
                 expected = ef;
                 shape = sf;
             }
-            _ if expected == shape && ground(expected) => break,
+            _ if expected == shape && !expected.has_expr_mvar() => break,
             _ => return Ok(None),
         }
     }
-    let mut canonical = expected.clone();
     let mut templates = syntax::Templates::default();
+    if let Some(ancestors) = ancestors
+        && !templates.anchor(context, ancestors)?
+    {
+        return Ok(None);
+    }
+    let Some(mut canonical) = templates.rewrite(context, frame, expected)? else {
+        return Ok(None);
+    };
     let mut spine_units = 0;
     for (argument, output) in arguments.into_iter().rev() {
         context.tick()?;
         let argument = if ground(argument) {
             argument.clone()
         } else {
-            if !output {
+            if !output && argument.has_expr_mvar() {
                 return Ok(None);
             }
             let Some(value) = templates.rewrite(context, frame, argument)? else {

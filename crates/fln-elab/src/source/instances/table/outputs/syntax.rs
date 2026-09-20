@@ -2,6 +2,8 @@
 //! raised under each binder; templates never enter the unifier or the kernel.
 use super::*;
 
+mod levels;
+
 struct HoleSlot {
     position: u32,
     complete: bool,
@@ -17,11 +19,20 @@ pub(super) struct Templates {
     holes: HashMap<MVarId, HoleSlot>,
     pub types: Vec<Expr>,
     done: HashMap<(Expr, u32), Expr>,
+    levels: levels::LevelTemplates,
 }
 
 impl Templates {
+    pub fn anchor(
+        &mut self,
+        context: &mut Context,
+        ancestors: &[Frame],
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.levels.anchor(context, ancestors)
+    }
+
     pub fn units(&self) -> usize {
-        self.done.len()
+        self.done.len() + self.levels.units()
     }
 
     // Hole types belong to the frame's saved context, not to any lexical binder
@@ -53,7 +64,6 @@ impl Templates {
             || decl.delayed.is_some()
             || frame.base.txn.mvars.is_assigned(id)
             || decl.lctx != frame.base.txn.lctx
-            || decl.type_.has_level_mvar()
             || decl.type_.has_loose_bvars()
         {
             return None;
@@ -86,12 +96,36 @@ impl Templates {
             if self.done.contains_key(&key) {
                 continue;
             }
-            if self.done.len() + self.holes.len() + pending.len() >= MAX_KEY_UNITS {
+            if self.units() + self.holes.len() + pending.len() >= MAX_KEY_UNITS {
                 return Ok(None);
             }
             if ground(&expr) {
                 self.done.insert(key, expr);
                 continue;
+            }
+            match expr.node() {
+                ExprNode::Sort { level } => {
+                    let Some(level) = self.levels.rewrite(context, frame, level)? else {
+                        return Ok(None);
+                    };
+                    self.done.insert(key, Expr::sort(level));
+                    continue;
+                }
+                ExprNode::Const { name, levels } => {
+                    if levels.len() > MAX_KEY_UNITS.saturating_sub(self.units()) {
+                        return Ok(None);
+                    }
+                    let mut rewritten = Vec::with_capacity(levels.len());
+                    for level in levels {
+                        let Some(level) = self.levels.rewrite(context, frame, level)? else {
+                            return Ok(None);
+                        };
+                        rewritten.push(level);
+                    }
+                    self.done.insert(key, Expr::const_(name.clone(), rewritten));
+                    continue;
+                }
+                _ => {}
             }
             if let ExprNode::MVar { id } = expr.node() {
                 match self.hole(frame, id, depth, finish) {
@@ -503,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_holes_keep_kind_depth_scope_and_universe_refusals() {
+    fn dependency_holes_keep_kind_depth_and_scope_refusals() {
         for (kind, depth, foreign_scope) in [
             (MetavarKind::SyntheticOpaque, 0, false),
             (MetavarKind::Natural, 1, false),
@@ -556,6 +590,174 @@ mod tests {
                 context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 20;
                 assert!(canonical(&mut context, &input).is_err());
                 assert_eq!(input.base.txn.mvars, original);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn uvar(name: &str) -> Level {
+        Level::mvar(LMVarId(Name::from_components([name])))
+    }
+    fn polymorphic_frame(name: &str) -> Frame {
+        let mut input = frame(hole());
+        let level = uvar(name);
+        declare(&mut input, "x", Expr::sort(level.clone()));
+        let head = Expr::const_(Name::from_components(["C"]), vec![level]);
+        input.expected = Expr::app(head.clone(), hole());
+        input.target = input.expected.clone();
+        input.key = Expr::app(head, Expr::bvar(0).unwrap());
+        input
+    }
+
+    #[test]
+    fn universe_variants_preserve_shared_level_holes_and_rigid_parameters() {
+        let first = polymorphic_frame("u");
+        let second = polymorphic_frame("v");
+        let left = canonical(&mut context(), &first).unwrap().unwrap();
+        let right = canonical(&mut context(), &second).unwrap().unwrap();
+        assert_eq!(left.expected, right.expected);
+        assert_eq!(left.types, right.types);
+        let mut separate = polymorphic_frame("u");
+        declare(&mut separate, "x", Expr::sort(uvar("v")));
+        let separate = canonical(&mut context(), &separate).unwrap().unwrap();
+        assert_eq!(left.expected, separate.expected);
+        assert_ne!(left.types, separate.types);
+        let mut rigid = polymorphic_frame("u");
+        // Even a rigid parameter spelled exactly like a private key variable
+        // must not be treated as an inference hole.
+        declare(
+            &mut rigid,
+            "x",
+            Expr::sort(Level::param(Name::num(Name::anonymous(), 0))),
+        );
+        let rigid = canonical(&mut context(), &rigid).unwrap().unwrap();
+        assert_ne!(left.types, rigid.types);
+    }
+
+    #[test]
+    fn saved_universe_assignments_not_current_mutable_state_determine_the_key() {
+        let mut input = polymorphic_frame("u");
+        let id = LMVarId(Name::from_components(["u"]));
+        input.base.txn.universes.assign(id.clone(), Level::one());
+        let original = input.base.txn.universes.clone();
+        let mut context = context();
+        context.txn.universes.assign(id.clone(), Level::zero());
+        let current = context.txn.universes.clone();
+        let output = canonical(&mut context, &input).unwrap().unwrap();
+        assert_eq!(output.types, vec![Expr::sort(Level::one())]);
+        assert_eq!(input.base.txn.universes, original);
+        assert_eq!(context.txn.universes, current);
+        input.base.txn.universes.assign(id, Level::zero());
+        let other = canonical(&mut context, &input).unwrap().unwrap();
+        assert_ne!(output.expected, other.expected);
+        assert_ne!(output.types, other.types);
+    }
+
+    #[test]
+    fn active_cycle_universes_are_anchored_but_unrelated_path_holes_are_not() {
+        let input = polymorphic_frame("query");
+        let unrelated = polymorphic_frame("ancestor");
+        assert!(
+            canonical_with_ancestors(&mut context(), &input, &[unrelated])
+                .unwrap()
+                .is_some()
+        );
+        let mut related = frame(constant("unrelated"));
+        // Anchor discovery traverses nested expression containers too.
+        related.key = Expr::lam(
+            Name::anonymous(),
+            constant("Nat"),
+            Expr::sort(uvar("query")),
+            BinderInfo::Default,
+        );
+        assert!(
+            canonical_with_ancestors(&mut context(), &input, &[related])
+                .unwrap()
+                .is_none()
+        );
+        let input = polymorphic_frame("query");
+        let mut negative = GroundTable::default();
+        negative
+            .exhausted(&mut context(), &input, &[polymorphic_frame("query")])
+            .unwrap();
+        assert_eq!(negative.entries, 0);
+    }
+
+    #[test]
+    fn cyclic_universe_assignments_cannot_become_a_completed_or_negative_key() {
+        let mut input = polymorphic_frame("u");
+        input.base.txn.universes.assign(
+            LMVarId(Name::from_components(["u"])),
+            Level::max(uvar("v"), Level::one()).unwrap(),
+        );
+        input
+            .base
+            .txn
+            .universes
+            .assign(LMVarId(Name::from_components(["v"])), uvar("u"));
+        let before = input.base.txn.universes.clone();
+        let mut context = context();
+        context.txn.budget.max_heartbeats = 100;
+        assert!(canonical(&mut context, &input).unwrap().is_none());
+        let mut table = GroundTable::default();
+        table
+            .exhausted(&mut context, &input, &[frame(constant("Root"))])
+            .unwrap();
+        assert_eq!(table.entries, 0);
+        assert_eq!(input.base.txn.universes, before);
+    }
+
+    #[test]
+    fn universe_level_constructors_are_not_erased_or_solved_by_key_building() {
+        let mut input = polymorphic_frame("head");
+        let first = Level::imax(
+            Level::max(uvar("u"), uvar("v")).unwrap(),
+            uvar("u").succ().unwrap(),
+        )
+        .unwrap();
+        declare(&mut input, "x", Expr::sort(first));
+        let output = canonical(&mut context(), &input).unwrap().unwrap();
+        let private = |n| Level::mvar(LMVarId(Name::num(Name::anonymous(), n)));
+        assert_eq!(
+            output.types,
+            vec![Expr::sort(
+                Level::imax(
+                    Level::max(private(1), private(2)).unwrap(),
+                    private(1).succ().unwrap(),
+                )
+                .unwrap()
+            )]
+        );
+        assert!(input.base.txn.universes.is_empty());
+        assert!(output.types[0].has_level_mvar()); // Only private key data.
+    }
+
+    #[test]
+    fn deep_universe_aliases_and_shared_levels_stay_metered_and_stack_safe() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut input = polymorphic_frame("u");
+                let mut level = uvar("leaf");
+                for n in 0..1500 {
+                    let id = LMVarId(Name::num(Name::from_components(["chain"]), n));
+                    input.base.txn.universes.assign(id.clone(), level);
+                    level = Level::mvar(id);
+                }
+                for _ in 0..35 {
+                    level = Level::max(level.clone(), level).unwrap();
+                }
+                declare(&mut input, "x", Expr::sort(level));
+                let mut context = context();
+                context.txn.budget.max_heartbeats = 10_000;
+                let result = canonical(&mut context, &input).unwrap().unwrap();
+                assert!(result.units < 4000);
+                assert!(result.types[0].has_level_mvar());
+                let before = input.base.txn.universes.clone();
+                context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 10;
+                assert!(canonical(&mut context, &input).is_err());
+                assert_eq!(input.base.txn.universes, before);
             })
             .unwrap()
             .join()

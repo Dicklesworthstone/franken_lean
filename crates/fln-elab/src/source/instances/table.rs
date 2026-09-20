@@ -7,7 +7,8 @@
 //! where that cycle is absent (which could select a higher-priority instance).
 //! Fresh, typed output holes are alpha-keyed; their selected values are replayed
 //! by native unification, never by copying assignments. Cached open answers keep
-//! lazy search continuations. Open inputs/universes, newly opened binders and
+//! lazy search continuations. Independent universe variants may share answer
+//! keys without changing cycle-key equality. Open inputs, newly opened binders and
 //! pending equations remain untabled.
 //! Exhausted entries mean every candidate was tried under that exact key, not
 //! that a resource limit, cancellation or temporarily blocked input was seen.
@@ -48,11 +49,8 @@ fn ground(expr: &Expr) -> bool {
 // Output slots are replaced by preparation; semi-output slots retain their
 // original structure. Unknown ordinary inputs never reach a prepared frame.
 fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
-    if ground(&frame.target) {
+    if !frame.target.has_expr_mvar() {
         return Ok(true);
-    }
-    if frame.key.has_level_mvar() {
-        return Ok(false);
     }
     let mut target = &frame.target;
     let mut shape = &frame.key;
@@ -67,14 +65,14 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
             ) => {
                 let output = matches!(sa.node(), ExprNode::BVar { .. })
                     && matches!(ta.node(), ExprNode::MVar { .. });
-                if !output && (ta != sa || ta != ea || ta.has_level_mvar()) {
+                if !output && (ta != sa || ta != ea) {
                     return Ok(false);
                 }
                 target = tf;
                 shape = sf;
                 expected = ef;
             }
-            _ => return Ok(target == shape && target == expected && ground(target)),
+            _ => return Ok(target == shape && target == expected && !target.has_expr_mvar()),
         }
     }
 }
@@ -173,7 +171,7 @@ fn key(
     if !ground_locals(context, locals)? {
         return Ok(None);
     }
-    let Some(canonical) = outputs::canonical(context, frame)? else {
+    let Some(canonical) = outputs::canonical_with_ancestors(context, frame, ancestors)? else {
         return Ok(None);
     };
     let mut syntax_units = canonical.units;
@@ -181,8 +179,19 @@ fn key(
     let mut units = 1 + locals.len() + canonical.types.len() + syntax_units;
     for ancestor in ancestors {
         context.tick()?;
-        let Some(key) = outputs::cycle_key(context, ancestor)? else {
-            return Ok(None);
+        let key = if !ancestor.key.has_expr_mvar() {
+            // Such an open-universe ancestor participates only in exact cycle
+            // equality. Keep its saved syntax, not the latest assignments.
+            outputs::Canonical {
+                expected: ancestor.key.clone(),
+                types: Vec::new(),
+                units: 0,
+            }
+        } else {
+            let Some(key) = outputs::cycle_key(context, ancestor)? else {
+                return Ok(None);
+            };
+            key
         };
         units += 1 + key.types.len() + key.units;
         if units > MAX_KEY_UNITS {
@@ -747,5 +756,55 @@ mod tests {
         let before = context.txn.mvars.clone();
         assert!(same_goal(&mut context, &first, &second).is_err());
         assert_eq!(context.txn.mvars, before);
+    }
+
+    #[test]
+    fn universe_answer_variants_do_not_become_new_cycle_equivalences() {
+        let mut context = context();
+        let u = Level::mvar(LMVarId(Name::from_components(["u"])));
+        let v = Level::mvar(LMVarId(Name::from_components(["v"])));
+        let mut first = open_outputs(&["a"], Expr::sort(u));
+        let mut second = open_outputs(&["b"], Expr::sort(v));
+        // Semi-output variables retain their type graphs in cycle comparisons.
+        first.key = first.expected.clone();
+        second.key = second.expected.clone();
+        assert!(!same_goal(&mut context, &first, &second).unwrap());
+        assert!(same_goal(&mut context, &first, &first).unwrap());
+        let path = [frame("Root")];
+        let first_key = key(&mut context, &first, &path).unwrap().unwrap();
+        assert!(Some(first_key) == key(&mut context, &second, &path).unwrap());
+        assert!(context.txn.mvars.is_empty());
+        assert!(context.txn.universes.is_empty());
+    }
+
+    #[test]
+    fn exact_open_universe_ancestor_paths_still_separate_exhausted_answers() {
+        let mut context = context();
+        let query = open_outputs(&["a"], Expr::sort(Level::one()));
+        let mut first_path = frame("Root");
+        first_path.key = Expr::const_(
+            Name::from_components(["Root"]),
+            vec![Level::mvar(LMVarId(Name::from_components(["u"])))],
+        );
+        let mut second_path = frame("Root");
+        second_path.key = Expr::const_(
+            Name::from_components(["Root"]),
+            vec![Level::mvar(LMVarId(Name::from_components(["v"])))],
+        );
+        let first_path = [first_path];
+        let second_path = [second_path];
+        let mut table = GroundTable::default();
+        table.exhausted(&mut context, &query, &first_path).unwrap();
+        assert_eq!(
+            table.lookup(&mut context, &query, &first_path).unwrap(),
+            Some(Answer::Exhausted)
+        );
+        assert!(
+            table
+                .lookup(&mut context, &query, &second_path)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(table.entries, 1);
     }
 }
