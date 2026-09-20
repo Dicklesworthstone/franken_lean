@@ -3,6 +3,7 @@
 use super::*;
 pub mod attributes;
 pub mod imports;
+pub mod instances;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
@@ -12,6 +13,7 @@ pub enum ScopeCommand {
     Open(Vec<Name>),
     Universe(Vec<Name>),
     Simp(attributes::SimpAttribute),
+    Instance(instances::InstanceAttribute),
     Trivia,
 }
 
@@ -82,6 +84,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         return Ok(None);
     };
     if keyword == "attribute" {
+        if let Some(attribute) = instances::parse(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::Instance(attribute)));
+        }
         return attributes::parse(source).map(|attribute| attribute.map(ScopeCommand::Simp));
     }
     if !control(keyword) {

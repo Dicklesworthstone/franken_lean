@@ -82,6 +82,9 @@ impl Scopes {
     pub fn apply(&mut self, command: ScopeCommand) -> Result<(), String> {
         let namespace = matches!(command, ScopeCommand::Namespace(_));
         match command {
+            ScopeCommand::Instance(_) => {
+                return Err("instance attributes require an environment transition".into());
+            }
             ScopeCommand::Simp(_) => {
                 return Err("simp attributes require an environment transition".into());
             }

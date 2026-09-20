@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+mod instance_attributes;
 pub mod modules;
 mod scopes;
 
@@ -227,6 +228,18 @@ impl Engine {
                 })?;
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
+                        continue;
+                    }
+                    if let fln_parse::command_scope::ScopeCommand::Instance(attribute) = control {
+                        engine.environment = instance_attributes::apply(
+                            engine.environment(),
+                            &scopes.current,
+                            attribute,
+                            file,
+                            count,
+                            start.0,
+                        )?;
+                        count += 1;
                         continue;
                     }
                     if let fln_parse::command_scope::ScopeCommand::Simp(attribute) = control {
