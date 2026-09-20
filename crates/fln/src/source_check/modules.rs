@@ -50,29 +50,86 @@ pub enum SourceModuleCheckError {
     EmptyInput,
     InvalidName(Name),
     DuplicateModule(Name),
-    MissingModule { importer: Name, module: Name },
+    MissingModule {
+        importer: Name,
+        module: Name,
+    },
     Cycle(Name),
     UnreachableModule(Name),
-    Limit { resource: &'static str, limit: usize },
-    Header { module: Name, error: DefinitionParseError },
-    Source { module: Name, error: SourceCheckError },
-    Replay { module: Name, error: Box<EngineExecutionError> },
-    Extension { module: Name, extension: Name, reason: &'static str },
+    Limit {
+        resource: &'static str,
+        limit: usize,
+    },
+    Header {
+        module: Name,
+        error: DefinitionParseError,
+    },
+    Source {
+        module: Name,
+        error: SourceCheckError,
+    },
+    Replay {
+        module: Name,
+        error: Box<EngineExecutionError>,
+    },
+    Extension {
+        module: Name,
+        extension: Name,
+        reason: &'static str,
+    },
 }
 impl std::fmt::Display for SourceModuleCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyInput => write!(f, "source module checking requires an entry module"),
-            Self::InvalidName(name) => write!(f, "invalid source module name `{}`", name.to_display_string()),
-            Self::DuplicateModule(name) => write!(f, "duplicate source module `{}`", name.to_display_string()),
-            Self::MissingModule { importer, module } => write!(f, "module `{}` requires missing module `{}`", importer.to_display_string(), module.to_display_string()),
-            Self::Cycle(name) => write!(f, "source import cycle through `{}`", name.to_display_string()),
-            Self::UnreachableModule(name) => write!(f, "source module `{}` is outside the entry import closure", name.to_display_string()),
-            Self::Limit { resource, limit } => write!(f, "source module check exceeds {resource} limit {limit}"),
-            Self::Header { module, error } => write!(f, "module `{}` header: {error}", module.to_display_string()),
-            Self::Source { module, error } => write!(f, "module `{}`: {error}", module.to_display_string()),
-            Self::Replay { module, error } => write!(f, "importing checked module `{}`: {error}", module.to_display_string()),
-            Self::Extension { module, extension, reason } => write!(f, "module `{}` extension `{}`: {reason}", module.to_display_string(), extension.to_display_string()),
+            Self::InvalidName(name) => write!(
+                f,
+                "invalid source module name `{}`",
+                name.to_display_string()
+            ),
+            Self::DuplicateModule(name) => {
+                write!(f, "duplicate source module `{}`", name.to_display_string())
+            }
+            Self::MissingModule { importer, module } => write!(
+                f,
+                "module `{}` requires missing module `{}`",
+                importer.to_display_string(),
+                module.to_display_string()
+            ),
+            Self::Cycle(name) => write!(
+                f,
+                "source import cycle through `{}`",
+                name.to_display_string()
+            ),
+            Self::UnreachableModule(name) => write!(
+                f,
+                "source module `{}` is outside the entry import closure",
+                name.to_display_string()
+            ),
+            Self::Limit { resource, limit } => {
+                write!(f, "source module check exceeds {resource} limit {limit}")
+            }
+            Self::Header { module, error } => {
+                write!(f, "module `{}` header: {error}", module.to_display_string())
+            }
+            Self::Source { module, error } => {
+                write!(f, "module `{}`: {error}", module.to_display_string())
+            }
+            Self::Replay { module, error } => write!(
+                f,
+                "importing checked module `{}`: {error}",
+                module.to_display_string()
+            ),
+            Self::Extension {
+                module,
+                extension,
+                reason,
+            } => write!(
+                f,
+                "module `{}` extension `{}`: {reason}",
+                module.to_display_string(),
+                extension.to_display_string()
+            ),
         }
     }
 }
@@ -96,13 +153,25 @@ struct Meter {
 }
 impl Meter {
     fn work(&mut self, amount: usize) -> Result<(), SourceModuleCheckError> {
-        self.work = self.work.checked_add(amount).filter(|n| *n <= self.limits.max_work)
-            .ok_or(SourceModuleCheckError::Limit { resource: "module work", limit: self.limits.max_work })?;
+        self.work = self
+            .work
+            .checked_add(amount)
+            .filter(|n| *n <= self.limits.max_work)
+            .ok_or(SourceModuleCheckError::Limit {
+                resource: "module work",
+                limit: self.limits.max_work,
+            })?;
         Ok(())
     }
     fn bytes(&mut self, amount: usize) -> Result<(), SourceModuleCheckError> {
-        self.bytes = self.bytes.checked_add(amount).filter(|n| *n <= self.limits.max_extension_bytes)
-            .ok_or(SourceModuleCheckError::Limit { resource: "extension bytes", limit: self.limits.max_extension_bytes })?;
+        self.bytes = self
+            .bytes
+            .checked_add(amount)
+            .filter(|n| *n <= self.limits.max_extension_bytes)
+            .ok_or(SourceModuleCheckError::Limit {
+                resource: "extension bytes",
+                limit: self.limits.max_extension_bytes,
+            })?;
         Ok(())
     }
 }

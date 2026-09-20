@@ -16,7 +16,10 @@ impl Plan {
             return Err(SourceModuleCheckError::EmptyInput);
         }
         if modules.len() > meter.limits.max_modules {
-            return Err(SourceModuleCheckError::Limit { resource: "modules", limit: meter.limits.max_modules });
+            return Err(SourceModuleCheckError::Limit {
+                resource: "modules",
+                limit: meter.limits.max_modules,
+            });
         }
         let mut by_name = BTreeMap::new();
         let mut total_bytes = 0usize;
@@ -25,29 +28,49 @@ impl Plan {
             if by_name.insert(module.name.clone(), index).is_some() {
                 return Err(SourceModuleCheckError::DuplicateModule(module.name.clone()));
             }
-            total_bytes = total_bytes.checked_add(module.source.len())
+            total_bytes = total_bytes
+                .checked_add(module.source.len())
                 .filter(|n| *n <= meter.limits.source.max_bytes)
-                .ok_or(SourceModuleCheckError::Limit { resource: "source bytes", limit: meter.limits.source.max_bytes })?;
+                .ok_or(SourceModuleCheckError::Limit {
+                    resource: "source bytes",
+                    limit: meter.limits.source.max_bytes,
+                })?;
         }
         validate_name(entry, meter)?;
-        let entry = by_name.get(entry).copied().ok_or_else(|| SourceModuleCheckError::MissingModule {
-            importer: entry.clone(), module: entry.clone(),
-        })?;
+        let entry =
+            by_name
+                .get(entry)
+                .copied()
+                .ok_or_else(|| SourceModuleCheckError::MissingModule {
+                    importer: entry.clone(),
+                    module: entry.clone(),
+                })?;
         let mut headers = Vec::new();
         let mut dependencies = Vec::new();
         let mut imports = 0usize;
         for module in modules {
             meter.work(1)?;
-            let header = parse_source_header(module.source).map_err(|error| SourceModuleCheckError::Header {
-                module: module.name.clone(), error,
+            let header = parse_source_header(module.source).map_err(|error| {
+                SourceModuleCheckError::Header {
+                    module: module.name.clone(),
+                    error,
+                }
             })?;
-            imports = imports.checked_add(header.imports.len()).filter(|n| *n <= meter.limits.max_imports)
-                .ok_or(SourceModuleCheckError::Limit { resource: "imports", limit: meter.limits.max_imports })?;
+            imports = imports
+                .checked_add(header.imports.len())
+                .filter(|n| *n <= meter.limits.max_imports)
+                .ok_or(SourceModuleCheckError::Limit {
+                    resource: "imports",
+                    limit: meter.limits.max_imports,
+                })?;
             let mut direct = Vec::new();
             for name in &header.imports {
                 validate_name(name, meter)?;
-                direct.push(by_name.get(name).copied().ok_or_else(|| SourceModuleCheckError::MissingModule {
-                    importer: module.name.clone(), module: name.clone(),
+                direct.push(by_name.get(name).copied().ok_or_else(|| {
+                    SourceModuleCheckError::MissingModule {
+                        importer: module.name.clone(),
+                        module: name.clone(),
+                    }
                 })?);
             }
             headers.push(header);
@@ -56,12 +79,18 @@ impl Plan {
         let order = postorder(entry, &dependencies, modules, meter)?;
         if order.len() != modules.len() {
             let reached: std::collections::BTreeSet<_> = order.iter().copied().collect();
-            let missing = by_name.iter().find_map(|(name, &index)| {
-                (!reached.contains(&index)).then_some(name)
-            }).expect("unreachable module");
+            let missing = by_name
+                .iter()
+                .find_map(|(name, &index)| (!reached.contains(&index)).then_some(name))
+                .expect("unreachable module");
             return Err(SourceModuleCheckError::UnreachableModule(missing.clone()));
         }
-        Ok(Self { headers, order, entry, dependencies })
+        Ok(Self {
+            headers,
+            order,
+            entry,
+            dependencies,
+        })
     }
 
     pub(super) fn dependencies_of(
@@ -85,12 +114,20 @@ fn validate_name(name: &Name, meter: &mut Meter) -> Result<(), SourceModuleCheck
         meter.work(1)?;
         depth += 1;
         if depth > meter.limits.max_name_depth {
-            return Err(SourceModuleCheckError::Limit { resource: "module name depth", limit: meter.limits.max_name_depth });
+            return Err(SourceModuleCheckError::Limit {
+                resource: "module name depth",
+                limit: meter.limits.max_name_depth,
+            });
         }
         match cursor.leaf_view() {
             LeafView::Str(component) if !component.is_empty() => {
-                bytes = bytes.checked_add(component.len()).filter(|n| *n <= meter.limits.source.max_bytes)
-                    .ok_or(SourceModuleCheckError::Limit { resource: "module name bytes", limit: meter.limits.source.max_bytes })?;
+                bytes = bytes
+                    .checked_add(component.len())
+                    .filter(|n| *n <= meter.limits.source.max_bytes)
+                    .ok_or(SourceModuleCheckError::Limit {
+                        resource: "module name bytes",
+                        limit: meter.limits.source.max_bytes,
+                    })?;
             }
             _ => return Err(SourceModuleCheckError::InvalidName(name.clone())),
         }
@@ -123,7 +160,11 @@ fn postorder(
                     colors[dependency] = 1;
                     stack.push((dependency, 0));
                 }
-                1 => return Err(SourceModuleCheckError::Cycle(modules[dependency].name.clone())),
+                1 => {
+                    return Err(SourceModuleCheckError::Cycle(
+                        modules[dependency].name.clone(),
+                    ));
+                }
                 _ => {}
             }
         } else {

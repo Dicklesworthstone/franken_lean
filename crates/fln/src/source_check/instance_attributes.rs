@@ -29,15 +29,25 @@ pub(super) fn apply(
         let name = scope
             .resolve(&requested, |name| next.contains(name))
             .map_err(|error| SourceCheckError::Scope {
-                file, command, offset, message: error.to_string(),
+                file,
+                command,
+                offset,
+                message: error.to_string(),
             })?
             .ok_or_else(|| SourceCheckError::Scope {
-                file, command, offset,
-                message: format!("unknown instance declaration `{}`", requested.to_display_string()),
+                file,
+                command,
+                offset,
+                message: format!(
+                    "unknown instance declaration `{}`",
+                    requested.to_display_string()
+                ),
             })?;
-        next = fln_elab::instances::set_instance(&next, &name, attribute.priority)
-            .map_err(|error| SourceCheckError::Command {
-                file, command, offset,
+        next = fln_elab::instances::set_instance(&next, &name, attribute.priority).map_err(
+            |error| SourceCheckError::Command {
+                file,
+                command,
+                offset,
                 error: Box::new(EngineExecutionError::Frontend(
                     DefinitionFrontendError::Elaborate(
                         fln_elab::NatDefinitionElabError::Inference(
@@ -45,7 +55,8 @@ pub(super) fn apply(
                         ),
                     ),
                 )),
-            })?;
+            },
+        )?;
     }
     // A late name/type/registry refusal drops this entire speculative successor.
     Ok(next)
