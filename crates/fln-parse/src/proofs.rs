@@ -110,6 +110,7 @@ fn tactic(
             "generalize",
             "exact",
             "assumption",
+            "solve_by_elim",
             "apply",
             "refine",
             "constructor",
@@ -231,8 +232,8 @@ fn local_tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
-        "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right" | "skip"
-        | "fail" | "decide"
+        "assumption" | "solve_by_elim" | "rfl" | "contradiction" | "constructor" | "left"
+        | "right" | "skip" | "fail" | "decide"
             if range.end == start + 1 => {}
         _ => return Err(refusal(view, tokens, start)),
     }
@@ -1120,5 +1121,41 @@ mod simpa_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn solve_by_elim_is_contextual_lossless_and_composes_with_controls() {
+        for source in [
+            "def solve_by_elim (n : Nat) : Nat := n",
+            "theorem t (p : Prop) (h : p) : p := by\r\n  solve_by_elim /- local search -/\r\n",
+            "theorem t : P := by first | solve_by_elim | assumption",
+            "theorem t : And P Q := by constructor <;> (solve_by_elim)",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn solve_by_elim_does_not_silently_ignore_unsupported_options() {
+        for tail in [
+            "solve_by_elim h",
+            "solve_by_elim [h]",
+            "solve_by_elim only",
+            "solve_by_elim (config := {})",
+            "solve_by_elim at h",
+        ] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
     }
 }
