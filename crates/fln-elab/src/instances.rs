@@ -116,7 +116,10 @@ impl InstanceRegistry {
             return Err(InstanceRegistryError::Limit);
         }
         let mut out = Self::default();
-        let mut seen = BTreeSet::new();
+        // Keep a stable slot per declaration. Attribute updates replace its
+        // priority in place, just as the Reference's DiscrTree.insertVal does;
+        // re-registering an existing instance does not make it a newer peer.
+        let mut positions = BTreeMap::new();
         for (order, entry) in extension.entries().enumerate() {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(InstanceRegistryError::Limit);
@@ -134,24 +137,41 @@ impl InstanceRegistry {
                         return Err(InstanceRegistryError::Malformed);
                     }
                 }
-                1 => {
+                // Tag 1 is the original strict registration operation. Tag 2
+                // is an explicit attribute upsert; old readers refuse that tag
+                // rather than silently ignoring a priority change.
+                1 | 2 => {
                     let declaration = read_name(&mut bytes)?;
                     let priority = u32::from_le_bytes(
                         take(&mut bytes, 4)?
                             .try_into()
                             .map_err(|_| InstanceRegistryError::Malformed)?,
                     );
-                    if !out.classes.contains(&class) || !seen.insert(declaration.clone()) {
+                    if !out.classes.contains(&class)
+                        || validate_instance(env, &declaration)? != class
+                    {
                         return Err(InstanceRegistryError::Malformed);
                     }
-                    if validate_instance(env, &declaration)? != class {
-                        return Err(InstanceRegistryError::Malformed);
+                    let entries = out.instances.entry(class).or_default();
+                    if let Some(&slot) = positions.get(&declaration) {
+                        if tag == 1 {
+                            return Err(InstanceRegistryError::Malformed);
+                        }
+                        let previous: &mut InstanceEntry = entries
+                            .get_mut(slot)
+                            .ok_or(InstanceRegistryError::Malformed)?;
+                        if previous.declaration != declaration {
+                            return Err(InstanceRegistryError::Malformed);
+                        }
+                        previous.priority = priority;
+                    } else {
+                        positions.insert(declaration.clone(), entries.len());
+                        entries.push(InstanceEntry {
+                            declaration,
+                            priority,
+                            order,
+                        });
                     }
-                    out.instances.entry(class).or_default().push(InstanceEntry {
-                        declaration,
-                        priority,
-                        order,
-                    });
                 }
                 _ => return Err(InstanceRegistryError::Malformed),
             }
@@ -257,6 +277,33 @@ pub fn register_instance(
     }
     let mut payload = MAGIC.to_vec();
     payload.push(1);
+    write_name(&class, &mut payload)?;
+    write_name(declaration, &mut payload)?;
+    payload.extend(priority.to_le_bytes());
+    append(env, payload)
+}
+
+/// Add or reprioritize an already admitted safe declaration for a global
+/// `attribute [instance]` command. Unlike [`register_instance`], this operation
+/// deliberately permits an existing registration. Its original equal-priority
+/// tie-break position is preserved; no stale higher-priority copy survives.
+///
+/// The update is an append-only, validated journal event, so immutable snapshots
+/// and the native module export/replay path retain their ordinary identities.
+/// This does not implement scoped/local attributes or instance erasure, and it
+/// never admits a declaration or changes its reducibility metadata.
+pub fn set_instance(
+    env: &Environment,
+    declaration: &Name,
+    priority: u32,
+) -> Result<Environment, InstanceRegistryError> {
+    let registry = InstanceRegistry::read(env)?;
+    let class = validate_instance(env, declaration)?;
+    if !registry.is_class(&class) {
+        return Err(InstanceRegistryError::UnknownClass(class));
+    }
+    let mut payload = MAGIC.to_vec();
+    payload.push(2);
     write_name(&class, &mut payload)?;
     write_name(declaration, &mut payload)?;
     payload.extend(priority.to_le_bytes());
