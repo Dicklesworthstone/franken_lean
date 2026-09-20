@@ -36,8 +36,12 @@ jobs:
       - name: Install repository-pinned Rust
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
+      - name: Check transactional search and lossless syntax
+        run: |
+          cargo test --locked -p fln-elab --lib source::tactics::search
+          cargo test --locked -p fln-parse --lib proofs::search_tests
       - name: Check proofs and proof-carrying decisions through both engines
-        run: cargo test --locked -p fln --test source_logic --test source_decisions --test source_equality_decisions --no-fail-fast
+        run: cargo test --locked -p fln --test source_proof_search --test source_logic --test source_decisions --test source_equality_decisions --no-fail-fast
       - name: Check installed-command receipts and recovery
         run: cargo test --locked -p fln-cli --test source_logic
       - name: Lint touched source packages and downstream consumers
