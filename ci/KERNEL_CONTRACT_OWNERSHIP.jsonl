@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":477,"projection_hash":"0826d30ff6e1e05177de9785a216c4129796d58fc7ee0859c42efb4da7c45e41"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":478,"projection_hash":"4d38ce3a06a8313cdc4eead63d76cb7df32093a1f1a77f5f912474cb0b228efb"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -121,6 +121,7 @@
 {"id":"fln-in1"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
+{"id":"fln-init-control-council-4698-1yyb"}
 {"id":"fln-init-core-council-4442-aiwk"}
 {"id":"fln-init-sizeof-council-3290-w4xk"}
 {"id":"fln-iron-target-profile-contract-ba9"}
