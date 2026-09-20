@@ -328,6 +328,22 @@ fn head_arity_level_cap_and_closed_pair_gates_are_exact() {
         }
     ));
 
+    let loose_bvar = Expr::bvar(0).unwrap();
+    assert!(matches!(
+        reduce_nat(
+            &decoded(&binary("add", loose_bvar.clone(), literal(2))),
+            &companion(),
+            &context,
+            NatReductionBudget::unlimited(),
+        ),
+        NatReductionOutcome::NotReduced {
+            reason: NatNotReduced::OpenPair {
+                input: NatReductionInput::Candidate,
+            },
+            ..
+        }
+    ));
+
     assert!(matches!(
         reduce_nat(
             &decoded(&binary(

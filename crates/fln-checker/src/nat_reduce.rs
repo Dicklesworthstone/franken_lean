@@ -820,9 +820,16 @@ fn validate_child(input: NatReductionInput, parent: ExprId, child: ExprId) -> Re
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClosedWork {
+    id: ExprId,
+    depth: u32,
+}
+
 fn push_child(
-    stack: &mut Vec<ExprId>,
+    stack: &mut Vec<ClosedWork>,
     child: ExprId,
+    depth: u32,
     parent: ExprId,
     input: NatReductionInput,
     control: &mut Control<'_>,
@@ -830,7 +837,7 @@ fn push_child(
     validate_child(input, parent, child)?;
     control.push_work(
         stack,
-        child,
+        ClosedWork { id: child, depth },
         parent.index(),
         NatReductionAllocation::ClosedWalk,
     )
@@ -845,22 +852,26 @@ fn is_closed(
     let mut pending = Vec::new();
     control.push_work(
         &mut pending,
-        root,
+        ClosedWork { id: root, depth: 0 },
         root.index(),
         NatReductionAllocation::ClosedWalk,
     )?;
     while let Some(current) = pending.pop() {
-        control.step(current.index())?;
-        let node = term
-            .node(current)
-            .ok_or(Halt::Fault(NatReductionFault::MissingExpression {
-                input,
-                index: current.index(),
-            }))?;
+        control.step(current.id.index())?;
+        let node =
+            term.node(current.id)
+                .ok_or(Halt::Fault(NatReductionFault::MissingExpression {
+                    input,
+                    index: current.id.index(),
+                }))?;
         match node {
             ExprNode::Free { .. } => return Ok(false),
-            ExprNode::Bound { .. }
-            | ExprNode::Meta { .. }
+            ExprNode::Bound { index } => {
+                if *index >= current.depth {
+                    return Ok(false);
+                }
+            }
+            ExprNode::Meta { .. }
             | ExprNode::Sort { .. }
             | ExprNode::Constant { .. }
             | ExprNode::StringLiteral(_) => {}
@@ -868,13 +879,27 @@ fn is_closed(
                 if limbs_le.last() == Some(&0) {
                     return Err(Halt::Fault(NatReductionFault::NonCanonicalNatLiteral {
                         input,
-                        index: current.index(),
+                        index: current.id.index(),
                     }));
                 }
             }
             ExprNode::Apply { function, argument } => {
-                push_child(&mut pending, *function, current, input, control)?;
-                push_child(&mut pending, *argument, current, input, control)?;
+                push_child(
+                    &mut pending,
+                    *function,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
+                push_child(
+                    &mut pending,
+                    *argument,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
             }
             ExprNode::Lambda {
                 binder_type, body, ..
@@ -882,18 +907,60 @@ fn is_closed(
             | ExprNode::Forall {
                 binder_type, body, ..
             } => {
-                push_child(&mut pending, *binder_type, current, input, control)?;
-                push_child(&mut pending, *body, current, input, control)?;
+                push_child(
+                    &mut pending,
+                    *binder_type,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
+                push_child(
+                    &mut pending,
+                    *body,
+                    current.depth.saturating_add(1),
+                    current.id,
+                    input,
+                    control,
+                )?;
             }
             ExprNode::Let {
                 type_, value, body, ..
             } => {
-                push_child(&mut pending, *type_, current, input, control)?;
-                push_child(&mut pending, *value, current, input, control)?;
-                push_child(&mut pending, *body, current, input, control)?;
+                push_child(
+                    &mut pending,
+                    *type_,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
+                push_child(
+                    &mut pending,
+                    *value,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
+                push_child(
+                    &mut pending,
+                    *body,
+                    current.depth.saturating_add(1),
+                    current.id,
+                    input,
+                    control,
+                )?;
             }
             ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
-                push_child(&mut pending, *expression, current, input, control)?;
+                push_child(
+                    &mut pending,
+                    *expression,
+                    current.depth,
+                    current.id,
+                    input,
+                    control,
+                )?;
             }
         }
     }

@@ -20,6 +20,7 @@ mod spine;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::environment::ReducibilityHint;
 use crate::term::{TermBudget, TermOutcome, TermStop, copy_compact_subterm_with};
 
 use crate::nat_reduce::{
@@ -1178,6 +1179,130 @@ impl SlowControl {
             .progress
             .nat_output_units
             .saturating_add(progress.output_units);
+    }
+
+    fn remaining_defeq_budget(&self) -> DefEqBudget {
+        let mut budget = self.budget;
+        budget.max_slow_comparisons = self
+            .budget
+            .max_slow_comparisons
+            .saturating_sub(self.progress.slow_comparisons);
+        budget.max_normalizations = self
+            .budget
+            .max_normalizations
+            .saturating_sub(self.progress.normalizations);
+        budget.max_materialized_arena_nodes = self
+            .budget
+            .max_materialized_arena_nodes
+            .saturating_sub(self.progress.materialized_arena_nodes);
+        budget.max_materialized_owned_units = self
+            .budget
+            .max_materialized_owned_units
+            .saturating_sub(self.progress.materialized_owned_units);
+        budget.quick.max_comparisons = self
+            .budget
+            .quick
+            .max_comparisons
+            .saturating_sub(self.progress.quick_comparisons);
+        budget.whnf.max_steps = self
+            .budget
+            .whnf
+            .max_steps
+            .saturating_sub(self.progress.whnf_steps);
+        budget.whnf.max_reductions = self
+            .budget
+            .whnf
+            .max_reductions
+            .saturating_sub(self.progress.whnf_reductions);
+        budget
+    }
+
+    fn absorb_defeq_progress(&mut self, progress: &DefEqProgress) {
+        self.progress.quick_comparisons = self
+            .progress
+            .quick_comparisons
+            .saturating_add(progress.quick_comparisons);
+        self.progress.slow_comparisons = self
+            .progress
+            .slow_comparisons
+            .saturating_add(progress.slow_comparisons);
+        self.progress.normalizations = self
+            .progress
+            .normalizations
+            .saturating_add(progress.normalizations);
+        self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(progress.whnf_steps);
+        self.progress.whnf_reductions = self
+            .progress
+            .whnf_reductions
+            .saturating_add(progress.whnf_reductions);
+        self.progress.delta_unfolds = self
+            .progress
+            .delta_unfolds
+            .saturating_add(progress.delta_unfolds);
+        self.progress.nat_offset_steps = self
+            .progress
+            .nat_offset_steps
+            .saturating_add(progress.nat_offset_steps);
+        self.progress.nat_offset_limb_steps = self
+            .progress
+            .nat_offset_limb_steps
+            .saturating_add(progress.nat_offset_limb_steps);
+        self.progress.nat_reduction_steps = self
+            .progress
+            .nat_reduction_steps
+            .saturating_add(progress.nat_reduction_steps);
+        self.progress.nat_work_items = self
+            .progress
+            .nat_work_items
+            .saturating_add(progress.nat_work_items);
+        self.progress.nat_generated_arenas = self
+            .progress
+            .nat_generated_arenas
+            .saturating_add(progress.nat_generated_arenas);
+        self.progress.nat_numeric_steps = self
+            .progress
+            .nat_numeric_steps
+            .saturating_add(progress.nat_numeric_steps);
+        self.progress.nat_numeric_materialized_limbs = self
+            .progress
+            .nat_numeric_materialized_limbs
+            .saturating_add(progress.nat_numeric_materialized_limbs);
+        self.progress.nat_reductions = self
+            .progress
+            .nat_reductions
+            .saturating_add(progress.nat_reductions);
+        self.progress.nat_output_units = self
+            .progress
+            .nat_output_units
+            .saturating_add(progress.nat_output_units);
+        self.progress.string_steps = self
+            .progress
+            .string_steps
+            .saturating_add(progress.string_steps);
+        self.progress.string_code_points = self
+            .progress
+            .string_code_points
+            .saturating_add(progress.string_code_points);
+        self.progress.string_generated_arenas = self
+            .progress
+            .string_generated_arenas
+            .saturating_add(progress.string_generated_arenas);
+        self.progress.string_arena_nodes = self
+            .progress
+            .string_arena_nodes
+            .saturating_add(progress.string_arena_nodes);
+        self.progress.string_owned_units = self
+            .progress
+            .string_owned_units
+            .saturating_add(progress.string_owned_units);
+        self.progress.materialized_arena_nodes = self
+            .progress
+            .materialized_arena_nodes
+            .saturating_add(progress.materialized_arena_nodes);
+        self.progress.materialized_owned_units = self
+            .progress
+            .materialized_owned_units
+            .saturating_add(progress.materialized_owned_units);
     }
 }
 
@@ -2438,7 +2563,8 @@ fn eta_candidate(
         let mut inside = eta_visible(child(lambda, body)?, sources, control, cancelled)?;
 
         let sources = TermSources::new(left, right, generated);
-        let has_delta_head = definition_height(inside, sources, context, control, cancelled)?.is_some();
+        let has_delta_head =
+            definition_height(inside, sources, context, control, cancelled)?.is_some();
         if has_delta_head {
             let sources = TermSources::new(left, right, generated);
             let inside_term = sources.source(inside)?;
@@ -2481,8 +2607,9 @@ fn eta_candidate(
         {
             binder_types.push(child(lambda, *binder_type)?);
         }
-        while let Some(ExprNode::Lambda { binder_type, body, .. }) =
-            sources.source(inside)?.node(inside.root)
+        while let Some(ExprNode::Lambda {
+            binder_type, body, ..
+        }) = sources.source(inside)?.node(inside.root)
         {
             binder_types.push(child(inside, *binder_type)?);
             width = width
@@ -2517,7 +2644,9 @@ fn eta_candidate(
                         } else {
                             let binder_idx = width as usize - 1 - index as usize;
                             let unit_like = if let Some(&bt) = binder_types.get(binder_idx) {
-                                unit_like_inductive_for_binder(bt, sources, context, control, cancelled)?
+                                unit_like_inductive_for_binder(
+                                    bt, sources, context, control, cancelled,
+                                )?
                             } else {
                                 None
                             };
@@ -2526,7 +2655,9 @@ fn eta_candidate(
                                 while let Some(node) = result.term.node(arg_head) {
                                     match node {
                                         ExprNode::Apply { function, .. } => arg_head = *function,
-                                        ExprNode::Metadata { expression, .. } => arg_head = *expression,
+                                        ExprNode::Metadata { expression, .. } => {
+                                            arg_head = *expression
+                                        }
                                         _ => break,
                                     }
                                 }
@@ -2957,6 +3088,166 @@ fn unresolved_pair(
     }
 }
 
+fn materialize_subterm_wire(
+    term: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<WireExpr, SlowHalt> {
+    let visible = eta_visible(term, sources, control, cancelled)?;
+    let arena = sources.source(visible)?;
+    match copy_compact_subterm_with(arena, visible.root, TermBudget::unlimited(), cancelled) {
+        TermOutcome::Complete(wire) => Ok(wire),
+        TermOutcome::Inconclusive(stop) => Err(SlowHalt::Stop(Box::new(match stop {
+            TermStop::Cancelled { polls, .. } => DefEqStop::Cancelled {
+                polls: control.polls.saturating_add(polls),
+                progress: control.progress,
+            },
+            TermStop::Resource {
+                allowed, observed, ..
+            } => DefEqStop::Resource {
+                limit: DefEqLimit::MaterializedArenaNodes,
+                allowed,
+                observed,
+                progress: control.progress,
+            },
+        }))),
+        TermOutcome::InternalFault(_) => Err(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: term.location(),
+        })),
+    }
+}
+
+/// Upstream Lean 4 / K1 equal-regular-definition shortcut:
+/// Before unfolding two applications of the SAME regular definition,
+/// check whether all arguments are definitionally equal.
+/// If all arguments are defeq, congruence proves definitional equality
+/// directly, skipping delta reduction. If argument checking fails,
+/// this returns `Ok(false)` and lazy delta continues with normal height ordering.
+fn regular_same_head_apps_def_eq(
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &[WireExpr],
+    context: &WhnfContext,
+    nat_scope: NatReductionScope,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    let sources = TermSources::new(left, right, generated);
+    let (left_head, left_args) =
+        collect_constructor_spine(left_reference, sources, control, cancelled)?;
+    if left_args.is_empty() {
+        return Ok(false);
+    }
+    let sources = TermSources::new(left, right, generated);
+    let (right_head, right_args) =
+        collect_constructor_spine(right_reference, sources, control, cancelled)?;
+    if left_args.len() != right_args.len() {
+        return Ok(false);
+    }
+
+    let sources = TermSources::new(left, right, generated);
+    let left_arena = sources.source(left_head)?;
+    let right_arena = sources.source(right_head)?;
+    let (
+        Some(ExprNode::Constant {
+            name: left_name,
+            levels: left_levels,
+        }),
+        Some(ExprNode::Constant {
+            name: right_name,
+            levels: right_levels,
+        }),
+    ) = (
+        left_arena.node(left_head.root),
+        right_arena.node(right_head.root),
+    )
+    else {
+        return Ok(false);
+    };
+
+    if left_name != right_name || left_levels.len() != right_levels.len() {
+        return Ok(false);
+    }
+
+    for (left_level, right_level) in left_levels.iter().zip(right_levels) {
+        let equal = level_roots_equal(
+            left_arena.levels(),
+            *left_level,
+            right_arena.levels(),
+            *right_level,
+        )
+        .map_err(|error| {
+            SlowHalt::Fault(DefEqFault::Universe {
+                left: left_reference.location(),
+                right: right_reference.location(),
+                error,
+            })
+        })?;
+        if !equal {
+            return Ok(false);
+        }
+    }
+
+    let is_regular = context
+        .constants()
+        .find(left_name)
+        .and_then(|constant| constant.delta_body())
+        .map(|definition| matches!(definition.hint(), ReducibilityHint::Regular(_)))
+        .unwrap_or(false);
+
+    if !is_regular {
+        return Ok(false);
+    }
+
+    for (&left_arg, &right_arg) in left_args.iter().zip(&right_args) {
+        let sources = TermSources::new(left, right, generated);
+        let left_wire = materialize_subterm_wire(left_arg, sources, control, cancelled)?;
+        let sources = TermSources::new(left, right, generated);
+        let right_wire = materialize_subterm_wire(right_arg, sources, control, cancelled)?;
+
+        let sub_budget = control.remaining_defeq_budget();
+        let outcome = def_eq_scoped_with(
+            &left_wire,
+            &right_wire,
+            context,
+            sub_budget,
+            nat_scope,
+            cancelled,
+        );
+        match outcome {
+            DefEqOutcome::Equal(progress) => {
+                control.absorb_defeq_progress(&progress);
+            }
+            DefEqOutcome::NotEqual { progress, .. } | DefEqOutcome::Deferred { progress, .. } => {
+                control.absorb_defeq_progress(&progress);
+                return Ok(false);
+            }
+            DefEqOutcome::Inconclusive(stop) => {
+                return Err(SlowHalt::Stop(Box::new(stop)));
+            }
+            DefEqOutcome::Refused {
+                side,
+                refusal,
+                progress,
+            } => {
+                return Err(SlowHalt::Refusal {
+                    side,
+                    refusal: Box::new(refusal),
+                    progress: Box::new(progress),
+                });
+            }
+            DefEqOutcome::InternalFault(fault) => {
+                return Err(SlowHalt::Fault(fault));
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 fn run_slow(
     left: &WireExpr,
     right: &WireExpr,
@@ -3298,6 +3589,21 @@ fn run_slow(
                     (Some(_), None) => (true, false),
                     (None, Some(_)) => (false, true),
                     (Some(left_height), Some(right_height)) => {
+                        if left_height == right_height
+                            && regular_same_head_apps_def_eq(
+                                left_reference,
+                                right_reference,
+                                left,
+                                right,
+                                &generated,
+                                context,
+                                nat_scope,
+                                &mut control,
+                                cancelled,
+                            )?
+                        {
+                            continue;
+                        }
                         (left_height >= right_height, right_height >= left_height)
                     }
                 };

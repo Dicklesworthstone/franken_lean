@@ -996,7 +996,14 @@ fn inspect_init_sizeof_module() {
     for c in &decoded.constants {
         if c.name().to_display_string() == "Unit.sizeOf" {
             eprintln!("Found Unit.sizeOf:");
-            eprintln!("  kind: {:?}", match c { ConstantInfo::Thm(_) => "Thm", ConstantInfo::Defn(_) => "Defn", _ => "Other" });
+            eprintln!(
+                "  kind: {:?}",
+                match c {
+                    ConstantInfo::Thm(_) => "Thm",
+                    ConstantInfo::Defn(_) => "Defn",
+                    _ => "Other",
+                }
+            );
             eprintln!("  type: {:?}", c.constant_val().type_);
             if let ConstantInfo::Thm(t) = c {
                 eprintln!("  thm value: {:?}", t.value);
@@ -1122,8 +1129,7 @@ fn inspect_init_core_module() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
     let core_base = lib.join("Init/Core.olean");
     let exported = std::fs::read(&core_base).expect("read exported Core");
-    let server =
-        std::fs::read(core_base.with_extension("olean.server")).expect("read Core server");
+    let server = std::fs::read(core_base.with_extension("olean.server")).expect("read Core server");
     let private =
         std::fs::read(core_base.with_extension("olean.private")).expect("read Core private");
 
@@ -1187,7 +1193,15 @@ fn inspect_init_control_modules() {
             fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
                 .expect("decode");
         eprintln!("=== Module {rel_path} ===");
-        eprintln!("  imports: {:?}", decoded.module.imports.iter().map(|i| i.module.to_display_string()).collect::<Vec<_>>());
+        eprintln!(
+            "  imports: {:?}",
+            decoded
+                .module
+                .imports
+                .iter()
+                .map(|i| i.module.to_display_string())
+                .collect::<Vec<_>>()
+        );
         eprintln!("  total declarations: {}", decoded.constants.len());
         let mut inducts = Vec::new();
         let mut ctors = Vec::new();
@@ -1449,7 +1463,10 @@ fn preflight_extended_12_modules_council_fast_admission() {
             env = env.add_decl(c).expect("add decl to env");
         }
     }
-    eprintln!("Preloaded 13-module base environment has {} constants", env.len());
+    eprintln!(
+        "Preloaded 13-module base environment has {} constants",
+        env.len()
+    );
 
     let mut engine = Engine::from_environment(env);
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
@@ -1473,7 +1490,10 @@ fn preflight_extended_12_modules_council_fast_admission() {
     for (name, expected_count) in candidates {
         let start = std::time::Instant::now();
         let m = load(name);
-        eprintln!("Checking candidate {name} ({} declarations)...", m.constants.len());
+        eprintln!(
+            "Checking candidate {name} ({} declarations)...",
+            m.constants.len()
+        );
         let outcome = engine
             .check_decoded_olean(m, &KVMap::new(), limits)
             .unwrap_or_else(|err| panic!("check failed for {name}: {err}"));
@@ -1545,8 +1565,10 @@ fn preflight_extended_13_modules_council_fast_admission() {
     ];
 
     let mut env = Environment::new();
-    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
-    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
     for name in &base_modules {
         set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
         let m = load(name);
@@ -1555,7 +1577,10 @@ fn preflight_extended_13_modules_council_fast_admission() {
             env = env.add_decl(c).expect("add decl to env");
         }
     }
-    eprintln!("Preloaded 25-module base environment has {} constants", env.len());
+    eprintln!(
+        "Preloaded 25-module base environment has {} constants",
+        env.len()
+    );
 
     let mut engine = Engine::from_environment(env);
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
@@ -1744,8 +1769,10 @@ fn preflight_extended_18_modules_council_fast_admission() {
     ];
 
     let mut env = Environment::new();
-    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
-    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
     for name in &base_modules {
         set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
         let m = load(name);
@@ -1754,7 +1781,10 @@ fn preflight_extended_18_modules_council_fast_admission() {
             env = env.add_decl(c).expect("add decl to env");
         }
     }
-    eprintln!("Preloaded 38-module base environment has {} constants", env.len());
+    eprintln!(
+        "Preloaded 38-module base environment has {} constants",
+        env.len()
+    );
 
     let mut engine = Engine::from_environment(env);
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
@@ -1966,8 +1996,10 @@ fn preflight_extended_3_modules_council_fast_admission() {
     ];
 
     let mut env = Environment::new();
-    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
-    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
     for name in &base_modules {
         set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
         let m = load(name);
@@ -1976,7 +2008,10 @@ fn preflight_extended_3_modules_council_fast_admission() {
             env = env.add_decl(c).expect("add decl to env");
         }
     }
-    eprintln!("Preloaded 56-module base environment has {} constants", env.len());
+    eprintln!(
+        "Preloaded 56-module base environment has {} constants",
+        env.len()
+    );
 
     let mut engine = Engine::from_environment(env);
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
@@ -2095,6 +2130,134 @@ fn preflight_extended_3_modules_council_fast_admission() {
     eprintln!(
         "ALL 3 EXTENDED MODULES ({total_new_decls} DECLARATIONS) VERIFIED THROUGH TWO-CHECKER COUNCIL!"
     );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_extended_1_module_council_fast_admission() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
+        "Init/Control/Option",
+        "Init/Data/BitVec/BasicAux",
+        "Init/Data/Int/Basic",
+        "Init/Data/List/Notation",
+        "Init/Data/Option/Instances",
+        "Init/Grind/Cases",
+        "Init/WF",
+        "Init/WFTactics",
+        "Init/MetaTypes",
+        "Init/Control/Do",
+        "Init/Data/Nat/Div/Basic",
+        "Init/Data/List/Basic",
+        "Init/Data/ByteArray/Bootstrap",
+        "Init/Data/Int/DivMod/Basic",
+        "Init/Data/List/Scan/Basic",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Nat/Bitwise/Basic",
+        "Init/Task",
+        "Init/Data/Fin/Basic",
+        "Init/Data/Int/Bitwise/Basic",
+        "Init/Grind/Config",
+    ];
+
+    let mut env = Environment::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
+    for name in &base_modules {
+        set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
+        let m = load(name);
+        for c in m.constants {
+            available_consts.insert(c.name().clone());
+            env = env.add_decl(c).expect("add decl to env");
+        }
+    }
+    eprintln!(
+        "Preloaded 59-module base environment has {} constants",
+        env.len()
+    );
+
+    let engine = Engine::from_environment(env);
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+
+    let m = load("Init/Data/UInt/BasicAux");
+    let num_decls = m.constants.len();
+    eprintln!("\n=== CANDIDATE Init/Data/UInt/BasicAux ({num_decls} declarations) ===");
+
+    for imp in &m.module.imports {
+        assert!(
+            set_of_all.contains(&imp.module),
+            "Candidate Init/Data/UInt/BasicAux imports {} which is not available!",
+            imp.module.to_display_string()
+        );
+    }
+
+    let outcome = engine
+        .check_decoded_olean(m, &KVMap::new(), limits)
+        .expect("check_decoded_olean");
+    match outcome {
+        Outcome::Complete(checked) => {
+            assert_eq!(checked.declarations.len(), 89);
+            eprintln!("Init/Data/UInt/BasicAux (89 declarations) ADMITTED IN TWO-CHECKER COUNCIL!");
+        }
+        Outcome::Inconclusive(reason) => {
+            panic!("INCONCLUSIVE for Init/Data/UInt/BasicAux: {reason:?}");
+        }
+        Outcome::InternalFault(fault) => {
+            panic!("FAULT for Init/Data/UInt/BasicAux: {fault:?}");
+        }
+    }
 }
 
 #[test]
@@ -2258,7 +2421,11 @@ fn preflight_init_bindernamehint_dependencies() {
         available.insert(c.name().clone());
     }
 
-    assert_eq!(bnh.constants.len(), 2, "Init.BinderNameHint has 2 declarations");
+    assert_eq!(
+        bnh.constants.len(),
+        2,
+        "Init.BinderNameHint has 2 declarations"
+    );
 
     let mut missing = std::collections::BTreeSet::new();
     for c in &bnh.constants {
@@ -2367,8 +2534,10 @@ fn preflight_candidate_modules() {
         }
     }
     let mut available_consts = std::collections::BTreeSet::new();
-    let mut missing_by_module: std::collections::BTreeMap<&str, std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>> =
-        std::collections::BTreeMap::new();
+    let mut missing_by_module: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>,
+    > = std::collections::BTreeMap::new();
     for name in &module_names {
         let m = load(name);
         for c in &m.constants {
@@ -2527,7 +2696,8 @@ fn scan_downstream_candidates() {
         "Init.Data.Float32",
         "Init.Data.Option.BasicAux",
     ];
-    let mut known: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut known: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
     for name in &base_modules {
         known.insert(fln_core::name::Name::from_components(name.split('.')));
     }
@@ -2566,7 +2736,9 @@ fn scan_downstream_candidates() {
         };
         let server = std::fs::read(path.with_extension("olean.server")).unwrap_or_default();
         let private = std::fs::read(path.with_extension("olean.private")).unwrap_or_default();
-        if let Ok(decoded) = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode) {
+        if let Ok(decoded) =
+            fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        {
             let mut all_imports_satisfied = true;
             let mut missing_imports = Vec::new();
             for imp in &decoded.module.imports {
@@ -2672,7 +2844,11 @@ fn preflight_candidate_38_modules() {
     for name in &candidate_modules {
         let m = load(name);
         total_decls += m.constants.len();
-        eprintln!("Checking candidate {}: {} declarations", name, m.constants.len());
+        eprintln!(
+            "Checking candidate {}: {} declarations",
+            name,
+            m.constants.len()
+        );
         for imp in &m.module.imports {
             eprintln!("  imports: {}", imp.module.to_display_string());
             assert!(
@@ -2687,8 +2863,10 @@ fn preflight_candidate_38_modules() {
         }
     }
 
-    let mut missing_by_module: std::collections::BTreeMap<&str, std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>> =
-        std::collections::BTreeMap::new();
+    let mut missing_by_module: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>,
+    > = std::collections::BTreeMap::new();
     for name in &candidate_modules {
         let m = load(name);
         for c in &m.constants {
@@ -2850,7 +3028,8 @@ fn preflight_candidate_56_modules() {
         set_of_all.insert(fln_name);
     }
 
-    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> = std::collections::BTreeMap::new();
+    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> =
+        std::collections::BTreeMap::new();
     let mut total_decls = 0;
     for name in &base_modules {
         let m = load(name);
@@ -2866,7 +3045,11 @@ fn preflight_candidate_56_modules() {
         let m = load(name);
         total_decls += m.constants.len();
         candidate_decl_counts.push((*name, m.constants.len()));
-        eprintln!("Checking candidate {}: {} declarations", name, m.constants.len());
+        eprintln!(
+            "Checking candidate {}: {} declarations",
+            name,
+            m.constants.len()
+        );
         for imp in &m.module.imports {
             eprintln!("  imports: {}", imp.module.to_display_string());
             assert!(
@@ -2893,8 +3076,10 @@ fn preflight_candidate_56_modules() {
         "No duplicate constants allowed: {duplicates:?}"
     );
 
-    let mut missing_by_module: std::collections::BTreeMap<&str, std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>> =
-        std::collections::BTreeMap::new();
+    let mut missing_by_module: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>,
+    > = std::collections::BTreeMap::new();
     for name in &candidate_modules {
         let m = load(name);
         for c in &m.constants {
@@ -3063,7 +3248,8 @@ fn preflight_candidate_59_modules() {
         set_of_all.insert(fln_name);
     }
 
-    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> = std::collections::BTreeMap::new();
+    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> =
+        std::collections::BTreeMap::new();
     let mut total_decls = 0;
     for name in &base_modules {
         let m = load(name);
@@ -3079,7 +3265,11 @@ fn preflight_candidate_59_modules() {
         let m = load(name);
         total_decls += m.constants.len();
         candidate_decl_counts.push((*name, m.constants.len()));
-        eprintln!("Checking candidate {}: {} declarations", name, m.constants.len());
+        eprintln!(
+            "Checking candidate {}: {} declarations",
+            name,
+            m.constants.len()
+        );
         for imp in &m.module.imports {
             eprintln!("  imports: {}", imp.module.to_display_string());
             assert!(
@@ -3106,8 +3296,10 @@ fn preflight_candidate_59_modules() {
         "No duplicate constants allowed: {duplicates:?}"
     );
 
-    let mut missing_by_module: std::collections::BTreeMap<&str, std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>> =
-        std::collections::BTreeMap::new();
+    let mut missing_by_module: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>,
+    > = std::collections::BTreeMap::new();
     for name in &candidate_modules {
         let m = load(name);
         for c in &m.constants {
@@ -3190,6 +3382,210 @@ fn preflight_candidate_59_modules() {
 }
 
 #[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_candidate_60_modules() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
+        "Init/Control/Option",
+        "Init/Data/BitVec/BasicAux",
+        "Init/Data/Int/Basic",
+        "Init/Data/List/Notation",
+        "Init/Data/Option/Instances",
+        "Init/Grind/Cases",
+        "Init/WF",
+        "Init/WFTactics",
+        "Init/MetaTypes",
+        "Init/Control/Do",
+        "Init/Data/Nat/Div/Basic",
+        "Init/Data/List/Basic",
+        "Init/Data/ByteArray/Bootstrap",
+        "Init/Data/Int/DivMod/Basic",
+        "Init/Data/List/Scan/Basic",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Nat/Bitwise/Basic",
+        "Init/Task",
+        "Init/Data/Fin/Basic",
+        "Init/Data/Int/Bitwise/Basic",
+        "Init/Grind/Config",
+    ];
+
+    let candidate_modules = ["Init/Data/UInt/BasicAux"];
+
+    let mut set_of_all = std::collections::BTreeSet::new();
+    for name in base_modules.iter().chain(candidate_modules.iter()) {
+        let fln_name = fln_core::name::Name::from_components(name.split('/'));
+        set_of_all.insert(fln_name);
+    }
+
+    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> =
+        std::collections::BTreeMap::new();
+    let mut total_decls = 0;
+    for name in &base_modules {
+        let m = load(name);
+        total_decls += m.constants.len();
+        for c in &m.constants {
+            available_consts.insert(c.name().clone(), *name);
+        }
+    }
+
+    let mut candidate_decl_counts = Vec::new();
+    let mut duplicates = Vec::new();
+    for name in &candidate_modules {
+        let m = load(name);
+        total_decls += m.constants.len();
+        candidate_decl_counts.push((*name, m.constants.len()));
+        eprintln!(
+            "Checking candidate {}: {} declarations",
+            name,
+            m.constants.len()
+        );
+        for imp in &m.module.imports {
+            eprintln!("  imports: {}", imp.module.to_display_string());
+            assert!(
+                set_of_all.contains(&imp.module),
+                "Candidate {} imports {} which is not available!",
+                name,
+                imp.module.to_display_string()
+            );
+        }
+        for c in &m.constants {
+            if let Some(prev_mod) = available_consts.get(c.name()) {
+                eprintln!(
+                    "DUPLICATE CONSTANT in {name}: {} (previously in {})",
+                    c.name().to_display_string(),
+                    prev_mod
+                );
+                duplicates.push((*name, c.name().to_display_string(), *prev_mod));
+            }
+            available_consts.insert(c.name().clone(), *name);
+        }
+    }
+    assert!(
+        duplicates.is_empty(),
+        "No duplicate constants allowed: {duplicates:?}"
+    );
+
+    let mut missing_by_module: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>,
+    > = std::collections::BTreeMap::new();
+    for name in &candidate_modules {
+        let m = load(name);
+        for c in &m.constants {
+            let mut exprs = vec![c.constant_val().type_.clone()];
+            match c {
+                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+                _ => {}
+            }
+            for e in exprs {
+                let mut stack = vec![e];
+                while let Some(cur) = stack.pop() {
+                    match cur.node() {
+                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
+                            if !available_consts.contains_key(cname) {
+                                missing_by_module
+                                    .entry(*name)
+                                    .or_default()
+                                    .insert((c.name().clone(), cname.clone()));
+                            }
+                        }
+                        fln_core::expr::ExprNode::App { f, a } => {
+                            stack.push(f.clone());
+                            stack.push(a.clone());
+                        }
+                        fln_core::expr::ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | fln_core::expr::ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            stack.push(binder_type.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            stack.push(type_.clone());
+                            stack.push(value.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::Proj { expr, .. } => {
+                            stack.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        missing_by_module.is_empty(),
+        "No candidates should have missing constant references!"
+    );
+
+    for (name, count) in candidate_decl_counts {
+        eprintln!("  {name}: {count}");
+    }
+    assert_eq!(total_decls, 8485);
+    eprintln!(
+        "ALL 60 CANDIDATE MODULES HAVE STRICTLY SATISFIED IMPORTS AND ZERO MISSING CONSTANTS! (Total declarations: {total_decls})"
+    );
+}
+
+#[test]
 fn diagnose_candidate_modules() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
@@ -3267,7 +3663,8 @@ fn diagnose_candidate_modules() {
     ];
 
     let mut env = Environment::new();
-    let mut available: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut available: std::collections::BTreeSet<fln_core::name::Name> =
+        std::collections::BTreeSet::new();
     for name in &base_modules {
         let m = load(name);
         for c in m.constants {
@@ -3275,135 +3672,32 @@ fn diagnose_candidate_modules() {
             env = env.add_decl(c).expect("add decl to env");
         }
     }
-    eprintln!("Preloaded 59-module base environment has {} constants", env.len());
+    eprintln!(
+        "Preloaded 59-module base environment has {} constants",
+        env.len()
+    );
 
     let m = load("Init/Data/UInt/BasicAux");
-    eprintln!("Init/Data/UInt/BasicAux has {} declarations", m.constants.len());
+    eprintln!(
+        "Init/Data/UInt/BasicAux has {} declarations",
+        m.constants.len()
+    );
 
-    let mut engine = Engine::from_environment(env.clone());
+    let engine = Engine::from_environment(env);
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
-    let mut remaining = m.constants.clone();
-    let mut step = 0;
-    while !remaining.is_empty() {
-        let idx = remaining.iter().position(|c| {
-            let mut exprs = vec![c.constant_val().type_.clone()];
-            match c {
-                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
-                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
-                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
-                _ => {}
-            }
-            let mut ok = true;
-            for e in exprs {
-                let mut stack = vec![e];
-                while let Some(cur) = stack.pop() {
-                    match cur.node() {
-                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
-                            if !available.contains(cname) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        fln_core::expr::ExprNode::App { f, a } => {
-                            stack.push(f.clone());
-                            stack.push(a.clone());
-                        }
-                        fln_core::expr::ExprNode::Lam {
-                            binder_type, body, ..
-                        }
-                        | fln_core::expr::ExprNode::ForallE {
-                            binder_type, body, ..
-                        } => {
-                            stack.push(binder_type.clone());
-                            stack.push(body.clone());
-                        }
-                        fln_core::expr::ExprNode::LetE {
-                            type_, value, body, ..
-                        } => {
-                            stack.push(type_.clone());
-                            stack.push(value.clone());
-                            stack.push(body.clone());
-                        }
-                        fln_core::expr::ExprNode::Proj { expr, .. } => {
-                            stack.push(expr.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                if !ok {
-                    break;
-                }
-            }
-            ok
-        });
-
-        let Some(pos) = idx else {
-            eprintln!("Cannot find next ready constant among {} remaining:", remaining.len());
-            for rem in &remaining {
-                eprintln!("  - {}", rem.name().to_display_string());
-            }
-            panic!("Deadlock in dependency resolution");
-        };
-
-        let c = remaining.remove(pos);
-        step += 1;
-        if c.name().to_display_string() != "UInt32.lt_ofNatLT_of_lt" {
-            let next_env = engine.environment().add_decl(c.clone()).unwrap_or_else(|e| panic!("failed to add {}: {e:?}", c.name().to_display_string()));
-            engine = Engine::from_environment(next_env);
-            available.insert(c.name().clone());
-            continue;
+    let outcome = engine
+        .check_decoded_olean(m, &KVMap::new(), limits)
+        .expect("check_decoded_olean");
+    match outcome {
+        Outcome::Complete(checked) => {
+            assert_eq!(checked.declarations.len(), 89);
+            eprintln!(
+                "ALL 89 DECLARATIONS OF Init/Data/UInt/BasicAux ADMITTED IN A SINGLE OLEAN CHECK!"
+            );
         }
-
-        eprintln!("Step {step}/89: REACHED TARGET DECLARATION: {}", c.name().to_display_string());
-        eprintln!("  kind: {:?}", match &c {
-            ConstantInfo::Thm(_) => "Theorem",
-            ConstantInfo::Defn(_) => "Definition",
-            ConstantInfo::Axiom(_) => "Axiom",
-            ConstantInfo::Opaque(_) => "Opaque",
-            ConstantInfo::Ctor(_) => "Constructor",
-            ConstantInfo::Induct(_) => "Inductive",
-            ConstantInfo::Rec(_) => "Recursor",
-            ConstantInfo::Quot(_) => "Quotient",
-        });
-        eprintln!("  type: {:?}", c.constant_val().type_);
-        if let ConstantInfo::Thm(thm) = &c {
-            eprintln!("  thm value: {:?}", thm.value);
-        } else if let ConstantInfo::Defn(dfn) = &c {
-            eprintln!("  dfn value: {:?}", dfn.value);
-        }
-
-        eprintln!("Testing K1 (fln-kernel) admission...");
-        let k1_env = engine.environment().clone();
-        let k1_res = k1_env.add_decl(c.clone());
-        eprintln!("K1 result: {:?}", k1_res.is_ok());
-
-        eprintln!("Testing fln-checker admission in thread with 128MB stack...");
-        let c_clone = c.clone();
-        let checker_handle = std::thread::Builder::new()
-            .name("checker-test".to_string())
-            .stack_size(128 * 1024 * 1024)
-            .spawn(move || {
-                let mut single_decoded = m.clone();
-                single_decoded.constants = vec![c_clone];
-                engine.check_decoded_olean(single_decoded, &KVMap::new(), limits)
-            })
-            .unwrap();
-        let res = checker_handle.join();
-        eprintln!("Thread with 128MB stack joined: {:?}", res.is_ok());
-        match res {
-            Ok(Ok(Outcome::Complete(_))) => eprintln!("128MB thread: COMPLETE!"),
-            Ok(Ok(Outcome::Inconclusive(r))) => eprintln!("128MB thread: INCONCLUSIVE: {r:?}"),
-            Ok(Ok(Outcome::InternalFault(f))) => eprintln!("128MB thread: FAULT: {f:?}"),
-            Ok(Err(e)) => eprintln!("128MB thread: ERROR: {e:?}"),
-            Err(_) => eprintln!("128MB thread: PANIC / ABORT"),
-        }
-        return;
+        other => panic!("Unexpected outcome for Init/Data/UInt/BasicAux: {other:?}"),
     }
 }
-
-
-
-
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init 5-module companion chain"]
@@ -3679,8 +3973,8 @@ fn pinned_init_prelude_coe_notation_tactics_bindernamehint_council_run() {
     let bnh_exported = std::fs::read(&bnh_base).expect("read exported BinderNameHint");
     let bnh_server =
         std::fs::read(bnh_base.with_extension("olean.server")).expect("read BinderNameHint server");
-    let bnh_private =
-        std::fs::read(bnh_base.with_extension("olean.private")).expect("read BinderNameHint private");
+    let bnh_private = std::fs::read(bnh_base.with_extension("olean.private"))
+        .expect("read BinderNameHint private");
 
     let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
     let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
@@ -3804,8 +4098,8 @@ fn pinned_init_prelude_coe_notation_tactics_sizeof_core_bindernamehint_council_r
     let bnh_exported = std::fs::read(&bnh_base).expect("read exported BinderNameHint");
     let bnh_server =
         std::fs::read(bnh_base.with_extension("olean.server")).expect("read BinderNameHint server");
-    let bnh_private =
-        std::fs::read(bnh_base.with_extension("olean.private")).expect("read BinderNameHint private");
+    let bnh_private = std::fs::read(bnh_base.with_extension("olean.private"))
+        .expect("read BinderNameHint private");
 
     let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
     let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
@@ -4108,7 +4402,8 @@ fn pinned_extended_25_module_companion_chain_council_run() {
     let exc_name = fln_core::name::Name::from_components(["Init", "Control", "Except"]);
     let rdr_name = fln_core::name::Name::from_components(["Init", "Control", "Reader"]);
     let st_name = fln_core::name::Name::from_components(["Init", "Control", "State"]);
-    let mlb_name = fln_core::name::Name::from_components(["Init", "Control", "Lawful", "MonadLift", "Basic"]);
+    let mlb_name =
+        fln_core::name::Name::from_components(["Init", "Control", "Lawful", "MonadLift", "Basic"]);
     let plift_name = fln_core::name::Name::from_components(["Init", "Data", "PLift"]);
     let ulift_name = fln_core::name::Name::from_components(["Init", "Data", "ULift"]);
     let zero_name = fln_core::name::Name::from_components(["Init", "Data", "Zero"]);
@@ -4391,7 +4686,8 @@ fn pinned_extended_38_module_companion_chain_council_run() {
     let exc_name = fln_core::name::Name::from_components(["Init", "Control", "Except"]);
     let rdr_name = fln_core::name::Name::from_components(["Init", "Control", "Reader"]);
     let st_name = fln_core::name::Name::from_components(["Init", "Control", "State"]);
-    let mlb_name = fln_core::name::Name::from_components(["Init", "Control", "Lawful", "MonadLift", "Basic"]);
+    let mlb_name =
+        fln_core::name::Name::from_components(["Init", "Control", "Lawful", "MonadLift", "Basic"]);
     let plift_name = fln_core::name::Name::from_components(["Init", "Data", "PLift"]);
     let ulift_name = fln_core::name::Name::from_components(["Init", "Data", "ULift"]);
     let zero_name = fln_core::name::Name::from_components(["Init", "Data", "Zero"]);
@@ -4714,8 +5010,8 @@ fn pinned_extended_38_module_companion_chain_council_run() {
 }
 
 #[test]
-#[ignore = "requires the pinned Lean v4.32.0 Init 59-module companion chain"]
-fn pinned_extended_59_module_companion_chain_council_run() {
+#[ignore = "requires the pinned Lean v4.32.0 Init 60-module companion chain"]
+fn pinned_extended_60_module_companion_chain_council_run() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
     let load_module = |rel_path: &str| {
@@ -4726,7 +5022,7 @@ fn pinned_extended_59_module_companion_chain_council_run() {
         (exported, server, private)
     };
 
-    let module_specs: [(&str, usize); 59] = [
+    let module_specs: [(&str, usize); 60] = [
         ("Init/Prelude", 2314),
         ("Init/Coe", 158),
         ("Init/Notation", 284),
@@ -4786,6 +5082,7 @@ fn pinned_extended_59_module_companion_chain_council_run() {
         ("Init/Data/Fin/Basic", 90),
         ("Init/Data/Int/Bitwise/Basic", 8),
         ("Init/Grind/Config", 476),
+        ("Init/Data/UInt/BasicAux", 89),
     ];
 
     let raw_modules: Vec<(fln_core::name::Name, Vec<u8>, Vec<u8>, Vec<u8>)> = module_specs
@@ -4820,7 +5117,7 @@ fn pinned_extended_59_module_companion_chain_council_run() {
                     m.declarations.len()
                 );
             }
-            assert_eq!(checked.modules.len(), 59);
+            assert_eq!(checked.modules.len(), 60);
             let mut total_verified = 0;
             let checked_map: std::collections::BTreeMap<fln_core::name::Name, usize> = checked
                 .modules
@@ -4832,11 +5129,16 @@ fn pinned_extended_59_module_companion_chain_council_run() {
                 let actual_count = checked_map.get(&expected_name).unwrap_or_else(|| {
                     panic!("Missing checked module {expected_path}");
                 });
-                assert_eq!(*actual_count, *expected_count, "Mismatch for module {expected_path}");
+                assert_eq!(
+                    *actual_count, *expected_count,
+                    "Mismatch for module {expected_path}"
+                );
                 total_verified += *actual_count;
             }
-            assert_eq!(total_verified, 8396);
-            eprintln!("ALL 59 MODULES ({total_verified} DECLARATIONS) FULLY VERIFIED IN PARALLEL COUNCIL!");
+            assert_eq!(total_verified, 8485);
+            eprintln!(
+                "ALL 60 MODULES ({total_verified} DECLARATIONS) FULLY VERIFIED IN PARALLEL COUNCIL!"
+            );
         }
         Ok(Outcome::Inconclusive(reason)) => {
             panic!("INCONCLUSIVE: {reason:?}");
@@ -4849,9 +5151,3 @@ fn pinned_extended_59_module_companion_chain_council_run() {
         }
     }
 }
-
-
-
-
-
-

@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":482,"projection_hash":"fb23c25ed471da54166d2ac1ee6ae4e9a707e22f856043029f57fd959c0b3c71"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":483,"projection_hash":"143a5737f45405c6b6ea28c2742db9728f17d3cacfbdbf9562a596e179bf8508"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -102,6 +102,7 @@
 {"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-fixture-retention-unbounded-evit"}
+{"id":"fln-fln-extended-60-modules-council-8485-27jb"}
 {"id":"fln-fur"}
 {"id":"fln-g6d1"}
 {"id":"fln-giap"}
