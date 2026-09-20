@@ -788,8 +788,7 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        enum Task<'a> {
-            DoAction(&'a [Syntax], Option<Expr>),
+        enum Task<'a> {            DoAction(&'a [Syntax], Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -817,6 +816,7 @@ impl Context {
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(local_functions::Build<'a>),
+            LocalFunctionStart(local_functions::Build<'a>, Option<usize>),
             LocalFunctionValue(local_functions::Build<'a>),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool),
@@ -863,7 +863,11 @@ impl Context {
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
         let mut values: Vec<Typed> = Vec::new();
-        let mut attempts: Vec<tactics::backtrack::Checkpoint<'_>> = Vec::new();
+        enum Attempt<'a> {
+            Proof(tactics::backtrack::Checkpoint<'a>),
+            LocalFunction(Box<local_functions::Checkpoint<'a>>),
+        }
+        let mut attempts: Vec<Attempt<'_>> = Vec::new();
         loop {
             let result = (|| {
                 while let Some(task) = tasks.pop() {
@@ -1117,10 +1121,12 @@ impl Context {
                                 }
                                 if kind == &parser_kind(&["Term", "let"])
                                     || kind == &parser_kind(&["Term", "have"])
+                                    || kind == &parser_kind(&["Term", "letrec"])
                                 {
                                     let opaque = kind == &parser_kind(&["Term", "have"]);
-                                    let binding = self.let_parts(args, opaque)?;
-                                    if !expect_null_args(
+                                    let recursive = kind == &parser_kind(&["Term", "letrec"]);
+                                    let binding = self.let_parts(args, opaque, recursive)?;
+                                    if recursive || !expect_null_args(
                                         binding.parameters,
                                         "local function parameters",
                                     )?
@@ -1395,14 +1401,16 @@ impl Context {
                                     values.len(),
                                 );
                                 let branch = checkpoint.begin(self, attempts.len())?;
-                                attempts.push(checkpoint);
+                                attempts.push(Attempt::Proof(checkpoint));
                                 tasks.push(Task::Proof(branch));
                             }
                             tactics::ProofAction::AttemptComplete(index) => {
                                 if index + 1 != attempts.len() {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
-                                let checkpoint = attempts.pop().expect("checked attempt index");
+                                let Some(Attempt::Proof(checkpoint)) = attempts.pop() else {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                };
                                 if checkpoint.tasks != tasks.len()
                                     || checkpoint.values != values.len()
                                 {
@@ -1411,7 +1419,7 @@ impl Context {
                                 checkpoint.finish(self, &mut proof);
                                 if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
                                     proof = next.begin(self, attempts.len())?;
-                                    attempts.push(next);
+                                    attempts.push(Attempt::Proof(next));
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
@@ -1739,13 +1747,40 @@ impl Context {
                             let annotation = values.pop().expect("local function annotation visit");
                             self.sort_level(&annotation)?;
                             build.result_type = Some(annotation.value.clone());
-                            let value = build.binding.value;
+                            if build.binding.recursive {
+                                let mut checkpoint = local_functions::Checkpoint::new(
+                                    self, build, tasks.len(), values.len(),
+                                )?;
+                                let (build, column) = checkpoint.begin(attempts.len());
+                                attempts.push(Attempt::LocalFunction(Box::new(checkpoint)));
+                                tasks.push(Task::LocalFunctionStart(build, column));
+                            } else {
+                                let value = build.binding.value;
+                                tasks.push(Task::LocalFunctionValue(build));
+                                tasks.push(Task::Visit(value, Some(annotation.value), true));
+                            }
+                        }
+                        Task::LocalFunctionStart(mut build, column) => {
+                            self.start_local_function_value(&mut build, column)?;
+                            let value = build.value_syntax;
+                            let expected = build.result_type.clone();
                             tasks.push(Task::LocalFunctionValue(build));
-                            tasks.push(Task::Visit(value, Some(annotation.value), true));
+                            tasks.push(Task::Visit(value, expected, true));
                         }
                         Task::LocalFunctionValue(build) => {
                             let value = values.pop().expect("local function value visit");
                             let value = self.close_local_function(&build, value)?;
+                            if let Some(index) = build.checkpoint {
+                                if index + 1 != attempts.len() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                let Some(Attempt::LocalFunction(checkpoint)) = attempts.pop() else {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                };
+                                if checkpoint.tasks != tasks.len() || checkpoint.values != values.len() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                            }
                             values.push(value);
                             tasks.push(Task::LetValue(
                                 build.binding.name,
@@ -1841,22 +1876,38 @@ impl Context {
                         return Err(problem);
                     }
                     loop {
-                        let Some(mut checkpoint) = attempts.pop() else {
+                        let Some(attempt) = attempts.pop() else {
                             return Err(problem);
                         };
-                        tasks.truncate(checkpoint.tasks);
-                        values.truncate(checkpoint.values);
-                        checkpoint.restore(self);
-                        self.tick()?;
-                        if checkpoint.retry() {
-                            let proof = checkpoint.begin(self, attempts.len())?;
-                            attempts.push(checkpoint);
-                            tasks.push(Task::Proof(proof));
-                            break;
-                        }
-                        if checkpoint.optional() {
-                            tasks.push(Task::Proof(checkpoint.original()));
-                            break;
+                        match attempt {
+                            Attempt::LocalFunction(mut checkpoint) => {
+                                tasks.truncate(checkpoint.tasks);
+                                values.truncate(checkpoint.values);
+                                checkpoint.restore(self);
+                                self.tick()?;
+                                if local_functions::retryable(&problem) && checkpoint.retry() {
+                                    let (build, column) = checkpoint.begin(attempts.len());
+                                    attempts.push(Attempt::LocalFunction(checkpoint));
+                                    tasks.push(Task::LocalFunctionStart(build, column));
+                                    break;
+                                }
+                            }
+                            Attempt::Proof(mut checkpoint) => {
+                                tasks.truncate(checkpoint.tasks);
+                                values.truncate(checkpoint.values);
+                                checkpoint.restore(self);
+                                self.tick()?;
+                                if checkpoint.retry() {
+                                    let proof = checkpoint.begin(self, attempts.len())?;
+                                    attempts.push(Attempt::Proof(checkpoint));
+                                    tasks.push(Task::Proof(proof));
+                                    break;
+                                }
+                                if checkpoint.optional() {
+                                    tasks.push(Task::Proof(checkpoint.original()));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1927,22 +1978,64 @@ impl Context {
         &mut self,
         parts: &'a [Syntax],
         opaque: bool,
+        recursive: bool,
     ) -> Result<local_functions::Binding<'a>, NatDefinitionElabError> {
-        let [keyword, config, declaration, separator, body] = parts else {
-            return Err(failure(SourceInferenceError::Scope));
+        let (declaration, separator, body) = if recursive {
+            let [keywords, declarations, separator, body] = parts else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            let [keyword, rec] = expect_null_args(keywords, "let rec keywords")? else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            expect_atom(keyword, "let", "recursive local keyword")?;
+            expect_atom(rec, "rec", "recursive local keyword")?;
+            let declarations = expect_node(
+                declarations,
+                &parser_kind(&["Term", "letRecDecls"]),
+                1,
+                "local recursive group",
+            )?;
+            let [declaration] =
+                expect_null_args(&declarations[0], "single local recursive definition")?
+            else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            let declaration = expect_node(
+                declaration,
+                &parser_kind(&["Term", "letRecDecl"]),
+                4,
+                "local recursive definition",
+            )?;
+            expect_empty_null(&declaration[0], "absent local doc comment")?;
+            expect_empty_null(&declaration[1], "absent local attributes")?;
+            let termination = expect_node(
+                &declaration[3],
+                &parser_kind(&["Termination", "suffix"]),
+                2,
+                "local termination suffix",
+            )?;
+            for part in termination {
+                expect_empty_null(part, "absent local termination annotation")?;
+            }
+            (&declaration[2], separator, body)
+        } else {
+            let [keyword, config, declaration, separator, body] = parts else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            expect_atom(
+                keyword,
+                if opaque { "have" } else { "let" },
+                "local binding keyword",
+            )?;
+            let config = expect_node(
+                config,
+                &parser_kind(&["Term", "letConfig"]),
+                1,
+                "let config",
+            )?;
+            expect_empty_null(&config[0], "empty let config")?;
+            (declaration, separator, body)
         };
-        expect_atom(
-            keyword,
-            if opaque { "have" } else { "let" },
-            "local binding keyword",
-        )?;
-        let config = expect_node(
-            config,
-            &parser_kind(&["Term", "letConfig"]),
-            1,
-            "let config",
-        )?;
-        expect_empty_null(&config[0], "empty let config")?;
         let wrapper = expect_node(
             declaration,
             &parser_kind(&["Term", "letDecl"]),
@@ -1984,14 +2077,15 @@ impl Context {
         expect_null_args(&declaration[1], "local function parameters")?;
         let annotation = optional_type_syntax(&declaration[2])?;
         expect_atom(&declaration[3], ":=", "let assignment")?;
-        if opaque && separator.kind() == Some(&Name::from_components(["null"])) {
-            expect_empty_null(separator, "assertion linebreak")?;
+        if separator.kind() == Some(&Name::from_components(["null"])) {
+            expect_empty_null(separator, "local declaration linebreak")?;
         } else {
             expect_atom(separator, ";", "let separator")?;
         }
         Ok(local_functions::Binding {
             name,
             opaque,
+            recursive,
             parameters: &declaration[1],
             annotation,
             value: &declaration[4],

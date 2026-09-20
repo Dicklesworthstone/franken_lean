@@ -423,26 +423,39 @@ fn type_positions_allow_later_header_constraints_before_resolving_instances() {
 }
 
 #[test]
-fn type_positions_preserve_supported_let_scope_and_refuse_nested_let_syntax() {
+fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionaries() {
     let base = check(
         &engine(),
         "class Factory where\n  carrier : Type\n  produce : carrier",
     )
     .engine;
     let root = base.logical_root(&KVMap::new());
-    // Nested lets remain outside the source parser's bounded grammar. Keep
-    // that refusal distinct from elaboration and dictionary-scope failures.
-    let source = b"def bad (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x";
-    let error = base
-        .check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits()))
-        .unwrap_err();
-    assert!(
-        matches!(&error, fln::SourceCheckError::Command { error, .. }
-        if matches!(error.as_ref(), fln::EngineExecutionError::Frontend(
-            fln_elab::NatDefinitionFrontendError::Parse(_)
-        ))),
-        "{error:?}"
+    // Parenthesized locals are now real source terms. Their dictionaries may
+    // determine the annotation, but must leave scope before later annotations
+    // or the body. Do not retain the old parser-refusal expectation as a gate.
+    check(
+        &base,
+        "def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\n\
+         theorem computes : nested 8 = 8 := by rfl\n\
+         def recursiveType (x : (let rec ty (n : Nat) : Type := match n with | .zero => Nat | .succ k => ty k; ty 2)) : Nat := x\n\
+         theorem recursive_computes : recursiveType 9 = 9 := by rfl",
     );
+    for source in [
+        "def bad (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Factory.carrier := x",
+        "def bad (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := d.produce",
+        "def bad (x : (let d : Factory := { carrier := Nat, produce := true }; Factory.carrier)) : Nat := x",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
     assert_eq!(base.logical_root(&KVMap::new()), root);
     assert!(!base.environment().contains(&Name::from_components(["bad"])));
     check(

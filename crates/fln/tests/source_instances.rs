@@ -318,7 +318,10 @@ fn named_instance_syntax_is_canonical_and_lossless_and_bounded() {
                 .is_some()
         );
         assert!(fln_parse::parse_nat_definition(source.as_bytes()).is_err());
-        assert!(fln_parse::parse_source_command(source.as_bytes()).is_err());
+        let command = fln_parse::parse_source_command(source.as_bytes()).unwrap();
+        assert_eq!(command.kind(), fln_parse::SourceCommandKind::Definition);
+        assert_eq!(command.syntax(), parsed.syntax());
+        assert!(command.query_term_normalized().is_none());
     }
     for source in [
         "instance : Inhabited Nat := Inhabited.mk 1",

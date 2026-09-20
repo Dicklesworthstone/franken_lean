@@ -222,7 +222,7 @@ impl Context {
                 alternatives,
             ],
         );
-        let body = self.compile_pattern_matrix(&body, required, false)?;
+        let body = self.compile_pattern_matrix(&body, required, None)?;
         Ok(Syntax::node(
             parser_kind(&["Term", "fun"]),
             vec![
@@ -359,14 +359,9 @@ impl Context {
         &mut self,
         syntax: &Syntax,
         required: &mut Vec<Name>,
-        recursive_root: bool,
+        recursive_column: Option<usize>,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        if recursive_root {
-            self.recursion
-                .as_mut()
-                .expect("recursive matrix root")
-                .matrix = true;
-        }
+        let recursive_root = recursive_column.is_some();
         let parts = expect_node(
             syntax,
             &parser_kind(&["Term", "match"]),
@@ -442,11 +437,7 @@ impl Context {
         }
         // Structural selection changes the decision-tree split, not argument
         // order or row priority. Original inputs retain their checked bindings.
-        let root_column = if recursive_root {
-            self.recursion.as_ref().expect("recursive matrix").column
-        } else {
-            0
-        };
+        let root_column = recursive_column.unwrap_or(0);
         if root_column != 0 {
             if root_column >= subjects.len() {
                 return Err(invalid());
@@ -765,13 +756,26 @@ impl Context {
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
         let mut scan = vec![syntax];
         let mut needed = false;
+        let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
+            if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) {
+                continue;
+            }
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
                 || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
+                if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
+                    let binding = self.let_parts(args, false, true)?;
+                    let mut root = binding.value;
+                    while let Some(inner) = parenthesized_inner(root)? {
+                        self.tick()?;
+                        root = inner;
+                    }
+                    local_roots.insert(std::ptr::from_ref(root));
+                }
                 scan.extend(args);
             }
         }
@@ -793,6 +797,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
+                Task::Visit(node, _) if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) => {
+                    built.push(self.copy_pattern_syntax(node)?);
+                }
                 Task::Visit(node @ Syntax::Node { kind, args, .. }, pattern) => {
                     tasks.push(Task::Node(node, built.len(), pattern));
                     for (index, argument) in args.iter().enumerate().rev() {
@@ -815,14 +822,30 @@ impl Context {
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let mut required = Vec::new();
-                    let node = if pattern_function(&node) {
+                    let node = if local_roots.contains(&std::ptr::from_ref(original))
+                        && complex(&node, &self.txn.env)
+                    {
+                        // Keep all bodies inside this owned syntax tree. The
+                        // term driver can borrow and retry them on its heap
+                        // worklist, without recursive host calls or leaking an
+                        // arena. Header identities and typing are resolved only
+                        // when the local definition is actually elaborated.
+                        self.local_recursive_matrices(node)?
+                    } else if pattern_function(&node) {
                         self.compile_pattern_function(node, &mut required)?
                     } else if complex(&node, &self.txn.env) {
+                        let column = if std::ptr::eq(original, root) {
+                            self.recursion.as_mut().filter(|r| r.pending).map(|r| {
+                                r.matrix = true;
+                                r.column
+                            })
+                        } else {
+                            None
+                        };
                         self.compile_pattern_matrix(
                             &node,
                             &mut required,
-                            std::ptr::eq(original, root)
-                                && self.recursion.as_ref().is_some_and(|r| r.pending),
+                            column,
                         )?
                     } else {
                         node
@@ -842,5 +865,48 @@ impl Context {
             }
         }
         Ok(Cow::Owned(built.pop().expect("rewritten root")))
+    }
+
+    /// The original matrix, ordinary decision tree, then one tree per possible
+    /// root column. Trees are only candidate syntax: each selected body still
+    /// passes the ordinary coverage, termination, type, and kernel checks.
+    /// An impossible structural split is retained as a missing candidate, not
+    /// turned into a failure in an unchosen tactic branch.
+    fn local_recursive_matrices(&mut self, node: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+        let parts = expect_node(
+            &node,
+            &parser_kind(&["Term", "match"]),
+            6,
+            "local recursive matrix",
+        )?;
+        let discriminants = expect_null_args(&parts[3], "local recursive discriminants")?;
+        let columns = discriminants.len().div_ceil(2);
+        let mut bodies = vec![self.copy_pattern_syntax(&node)?];
+        for column in std::iter::once(None).chain((0..columns).map(Some)) {
+            self.tick()?;
+            let mut required = Vec::new();
+            let body = match self.compile_pattern_matrix(&node, &mut required, column) {
+                Ok(body) => body,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                    recursion::RecursionError::RootMatchRequired,
+                ))) if column.is_some() => {
+                    bodies.push(Syntax::Missing);
+                    continue;
+                }
+                Err(problem) => return Err(problem),
+            };
+            bodies.push(if required.is_empty() {
+                body
+            } else {
+                Syntax::node(
+                    parser_kind(&["Term", "matrixScope"]),
+                    vec![null(required.into_iter().map(identifier).collect()), body],
+                )
+            });
+        }
+        Ok(Syntax::node(
+            parser_kind(&["Term", "localRecValue"]),
+            bodies,
+        ))
     }
 }

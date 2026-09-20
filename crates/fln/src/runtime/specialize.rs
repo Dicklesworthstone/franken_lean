@@ -264,6 +264,14 @@ impl Preparation<'_> {
         } = body.node()
         {
             self.tick()?;
+            let depth = binders.len().saturating_add(1);
+            if depth > self.limits.max_context_depth {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ContextDepth,
+                    limit: self.limits.max_context_depth,
+                    observed: depth,
+                });
+            }
             reserve(&mut binders, self.limits.max_context_depth)?;
             binders.push((
                 binder_name.clone(),

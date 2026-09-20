@@ -53,6 +53,81 @@ fn file(text: &str) -> PathBuf {
 fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
     fln_cli::run(args)
 }
+
+#[test]
+fn installed_local_recursion_checks_runs_and_replays_without_partial_publication() {
+    let text = include_str!("../../../examples/native_local_recursion.lean");
+    let source = file(text);
+    let checked = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{:?}", checked);
+    assert!(checked.stderr.is_empty());
+    let json = String::from_utf8(checked.stdout).unwrap();
+    for expected in ["\"theorems\":1", "\"executed\":false", "\"authority\":true"] {
+        assert!(json.contains(expected), "{json}");
+    }
+
+    let program = format!("{text}\n#eval answer\n");
+    std::fs::write(&source, &program).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n");
+
+    let artifact = source.with_extension("flbc");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    let json = String::from_utf8(output.stdout).unwrap();
+    assert!(json.contains("\"finalValue\":42"), "{json}");
+    let retained = std::fs::read(&artifact).unwrap();
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&artifact)
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{:?}", replay);
+    assert!(replay.stderr.is_empty());
+    let json = String::from_utf8(replay.stdout).unwrap();
+    assert!(json.contains("\"returnValue\":42"), "{json}");
+
+    std::fs::write(
+        &source,
+        format!("{program}\ndef bad : Nat := let rec go (n : Nat) : Nat := match n with | .zero => 0 | .succ k => go n; 42"),
+    ).unwrap();
+    let failed = source.with_extension("failed.flbc");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&failed)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(!failed.exists());
+    assert_eq!(std::fs::read(&artifact).unwrap(), retained);
+
+    std::fs::write(&source, text).unwrap();
+    let recovered = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{:?}", recovered);
+    assert!(recovered.stderr.is_empty());
+}
 #[test]
 fn installed_binary_checks_a_real_source_proof_file() {
     let path = file(

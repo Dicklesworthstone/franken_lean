@@ -2424,11 +2424,9 @@ fn eta_visible(
 }
 
 fn eta_candidate(
-    mut lambda: DefEqTerm,
-    mut body: ExprId,
+    (mut lambda, mut body): (DefEqTerm, ExprId),
     outside: DefEqTerm,
-    left: &WireExpr,
-    right: &WireExpr,
+    (left, right): (&WireExpr, &WireExpr),
     generated: &mut Vec<WireExpr>,
     context: &WhnfContext,
     control: &mut SlowControl,
@@ -2588,8 +2586,7 @@ fn eta_candidate(
 fn exact_function_eta(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
-    left: &WireExpr,
-    right: &WireExpr,
+    (left, right): (&WireExpr, &WireExpr),
     generated: &mut Vec<WireExpr>,
     context: &WhnfContext,
     control: &mut SlowControl,
@@ -2613,11 +2610,9 @@ fn exact_function_eta(
     match (left_node, right_node) {
         (ExprNode::Lambda { body, .. }, node) if !matches!(node, ExprNode::Lambda { .. }) => {
             eta_candidate(
-                left_reference,
-                *body,
+                (left_reference, *body),
                 right_reference,
-                left,
-                right,
+                (left, right),
                 generated,
                 context,
                 control,
@@ -2626,11 +2621,9 @@ fn exact_function_eta(
         }
         (node, ExprNode::Lambda { body, .. }) if !matches!(node, ExprNode::Lambda { .. }) => {
             eta_candidate(
-                right_reference,
-                *body,
+                (right_reference, *body),
                 left_reference,
-                left,
-                right,
+                (left, right),
                 generated,
                 context,
                 control,
@@ -3248,8 +3241,7 @@ fn run_slow(
                         if exact_function_eta(
                             left_reference,
                             right_reference,
-                            left,
-                            right,
+                            (left, right),
                             &mut generated,
                             context,
                             &mut control,

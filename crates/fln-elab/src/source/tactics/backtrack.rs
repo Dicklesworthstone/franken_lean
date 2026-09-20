@@ -113,6 +113,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
             | SourceInferenceError::ExpectedFunction
             | SourceInferenceError::ExpectedType
             | SourceInferenceError::Match(_)
+            | SourceInferenceError::Recursion(_)
             | SourceInferenceError::InstanceSynthesisRequired
             | SourceInferenceError::UnresolvedHoles { .. }
             | SourceInferenceError::UnresolvedUniverses,

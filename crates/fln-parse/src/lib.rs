@@ -244,12 +244,13 @@ struct ExplicitBinderTokens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LetBindingTokens {
     keyword: usize,
+    recursive: Option<usize>,
     name: usize,
     parameters: Vec<ExplicitBinderTokens>,
     explicit_type: Option<(usize, std::ops::Range<usize>)>,
     assignment: usize,
     value: std::ops::Range<usize>,
-    separator: usize,
+    separator: Option<usize>,
 }
 
 struct BoundedTermFrame {
@@ -775,15 +776,71 @@ fn bounded_term_leaf(
 
 /// Find the separator belonging to this let, not one in a nested let or a
 /// delimited subexpression. The term parser still validates the resulting ranges.
-fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
+fn local_line_break(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+    from: usize,
+    at: usize,
+) -> bool {
+    if at <= from || at >= tokens.len() || from >= tokens.len() {
+        return false;
+    }
+    if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄"))
+    {
+        return false;
+    }
+    if [
+        "termination_by",
+        "decreasing_by",
+        "partial_fixpoint",
+        "coinductive_fixpoint",
+        "inductive_fixpoint",
+    ]
+    .iter()
+    .any(|word| term_locals::word(tokens, at, word))
+    {
+        return false;
+    }
+    let source = view.normalized();
+    let line = source.line_of(tokens[at].extent.start());
+    if line <= source.line_of(tokens[from].extent.start()) {
+        return false;
+    }
+    let begin = source
+        .line_start(source.line_of(tokens[keyword].extent.start()))
+        .expect("keyword line")
+        .0;
+    let baseline = source.as_bytes()[begin..tokens[keyword].extent.start().0]
+        .iter()
+        .take_while(|&&byte| byte == b' ' || byte == b'\t')
+        .count();
+    tokens[at].extent.start().0 - source.line_start(line).expect("local continuation line").0
+        <= baseline
+}
+
+fn find_let_separator(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+    from: usize,
+) -> Option<(usize, Option<usize>, usize)> {
     let mut delimiters = Vec::new();
-    let mut nested_lets = 0usize;
+    let mut nested_lets = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(from) {
+        if delimiters.is_empty() {
+            if local_line_break(view, tokens, keyword, from, index) {
+                return Some((index, None, index));
+            }
+            while nested_lets.last().is_some_and(|&nested| local_line_break(view, tokens, nested, nested, index)) {
+                nested_lets.pop();
+            }
+        }
         if delimiters.is_empty()
             && (term_locals::word(tokens, index, "have")
                 || term_locals::word(tokens, index, "suffices"))
         {
-            nested_lets += 1;
+            nested_lets.push(index);
             continue;
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
@@ -797,12 +854,12 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
                         return None;
                     }
                 }
-                "let" if delimiters.is_empty() => nested_lets += 1,
+                "let" if delimiters.is_empty() => nested_lets.push(index),
                 ";" if delimiters.is_empty() => {
-                    if nested_lets == 0 {
-                        return Some(index);
+                    if nested_lets.is_empty() {
+                        return Some((index, Some(index), index + 1));
                     }
-                    nested_lets -= 1;
+                    nested_lets.pop();
                 }
                 _ => {}
             }
@@ -865,7 +922,8 @@ fn bounded_let_bindings(
         Some(TokenKind::Symbol(symbol)) if symbol == "let"
     ) {
         let keyword = body_start;
-        let name = keyword + 1;
+        let recursive = term_locals::word(tokens, keyword + 1, "rec").then_some(keyword + 1);
+        let name = keyword + 1 + usize::from(recursive.is_some());
         if !matches!(
             tokens.get(name).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
@@ -900,22 +958,43 @@ fn bounded_let_bindings(
             });
         }
         let value_start = assignment + 1;
-        let Some(separator) = find_let_separator(tokens, value_start) else {
+        let Some((value_end, separator, next)) = find_let_separator(view, tokens, keyword, value_start) else {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, tokens.len()),
                 expected: NatDefinitionExpectation::LetSeparator,
             });
         };
+        if recursive.is_some() {
+            let mut depth = 0usize;
+            for at in value_start..value_end {
+                if depth == 0 && ["termination_by", "decreasing_by", "partial_fixpoint", "coinductive_fixpoint", "inductive_fixpoint"]
+                    .iter().any(|word| term_locals::word(tokens, at, word))
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, at),
+                        expected: NatDefinitionExpectation::LetSeparator,
+                    });
+                }
+                if let TokenKind::Symbol(s) = &tokens[at].kind {
+                    match s.as_str() {
+                        "(" | "{" | ".{" | "[" | "⦃" => depth += 1,
+                        ")" | "}" | "]" | "⦄" => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+        }
         let_bindings.push(LetBindingTokens {
             keyword,
+            recursive,
             name,
             parameters,
             explicit_type,
             assignment,
-            value: value_start..separator,
+            value: value_start..value_end,
             separator,
         });
-        body_start = separator + 1;
+        body_start = next;
     }
     Ok((let_bindings, body_start))
 }
@@ -930,9 +1009,11 @@ fn bounded_value_syntax(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut value = bounded_term(leaves, view, tokens, body_start..tokens.len(), grammar)?;
     for binding in let_bindings.into_iter().rev() {
-        if grammar == DefinitionGrammar::NatOnly && !binding.parameters.is_empty() {
+        if grammar == DefinitionGrammar::NatOnly
+            && (binding.recursive.is_some() || !binding.parameters.is_empty())
+        {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(view, tokens, binding.parameters[0].open),
+                at: original_position(view, tokens, binding.keyword),
                 expected: NatDefinitionExpectation::LocalAssignment,
             });
         }
@@ -967,21 +1048,75 @@ fn bounded_value_syntax(
                 local_value,
             ],
         );
-        value = Syntax::node(
-            parser_kind(&["Term", "let"]),
-            vec![
-                leaves.leaf(binding.keyword)?,
-                Syntax::node(
-                    parser_kind(&["Term", "letConfig"]),
-                    vec![null_node(Vec::new())],
-                ),
-                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![local_declaration]),
-                leaves.leaf(binding.separator)?,
-                value,
-            ],
-        );
+        value = local_binding_syntax(
+            leaves,
+            binding.keyword,
+            binding.recursive,
+            local_declaration,
+            binding.separator,
+            value,
+        )?;
     }
     Ok(value)
+}
+
+/// Share the pinned let/letrec wrappers between top-level and nested lets.
+/// A recursive group currently contains one declaration; commas are not erased
+/// or interpreted as an ordinary let. Every keyword retains its original span.
+fn local_binding_syntax(
+    leaves: &Leaves,
+    keyword: usize,
+    recursive: Option<usize>,
+    declaration: Syntax,
+    separator: Option<usize>,
+    body: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let declaration = Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]);
+    let separator = match separator {
+        Some(at) => leaves.leaf(at)?,
+        None => null_node(vec![]),
+    };
+    if let Some(rec) = recursive {
+        let rec_atom = Syntax::Atom {
+            info: leaves.leaf(rec)?.info(),
+            val: "rec".to_string(),
+        };
+        let declaration = Syntax::node(
+            parser_kind(&["Term", "letRecDecl"]),
+            vec![
+                null_node(vec![]),
+                null_node(vec![]),
+                declaration,
+                Syntax::node(
+                    parser_kind(&["Termination", "suffix"]),
+                    vec![null_node(vec![]), null_node(vec![])],
+                ),
+            ],
+        );
+        Ok(Syntax::node(
+            parser_kind(&["Term", "letrec"]),
+            vec![
+                null_node(vec![leaves.leaf(keyword)?, rec_atom]),
+                Syntax::node(
+                    parser_kind(&["Term", "letRecDecls"]),
+                    vec![null_node(vec![declaration])],
+                ),
+                separator,
+                body,
+            ],
+        ))
+    } else {
+        Ok(Syntax::node(
+            parser_kind(&["Term", "let"]),
+            vec![
+                leaves.leaf(keyword)?,
+                Syntax::node(parser_kind(&["Term", "letConfig"]), vec![null_node(vec![])]),
+                declaration,
+                separator,
+                body,
+            ],
+        ))
+    }
 }
 
 fn finish_bounded_application(

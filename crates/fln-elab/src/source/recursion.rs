@@ -193,7 +193,7 @@ impl Context {
     /// A structural candidate must be an actual explicit header parameter, not
     /// a computed expression. Each input identity is tried at most once. The
     /// pattern matrix still checks every source discriminant and every row.
-    fn recursion_columns(
+    pub(super) fn recursion_columns(
         &mut self,
         parameters: &[LocalDecl],
         mut syntax: &Syntax,
@@ -249,7 +249,7 @@ impl Context {
         Ok(columns)
     }
 
-    fn prepare_recursion(
+    pub(super) fn prepare_recursion(
         &mut self,
         name: &Name,
         parameters: &[LocalDecl],
@@ -547,10 +547,7 @@ impl Context {
             .iter()
             .chain(&recursion.varying)
             .map(|position| recursion.parameters[*position].id.clone())
-            .chain([
-                recursion.parameters[recursion.decreasing].id.clone(),
-                recursion.marker.clone(),
-            ])
+            .chain([recursion.parameters[recursion.decreasing].id.clone()])
             .collect();
         let previous = self.txn.lctx.clone();
         self.txn.lctx = LocalContext::new();
@@ -574,12 +571,18 @@ impl Context {
                 }
             }
         }
-        self.txn.lctx.add_param(
-            recursion.marker.clone(),
-            Name::anonymous(),
-            recursion.reference.type_.clone(),
-            BinderInfo::Default,
-        );
+        // Preserve a local recursive self binder's lexical position and name.
+        // Replacing it by an anonymous marker would resolve a recursive call
+        // to an outer binding with the same name. Its type is already closed
+        // over the function parameters, so it does not capture the old major.
+        if !self.txn.lctx.contains(&recursion.marker) {
+            self.txn.lctx.add_param(
+                recursion.marker.clone(),
+                Name::anonymous(),
+                recursion.reference.type_.clone(),
+                BinderInfo::Default,
+            );
+        }
         Ok(())
     }
 
