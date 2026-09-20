@@ -1688,6 +1688,210 @@ fn preflight_extended_13_modules_council_fast_admission() {
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_extended_18_modules_council_fast_admission() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
+    ];
+
+    let mut env = Environment::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    for name in &base_modules {
+        set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
+        let m = load(name);
+        for c in m.constants {
+            available_consts.insert(c.name().clone());
+            env = env.add_decl(c).expect("add decl to env");
+        }
+    }
+    eprintln!("Preloaded 38-module base environment has {} constants", env.len());
+
+    let mut engine = Engine::from_environment(env);
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+
+    let candidates = [
+        ("Init/Control/Option", 22),
+        ("Init/Data/BitVec/BasicAux", 6),
+        ("Init/Data/Int/Basic", 104),
+        ("Init/Data/List/Notation", 8),
+        ("Init/Data/Option/Instances", 39),
+        ("Init/Grind/Cases", 0),
+        ("Init/WF", 129),
+        ("Init/WFTactics", 16),
+        ("Init/MetaTypes", 453),
+        ("Init/Control/Do", 10),
+        ("Init/Data/Nat/Div/Basic", 115),
+        ("Init/Data/List/Basic", 805),
+        ("Init/Data/ByteArray/Bootstrap", 21),
+        ("Init/Data/Int/DivMod/Basic", 41),
+        ("Init/Data/List/Scan/Basic", 10),
+        ("Init/Data/List/ToArrayImpl", 6),
+        ("Init/Data/Nat/Bitwise/Basic", 48),
+        ("Init/Task", 7),
+    ];
+
+    let mut total_new_decls = 0;
+    for (name, expected_count) in candidates {
+        let start = std::time::Instant::now();
+        let m = load(name);
+        let num_decls = m.constants.len();
+        eprintln!("\n=== CANDIDATE {name} ({num_decls} declarations) ===");
+
+        let mut missing_imports = Vec::new();
+        for imp in &m.module.imports {
+            if !set_of_all.contains(&imp.module) {
+                missing_imports.push(imp.module.to_display_string());
+            }
+        }
+        assert!(
+            missing_imports.is_empty(),
+            "Candidate {name} has missing imports: {missing_imports:?}"
+        );
+
+        let mut check_consts = available_consts.clone();
+        for c in &m.constants {
+            check_consts.insert(c.name().clone());
+        }
+
+        let mut missing_consts = std::collections::BTreeSet::new();
+        for c in &m.constants {
+            let mut exprs = vec![c.constant_val().type_.clone()];
+            match c {
+                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+                _ => {}
+            }
+            for e in exprs {
+                let mut stack = vec![e];
+                while let Some(cur) = stack.pop() {
+                    match cur.node() {
+                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
+                            if !check_consts.contains(cname) {
+                                missing_consts.insert(cname.clone());
+                            }
+                        }
+                        fln_core::expr::ExprNode::App { f, a } => {
+                            stack.push(f.clone());
+                            stack.push(a.clone());
+                        }
+                        fln_core::expr::ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | fln_core::expr::ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            stack.push(binder_type.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            stack.push(type_.clone());
+                            stack.push(value.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::Proj { expr, .. } => {
+                            stack.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(
+            missing_consts.is_empty(),
+            "Candidate {name} has missing constant references: {missing_consts:?}"
+        );
+
+        eprintln!("All imports and constants closed! Running council check...");
+        let outcome = engine
+            .check_decoded_olean(m, &KVMap::new(), limits)
+            .unwrap_or_else(|err| panic!("check failed for {name}: {err}"));
+        match outcome {
+            Outcome::Complete(checked) => {
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "PASS: Checked {name} with {} declarations in {:.2?}!",
+                    checked.declarations.len(),
+                    elapsed
+                );
+                assert_eq!(checked.declarations.len(), expected_count);
+                total_new_decls += checked.declarations.len();
+                set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
+                for c in &checked.declarations {
+                    available_consts.insert(c.name.clone());
+                }
+                engine = checked.engine;
+            }
+            Outcome::Inconclusive(reason) => {
+                panic!("INCONCLUSIVE for {name}: {reason:?}");
+            }
+            Outcome::InternalFault(fault) => {
+                panic!("FAULT for {name}: {fault:?}");
+            }
+        }
+    }
+
+    assert_eq!(total_new_decls, 1840);
+    eprintln!(
+        "ALL 18 EXTENDED MODULES ({total_new_decls} DECLARATIONS) VERIFIED THROUGH TWO-CHECKER COUNCIL!"
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
 fn preflight_init_core_dependencies() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
@@ -2069,6 +2273,34 @@ fn scan_downstream_candidates() {
         "Init.Data.Order.Classes",
         "Init.Dynamic",
         "Init.Try",
+        "Init.Data.NeZero",
+        "Init.Syntax",
+        "Init.Grind.Annotated",
+        "Init.Grind.Attr",
+        "Init.Grind.Lint",
+        "Init.Internal.Order.Tactic",
+        "Init.Sym.DSimp.DSimprocDSL",
+        "Init.Sym.Simp.SimprocDSL",
+        "Init.SimpLemmas",
+        "Init.Grind.Interactive",
+        "Init.Grind.Tactics",
+        "Init.Data.Option.Basic",
+        "Init.Data.Nat.Basic",
+        "Init.ByCases",
+        "Init.Control.Option",
+        "Init.Data.BitVec.BasicAux",
+        "Init.Data.Function",
+        "Init.Data.Int.Basic",
+        "Init.Data.List.Notation",
+        "Init.Data.Option.Instances",
+        "Init.Grind.Cases",
+        "Init.MethodSpecsSimp",
+        "Init.WF",
+        "Init.WFTactics",
+        "Init.MetaTypes",
+        "Init.Control.Do",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.List.Basic",
     ];
     let mut known: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
     for name in &base_modules {
@@ -2130,7 +2362,7 @@ fn scan_downstream_candidates() {
         }
     }
 
-    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES (ALL IMPORTS SATISFIED BY CURRENT 25) ===");
+    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES (ALL IMPORTS SATISFIED BY CURRENT 38) ===");
     for (cand, count) in &immediate_candidates {
         eprintln!("  Candidate: {} ({} declarations)", cand, count);
     }
@@ -2306,6 +2538,216 @@ fn preflight_candidate_38_modules() {
     assert_eq!(total_decls, 5982);
     eprintln!(
         "ALL 38 MODULES ({total_decls} TOTAL DECLARATIONS) HAVE STRICTLY SATISFIED IMPORTS AND ZERO MISSING CONSTANTS!"
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_candidate_next_wave_modules() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
+    ];
+
+    let candidate_modules = [
+        "Init/Control/Option",
+        "Init/Data/BitVec/BasicAux",
+        "Init/Data/Int/Basic",
+        "Init/Data/List/Notation",
+        "Init/Data/Option/Instances",
+        "Init/Grind/Cases",
+        "Init/WF",
+        "Init/WFTactics",
+        "Init/MetaTypes",
+        "Init/Control/Do",
+        "Init/Data/Nat/Div/Basic",
+        "Init/Data/List/Basic",
+        "Init/Data/ByteArray/Bootstrap",
+        "Init/Data/Int/DivMod/Basic",
+        "Init/Data/List/Scan/Basic",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Nat/Bitwise/Basic",
+        "Init/Task",
+    ];
+
+    let mut set_of_all = std::collections::BTreeSet::new();
+    for name in base_modules.iter().chain(candidate_modules.iter()) {
+        let fln_name = fln_core::name::Name::from_components(name.split('/'));
+        set_of_all.insert(fln_name);
+    }
+
+    let mut available_consts: std::collections::BTreeMap<fln_core::name::Name, &str> = std::collections::BTreeMap::new();
+    let mut total_decls = 0;
+    for name in &base_modules {
+        let m = load(name);
+        total_decls += m.constants.len();
+        for c in &m.constants {
+            available_consts.insert(c.name().clone(), *name);
+        }
+    }
+
+    let mut candidate_decl_counts = Vec::new();
+    let mut duplicates = Vec::new();
+    for name in &candidate_modules {
+        let m = load(name);
+        total_decls += m.constants.len();
+        candidate_decl_counts.push((*name, m.constants.len()));
+        eprintln!("Checking candidate {}: {} declarations", name, m.constants.len());
+        for imp in &m.module.imports {
+            eprintln!("  imports: {}", imp.module.to_display_string());
+            assert!(
+                set_of_all.contains(&imp.module),
+                "Candidate {} imports {} which is not available!",
+                name,
+                imp.module.to_display_string()
+            );
+        }
+        for c in &m.constants {
+            if let Some(prev_mod) = available_consts.get(c.name()) {
+                eprintln!(
+                    "DUPLICATE CONSTANT in {name}: {} (previously in {})",
+                    c.name().to_display_string(),
+                    prev_mod
+                );
+                duplicates.push((*name, c.name().to_display_string(), *prev_mod));
+            }
+            available_consts.insert(c.name().clone(), *name);
+        }
+    }
+    assert!(
+        duplicates.is_empty(),
+        "No duplicate constants allowed: {duplicates:?}"
+    );
+
+    let mut missing_by_module: std::collections::BTreeMap<&str, std::collections::BTreeSet<(fln_core::name::Name, fln_core::name::Name)>> =
+        std::collections::BTreeMap::new();
+    for name in &candidate_modules {
+        let m = load(name);
+        for c in &m.constants {
+            let mut exprs = vec![c.constant_val().type_.clone()];
+            match c {
+                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+                _ => {}
+            }
+            for e in exprs {
+                let mut stack = vec![e];
+                while let Some(cur) = stack.pop() {
+                    match cur.node() {
+                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
+                            if !available_consts.contains_key(cname) {
+                                missing_by_module
+                                    .entry(*name)
+                                    .or_default()
+                                    .insert((c.name().clone(), cname.clone()));
+                            }
+                        }
+                        fln_core::expr::ExprNode::App { f, a } => {
+                            stack.push(f.clone());
+                            stack.push(a.clone());
+                        }
+                        fln_core::expr::ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | fln_core::expr::ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            stack.push(binder_type.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            stack.push(type_.clone());
+                            stack.push(value.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::Proj { expr, .. } => {
+                            stack.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    for (mod_name, missing) in &missing_by_module {
+        eprintln!(
+            "MODULE {} HAS {} MISSING CONSTANT REFS:",
+            mod_name,
+            missing.len()
+        );
+        for (decl, needed) in missing.iter().take(10) {
+            eprintln!(
+                "  decl {} needs {}",
+                decl.to_display_string(),
+                needed.to_display_string()
+            );
+        }
+    }
+    assert!(
+        missing_by_module.is_empty(),
+        "No candidates should have missing constant references!"
+    );
+
+    eprintln!("\nCandidate declaration counts:");
+    for (name, count) in candidate_decl_counts {
+        eprintln!("  {name}: {count}");
+    }
+    assert_eq!(total_decls, 7822);
+    eprintln!(
+        "ALL 18 CANDIDATE MODULES HAVE STRICTLY SATISFIED IMPORTS AND ZERO MISSING CONSTANTS! (Total declarations: {total_decls})"
     );
 }
 
