@@ -1502,6 +1502,110 @@ fn preflight_extended_12_modules_council_fast_admission() {
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_candidate_next_batch_council_admission() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+    ];
+
+    let mut env = Environment::new();
+    for name in &base_modules {
+        let m = load(name);
+        for c in m.constants {
+            env = env.add_decl(c).expect("add decl to env");
+        }
+    }
+    eprintln!("Preloaded 25-module base environment has {} constants", env.len());
+
+    let mut engine = Engine::from_environment(env);
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+
+    let candidates = [
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Config",
+        "Init/MetaTypes",
+    ];
+
+    for name in candidates {
+        let start = std::time::Instant::now();
+        let m = load(name);
+        let num_decls = m.constants.len();
+        eprintln!("Checking candidate {name} ({num_decls} declarations)...");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.clone().check_decoded_olean(m, &KVMap::new(), limits)
+        }));
+        match result {
+            Ok(Ok(Outcome::Complete(checked))) => {
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "PASS: Checked {name} with {} declarations in {:.2?}!",
+                    checked.declarations.len(),
+                    elapsed
+                );
+                engine = checked.engine;
+            }
+            Ok(Ok(Outcome::Inconclusive(reason))) => {
+                eprintln!("INCONCLUSIVE for {name}: {reason:?}");
+            }
+            Ok(Ok(Outcome::InternalFault(fault))) => {
+                eprintln!("FAULT for {name}: {fault:?}");
+            }
+            Ok(Err(err)) => {
+                eprintln!("ERR for {name}: {err}");
+            }
+            Err(_) => {
+                eprintln!("PANIC for {name}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
 fn preflight_init_core_dependencies() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
@@ -1871,6 +1975,18 @@ fn scan_downstream_candidates() {
         "Init.Control.Except",
         "Init.Control.Reader",
         "Init.Control.State",
+        "Init.Control.Lawful.MonadLift.Basic",
+        "Init.Data.PLift",
+        "Init.Data.ULift",
+        "Init.Data.Zero",
+        "Init.Data.Cast",
+        "Init.Data.Option.Coe",
+        "Init.Data.LawfulHashable",
+        "Init.Data.Array.Set",
+        "Init.Data.Slice.Basic",
+        "Init.Data.Order.Classes",
+        "Init.Dynamic",
+        "Init.Try",
     ];
     let mut known: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
     for name in &base_modules {
@@ -1932,7 +2048,7 @@ fn scan_downstream_candidates() {
         }
     }
 
-    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES (ALL IMPORTS SATISFIED BY CURRENT 13) ===");
+    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES (ALL IMPORTS SATISFIED BY CURRENT 25) ===");
     for (cand, count) in &immediate_candidates {
         eprintln!("  Candidate: {} ({} declarations)", cand, count);
     }
