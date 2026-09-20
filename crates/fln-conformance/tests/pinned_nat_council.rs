@@ -1502,7 +1502,7 @@ fn preflight_extended_12_modules_council_fast_admission() {
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
-fn preflight_candidate_next_batch_council_admission() {
+fn preflight_extended_13_modules_council_fast_admission() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
     let load = |name: &str| {
@@ -1561,22 +1561,23 @@ fn preflight_candidate_next_batch_council_admission() {
     let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
 
     let candidates = [
-        "Init/Data/NeZero",
-        "Init/Syntax",
-        "Init/Grind/Annotated",
-        "Init/Grind/Attr",
-        "Init/Grind/Lint",
-        "Init/Internal/Order/Tactic",
-        "Init/Sym/DSimp/DSimprocDSL",
-        "Init/Sym/Simp/SimprocDSL",
-        "Init/SimpLemmas",
-        "Init/Grind/Interactive",
-        "Init/Grind/Tactics",
-        "Init/Data/Option/Basic",
-        "Init/Data/Nat/Basic",
+        ("Init/Data/NeZero", 24),
+        ("Init/Syntax", 3),
+        ("Init/Grind/Annotated", 1),
+        ("Init/Grind/Attr", 28),
+        ("Init/Grind/Lint", 4),
+        ("Init/Internal/Order/Tactic", 1),
+        ("Init/Sym/DSimp/DSimprocDSL", 18),
+        ("Init/Sym/Simp/SimprocDSL", 25),
+        ("Init/SimpLemmas", 199),
+        ("Init/Grind/Interactive", 100),
+        ("Init/Grind/Tactics", 8),
+        ("Init/Data/Option/Basic", 120),
+        ("Init/Data/Nat/Basic", 477),
     ];
 
-    for name in candidates {
+    let mut total_new_decls = 0;
+    for (name, expected_count) in candidates {
         let start = std::time::Instant::now();
         let m = load(name);
         let num_decls = m.constants.len();
@@ -1588,10 +1589,10 @@ fn preflight_candidate_next_batch_council_admission() {
                 missing_imports.push(imp.module.to_display_string());
             }
         }
-        if !missing_imports.is_empty() {
-            eprintln!("SKIPPING {name}: missing imports {missing_imports:?}");
-            continue;
-        }
+        assert!(
+            missing_imports.is_empty(),
+            "Candidate {name} has missing imports: {missing_imports:?}"
+        );
 
         let mut check_consts = available_consts.clone();
         for c in &m.constants {
@@ -1645,47 +1646,44 @@ fn preflight_candidate_next_batch_council_admission() {
             }
         }
 
-        if !missing_consts.is_empty() {
-            eprintln!(
-                "SKIPPING {name}: {} missing constant references (sample: {:?})",
-                missing_consts.len(),
-                missing_consts.iter().take(5).map(|n| n.to_display_string()).collect::<Vec<_>>()
-            );
-            continue;
-        }
+        assert!(
+            missing_consts.is_empty(),
+            "Candidate {name} has missing constant references: {missing_consts:?}"
+        );
 
         eprintln!("All imports and constants closed! Running council check...");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.clone().check_decoded_olean(m, &KVMap::new(), limits)
-        }));
-        match result {
-            Ok(Ok(Outcome::Complete(checked))) => {
+        let outcome = engine
+            .check_decoded_olean(m, &KVMap::new(), limits)
+            .unwrap_or_else(|err| panic!("check failed for {name}: {err}"));
+        match outcome {
+            Outcome::Complete(checked) => {
                 let elapsed = start.elapsed();
                 eprintln!(
                     "PASS: Checked {name} with {} declarations in {:.2?}!",
                     checked.declarations.len(),
                     elapsed
                 );
+                assert_eq!(checked.declarations.len(), expected_count);
+                total_new_decls += checked.declarations.len();
                 set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
                 for c in &checked.declarations {
                     available_consts.insert(c.name.clone());
                 }
                 engine = checked.engine;
             }
-            Ok(Ok(Outcome::Inconclusive(reason))) => {
-                eprintln!("INCONCLUSIVE for {name}: {reason:?}");
+            Outcome::Inconclusive(reason) => {
+                panic!("INCONCLUSIVE for {name}: {reason:?}");
             }
-            Ok(Ok(Outcome::InternalFault(fault))) => {
-                eprintln!("FAULT for {name}: {fault:?}");
-            }
-            Ok(Err(err)) => {
-                eprintln!("ERR for {name}: {err}");
-            }
-            Err(_) => {
-                eprintln!("PANIC for {name}");
+            Outcome::InternalFault(fault) => {
+                panic!("FAULT for {name}: {fault:?}");
             }
         }
     }
+
+    assert_eq!(total_new_decls, 1008);
+    eprintln!(
+        "ALL 13 EXTENDED MODULES ({total_new_decls} DECLARATIONS) VERIFIED THROUGH TWO-CHECKER COUNCIL!"
+    );
 }
 
 #[test]
@@ -2140,7 +2138,7 @@ fn scan_downstream_candidates() {
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
-fn preflight_candidate_25_modules() {
+fn preflight_candidate_38_modules() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
     let load = |name: &str| {
@@ -2168,9 +2166,6 @@ fn preflight_candidate_25_modules() {
         "Init/Control/Except",
         "Init/Control/Reader",
         "Init/Control/State",
-    ];
-
-    let candidate_modules = [
         "Init/Control/Lawful/MonadLift/Basic",
         "Init/Data/PLift",
         "Init/Data/ULift",
@@ -2183,6 +2178,22 @@ fn preflight_candidate_25_modules() {
         "Init/Data/Order/Classes",
         "Init/Dynamic",
         "Init/Try",
+    ];
+
+    let candidate_modules = [
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
     ];
 
     let mut set_of_all = std::collections::BTreeSet::new();
@@ -2292,9 +2303,9 @@ fn preflight_candidate_25_modules() {
         "No candidates should have missing constant references!"
     );
 
-    assert_eq!(total_decls, 4974);
+    assert_eq!(total_decls, 5982);
     eprintln!(
-        "ALL 25 MODULES ({total_decls} TOTAL DECLARATIONS) HAVE STRICTLY SATISFIED IMPORTS AND ZERO MISSING CONSTANTS!"
+        "ALL 38 MODULES ({total_decls} TOTAL DECLARATIONS) HAVE STRICTLY SATISFIED IMPORTS AND ZERO MISSING CONSTANTS!"
     );
 }
 
@@ -3209,6 +3220,393 @@ fn pinned_extended_25_module_companion_chain_council_run() {
             assert_eq!(checked.modules[22].declarations.len(), 109);
             assert_eq!(checked.modules[23].declarations.len(), 28);
             assert_eq!(checked.modules[24].declarations.len(), 43);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init 38-module companion chain"]
+fn pinned_extended_38_module_companion_chain_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load_module = |rel_path: &str| {
+        let base = lib.join(format!("{rel_path}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        (exported, server, private)
+    };
+
+    let (prelude_exp, prelude_srv, prelude_prv) = load_module("Init/Prelude");
+    let (coe_exp, coe_srv, coe_prv) = load_module("Init/Coe");
+    let (not_exp, not_srv, not_prv) = load_module("Init/Notation");
+    let (tac_exp, tac_srv, tac_prv) = load_module("Init/Tactics");
+    let (sz_exp, sz_srv, sz_prv) = load_module("Init/SizeOf");
+    let (core_exp, core_srv, core_prv) = load_module("Init/Core");
+    let (bnh_exp, bnh_srv, bnh_prv) = load_module("Init/BinderNameHint");
+    let (ma_exp, ma_srv, ma_prv) = load_module("Init/Control/MonadAttach");
+    let (bas_exp, bas_srv, bas_prv) = load_module("Init/Control/Basic");
+    let (id_exp, id_srv, id_prv) = load_module("Init/Control/Id");
+    let (exc_exp, exc_srv, exc_prv) = load_module("Init/Control/Except");
+    let (rdr_exp, rdr_srv, rdr_prv) = load_module("Init/Control/Reader");
+    let (st_exp, st_srv, st_prv) = load_module("Init/Control/State");
+    let (mlb_exp, mlb_srv, mlb_prv) = load_module("Init/Control/Lawful/MonadLift/Basic");
+    let (plift_exp, plift_srv, plift_prv) = load_module("Init/Data/PLift");
+    let (ulift_exp, ulift_srv, ulift_prv) = load_module("Init/Data/ULift");
+    let (zero_exp, zero_srv, zero_prv) = load_module("Init/Data/Zero");
+    let (cast_exp, cast_srv, cast_prv) = load_module("Init/Data/Cast");
+    let (optcoe_exp, optcoe_srv, optcoe_prv) = load_module("Init/Data/Option/Coe");
+    let (lh_exp, lh_srv, lh_prv) = load_module("Init/Data/LawfulHashable");
+    let (arrset_exp, arrset_srv, arrset_prv) = load_module("Init/Data/Array/Set");
+    let (slice_exp, slice_srv, slice_prv) = load_module("Init/Data/Slice/Basic");
+    let (ord_exp, ord_srv, ord_prv) = load_module("Init/Data/Order/Classes");
+    let (dyn_exp, dyn_srv, dyn_prv) = load_module("Init/Dynamic");
+    let (try_exp, try_srv, try_prv) = load_module("Init/Try");
+    let (nezero_exp, nezero_srv, nezero_prv) = load_module("Init/Data/NeZero");
+    let (syntax_exp, syntax_srv, syntax_prv) = load_module("Init/Syntax");
+    let (annot_exp, annot_srv, annot_prv) = load_module("Init/Grind/Annotated");
+    let (attr_exp, attr_srv, attr_prv) = load_module("Init/Grind/Attr");
+    let (lint_exp, lint_srv, lint_prv) = load_module("Init/Grind/Lint");
+    let (iot_exp, iot_srv, iot_prv) = load_module("Init/Internal/Order/Tactic");
+    let (dsimp_exp, dsimp_srv, dsimp_prv) = load_module("Init/Sym/DSimp/DSimprocDSL");
+    let (simp_exp, simp_srv, simp_prv) = load_module("Init/Sym/Simp/SimprocDSL");
+    let (sl_exp, sl_srv, sl_prv) = load_module("Init/SimpLemmas");
+    let (gi_exp, gi_srv, gi_prv) = load_module("Init/Grind/Interactive");
+    let (gt_exp, gt_srv, gt_prv) = load_module("Init/Grind/Tactics");
+    let (opt_exp, opt_srv, opt_prv) = load_module("Init/Data/Option/Basic");
+    let (nat_exp, nat_srv, nat_prv) = load_module("Init/Data/Nat/Basic");
+
+    let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
+    let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
+    let not_name = fln_core::name::Name::from_components(["Init", "Notation"]);
+    let tac_name = fln_core::name::Name::from_components(["Init", "Tactics"]);
+    let sz_name = fln_core::name::Name::from_components(["Init", "SizeOf"]);
+    let core_name = fln_core::name::Name::from_components(["Init", "Core"]);
+    let bnh_name = fln_core::name::Name::from_components(["Init", "BinderNameHint"]);
+    let ma_name = fln_core::name::Name::from_components(["Init", "Control", "MonadAttach"]);
+    let bas_name = fln_core::name::Name::from_components(["Init", "Control", "Basic"]);
+    let id_name = fln_core::name::Name::from_components(["Init", "Control", "Id"]);
+    let exc_name = fln_core::name::Name::from_components(["Init", "Control", "Except"]);
+    let rdr_name = fln_core::name::Name::from_components(["Init", "Control", "Reader"]);
+    let st_name = fln_core::name::Name::from_components(["Init", "Control", "State"]);
+    let mlb_name = fln_core::name::Name::from_components(["Init", "Control", "Lawful", "MonadLift", "Basic"]);
+    let plift_name = fln_core::name::Name::from_components(["Init", "Data", "PLift"]);
+    let ulift_name = fln_core::name::Name::from_components(["Init", "Data", "ULift"]);
+    let zero_name = fln_core::name::Name::from_components(["Init", "Data", "Zero"]);
+    let cast_name = fln_core::name::Name::from_components(["Init", "Data", "Cast"]);
+    let optcoe_name = fln_core::name::Name::from_components(["Init", "Data", "Option", "Coe"]);
+    let lh_name = fln_core::name::Name::from_components(["Init", "Data", "LawfulHashable"]);
+    let arrset_name = fln_core::name::Name::from_components(["Init", "Data", "Array", "Set"]);
+    let slice_name = fln_core::name::Name::from_components(["Init", "Data", "Slice", "Basic"]);
+    let ord_name = fln_core::name::Name::from_components(["Init", "Data", "Order", "Classes"]);
+    let dyn_name = fln_core::name::Name::from_components(["Init", "Dynamic"]);
+    let try_name = fln_core::name::Name::from_components(["Init", "Try"]);
+    let nezero_name = fln_core::name::Name::from_components(["Init", "Data", "NeZero"]);
+    let syntax_name = fln_core::name::Name::from_components(["Init", "Syntax"]);
+    let annot_name = fln_core::name::Name::from_components(["Init", "Grind", "Annotated"]);
+    let attr_name = fln_core::name::Name::from_components(["Init", "Grind", "Attr"]);
+    let lint_name = fln_core::name::Name::from_components(["Init", "Grind", "Lint"]);
+    let iot_name = fln_core::name::Name::from_components(["Init", "Internal", "Order", "Tactic"]);
+    let dsimp_name = fln_core::name::Name::from_components(["Init", "Sym", "DSimp", "DSimprocDSL"]);
+    let simp_name = fln_core::name::Name::from_components(["Init", "Sym", "Simp", "SimprocDSL"]);
+    let sl_name = fln_core::name::Name::from_components(["Init", "SimpLemmas"]);
+    let gi_name = fln_core::name::Name::from_components(["Init", "Grind", "Interactive"]);
+    let gt_name = fln_core::name::Name::from_components(["Init", "Grind", "Tactics"]);
+    let opt_name = fln_core::name::Name::from_components(["Init", "Data", "Option", "Basic"]);
+    let nat_name = fln_core::name::Name::from_components(["Init", "Data", "Nat", "Basic"]);
+
+    let modules = [
+        fln::OleanModuleInput {
+            name: &prelude_name,
+            artifact: &prelude_exp,
+            server_artifact: Some(&prelude_srv),
+            private_artifact: Some(&prelude_prv),
+        },
+        fln::OleanModuleInput {
+            name: &coe_name,
+            artifact: &coe_exp,
+            server_artifact: Some(&coe_srv),
+            private_artifact: Some(&coe_prv),
+        },
+        fln::OleanModuleInput {
+            name: &not_name,
+            artifact: &not_exp,
+            server_artifact: Some(&not_srv),
+            private_artifact: Some(&not_prv),
+        },
+        fln::OleanModuleInput {
+            name: &tac_name,
+            artifact: &tac_exp,
+            server_artifact: Some(&tac_srv),
+            private_artifact: Some(&tac_prv),
+        },
+        fln::OleanModuleInput {
+            name: &sz_name,
+            artifact: &sz_exp,
+            server_artifact: Some(&sz_srv),
+            private_artifact: Some(&sz_prv),
+        },
+        fln::OleanModuleInput {
+            name: &core_name,
+            artifact: &core_exp,
+            server_artifact: Some(&core_srv),
+            private_artifact: Some(&core_prv),
+        },
+        fln::OleanModuleInput {
+            name: &bnh_name,
+            artifact: &bnh_exp,
+            server_artifact: Some(&bnh_srv),
+            private_artifact: Some(&bnh_prv),
+        },
+        fln::OleanModuleInput {
+            name: &ma_name,
+            artifact: &ma_exp,
+            server_artifact: Some(&ma_srv),
+            private_artifact: Some(&ma_prv),
+        },
+        fln::OleanModuleInput {
+            name: &bas_name,
+            artifact: &bas_exp,
+            server_artifact: Some(&bas_srv),
+            private_artifact: Some(&bas_prv),
+        },
+        fln::OleanModuleInput {
+            name: &id_name,
+            artifact: &id_exp,
+            server_artifact: Some(&id_srv),
+            private_artifact: Some(&id_prv),
+        },
+        fln::OleanModuleInput {
+            name: &exc_name,
+            artifact: &exc_exp,
+            server_artifact: Some(&exc_srv),
+            private_artifact: Some(&exc_prv),
+        },
+        fln::OleanModuleInput {
+            name: &rdr_name,
+            artifact: &rdr_exp,
+            server_artifact: Some(&rdr_srv),
+            private_artifact: Some(&rdr_prv),
+        },
+        fln::OleanModuleInput {
+            name: &st_name,
+            artifact: &st_exp,
+            server_artifact: Some(&st_srv),
+            private_artifact: Some(&st_prv),
+        },
+        fln::OleanModuleInput {
+            name: &mlb_name,
+            artifact: &mlb_exp,
+            server_artifact: Some(&mlb_srv),
+            private_artifact: Some(&mlb_prv),
+        },
+        fln::OleanModuleInput {
+            name: &plift_name,
+            artifact: &plift_exp,
+            server_artifact: Some(&plift_srv),
+            private_artifact: Some(&plift_prv),
+        },
+        fln::OleanModuleInput {
+            name: &ulift_name,
+            artifact: &ulift_exp,
+            server_artifact: Some(&ulift_srv),
+            private_artifact: Some(&ulift_prv),
+        },
+        fln::OleanModuleInput {
+            name: &zero_name,
+            artifact: &zero_exp,
+            server_artifact: Some(&zero_srv),
+            private_artifact: Some(&zero_prv),
+        },
+        fln::OleanModuleInput {
+            name: &cast_name,
+            artifact: &cast_exp,
+            server_artifact: Some(&cast_srv),
+            private_artifact: Some(&cast_prv),
+        },
+        fln::OleanModuleInput {
+            name: &optcoe_name,
+            artifact: &optcoe_exp,
+            server_artifact: Some(&optcoe_srv),
+            private_artifact: Some(&optcoe_prv),
+        },
+        fln::OleanModuleInput {
+            name: &lh_name,
+            artifact: &lh_exp,
+            server_artifact: Some(&lh_srv),
+            private_artifact: Some(&lh_prv),
+        },
+        fln::OleanModuleInput {
+            name: &arrset_name,
+            artifact: &arrset_exp,
+            server_artifact: Some(&arrset_srv),
+            private_artifact: Some(&arrset_prv),
+        },
+        fln::OleanModuleInput {
+            name: &slice_name,
+            artifact: &slice_exp,
+            server_artifact: Some(&slice_srv),
+            private_artifact: Some(&slice_prv),
+        },
+        fln::OleanModuleInput {
+            name: &ord_name,
+            artifact: &ord_exp,
+            server_artifact: Some(&ord_srv),
+            private_artifact: Some(&ord_prv),
+        },
+        fln::OleanModuleInput {
+            name: &dyn_name,
+            artifact: &dyn_exp,
+            server_artifact: Some(&dyn_srv),
+            private_artifact: Some(&dyn_prv),
+        },
+        fln::OleanModuleInput {
+            name: &try_name,
+            artifact: &try_exp,
+            server_artifact: Some(&try_srv),
+            private_artifact: Some(&try_prv),
+        },
+        fln::OleanModuleInput {
+            name: &nezero_name,
+            artifact: &nezero_exp,
+            server_artifact: Some(&nezero_srv),
+            private_artifact: Some(&nezero_prv),
+        },
+        fln::OleanModuleInput {
+            name: &syntax_name,
+            artifact: &syntax_exp,
+            server_artifact: Some(&syntax_srv),
+            private_artifact: Some(&syntax_prv),
+        },
+        fln::OleanModuleInput {
+            name: &annot_name,
+            artifact: &annot_exp,
+            server_artifact: Some(&annot_srv),
+            private_artifact: Some(&annot_prv),
+        },
+        fln::OleanModuleInput {
+            name: &attr_name,
+            artifact: &attr_exp,
+            server_artifact: Some(&attr_srv),
+            private_artifact: Some(&attr_prv),
+        },
+        fln::OleanModuleInput {
+            name: &lint_name,
+            artifact: &lint_exp,
+            server_artifact: Some(&lint_srv),
+            private_artifact: Some(&lint_prv),
+        },
+        fln::OleanModuleInput {
+            name: &iot_name,
+            artifact: &iot_exp,
+            server_artifact: Some(&iot_srv),
+            private_artifact: Some(&iot_prv),
+        },
+        fln::OleanModuleInput {
+            name: &dsimp_name,
+            artifact: &dsimp_exp,
+            server_artifact: Some(&dsimp_srv),
+            private_artifact: Some(&dsimp_prv),
+        },
+        fln::OleanModuleInput {
+            name: &simp_name,
+            artifact: &simp_exp,
+            server_artifact: Some(&simp_srv),
+            private_artifact: Some(&simp_prv),
+        },
+        fln::OleanModuleInput {
+            name: &sl_name,
+            artifact: &sl_exp,
+            server_artifact: Some(&sl_srv),
+            private_artifact: Some(&sl_prv),
+        },
+        fln::OleanModuleInput {
+            name: &gi_name,
+            artifact: &gi_exp,
+            server_artifact: Some(&gi_srv),
+            private_artifact: Some(&gi_prv),
+        },
+        fln::OleanModuleInput {
+            name: &gt_name,
+            artifact: &gt_exp,
+            server_artifact: Some(&gt_srv),
+            private_artifact: Some(&gt_prv),
+        },
+        fln::OleanModuleInput {
+            name: &opt_name,
+            artifact: &opt_exp,
+            server_artifact: Some(&opt_srv),
+            private_artifact: Some(&opt_prv),
+        },
+        fln::OleanModuleInput {
+            name: &nat_name,
+            artifact: &nat_exp,
+            server_artifact: Some(&nat_srv),
+            private_artifact: Some(&nat_prv),
+        },
+    ];
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 38);
+            assert_eq!(checked.modules[0].declarations.len(), 2314);
+            assert_eq!(checked.modules[1].declarations.len(), 158);
+            assert_eq!(checked.modules[2].declarations.len(), 284);
+            assert_eq!(checked.modules[3].declarations.len(), 360);
+            assert_eq!(checked.modules[4].declarations.len(), 174);
+            assert_eq!(checked.modules[5].declarations.len(), 1152);
+            assert_eq!(checked.modules[6].declarations.len(), 2);
+            assert_eq!(checked.modules[7].declarations.len(), 30);
+            assert_eq!(checked.modules[8].declarations.len(), 108);
+            assert_eq!(checked.modules[9].declarations.len(), 12);
+            assert_eq!(checked.modules[10].declarations.len(), 62);
+            assert_eq!(checked.modules[11].declarations.len(), 9);
+            assert_eq!(checked.modules[12].declarations.len(), 33);
+            assert_eq!(checked.modules[13].declarations.len(), 16);
+            assert_eq!(checked.modules[14].declarations.len(), 7);
+            assert_eq!(checked.modules[15].declarations.len(), 7);
+            assert_eq!(checked.modules[16].declarations.len(), 13);
+            assert_eq!(checked.modules[17].declarations.len(), 15);
+            assert_eq!(checked.modules[18].declarations.len(), 1);
+            assert_eq!(checked.modules[19].declarations.len(), 9);
+            assert_eq!(checked.modules[20].declarations.len(), 4);
+            assert_eq!(checked.modules[21].declarations.len(), 24);
+            assert_eq!(checked.modules[22].declarations.len(), 109);
+            assert_eq!(checked.modules[23].declarations.len(), 28);
+            assert_eq!(checked.modules[24].declarations.len(), 43);
+            assert_eq!(checked.modules[25].declarations.len(), 24);
+            assert_eq!(checked.modules[26].declarations.len(), 3);
+            assert_eq!(checked.modules[27].declarations.len(), 1);
+            assert_eq!(checked.modules[28].declarations.len(), 28);
+            assert_eq!(checked.modules[29].declarations.len(), 4);
+            assert_eq!(checked.modules[30].declarations.len(), 1);
+            assert_eq!(checked.modules[31].declarations.len(), 18);
+            assert_eq!(checked.modules[32].declarations.len(), 25);
+            assert_eq!(checked.modules[33].declarations.len(), 199);
+            assert_eq!(checked.modules[34].declarations.len(), 100);
+            assert_eq!(checked.modules[35].declarations.len(), 8);
+            assert_eq!(checked.modules[36].declarations.len(), 120);
+            assert_eq!(checked.modules[37].declarations.len(), 477);
         }
         Ok(Outcome::Inconclusive(reason)) => {
             panic!("INCONCLUSIVE: {reason:?}");
