@@ -25,12 +25,19 @@ struct Key {
     output_types: Vec<Expr>,
     syntax_units: usize,
     locals: LocalContext,
-    ancestors: Vec<Expr>,
+    ancestors: Vec<(Expr, Vec<Expr>)>,
 }
 
 impl Key {
     fn units(&self) -> usize {
-        1 + self.syntax_units + self.output_types.len() + self.locals.len() + self.ancestors.len()
+        1 + self.syntax_units
+            + self.output_types.len()
+            + self.locals.len()
+            + self
+                .ancestors
+                .iter()
+                .map(|(_, types)| 1 + types.len())
+                .sum::<usize>()
     }
 }
 
@@ -38,33 +45,78 @@ fn ground(expr: &Expr) -> bool {
     !expr.has_expr_mvar() && !expr.has_level_mvar()
 }
 
-// A prepared target may differ from its original only at explicit
-// output slots. Their fresh holes correspond to the top-level placeholders
-// introduced by prepare_instance_target, never to arbitrary unknown inputs.
+// Output slots are replaced by preparation; semi-output slots retain their
+// original structure. Unknown ordinary inputs never reach a prepared frame.
 fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
     if ground(&frame.target) {
         return Ok(true);
     }
-    if !ground(&frame.key) {
+    if frame.key.has_level_mvar() {
         return Ok(false);
     }
     let mut target = &frame.target;
     let mut shape = &frame.key;
+    let mut expected = &frame.expected;
     loop {
         context.tick()?;
-        match (target.node(), shape.node()) {
-            (ExprNode::App { f: tf, a: ta }, ExprNode::App { f: sf, a: sa }) => {
+        match (target.node(), shape.node(), expected.node()) {
+            (
+                ExprNode::App { f: tf, a: ta },
+                ExprNode::App { f: sf, a: sa },
+                ExprNode::App { f: ef, a: ea },
+            ) => {
                 let output = matches!(sa.node(), ExprNode::BVar { .. })
                     && matches!(ta.node(), ExprNode::MVar { .. });
-                if !output && (ta != sa || !ground(ta)) {
+                if !output && (ta != sa || ta != ea || ta.has_level_mvar()) {
                     return Ok(false);
                 }
                 target = tf;
                 shape = sf;
+                expected = ef;
             }
-            _ => return Ok(target == shape && ground(target)),
+            _ => return Ok(target == shape && target == expected && ground(target)),
         }
     }
+}
+
+fn ground_locals(
+    context: &mut Context,
+    locals: &LocalContext,
+) -> Result<bool, NatDefinitionElabError> {
+    for local in locals.decls() {
+        context.tick()?;
+        if !ground(&local.type_) || local.value.as_ref().is_some_and(|value| !ground(value)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Fresh output names are not progress. Variant checks preserve the complete
+/// pattern, aliasing, declared hole types and local scope; they assign nothing.
+pub(super) fn same_goal(
+    context: &mut Context,
+    left: &Frame,
+    right: &Frame,
+) -> Result<bool, NatDefinitionElabError> {
+    context.tick()?;
+    if left.key == right.key {
+        return Ok(true);
+    }
+    if !left.binders.is_empty()
+        || !right.binders.is_empty()
+        || left.base.txn.lctx != right.base.txn.lctx
+        || !ground_locals(context, &left.base.txn.lctx)?
+    {
+        return Ok(false);
+    }
+    let Some(left) = outputs::cycle_key(context, left)? else {
+        return Ok(false);
+    };
+    let Some(right) = outputs::cycle_key(context, right)? else {
+        return Ok(false);
+    };
+    Ok(left.expected == right.expected && left.types == right.types)
 }
 
 fn replay_outputs(
@@ -118,27 +170,33 @@ fn key(
     if 1 + locals.len() + ancestors.len() > MAX_KEY_UNITS {
         return Ok(None);
     }
-    for local in locals.decls() {
-        context.tick()?;
-        if !ground(&local.type_) || local.value.as_ref().is_some_and(|value| !ground(value)) {
-            return Ok(None);
-        }
-    }
-    for ancestor in ancestors {
-        context.tick()?;
-        if !ground(&ancestor.key) {
-            return Ok(None);
-        }
+    if !ground_locals(context, locals)? {
+        return Ok(None);
     }
     let Some(canonical) = outputs::canonical(context, frame)? else {
         return Ok(None);
     };
+    let mut syntax_units = canonical.units;
+    let mut path = Vec::with_capacity(ancestors.len());
+    let mut units = 1 + locals.len() + canonical.types.len() + syntax_units;
+    for ancestor in ancestors {
+        context.tick()?;
+        let Some(key) = outputs::cycle_key(context, ancestor)? else {
+            return Ok(None);
+        };
+        units += 1 + key.types.len() + key.units;
+        if units > MAX_KEY_UNITS {
+            return Ok(None);
+        }
+        syntax_units += key.units;
+        path.push((key.expected, key.types));
+    }
     Ok(Some(Key {
         expected: canonical.expected,
         output_types: canonical.types,
-        syntax_units: canonical.units,
+        syntax_units,
         locals: locals.clone(),
-        ancestors: ancestors.iter().map(|frame| frame.key.clone()).collect(),
+        ancestors: path,
     }))
 }
 
@@ -645,5 +703,49 @@ mod tests {
         assert!(table.answers.is_empty());
         assert_eq!(table.entries, 0);
         assert!(context.txn.mvars.is_empty());
+    }
+
+    #[test]
+    fn semi_variants_preserve_hole_types_aliases_and_cycle_paths() {
+        let mut context = context();
+        let semi = |names: &[&str], type_: Expr| {
+            let mut frame = open_outputs(names, type_);
+            frame.key = frame.expected.clone();
+            frame
+        };
+        let first = semi(&["x", "y"], Expr::sort(Level::one()));
+        let renamed = semi(&["a", "b"], Expr::sort(Level::one()));
+        let aliased = semi(&["a", "a"], Expr::sort(Level::one()));
+        let different = semi(&["a", "b"], Expr::sort(Level::zero()));
+        assert!(same_goal(&mut context, &first, &renamed).unwrap());
+        assert!(!same_goal(&mut context, &first, &aliased).unwrap());
+        assert!(!same_goal(&mut context, &first, &different).unwrap());
+        let target = frame("Goal");
+        let first_key = key(&mut context, &target, &[first]).unwrap().unwrap();
+        assert!(Some(first_key.clone()) == key(&mut context, &target, &[renamed]).unwrap());
+        assert!(Some(first_key.clone()) != key(&mut context, &target, &[aliased]).unwrap());
+        assert!(Some(first_key) != key(&mut context, &target, &[different]).unwrap());
+        assert!(context.txn.mvars.is_empty());
+    }
+
+    #[test]
+    fn variant_cycles_do_not_cross_local_scopes_or_resource_stops() {
+        let mut context = context();
+        let mut first = open_outputs(&["x"], Expr::sort(Level::one()));
+        first.key = first.expected.clone();
+        let mut second = open_outputs(&["y"], Expr::sort(Level::one()));
+        second.key = second.expected.clone();
+        let id = FVarId(Name::from_components(["local"]));
+        second
+            .base
+            .txn
+            .lctx
+            .add_param(id.clone(), id.0, constant("Nat"), BinderInfo::Default);
+        assert!(!same_goal(&mut context, &first, &second).unwrap());
+        second.base.txn.lctx = LocalContext::new();
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 1;
+        let before = context.txn.mvars.clone();
+        assert!(same_goal(&mut context, &first, &second).is_err());
+        assert_eq!(context.txn.mvars, before);
     }
 }

@@ -1,0 +1,72 @@
+name: Native instance variant integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-elab/**'
+      - 'crates/fln/tests/source_instance*.rs'
+      - 'crates/fln-cli/tests/instance*.rs'
+      - '.github/workflows/native-instance-variants.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-instance-variants-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Retain exact integration input
+        run: |
+          mkdir -p target/instance-variants
+          git archive --format=tar.gz HEAD > target/instance-variants/source.tar.gz
+          git rev-parse HEAD > target/instance-variants/commit.txt
+          git rev-parse 'HEAD^{tree}' > target/instance-variants/tree.txt
+      - name: Install configured compiler
+        id: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/instance-variants/compiler.txt
+      - name: Elaborator and source instance regressions
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/instance-variants/elab.log
+          a=${PIPESTATUS[0]}
+          cargo test --locked -p fln --test source_instance_variants --test source_instance_tabling --test source_instances 2>&1 | tee target/instance-variants/engine.log
+          b=${PIPESTATUS[0]}
+          cargo test --locked -p fln-cli --test instance_variants --test instance_tabling 2>&1 | tee target/instance-variants/cli.log
+          c=${PIPESTATUS[0]}
+          printf 'elab=%s engine=%s cli=%s\n' "$a" "$b" "$c" | tee target/instance-variants/tests.txt
+          test "$a" -eq 0 && test "$b" -eq 0 && test "$c" -eq 0
+      - name: Lint and downstream compilation
+        if: always() && steps.compiler.outcome == 'success'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/instance-variants/clippy.log
+          a=${PIPESTATUS[0]}
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-variants/workspace.log
+          b=${PIPESTATUS[0]}
+          printf 'clippy=%s workspace=%s\n' "$a" "$b" | tee target/instance-variants/checks.txt
+          test "$a" -eq 0 && test "$b" -eq 0
+      - name: Retain source and results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: instance-variants-${{ github.sha }}
+          path: target/instance-variants
+          retention-days: 1
+          if-no-files-found: error

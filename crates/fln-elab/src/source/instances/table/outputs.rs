@@ -15,17 +15,37 @@ pub(super) fn canonical(
     context: &mut Context,
     frame: &Frame,
 ) -> Result<Option<Canonical>, NatDefinitionElabError> {
-    if frame.expected.has_level_mvar() || frame.expected.has_loose_bvars() {
+    if frame.expected.has_loose_bvars() {
         return Ok(None);
     }
-    if ground(&frame.expected) {
+    pattern(context, frame, &frame.expected)
+}
+
+/// Prepared keys contain top-level output wildcards, never proof terms.
+/// Keep these fixed while alpha-renaming only retained semi-output holes.
+pub(super) fn cycle_key(
+    context: &mut Context,
+    frame: &Frame,
+) -> Result<Option<Canonical>, NatDefinitionElabError> {
+    pattern(context, frame, &frame.key)
+}
+
+fn pattern(
+    context: &mut Context,
+    frame: &Frame,
+    expression: &Expr,
+) -> Result<Option<Canonical>, NatDefinitionElabError> {
+    if expression.has_level_mvar() {
+        return Ok(None);
+    }
+    if ground(expression) {
         return Ok(Some(Canonical {
-            expected: frame.expected.clone(),
+            expected: expression.clone(),
             types: Vec::new(),
             units: 0,
         }));
     }
-    let mut expected = &frame.expected;
+    let mut expected = expression;
     let mut shape = &frame.key;
     let mut arguments = Vec::new();
     // Collect before numbering, so placeholder order follows the telescope.
@@ -33,7 +53,10 @@ pub(super) fn canonical(
         context.tick()?;
         match (expected.node(), shape.node()) {
             (ExprNode::App { f: ef, a: ea }, ExprNode::App { f: sf, a: sa }) => {
-                arguments.push((ea, matches!(sa.node(), ExprNode::BVar { .. })));
+                // Unknown ordinary inputs never pass target preparation.
+                // Retained unknowns are semi-outputs: their entire structure
+                // and each typed hole stay in the key, unlike output wildcards.
+                arguments.push((ea, matches!(sa.node(), ExprNode::BVar { .. }) || ea == sa));
                 expected = ef;
                 shape = sf;
             }

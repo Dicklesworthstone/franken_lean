@@ -531,7 +531,14 @@ impl Context {
                     // blocked preparation, but retain every charged heartbeat.
                 }
                 if let Some(mut child) = ready {
-                    if frames.iter().any(|frame| frame.key == child.key) {
+                    let mut cycle = false;
+                    for ancestor in &frames {
+                        if table::same_goal(self, ancestor, &child)? {
+                            cycle = true;
+                            break;
+                        }
+                    }
+                    if cycle {
                         self.retry_instance_choice(&mut frames, &mut history)?;
                         continue;
                     }
