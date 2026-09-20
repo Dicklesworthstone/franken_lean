@@ -5,6 +5,7 @@ use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
 
 mod parameters;
+mod table;
 
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
@@ -446,6 +447,27 @@ impl Context {
         Ok(())
     }
 
+    fn assign_instance_answer(
+        &mut self,
+        frame: &Frame,
+        value: Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let class = result_head(&frame.target)
+            .ok_or_else(|| failure(SourceInferenceError::InvalidInstanceBinder))?;
+        self.txn
+            .assign_mvar(
+                frame.goal.clone(),
+                value,
+                AssignmentJustification::InstanceSearch { class_name: class },
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Metavariable(error),
+                )))
+            })
+    }
+
     pub(super) fn search_instance(
         &mut self,
         root: MVarId,
@@ -473,6 +495,7 @@ impl Context {
         let mut frames = vec![first];
         let mut history = Vec::new();
         let mut attempts = 0usize;
+        let mut table = table::GroundTable::default();
         while !frames.is_empty() {
             self.tick()?;
             let index = frames.len() - 1;
@@ -507,6 +530,10 @@ impl Context {
                     }
                     if frames.len() >= MAX_SEARCH_DEPTH {
                         return Err(failure(SourceInferenceError::ResourceLimit));
+                    }
+                    if let Some(value) = table.lookup(self, &child, &frames)? {
+                        self.assign_instance_answer(&child, value)?;
+                        continue;
                     }
                     frames.push(child);
                     continue;
@@ -555,20 +582,8 @@ impl Context {
                         .map_err(|_| failure(SourceInferenceError::Scope))?;
                     value = Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info);
                 }
-                let id = frames[index].goal.clone();
-                let class = result_head(&frames[index].target)
-                    .ok_or_else(|| failure(SourceInferenceError::InvalidInstanceBinder))?;
-                self.txn
-                    .assign_mvar(
-                        id,
-                        value,
-                        AssignmentJustification::InstanceSearch { class_name: class },
-                    )
-                    .map_err(|error| {
-                        failure(SourceInferenceError::Unification(Box::new(
-                            UnificationError::Metavariable(error),
-                        )))
-                    })?;
+                self.assign_instance_answer(&frames[index], value.clone())?;
+                table.remember(self, &frames[index], &frames[..index], &value)?;
                 let complete = frames.pop().expect("completed instance frame");
                 if complete.resumable
                     && let Some(parent) = frames.last_mut()
