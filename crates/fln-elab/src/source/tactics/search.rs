@@ -391,7 +391,7 @@ mod tests {
         let mut context = seeded_context();
         let p = proposition(&mut context, "p");
         let alpha = Expr::sort(Level::zero());
-        let level = Level::succ(Level::zero());
+        let level = Level::one();
         let equality = equality::equation(level.clone(), alpha.clone(), p.clone(), p.clone());
         let q = proposition(&mut context, "q");
         let rule = local(&mut context, "rule", arrow(equality, q.clone()));
@@ -408,7 +408,7 @@ mod tests {
         let mut context = seeded_context();
         let p = proposition(&mut context, "p");
         let alpha = Expr::sort(Level::zero());
-        let level = Level::succ(Level::zero());
+        let level = Level::one();
         let target = [alpha.clone(), p.clone(), alpha.clone(), p.clone()]
             .into_iter()
             .fold(Expr::const_(Name::from_components(["HEq"]), vec![level.clone()]), Expr::app);
@@ -445,6 +445,8 @@ mod tests {
             "theorem automatic (x y : Nat) (P : Prop) (h : P) (f : P -> x = y) : y = x := by solve_by_elim",
             "theorem automatic (x y : Nat) (P : Prop) (f : y = x -> P) (h : x = y) : P := by solve_by_elim",
             "theorem automatic {A : Type} (x y : A) (h : x = y) : y = x := by solve_by_elim",
+            "theorem automatic (x y : Nat) (P Q : Prop) (good : y = x -> P) (bad : Q -> P) (h : x = y) : P := by solve_by_elim",
+            "theorem automatic (x y : Nat) (P : Nat -> Prop) (Q : Prop) (hx : P x) (f : (n : Nat) -> n = n -> P n -> Q) : Q := by solve_by_elim",
         ] {
             let result = crate::check_definition_source(
                 source.as_bytes(), &environment, Budget::for_stack_bytes(2 * 1024 * 1024),
