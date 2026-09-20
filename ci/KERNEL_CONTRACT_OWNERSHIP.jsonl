@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":481,"projection_hash":"66459bdff834bfecd47f43b274dfdc046a89fb4c56cf41b605e7c47e9ea6c4cd"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":482,"projection_hash":"fb23c25ed471da54166d2ac1ee6ae4e9a707e22f856043029f57fd959c0b3c71"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -96,6 +96,7 @@
 {"id":"fln-extended-25-modules-council-4974-9m8q"}
 {"id":"fln-extended-38-modules-council-5982-3k7p"}
 {"id":"fln-extended-56-modules-council-7822-4r9w"}
+{"id":"fln-extended-59-modules-council-8396-5s8t"}
 {"id":"fln-extension-history-checkpoint-identity-41s"}
 {"id":"fln-extension-merge-validation-proof-debt-dt5"}
 {"id":"fln-fei1"}
