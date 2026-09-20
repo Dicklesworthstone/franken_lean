@@ -2543,7 +2543,7 @@ fn preflight_candidate_38_modules() {
 
 #[test]
 #[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
-fn preflight_candidate_next_wave_modules() {
+fn preflight_candidate_56_modules() {
     let lib = reference_lib().expect("pinned Reference library is unavailable");
 
     let load = |name: &str| {
@@ -4049,6 +4049,133 @@ fn pinned_extended_38_module_companion_chain_council_run() {
             assert_eq!(checked.modules[35].declarations.len(), 8);
             assert_eq!(checked.modules[36].declarations.len(), 120);
             assert_eq!(checked.modules[37].declarations.len(), 477);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init 56-module companion chain"]
+fn pinned_extended_56_module_companion_chain_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load_module = |rel_path: &str| {
+        let base = lib.join(format!("{rel_path}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        (exported, server, private)
+    };
+
+    let module_specs: [(&str, usize); 56] = [
+        ("Init/Prelude", 2314),
+        ("Init/Coe", 158),
+        ("Init/Notation", 284),
+        ("Init/Tactics", 360),
+        ("Init/SizeOf", 174),
+        ("Init/Core", 1152),
+        ("Init/BinderNameHint", 2),
+        ("Init/Control/MonadAttach", 30),
+        ("Init/Control/Basic", 108),
+        ("Init/Control/Id", 12),
+        ("Init/Control/Except", 62),
+        ("Init/Control/Reader", 9),
+        ("Init/Control/State", 33),
+        ("Init/Control/Lawful/MonadLift/Basic", 16),
+        ("Init/Data/PLift", 7),
+        ("Init/Data/ULift", 7),
+        ("Init/Data/Zero", 13),
+        ("Init/Data/Cast", 15),
+        ("Init/Data/Option/Coe", 1),
+        ("Init/Data/LawfulHashable", 9),
+        ("Init/Data/Array/Set", 4),
+        ("Init/Data/Slice/Basic", 24),
+        ("Init/Data/Order/Classes", 109),
+        ("Init/Dynamic", 28),
+        ("Init/Try", 43),
+        ("Init/Data/NeZero", 24),
+        ("Init/Syntax", 3),
+        ("Init/Grind/Annotated", 1),
+        ("Init/Grind/Attr", 28),
+        ("Init/Grind/Lint", 4),
+        ("Init/Internal/Order/Tactic", 1),
+        ("Init/Sym/DSimp/DSimprocDSL", 18),
+        ("Init/Sym/Simp/SimprocDSL", 25),
+        ("Init/SimpLemmas", 199),
+        ("Init/Grind/Interactive", 100),
+        ("Init/Grind/Tactics", 8),
+        ("Init/Data/Option/Basic", 120),
+        ("Init/Data/Nat/Basic", 477),
+        ("Init/Control/Option", 22),
+        ("Init/Data/BitVec/BasicAux", 6),
+        ("Init/Data/Int/Basic", 104),
+        ("Init/Data/List/Notation", 8),
+        ("Init/Data/Option/Instances", 39),
+        ("Init/Grind/Cases", 0),
+        ("Init/WF", 129),
+        ("Init/WFTactics", 16),
+        ("Init/MetaTypes", 453),
+        ("Init/Control/Do", 10),
+        ("Init/Data/Nat/Div/Basic", 115),
+        ("Init/Data/List/Basic", 805),
+        ("Init/Data/ByteArray/Bootstrap", 21),
+        ("Init/Data/Int/DivMod/Basic", 41),
+        ("Init/Data/List/Scan/Basic", 10),
+        ("Init/Data/List/ToArrayImpl", 6),
+        ("Init/Data/Nat/Bitwise/Basic", 48),
+        ("Init/Task", 7),
+    ];
+
+    let raw_modules: Vec<(fln_core::name::Name, Vec<u8>, Vec<u8>, Vec<u8>)> = module_specs
+        .iter()
+        .map(|(path, _)| {
+            let name = fln_core::name::Name::from_components(path.split('/'));
+            let (exp, srv, prv) = load_module(path);
+            (name, exp, srv, prv)
+        })
+        .collect();
+
+    let modules: Vec<fln::OleanModuleInput<'_>> = raw_modules
+        .iter()
+        .map(|(name, exp, srv, prv)| fln::OleanModuleInput {
+            name,
+            artifact: exp,
+            server_artifact: Some(srv),
+            private_artifact: Some(prv),
+        })
+        .collect();
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 56);
+            let mut total_verified = 0;
+            for (m, (expected_path, expected_count)) in checked.modules.iter().zip(&module_specs) {
+                let expected_name = fln_core::name::Name::from_components(expected_path.split('/'));
+                assert_eq!(m.name, expected_name);
+                assert_eq!(m.declarations.len(), *expected_count);
+                total_verified += m.declarations.len();
+            }
+            assert_eq!(total_verified, 7822);
+            eprintln!("ALL 56 MODULES ({total_verified} DECLARATIONS) FULLY VERIFIED IN PARALLEL COUNCIL!");
         }
         Ok(Outcome::Inconclusive(reason)) => {
             panic!("INCONCLUSIVE: {reason:?}");
