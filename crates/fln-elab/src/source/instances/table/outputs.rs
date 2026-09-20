@@ -1,4 +1,4 @@
-//! Canonical keys for fresh, bare outParam holes. Placeholders are key data only.
+//! Canonical keys for fresh, bare output and semi-output holes. Placeholders are key data only.
 //! Sharing preserves repeated-hole identity and the exact declared hole types.
 //! Arbitrary open terms, opaque/delayed holes and foreign scopes are not guessed.
 use super::*;
@@ -21,7 +21,7 @@ pub(super) fn canonical(
         context.tick()?;
         match (expected.node(), shape.node()) {
             (ExprNode::App { f: ef, a: ea }, ExprNode::App { f: sf, a: sa }) => {
-                arguments.push((ea, matches!(sa.node(), ExprNode::BVar { idx: 0 })));
+                arguments.push((ea, matches!(sa.node(), ExprNode::BVar { .. })));
                 expected = ef;
                 shape = sf;
             }

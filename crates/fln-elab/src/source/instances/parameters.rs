@@ -14,7 +14,7 @@ enum ParameterMode {
 pub(super) struct PreparedTarget {
     pub target: Expr,
     pub expected: Expr,
-    /// Output holes are deliberately absent from this cycle-detection key.
+    /// Outputs are erased; bare unknown semi-outputs are alpha-canonicalized.
     /// This expression is never used as a term or submitted to a checker.
     pub key: Expr,
 }
@@ -93,6 +93,7 @@ impl Context {
         let mut telescope = self.instantiate_params(&base.type_, &base.level_params, levels)?;
         let mut prepared = head.clone();
         let mut key = head;
+        let mut semi_holes = Vec::new();
         for argument in arguments.into_iter().rev() {
             self.tick()?;
             telescope = self.instance_type(&telescope)?;
@@ -118,6 +119,27 @@ impl Context {
             };
             let key_argument = if mode == ParameterMode::Output {
                 Expr::bvar(0).expect("fixed cycle-key placeholder")
+            } else if mode == ParameterMode::SemiOutput
+                && let ExprNode::MVar { id } = argument.node()
+            {
+                // Unknown semi-outputs are query variables, not fresh query
+                // identities. Preserve repeated-variable equality, and never
+                // erase a known semi-output (which filters candidate matching).
+                let mut position = None;
+                for (index, previous) in semi_holes.iter().enumerate() {
+                    self.tick()?;
+                    if previous == id {
+                        position = Some(index);
+                        break;
+                    }
+                }
+                let index = position.unwrap_or(semi_holes.len());
+                if position.is_none() {
+                    semi_holes.push(id.clone());
+                }
+                let index = u32::try_from(index + 1)
+                    .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+                Expr::bvar(index).map_err(|_| failure(SourceInferenceError::Scope))?
             } else {
                 argument
             };
@@ -125,7 +147,10 @@ impl Context {
             prepared = Expr::app(prepared, selected);
             key = Expr::app(key, key_argument);
         }
-        if !matches!(self.instance_type(&telescope)?.node(), ExprNode::Sort { .. }) {
+        if !matches!(
+            self.instance_type(&telescope)?.node(),
+            ExprNode::Sort { .. }
+        ) {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         }
         Ok(Some(PreparedTarget {
@@ -164,7 +189,10 @@ mod tests {
                 ParameterMode::Input
             );
             let annotation = Expr::app(head, sort.clone());
-            assert_eq!(context.instance_parameter_mode(&annotation).unwrap(), expected);
+            assert_eq!(
+                context.instance_parameter_mode(&annotation).unwrap(),
+                expected
+            );
             assert_eq!(
                 context
                     .instance_parameter_mode(&Expr::app(annotation, sort.clone()))

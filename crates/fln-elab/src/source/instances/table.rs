@@ -37,7 +37,7 @@ fn ground(expr: &Expr) -> bool {
     !expr.has_expr_mvar() && !expr.has_level_mvar()
 }
 
-// A prepared target may differ from its ground original only at explicit
+// A prepared target may differ from its original only at explicit
 // output slots. Their fresh holes correspond to the top-level placeholders
 // introduced by prepare_instance_target, never to arbitrary unknown inputs.
 fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
@@ -53,7 +53,7 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
         context.tick()?;
         match (target.node(), shape.node()) {
             (ExprNode::App { f: tf, a: ta }, ExprNode::App { f: sf, a: sa }) => {
-                let output = matches!(sa.node(), ExprNode::BVar { idx: 0 })
+                let output = matches!(sa.node(), ExprNode::BVar { .. })
                     && matches!(ta.node(), ExprNode::MVar { .. });
                 if !output && (ta != sa || !ground(ta)) {
                     return Ok(false);
@@ -149,7 +149,8 @@ pub(super) enum Answer {
 #[derive(Clone)]
 struct Entry {
     answer: Answer,
-    // The fully instantiated selected target, not an inference template.
+    // Selected ground target for solved entries; key data for exhausted entries.
+    // Exhausted entries never replay this field as a typing equation.
     type_: Expr,
 }
 
@@ -178,8 +179,9 @@ impl GroundTable {
                 if stored == &key {
                     let usable = match &value.answer {
                         Answer::Solved(_) => replay_outputs(context, frame, &value.type_)?,
-                        // Negative answers do not summarize output selection.
-                        Answer::Exhausted => ground(&frame.target),
+                        // Only complete, answer-free enumeration creates this
+                        // entry. It is valid for the exact typed open query too.
+                        Answer::Exhausted => true,
                     };
                     return Ok(usable.then(|| value.answer.clone()));
                 }
@@ -211,17 +213,17 @@ impl GroundTable {
         )
     }
 
-    /// Called only after candidate enumeration is exhausted. Roots, open goals
-    /// and contexts with unresolved obligations are excluded by the same key
-    /// eligibility rule as positive answers. There is no entry for a resource
-    /// stop: those return immediately from search, before this boundary.
+    /// Called only after candidate enumeration is exhausted without an answer.
+    /// Running out of alternatives after an earlier successful answer is NOT
+    /// an empty result. Roots and ineligible open queries remain excluded, and
+    /// resource stops return from search before this publication boundary.
     pub(super) fn exhausted(
         &mut self,
         context: &mut Context,
         frame: &Frame,
         ancestors: &[Frame],
     ) -> Result<(), NatDefinitionElabError> {
-        if frame.returned || !ground(&frame.target) {
+        if frame.returned {
             return Ok(());
         }
         self.insert(
@@ -229,7 +231,7 @@ impl GroundTable {
             frame,
             ancestors,
             Answer::Exhausted,
-            frame.target.clone(),
+            frame.key.clone(),
         )
     }
 
@@ -359,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_output_slots_can_replay_and_failure_is_not_tabled() {
+    fn only_explicit_output_slots_can_replay_or_share_complete_exhaustion() {
         let mut context = context();
         let mut table = GroundTable::default();
         let path = [frame("Root")];
@@ -370,7 +372,11 @@ mod tests {
         target.key = Expr::app(constant("C"), Expr::bvar(0).unwrap());
         assert!(key(&mut context, &target, &path).unwrap().is_some());
         table.exhausted(&mut context, &target, &path).unwrap();
-        assert_eq!(table.entries, 0);
+        assert_eq!(table.entries, 1);
+        assert_eq!(
+            table.lookup(&mut context, &target, &path).unwrap(),
+            Some(Answer::Exhausted)
+        );
         target.key = target.target.clone();
         assert!(key(&mut context, &target, &path).unwrap().is_none());
         target.key = Expr::app(constant("C"), Expr::bvar(0).unwrap());
@@ -577,6 +583,65 @@ mod tests {
         context.txn.budget.max_heartbeats = 2;
         assert!(key(&mut context, &target, &path).is_err());
         assert_eq!(target.base.txn.mvars, before);
+        assert!(context.txn.mvars.is_empty());
+    }
+    #[test]
+    fn exhausted_output_queries_share_only_exact_typed_variants() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let path = [frame("Root")];
+        let first = open_outputs(&["x"], Expr::sort(Level::one()));
+        let renamed = open_outputs(&["y"], Expr::sort(Level::one()));
+        table.exhausted(&mut context, &first, &path).unwrap();
+        assert_eq!(
+            table.lookup(&mut context, &renamed, &path).unwrap(),
+            Some(Answer::Exhausted)
+        );
+        let different = open_outputs(&["y"], Expr::sort(Level::zero()));
+        assert!(
+            table
+                .lookup(&mut context, &different, &path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            table
+                .lookup(&mut context, &renamed, &[frame("Other")])
+                .unwrap()
+                .is_none()
+        );
+        assert!(context.txn.mvars.is_empty());
+    }
+
+    #[test]
+    fn running_out_of_alternatives_is_not_an_empty_search_result() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let path = [frame("Root")];
+        let mut target = open_outputs(&["x"], Expr::sort(Level::one()));
+        target.returned = true;
+        // The first answer might not have been inserted (e.g. the key was
+        // ineligible). Exhausting its continuation must not create a negative.
+        table.exhausted(&mut context, &target, &path).unwrap();
+        assert_eq!(table.entries, 0);
+        assert!(
+            table
+                .lookup(&mut context, &target, &path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn open_negative_key_exhaustion_publishes_nothing() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let target = open_outputs(&["x"], Expr::sort(Level::one()));
+        let path = [frame("Root")];
+        context.txn.budget.max_heartbeats = 3;
+        assert!(table.exhausted(&mut context, &target, &path).is_err());
+        assert!(table.answers.is_empty());
+        assert_eq!(table.entries, 0);
         assert!(context.txn.mvars.is_empty());
     }
 }
