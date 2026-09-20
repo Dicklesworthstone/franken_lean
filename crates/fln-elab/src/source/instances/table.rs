@@ -6,6 +6,8 @@
 //! each key. In particular, a dictionary selected below a cycle is not reused
 //! where that cycle is absent (which could select a higher-priority instance).
 //! Open goals, newly opened binders and pending equations remain untabled.
+//! Exhausted entries mean every candidate was tried under that exact key, not
+//! that a resource limit, cancellation or temporarily blocked input was seen.
 use super::*;
 use std::collections::HashMap;
 
@@ -69,11 +71,17 @@ fn key(
     }))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Answer {
+    Solved(Expr),
+    Exhausted,
+}
+
 #[derive(Default)]
 pub(super) struct GroundTable {
     // Hashing selects a bucket only. Equality checks the complete key; no
     // result depends on hash iteration order or hash collision resistance.
-    answers: HashMap<Expr, Vec<(Key, Expr)>>,
+    answers: HashMap<Expr, Vec<(Key, Answer)>>,
     entries: usize,
     key_units: usize,
 }
@@ -84,7 +92,7 @@ impl GroundTable {
         context: &mut Context,
         frame: &Frame,
         ancestors: &[Frame],
-    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+    ) -> Result<Option<Answer>, NatDefinitionElabError> {
         let Some(key) = key(context, frame, ancestors)? else {
             return Ok(None);
         };
@@ -106,7 +114,33 @@ impl GroundTable {
         ancestors: &[Frame],
         value: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        if self.entries >= MAX_ENTRIES || !ground(value) {
+        if !ground(value) {
+            return Ok(());
+        }
+        self.insert(context, frame, ancestors, Answer::Solved(value.clone()))
+    }
+
+    /// Called only after candidate enumeration is exhausted. Roots, open goals
+    /// and contexts with unresolved obligations are excluded by the same key
+    /// eligibility rule as positive answers. There is no entry for a resource
+    /// stop: those return immediately from search, before this boundary.
+    pub(super) fn exhausted(
+        &mut self,
+        context: &mut Context,
+        frame: &Frame,
+        ancestors: &[Frame],
+    ) -> Result<(), NatDefinitionElabError> {
+        self.insert(context, frame, ancestors, Answer::Exhausted)
+    }
+
+    fn insert(
+        &mut self,
+        context: &mut Context,
+        frame: &Frame,
+        ancestors: &[Frame],
+        answer: Answer,
+    ) -> Result<(), NatDefinitionElabError> {
+        if self.entries >= MAX_ENTRIES {
             return Ok(());
         }
         let Some(key) = key(context, frame, ancestors)? else {
@@ -124,7 +158,7 @@ impl GroundTable {
                 return Ok(());
             }
         }
-        bucket.push((key, value.clone()));
+        bucket.push((key, answer));
         self.entries += 1;
         self.key_units += units;
         Ok(())
@@ -172,7 +206,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             table.lookup(&mut context, &target, &path).unwrap(),
-            Some(value)
+            Some(Answer::Solved(value))
         );
         for other in [vec![], vec![frame("Root")], vec![frame("Root"), frame("B")]] {
             assert!(
@@ -188,6 +222,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn exhaustion_is_scoped_and_never_hides_open_goals() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let target = frame("C");
+        let path = [frame("Root"), frame("A")];
+        table.exhausted(&mut context, &target, &path).unwrap();
+        assert_eq!(
+            table.lookup(&mut context, &target, &path).unwrap(),
+            Some(Answer::Exhausted)
+        );
+        assert!(
+            table
+                .lookup(&mut context, &target, &[frame("Root")])
+                .unwrap()
+                .is_none()
+        );
+        let mut open = frame("C");
+        open.target = Expr::mvar(MVarId(Name::from_components(["open"])));
+        table.exhausted(&mut context, &open, &path).unwrap();
+        assert!(table.lookup(&mut context, &open, &path).unwrap().is_none());
+        assert_eq!(table.entries, 1);
+        let fresh = GroundTable::default();
+        assert!(
+            fresh
+                .lookup(&mut context, &target, &path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resource_exhaustion_never_publishes_a_negative_answer() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let target = frame("C");
+        let path = [frame("Root")];
+        context.tick().unwrap(); // A zero limit denotes an unlimited budget.
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed;
+        assert!(table.exhausted(&mut context, &target, &path).is_err());
+        assert_eq!(table.entries, 0);
+        assert!(table.answers.is_empty());
     }
 
     #[test]

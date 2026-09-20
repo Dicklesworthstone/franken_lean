@@ -531,9 +531,16 @@ impl Context {
                     if frames.len() >= MAX_SEARCH_DEPTH {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
-                    if let Some(value) = table.lookup(self, &child, &frames)? {
-                        self.assign_instance_answer(&child, value)?;
-                        continue;
+                    match table.lookup(self, &child, &frames)? {
+                        Some(table::Answer::Solved(value)) => {
+                            self.assign_instance_answer(&child, value)?;
+                            continue;
+                        }
+                        Some(table::Answer::Exhausted) => {
+                            self.retry_instance_choice(&mut frames, &mut history)?;
+                            continue;
+                        }
+                        None => {}
                     }
                     frames.push(child);
                     continue;
@@ -600,6 +607,7 @@ impl Context {
             let frame = &mut frames[index];
             let Some(candidate) = frame.candidates.get(frame.cursor).cloned() else {
                 let failed = frames.pop().expect("exhausted instance frame");
+                table.exhausted(self, &failed, &frames)?;
                 self.discard_instance_choices(failed, &mut history)?;
                 if frames.is_empty() {
                     return Ok(false);
