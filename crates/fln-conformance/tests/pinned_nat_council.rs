@@ -3189,6 +3189,219 @@ fn preflight_candidate_59_modules() {
     );
 }
 
+#[test]
+fn diagnose_candidate_modules() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let base_modules = [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/SizeOf",
+        "Init/Core",
+        "Init/BinderNameHint",
+        "Init/Control/MonadAttach",
+        "Init/Control/Basic",
+        "Init/Control/Id",
+        "Init/Control/Except",
+        "Init/Control/Reader",
+        "Init/Control/State",
+        "Init/Control/Lawful/MonadLift/Basic",
+        "Init/Data/PLift",
+        "Init/Data/ULift",
+        "Init/Data/Zero",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/LawfulHashable",
+        "Init/Data/Array/Set",
+        "Init/Data/Slice/Basic",
+        "Init/Data/Order/Classes",
+        "Init/Dynamic",
+        "Init/Try",
+        "Init/Data/NeZero",
+        "Init/Syntax",
+        "Init/Grind/Annotated",
+        "Init/Grind/Attr",
+        "Init/Grind/Lint",
+        "Init/Internal/Order/Tactic",
+        "Init/Sym/DSimp/DSimprocDSL",
+        "Init/Sym/Simp/SimprocDSL",
+        "Init/SimpLemmas",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
+        "Init/Control/Option",
+        "Init/Data/BitVec/BasicAux",
+        "Init/Data/Int/Basic",
+        "Init/Data/List/Notation",
+        "Init/Data/Option/Instances",
+        "Init/Grind/Cases",
+        "Init/WF",
+        "Init/WFTactics",
+        "Init/MetaTypes",
+        "Init/Control/Do",
+        "Init/Data/Nat/Div/Basic",
+        "Init/Data/List/Basic",
+        "Init/Data/ByteArray/Bootstrap",
+        "Init/Data/Int/DivMod/Basic",
+        "Init/Data/List/Scan/Basic",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Nat/Bitwise/Basic",
+        "Init/Task",
+        "Init/Data/Fin/Basic",
+        "Init/Data/Int/Bitwise/Basic",
+        "Init/Grind/Config",
+    ];
+
+    let mut env = Environment::new();
+    let mut available: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    for name in &base_modules {
+        let m = load(name);
+        for c in m.constants {
+            available.insert(c.name().clone());
+            env = env.add_decl(c).expect("add decl to env");
+        }
+    }
+    eprintln!("Preloaded 59-module base environment has {} constants", env.len());
+
+    let m = load("Init/Data/UInt/BasicAux");
+    eprintln!("Init/Data/UInt/BasicAux has {} declarations", m.constants.len());
+
+    let mut engine = Engine::from_environment(env.clone());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let mut remaining = m.constants.clone();
+    let mut step = 0;
+    while !remaining.is_empty() {
+        let idx = remaining.iter().position(|c| {
+            let mut exprs = vec![c.constant_val().type_.clone()];
+            match c {
+                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+                _ => {}
+            }
+            let mut ok = true;
+            for e in exprs {
+                let mut stack = vec![e];
+                while let Some(cur) = stack.pop() {
+                    match cur.node() {
+                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
+                            if !available.contains(cname) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        fln_core::expr::ExprNode::App { f, a } => {
+                            stack.push(f.clone());
+                            stack.push(a.clone());
+                        }
+                        fln_core::expr::ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | fln_core::expr::ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            stack.push(binder_type.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            stack.push(type_.clone());
+                            stack.push(value.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::Proj { expr, .. } => {
+                            stack.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            ok
+        });
+
+        let Some(pos) = idx else {
+            eprintln!("Cannot find next ready constant among {} remaining:", remaining.len());
+            for rem in &remaining {
+                eprintln!("  - {}", rem.name().to_display_string());
+            }
+            panic!("Deadlock in dependency resolution");
+        };
+
+        let c = remaining.remove(pos);
+        step += 1;
+        if c.name().to_display_string() != "UInt32.lt_ofNatLT_of_lt" {
+            let next_env = engine.environment().add_decl(c.clone()).unwrap_or_else(|e| panic!("failed to add {}: {e:?}", c.name().to_display_string()));
+            engine = Engine::from_environment(next_env);
+            available.insert(c.name().clone());
+            continue;
+        }
+
+        eprintln!("Step {step}/89: REACHED TARGET DECLARATION: {}", c.name().to_display_string());
+        eprintln!("  kind: {:?}", match &c {
+            ConstantInfo::Thm(_) => "Theorem",
+            ConstantInfo::Defn(_) => "Definition",
+            ConstantInfo::Axiom(_) => "Axiom",
+            ConstantInfo::Opaque(_) => "Opaque",
+            ConstantInfo::Ctor(_) => "Constructor",
+            ConstantInfo::Induct(_) => "Inductive",
+            ConstantInfo::Rec(_) => "Recursor",
+            ConstantInfo::Quot(_) => "Quotient",
+        });
+        eprintln!("  type: {:?}", c.constant_val().type_);
+        if let ConstantInfo::Thm(thm) = &c {
+            eprintln!("  thm value: {:?}", thm.value);
+        } else if let ConstantInfo::Defn(dfn) = &c {
+            eprintln!("  dfn value: {:?}", dfn.value);
+        }
+
+        eprintln!("Testing K1 (fln-kernel) admission...");
+        let k1_env = engine.environment().clone();
+        let k1_res = k1_env.add_decl(c.clone());
+        eprintln!("K1 result: {:?}", k1_res.is_ok());
+
+        eprintln!("Testing fln-checker admission in thread with 128MB stack...");
+        let c_clone = c.clone();
+        let checker_handle = std::thread::Builder::new()
+            .name("checker-test".to_string())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(move || {
+                let mut single_decoded = m.clone();
+                single_decoded.constants = vec![c_clone];
+                engine.check_decoded_olean(single_decoded, &KVMap::new(), limits)
+            })
+            .unwrap();
+        let res = checker_handle.join();
+        eprintln!("Thread with 128MB stack joined: {:?}", res.is_ok());
+        match res {
+            Ok(Ok(Outcome::Complete(_))) => eprintln!("128MB thread: COMPLETE!"),
+            Ok(Ok(Outcome::Inconclusive(r))) => eprintln!("128MB thread: INCONCLUSIVE: {r:?}"),
+            Ok(Ok(Outcome::InternalFault(f))) => eprintln!("128MB thread: FAULT: {f:?}"),
+            Ok(Err(e)) => eprintln!("128MB thread: ERROR: {e:?}"),
+            Err(_) => eprintln!("128MB thread: PANIC / ABORT"),
+        }
+        return;
+    }
+}
+
+
 
 
 

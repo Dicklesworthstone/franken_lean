@@ -487,6 +487,30 @@ struct Cursor {
 enum ReductionFrame {
     Projection(ProjectionFrame),
     Quotient(quotient::QuotientFrame),
+    Recursor(Box<RecursorFrame>),
+}
+
+struct RecursorFrame {
+    head: Cursor,
+    metadata: RecursorDeclaration,
+    level_parameters: Vec<WireName>,
+    recursor_type: WireExpr,
+    levels: Vec<LevelId>,
+    arguments: VecDeque<Cursor>,
+    major_index: usize,
+    parameter_count: usize,
+    prefix: usize,
+    delta_mode: DeltaMode,
+    unfolded_bindings: BTreeSet<usize>,
+    force_string_delta: bool,
+}
+
+enum RecursorStep {
+    Reduced(Cursor),
+    NormalizeMajor {
+        frame: Box<RecursorFrame>,
+        major: Cursor,
+    },
 }
 
 struct ProjectionFrame {
@@ -1081,6 +1105,14 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }))
             }
         }
+    }
+
+    fn reduce_demanded_nat_cursor(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
+        if !is_potential_nat_reduction(&cursor.arena, cursor.root) {
+            return Ok(cursor.clone());
+        }
+        let term = self.materialize_wire(&cursor.arena, cursor.root, WhnfPhase::Iota)?;
+        self.reduce_demanded_nat(term)
     }
 
     fn absorb_demanded_nat(
@@ -1945,6 +1977,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
     }
 
     /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
+    /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
     /// fires when its major premise reduces to a constructor of the recursor's
     /// inductive. The matching rule's right-hand side is instantiated with the
     /// recursor's levels and applied to the spine's parameters, motives, and
@@ -1953,29 +1986,24 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// arguments. Nat literal majors expose one compact constructor layer;
     /// structure-eta coercion reduces non-Prop structures; String literal
     /// majors remain unsupported.
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    fn finish_recursor_reduction(
+    fn apply_recursor_rule(
         &mut self,
         metadata: &RecursorDeclaration,
         level_parameters: &[WireName],
-        current: &Cursor,
+        head: &Cursor,
         levels: &[LevelId],
-        arguments: &mut VecDeque<Cursor>,
+        arguments: &VecDeque<Cursor>,
         major_index: usize,
         major: &Cursor,
         prefix: usize,
     ) -> Result<Option<Cursor>, Halt> {
-        let reduced_major = self.whnf_recursor_major(major)?;
-        // Even when iota stays stuck, retain reductions performed inside the
-        // major premise. Dropping them would report progress while returning
-        // the original recursor, causing defeq to unfold the same definition
-        // forever instead of reaching a stable stuck spine.
-        arguments[major_index] = reduced_major.clone();
         let (constructor_name, major_args) =
-            if let Some(parts) = self.nat_literal_constructor(metadata, &reduced_major)? {
+            if let Some(parts) = self.nat_literal_constructor(metadata, major)? {
                 parts
             } else {
-                let (major_head, major_args) = self.peel_application(&reduced_major)?;
+                let (major_head, major_args) = self.peel_application(major)?;
                 let ExprNode::Constant { name, .. } = self.node(&major_head)? else {
                     return Ok(None);
                 };
@@ -1996,11 +2024,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(None);
         }
         self.control
-            .reduction(current.root.index(), self.cancelled)?;
+            .reduction(head.root.index(), self.cancelled)?;
         let instantiated_rhs = match instantiate_term_parameters_from_level_roots_with(
             rule.rhs(),
             level_parameters,
-            current.arena.levels(),
+            head.arena.levels(),
             levels,
             self.control.budget.materialization,
             &mut *self.cancelled,
@@ -2008,13 +2036,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             InstantiationOutcome::Complete(term) => term,
             InstantiationOutcome::Refused(refusal) => {
                 return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at: head.root.index(),
                     refusal,
                 }));
             }
             InstantiationOutcome::Inconclusive(stop) => {
                 return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at: head.root.index(),
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
@@ -2022,7 +2050,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             }
             InstantiationOutcome::InternalFault(fault) => {
                 return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at: head.root.index(),
                     fault,
                 }));
             }
@@ -2079,15 +2107,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }))
     }
 
-    /// Try to reduce a recursor application sitting at a constant head with a
-    /// collected spine: the K corner first for a K-flagged recursor with a
-    /// stuck major, then the ordinary constructor fire. On a fire the whole
-    /// spine is consumed into the composed result and `arguments` is drained.
-    fn try_recursor_reduction(
+    /// Step recursor reduction: if the major premise is already a constructor,
+    /// fire the rule immediately. Otherwise, package the state into a heap-allocated
+    /// `RecursorFrame` to evaluate the major premise without native Rust recursion.
+    #[inline(never)]
+    fn step_recursor_reduction(
         &mut self,
         current: &Cursor,
         arguments: &mut VecDeque<Cursor>,
-    ) -> Result<Option<Cursor>, Halt> {
+    ) -> Result<Option<RecursorStep>, Halt> {
         let (name, levels) = match self.node(current)? {
             ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
             _ => return Ok(None),
@@ -2141,7 +2169,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let prefix = parameter_count
             .saturating_add(usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX))
             .saturating_add(usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX));
-        let Some(reduced) = self.finish_recursor_reduction(
+
+        if let Some(reduced) = self.apply_recursor_rule(
             &metadata,
             &level_parameters,
             current,
@@ -2150,12 +2179,26 @@ impl<'a, 'c> Reducer<'a, 'c> {
             major_index,
             &major,
             prefix,
-        )?
-        else {
-            return Ok(None);
-        };
-        arguments.clear();
-        Ok(Some(reduced))
+        )? {
+            arguments.clear();
+            return Ok(Some(RecursorStep::Reduced(reduced)));
+        }
+
+        let frame = Box::new(RecursorFrame {
+            head: current.clone(),
+            metadata,
+            level_parameters,
+            recursor_type,
+            levels,
+            arguments: std::mem::take(arguments),
+            major_index,
+            parameter_count,
+            prefix,
+            delta_mode: self.delta_mode,
+            unfolded_bindings: self.unfolded_bindings.clone(),
+            force_string_delta: self.force_string_delta,
+        });
+        Ok(Some(RecursorStep::NormalizeMajor { frame, major }))
     }
 
     /// KR-313 natural literal acceleration in the WHNF loop (type_checker.cpp:689).
@@ -2409,11 +2452,22 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         continue;
                     }
                     if !pending_arguments.is_empty()
-                        && let Some(reduced) =
-                            self.try_recursor_reduction(&current, &mut pending_arguments)?
+                        && let Some(step) =
+                            self.step_recursor_reduction(&current, &mut pending_arguments)?
                     {
-                        current = reduced;
-                        continue;
+                        match step {
+                            RecursorStep::Reduced(reduced) => {
+                                current = reduced;
+                                continue;
+                            }
+                            RecursorStep::NormalizeMajor { frame, major } => {
+                                frames.push(ReductionFrame::Recursor(frame));
+                                self.delta_mode = DeltaMode::Eager;
+                                self.force_string_delta = false;
+                                current = major;
+                                continue;
+                            }
+                        }
                     }
                 }
                 HeadAction::Apply => {
@@ -2502,6 +2556,72 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         // Preserve progress within a blocked major, but do not
                         // re-enter the same unchanged eliminator in a loop.
                         frame.arguments[frame.major] = current;
+                        current = self.compose_application(&frame.head, &frame.arguments)?;
+                        continue;
+                    }
+                    ReductionFrame::Recursor(mut frame) => {
+                        self.delta_mode = frame.delta_mode;
+                        self.unfolded_bindings = frame.unfolded_bindings;
+                        self.force_string_delta = frame.force_string_delta;
+
+                        let reduced_major = self.reduce_demanded_nat_cursor(&current)?;
+                        frame.arguments[frame.major_index] = reduced_major.clone();
+
+                        if let Some(reduced) = self.apply_recursor_rule(
+                            &frame.metadata,
+                            &frame.level_parameters,
+                            &frame.head,
+                            &frame.levels,
+                            &frame.arguments,
+                            frame.major_index,
+                            &reduced_major,
+                            frame.prefix,
+                        )? {
+                            current = reduced;
+                            continue 'normalize;
+                        }
+
+                        let mut alt_major = None;
+                        if frame.metadata.k() {
+                            if let Some(replacement) = self.recursor_major_to_nullary_constructor(
+                                &frame.level_parameters,
+                                &frame.recursor_type,
+                                &frame.head,
+                                &frame.levels,
+                                &frame.arguments,
+                                frame.major_index,
+                                frame.parameter_count,
+                            )? {
+                                alt_major = Some(replacement);
+                            }
+                        } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
+                            &frame.level_parameters,
+                            &frame.recursor_type,
+                            &frame.head,
+                            &frame.levels,
+                            &frame.arguments,
+                            frame.major_index,
+                        )? {
+                            alt_major = Some(replacement);
+                        }
+
+                        if let Some(alt_major) = alt_major {
+                            if let Some(reduced) = self.apply_recursor_rule(
+                                &frame.metadata,
+                                &frame.level_parameters,
+                                &frame.head,
+                                &frame.levels,
+                                &frame.arguments,
+                                frame.major_index,
+                                &alt_major,
+                                frame.prefix,
+                            )? {
+                                current = reduced;
+                                continue 'normalize;
+                            }
+                        }
+
+                        // Preserve progress within a blocked major:
                         current = self.compose_application(&frame.head, &frame.arguments)?;
                         continue;
                     }
