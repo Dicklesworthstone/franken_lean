@@ -1,4 +1,4 @@
-name: Native local recursion
+name: Native local recursion and monadic branches
 on:
   push:
     branches: [main]
@@ -13,7 +13,7 @@ jobs:
     if: >-
       github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): land checked native local recursion'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 50
     permissions:
       contents: write
     steps:
@@ -28,7 +28,7 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
           rustc -Vv
-      - name: Verify, test, and publish native local recursion
+      - name: Check and publish two native source increments
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -48,84 +48,88 @@ jobs:
                       print(line.decode(errors='replace'), end='', flush=True)
                   if process.wait():
                       raise RuntimeError('validation failed: ' + label)
-          expected = {
-              'crates/fln-cli/tests/source_check.rs': 'cd03b5ffa093e5225a4358b39adaf523f81669be',
-              'crates/fln-elab/src/source.rs': 'e514cd7c6c291d91ab95b9127e7d190e66883962',
-              'crates/fln-elab/src/source/local_functions.rs': '30d2b24bc91f035b313d7ea15c2d5926ea34af08',
-              'crates/fln-elab/src/source/patterns.rs': 'c6c96a47ac85170f975469d27920ca66770dac6c',
-              'crates/fln-elab/src/source/recursion.rs': '45db4fc0910f8b1043ca42a5d8687ec531b13215',
-              'crates/fln-elab/src/source/tactics/backtrack.rs': '0e803b572af79ed826f765460e5c15e19864404f',
-              'crates/fln-parse/src/lib.rs': '5f47ad583e1567780853e8bb58ef3d7f06614e85',
-              'crates/fln-parse/src/matching.rs': 'b2e6ad8ba45e0bf37d3ee733a31768dc8cc03b80',
-              'crates/fln-parse/tests/local_recursion.rs': 'c26b7f83947fe620eb07073610dac4fe4e5dfad5',
-              'crates/fln/tests/source_local_recursion.rs': '190ac5daf6095c5954abc6a7e42193bcc4cf6ce4',
-              'crates/fln/tests/source_record_literals.rs': '22700f609d0d0ca9232836d448871bb6ff9c21f4',
-              'docs/NATIVE_LOCAL_RECURSION.md': 'ff5914f9e75595d1902ccf5f7a83a1b3a598aa9c',
-              'examples/native_local_recursion.lean': '2951909ff356bc752630c41ef585bff7ea8393bd',
+          def decode(shas, digest, label):
+              chunks = []
+              for sha in shas:
+                  req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      data = json.load(response)
+                  assert data['encoding'] == 'base64'
+                  content = base64.b64decode(data['content'])
+                  assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
+                  chunks.append(content)
+              patch = lzma.decompress(base64.b64decode(b''.join(chunks), validate=True))
+              assert hashlib.sha256(patch).hexdigest() == digest
+              assert '\ndeleted file mode ' not in patch.decode()
+              file = evidence / (label + '.patch')
+              file.write_bytes(patch)
+              return file
+          recursive_paths = {
+              'crates/fln-cli/tests/source_check.rs',
+              'crates/fln-elab/src/source.rs',
+              'crates/fln-elab/src/source/local_functions.rs',
+              'crates/fln-elab/src/source/patterns.rs',
+              'crates/fln-elab/src/source/recursion.rs',
+              'crates/fln-elab/src/source/tactics/backtrack.rs',
+              'crates/fln-parse/src/lib.rs',
+              'crates/fln-parse/src/matching.rs',
+              'crates/fln-parse/tests/local_recursion.rs',
+              'crates/fln/tests/source_local_recursion.rs',
+              'crates/fln/tests/source_record_literals.rs',
+              'docs/NATIVE_LOCAL_RECURSION.md',
+              'examples/native_local_recursion.lean',
           }
-          chunks = []
-          for sha in ['f5feb0a8b27fc91c9deae1b05dad360065972455', 'ba71a80586059d7c16c521d5f6968d485c03e49b', '0cc75a2f2cd1611f4f53c48f8840c8950188b3e8', '0fb161c37784316aad7459da56637ee6fe9483d5']:
-              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  data = json.load(response)
-              assert data['encoding'] == 'base64'
-              content = base64.b64decode(data['content'])
-              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
-              chunks.append(content)
-          patch = lzma.decompress(base64.b64decode(b''.join(chunks), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '85f72fc5c4aa72dc9a16fcd5ecef6d3d4cb24f6227e87bd3ffa11f6ec91cec41'
-          assert '\ndeleted file mode ' not in patch.decode()
-          (evidence / 'implementation.patch').write_bytes(patch)
-          (evidence / 'base.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
-          assert not output('git', 'status', '--porcelain')
-          run('git', 'apply', '--index', '--whitespace=error', str(evidence / 'implementation.patch'))
-          assert sorted(output('git', 'diff', '--cached', '--name-only').splitlines()) == sorted(expected)
-          for path, sha in expected.items():
-              assert output('git', 'hash-object', path) == sha, 'concurrent edit: ' + path
-          # The first run exposed E0716 in the independently landed application-
-          # head test: the admission capability borrows its base environment.
-          # Preserve that lifetime instead of bypassing the new regression suite.
-          test = 'crates/fln-elab/tests/native_unification_application_head.rs'
-          assert output('git', 'hash-object', test) == 'fb6738ae7cb9c07cc57cf0e396bb76aed047dce6'
-          repair = '\n'.join([
-              'diff --git a/' + test + ' b/' + test,
-              '--- a/' + test, '+++ b/' + test,
-              '@@ -50,8 +50,9 @@ fn budget() -> UnificationBudget {',
-              ' fn transaction() -> ElabTxn {',
-              '     // The opaque Nat bootstrap supports literals, not constructor names.',
-              '     // These tests need the real inductive block, admitted through K1.',
-              '+    let environment = Environment::new();',
-              '     let Outcome::Complete(admitted) = admit(',
-              '-        &Environment::new(),', '+        &environment,',
-              '         fln_elab::seed::nat_inductive_seed_declaration(),',
-              '         budget().kernel,', '     ) else {', '',
-          ])
-          (evidence / 'lifetime.patch').write_text(repair)
-          run('git', 'apply', '--index', '--whitespace=error', str(evidence / 'lifetime.patch'))
-          expected[test] = output('git', 'hash-object', test)
-          assert sorted(output('git', 'diff', '--cached', '--name-only').splitlines()) == sorted(expected)
+          repairs = {
+              'crates/fln-elab/tests/native_unification_application_head.rs',
+              'crates/fln/src/runtime/specialize.rs',
+              'crates/fln/tests/source_instances.rs',
+          }
+          conditional_paths = {
+              'crates/fln-elab/src/source/do_notation.rs',
+              'crates/fln-parse/src/lib.rs',
+              'crates/fln-parse/src/matching.rs',
+              'crates/fln-parse/src/term_do.rs',
+              'crates/fln-parse/tests/do_notation.rs',
+              'crates/fln/src/runtime.rs',
+              'crates/fln/tests/source_do.rs',
+              'docs/NATIVE_DO_NOTATION.md',
+          }
+          recursion = decode(['f5feb0a8b27fc91c9deae1b05dad360065972455', 'ba71a80586059d7c16c521d5f6968d485c03e49b', '0cc75a2f2cd1611f4f53c48f8840c8950188b3e8', '0fb161c37784316aad7459da56637ee6fe9483d5'], '85f72fc5c4aa72dc9a16fcd5ecef6d3d4cb24f6227e87bd3ffa11f6ec91cec41', 'recursion')
+          repair = decode(['0fb7de6516c770ecaed4c7cc94bd9d496e0ef8a4'], '0186d36f2b5b827a31d0bb63526d916f9f15cd841dab4e3fb0552c81d84e4549', 'repairs')
+          conditional = decode(['e2bc5679aa560167b87ceffa7d11610368d0da13'], '92b8f1661664341dbad766a2e3a0e614883ea7339f2f092cbb32ff1778b9c5ec', 'conditional')
           def validate(prefix):
-              checked(prefix + 'frontend-and-engine', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '--no-fail-fast')
+              checked(prefix + 'tests', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '--no-fail-fast')
               checked(prefix + 'installed', 'cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check', 'installed_local_recursion_checks_runs_and_replays_without_partial_publication')
               checked(prefix + 'clippy', 'cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings')
               checked(prefix + 'workspace', 'cargo', 'check', '--locked', '--workspace', '--all-targets')
               run('git', 'diff', '--check')
               run('git', 'diff', '--cached', '--check')
-          validate('')
           run('git', 'config', 'user.name', 'github-actions[bot]')
           run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
-          run('git', 'commit', '-m', 'feat(source): support checked local structural recursion and native execution', '-m', 'Recover lexical captures, nested helpers, dependent results, structural-column retries and newline syntax. Includes source/VM/FLBC and scope-refusal regressions. Preserve the borrowed base lifetime in the concurrent application-head test. Parser/elaborator/engine tests, installed regression, scoped Clippy and workspace compilation passed before publication. No new axiom or kernel rule; fln-qb5 remains open.')
-          for attempt in range(4):
-              if subprocess.run(['git', 'push', 'origin', 'HEAD:main']).returncode == 0:
-                  (evidence / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
-                  break
-              run('git', 'fetch', 'origin', 'main')
-              previous = output('git', 'rev-parse', 'HEAD')
-              run('git', 'rebase', 'origin/main')
-              assert output('git', 'rev-parse', 'HEAD') != previous
-              validate('rebase-' + str(attempt + 1) + '-')
-          else:
-              raise RuntimeError('publication retry limit reached')
+          phases = [
+              ([recursion, repair], recursive_paths | repairs, 'feat(source): support checked local structural recursion and native execution'),
+              ([conditional], conditional_paths, 'feat(source): check and execute terminal monadic conditional branches'),
+          ]
+          for phase, (patches, paths, message) in enumerate(phases, 1):
+              assert not output('git', 'status', '--porcelain')
+              (evidence / ('base-' + str(phase) + '.txt')).write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+              for patch in patches:
+                  run('git', 'apply', '--index', '--whitespace=error', str(patch))
+              assert set(output('git', 'diff', '--cached', '--name-only').splitlines()) == paths
+              (evidence / ('manifest-' + str(phase) + '.json')).write_text(json.dumps({p:output('git', 'hash-object', p) for p in sorted(paths)}, indent=2))
+              validate(str(phase) + '-')
+              run('git', 'commit', '-m', message, '-m', 'Identity-verified native implementation with source and execution regressions. Parser, elaborator and engine package tests, installed local-recursion test, scoped all-target Clippy and workspace compilation passed before publication. Preserve K1 and independent-checker authority; no new axioms or Reference fallback. fln-qb5 remains open.')
+              for attempt in range(4):
+                  if subprocess.run(['git', 'push', 'origin', 'HEAD:main']).returncode == 0:
+                      (evidence / ('published-' + str(phase) + '.txt')).write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+                      break
+                  run('git', 'fetch', 'origin', 'main')
+                  previous = output('git', 'rev-parse', 'HEAD')
+                  run('git', 'rebase', 'origin/main')
+                  assert output('git', 'rev-parse', 'HEAD') != previous
+                  validate(str(phase) + '-rebase-' + str(attempt + 1) + '-')
+              else:
+                  raise RuntimeError('publication retry limit reached')
       - name: Retain exact source and results
         if: always()
         shell: bash
