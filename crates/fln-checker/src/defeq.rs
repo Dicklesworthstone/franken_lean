@@ -2617,6 +2617,37 @@ fn eta_candidate(
                 .ok_or_else(|| control.bound_index(u64::MAX))?;
             inside = eta_visible(child(inside, *body)?, sources, control, cancelled)?;
         }
+        let sources = TermSources::new(left, right, generated);
+        let inside_term = sources.source(inside)?;
+        let budget = control.begin_normalization(cancelled)?;
+        match whnf_at_with(inside_term, inside.root, context, budget, cancelled) {
+            WhnfOutcome::Complete(result) => {
+                control.absorb_whnf(&result, cancelled)?;
+                if result.reductions != 0 {
+                    inside = retain_generated(generated, lambda.side(), result.term);
+                }
+            }
+            WhnfOutcome::Refused(refusal) => {
+                return Err(SlowHalt::Refusal {
+                    side: inside.side(),
+                    refusal: Box::new(refusal),
+                    progress: Box::new(control.progress),
+                });
+            }
+            WhnfOutcome::Inconclusive(stop) => {
+                return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+                    side: inside.side(),
+                    stop,
+                    progress: control.progress,
+                })));
+            }
+            WhnfOutcome::InternalFault(fault) => {
+                return Err(SlowHalt::Fault(DefEqFault::Whnf {
+                    side: inside.side(),
+                    fault,
+                }));
+            }
+        }
         for index in 0..width {
             let sources = TermSources::new(left, right, generated);
             let term = sources.source(inside)?;

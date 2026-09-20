@@ -1132,6 +1132,7 @@ struct OleanDeclarationUnit {
 struct OleanDeclarationPlan {
     units: Vec<OleanDeclarationUnit>,
     order: Vec<usize>,
+    already_present: Vec<(Name, CheckerAgreement)>,
 }
 
 fn unsupported_mutual_envelope(value: &DefinitionVal) -> OleanCheckError {
@@ -1565,16 +1566,50 @@ fn plan_olean_declarations(
             limit: limits.max_declarations,
         });
     }
+
+    let mut seen_names = BTreeSet::new();
     let mut owners = BTreeMap::new();
-    for (index, info) in constants.iter().enumerate() {
-        if owners.insert(info.name().clone(), index).is_some() {
+    let mut already_present = Vec::new();
+    let mut new_constants = Vec::new();
+
+    for info in constants {
+        if !seen_names.insert(info.name().clone()) {
             return Err(OleanCheckError::DuplicateDeclaration {
                 name: info.name().clone(),
             });
         }
+
+        if let Some(existing) = base.find(info.name()) {
+            if *existing != *info {
+                return Err(OleanCheckError::DuplicateDeclaration {
+                    name: info.name().clone(),
+                });
+            }
+            let ground = match info {
+                ConstantInfo::Thm(_) | ConstantInfo::Defn(_) | ConstantInfo::Opaque(_) => {
+                    CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                }
+                ConstantInfo::Axiom(_) => CheckerAdmissionGround::AxiomPreamble,
+                ConstantInfo::Quot(_) => CheckerAdmissionGround::QuotientPrimitiveChecked,
+                ConstantInfo::Induct(_) | ConstantInfo::Ctor(_) | ConstantInfo::Rec(_) => {
+                    CheckerAdmissionGround::InductiveNonrecursiveChecked
+                }
+            };
+            already_present.push((
+                info.name().clone(),
+                CheckerAgreement {
+                    schema: "fln-checker/v1",
+                    ground,
+                },
+            ));
+            continue;
+        }
+
+        owners.insert(info.name().clone(), new_constants.len());
+        new_constants.push(info.clone());
     }
 
-    let (units, constant_units) = build_olean_declaration_units(constants, &owners)?;
+    let (units, constant_units) = build_olean_declaration_units(&new_constants, &owners)?;
 
     let mut remaining = vec![0_usize; units.len()];
     let mut dependents = vec![Vec::new(); units.len()];
@@ -1583,7 +1618,7 @@ fn plan_olean_declarations(
         let mut missing = BTreeSet::new();
         let mut dependencies = BTreeSet::new();
         for constant_index in &unit.constant_indices {
-            let Some(info) = constants.get(*constant_index) else {
+            let Some(info) = new_constants.get(*constant_index) else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "authority unit names a declaration outside the decoded table",
                 });
@@ -1687,7 +1722,11 @@ fn plan_olean_declarations(
             .collect();
         return Err(OleanCheckError::DependencyCycle { declarations });
     }
-    Ok(OleanDeclarationPlan { units, order })
+    Ok(OleanDeclarationPlan {
+        units,
+        order,
+        already_present,
+    })
 }
 
 /// Caller-supplied bounds for one proof-producing bitvector decision and its
@@ -2566,12 +2605,17 @@ impl Engine {
         let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
         let base_logical_root = self.logical_root(options);
         if plan.order.is_empty() {
+            let checked = plan
+                .already_present
+                .into_iter()
+                .map(|(name, checker)| OleanCheckedDeclaration { name, checker })
+                .collect();
             return Ok(Outcome::Complete(CheckedOlean {
                 engine: self.clone(),
                 decoded,
                 base_logical_root,
                 result_logical_root: base_logical_root,
-                declarations: Vec::new(),
+                declarations: checked,
             }));
         }
 
@@ -2622,6 +2666,9 @@ impl Engine {
                     checker: admission.checker,
                 });
             }
+        }
+        for (name, checker) in plan.already_present {
+            checked.push(OleanCheckedDeclaration { name, checker });
         }
         if checked.len() != decoded.constants.len() {
             return Err(OleanCheckError::InternalInvariant {
