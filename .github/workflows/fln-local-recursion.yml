@@ -11,7 +11,7 @@ concurrency:
 jobs:
   local-recursion:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): land checked native local recursion'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): finish checked monadic branch publication'
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
@@ -28,7 +28,7 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
           rustc -Vv
-      - name: Check and publish two native source increments
+      - name: Check and publish the remaining native source increment
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -64,26 +64,6 @@ jobs:
               file = evidence / (label + '.patch')
               file.write_bytes(patch)
               return file
-          recursive_paths = {
-              'crates/fln-cli/tests/source_check.rs',
-              'crates/fln-elab/src/source.rs',
-              'crates/fln-elab/src/source/local_functions.rs',
-              'crates/fln-elab/src/source/patterns.rs',
-              'crates/fln-elab/src/source/recursion.rs',
-              'crates/fln-elab/src/source/tactics/backtrack.rs',
-              'crates/fln-parse/src/lib.rs',
-              'crates/fln-parse/src/matching.rs',
-              'crates/fln-parse/tests/local_recursion.rs',
-              'crates/fln/tests/source_local_recursion.rs',
-              'crates/fln/tests/source_record_literals.rs',
-              'docs/NATIVE_LOCAL_RECURSION.md',
-              'examples/native_local_recursion.lean',
-          }
-          repairs = {
-              'crates/fln-checker/src/defeq.rs',
-              'crates/fln/src/runtime/specialize.rs',
-              'crates/fln/tests/source_instances.rs',
-          }
           conditional_paths = {
               'crates/fln-elab/src/source/do_notation.rs',
               'crates/fln-parse/src/lib.rs',
@@ -94,8 +74,8 @@ jobs:
               'crates/fln/tests/source_do.rs',
               'docs/NATIVE_DO_NOTATION.md',
           }
-          recursion = decode(['f5feb0a8b27fc91c9deae1b05dad360065972455', 'ba71a80586059d7c16c521d5f6968d485c03e49b', '0cc75a2f2cd1611f4f53c48f8840c8950188b3e8', '0fb161c37784316aad7459da56637ee6fe9483d5'], '85f72fc5c4aa72dc9a16fcd5ecef6d3d4cb24f6227e87bd3ffa11f6ec91cec41', 'recursion')
-          repair = decode(['90efd71c34f866d8d868c5e58cbdc0f95602ec09'], 'b3e487b49662ba85f6985e5309bd292eaf77fbc186e4e769de7c15626a7f048d', 'repairs')
+          # The recursion increment is already on main as 7388e436. Resume only
+          # the second increment interrupted by the prior run's time limit.
           conditional = decode(['e2bc5679aa560167b87ceffa7d11610368d0da13'], '92b8f1661664341dbad766a2e3a0e614883ea7339f2f092cbb32ff1778b9c5ec', 'conditional')
           def validate(prefix):
               checked(prefix + 'tests', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '--no-fail-fast')
@@ -107,10 +87,9 @@ jobs:
           run('git', 'config', 'user.name', 'github-actions[bot]')
           run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
           phases = [
-              ([recursion, repair], recursive_paths | repairs, 'feat(source): support checked local structural recursion and native execution'),
               ([conditional], conditional_paths, 'feat(source): check and execute terminal monadic conditional branches'),
           ]
-          for phase, (patches, paths, message) in enumerate(phases, 1):
+          for phase, (patches, paths, message) in enumerate(phases, 2):
               assert not output('git', 'status', '--porcelain')
               (evidence / ('base-' + str(phase) + '.txt')).write_text(output('git', 'rev-parse', 'HEAD') + '\n')
               for patch in patches:
@@ -118,7 +97,7 @@ jobs:
               assert set(output('git', 'diff', '--cached', '--name-only').splitlines()) == paths
               (evidence / ('manifest-' + str(phase) + '.json')).write_text(json.dumps({p:output('git', 'hash-object', p) for p in sorted(paths)}, indent=2))
               validate(str(phase) + '-')
-              run('git', 'commit', '-m', message, '-m', 'Identity-verified native implementation with source and execution regressions. Parser, elaborator and engine package tests, installed local-recursion test, scoped all-target Clippy and workspace compilation passed before publication. Preserve K1 and independent-checker authority; no new axioms or Reference fallback. fln-qb5 remains open.')
+              run('git', 'commit', '-m', message, '-m', 'Resume the hash-verified terminal do-conditional increment after the preceding local-recursion increment reached main. Preserve current instance-attribute, calc, kernel and conformance work. Parser, elaborator and engine package tests, installed local-recursion test, scoped all-target Clippy and workspace compilation passed before publication. Preserve K1 and independent-checker authority; no new axioms or Reference fallback. fln-qb5 remains open.')
               for attempt in range(4):
                   if subprocess.run(['git', 'push', 'origin', 'HEAD:main']).returncode == 0:
                       (evidence / ('published-' + str(phase) + '.txt')).write_text(output('git', 'rev-parse', 'HEAD') + '\n')
