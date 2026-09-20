@@ -1,6 +1,7 @@
 //! Native calculations over binary relations. Every written step remains an
 //! annotated let in the final candidate, even when conversion could ignore its
-//! proof. Equality transport uses ordinary Eq.rec and grants no admission.
+//! proof. Composition uses Eq.rec or a synthesized Trans.trans application;
+//! neither path grants admission.
 use super::*;
 
 pub(super) struct Build<'a> {
@@ -110,9 +111,17 @@ impl Context {
             // Only adjacent written endpoints constrain continuation holes.
             // The expected result is checked after composition, not mined for
             // endpoints: relations may be heterogeneous or reverse arguments.
-            self.equations
-                .push(SourceEquation::selection(current.left, previous.right));
-            self.flush(true)?;
+            if let (Some(left_type), Some(right_type)) = (
+                self.known_type(&current.left)?,
+                self.known_type(&previous.right)?,
+            ) {
+                self.constrain_type(&left_type, &right_type)?;
+            }
+            // Do not delegate this obligation to final admission: a relation
+            // can erase its endpoints. Unlike instance selection, calculation
+            // endpoints permit ordinary safe-definition conversion.
+            self.unify_source_batch(&[(current.left, previous.right)], true)
+                .map_err(|error| failure(SourceInferenceError::Unification(Box::new(error))))?;
         }
         self.instantiate(&target)
     }
@@ -164,7 +173,12 @@ impl Context {
             } else if let Some(equality) = tactics::equality_target(&previous_type) {
                 (equality, next_relation, next.value.clone(), true)
             } else {
-                return Err(invalid());
+                return self.compose_relation_calculation(
+                    previous,
+                    next,
+                    previous_relation,
+                    next_relation,
+                );
             };
         let (level, alpha, base, end) = equality;
         let endpoint_name = self.fresh_name()?;
@@ -223,8 +237,86 @@ impl Context {
                 Expr::app,
             );
         Ok(Typed {
-            value: if backwards { Expr::app(value, proof) } else { value },
+            value: if backwards {
+                Expr::app(value, proof)
+            } else {
+                value
+            },
             type_: result,
+        })
+    }
+
+    /// Consume exactly one formal argument, including implicit parameters.
+    /// Universe and argument-type constraints come from the admitted operation's
+    /// telescope, not a second, hard-coded declaration of Trans.trans.
+    fn calculation_argument(
+        &mut self,
+        function: Typed,
+        argument: Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let type_ = self.whnf(&function.type_)?;
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = type_.node()
+        else {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        };
+        let actual = self
+            .known_type(&argument)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        self.constrain_type(&actual, binder_type)?;
+        Ok(Typed {
+            value: Expr::app(function.value, argument.clone()),
+            type_: self.substitute(body, &argument)?,
+        })
+    }
+
+    /// The output relation is an outParam of Trans. It must be selected by
+    /// instance search, not guessed from the final goal (which can reverse or
+    /// unfold the written relation). The resulting dictionary remains in the
+    /// proof term and is checked again by the ordinary declaration gate.
+    fn compose_relation_calculation(
+        &mut self,
+        previous: Typed,
+        next: Typed,
+        left: Relation,
+        right: Relation,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let mut function = self.constant(&Name::from_components(["Trans", "trans"]))?;
+        for endpoint in [&left.left, &left.right, &right.right] {
+            let type_ = self
+                .known_type(endpoint)?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            function = self.calculation_argument(function, type_)?;
+        }
+        for relation in [left.head, right.head] {
+            function = self.calculation_argument(function, relation)?;
+        }
+        // The output relation and dictionary are still ordinary typed holes.
+        // Only the dictionary uses synthetic-opaque assignment authority.
+        for dictionary in [false, true] {
+            let type_ = self.whnf(&function.type_)?;
+            let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+                return Err(failure(SourceInferenceError::ExpectedFunction));
+            };
+            let argument = if dictionary {
+                self.instance_hole(binder_type.clone())?
+            } else {
+                self.hole(binder_type.clone())?
+            };
+            function = self.calculation_argument(function, argument)?;
+        }
+        for argument in [left.left, left.right, right.right, previous.value, next.value] {
+            function = self.calculation_argument(function, argument)?;
+        }
+        // An unresolved dictionary is not transitivity evidence. In particular,
+        // a missing instance cannot leave an invented output relation behind.
+        self.resolve_instances(true)?;
+        self.flush(true)?;
+        let (type_, _) = self.calculation_relation(&function.type_)?;
+        Ok(Typed {
+            value: self.instantiate(&function.value)?,
+            type_,
         })
     }
 
