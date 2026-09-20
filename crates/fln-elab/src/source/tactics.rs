@@ -18,6 +18,7 @@ mod equality;
 mod index_equations;
 mod refine;
 mod rewrite;
+mod search;
 pub(in crate::source) use refine::RefinementFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,6 +726,12 @@ impl Context {
                     goal,
                     apply: false,
                 });
+            } else if kind == &parser_kind(&["Tactic", "solve_by_elim"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "solve_by_elim", "local proof search tactic")?;
+                self.solve_by_elim_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
