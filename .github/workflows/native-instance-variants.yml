@@ -36,7 +36,8 @@ jobs:
           git rev-parse HEAD > target/instance-variants/commit.txt
           git rev-parse 'HEAD^{tree}' > target/instance-variants/base-tree.txt
       - name: Prepare exact locally tested integration patch
-        if: startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
+        if: >-
+          startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -116,7 +117,8 @@ jobs:
           printf 'clippy=%s workspace=%s\n' "$a" "$b" | tee target/instance-variants/checks.txt
           test "$a" -eq 0 && test "$b" -eq 0
       - name: Export verified Git objects without changing any ref
-        if: success() && startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
+        if: >-
+          success() && startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
