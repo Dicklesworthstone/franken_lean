@@ -5,7 +5,9 @@
 //! Exact local declarations and the active cycle-detection path are part of
 //! each key. In particular, a dictionary selected below a cycle is not reused
 //! where that cycle is absent (which could select a higher-priority instance).
-//! Open goals, newly opened binders and pending equations remain untabled.
+//! Open original goals, newly opened binders and pending equations remain
+//! untabled. Fixed output goals can share a solved answer, but must replay the
+//! prepared output-hole equations transactionally before using it.
 //! Exhausted entries mean every candidate was tried under that exact key, not
 //! that a resource limit, cancellation or temporarily blocked input was seen.
 use super::*;
@@ -31,6 +33,60 @@ fn ground(expr: &Expr) -> bool {
     !expr.has_expr_mvar() && !expr.has_level_mvar()
 }
 
+// A prepared target may differ from its ground original only at explicit
+// output slots. Their fresh holes correspond to the top-level placeholders
+// introduced by prepare_instance_target, never to arbitrary unknown inputs.
+fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
+    if ground(&frame.target) {
+        return Ok(true);
+    }
+    if !ground(&frame.key) {
+        return Ok(false);
+    }
+    let mut target = &frame.target;
+    let mut shape = &frame.key;
+    loop {
+        context.tick()?;
+        match (target.node(), shape.node()) {
+            (ExprNode::App { f: tf, a: ta }, ExprNode::App { f: sf, a: sa }) => {
+                let output = matches!(sa.node(), ExprNode::BVar { idx: 0 })
+                    && matches!(ta.node(), ExprNode::MVar { .. });
+                if !output && (ta != sa || !ground(ta)) {
+                    return Ok(false);
+                }
+                target = tf;
+                shape = sf;
+            }
+            _ => return Ok(target == shape && ground(target)),
+        }
+    }
+}
+
+fn replay_outputs(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
+    if ground(&frame.target) {
+        return Ok(true);
+    }
+    // This is after selection of a previously completed answer at this exact
+    // expected type. It must not feed known outputs into candidate selection.
+    let mut trial = context.clone();
+    trial.equations.push(SourceEquation::selection(
+        frame.expected.clone(),
+        frame.target.clone(),
+    ));
+    let result = trial.flush(true);
+    context.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+    match result {
+        Ok(()) => {
+            *context = trial;
+            Ok(true)
+        }
+        // A replay that cannot reconstruct the assignments is merely a cache
+        // miss. Drop all speculative state, but never refund its charged work.
+        Err(error) if nonmatch(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn key(
     context: &mut Context,
     frame: &Frame,
@@ -38,14 +94,14 @@ fn key(
 ) -> Result<Option<Key>, NatDefinitionElabError> {
     context.tick()?;
     // The root may have a forced default-instance candidate. Never table it.
-    // Requiring the prepared target to be ground also excludes the fresh
-    // output holes whose assignments a shortcut would otherwise have to replay.
     if ancestors.is_empty()
         || !frame.binders.is_empty()
         || !frame.base.equations.is_empty()
         || !ground(&frame.expected)
-        || !ground(&frame.target)
     {
+        return Ok(None);
+    }
+    if !replayable_target(context, frame)? {
         return Ok(None);
     }
     let locals = &frame.base.txn.lctx;
@@ -100,7 +156,12 @@ impl GroundTable {
             for (stored, value) in bucket {
                 context.tick()?;
                 if stored == &key {
-                    return Ok(Some(value.clone()));
+                    let usable = match value {
+                        Answer::Solved(_) => replay_outputs(context, frame)?,
+                        // Negative answers do not summarize output selection.
+                        Answer::Exhausted => ground(&frame.target),
+                    };
+                    return Ok(usable.then(|| value.clone()));
                 }
             }
         }
@@ -130,6 +191,9 @@ impl GroundTable {
         frame: &Frame,
         ancestors: &[Frame],
     ) -> Result<(), NatDefinitionElabError> {
+        if !ground(&frame.target) {
+            return Ok(());
+        }
         self.insert(context, frame, ancestors, Answer::Exhausted)
     }
 
@@ -253,6 +317,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_explicit_output_slots_can_replay_and_failure_is_not_tabled() {
+        let mut context = context();
+        let mut table = GroundTable::default();
+        let path = [frame("Root")];
+        let mut target = frame("C");
+        let hole = Expr::mvar(MVarId(Name::from_components(["output"])));
+        target.expected = Expr::app(constant("C"), constant("Nat"));
+        target.target = Expr::app(constant("C"), hole.clone());
+        target.key = Expr::app(constant("C"), Expr::bvar(0).unwrap());
+        assert!(key(&mut context, &target, &path).unwrap().is_some());
+        table.exhausted(&mut context, &target, &path).unwrap();
+        assert_eq!(table.entries, 0);
+        target.key = target.target.clone();
+        assert!(key(&mut context, &target, &path).unwrap().is_none());
+        target.key = Expr::app(constant("C"), Expr::bvar(0).unwrap());
+        target.expected = Expr::app(constant("C"), hole);
+        assert!(key(&mut context, &target, &path).unwrap().is_none());
     }
 
     #[test]

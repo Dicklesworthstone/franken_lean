@@ -144,3 +144,40 @@ theorem leftValue : result.left = 2 := by rfl
 theorem rightValue : result.right = 3 := by rfl"#,
     );
 }
+
+#[test]
+fn fixed_output_parameter_prerequisites_replay_their_fresh_output_assignments() {
+    let mut source = String::from(
+        "class Out0 (A : outParam Type) where\n  value : A\ninstance out0 : Out0 Nat := Out0.mk 7\n",
+    );
+    for depth in 1..=12 {
+        let previous = depth - 1;
+        source.push_str(&format!(
+            "class Out{depth} (A : outParam Type) where\n  value : A\ninstance out{depth} [first : Out{previous} Nat] [second : Out{previous} Nat] : Out{depth} Nat := Out{depth}.mk first.value\n"
+        ));
+    }
+    let base = checked(&engine(), &source);
+    checked(
+        &base,
+        "def result : Out12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+    );
+}
+
+#[test]
+fn output_answer_replay_does_not_turn_output_parameters_into_input_filters() {
+    let base = checked(
+        &engine(),
+        r#"class Transfer (A : Type) (B : outParam Type) where
+  convert : A -> B
+instance (priority := 500) boolean : Transfer Nat Bool := Transfer.mk (fun x => true)
+instance (priority := 2000) natural : Transfer Nat Nat := Transfer.mk (fun x => x + 1)
+class Root where
+  value : Nat
+instance fallback [d : Transfer Nat Nat] : Root := Root.mk 7
+instance incompatible [first : Transfer Nat Nat] [again : Transfer Nat Nat] [bad : Transfer Nat Bool] : Root := Root.mk 99"#,
+    );
+    checked(
+        &base,
+        "def result : Root := inferInstance\ntheorem priorityPreserved : result.value = 7 := by rfl",
+    );
+}
