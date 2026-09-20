@@ -185,7 +185,7 @@ impl Context {
             let minor = Expr::lam(
                 Name::anonymous(),
                 result.clone(),
-                Expr::bvar(0),
+                Expr::bvar(0).map_err(|_| failure(SourceInferenceError::Scope))?,
                 BinderInfo::Default,
             );
             (result, family, minor, previous.value)
