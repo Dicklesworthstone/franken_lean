@@ -33,6 +33,11 @@ struct Frame {
     // completes. Arena indices keep this history flat, not recursively cloned.
     children: Vec<usize>,
     resumable: bool,
+    // A table hit returns the first answer but retains a lazy continuation.
+    // On backtracking rebuild its choices, skip that answer once, then resume
+    // the original depth-first order. No foreign metavariable IDs are replayed.
+    replay_first: bool,
+    returned: bool,
 }
 
 pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabError {
@@ -337,6 +342,8 @@ impl Context {
         let resumable = prepared.expected.has_expr_mvar();
         Ok(Some(Frame {
             resumable,
+            replay_first: false,
+            returned: false,
             goal,
             target: prepared.target,
             expected: prepared.expected,
@@ -523,7 +530,7 @@ impl Context {
                     // Drop speculative output holes and opened binders from
                     // blocked preparation, but retain every charged heartbeat.
                 }
-                if let Some(child) = ready {
+                if let Some(mut child) = ready {
                     if frames.iter().any(|frame| frame.key == child.key) {
                         self.retry_instance_choice(&mut frames, &mut history)?;
                         continue;
@@ -534,6 +541,12 @@ impl Context {
                     match table.lookup(self, &child, &frames)? {
                         Some(table::Answer::Solved(value)) => {
                             self.assign_instance_answer(&child, value)?;
+                            if child.resumable {
+                                child.replay_first = true;
+                                child.returned = true;
+                                frames[index].children.push(history.len());
+                                history.push(Some(child));
+                            }
                             continue;
                         }
                         Some(table::Answer::Exhausted) => {
@@ -589,8 +602,16 @@ impl Context {
                         .map_err(|_| failure(SourceInferenceError::Scope))?;
                     value = Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info);
                 }
+                if frames[index].replay_first {
+                    frames[index].replay_first = false;
+                    self.retry_instance_choice(&mut frames, &mut history)?;
+                    continue;
+                }
                 self.assign_instance_answer(&frames[index], value.clone())?;
-                table.remember(self, &frames[index], &frames[..index], &value)?;
+                if !frames[index].returned {
+                    table.remember(self, &frames[index], &frames[..index], &value)?;
+                }
+                frames[index].returned = true;
                 let complete = frames.pop().expect("completed instance frame");
                 if complete.resumable
                     && let Some(parent) = frames.last_mut()

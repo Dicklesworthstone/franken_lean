@@ -1,17 +1,20 @@
-//! Ground instance answers, scoped to one search invocation.
+//! Completed instance answers, scoped to one search invocation.
 //!
 //! This is deliberately not a persistent cache: the environment, registry,
 //! source options and ambient instance eligibility are fixed by the caller.
 //! Exact local declarations and the active cycle-detection path are part of
 //! each key. In particular, a dictionary selected below a cycle is not reused
 //! where that cycle is absent (which could select a higher-priority instance).
-//! Open original goals, newly opened binders and pending equations remain
-//! untabled. Fixed output goals can share a solved answer, but must replay the
-//! prepared output-hole equations transactionally before using it.
+//! Fresh, typed output holes are alpha-keyed; their selected values are replayed
+//! by native unification, never by copying assignments. Cached open answers keep
+//! lazy search continuations. Open inputs/universes, newly opened binders and
+//! pending equations remain untabled.
 //! Exhausted entries mean every candidate was tried under that exact key, not
 //! that a resource limit, cancellation or temporarily blocked input was seen.
 use super::*;
 use std::collections::HashMap;
+
+mod outputs;
 
 const MAX_ENTRIES: usize = MAX_CANDIDATE_ATTEMPTS;
 const MAX_KEY_UNITS: usize = 65_536;
@@ -19,13 +22,14 @@ const MAX_KEY_UNITS: usize = 65_536;
 #[derive(Clone, PartialEq, Eq)]
 struct Key {
     expected: Expr,
+    output_types: Vec<Expr>,
     locals: LocalContext,
     ancestors: Vec<Expr>,
 }
 
 impl Key {
     fn units(&self) -> usize {
-        1 + self.locals.len() + self.ancestors.len()
+        1 + self.output_types.len() + self.locals.len() + self.ancestors.len()
     }
 }
 
@@ -62,16 +66,25 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
     }
 }
 
-fn replay_outputs(context: &mut Context, frame: &Frame) -> Result<bool, NatDefinitionElabError> {
-    if ground(&frame.target) {
+fn replay_outputs(
+    context: &mut Context,
+    frame: &Frame,
+    type_: &Expr,
+) -> Result<bool, NatDefinitionElabError> {
+    if ground(&frame.target) && frame.expected == *type_ {
         return Ok(true);
     }
-    // This is after selection of a previously completed answer at this exact
-    // expected type. It must not feed known outputs into candidate selection.
+    // Match a completed answer to BOTH the prepared target and original goal.
+    // This propagates fresh outputs, without feeding known output values into
+    // candidate selection or copying an old search's metavariable assignments.
     let mut trial = context.clone();
     trial.equations.push(SourceEquation::selection(
-        frame.expected.clone(),
+        type_.clone(),
         frame.target.clone(),
+    ));
+    trial.equations.push(SourceEquation::selection(
+        type_.clone(),
+        frame.expected.clone(),
     ));
     let result = trial.flush(true);
     context.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
@@ -94,11 +107,7 @@ fn key(
 ) -> Result<Option<Key>, NatDefinitionElabError> {
     context.tick()?;
     // The root may have a forced default-instance candidate. Never table it.
-    if ancestors.is_empty()
-        || !frame.binders.is_empty()
-        || !frame.base.equations.is_empty()
-        || !ground(&frame.expected)
-    {
+    if ancestors.is_empty() || !frame.binders.is_empty() || !frame.base.equations.is_empty() {
         return Ok(None);
     }
     if !replayable_target(context, frame)? {
@@ -120,8 +129,12 @@ fn key(
             return Ok(None);
         }
     }
+    let Some((expected, output_types)) = outputs::canonical(context, frame)? else {
+        return Ok(None);
+    };
     Ok(Some(Key {
-        expected: frame.expected.clone(),
+        expected,
+        output_types,
         locals: locals.clone(),
         ancestors: ancestors.iter().map(|frame| frame.key.clone()).collect(),
     }))
@@ -133,11 +146,18 @@ pub(super) enum Answer {
     Exhausted,
 }
 
+#[derive(Clone)]
+struct Entry {
+    answer: Answer,
+    // The fully instantiated selected target, not an inference template.
+    type_: Expr,
+}
+
 #[derive(Default)]
 pub(super) struct GroundTable {
     // Hashing selects a bucket only. Equality checks the complete key; no
     // result depends on hash iteration order or hash collision resistance.
-    answers: HashMap<Expr, Vec<(Key, Answer)>>,
+    answers: HashMap<Expr, Vec<(Key, Entry)>>,
     entries: usize,
     key_units: usize,
 }
@@ -156,12 +176,12 @@ impl GroundTable {
             for (stored, value) in bucket {
                 context.tick()?;
                 if stored == &key {
-                    let usable = match value {
-                        Answer::Solved(_) => replay_outputs(context, frame)?,
+                    let usable = match &value.answer {
+                        Answer::Solved(_) => replay_outputs(context, frame, &value.type_)?,
                         // Negative answers do not summarize output selection.
                         Answer::Exhausted => ground(&frame.target),
                     };
-                    return Ok(usable.then(|| value.clone()));
+                    return Ok(usable.then(|| value.answer.clone()));
                 }
             }
         }
@@ -178,7 +198,17 @@ impl GroundTable {
         if !ground(value) {
             return Ok(());
         }
-        self.insert(context, frame, ancestors, Answer::Solved(value.clone()))
+        let type_ = context.instantiate(&frame.target)?;
+        if !ground(&type_) {
+            return Ok(());
+        }
+        self.insert(
+            context,
+            frame,
+            ancestors,
+            Answer::Solved(value.clone()),
+            type_,
+        )
     }
 
     /// Called only after candidate enumeration is exhausted. Roots, open goals
@@ -191,10 +221,16 @@ impl GroundTable {
         frame: &Frame,
         ancestors: &[Frame],
     ) -> Result<(), NatDefinitionElabError> {
-        if !ground(&frame.target) {
+        if frame.returned || !ground(&frame.target) {
             return Ok(());
         }
-        self.insert(context, frame, ancestors, Answer::Exhausted)
+        self.insert(
+            context,
+            frame,
+            ancestors,
+            Answer::Exhausted,
+            frame.target.clone(),
+        )
     }
 
     fn insert(
@@ -203,6 +239,7 @@ impl GroundTable {
         frame: &Frame,
         ancestors: &[Frame],
         answer: Answer,
+        type_: Expr,
     ) -> Result<(), NatDefinitionElabError> {
         if self.entries >= MAX_ENTRIES {
             return Ok(());
@@ -222,7 +259,7 @@ impl GroundTable {
                 return Ok(());
             }
         }
-        bucket.push((key, answer));
+        bucket.push((key, Entry { answer, type_ }));
         self.entries += 1;
         self.key_units += units;
         Ok(())
@@ -255,6 +292,8 @@ mod tests {
             chosen: None,
             children: vec![],
             resumable: false,
+            replay_first: false,
+            returned: false,
         }
     }
 
@@ -442,5 +481,102 @@ mod tests {
         assert!(context.txn.budget.heartbeats_consumed > before);
         context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed;
         assert!(table.lookup(&mut context, &target, &path).is_err());
+    }
+    fn open_outputs(names: &[&str], type_: Expr) -> Frame {
+        let mut result = frame("C");
+        for name in names {
+            let id = MVarId(Name::from_components([*name]));
+            result.base.txn.mvars.declare(
+                id.clone(),
+                id.0.clone(),
+                type_.clone(),
+                LocalContext::new(),
+                MetavarKind::Natural,
+                0,
+                None,
+            );
+            let hole = Expr::mvar(id);
+            result.expected = Expr::app(result.expected, hole.clone());
+            result.target = Expr::app(result.target, hole);
+            result.key = Expr::app(result.key, Expr::bvar(0).unwrap());
+        }
+        result
+    }
+
+    #[test]
+    fn output_keys_preserve_alias_patterns_and_declared_types() {
+        let mut context = context();
+        let path = [frame("Root")];
+        let first = open_outputs(&["x", "y"], Expr::sort(Level::one()));
+        let renamed = open_outputs(&["a", "b"], Expr::sort(Level::one()));
+        let aliased = open_outputs(&["a", "a"], Expr::sort(Level::one()));
+        let differently_typed = open_outputs(&["a", "b"], Expr::sort(Level::zero()));
+        let first_key = key(&mut context, &first, &path).unwrap().unwrap();
+        assert!(Some(first_key.clone()) == key(&mut context, &renamed, &path).unwrap());
+        assert!(Some(first_key.clone()) != key(&mut context, &aliased, &path).unwrap());
+        assert!(Some(first_key) != key(&mut context, &differently_typed, &path).unwrap());
+        assert!(first.expected.has_expr_mvar());
+        assert!(renamed.expected.has_expr_mvar());
+    }
+
+    #[test]
+    fn open_output_keys_refuse_opaque_deep_or_foreign_holes() {
+        let mut context = context();
+        let path = [frame("Root")];
+        let id = MVarId(Name::from_components(["x"]));
+        for (kind, depth) in [(MetavarKind::SyntheticOpaque, 0), (MetavarKind::Natural, 1)] {
+            let mut target = open_outputs(&["x"], Expr::sort(Level::one()));
+            target.base.txn.mvars.declare(
+                id.clone(),
+                id.0.clone(),
+                Expr::sort(Level::one()),
+                LocalContext::new(),
+                kind,
+                depth,
+                None,
+            );
+            assert!(key(&mut context, &target, &path).unwrap().is_none());
+        }
+        let mut target = open_outputs(&["x"], Expr::sort(Level::one()));
+        let local = FVarId(Name::from_components(["newer"]));
+        target
+            .base
+            .txn
+            .lctx
+            .add_param(local.clone(), local.0, constant("C"), BinderInfo::Default);
+        assert!(key(&mut context, &target, &path).unwrap().is_none());
+        let target = open_outputs(
+            &["x"],
+            Expr::mvar(MVarId(Name::from_components(["unknownType"]))),
+        );
+        assert!(key(&mut context, &target, &path).unwrap().is_none());
+    }
+
+    #[test]
+    fn spent_replay_work_survives_failure_without_assignments_or_equations() {
+        let mut context = context();
+        let target = open_outputs(&["x"], Expr::sort(Level::one()));
+        context.txn.mvars = target.base.txn.mvars.clone();
+        let before_mvars = context.txn.mvars.clone();
+        let before_levels = context.txn.universes.clone();
+        let before_work = context.txn.budget.heartbeats_consumed;
+        let incompatible = Expr::app(constant("Other"), Expr::sort(Level::zero()));
+        assert!(!replay_outputs(&mut context, &target, &incompatible).unwrap());
+        assert_eq!(context.txn.mvars, before_mvars);
+        assert_eq!(context.txn.universes, before_levels);
+        assert!(context.equations.is_empty());
+        assert!(context.txn.budget.heartbeats_consumed > before_work);
+    }
+
+    #[test]
+    fn open_key_construction_stops_at_the_same_work_budget() {
+        let mut context = context();
+        let target = open_outputs(&["x", "y"], Expr::sort(Level::one()));
+        let path = [frame("Root")];
+        let before = target.base.txn.mvars.clone();
+        context.txn.budget.max_heartbeats = 2;
+        assert!(key(&mut context, &target, &path).is_err());
+        assert_eq!(target.base.txn.mvars, before);
+        assert!(context.txn.mvars.is_empty());
     }
 }
