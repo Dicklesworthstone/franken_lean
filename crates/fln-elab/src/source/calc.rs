@@ -1,6 +1,6 @@
-//! Native equality calculations. Every written step remains an annotated let
-//! in the final candidate, even when conversion could ignore its proof. The
-//! chain is composed with ordinary Eq.rec; this module grants no admission.
+//! Native calculations over binary relations. Every written step remains an
+//! annotated let in the final candidate, even when conversion could ignore its
+//! proof. Equality transport uses ordinary Eq.rec and grants no admission.
 use super::*;
 
 pub(super) struct Build<'a> {
@@ -12,10 +12,36 @@ pub(super) struct Build<'a> {
     chain: Option<Typed>,
 }
 
+struct Relation {
+    head: Expr,
+    left: Expr,
+    right: Expr,
+}
+
+impl Relation {
+    fn view(expression: &Expr) -> Option<Self> {
+        let ExprNode::App { f, a: right } = expression.node() else {
+            return None;
+        };
+        let ExprNode::App { f: head, a: left } = f.node() else {
+            return None;
+        };
+        Some(Self {
+            head: head.clone(),
+            left: left.clone(),
+            right: right.clone(),
+        })
+    }
+
+    fn at(&self, left: Expr, right: Expr) -> Expr {
+        Expr::app(Expr::app(self.head.clone(), left), right)
+    }
+}
+
 fn invalid() -> NatDefinitionElabError {
-    failure(SourceInferenceError::Tactic(
-        tactics::TacticError::ExpectedEquality,
-    ))
+    NatDefinitionElabError::UnexpectedSyntax {
+        expected: "a binary relation with two endpoints in a calculation",
+    }
 }
 fn equation(level: Level, alpha: Expr, left: Expr, right: Expr) -> Expr {
     [alpha, left, right].into_iter().fold(
@@ -57,29 +83,36 @@ impl Context {
         })
     }
 
+    // Preserve the written relation head: unfolding it can erase its endpoints
+    // or reverse them (for example, a greater-than abbreviation). Reduction is
+    // only a fallback for a type hidden behind a let or other non-application.
+    fn calculation_relation(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<(Expr, Relation), NatDefinitionElabError> {
+        let expression = self.instantiate(expression)?;
+        if let Some(relation) = Relation::view(&expression) {
+            return Ok((expression, relation));
+        }
+        let expression = self.whnf(&expression)?;
+        let relation = Relation::view(&expression).ok_or_else(invalid)?;
+        Ok((expression, relation))
+    }
+
     pub(super) fn prepare_calculation_step(
         &mut self,
         build: &mut Build<'_>,
         relation: Typed,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let target = self.whnf(&relation.value)?;
-        let (_, alpha, left, _) = tactics::equality_target(&target).ok_or_else(invalid)?;
-        let predecessor = if let Some(chain) = &build.chain {
-            let ty = self.whnf(&chain.type_)?;
-            let (_, alpha, _, right) = tactics::equality_target(&ty).ok_or_else(invalid)?;
-            Some((alpha, right))
-        } else if let Some(expected) = &build.expected {
-            let ty = self.whnf(expected)?;
-            tactics::equality_target(&ty).map(|(_, alpha, left, _)| (alpha, left))
-        } else {
-            None
-        };
-        if let Some((previous_alpha, previous_endpoint)) = predecessor {
-            // Solves continuation `_` holes. These are elaboration constraints,
-            // not trust: the exact asserted types are retained below and both
-            // endpoints are checked again through Eq.rec in the final term.
-            self.constrain(&alpha, &previous_alpha)?;
-            self.constrain(&left, &previous_endpoint)?;
+        let (target, current) = self.calculation_relation(&relation.value)?;
+        if let Some(chain) = &build.chain {
+            let (_, previous) = self.calculation_relation(&chain.type_)?;
+            // Only adjacent written endpoints constrain continuation holes.
+            // The expected result is checked after composition, not mined for
+            // endpoints: relations may be heterogeneous or reverse arguments.
+            self.equations
+                .push(SourceEquation::selection(current.left, previous.right));
+            self.flush(true)?;
         }
         self.instantiate(&target)
     }
@@ -117,29 +150,62 @@ impl Context {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn compose_calculation(
         &mut self,
         previous: Typed,
         next: Typed,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let previous_type = self.whnf(&previous.type_)?;
-        let next_type = self.whnf(&next.type_)?;
-        let (level, alpha, first, middle) =
-            tactics::equality_target(&previous_type).ok_or_else(invalid)?;
-        let (_, _, _, last) = tactics::equality_target(&next_type).ok_or_else(invalid)?;
+        let (previous_type, previous_relation) = self.calculation_relation(&previous.type_)?;
+        let (next_type, next_relation) = self.calculation_relation(&next.type_)?;
+        let (equality, relation, proof, backwards) =
+            if let Some(equality) = tactics::equality_target(&next_type) {
+                (equality, previous_relation, previous.value.clone(), false)
+            } else if let Some(equality) = tactics::equality_target(&previous_type) {
+                (equality, next_relation, next.value.clone(), true)
+            } else {
+                return Err(invalid());
+            };
+        let (level, alpha, base, end) = equality;
         let endpoint_name = self.fresh_name()?;
         let endpoint = FVarId(endpoint_name.clone());
         let endpoint_expr = Expr::fvar(endpoint.clone());
+        let (result, family, minor, equality_proof) = if backwards {
+            // a = b, S b c  ==> S a c. Eliminate a = b into
+            // (S x c -> S a c), with identity at x = a, then apply S b c.
+            // This avoids inventing symmetry axioms or assuming S is injective.
+            let result = relation.at(base.clone(), relation.right.clone());
+            let domain = relation.at(endpoint_expr.clone(), relation.right.clone());
+            let family = Expr::forall_e(
+                Name::anonymous(),
+                domain,
+                result.clone(),
+                BinderInfo::Default,
+            );
+            let minor = Expr::lam(
+                Name::anonymous(),
+                result.clone(),
+                Expr::bvar(0),
+                BinderInfo::Default,
+            );
+            (result, family, minor, previous.value)
+        } else {
+            // R a b, b = c  ==> R a c, including equality-only chains.
+            let result = relation.at(relation.left.clone(), end.clone());
+            let family = relation.at(relation.left.clone(), endpoint_expr.clone());
+            (result, family, proof.clone(), next.value)
+        };
+        let result_sort = self
+            .known_type(&result)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let result_sort = self.whnf(&result_sort)?;
+        let ExprNode::Sort { level: result_level } = result_sort.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
         let witness_name = self.fresh_name()?;
         let witness = FVarId(witness_name.clone());
-        let witness_type = equation(
-            level.clone(),
-            alpha.clone(),
-            middle.clone(),
-            endpoint_expr.clone(),
-        );
-        let result = equation(level.clone(), alpha.clone(), first.clone(), endpoint_expr);
-        let body = result
+        let witness_type = equation(level.clone(), alpha.clone(), base.clone(), endpoint_expr);
+        let body = family
             .abstract_fvar(&witness, 0)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         let motive = Expr::lam(witness_name, witness_type, body, BinderInfo::Default);
@@ -147,25 +213,18 @@ impl Context {
             .abstract_fvar(&endpoint, 0)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         let motive = Expr::lam(endpoint_name, alpha.clone(), motive, BinderInfo::Default);
-        let value = [
-            alpha.clone(),
-            middle,
-            motive,
-            previous.value,
-            last.clone(),
-            next.value,
-        ]
-        .into_iter()
-        .fold(
-            Expr::const_(
-                Name::from_components(["Eq", "rec"]),
-                vec![Level::zero(), level.clone()],
-            ),
-            Expr::app,
-        );
+        let value = [alpha, base, motive, minor, end, equality_proof]
+            .into_iter()
+            .fold(
+                Expr::const_(
+                    Name::from_components(["Eq", "rec"]),
+                    vec![result_level.clone(), level],
+                ),
+                Expr::app,
+            );
         Ok(Typed {
-            value,
-            type_: equation(level, alpha, first, last),
+            value: if backwards { Expr::app(value, proof) } else { value },
+            type_: result,
         })
     }
 
