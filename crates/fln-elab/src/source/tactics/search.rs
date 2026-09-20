@@ -25,9 +25,9 @@ fn restore(context: &mut Context, snapshot: &Context) {
 
 impl Context {
     /// Native `solve_by_elim` searches local declarations, newest first. Exact
-    /// evidence and reflexivity/True leaves precede applications, and shallower
-    /// proofs precede deeper ones. Defaults construct ordinary proof terms;
-    /// they never register declarations or grant kernel acceptance.
+    /// evidence, reflexivity/True leaves, and reversed equality facts precede
+    /// applications. Shallower proofs precede deeper ones. Defaults construct
+    /// ordinary proof terms, never declarations or kernel acceptance.
     pub(super) fn solve_by_elim_proof_goal(
         &mut self,
         goal: ProofGoal,
@@ -60,23 +60,39 @@ impl Context {
             self.tick()?;
             if let Some(mut choice) = retry.take() {
                 let count = choice.locals.len();
-                // The default leaf is a genuine choice point, including when
-                // there are no locals. Its assignments must be rolled back if
-                // a later dependent premise needs a different witness.
-                let attempts = if choice.depth < limit { count * 2 + 1 } else { count + 1 };
+                // Defaults and both orientations are genuine choice points:
+                // a later dependent premise may require another witness.
+                let attempts = if choice.depth < limit {
+                    count * 4 + 1
+                } else {
+                    count * 2 + 1
+                };
                 let mut selected = None;
                 while choice.next < attempts {
                     restore(self, &choice.context);
                     self.tick()?;
                     let candidate = choice.next;
                     choice.next += 1;
-                    let result = if candidate == count {
+                    let result = if candidate < count {
+                        let local = choice.locals[candidate].clone();
+                        self.search_local_candidate(&choice.goal, local, false)
+                    } else if candidate == count {
                         self.search_default_candidate(&choice.goal)
                     } else {
-                        let application = candidate > count;
-                        let index = if application { candidate - count - 1 } else { candidate };
+                        let offset = candidate - count - 1;
+                        let (index, application, reverse) = if offset < count {
+                            (offset, false, true)
+                        } else if offset < count * 2 {
+                            (offset - count, true, false)
+                        } else {
+                            (offset - count * 2, true, true)
+                        };
                         let local = choice.locals[index].clone();
-                        self.search_local_candidate(&choice.goal, local, application)
+                        if reverse {
+                            self.search_symmetric_candidate(&choice.goal, local, application)
+                        } else {
+                            self.search_local_candidate(&choice.goal, local, application)
+                        }
                     };
                     match result {
                         Ok(work) => {
@@ -182,6 +198,33 @@ impl Context {
         Ok(vec![Work::Close(goal.clone(), value)])
     }
 
+    fn search_symmetric_candidate(
+        &mut self,
+        goal: &ProofGoal,
+        local: LocalDecl,
+        application: bool,
+    ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.tick()?;
+        let target = self.whnf(&goal.target)?;
+        let Some((level, alpha, left, right)) = equality_target(&target) else {
+            return Err(error(TacticError::NoMatchingAssumption));
+        };
+        let reversed = equality::equation(
+            level.clone(), alpha.clone(), right.clone(), left.clone(),
+        );
+        let (witness, subgoal) = self.proof_goal(reversed)?;
+        let candidate = self.search_local_candidate(&subgoal, local, application)?;
+        let value = self.symmetric_equality(&level, &alpha, &right, &left, witness)?;
+        // The local rule must actually prove the reversed equation before the
+        // Eq.rec bridge closes the parent. This is not a recursive "try symm"
+        // rule, so it cannot alternate orientations forever or evade the depth
+        // bound. Its premises still participate in whole-stack backtracking.
+        let mut work = vec![Work::Close(goal.clone(), value)];
+        work.extend(candidate);
+        Ok(work)
+    }
+
     fn search_local_candidate(
         &mut self,
         goal: &ProofGoal,
@@ -222,6 +265,40 @@ mod tests {
 
     fn context() -> Context {
         Context::new(&Environment::new(), Budget::for_stack_bytes(2 * 1024 * 1024))
+    }
+
+    fn source_environment() -> Environment {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut environment = Environment::new();
+        for declaration in crate::seed::source_seed_declarations() {
+            let Outcome::Complete(admitted) = admit(
+                &environment, declaration, Budget::for_stack_bytes(2 * 1024 * 1024),
+            ) else {
+                panic!("seed nonanswer");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("seed rejected");
+            };
+            environment = match checked.publish(
+                DeclarationBudget::default(), CollisionBudget::default(), None,
+            ) {
+                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
+                    result.environment
+                }
+                Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+                other => panic!("seed publication {other:?}"),
+            };
+        }
+        environment
+    }
+
+    fn seeded_context() -> Context {
+        Context::new(&source_environment(), Budget::for_stack_bytes(2 * 1024 * 1024))
     }
 
     fn local(context: &mut Context, name: &str, type_: Expr) -> Expr {
@@ -299,7 +376,7 @@ mod tests {
 
     #[test]
     fn default_leaf_constructs_true_without_any_local_hypothesis() {
-        let mut context = context();
+        let mut context = seeded_context();
         let target = Expr::const_(Name::from_components(["True"]), Vec::new());
         let (root, goal) = context.proof_goal(target).unwrap();
         context.solve_by_elim_proof_goal(goal).unwrap();
@@ -311,7 +388,7 @@ mod tests {
 
     #[test]
     fn default_reflexivity_closes_a_local_lemma_premise() {
-        let mut context = context();
+        let mut context = seeded_context();
         let p = proposition(&mut context, "p");
         let alpha = Expr::sort(Level::zero());
         let level = Level::succ(Level::zero());
@@ -328,7 +405,7 @@ mod tests {
 
     #[test]
     fn default_heterogeneous_reflexivity_constructs_heq_refl() {
-        let mut context = context();
+        let mut context = seeded_context();
         let p = proposition(&mut context, "p");
         let alpha = Expr::sort(Level::zero());
         let level = Level::succ(Level::zero());
@@ -352,5 +429,59 @@ mod tests {
         let id = goal.id.clone();
         assert!(context.solve_by_elim_proof_goal(goal).is_err());
         assert!(!context.txn.mvars.is_assigned(&id));
+    }
+
+    #[test]
+    fn source_defaults_and_symmetric_rules_build_kernel_accepted_theorems() {
+        let environment = source_environment();
+        for source in [
+            "theorem automatic : True := by solve_by_elim",
+            "theorem automatic (x : Nat) : x = x := by solve_by_elim",
+            "theorem automatic : 2 + 3 = 5 := by solve_by_elim",
+            "theorem automatic (x : Nat) : HEq x x := by solve_by_elim",
+            "theorem automatic (P : Prop) (f : True -> P) : P := by solve_by_elim",
+            "theorem automatic (x : Nat) (P : Prop) (f : x = x -> P) : P := by solve_by_elim",
+            "theorem automatic (x y : Nat) (h : x = y) : y = x := by solve_by_elim",
+            "theorem automatic (x y : Nat) (P : Prop) (h : P) (f : P -> x = y) : y = x := by solve_by_elim",
+            "theorem automatic (x y : Nat) (P : Prop) (f : y = x -> P) (h : x = y) : P := by solve_by_elim",
+            "theorem automatic {A : Type} (x y : A) (h : x = y) : y = x := by solve_by_elim",
+        ] {
+            let result = crate::check_definition_source(
+                source.as_bytes(), &environment, Budget::for_stack_bytes(2 * 1024 * 1024),
+            ).unwrap_or_else(|problem| panic!("{source}\n{problem:?}"));
+            assert!(
+                matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                "{source}\n{:?}", result.outcome,
+            );
+            let fln_kernel::Declaration::Thm(theorem) = result.declaration else {
+                panic!("search must produce a theorem, not an axiom");
+            };
+            assert!(!theorem.value.has_fvar(), "{source}");
+            assert!(!theorem.value.has_expr_mvar(), "{source}");
+            assert!(!theorem.value.has_level_mvar(), "{source}");
+            assert!(!theorem.value.has_loose_bvars(), "{source}");
+        }
+    }
+
+    #[test]
+    fn source_defaults_and_symmetry_never_admit_missing_evidence() {
+        let environment = source_environment();
+        for source in [
+            "theorem unsound : 1 = 2 := by solve_by_elim",
+            "theorem unsound (P : Prop) : P := by solve_by_elim",
+            "theorem unsound (x y : Nat) : y = x := by solve_by_elim",
+            "theorem unsound (P : Prop) (cycle : P -> P) : P := by solve_by_elim",
+            "theorem unsound (x y : Nat) (P : Prop) (f : P -> x = y) : y = x := by solve_by_elim",
+            "theorem unsound : Nat := by solve_by_elim",
+        ] {
+            if let Ok(result) = crate::check_definition_source(
+                source.as_bytes(), &environment, Budget::for_stack_bytes(2 * 1024 * 1024),
+            ) {
+                assert!(
+                    !matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                    "{source}",
+                );
+            }
+        }
     }
 }
