@@ -91,7 +91,7 @@ impl Context {
 
     /// Automatic tactic closure uses reducible transparency for both the goal
     /// head and its operands. Ordinary `rfl` retains its separate, wider policy.
-    fn automatic_reflexivity_candidate(
+    pub(super) fn automatic_reflexivity_candidate(
         &mut self,
         goal: &ProofGoal,
         zeta_delta: bool,
@@ -110,7 +110,9 @@ impl Context {
             }
             let left = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
             let right = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
-            if !self.proof_types_match_with_budget(&left, &right, budget)? {
+            if !self.proof_types_match_with_budget(&left, &right, budget)?
+                && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
+            {
                 return Ok(None);
             }
             return Ok(Some(app(
