@@ -80,7 +80,7 @@ jobs:
               'examples/native_local_recursion.lean',
           }
           repairs = {
-              'crates/fln-elab/tests/native_unification_application_head.rs',
+              'crates/fln-checker/src/defeq.rs',
               'crates/fln/src/runtime/specialize.rs',
               'crates/fln/tests/source_instances.rs',
           }
@@ -95,7 +95,7 @@ jobs:
               'docs/NATIVE_DO_NOTATION.md',
           }
           recursion = decode(['f5feb0a8b27fc91c9deae1b05dad360065972455', 'ba71a80586059d7c16c521d5f6968d485c03e49b', '0cc75a2f2cd1611f4f53c48f8840c8950188b3e8', '0fb161c37784316aad7459da56637ee6fe9483d5'], '85f72fc5c4aa72dc9a16fcd5ecef6d3d4cb24f6227e87bd3ffa11f6ec91cec41', 'recursion')
-          repair = decode(['0fb7de6516c770ecaed4c7cc94bd9d496e0ef8a4'], '0186d36f2b5b827a31d0bb63526d916f9f15cd841dab4e3fb0552c81d84e4549', 'repairs')
+          repair = decode(['90efd71c34f866d8d868c5e58cbdc0f95602ec09'], 'b3e487b49662ba85f6985e5309bd292eaf77fbc186e4e769de7c15626a7f048d', 'repairs')
           conditional = decode(['e2bc5679aa560167b87ceffa7d11610368d0da13'], '92b8f1661664341dbad766a2e3a0e614883ea7339f2f092cbb32ff1778b9c5ec', 'conditional')
           def validate(prefix):
               checked(prefix + 'tests', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln', '--no-fail-fast')
