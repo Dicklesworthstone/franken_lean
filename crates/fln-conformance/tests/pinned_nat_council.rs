@@ -3720,63 +3720,49 @@ fn diagnose_candidate_modules() {
             }
         }
     }
-
-    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES FOR 60-MODULE BASE ===");
-    for (rel, name, count) in &immediate_candidates {
-        eprintln!("  Candidate: {} ({}) -> {} declarations", rel, name, count);
+    eprintln!("\n=== IMMEDIATE CANDIDATE MODULES (ALL IMPORTS SATISFIED BY CURRENT 60) ===");
+    for (rel_path, name, count) in &immediate_candidates {
+        eprintln!("  Candidate: {} ({}) with {} declarations", rel_path, name, count);
     }
 
-    // Inspect imports and constants of immediate candidates
-    let mut wave1_known = known.clone();
-    for (rel, _, _) in &immediate_candidates {
-        wave1_known.insert(fln_core::name::Name::from_components(rel.split('/')));
-        let path = lib.join(format!("{rel}.olean"));
-        let exported = std::fs::read(&path).expect("read");
-        let server = std::fs::read(path.with_extension("olean.server")).unwrap_or_default();
-        let private = std::fs::read(path.with_extension("olean.private")).unwrap_or_default();
-        let decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode).expect("decode");
-        eprintln!("\nModule {rel} imports:");
-        for imp in &decoded.module.imports {
-            eprintln!("  - {}", imp.module.to_display_string());
-        }
-    }
-
-    // Find wave 2 candidates
-    let mut wave2_candidates = Vec::new();
-    for path in &olean_files {
-        let rel = path.strip_prefix(&lib).unwrap().with_extension("");
-        let components: Vec<&str> = rel.iter().map(|s| s.to_str().unwrap()).collect();
-        let fln_name = fln_core::name::Name::from_components(components);
-        if wave1_known.contains(&fln_name) {
-            continue;
-        }
-
-        let exported = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let server = std::fs::read(path.with_extension("olean.server")).unwrap_or_default();
-        let private = std::fs::read(path.with_extension("olean.private")).unwrap_or_default();
-        if let Ok(decoded) =
-            fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
-        {
-            let mut all_imports_satisfied = true;
-            for imp in &decoded.module.imports {
-                if !wave1_known.contains(&imp.module) {
-                    all_imports_satisfied = false;
-                    break;
-                }
+    eprintln!("\n=== PRELOADING 60-MODULE BASE ENVIRONMENT ===");
+    let mut env = Environment::new();
+    for name in &base_modules {
+        let m = load(name);
+        for c in m.constants {
+            if c.name().to_display_string() == "ite.congr_simp" {
+                eprintln!("FOUND ite.congr_simp in base module {name}!");
             }
-            if all_imports_satisfied {
-                let rel_slash = rel.to_str().unwrap().to_string();
-                wave2_candidates.push((rel_slash, fln_name.to_display_string(), decoded.constants.len()));
+            env = env.add_decl(c).expect("add decl to env");
+        }
+    }
+    eprintln!("Preloaded 60-module base environment has {} constants", env.len());
+
+    let candidates: Vec<&str> = immediate_candidates.iter().map(|(p, _, _)| p.as_str()).collect();
+
+    for cand in &candidates {
+        eprintln!("\n=== TESTING CANDIDATE MODULE {} ===", cand);
+        let m = load(cand);
+        let num_decls = m.constants.len();
+        eprintln!("Candidate {} has {} declarations", cand, num_decls);
+
+        let engine = Engine::from_environment(env.clone());
+        let res = engine.check_decoded_olean(m, &KVMap::new(), limits);
+        match res {
+            Ok(Outcome::Complete(checked)) => {
+                assert_eq!(checked.declarations.len(), num_decls);
+                eprintln!("SUCCESS: All {num_decls} declarations of {cand} ADMITTED IN TWO-CHECKER COUNCIL!");
+            }
+            Ok(Outcome::Inconclusive(reason)) => {
+                eprintln!("INCONCLUSIVE for {cand}: {reason:?}");
+            }
+            Ok(Outcome::InternalFault(fault)) => {
+                eprintln!("FAULT for {cand}: {fault:?}");
+            }
+            Err(err) => {
+                eprintln!("ERR for {cand}: {err:?}");
             }
         }
-    }
-
-    eprintln!("\n=== WAVE 2 CANDIDATE MODULES (AFTER 4 IMMEDIATE CANDIDATES) ===");
-    for (rel, name, count) in &wave2_candidates {
-        eprintln!("  Wave 2 Candidate: {} ({}) -> {} declarations", rel, name, count);
     }
 }
 
