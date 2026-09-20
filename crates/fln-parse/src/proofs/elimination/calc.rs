@@ -1,4 +1,4 @@
-//! Equality calculations are planned on the same heap as nested tactic proofs.
+//! Calculations are planned on the same heap as nested tactic proofs.
 //! Each row retains its written relation and its proof. No source text is
 //! generated, and the parser does not claim that adjacent endpoints agree.
 use super::*;
@@ -65,8 +65,15 @@ pub(super) fn plan(
             delimiter_depth(&tokens[at], &mut depth);
         }
         let assign = assign.ok_or_else(|| refusal(view, tokens, row))?;
-        let equality = equality.ok_or_else(|| refusal(view, tokens, row))?;
-        if equality == row || equality + 1 == assign || assign + 1 == stop || depth != 0 {
+        // The ordinary term parser owns the written relation. Requiring an
+        // infix equality here prevents prefix relations (R a b), parenthesized
+        // propositions and checked Trans instances from reaching elaboration.
+        // Relation arity, typing and endpoint connectivity are semantic checks.
+        if row == assign
+            || equality.is_some_and(|at| at == row || at + 1 == assign)
+            || assign + 1 == stop
+            || depth != 0
+        {
             return Err(refusal(view, tokens, assign));
         }
         steps.push(Step {
@@ -88,6 +95,10 @@ mod tests {
             "theorem chain (α : Type) (a : α) : a = a := by\r\n  calc\r\n    a = a := by\r\n      calc\r\n        a = a := by rfl -- end\r\n",
             "theorem chain (a : Nat) : a = a := by\n  exact calc\n    a = a := by rfl\n",
             "theorem chain (a : Nat) : a = a := (calc\n  a = a := by rfl)\n",
+            "theorem chain (R : Nat -> Bool -> Prop) (a : Nat) (b : Bool) (h : R a b) : R a b := calc\n  R a b := h\n",
+            "theorem chain (R : Nat -> Nat -> Prop) (a b c : Nat) (h : R a b) (k : b = c) : R a c := by\r\n  calc\r\n    R a b := by exact h -- relation\r\n    _ = c := by exact k\r\n",
+            "theorem chain (R : Nat -> Bool -> Prop) (a : Nat) (b : Bool) (h : R a b) : R a b := (calc\n  (R a b) := h)\n",
+            "theorem chain (a : Nat) : a = a := calc\n  Eq a a := by rfl\n",
         ] {
             let parsed =
                 parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
@@ -101,9 +112,68 @@ mod tests {
             "theorem bad (a : Nat) : a = a := calc\n  a = a := by rfl\n  _ = a :=",
             "theorem bad (a : Nat) : a = a := calc\n  a = a := by rfl\n  _ = a",
             "theorem bad (a : Nat) : a = a := calc\n  a = a = a := by rfl",
-            "theorem bad (a : Nat) : a = a := calc\n  a := by rfl",
+            "theorem bad (a : Nat) : a = a := calc\n  := by rfl",
+            "theorem bad (a : Nat) : a = a := calc\n  R a a := by rfl\n  S a a :=",
+            "theorem bad (a : Nat) : a = a := calc\n  R a a := by rfl\n  S a a",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    fn tokens(view: &SourceView) -> Vec<LexedToken> {
+        let run = lex_run(view.normalized(), &source_module_token_table());
+        assert!(run.diagnostics().is_empty());
+        run.events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Token(token) => Some(token),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn general_relation_planner_retains_exact_ranges_and_closing_delimiter() {
+        let original = SourceText::from_utf8(
+            b"calc\r\n  R a b := by\r\n    exact h -- proof\r\n  (S _ c) := k)\r\n",
+        )
+        .unwrap();
+        let view = SourceView::of(&original);
+        let tokens = tokens(&view);
+        let planned = plan(&view, &tokens, 0, tokens.len()).unwrap();
+        assert_eq!(planned.start, 0);
+        assert_eq!(planned.steps.len(), 2);
+        assert!(symbol(&tokens, planned.end, ")"));
+        let texts = planned
+            .steps
+            .iter()
+            .map(|step| {
+                assert!(symbol(&tokens, step.assign, ":="));
+                assert_eq!(step.relation.end, step.assign);
+                assert_eq!(step.proof.start, step.assign + 1);
+                let start = tokens[step.relation.start].extent.start().0;
+                let end = tokens[step.relation.end - 1].extent.end().0;
+                &view.normalized().as_str()[start..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["R a b", "(S _ c)"]);
+    }
+
+    #[test]
+    fn general_relation_planner_rejects_incomplete_rows_without_a_prefix_answer() {
+        for source in [
+            "calc\n  R a b := h\n  S _ c :=",
+            "calc\n  R a b := h\n  S _ c",
+            "calc\n  := h",
+            "calc\n  R a b := h\n  = c := k",
+            "calc\n  R a b := h\n  b = := k",
+            "calc\n  R a b := h\n  b = c = d := k",
+            "calc\n  (R a b := h",
+        ] {
+            let original = SourceText::from_utf8(source.as_bytes()).unwrap();
+            let view = SourceView::of(&original);
+            let tokens = tokens(&view);
+            assert!(plan(&view, &tokens, 0, tokens.len()).is_err(), "{source}");
         }
     }
 }
