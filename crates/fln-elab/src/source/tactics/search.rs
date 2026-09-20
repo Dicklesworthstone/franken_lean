@@ -1,4 +1,4 @@
-//! Bounded local-lemma search using ordinary application and checked goal closure.
+//! Bounded proof search using ordinary application and checked goal closure.
 //!
 //! Choice points include the entire remaining obligation stack. A later premise
 //! can therefore backtrack into the witness chosen for an earlier dependent
@@ -25,8 +25,9 @@ fn restore(context: &mut Context, snapshot: &Context) {
 
 impl Context {
     /// Native `solve_by_elim` searches local declarations, newest first. Exact
-    /// evidence precedes applications, and shallower proofs precede deeper ones.
-    /// This bounded subset does not silently consult global lemmas or axioms.
+    /// evidence and reflexivity/True leaves precede applications, and shallower
+    /// proofs precede deeper ones. Defaults construct ordinary proof terms;
+    /// they never register declarations or grant kernel acceptance.
     pub(super) fn solve_by_elim_proof_goal(
         &mut self,
         goal: ProofGoal,
@@ -59,15 +60,25 @@ impl Context {
             self.tick()?;
             if let Some(mut choice) = retry.take() {
                 let count = choice.locals.len();
-                let attempts = if choice.depth < limit { count * 2 } else { count };
+                // The default leaf is a genuine choice point, including when
+                // there are no locals. Its assignments must be rolled back if
+                // a later dependent premise needs a different witness.
+                let attempts = if choice.depth < limit { count * 2 + 1 } else { count + 1 };
                 let mut selected = None;
                 while choice.next < attempts {
                     restore(self, &choice.context);
                     self.tick()?;
-                    let application = choice.next >= count;
-                    let local = choice.locals[choice.next % count].clone();
+                    let candidate = choice.next;
                     choice.next += 1;
-                    match self.search_local_candidate(&choice.goal, local, application) {
+                    let result = if candidate == count {
+                        self.search_default_candidate(&choice.goal)
+                    } else {
+                        let application = candidate > count;
+                        let index = if application { candidate - count - 1 } else { candidate };
+                        let local = choice.locals[index].clone();
+                        self.search_local_candidate(&choice.goal, local, application)
+                    };
+                    match result {
                         Ok(work) => {
                             selected = Some(work);
                             break;
@@ -128,11 +139,47 @@ impl Context {
                         Err(problem) => return Err(problem),
                     }
                 }
-                // Only application-generated goals and continuations enter
-                // this private stack, never source scripts or control frames.
+                // Only generated goals and continuations enter this private
+                // stack, never source scripts or control frames.
                 _ => return Err(error(TacticError::MalformedScript)),
             }
         }
+    }
+
+    fn search_default_candidate(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.tick()?;
+        let target = self.whnf(&goal.target)?;
+        let value = if let Some((level, alpha, left, beta, right)) =
+            equality::heterogeneous_target(&target)
+        {
+            if !self.proof_types_match(&alpha, &beta)?
+                || !self.proof_types_match(&left, &right)?
+            {
+                return Err(error(TacticError::NoMatchingAssumption));
+            }
+            [alpha, left].into_iter().fold(
+                Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                Expr::app,
+            )
+        } else if let Some((level, alpha, left, right)) = equality_target(&target) {
+            if !self.proof_types_match(&left, &right)? {
+                return Err(error(TacticError::NoMatchingAssumption));
+            }
+            equality::reflexivity(level, alpha, left)
+        } else if matches!(target.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["True"]) && levels.is_empty())
+        {
+            Expr::const_(Name::from_components(["True", "intro"]), Vec::new())
+        } else {
+            return Err(error(TacticError::NoMatchingAssumption));
+        };
+        // Just like an explicit rfl/constructor, this is a candidate, not a
+        // verdict. Closing and final command admission retain their usual checks.
+        Ok(vec![Work::Close(goal.clone(), value)])
     }
 
     fn search_local_candidate(
@@ -247,6 +294,63 @@ mod tests {
             context.solve_by_elim_proof_goal(goal),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
         ));
+        assert!(!context.txn.mvars.is_assigned(&id));
+    }
+
+    #[test]
+    fn default_leaf_constructs_true_without_any_local_hypothesis() {
+        let mut context = context();
+        let target = Expr::const_(Name::from_components(["True"]), Vec::new());
+        let (root, goal) = context.proof_goal(target).unwrap();
+        context.solve_by_elim_proof_goal(goal).unwrap();
+        assert_eq!(
+            context.instantiate(&root).unwrap(),
+            Expr::const_(Name::from_components(["True", "intro"]), Vec::new())
+        );
+    }
+
+    #[test]
+    fn default_reflexivity_closes_a_local_lemma_premise() {
+        let mut context = context();
+        let p = proposition(&mut context, "p");
+        let alpha = Expr::sort(Level::zero());
+        let level = Level::succ(Level::zero());
+        let equality = equality::equation(level.clone(), alpha.clone(), p.clone(), p.clone());
+        let q = proposition(&mut context, "q");
+        let rule = local(&mut context, "rule", arrow(equality, q.clone()));
+        let (root, goal) = context.proof_goal(q).unwrap();
+        context.solve_by_elim_proof_goal(goal).unwrap();
+        assert_eq!(
+            context.instantiate(&root).unwrap(),
+            Expr::app(rule, equality::reflexivity(level, alpha, p))
+        );
+    }
+
+    #[test]
+    fn default_heterogeneous_reflexivity_constructs_heq_refl() {
+        let mut context = context();
+        let p = proposition(&mut context, "p");
+        let alpha = Expr::sort(Level::zero());
+        let level = Level::succ(Level::zero());
+        let target = [alpha.clone(), p.clone(), alpha.clone(), p.clone()]
+            .into_iter()
+            .fold(Expr::const_(Name::from_components(["HEq"]), vec![level.clone()]), Expr::app);
+        let (root, goal) = context.proof_goal(target).unwrap();
+        context.solve_by_elim_proof_goal(goal).unwrap();
+        let expected = [alpha, p].into_iter().fold(
+            Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+            Expr::app,
+        );
+        assert_eq!(context.instantiate(&root).unwrap(), expected);
+    }
+
+    #[test]
+    fn defaults_do_not_prove_an_arbitrary_proposition() {
+        let mut context = context();
+        let p = proposition(&mut context, "p");
+        let (_, goal) = context.proof_goal(p).unwrap();
+        let id = goal.id.clone();
+        assert!(context.solve_by_elim_proof_goal(goal).is_err());
         assert!(!context.txn.mvars.is_assigned(&id));
     }
 }
