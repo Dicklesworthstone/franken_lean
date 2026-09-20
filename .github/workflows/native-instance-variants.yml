@@ -4,8 +4,11 @@ on:
   push:
     branches: [main]
     paths:
+      - 'crates/fln-checker/**'
       - 'crates/fln-elab/**'
+      - 'crates/fln/src/lib.rs'
       - 'crates/fln/tests/source_instance*.rs'
+      - 'crates/fln/tests/source_automatic_arithmetic.rs'
       - 'crates/fln-cli/tests/instance*.rs'
       - '.github/workflows/native-instance-variants.yml'
   workflow_dispatch:
@@ -21,6 +24,8 @@ jobs:
   integration:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -28,9 +33,53 @@ jobs:
       - name: Retain exact integration input
         run: |
           mkdir -p target/instance-variants
-          git archive --format=tar.gz HEAD > target/instance-variants/source.tar.gz
           git rev-parse HEAD > target/instance-variants/commit.txt
-          git rev-parse 'HEAD^{tree}' > target/instance-variants/tree.txt
+          git rev-parse 'HEAD^{tree}' > target/instance-variants/base-tree.txt
+      - name: Prepare exact locally tested integration patch
+        if: startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          base = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
+          parts = ['d897277a5956228fdc45434c457878560488744a', '743f14a9a55f4bb5bff83fde22cd0249e0a70a6c', 'a24d9fb419ab362c787f6645af5dd44720b0a72b']
+          def blob_hash(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          chunks = []
+          for sha in parts:
+              with urllib.request.urlopen(urllib.request.Request(base + '/git/blobs/' + sha, headers=headers), timeout=60) as response:
+                  data = base64.b64decode(json.load(response)['content'])
+              assert blob_hash(data) == sha
+              chunks.append(data)
+          compressed = b''.join(chunks)
+          assert blob_hash(compressed) == 'be0b88a7c2d24b52beabcd51c2263603a1d79932'
+          payload = json.loads(gzip.decompress(compressed))
+          for item in payload['files']:
+              path = pathlib.Path(item['path'])
+              assert not path.is_absolute() and '..' not in path.parts and path.parts[0] == 'crates'
+              actual = blob_hash(path.read_bytes()) if path.exists() else None
+              assert actual == item['before'], (str(path), actual, item['before'])
+          out = pathlib.Path('target/instance-variants')
+          (out / 'manifest.json').write_text(json.dumps(payload['files'], indent=2))
+          patch = out / 'implementation.patch'
+          patch.write_text(payload['patch'])
+          subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+          for item in payload['files']:
+              assert blob_hash(pathlib.Path(item['path']).read_bytes()) == item['after']
+          actual_paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert sorted(actual_paths) == sorted(item['path'] for item in payload['files'])
+          PY
+      - name: Retain tested source tree
+        run: |
+          tree="$(git write-tree)"
+          echo "$tree" > target/instance-variants/tree.txt
+          git archive --format=tar.gz "$tree" > target/instance-variants/source.tar.gz
+          git diff --cached --check
       - name: Install configured compiler
         id: compiler
         shell: bash
@@ -39,29 +88,58 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/instance-variants/compiler.txt
-      - name: Elaborator and source instance regressions
+      - name: Checker elaborator engine and command regressions
         shell: bash
         run: |
+          set +e
           set -uo pipefail
-          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/instance-variants/elab.log
+          cargo test --locked -p fln-checker --no-fail-fast 2>&1 | tee target/instance-variants/checker.log
           a=${PIPESTATUS[0]}
-          cargo test --locked -p fln --test source_instance_variants --test source_instance_tabling --test source_instances 2>&1 | tee target/instance-variants/engine.log
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/instance-variants/elab.log
           b=${PIPESTATUS[0]}
-          cargo test --locked -p fln-cli --test instance_variants --test instance_tabling 2>&1 | tee target/instance-variants/cli.log
+          cargo test --locked -p fln --test source_instance_polymorphic_tabling --test source_automatic_arithmetic --test source_instance_variants --test source_instance_tabling --test source_instances --test source_proof_search 2>&1 | tee target/instance-variants/engine.log
           c=${PIPESTATUS[0]}
-          printf 'elab=%s engine=%s cli=%s\n' "$a" "$b" "$c" | tee target/instance-variants/tests.txt
-          test "$a" -eq 0 && test "$b" -eq 0 && test "$c" -eq 0
+          cargo test --locked -p fln-cli --test instance_variants --test instance_tabling 2>&1 | tee target/instance-variants/cli.log
+          d=${PIPESTATUS[0]}
+          printf 'checker=%s elab=%s engine=%s cli=%s\n' "$a" "$b" "$c" "$d" | tee target/instance-variants/tests.txt
+          test "$a" -eq 0 && test "$b" -eq 0 && test "$c" -eq 0 && test "$d" -eq 0
       - name: Lint and downstream compilation
         if: always() && steps.compiler.outcome == 'success'
         shell: bash
         run: |
+          set +e
           set -uo pipefail
-          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/instance-variants/clippy.log
+          cargo clippy --locked -p fln-checker -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee target/instance-variants/clippy.log
           a=${PIPESTATUS[0]}
           cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-variants/workspace.log
           b=${PIPESTATUS[0]}
           printf 'clippy=%s workspace=%s\n' "$a" "$b" | tee target/instance-variants/checks.txt
           test "$a" -eq 0 && test "$b" -eq 0
+      - name: Export verified Git objects without changing any ref
+        if: success() && startsWith(github.event.head_commit.message, 'build(instance): prepare verified polymorphic objects')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          out = pathlib.Path('target/instance-variants')
+          manifest = json.loads((out / 'manifest.json').read_text())
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+          for item in manifest:
+              data = pathlib.Path(item['path']).read_bytes()
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              assert expected == item['after'], item['path']
+              body = json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=body, headers=headers, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected, item['path']
+              item['sha'] = result['sha']
+          (out / 'blobs.json').write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          PY
       - name: Retain source and results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
