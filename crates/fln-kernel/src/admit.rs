@@ -3558,7 +3558,7 @@ mod tests {
                         is_reflexive: false,
                     })
                     .collect(),
-                ctors: Vec::new>,
+                ctors: Vec::new(),
                 recursors: Vec::new(),
             }
         }
