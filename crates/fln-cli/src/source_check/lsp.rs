@@ -8,27 +8,47 @@ use fln_server::dispatch::OpenDocumentSource;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod dependencies;
+mod render;
+use fln::source_check::inspect::{ObservationKind, SourceObservation};
+use fln_server::dispatch::semantic::{Answer, Query, QueryKind};
+
+enum Request {
+    Check(Sources),
+    Inspect(Sources, usize, QueryKind),
+}
+enum Response {
+    Diagnostics(Vec<String>),
+    Semantic(Result<Option<Answer>, String>),
+}
+
 pub(crate) struct Checker {
     worker: Option<Worker>,
     dependencies: dependencies::Dependencies,
 }
 struct Worker {
-    input: SyncSender<Option<Sources>>,
-    output: Receiver<Vec<String>>,
+    input: SyncSender<Option<Request>>,
+    output: Receiver<Response>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Worker {
     fn new() -> std::io::Result<Self> {
-        let (input, requests) = sync_channel::<Option<Sources>>(1);
+        let (input, requests) = sync_channel::<Option<Request>>(1);
         let (responses, output) = sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("fln-lsp-proof-check".to_owned())
             .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
             .spawn(move || {
                 let mut session = None;
-                while let Ok(Some(sources)) = requests.recv() {
-                    let messages = check_sources(&mut session, &sources);
-                    if responses.send(messages).is_err() {
+                while let Ok(Some(request)) = requests.recv() {
+                    let response = match request {
+                        Request::Check(sources) => {
+                            Response::Diagnostics(check_sources(&mut session, &sources))
+                        }
+                        Request::Inspect(sources, offset, kind) => Response::Semantic(
+                            inspect_sources(&mut session, &sources, offset, kind),
+                        ),
+                    };
+                    if responses.send(response).is_err() {
                         break;
                     }
                 }
@@ -111,8 +131,8 @@ impl Checker {
             }
         }
         let worker = self.worker.as_ref().expect("started worker");
-        if worker.input.send(Some(sources)).is_ok()
-            && let Ok(messages) = worker.output.recv()
+        if worker.input.send(Some(Request::Check(sources))).is_ok()
+            && let Ok(Response::Diagnostics(messages)) = worker.output.recv()
         {
             return messages;
         }
@@ -196,28 +216,8 @@ fn check_sources(session: &mut Option<SourceModuleSession>, sources: &Sources) -
     let uri = &sources.uris[0];
     // Source bytes came from validated UTF-8 editor text or the native lexer.
     let text = std::str::from_utf8(&sources.sources[0]).expect("editor source is UTF-8");
-    if session.is_none() {
-        let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
-            SOURCE_RUN_KERNEL_STACK_BYTES,
-        ));
-        let engine = match fln::Engine::with_coercion_seed(admission) {
-            Ok(fln::Outcome::Complete(engine)) => engine,
-            Ok(fln::Outcome::Inconclusive(reason)) => {
-                return project(uri, text, &nonanswer("seed", &format!("{reason:?}")));
-            }
-            Ok(fln::Outcome::InternalFault(reason)) => {
-                return project(uri, text, &fault("seed-admission", &format!("{reason:?}")));
-            }
-            Err(error) => return project(uri, text, &fault("seed-admission", &error.to_string())),
-        };
-        let mut limits = fln::SourceCheckLimits::new(admission);
-        limits.max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
-        *session = Some(SourceModuleSession::new(
-            engine,
-            fln::KVMap::new(),
-            SourceModuleCheckLimits::new(limits),
-            SourceModuleCacheLimits::default(),
-        ));
+    if let Err(snapshot) = ensure_session(session) {
+        return project(uri, text, &snapshot);
     }
     let inputs: Vec<_> = sources
         .names
@@ -278,6 +278,41 @@ fn check_sources(session: &mut Option<SourceModuleSession>, sources: &Sources) -
 }
 
 impl fln_server::dispatch::WorkspaceChecker for Checker {
+    fn semantic_queries(&self) -> bool {
+        true
+    }
+    fn query(
+        &mut self,
+        query: Query<'_>,
+        documents: &[OpenDocumentSource<'_>],
+    ) -> Result<Option<Answer>, String> {
+        if query.text.len() > SOURCE_RUN_DEFAULT_MAX_BYTES {
+            return Err("editor source exceeds its byte limit".to_owned());
+        }
+        let sources = editor::load(
+            query.uri,
+            query.text,
+            documents,
+            SOURCE_RUN_DEFAULT_MAX_BYTES,
+        )
+        .map_err(|error| error.detail)?;
+        if self.worker.is_none() {
+            self.worker =
+                Some(Worker::new().map_err(|e| format!("could not start proof worker: {e}"))?);
+        }
+        let worker = self.worker.as_ref().expect("started query worker");
+        if worker
+            .input
+            .send(Some(Request::Inspect(sources, query.offset, query.kind)))
+            .is_ok()
+            && let Ok(Response::Semantic(result)) = worker.output.recv()
+        {
+            return result;
+        }
+        self.worker = None;
+        Err("proof worker stopped without a semantic result".to_owned())
+    }
+
     fn check(
         &mut self,
         uri: &str,
@@ -293,4 +328,119 @@ impl fln_server::dispatch::WorkspaceChecker for Checker {
     ) -> Vec<String> {
         self.dependencies.affected(changed, documents)
     }
+}
+
+fn ensure_session(
+    session: &mut Option<SourceModuleSession>,
+) -> Result<(), Box<ProjectionSnapshot>> {
+    if session.is_none() {
+        let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
+            SOURCE_RUN_KERNEL_STACK_BYTES,
+        ));
+        let engine = match fln::Engine::with_coercion_seed(admission) {
+            Ok(fln::Outcome::Complete(engine)) => engine,
+            Ok(fln::Outcome::Inconclusive(reason)) => {
+                return Err(Box::new(nonanswer("seed", &format!("{reason:?}"))));
+            }
+            Ok(fln::Outcome::InternalFault(reason)) => {
+                return Err(Box::new(fault("seed-admission", &format!("{reason:?}"))));
+            }
+            Err(error) => return Err(Box::new(fault("seed-admission", &error.to_string()))),
+        };
+        let mut limits = fln::SourceCheckLimits::new(admission);
+        limits.max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
+        *session = Some(SourceModuleSession::new(
+            engine,
+            fln::KVMap::new(),
+            SourceModuleCheckLimits::new(limits),
+            SourceModuleCacheLimits::default(),
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_sources(
+    session: &mut Option<SourceModuleSession>,
+    sources: &Sources,
+    offset: usize,
+    kind: QueryKind,
+) -> Result<Option<Answer>, String> {
+    ensure_session(session).map_err(|_| "native seed admission did not complete".to_owned())?;
+    let inputs: Vec<_> = sources
+        .names
+        .iter()
+        .zip(&sources.sources)
+        .map(|(name, source)| fln::SourceModuleInput { name, source })
+        .collect();
+    let wanted = match kind {
+        QueryKind::Goals => ObservationKind::Goals,
+        QueryKind::Hover => ObservationKind::Term,
+    };
+    let result = session
+        .as_mut()
+        .expect("initialized semantic session")
+        .inspect(&inputs, &sources.names[0], offset, wanted)
+        .map_err(|e| e.to_string())?;
+    let inspected = match result {
+        fln::Outcome::Complete(result) => result,
+        fln::Outcome::Inconclusive(reason) => {
+            return Err(format!("native inspection was inconclusive: {reason:?}"));
+        }
+        fln::Outcome::InternalFault(reason) => {
+            return Err(format!("native inspection fault: {reason:?}"));
+        }
+    };
+    Ok(match inspected.observation {
+        None => None,
+        Some(SourceObservation::Goals { goals, .. }) => {
+            if goals.len() > 256 {
+                return Err("too many goals for one editor response".to_owned());
+            }
+            let mut displayed = Vec::new();
+            let mut total = 0usize;
+            for goal in goals {
+                let mut renderer = render::Renderer::new();
+                let mut names = Vec::new();
+                for local in goal.locals.decls() {
+                    names.push(renderer.local(&local.id, &local.user_name)?);
+                }
+                let mut lines = Vec::new();
+                for (local, name) in goal.locals.decls().iter().zip(names) {
+                    let type_ = renderer.expr(&local.type_)?;
+                    let value = match &local.value {
+                        Some(v) => format!(" := {}", renderer.expr(v)?),
+                        None => String::new(),
+                    };
+                    lines.push(format!("{name} : {type_}{value}"));
+                }
+                lines.push(format!("⊢ {}", renderer.expr(&goal.target)?));
+                let text = lines.join("\n");
+                total = total
+                    .checked_add(text.len())
+                    .filter(|bytes| *bytes <= 64 * 1024)
+                    .ok_or("goal display exceeded its byte limit")?;
+                displayed.push(text);
+            }
+            Some(Answer::Goals { goals: displayed })
+        }
+        Some(SourceObservation::Term {
+            range,
+            expression,
+            type_,
+            locals,
+        }) => {
+            let mut renderer = render::Renderer::new();
+            for local in locals.decls() {
+                renderer.local(&local.id, &local.user_name)?;
+            }
+            Some(Answer::Hover {
+                contents: format!(
+                    "{} : {}",
+                    renderer.expr(&expression)?,
+                    renderer.expr(&type_)?
+                ),
+                range,
+            })
+        }
+    })
 }

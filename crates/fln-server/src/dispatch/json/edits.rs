@@ -25,14 +25,14 @@ struct Limits {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Position {
-    line: u32,
-    character: u32,
+pub(in crate::dispatch) struct Position {
+    pub(in crate::dispatch) line: u32,
+    pub(in crate::dispatch) character: u32,
 }
 
 type Refusal = &'static str;
 
-fn position(raw: RawField<'_>) -> Result<Position, Refusal> {
+pub(in crate::dispatch) fn position(raw: RawField<'_>) -> Result<Position, Refusal> {
     fn coordinate(raw: RawField<'_>, key: &str) -> Result<u32, Refusal> {
         match decoded_integer_field(raw, key) {
             VersionField::Valid(value) if (0..=i64::from(i32::MAX)).contains(&value) => {
@@ -49,7 +49,7 @@ fn position(raw: RawField<'_>) -> Result<Position, Refusal> {
 
 /// LSP clamps positions beyond the document/line to its end. An offset inside
 /// a surrogate pair has no UTF-8 scalar boundary and is refused, not rounded.
-fn byte_offset(text: &str, position: Position) -> Result<usize, Refusal> {
+pub(in crate::dispatch) fn byte_offset(text: &str, position: Position) -> Result<usize, Refusal> {
     let bytes = text.as_bytes();
     let mut start = 0;
     let mut line = 0;

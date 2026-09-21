@@ -4,6 +4,14 @@
 include!("json/core.rs");
 
 mod edits;
+pub(super) use edits::{Position, byte_offset};
+pub(super) fn query_position(params: RawField<'_>) -> Result<Position, &'static str> {
+    let RawField::Value(params) = params_object(params) else {
+        return Err("position parameters require an object");
+    };
+    edits::position(object_field(params, "position"))
+}
+
 pub(super) use edits::content_changes_text_from;
 
 mod files;

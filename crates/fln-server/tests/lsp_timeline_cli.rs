@@ -136,7 +136,7 @@ fn valid_interleaving_emits_cross_stream_causality_receipt() {
     assert!(stdout.contains("\"cancellationsBeforeResponse\":1"));
     assert!(stdout.contains("\"cancellationsAfterResponse\":0"));
     assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":1"));
-    assert!(stdout.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\""));
+    assert!(stdout.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/6\""));
     fs::remove_file(path).unwrap();
 }
 
