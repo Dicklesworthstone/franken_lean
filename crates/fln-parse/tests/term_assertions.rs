@@ -28,6 +28,7 @@ fn incomplete_assertions_never_drop_a_type_value_or_continuation() {
         "def x : Nat := show Nat",
         "def x : Nat := show from 0",
         "def x : Nat := show Nat from",
+        "def x : Nat := show Nat by",
         "def x : Nat := have h Nat := 0; h",
     ] {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
@@ -198,16 +199,4 @@ fn deep_multiline_assertions_keep_the_small_stack_bound() {
         .unwrap()
         .join()
         .unwrap();
-}
-
-#[test]
-fn empty_by_preserves_an_explicit_unsolved_proof_node() {
-    for source in [
-        "def x : Nat := show Nat by",
-        "theorem unfinished : False := by",
-    ] {
-        let parsed = parse_definition(source.as_bytes()).expect("empty proof syntax");
-        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
-        assert!(format!("{:?}", parsed.syntax()).contains("byTactic"));
-    }
 }

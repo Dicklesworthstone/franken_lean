@@ -12,17 +12,6 @@ pub struct OpenDocumentSource<'a> {
 pub type OnDocumentCheck<'a> = dyn FnMut(&str, &str, &[OpenDocumentSource<'_>]) -> Vec<String> + 'a;
 
 pub(super) trait CheckSource {
-    fn semantic_queries(&self) -> bool {
-        false
-    }
-    fn query(
-        &mut self,
-        _: semantic::Query<'_>,
-        _: &[OpenDocumentSource<'_>],
-    ) -> Result<Option<semantic::Answer>, String> {
-        Ok(None)
-    }
-
     fn tracks_dependencies(&self) -> bool {
         false
     }

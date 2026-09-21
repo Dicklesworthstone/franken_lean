@@ -133,7 +133,6 @@ enum Work<'a> {
 }
 #[derive(Clone)]
 pub(super) struct ProofState<'a> {
-    extent: Option<Box<std::ops::Range<usize>>>,
     saved: LocalContext,
     target: Expr,
     root: Expr,
@@ -229,10 +228,7 @@ impl Context {
         expect_atom(&parts[0], "by", "by keyword")?;
         let instructions = self.proof_instructions(&parts[1])?;
         let (root, goal) = self.proof_goal(target.clone())?;
-        let extent = self.observation_extent(syntax)?.map(Box::new);
-        self.observe_by(&parts[0], &goal)?;
         Ok(ProofState {
-            extent,
             saved: self.txn.lctx.clone(),
             target,
             root,
@@ -407,7 +403,6 @@ impl Context {
                 if proof.cursor != proof.instructions.len() {
                     return Err(error(TacticError::NoGoals));
                 }
-                self.observe_proof_end(proof.extent.as_deref(), &[])?;
                 self.txn.lctx = proof.saved.clone();
                 let value = self.instantiate(&proof.root)?;
                 return Ok(ProofAction::Complete(Typed {
@@ -477,22 +472,7 @@ impl Context {
             }
             self.txn.lctx = goal.lctx.clone();
             goal.target = self.instantiate(&goal.target)?;
-            let instruction = proof.instructions.get(proof.cursor).copied();
-            if self.observes_goal(instruction, proof.extent.as_deref())? {
-                let mut visible = vec![(goal.target.clone(), goal.lctx.clone())];
-                for pending in proof.work.iter().rev() {
-                    self.tick()?;
-                    match pending {
-                        Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_) => break,
-                        Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
-                            visible.push((other.target.clone(), other.lctx.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-                self.observe_goals(&visible)?;
-            }
-            let Some(instruction) = instruction else {
+            let Some(&instruction) = proof.instructions.get(proof.cursor) else {
                 if let Some(index) = self.suspend_attempt(proof, &goal)? {
                     return Ok(ProofAction::AttemptComplete(index));
                 }

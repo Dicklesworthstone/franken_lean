@@ -395,7 +395,6 @@ impl Context {
         };
         let (root, mut goal) = self.proof_goal(target.clone())?;
         let mut proof = ProofState {
-            extent: None,
             saved,
             target,
             root,

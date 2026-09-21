@@ -61,23 +61,7 @@ pub(super) fn parse(
     }
     let first = by + 1;
     if first == end {
-        let sequence = Syntax::node(
-            parser_kind(&["Tactic", "tacticSeq"]),
-            vec![Syntax::node(
-                parser_kind(&["Tactic", "tacticSeq1Indented"]),
-                vec![Syntax::node(
-                    Name::str(Name::anonymous(), "null"),
-                    Vec::new(),
-                )],
-            )],
-        );
-        return Ok((
-            Syntax::node(
-                parser_kind(&["Term", "byTactic"]),
-                vec![leaves.leaf(by)?, sequence],
-            ),
-            end,
-        ));
+        return Err(refusal(view, tokens, first));
     }
     let source = view.normalized();
     let first_line = source.line_of(tokens[first].extent.start());

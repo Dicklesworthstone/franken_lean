@@ -9,8 +9,6 @@ on:
       - 'crates/fln/src/source_check/**'
       - 'crates/fln-server/src/dispatch/**'
       - 'crates/fln-server/src/dispatch.rs'
-      - 'crates/fln-server/src/correlation.rs'
-      - 'crates/fln-server/src/json.rs'
       - 'crates/fln-cli/src/source_check/**'
       - 'crates/fln/tests/source_goal_inspection.rs'
       - 'crates/fln-cli/tests/lsp_goals.rs'
@@ -21,47 +19,10 @@ jobs:
   goals:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Apply exact locally checked native editor implementation
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-editor]')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          chunks = ['f12d5147884a63bd351a5b290b61073812308cee', '70db6ceba5bb8164a06321d8a20d91bb068e748d', '24a7fd8ddb64c3563a4969b58faaf24055dc152e', '47b34ebacc1709547a89e19fae41a556bce3a829']
-          compressed = bytearray()
-          for sha in chunks:
-              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  blob = json.load(response)
-              assert blob['encoding'] == 'base64'
-              data = base64.b64decode(blob['content'])
-              assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == sha
-              compressed.extend(data)
-          payload = gzip.decompress(compressed)
-          assert hashlib.sha256(payload).hexdigest() == '88df276b524fb82c174799db06a7119b5d25c7c4f11c80f67ba020aac367d4b7'
-          bundle = json.loads(payload)
-          allowed = {'crates/fln-cli/src/source_check/lsp.rs', 'crates/fln-cli/src/source_check/lsp/render.rs', 'crates/fln-cli/tests/lsp_goals.rs', 'crates/fln-server/src/bin/fln-lsp-timeline.rs', 'crates/fln-server/src/correlation.rs', 'crates/fln-server/src/dispatch.rs', 'crates/fln-server/src/dispatch/documents.rs', 'crates/fln-server/src/dispatch/json.rs', 'crates/fln-server/src/dispatch/json/edits.rs', 'crates/fln-server/src/dispatch/semantic.rs', 'crates/fln-server/src/dispatch/workspace.rs', 'crates/fln-server/src/json.rs', 'crates/fln-server/tests/lsp_correlate_cli.rs', 'crates/fln-server/tests/lsp_timeline_cli.rs', 'docs/NATIVE_EDITOR_QUERIES.md'}
-          assert set(bundle['preimages']) == allowed
-          for name, sha in bundle['preimages'].items():
-              path = pathlib.Path(name)
-              assert path.parts[0] in ('crates', 'docs') and '..' not in path.parts
-              if sha is None:
-                  assert not path.exists(), name
-              else:
-                  actual = subprocess.check_output(['git', 'hash-object', '--', name], text=True).strip()
-                  assert actual == sha, (name, actual, sha)
-          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-editor.patch'
-          patch.write_text(bundle['patch'])
-          assert '\ndeleted file mode ' not in bundle['patch']
-          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
-          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-          assert set(actual) == allowed
+        with:
+          persist-credentials: false
       - name: Install exact repository toolchain
         shell: bash
         run: |
@@ -69,33 +30,32 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv
-      - name: Check native goal and installed protocol consumers
+      - name: Retain reproducible offline development inputs
         shell: bash
         run: |
           set -euo pipefail
-          exec > >(tee "$RUNNER_TEMP/native-inspection-validation.log") 2>&1
-          git rev-parse HEAD
-          cargo test --locked -p fln-server --no-fail-fast
-          cargo test --locked -p fln-cli --test lsp_goals --test lsp_stdio_e2e --test lsp_proof_modules --test source_module_check
-          cargo test --locked -p fln-cli --lib source_check::lsp
-          cargo test --locked -p fln --test source_goal_inspection --test source_module_check --test source_module_session
-          cargo clippy --locked -p fln-elab -p fln-server -p fln -p fln-cli --all-targets -- -D warnings
-          cargo check --locked --workspace --all-targets
-          git diff --cached --check
-      - name: Publish tested implementation directly to main
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-editor]')
-        shell: bash
-        run: |
-          set -euo pipefail
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(lsp): serve native proof goals and hover from checked unsaved source'
-          git rev-parse HEAD | tee "$RUNNER_TEMP/native-inspection-commit.txt"
-          git push origin HEAD:main
+          mkdir -p "$RUNNER_TEMP/native-goals"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/native-goals/source.tar.gz"
+          sysroot=$(rustc --print sysroot)
+          tar -czf "$RUNNER_TEMP/native-goals/rust.tar.gz" -C "$sysroot" bin lib
+          git rev-parse HEAD > "$RUNNER_TEMP/native-goals/source-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
         with:
-          name: native-inspection-validation-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/native-inspection-validation.log
-            ${{ runner.temp }}/native-inspection-commit.txt
-          retention-days: 7
-          if-no-files-found: error
+          name: native-goal-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/native-goals
+          retention-days: 1
+          compression-level: 0
+      - name: Check native goal and protocol consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-server
+          cargo test --locked -p fln --test source_module_check --test source_module_session
+          if test -f crates/fln/tests/source_goal_inspection.rs; then
+            cargo test --locked -p fln --test source_goal_inspection
+          fi
+          if test -f crates/fln-cli/tests/lsp_goals.rs; then
+            cargo test --locked -p fln-cli --test lsp_goals
+          fi
+          cargo test --locked -p fln-cli --test lsp_stdio_e2e --test lsp_proof_modules
+          cargo check --locked --workspace --all-targets

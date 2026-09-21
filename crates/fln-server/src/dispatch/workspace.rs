@@ -8,17 +8,6 @@ use std::collections::BTreeSet;
 /// Returned URIs are requests to recheck, never diagnostic or source authority.
 /// The dispatcher intersects them with its current session and checks each once.
 pub trait WorkspaceChecker {
-    fn semantic_queries(&self) -> bool {
-        false
-    }
-    fn query(
-        &mut self,
-        _: semantic::Query<'_>,
-        _: &[OpenDocumentSource<'_>],
-    ) -> Result<Option<semantic::Answer>, String> {
-        Ok(None)
-    }
-
     fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
     fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>])
@@ -27,17 +16,6 @@ pub trait WorkspaceChecker {
 
 struct Adapter<'a>(&'a mut dyn WorkspaceChecker);
 impl CheckSource for Adapter<'_> {
-    fn semantic_queries(&self) -> bool {
-        self.0.semantic_queries()
-    }
-    fn query(
-        &mut self,
-        query: semantic::Query<'_>,
-        documents: &[OpenDocumentSource<'_>],
-    ) -> Result<Option<semantic::Answer>, String> {
-        self.0.query(query, documents)
-    }
-
     fn check(
         &mut self,
         uri: &str,

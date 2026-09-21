@@ -95,10 +95,10 @@ fn successful_join_emits_zero_unmatched_method_bound_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/6\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/5\""));
     assert!(stdout.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
     assert!(stdout.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
-    assert!(stdout.contains("\"methodResponseSchema\":\"fln.lsp-method-response/2\""));
+    assert!(stdout.contains("\"methodResponseSchema\":\"fln.lsp-method-response/1\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
@@ -153,8 +153,8 @@ fn method_contract_mismatch_fails_without_success_receipt() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("hover method contract"));
-    assert!(stderr.contains("expected InvalidParams, RequestFailed, or RequestCancelled"));
+    assert!(stderr.contains("no-information-query method contract"));
+    assert!(stderr.contains("expected the current null no-information result"));
     assert!(stderr.contains("observed error code -32601"));
 
     fs::remove_file(client_path).unwrap();
@@ -272,67 +272,4 @@ fn missing_response_and_numeric_normalization_fail_without_receipt() {
 
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
-}
-
-#[test]
-fn semantic_results_and_refusals_have_method_specific_contracts() {
-    let requests = framed(&[
-        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
-        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":"goal","method":"$/lean/plainGoal","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":"hover","method":"textDocument/hover","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":"bad","method":"$/lean/plainGoal","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown"}"#,
-        r#"{"jsonrpc":"2.0","method":"exit"}"#,
-    ]);
-    for (case, goal, hover, succeeds) in [
-        (
-            "good",
-            r#"{"rendered":"h : P\n⊢ P","goals":["h : P\n⊢ P"]}"#,
-            r#"{"contents":{"kind":"plaintext","value":"h : P"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}"#,
-            true,
-        ),
-        (
-            "wrong-goals",
-            r#"{"rendered":"fake","goals":[42]}"#,
-            "null",
-            false,
-        ),
-        ("missing-goals", r#"{"rendered":"fake"}"#, "null", false),
-        (
-            "reversed-range",
-            "null",
-            r#"{"contents":{"kind":"plaintext","value":"h : P"},"range":{"start":{"line":1,"character":0},"end":{"line":0,"character":1}}}"#,
-            false,
-        ),
-        (
-            "duplicate-field",
-            r#"{"rendered":"x","goals":[],"goals":["x"]}"#,
-            "null",
-            false,
-        ),
-    ] {
-        let replies = framed(&[
-            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
-            &format!(r#"{{"jsonrpc":"2.0","id":"goal","result":{goal}}}"#),
-            &format!(r#"{{"jsonrpc":"2.0","id":"hover","result":{hover}}}"#),
-            r#"{"jsonrpc":"2.0","id":"bad","error":{"code":-32602,"message":"invalid position"}}"#,
-            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
-        ]);
-        let (client, server) = write_pair(case, &requests, &replies);
-        let output = correlator().arg(client).arg(server).output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            succeeds,
-            "{case}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if succeeds {
-            let report = String::from_utf8(output.stdout).unwrap();
-            assert!(report.contains("\"semanticQueryResults\":2"));
-            assert!(report.contains("\"semanticQueryErrors\":1"));
-        } else {
-            assert!(output.stdout.is_empty());
-        }
-    }
 }

@@ -93,18 +93,6 @@ impl SourceModuleSession {
             source_bytes: 0,
         }
     }
-    /// Observe an unfinished declaration against the exact checked import and
-    /// command prefix. The declaration at the cursor is never admitted.
-    pub fn inspect(
-        &mut self,
-        modules: &[SourceModuleInput<'_>],
-        entry: &Name,
-        offset: usize,
-        kind: super::super::inspect::ObservationKind,
-    ) -> Result<Outcome<super::super::inspect::SourceInspection>, SourceModuleCheckError> {
-        super::super::inspect::module(self, modules, entry, offset, kind, self.limits)
-    }
-
     pub fn retained_modules(&self) -> usize {
         self.entries.len()
     }
