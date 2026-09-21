@@ -82,7 +82,12 @@ id_from() {
 
 create() {
   local title="$1"
-  br create "$title" --priority 1 --json --no-auto-flush --no-auto-import | id_from
+  local labels="${2:-}"
+  if [[ -n "$labels" ]]; then
+    br create "$title" --labels "$labels" --priority 1 --json --no-auto-flush --no-auto-import | id_from
+  else
+    br create "$title" --priority 1 --json --no-auto-flush --no-auto-import | id_from
+  fi
 }
 
 write_policy() {
@@ -92,7 +97,7 @@ write_policy() {
     --arg additive "$ADDITIVE_BEAD" --arg active1 "$ACTIVE1_BEAD" --arg active2 "$ACTIVE2_BEAD" \
     --arg active3 "$ACTIVE3_BEAD" --arg incident "$INCIDENT_BEAD" --arg later "$LATER_BEAD" \
     --arg expiry "$exception_expiry" \
-    '{schema:"fln.convergence-governance-policy/1",policy_version:"e2e/1",workstreams:["W1","W2","W3"],wip:{max_active_workstreams:2,verification_reservation:1,incident_reservation:1},review:{authority:"e2e",cadence_days:1,next_review:"2026-08-05T00:00:00Z"},gates:[{id:"G0",state:"failed",root_beads:[$root]},{id:"G1",state:"not_yet_runnable",root_beads:[$later]}],exceptions:[{id:"INC-1",owner:"e2e",scope:"incident",expiry:$expiry,review:"2026-08-04T12:00:00Z"}],registry:[{id:$root,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$ready,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$blocked,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$additive,class:"additive",workstream:"W3",gate:"G1"},{id:$active1,class:"implementation",workstream:"W1",gate:"G0"},{id:$active2,class:"implementation",workstream:"W2",gate:"G0"},{id:$active3,class:"implementation",workstream:"W3",gate:"G0"},{id:$incident,class:"incident",workstream:"W1",gate:"G0"}]}' \
+    '{schema:"fln.convergence-governance-policy/1",policy_version:"e2e/1",workstreams:["W1","W2","W3"],wip:{max_active_workstreams:2,verification_reservation:1,incident_reservation:1},fairness:{basis:"updated-or-created-utc",tie_break:"oldest-first-id",starvation_after_days:7},review:{authority:"e2e",cadence_days:1,next_review:"2026-08-05T00:00:00Z"},gates:[{id:"G0",state:"failed",root_beads:[$root]},{id:"G1",state:"not_yet_runnable",root_beads:[$later]}],exceptions:[{id:"INC-1",owner:"e2e",scope:"incident",expiry:$expiry,review:"2026-08-04T12:00:00Z"}],registry:[{id:$root,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$ready,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$blocked,class:"prerequisite",workstream:"W1",gate:"G0"},{id:$additive,class:"additive",workstream:"W3",gate:"G1"},{id:$active1,class:"implementation",workstream:"W1",gate:"G0"},{id:$active2,class:"implementation",workstream:"W2",gate:"G0"},{id:$active3,class:"implementation",workstream:"W3",gate:"G0"},{id:$incident,class:"incident",workstream:"W1",gate:"G0"}]}' \
     >| "$POLICY"
 }
 
@@ -131,9 +136,9 @@ ROOT_BEAD="$(create root-prerequisite)"
 READY_BEAD="$(create ready-g0-blocker)"
 BLOCKED_BEAD="$(create dependency-blocked-g0-blocker)"
 ADDITIVE_BEAD="$(create additive-feature)"
-ACTIVE1_BEAD="$(create active-w1)"
-ACTIVE2_BEAD="$(create active-w2)"
-ACTIVE3_BEAD="$(create candidate-w3)"
+ACTIVE1_BEAD="$(create active-w1 W1)"
+ACTIVE2_BEAD="$(create active-w2 W2)"
+ACTIVE3_BEAD="$(create candidate-w3 W3)"
 INCIDENT_BEAD="$(create bounded-incident)"
 LATER_BEAD="$(create later-gate)"
 br dep add "$BLOCKED_BEAD" "$ROOT_BEAD" --json --no-auto-flush --no-auto-import > "$SCRATCH/dep.json"
@@ -142,9 +147,9 @@ for bead in "$ACTIVE1_BEAD" "$ACTIVE2_BEAD"; do
     > "$SCRATCH/$bead.active.json"
 done
 write_policy 2026-08-04T11:00:00Z
-bv --db "$SCRATCH/.beads" --robot-graph --format json --no-cache > "$SCRATCH/bv-robot-graph.json"
+(cd "$SCRATCH" && br sync --flush-only --json > /dev/null && bv --robot-graph) > "$SCRATCH/bv-robot-graph.json"
 jq -e '.adjacency and .data_hash' "$SCRATCH/bv-robot-graph.json" > /dev/null
-event bv-robot-graph 'real robot graph' "present sha256=$(sha256_file "$SCRATCH/bv-robot-graph.json")" 'bv --db <scratch>/.beads --robot-graph --format json --no-cache' "$SCRATCH/bv-robot-graph.json"
+event bv-robot-graph 'real robot graph' "present sha256=$(sha256_file "$SCRATCH/bv-robot-graph.json")" '(cd <scratch> && br sync --flush-only --json && bv --robot-graph)' "$SCRATCH/bv-robot-graph.json"
 
 run_policy normal 0
 jq -e \

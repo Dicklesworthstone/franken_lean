@@ -60,6 +60,69 @@ const SELF_CLEANING: &[(&str, &str)] = &[
         "crates/fln-conformance/tests/attribute_state_census.rs",
         "remove_dir_all",
     ),
+    (
+        "crates/fln-olean/tests/chain_audit_cli.rs",
+        "remove_dir_all",
+    ),
+    (
+        "tools/structure-guard/tests/agent_anchor_cli.rs",
+        "remove_dir_all",
+    ),
+    (
+        "crates/fln-cli/tests/source_module_check.rs",
+        "remove_dir_all",
+    ),
+    (
+        "crates/fln-server/tests/lsp_client_lifecycle_params_cli.rs",
+        "remove_file",
+    ),
+    (
+        "crates/fln-server/tests/lsp_client_session_cli.rs",
+        "remove_file",
+    ),
+    (
+        "crates/fln-server/tests/lsp_correlate_cli.rs",
+        "remove_file",
+    ),
+    ("crates/fln-server/tests/lsp_replay_cli.rs", "remove_file"),
+    ("crates/fln-server/tests/lsp_timeline_cli.rs", "remove_file"),
+];
+
+/// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits).
+/// These call `std::env::temp_dir()` directly and do not yet route through `ScratchRoot`
+/// or self-clean.
+const UNROUTED_CLI_PRODUCERS: &[&str] = &[
+    "crates/fln-cli/tests/instance_dependent_outputs.rs",
+    "crates/fln-cli/tests/instance_output_search.rs",
+    "crates/fln-cli/tests/instance_tabling.rs",
+    "crates/fln-cli/tests/instance_universe_outputs.rs",
+    "crates/fln-cli/tests/instance_variants.rs",
+    "crates/fln-cli/tests/lsp_proof_modules.rs",
+    "crates/fln-cli/tests/runtime_conditionals.rs",
+    "crates/fln-cli/tests/source_check.rs",
+    "crates/fln-cli/tests/source_collection_notation.rs",
+    "crates/fln-cli/tests/source_collections.rs",
+    "crates/fln-cli/tests/source_constrained_simplification.rs",
+    "crates/fln-cli/tests/source_context_generalization.rs",
+    "crates/fln-cli/tests/source_default_simp.rs",
+    "crates/fln-cli/tests/source_delta_inference.rs",
+    "crates/fln-cli/tests/source_do_runtime.rs",
+    "crates/fln-cli/tests/source_equality_decisions.rs",
+    "crates/fln-cli/tests/source_expression_elimination.rs",
+    "crates/fln-cli/tests/source_hypothesis_rewriting.rs",
+    "crates/fln-cli/tests/source_local_helpers.rs",
+    "crates/fln-cli/tests/source_logic.rs",
+    "crates/fln-cli/tests/source_logical_rewriting.rs",
+    "crates/fln-cli/tests/source_nat_runtime.rs",
+    "crates/fln-cli/tests/source_proof_indices.rs",
+    "crates/fln-cli/tests/source_quotients.rs",
+    "crates/fln-cli/tests/source_record_runtime.rs",
+    "crates/fln-cli/tests/source_scopes.rs",
+    "crates/fln-cli/tests/source_search_reflexivity.rs",
+    "crates/fln-cli/tests/source_simp_hypotheses.rs",
+    "crates/fln-cli/tests/source_simpa.rs",
+    "crates/fln-cli/tests/source_term_binders.rs",
+    "crates/fln-cli/tests/source_variant_runtime.rs",
 ];
 
 /// Files whose needle sites materialize nothing: fence probes building synthetic
@@ -163,10 +226,12 @@ fn every_temp_dir_call_site_is_classified() {
         let in_remainder = remainder_files.contains(&found.as_str());
         let in_self_cleaning = SELF_CLEANING.iter().any(|(path, _)| path == found);
         let in_non_producer = NON_PRODUCER.contains(&found.as_str());
+        let in_unrouted_cli = UNROUTED_CLI_PRODUCERS.contains(&found.as_str());
         let classes = in_machinery as usize
             + in_remainder as usize
             + in_self_cleaning as usize
-            + in_non_producer as usize;
+            + in_non_producer as usize
+            + in_unrouted_cli as usize;
         if classes != 1 {
             unclassified.push(format!("{found} (in {classes} classes)"));
         }
@@ -174,7 +239,7 @@ fn every_temp_dir_call_site_is_classified() {
     assert!(
         unclassified.is_empty(),
         "every {NEEDLE} call site must be in exactly one class — machinery, declared \
-         remainder, self-cleaning, or non-producer. An entry here is either a new \
+         remainder, self-cleaning, non-producer, or unrouted CLI producer. An entry here is either a new \
          scratch producer bypassing the fence (route it through ScratchRoot with a new \
          SCRATCH_FAMILIES row) or a class this census has not been told about:\n{}",
         unclassified.join("\n")
@@ -188,6 +253,7 @@ fn every_temp_dir_call_site_is_classified() {
         .chain(NON_PRODUCER.iter())
         .chain(remainder_files.iter())
         .chain(SELF_CLEANING.iter().map(|(path, _)| path))
+        .chain(UNROUTED_CLI_PRODUCERS.iter())
     {
         if !needle_files.iter().any(|found| found == path) {
             missing.push(*path);

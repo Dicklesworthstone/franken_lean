@@ -45,46 +45,25 @@ const STALE_DAYS: i64 = 3;
 /// or receives fresh landed work — silently, by the one-way rule.
 const SEEDED_REMAINDER: &[(&str, &str)] = &[
     (
-        "fln-20n",
-        "codec read levels; partial work landed via the fln-wgp seam",
+        "fln-eae",
+        "W6 Synod instance engine; multi-slice epic, bounded native synthesis landed",
     ),
-    ("fln-amv", "env epic; sub-slices landed under fln-amv.* ids"),
     ("fln-h1k", "verdict follow-on; seeded unadjudicated"),
-    ("fln-lst4", "seeded unadjudicated at mechanism landing"),
-    ("fln-msou", "seeded unadjudicated at mechanism landing"),
     (
-        "fln-yihl",
-        "rch staleness finding; external-tool half stays open",
+        "fln-kpd",
+        "W6 Native tactic framework; multi-slice epic, bounded conditional rewriting landed",
     ),
     (
-        "franken_lean-83r",
-        "adjudicated: multi-slice epic, slices 1-5 landed (stage0 executes on Marrow \
-         incl. the 5-TU module DAG); runtime-suite half legitimately open on \
-         fln-3gv's IO plane",
-    ),
-    (
-        "franken_lean-d17i",
-        "seeded unadjudicated at mechanism landing",
-    ),
-    (
-        "franken_lean-d3-safety-note-unenforced-cdbg",
-        "seeded unadjudicated",
-    ),
-    (
-        "franken_lean-gii",
-        "fln-checker independent checker in-progress; Prelude items 0..10 passing, indexed Eq ongoing",
+        "fln-qb5",
+        "W6 Term elaboration; multi-slice epic, constructor/app slices landed",
     ),
     (
         "franken_lean-n8hw",
         "seeded unadjudicated at mechanism landing",
     ),
     (
-        "franken_lean-timy",
-        "seeded unadjudicated at mechanism landing",
-    ),
-    (
-        "franken_lean-zht",
-        "kernel coverage follow-up; bc7 carried part of it",
+        "franken_lean-xqc",
+        "W4 Vellum; multi-slice epic, parser/hygiene slices landed",
     ),
 ];
 

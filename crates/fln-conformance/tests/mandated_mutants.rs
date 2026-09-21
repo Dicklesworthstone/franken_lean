@@ -102,6 +102,7 @@ const STUB_DECLARATION: &str = "Stub crate: charter only.";
 #[derive(Clone, Copy)]
 enum SeedTrigger {
     /// Any implementation replaces the whole-crate stub declaration.
+    #[allow(dead_code)]
     CrateImplementation,
     /// A partial crate may exist first; the named construct is the relevant boundary.
     ///
@@ -138,7 +139,7 @@ const NOT_YET_SEEDED: [DeferredMutant; 2] = [
     DeferredMutant {
         name: "stale cache hit accepted",
         krate: "fln-ledger",
-        trigger: SeedTrigger::CrateImplementation,
+        trigger: SeedTrigger::ProductionNeedle("fn query"),
     },
 ];
 
@@ -810,8 +811,14 @@ fn deferrals_expire_on_their_declared_production_trigger() {
     );
 
     let ledger = NOT_YET_SEEDED[1].trigger;
-    assert!(!ledger.is_present(STUB_DECLARATION));
-    assert!(ledger.is_present("pub struct Ledger {}"));
+    assert!(
+        !ledger.is_present("pub struct LedgerRecord {}"),
+        "unrelated record types cannot carry a stale cache hit defect"
+    );
+    assert!(
+        ledger.is_present("pub fn query() {}"),
+        "the planned query function must expire the deferral"
+    );
 }
 
 /// The extractor, tested directly — otherwise the retention digest could be silently
