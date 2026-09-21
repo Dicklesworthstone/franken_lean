@@ -3,7 +3,7 @@
 
 #![allow(clippy::too_many_lines)]
 
-pub const CONTRACT_ROOT: &str = "fnv1a64:d6f53327ba516fa0";
+pub const CONTRACT_ROOT: &str = "fnv1a64:27b4b23f05767e37";
 pub const REFERENCE_TAG: &str = "v4.32.0";
 pub const REFERENCE_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
 pub const REFERENCE_TREE: &str = "15bccb750e9d73cd2a40f488bec389504a87896c";
@@ -38,10 +38,10 @@ pub const DOMAINS: &[GeneratedDomain] = &[
         schema: "fln-lsp-wire-inventory/1",
         platform: "portable-schema+linux-x86_64-oracle",
         row_count: 59,
-        input_root: "fnv1a64:8aa9b8f624f3b3fb",
-        raw_root: "fnv1a64:6e8d8f56dad3cf75",
+        input_root: "fnv1a64:b40f5f4fcd886bd9",
+        raw_root: "fnv1a64:b9a3481e0c28a168",
         policy_root: "fnv1a64:85170c7de27b0f02",
-        fixture_root: "fnv1a64:7883c2fbb97a0d6c",
+        fixture_root: "fnv1a64:15a787ff5e97bbbf",
     },
     GeneratedDomain {
         name: "option",
@@ -1109,14 +1109,14 @@ pub const FIXTURES: &[GeneratedFixture] = &[
     GeneratedFixture { domain: "cli-lake", key: "leanc:help", fixture_root: "fnv1a64:59c785966a009025" },
     GeneratedFixture { domain: "cli-lake", key: "leanc:unknown-option", fixture_root: "fnv1a64:26de5dfcbcad0d5a" },
     GeneratedFixture { domain: "cli-lake", key: "leanc:version", fixture_root: "fnv1a64:85e8752056a8dabc" },
-    GeneratedFixture { domain: "lsp", key: "cancellation.lean", fixture_root: "fnv1a64:68ca313f9b55a061" },
-    GeneratedFixture { domain: "lsp", key: "inlayHints.lean", fixture_root: "fnv1a64:bb52786c91b34f23" },
-    GeneratedFixture { domain: "lsp", key: "interactiveDiagnostics.lean", fixture_root: "fnv1a64:16272c320e845479" },
-    GeneratedFixture { domain: "lsp", key: "moduleHierarchyImports.lean", fixture_root: "fnv1a64:54ecd41c83906988" },
-    GeneratedFixture { domain: "lsp", key: "plainGoal.lean", fixture_root: "fnv1a64:429820fbae7ceb20" },
-    GeneratedFixture { domain: "lsp", key: "plainTermGoal.lean", fixture_root: "fnv1a64:246743a541d27206" },
-    GeneratedFixture { domain: "lsp", key: "semanticTokens.lean", fixture_root: "fnv1a64:0a2d37c7432edbee" },
-    GeneratedFixture { domain: "lsp", key: "userWidget.lean", fixture_root: "fnv1a64:4d2e646057ccbc6c" },
+    GeneratedFixture { domain: "lsp", key: "cancellation.lean", fixture_root: "fnv1a64:4d9740438b275e8d" },
+    GeneratedFixture { domain: "lsp", key: "inlayHints.lean", fixture_root: "fnv1a64:f3570e0f4982a8db" },
+    GeneratedFixture { domain: "lsp", key: "interactiveDiagnostics.lean", fixture_root: "fnv1a64:528174652037a265" },
+    GeneratedFixture { domain: "lsp", key: "moduleHierarchyImports.lean", fixture_root: "fnv1a64:ccccd5112e07b908" },
+    GeneratedFixture { domain: "lsp", key: "plainGoal.lean", fixture_root: "fnv1a64:d9258a12f44f8020" },
+    GeneratedFixture { domain: "lsp", key: "plainTermGoal.lean", fixture_root: "fnv1a64:697c4b59c9368cca" },
+    GeneratedFixture { domain: "lsp", key: "semanticTokens.lean", fixture_root: "fnv1a64:eb4f9d45e2ff5132" },
+    GeneratedFixture { domain: "lsp", key: "userWidget.lean", fixture_root: "fnv1a64:27c309543cf0e30c" },
     GeneratedFixture { domain: "option", key: "dump", fixture_root: "fnv1a64:c3590da701559829" },
     GeneratedFixture { domain: "option", key: "malformed-bool", fixture_root: "fnv1a64:9aca14cb5dab6759" },
     GeneratedFixture { domain: "option", key: "malformed-nat", fixture_root: "fnv1a64:b747bb55814a5441" },

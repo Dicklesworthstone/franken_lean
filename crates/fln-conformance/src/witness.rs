@@ -466,9 +466,9 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         evidence: "The bound is real and enforced: `covenant fln-kernel max-loc=12000` in \
                    ci/WORKSPACE_GRAPH.txt, checked on every structure-guard run as \
                    FLN-STRUCT-015, with FLN-STRUCT-024 refusing a larger declared limit. This \
-                   clause of B3 is earned; it is Supported so the matrix does not imply \
-                   otherwise. The trusted closure is 6 files under crates/fln-kernel/src, and \
-                   that cardinality is bound in both directions by \
+                    clause of B3 is earned; it is Supported so the matrix does not imply \
+                    otherwise. The trusted closure is 7 files under crates/fln-kernel/src, and \
+                    that cardinality is bound in both directions by \
                    `the_kernel_covenant_disclosure_matches_the_measured_closure` — a module \
                    entering or leaving the TCB is precisely the growth D6 requires be \
                    disclosed first, and it can no longer happen silently. CORRECTED at \
