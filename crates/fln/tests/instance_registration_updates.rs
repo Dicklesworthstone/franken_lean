@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
-use fln_elab::instances::{InstanceRegistry, InstanceRegistryError, register_instance, set_instance};
+use fln_elab::instances::{
+    InstanceRegistry, InstanceRegistryError, register_instance, set_instance,
+};
 
 fn n(name: &str) -> Name {
     Name::from_components(name.split('.'))
@@ -74,13 +76,18 @@ fn lowering_priority_removes_the_old_priority_from_candidate_selection() {
 fn updating_a_priority_keeps_the_original_equal_priority_position() {
     let base = base();
     let first = set_instance(base.environment(), &n("seven"), 2000).unwrap();
-    let old_order = InstanceRegistry::read(&first).unwrap()
-        .candidates(&n("Inhabited"))[0].order;
+    let old_order = InstanceRegistry::read(&first)
+        .unwrap()
+        .candidates(&n("Inhabited"))[0]
+        .order;
     let second = set_instance(&first, &n("nine"), 3000).unwrap();
     let equal = set_instance(&second, &n("seven"), 3000).unwrap();
     let registry = InstanceRegistry::read(&equal).unwrap();
-    let seven = registry.candidates(&n("Inhabited")).iter()
-        .find(|entry| entry.declaration == n("seven")).unwrap();
+    let seven = registry
+        .candidates(&n("Inhabited"))
+        .iter()
+        .find(|entry| entry.declaration == n("seven"))
+        .unwrap();
     assert_eq!(seven.order, old_order);
     // The pin replaces a matching DiscrTree value in its existing slot. Merely
     // updating the earlier dictionary must not make it newer than `nine`.
@@ -105,8 +112,14 @@ fn strict_registration_remains_strict_after_an_attribute_update() {
         Err(InstanceRegistryError::DuplicateInstance(name)) if name == n("seven")
     ));
     let registry = InstanceRegistry::read(&updated).unwrap();
-    assert_eq!(registry.candidates(&n("Inhabited")).iter()
-        .filter(|entry| entry.declaration == n("seven")).count(), 1);
+    assert_eq!(
+        registry
+            .candidates(&n("Inhabited"))
+            .iter()
+            .filter(|entry| entry.declaration == n("seven"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -131,8 +144,14 @@ fn bad_registrations_and_malformed_update_rows_fail_closed() {
     assert!(set_instance(base.environment(), &n("notAClass"), 1000).is_err());
     let env = set_instance(base.environment(), &n("seven"), 2000).unwrap();
     let name = n("FrankenLean.sourceInstances.v1");
-    let payload = env.extension(&name).unwrap().entries().last().unwrap()
-        .payload.to_vec();
+    let payload = env
+        .extension(&name)
+        .unwrap()
+        .entries()
+        .last()
+        .unwrap()
+        .payload
+        .to_vec();
     assert_eq!(payload[8], 2);
     let mut unknown = payload.clone();
     unknown[8] = 255;

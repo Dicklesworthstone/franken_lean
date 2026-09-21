@@ -8,17 +8,30 @@ use std::collections::BTreeSet;
 /// Returned URIs are requests to recheck, never diagnostic or source authority.
 /// The dispatcher intersects them with its current session and checks each once.
 pub trait WorkspaceChecker {
-    fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String>;
-    fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String>;
+    fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>])
+    -> Vec<String>;
+    fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>])
+    -> Vec<String>;
 }
 
 struct Adapter<'a>(&'a mut dyn WorkspaceChecker);
 impl CheckSource for Adapter<'_> {
-    fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+    fn check(
+        &mut self,
+        uri: &str,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+    ) -> Vec<String> {
         self.0.check(uri, text, documents)
     }
-    fn tracks_dependencies(&self) -> bool { true }
-    fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+    fn tracks_dependencies(&self) -> bool {
+        true
+    }
+    fn affected(
+        &mut self,
+        changed: &[String],
+        documents: &[OpenDocumentSource<'_>],
+    ) -> Vec<String> {
         self.0.affected(changed, documents)
     }
 }
@@ -41,20 +54,30 @@ pub fn serve_workspace(
 pub(super) struct BeforeChange(BTreeMap<String, (i64, bool)>);
 impl BeforeChange {
     pub(super) fn capture(session: &DocumentSession) -> Self {
-        Self(session.sources().iter().map(|d| {
-            (d.uri.to_owned(), (d.version, d.text.is_some()))
-        }).collect())
+        Self(
+            session
+                .sources()
+                .iter()
+                .map(|d| (d.uri.to_owned(), (d.version, d.text.is_some())))
+                .collect(),
+        )
     }
     pub(super) fn changed(self, session: &DocumentSession, checked: Option<&str>) -> Vec<String> {
         let after = Self::capture(session).0;
         let mut changed = BTreeSet::new();
         for (uri, before) in &self.0 {
-            if after.get(uri) != Some(before) { changed.insert(uri.clone()); }
+            if after.get(uri) != Some(before) {
+                changed.insert(uri.clone());
+            }
         }
         for (uri, current) in &after {
-            if self.0.get(uri) != Some(current) { changed.insert(uri.clone()); }
+            if self.0.get(uri) != Some(current) {
+                changed.insert(uri.clone());
+            }
         }
-        if let Some(uri) = checked { changed.insert(uri.to_owned()); }
+        if let Some(uri) = checked {
+            changed.insert(uri.to_owned());
+        }
         changed.into_iter().collect()
     }
 }
@@ -72,24 +95,39 @@ pub(super) fn refresh(
     let requested: BTreeSet<_> = checker.affected(changed, &sources).into_iter().collect();
     // Session ordering is deterministic. Unknown, closed, duplicate and already
     // checked targets cannot invent checks, text, versions or additional work.
-    let targets: Vec<_> = sources.iter().filter(|d| {
-        Some(d.uri) != already_checked && requested.contains(d.uri)
-    }).copied().collect();
+    let targets: Vec<_> = sources
+        .iter()
+        .filter(|d| Some(d.uri) != already_checked && requested.contains(d.uri))
+        .copied()
+        .collect();
     // Invalidate every affected frontier first, including unchanged importer
     // versions. A dependent's previous success belongs to a different world.
-    for target in &targets { frontiers.remove(target.uri); }
+    for target in &targets {
+        frontiers.remove(target.uri);
+    }
     for target in targets {
         let completion = match target.text {
             Some(text) => check_document(output, target.uri, text, checker, session)?,
             None => {
                 write_protocol_message(output, clear_diagnostics_notification(target.uri))?;
-                write_protocol_message(output, diagnostic_callback_failure_notification(target.uri))?;
+                write_protocol_message(
+                    output,
+                    diagnostic_callback_failure_notification(target.uri),
+                )?;
                 DiagnosticCompletion::Failed
             }
         };
-        let checked = CheckedVersion { uri: target.uri.to_owned(), version: target.version, completion };
+        let checked = CheckedVersion {
+            uri: target.uri.to_owned(),
+            version: target.version,
+            completion,
+        };
         record_frontier(frontiers, &checked);
-        settle_waits(output, waits.complete_ready(target.uri, target.version), completion)?;
+        settle_waits(
+            output,
+            waits.complete_ready(target.uri, target.version),
+            completion,
+        )?;
     }
     Ok(())
 }
@@ -100,20 +138,47 @@ mod tests {
     use std::io::Cursor;
 
     #[derive(Default)]
-    struct Checker { calls: Vec<(String, String)>, changes: Vec<Vec<String>> }
+    struct Checker {
+        calls: Vec<(String, String)>,
+        changes: Vec<Vec<String>>,
+    }
     impl WorkspaceChecker for Checker {
-        fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+        fn check(
+            &mut self,
+            uri: &str,
+            text: &str,
+            documents: &[OpenDocumentSource<'_>],
+        ) -> Vec<String> {
             self.calls.push((uri.to_owned(), text.to_owned()));
-            if text == "consumer" && documents.iter().any(|d| d.uri == "file:///Dep.lean" && d.text.is_none()) {
+            if text == "consumer"
+                && documents
+                    .iter()
+                    .any(|d| d.uri == "file:///Dep.lean" && d.text.is_none())
+            {
                 vec![diagnostic_callback_failure_notification(uri)]
-            } else { vec![clear_diagnostics_notification(uri)] }
+            } else {
+                vec![clear_diagnostics_notification(uri)]
+            }
         }
-        fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+        fn affected(
+            &mut self,
+            changed: &[String],
+            documents: &[OpenDocumentSource<'_>],
+        ) -> Vec<String> {
             self.changes.push(changed.to_vec());
-            if !changed.iter().any(|uri| uri == "file:///Dep.lean") { return Vec::new(); }
-            let mut targets: Vec<_> = documents.iter().filter(|d| d.text == Some("consumer"))
-                .map(|d| d.uri.to_owned()).collect();
-            targets.extend(["file:///Dep.lean".to_owned(), "file:///closed.lean".to_owned(), "file:///Main.lean".to_owned()]);
+            if !changed.iter().any(|uri| uri == "file:///Dep.lean") {
+                return Vec::new();
+            }
+            let mut targets: Vec<_> = documents
+                .iter()
+                .filter(|d| d.text == Some("consumer"))
+                .map(|d| d.uri.to_owned())
+                .collect();
+            targets.extend([
+                "file:///Dep.lean".to_owned(),
+                "file:///closed.lean".to_owned(),
+                "file:///Main.lean".to_owned(),
+            ]);
             targets.reverse();
             targets
         }
@@ -129,19 +194,31 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":999,"method":"shutdown"}"#.to_owned(),
             r#"{"jsonrpc":"2.0","method":"exit"}"#.to_owned(),
         ]);
-        for message in messages { transport::write_message(&mut input, message.as_bytes()).unwrap(); }
+        for message in messages {
+            transport::write_message(&mut input, message.as_bytes()).unwrap();
+        }
         let mut output = Vec::new();
-        assert!(serve_workspace(&mut Cursor::new(input), &mut output, checker).unwrap().clean);
+        assert!(
+            serve_workspace(&mut Cursor::new(input), &mut output, checker)
+                .unwrap()
+                .clean
+        );
         String::from_utf8(output).unwrap()
     }
     fn open(name: &str, text: &str) -> String {
-        format!(r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///{name}.lean","version":1,"text":"{text}"}}}}}}"#)
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///{name}.lean","version":1,"text":"{text}"}}}}}}"#
+        )
     }
     fn event(method: &str, extra: &str) -> String {
-        format!(r#"{{"jsonrpc":"2.0","method":"textDocument/{method}","params":{{"textDocument":{{"uri":"file:///Dep.lean"{extra}}}}}}}"#)
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/{method}","params":{{"textDocument":{{"uri":"file:///Dep.lean"{extra}}}}}}}"#
+        )
     }
     fn wait(id: usize) -> String {
-        format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"textDocument/waitForDiagnostics","params":{{"uri":"file:///Main.lean","version":1}}}}"#)
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"textDocument/waitForDiagnostics","params":{{"uri":"file:///Main.lean","version":1}}}}"#
+        )
     }
     #[test]
     fn dependent_checks_are_unique_sorted_and_do_not_replay_stale_events() {
@@ -155,13 +232,25 @@ mod tests {
             event("didSave", ""), event("didClose", ""), event("didClose", ""),
         ], &mut checker);
         let names: Vec<_> = checker.calls.iter().map(|(uri, _)| uri.as_str()).collect();
-        assert_eq!(names, [
-            "file:///Z.lean", "file:///Main.lean", "file:///Other.lean",
-            "file:///Dep.lean", "file:///Main.lean", "file:///Z.lean",
-            "file:///Dep.lean", "file:///Main.lean", "file:///Z.lean",
-            "file:///Dep.lean", "file:///Main.lean", "file:///Z.lean",
-            "file:///Main.lean", "file:///Z.lean",
-        ]);
+        assert_eq!(
+            names,
+            [
+                "file:///Z.lean",
+                "file:///Main.lean",
+                "file:///Other.lean",
+                "file:///Dep.lean",
+                "file:///Main.lean",
+                "file:///Z.lean",
+                "file:///Dep.lean",
+                "file:///Main.lean",
+                "file:///Z.lean",
+                "file:///Dep.lean",
+                "file:///Main.lean",
+                "file:///Z.lean",
+                "file:///Main.lean",
+                "file:///Z.lean",
+            ]
+        );
         assert_eq!(checker.changes.len(), 7);
         assert_eq!(checker.calls[9].1, "new");
     }
@@ -176,9 +265,19 @@ mod tests {
             wait(12),
         ], &mut checker);
         assert!(output.contains(r#""id":10,"result":{}"#), "{output}");
-        assert!(output.contains(r#""id":11,"error":{"code":-32803"#), "{output}");
+        assert!(
+            output.contains(r#""id":11,"error":{"code":-32803"#),
+            "{output}"
+        );
         assert!(output.contains(r#""id":12,"result":{}"#), "{output}");
-        assert_eq!(checker.calls.iter().filter(|(u, _)| u == "file:///Main.lean").count(), 3);
+        assert_eq!(
+            checker
+                .calls
+                .iter()
+                .filter(|(u, _)| u == "file:///Main.lean")
+                .count(),
+            3
+        );
     }
     #[test]
     fn metadata_change_detection_includes_closes_invalidations_and_same_version_saves() {
@@ -193,6 +292,9 @@ mod tests {
         let before = BeforeChange::capture(&session);
         session.close("a").unwrap();
         assert_eq!(before.changed(&session, None), ["a"]);
-        assert_eq!(BeforeChange::capture(&session).changed(&session, Some("saved")), ["saved"]);
+        assert_eq!(
+            BeforeChange::capture(&session).changed(&session, Some("saved")),
+            ["saved"]
+        );
     }
 }

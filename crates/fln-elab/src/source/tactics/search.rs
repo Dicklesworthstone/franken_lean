@@ -143,18 +143,16 @@ impl Context {
                         depth,
                     });
                 }
-                Work::Close(goal, value) => {
-                    match self.close_proof_goal(goal, value) {
-                        Ok(()) => {}
-                        Err(problem) if backtrack::recoverable(&problem) => {
-                            retry = choices.pop();
-                            if retry.is_none() {
-                                return Err(problem);
-                            }
+                Work::Close(goal, value) => match self.close_proof_goal(goal, value) {
+                    Ok(()) => {}
+                    Err(problem) if backtrack::recoverable(&problem) => {
+                        retry = choices.pop();
+                        if retry.is_none() {
+                            return Err(problem);
                         }
-                        Err(problem) => return Err(problem),
                     }
-                }
+                    Err(problem) => return Err(problem),
+                },
                 // Only generated goals and continuations enter this private
                 // stack, never source scripts or control frames.
                 _ => return Err(error(TacticError::MalformedScript)),
@@ -205,9 +203,8 @@ impl Context {
         let Some((level, alpha, left, right)) = equality_target(&target) else {
             return Err(error(TacticError::NoMatchingAssumption));
         };
-        let reversed = equality::equation(
-            level.clone(), alpha.clone(), right.clone(), left.clone(),
-        );
+        let reversed =
+            equality::equation(level.clone(), alpha.clone(), right.clone(), left.clone());
         let (witness, subgoal) = self.proof_goal(reversed)?;
         let candidate = self.search_local_candidate(&subgoal, local, application)?;
         let value = self.symmetric_equality(&level, &alpha, &right, &left, witness)?;
@@ -247,7 +244,10 @@ impl Context {
         self.apply_proof_term(
             &mut proof,
             goal.clone(),
-            Typed { value, type_: local.type_ },
+            Typed {
+                value,
+                type_: local.type_,
+            },
             instance_start,
         )?;
         Ok(proof.work)
@@ -259,7 +259,10 @@ mod tests {
     use super::*;
 
     fn context() -> Context {
-        Context::new(&Environment::new(), Budget::for_stack_bytes(2 * 1024 * 1024))
+        Context::new(
+            &Environment::new(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        )
     }
 
     fn source_environment() -> Environment {
@@ -271,7 +274,9 @@ mod tests {
         let mut environment = Environment::new();
         for declaration in crate::seed::source_seed_declarations() {
             let Outcome::Complete(admitted) = admit(
-                &environment, declaration, Budget::for_stack_bytes(2 * 1024 * 1024),
+                &environment,
+                declaration,
+                Budget::for_stack_bytes(2 * 1024 * 1024),
             ) else {
                 panic!("seed nonanswer");
             };
@@ -280,11 +285,13 @@ mod tests {
                 panic!("seed rejected");
             };
             environment = match checked.publish(
-                DeclarationBudget::default(), CollisionBudget::default(), None,
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
             ) {
-                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
-                    result.environment
-                }
+                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                    result,
+                ))) => result.environment,
                 Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
                 other => panic!("seed publication {other:?}"),
             };
@@ -293,13 +300,19 @@ mod tests {
     }
 
     fn seeded_context() -> Context {
-        Context::new(&source_environment(), Budget::for_stack_bytes(2 * 1024 * 1024))
+        Context::new(
+            &source_environment(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        )
     }
 
     fn local(context: &mut Context, name: &str, type_: Expr) -> Expr {
         let name = Name::from_components([name]);
         let id = FVarId(name.clone());
-        context.txn.lctx.add_param(id.clone(), name, type_, BinderInfo::Default);
+        context
+            .txn
+            .lctx
+            .add_param(id.clone(), name, type_, BinderInfo::Default);
         Expr::fvar(id)
     }
 
@@ -322,7 +335,10 @@ mod tests {
         let g = local(&mut context, "g", arrow(q, r.clone()));
         let (root, goal) = context.proof_goal(r).unwrap();
         context.solve_by_elim_proof_goal(goal).unwrap();
-        assert_eq!(context.instantiate(&root).unwrap(), Expr::app(g, Expr::app(f, hp)));
+        assert_eq!(
+            context.instantiate(&root).unwrap(),
+            Expr::app(g, Expr::app(f, hp))
+        );
     }
 
     #[test]
@@ -364,7 +380,9 @@ mod tests {
         context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 1;
         assert!(matches!(
             context.solve_by_elim_proof_goal(goal),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
         assert!(!context.txn.mvars.is_assigned(&id));
     }
@@ -406,7 +424,10 @@ mod tests {
         let level = Level::one();
         let target = [alpha.clone(), p.clone(), alpha.clone(), p.clone()]
             .into_iter()
-            .fold(Expr::const_(Name::from_components(["HEq"]), vec![level.clone()]), Expr::app);
+            .fold(
+                Expr::const_(Name::from_components(["HEq"]), vec![level.clone()]),
+                Expr::app,
+            );
         let (root, goal) = context.proof_goal(target).unwrap();
         context.solve_by_elim_proof_goal(goal).unwrap();
         let expected = [alpha, p].into_iter().fold(
@@ -444,11 +465,15 @@ mod tests {
             "theorem automatic (x y : Nat) (P : Nat -> Prop) (Q : Prop) (hx : P x) (f : (n : Nat) -> n = n -> P n -> Q) : Q := by solve_by_elim",
         ] {
             let result = crate::check_definition_source(
-                source.as_bytes(), &environment, Budget::for_stack_bytes(2 * 1024 * 1024),
-            ).unwrap_or_else(|problem| panic!("{source}\n{problem:?}"));
+                source.as_bytes(),
+                &environment,
+                Budget::for_stack_bytes(2 * 1024 * 1024),
+            )
+            .unwrap_or_else(|problem| panic!("{source}\n{problem:?}"));
             assert!(
                 matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),
-                "{source}\n{:?}", result.outcome,
+                "{source}\n{:?}",
+                result.outcome,
             );
             let fln_kernel::Declaration::Thm(theorem) = result.declaration else {
                 panic!("search must produce a theorem, not an axiom");
@@ -472,7 +497,9 @@ mod tests {
             "theorem unsound : Nat := by solve_by_elim",
         ] {
             if let Ok(result) = crate::check_definition_source(
-                source.as_bytes(), &environment, Budget::for_stack_bytes(2 * 1024 * 1024),
+                source.as_bytes(),
+                &environment,
+                Budget::for_stack_bytes(2 * 1024 * 1024),
             ) {
                 assert!(
                     !matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),

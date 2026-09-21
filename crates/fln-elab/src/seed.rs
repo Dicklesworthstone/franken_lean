@@ -684,8 +684,14 @@ pub fn source_seed_declarations() -> [Declaration; 89] {
     ] = logic::logical_seed_declarations();
     let [bool_eq, nat_eq, bool_instance, nat_instance] = equality_decision_seed_declarations();
     let [equality_type, generic_eq] = generic_equality_decision_seed_declarations();
-    let [option, option_get_d, option_map, option_bind, option_is_some, option_is_none] =
-        collections::option_seed_declarations();
+    let [
+        option,
+        option_get_d,
+        option_map,
+        option_bind,
+        option_is_some,
+        option_is_none,
+    ] = collections::option_seed_declarations();
     let [
         list,
         list_length,

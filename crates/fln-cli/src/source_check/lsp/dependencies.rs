@@ -20,7 +20,11 @@ pub(super) struct Dependencies {
 }
 impl Default for Dependencies {
     fn default() -> Self {
-        Self { entries: BTreeMap::new(), max_bytes: MAX_PATH_BYTES, max_paths: MAX_PATHS }
+        Self {
+            entries: BTreeMap::new(),
+            max_bytes: MAX_PATH_BYTES,
+            max_paths: MAX_PATHS,
+        }
     }
 }
 impl Dependencies {
@@ -43,22 +47,32 @@ impl Dependencies {
         let mut paths = BTreeSet::new();
         let mut bytes = 0usize;
         for imported in source_uris.iter().skip(1) {
-            let Ok(path) = editor::document_path(imported) else { return; };
+            let Ok(path) = editor::document_path(imported) else {
+                return;
+            };
             bytes = bytes.saturating_add(path.as_os_str().len());
-            if bytes > self.max_bytes || paths.len() >= self.max_paths { return; }
+            if bytes > self.max_bytes || paths.len() >= self.max_paths {
+                return;
+            }
             paths.insert(path);
         }
         self.remember(uri, paths);
     }
     fn remember(&mut self, uri: &str, paths: BTreeSet<PathBuf>) {
-        let Some(entry) = self.entries.get_mut(uri) else { return; };
+        let Some(entry) = self.entries.get_mut(uri) else {
+            return;
+        };
         *entry = Watch::Unknown;
         let mut count = paths.len();
-        let mut bytes = paths.iter().fold(0usize, |n, p| n.saturating_add(p.as_os_str().len()));
+        let mut bytes = paths
+            .iter()
+            .fold(0usize, |n, p| n.saturating_add(p.as_os_str().len()));
         for watch in self.entries.values() {
             if let Watch::Known(existing) = watch {
                 count = count.saturating_add(existing.len());
-                bytes = existing.iter().fold(bytes, |n, p| n.saturating_add(p.as_os_str().len()));
+                bytes = existing
+                    .iter()
+                    .fold(bytes, |n, p| n.saturating_add(p.as_os_str().len()));
             }
         }
         // A retention ceiling changes precision, never correctness or check
@@ -68,13 +82,26 @@ impl Dependencies {
         }
     }
     fn select(&self, paths: &BTreeSet<PathBuf>, uncertain: bool) -> Vec<String> {
-        self.entries.iter().filter(|(_, watch)| match watch {
-            Watch::Unknown => true,
-            Watch::Known(dependencies) => !dependencies.is_empty()
-                && (uncertain || dependencies.iter().any(|p| paths.iter().any(|changed| p.starts_with(changed)))),
-        }).map(|(uri, _)| uri.clone()).collect()
+        self.entries
+            .iter()
+            .filter(|(_, watch)| match watch {
+                Watch::Unknown => true,
+                Watch::Known(dependencies) => {
+                    !dependencies.is_empty()
+                        && (uncertain
+                            || dependencies
+                                .iter()
+                                .any(|p| paths.iter().any(|changed| p.starts_with(changed))))
+                }
+            })
+            .map(|(uri, _)| uri.clone())
+            .collect()
     }
-    pub(super) fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+    pub(super) fn affected(
+        &mut self,
+        changed: &[String],
+        documents: &[OpenDocumentSource<'_>],
+    ) -> Vec<String> {
         self.prune(documents);
         let mut local = false;
         let mut uncertain = false;
@@ -82,33 +109,49 @@ impl Dependencies {
         for uri in changed.iter().filter(|uri| uri.starts_with("file://")) {
             local = true;
             match editor::document_path(uri) {
-                Ok(path) => { paths.insert(path); }
+                Ok(path) => {
+                    paths.insert(path);
+                }
                 // Deletion, symlink replacement or unavailable parent cannot
                 // erase an already recorded edge by making normalization fail.
                 Err(_) => uncertain = true,
             }
         }
-        if local { self.select(&paths, uncertain) } else { Vec::new() }
+        if local {
+            self.select(&paths, uncertain)
+        } else {
+            Vec::new()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn paths(names: &[&str]) -> BTreeSet<PathBuf> { names.iter().map(PathBuf::from).collect() }
-    fn known(names: &[&str]) -> Watch { Watch::Known(paths(names)) }
+    fn paths(names: &[&str]) -> BTreeSet<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+    fn known(names: &[&str]) -> Watch {
+        Watch::Known(paths(names))
+    }
     fn fixture() -> Dependencies {
-        Dependencies { entries: BTreeMap::from([
-            ("Main".to_owned(), known(&["Base", "Left", "Right"])),
-            ("Left".to_owned(), known(&["Base"])),
-            ("Right".to_owned(), known(&["Base"])),
-            ("Other".to_owned(), known(&[])),
-        ]), ..Dependencies::default() }
+        Dependencies {
+            entries: BTreeMap::from([
+                ("Main".to_owned(), known(&["Base", "Left", "Right"])),
+                ("Left".to_owned(), known(&["Base"])),
+                ("Right".to_owned(), known(&["Base"])),
+                ("Other".to_owned(), known(&[])),
+            ]),
+            ..Dependencies::default()
+        }
     }
     #[test]
     fn transitive_diamonds_select_each_consumer_once_not_unrelated_siblings() {
         let watches = fixture();
-        assert_eq!(watches.select(&paths(&["Base"]), false), ["Left", "Main", "Right"]);
+        assert_eq!(
+            watches.select(&paths(&["Base"]), false),
+            ["Left", "Main", "Right"]
+        );
         assert_eq!(watches.select(&paths(&["Left"]), false), ["Main"]);
         assert!(watches.select(&paths(&["Other"]), false).is_empty());
     }
@@ -117,7 +160,10 @@ mod tests {
         let mut watches = fixture();
         watches.entries.insert("Missing".to_owned(), Watch::Unknown);
         assert_eq!(watches.select(&paths(&["New"]), false), ["Missing"]);
-        assert_eq!(watches.select(&paths(&[]), true), ["Left", "Main", "Missing", "Right"]);
+        assert_eq!(
+            watches.select(&paths(&[]), true),
+            ["Left", "Main", "Missing", "Right"]
+        );
     }
     #[test]
     fn path_count_and_byte_pressure_fall_back_to_conservative_observation() {
@@ -142,10 +188,13 @@ mod tests {
     }
     #[test]
     fn directory_events_invalidate_descendants_not_string_prefix_neighbors() {
-        let watches = Dependencies { entries: BTreeMap::from([
-            ("Main".to_owned(), known(&["Lib/A.lean", "Lib/B.lean"])),
-            ("Other".to_owned(), known(&["Library/A.lean"])),
-        ]), ..Dependencies::default() };
+        let watches = Dependencies {
+            entries: BTreeMap::from([
+                ("Main".to_owned(), known(&["Lib/A.lean", "Lib/B.lean"])),
+                ("Other".to_owned(), known(&["Library/A.lean"])),
+            ]),
+            ..Dependencies::default()
+        };
         assert_eq!(watches.select(&paths(&["Lib"]), false), ["Main"]);
         assert_eq!(watches.select(&paths(&["Lib/A.lean"]), false), ["Main"]);
         assert!(watches.select(&paths(&["Li"]), false).is_empty());
@@ -153,7 +202,11 @@ mod tests {
     #[test]
     fn closes_release_observations_but_unavailable_open_sources_do_not() {
         let mut watches = fixture();
-        let docs = [OpenDocumentSource { uri: "Main", version: 2, text: None }];
+        let docs = [OpenDocumentSource {
+            uri: "Main",
+            version: 2,
+            text: None,
+        }];
         watches.prune(&docs);
         assert_eq!(watches.entries.len(), 1);
         assert_eq!(watches.select(&paths(&["Base"]), false), ["Main"]);

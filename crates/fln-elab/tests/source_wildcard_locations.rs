@@ -135,12 +135,8 @@ fn wildcard_rewriting_retains_missing_premises_and_requires_a_real_match() {
 
 #[test]
 fn decide_closes_polymorphic_contexts_without_accepting_false_propositions() {
-    accepted(
-        "theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => True) x := by decide",
-    );
-    refused(
-        "theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => False) x := by decide",
-    );
+    accepted("theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => True) x := by decide");
+    refused("theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => False) x := by decide");
 }
 
 #[test]

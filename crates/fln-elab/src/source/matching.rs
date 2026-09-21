@@ -637,7 +637,10 @@ impl Context {
                 },
             )?;
         }
-        let motive = Typed { value: motive, type_: motive_type };
+        let motive = Typed {
+            value: motive,
+            type_: motive_type,
+        };
         recursor = if family.all.len() == 1 {
             self.match_apply(recursor, motive)?
         } else {

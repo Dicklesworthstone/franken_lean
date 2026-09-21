@@ -88,11 +88,16 @@ fn a_lambda_determines_its_missing_type_in_both_orientations() {
         let (type_, value) = holes(&mut txn, Level::one());
         let before = txn.clone();
         let (left, right) = (Expr::mvar(value.clone()), identity());
-        let (left, right) = if reversed { (right, left) } else { (left, right) };
+        let (left, right) = if reversed {
+            (right, left)
+        } else {
+            (left, right)
+        };
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.kernel_checks, 2);
         assert!(report.residual_metavariables.is_empty());
-        txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget()).unwrap();
+        txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget())
+            .unwrap();
         assert_eq!(txn.mvars.get_assigned_expr(&value), Some(&identity()));
         assert_eq!(txn.env, before.env);
         assert_eq!(txn.lctx, before.lctx);
@@ -101,7 +106,11 @@ fn a_lambda_determines_its_missing_type_in_both_orientations() {
 
 #[test]
 fn lambda_binder_styles_survive_in_the_inferred_telescope() {
-    for style in [BinderInfo::Default, BinderInfo::Implicit, BinderInfo::StrictImplicit] {
+    for style in [
+        BinderInfo::Default,
+        BinderInfo::Implicit,
+        BinderInfo::StrictImplicit,
+    ] {
         let mut txn = transaction();
         let (type_, value) = holes(&mut txn, Level::one());
         let candidate = Expr::lam(name("shadowed"), nat(), bvar(0), style);
@@ -126,7 +135,8 @@ fn dependent_lambdas_rebind_domains_and_results_without_capture() {
     let report = txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
     assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
-    txn.unify(&Expr::mvar(type_.clone()), &expected, budget()).unwrap();
+    txn.unify(&Expr::mvar(type_.clone()), &expected, budget())
+        .unwrap();
     let inferred = txn.mvars.get_assigned_expr(&type_).unwrap();
     assert!(!inferred.has_fvar());
     assert!(!inferred.has_loose_bvars());
@@ -138,10 +148,15 @@ fn an_inferred_function_type_also_determines_its_missing_universe() {
     let mut txn = transaction();
     let u = LMVarId(name("typeUniverse"));
     let (_, value) = holes(&mut txn, Level::mvar(u.clone()));
-    let report = txn.unify(&Expr::mvar(value), &identity(), budget()).unwrap();
+    let report = txn
+        .unify(&Expr::mvar(value), &identity(), budget())
+        .unwrap();
     assert_eq!(report.kernel_checks, 2);
     assert_eq!(report.universe_assignments, vec![u.clone()]);
-    assert_eq!(txn.universes.instantiate(&Level::mvar(u)).unwrap(), Level::one());
+    assert_eq!(
+        txn.universes.instantiate(&Level::mvar(u)).unwrap(),
+        Level::one()
+    );
 }
 
 #[test]
@@ -155,7 +170,8 @@ fn dependent_pi_types_preserve_symbolic_imax_universes() {
     let (type_, value) = holes(&mut txn, product_level.clone().succ().unwrap());
     let candidate = pi(a, Expr::app(family, bvar(0)));
     txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
-    txn.unify(&Expr::mvar(type_), &Expr::sort(product_level), budget()).unwrap();
+    txn.unify(&Expr::mvar(type_), &Expr::sort(product_level), budget())
+        .unwrap();
 }
 
 #[test]
@@ -164,8 +180,12 @@ fn quantified_propositions_stay_in_prop_instead_of_max_universes() {
     let (type_, value) = holes(&mut txn, Level::one());
     // forall (P : Prop), P -> P : Prop, not Type.
     let proposition = pi(Expr::sort(Level::zero()), pi(bvar(0), bvar(1)));
-    txn.unify(&Expr::mvar(value), &proposition, budget()).unwrap();
-    assert_eq!(txn.mvars.get_assigned_expr(&type_), Some(&Expr::sort(Level::zero())));
+    txn.unify(&Expr::mvar(value), &proposition, budget())
+        .unwrap();
+    assert_eq!(
+        txn.mvars.get_assigned_expr(&type_),
+        Some(&Expr::sort(Level::zero()))
+    );
 }
 
 #[test]
@@ -184,7 +204,12 @@ fn a_let_bound_type_is_substituted_out_of_a_nested_lambda_telescope() {
     );
     let before = txn.lctx.clone();
     txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
-    txn.unify(&Expr::mvar(type_.clone()), &pi(nat(), pi(nat(), nat())), budget()).unwrap();
+    txn.unify(
+        &Expr::mvar(type_.clone()),
+        &pi(nat(), pi(nat(), nat())),
+        budget(),
+    )
+    .unwrap();
     assert!(!txn.mvars.get_assigned_expr(&type_).unwrap().has_fvar());
     assert_eq!(txn.lctx, before);
 }
@@ -195,21 +220,30 @@ fn computed_applications_inside_lambdas_supply_their_dependent_result_type() {
     let (type_, value) = holes(&mut txn, Level::one());
     let polymorphic_identity = lam(Expr::sort(Level::one()), lam(bvar(0), bvar(0)));
     let body = Expr::app(Expr::app(polymorphic_identity, nat()), bvar(0));
-    txn.unify(&Expr::mvar(value), &lam(nat(), body), budget()).unwrap();
-    txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget()).unwrap();
+    txn.unify(&Expr::mvar(value), &lam(nat(), body), budget())
+        .unwrap();
+    txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget())
+        .unwrap();
 }
 
 #[test]
 fn fresh_inference_locals_do_not_capture_existing_user_identities() {
     let mut txn = transaction();
     let id = FVarId(Name::from_components(["_fln_unify_local", "0"]));
-    txn.lctx.add_param(id.clone(), name("A"), Expr::sort(Level::one()), BinderInfo::Default);
+    txn.lctx.add_param(
+        id.clone(),
+        name("A"),
+        Expr::sort(Level::one()),
+        BinderInfo::Default,
+    );
     let a = Expr::fvar(id);
     let x = local(&mut txn, "known", a.clone());
     let (type_, value) = holes(&mut txn, Level::one());
     let before = txn.lctx.clone();
-    txn.unify(&Expr::mvar(value), &lam(nat(), x), budget()).unwrap();
-    txn.unify(&Expr::mvar(type_), &pi(nat(), a), budget()).unwrap();
+    txn.unify(&Expr::mvar(value), &lam(nat(), x), budget())
+        .unwrap();
+    txn.unify(&Expr::mvar(type_), &pi(nat(), a), budget())
+        .unwrap();
     assert_eq!(txn.lctx, before);
 }
 
@@ -222,8 +256,10 @@ fn inferring_a_lambda_type_does_not_solve_its_residual_value_hole() {
     let report = txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
     assert!(report.residual_metavariables.contains(&residual));
     assert!(!txn.mvars.is_assigned(&residual));
-    txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget()).unwrap();
-    txn.unify(&Expr::mvar(residual), &numeral(12), budget()).unwrap();
+    txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget())
+        .unwrap();
+    txn.unify(&Expr::mvar(residual), &numeral(12), budget())
+        .unwrap();
 }
 
 #[test]
@@ -233,7 +269,10 @@ fn application_type_hints_cannot_hide_invalid_arguments_from_k1() {
     let (_, value) = holes(&mut txn, Level::one());
     let candidate = lam(nat(), Expr::app(op, Expr::sort(Level::zero())));
     let before = txn.clone();
-    assert_kernel_veto(txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap_err());
+    assert_kernel_veto(
+        txn.unify(&Expr::mvar(value), &candidate, budget())
+            .unwrap_err(),
+    );
     unchanged(&txn, &before);
 }
 
@@ -243,10 +282,19 @@ fn a_let_annotation_mismatch_is_not_erased_by_inferred_type_substitution() {
     let (_, value) = holes(&mut txn, Level::one());
     let candidate = lam(
         nat(),
-        Expr::let_e(name("bad"), nat(), Expr::sort(Level::zero()), bvar(0), false),
+        Expr::let_e(
+            name("bad"),
+            nat(),
+            Expr::sort(Level::zero()),
+            bvar(0),
+            false,
+        ),
     );
     let before = txn.clone();
-    assert_kernel_veto(txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap_err());
+    assert_kernel_veto(
+        txn.unify(&Expr::mvar(value), &candidate, budget())
+            .unwrap_err(),
+    );
     unchanged(&txn, &before);
 }
 
@@ -265,12 +313,21 @@ fn inferred_type_holes_respect_opaque_and_depth_policies() {
     for (kind, depth) in [(MetavarKind::SyntheticOpaque, 0), (MetavarKind::Natural, 1)] {
         let mut txn = transaction();
         let type_ = MVarId(name("restricted"));
-        txn.mvars.declare(type_.clone(), name("restricted"), Expr::sort(Level::one()),
-            txn.lctx.clone(), kind, depth, None);
+        txn.mvars.declare(
+            type_.clone(),
+            name("restricted"),
+            Expr::sort(Level::one()),
+            txn.lctx.clone(),
+            kind,
+            depth,
+            None,
+        );
         let value = goal(&mut txn, "value", Expr::mvar(type_));
         let before = txn.clone();
-        assert!(matches!(txn.unify(&Expr::mvar(value), &identity(), budget()),
-            Err(UnificationError::Deferred(_))));
+        assert!(matches!(
+            txn.unify(&Expr::mvar(value), &identity(), budget()),
+            Err(UnificationError::Deferred(_))
+        ));
         unchanged(&txn, &before);
     }
 }
@@ -283,8 +340,10 @@ fn inferred_types_cannot_capture_locals_outside_the_type_holes_scope() {
     let value = goal(&mut txn, "value", Expr::mvar(type_));
     let candidate = lam(a, bvar(0));
     let before = txn.clone();
-    assert!(matches!(txn.unify(&Expr::mvar(value), &candidate, budget()),
-        Err(UnificationError::Deferred(_))));
+    assert!(matches!(
+        txn.unify(&Expr::mvar(value), &candidate, budget()),
+        Err(UnificationError::Deferred(_))
+    ));
     unchanged(&txn, &before);
 }
 
@@ -294,20 +353,25 @@ fn cancellation_at_entry_during_inference_and_at_publication_is_atomic() {
     let (_, value) = holes(&mut base, Level::one());
     let equations = [(Expr::mvar(value), identity())];
     let polls = Cell::new(0usize);
-    base.clone().unify_many_with(&equations, budget(), &|| {
-        polls.set(polls.get() + 1);
-        false
-    }).unwrap();
+    base.clone()
+        .unify_many_with(&equations, budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
     let total = polls.get();
     assert!(total > 2);
     for stop in [0, total / 2, total - 1] {
         let mut txn = base.clone();
         let polls = Cell::new(0usize);
-        assert!(matches!(txn.unify_many_with(&equations, budget(), &|| {
-            let current = polls.get();
-            polls.set(current + 1);
-            current >= stop
-        }), Err(UnificationError::Cancelled)));
+        assert!(matches!(
+            txn.unify_many_with(&equations, budget(), &|| {
+                let current = polls.get();
+                polls.set(current + 1);
+                current >= stop
+            }),
+            Err(UnificationError::Cancelled)
+        ));
         unchanged(&txn, &base);
     }
 }
@@ -319,27 +383,43 @@ fn assignment_exhaustion_keeps_neither_the_lambda_nor_its_inferred_type() {
     let before = txn.clone();
     let mut limited = budget();
     limited.max_assignments = 1;
-    assert!(matches!(txn.unify(&Expr::mvar(value.clone()), &identity(), limited),
-        Err(UnificationError::AssignmentLimit { limit: 1 })));
+    assert!(matches!(
+        txn.unify(&Expr::mvar(value.clone()), &identity(), limited),
+        Err(UnificationError::AssignmentLimit { limit: 1 })
+    ));
     unchanged(&txn, &before);
-    txn.unify(&Expr::mvar(value), &identity(), budget()).unwrap();
+    txn.unify(&Expr::mvar(value), &identity(), budget())
+        .unwrap();
 }
 
 #[test]
 fn queue_solving_reports_awakened_typing_obligations_instead_of_solving_them() {
     let mut txn = transaction();
     let (type_, value) = holes(&mut txn, Level::one());
-    let typing = txn.postpone(ConstraintKind::HasType {
-        expr: Expr::mvar(value.clone()), expected_type: Expr::mvar(type_),
-    }, 0);
-    let equation = txn.postpone(ConstraintKind::DefEq {
-        lhs: Expr::mvar(value), rhs: identity(),
-    }, 0);
-    let report = txn.solve_defeq_constraints_with(&[equation], budget(), &|| false).unwrap();
+    let typing = txn.postpone(
+        ConstraintKind::HasType {
+            expr: Expr::mvar(value.clone()),
+            expected_type: Expr::mvar(type_),
+        },
+        0,
+    );
+    let equation = txn.postpone(
+        ConstraintKind::DefEq {
+            lhs: Expr::mvar(value),
+            rhs: identity(),
+        },
+        0,
+    );
+    let report = txn
+        .solve_defeq_constraints_with(&[equation], budget(), &|| false)
+        .unwrap();
     assert_eq!(report.solved, vec![equation]);
     assert_eq!(report.unification.awakened.len(), 1);
     assert_eq!(report.unification.awakened[0].id, typing);
-    assert!(matches!(&report.unification.awakened[0].kind, ConstraintKind::HasType { .. }));
+    assert!(matches!(
+        &report.unification.awakened[0].kind,
+        ConstraintKind::HasType { .. }
+    ));
 }
 
 #[test]
@@ -354,9 +434,12 @@ fn deep_structured_candidates_stop_under_explicit_resource_limits() {
     let mut limited = budget();
     limited.max_visited_nodes = 5_000;
     limited.max_steps = 10_000;
-    assert!(matches!(txn.unify(&Expr::mvar(value), &candidate, limited),
-        Err(UnificationError::NodeLimit { .. } | UnificationError::StepLimit { .. }
-            | UnificationError::HeartbeatLimit)));
+    assert!(matches!(
+        txn.unify(&Expr::mvar(value), &candidate, limited),
+        Err(UnificationError::NodeLimit { .. }
+            | UnificationError::StepLimit { .. }
+            | UnificationError::HeartbeatLimit)
+    ));
     unchanged(&txn, &before);
 }
 
@@ -365,7 +448,10 @@ fn an_inferred_type_cannot_raise_a_declared_prop_universe() {
     let mut txn = transaction();
     let (_, value) = holes(&mut txn, Level::zero());
     let before = txn.clone();
-    assert_kernel_veto(txn.unify(&Expr::mvar(value), &identity(), budget()).unwrap_err());
+    assert_kernel_veto(
+        txn.unify(&Expr::mvar(value), &identity(), budget())
+            .unwrap_err(),
+    );
     unchanged(&txn, &before);
 }
 
@@ -373,11 +459,22 @@ fn an_inferred_type_cannot_raise_a_declared_prop_universe() {
 fn dependent_let_results_refer_to_the_original_outer_binder() {
     let mut txn = transaction();
     let family = local(&mut txn, "Family", pi(nat(), Expr::sort(Level::one())));
-    let produce = local(&mut txn, "produce", pi(nat(), Expr::app(family.clone(), bvar(0))));
+    let produce = local(
+        &mut txn,
+        "produce",
+        pi(nat(), Expr::app(family.clone(), bvar(0))),
+    );
     let (type_, value) = holes(&mut txn, Level::one());
-    let candidate = lam(nat(), Expr::let_e(
-        name("y"), nat(), bvar(0), Expr::app(produce, bvar(0)), false,
-    ));
+    let candidate = lam(
+        nat(),
+        Expr::let_e(
+            name("y"),
+            nat(),
+            bvar(0),
+            Expr::app(produce, bvar(0)),
+            false,
+        ),
+    );
     let expected = pi(nat(), Expr::app(family, bvar(0)));
     txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
     txn.unify(&Expr::mvar(type_), &expected, budget()).unwrap();
@@ -389,6 +486,9 @@ fn an_invalid_lambda_domain_is_not_authenticated_by_a_pi_type_hint() {
     let (_, value) = holes(&mut txn, Level::one());
     let candidate = lam(numeral(0), bvar(0));
     let before = txn.clone();
-    assert_kernel_veto(txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap_err());
+    assert_kernel_veto(
+        txn.unify(&Expr::mvar(value), &candidate, budget())
+            .unwrap_err(),
+    );
     unchanged(&txn, &before);
 }

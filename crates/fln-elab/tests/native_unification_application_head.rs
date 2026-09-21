@@ -58,8 +58,7 @@ fn transaction() -> ElabTxn {
     ) else {
         panic!("Nat admission did not complete");
     };
-    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
-    else {
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
         panic!("Nat seed was rejected");
     };
     let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
@@ -71,13 +70,7 @@ fn transaction() -> ElabTxn {
     };
     ElabTxn::new(publication.environment, KVMap::new(), 23)
 }
-fn hole_at(
-    txn: &mut ElabTxn,
-    s: &str,
-    type_: Expr,
-    kind: MetavarKind,
-    depth: u32,
-) -> MVarId {
+fn hole_at(txn: &mut ElabTxn, s: &str, type_: Expr, kind: MetavarKind, depth: u32) -> MVarId {
     let id = MVarId(name(s));
     txn.mvars.declare(
         id.clone(),
@@ -121,7 +114,11 @@ fn recovers_a_checked_constructor_head_in_both_orientations() {
             let left = Expr::app(Expr::mvar(f.clone()), number(n));
             let right = Expr::app(succ(), number(n));
             let env = txn.env.clone();
-            let (left, right) = if reverse { (right, left) } else { (left, right) };
+            let (left, right) = if reverse {
+                (right, left)
+            } else {
+                (left, right)
+            };
             let report = txn.unify(&left, &right, budget()).unwrap();
             assert_eq!(report.expression_assignments, vec![f.clone()]);
             assert_eq!(report.kernel_checks, 1);
@@ -196,7 +193,11 @@ fn repeated_rigid_arguments_are_valid_for_head_recovery() {
     let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())));
     let args = [number(7), number(7)];
     let report = txn
-        .unify(&app(Expr::mvar(f.clone()), &args), &app(g.clone(), &args), budget())
+        .unify(
+            &app(Expr::mvar(f.clone()), &args),
+            &app(g.clone(), &args),
+            budget(),
+        )
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
     assert_eq!(report.kernel_checks, 1);
@@ -238,7 +239,8 @@ fn local_let_suffix_conversion_obeys_zeta_delta() {
     for unfold in [false, true] {
         let (mut txn, f, left, _) = successor_equation();
         let alias = FVarId(name("alias"));
-        txn.lctx.add_let(alias.clone(), alias.0.clone(), nat(), number(7));
+        txn.lctx
+            .add_let(alias.clone(), alias.0.clone(), nat(), number(7));
         let right = Expr::app(succ(), Expr::fvar(alias));
         let before = txn.clone();
         let mut limits = budget();
@@ -264,7 +266,10 @@ fn ordinary_pattern_assignments_retain_priority() {
         budget(),
     )
     .unwrap();
-    assert!(matches!(txn.mvars.get_assigned_expr(&f).unwrap().node(), ExprNode::Lam { .. }));
+    assert!(matches!(
+        txn.mvars.get_assigned_expr(&f).unwrap().node(),
+        ExprNode::Lam { .. }
+    ));
 }
 
 #[test]
@@ -302,7 +307,8 @@ fn candidate_type_holes_are_inferred_in_the_same_batch() {
     assert!(report.expression_assignments.contains(&type_id));
     assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
-    txn.unify(&Expr::mvar(type_id), &pi(nat(), nat()), budget()).unwrap();
+    txn.unify(&Expr::mvar(type_id), &pi(nat(), nat()), budget())
+        .unwrap();
 }
 
 #[test]
@@ -347,12 +353,20 @@ fn opaque_and_deeper_holes_keep_their_assignment_barriers() {
         let left = Expr::app(Expr::mvar(f.clone()), number(7));
         let right = Expr::app(succ(), number(7));
         let before = txn.clone();
-        assert!(matches!(txn.unify(&left, &right, budget()), Err(UnificationError::Deferred(_))));
+        assert!(matches!(
+            txn.unify(&left, &right, budget()),
+            Err(UnificationError::Deferred(_))
+        ));
         unchanged(&txn, &before);
         if kind == MetavarKind::Natural {
             let mut limits = budget();
             limits.max_metavar_depth = 1;
-            assert_eq!(txn.unify(&left, &right, limits).unwrap().expression_assignments, vec![f]);
+            assert_eq!(
+                txn.unify(&left, &right, limits)
+                    .unwrap()
+                    .expression_assignments,
+                vec![f]
+            );
         }
     }
 }
@@ -429,7 +443,9 @@ fn an_unsolved_later_equation_rolls_back_the_recovered_head() {
     let (mut txn, f, left, right) = successor_equation();
     let before = txn.clone();
     assert!(matches!(
-        txn.unify_many_with(&[(left, right), (number(0), number(1))], budget(), &|| false),
+        txn.unify_many_with(&[(left, right), (number(0), number(1))], budget(), &|| {
+            false
+        }),
         Err(UnificationError::Deferred(_))
     ));
     assert!(!txn.mvars.is_assigned(&f));
@@ -451,7 +467,10 @@ fn all_native_resource_gates_preserve_transactional_state() {
         match gate {
             0 => assert!(matches!(result, Err(UnificationError::StepLimit { .. }))),
             1 => assert!(matches!(result, Err(UnificationError::NodeLimit { .. }))),
-            _ => assert!(matches!(result, Err(UnificationError::AssignmentLimit { .. }))),
+            _ => assert!(matches!(
+                result,
+                Err(UnificationError::AssignmentLimit { .. })
+            )),
         }
         unchanged(&txn, &before);
     }

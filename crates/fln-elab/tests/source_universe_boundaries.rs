@@ -25,10 +25,7 @@ fn the_sort_of_type_is_not_type_itself() {
         panic!("definition")
     };
     assert_eq!(value.value, Expr::sort(Level::one()));
-    assert_eq!(
-        value.base.type_,
-        Expr::sort(Level::one().succ().unwrap())
-    );
+    assert_eq!(value.base.type_, Expr::sort(Level::one().succ().unwrap()));
 }
 
 #[test]

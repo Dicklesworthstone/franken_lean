@@ -8,9 +8,9 @@ use fln_checker::defeq::{
     QuickDefEqResult, QuickDefEqStop, def_eq, def_eq_with, quick_def_eq, quick_def_eq_with,
 };
 use fln_checker::environment::{
-    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, ConstructorDeclaration,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, InductiveDeclaration,
-    ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, InductiveDeclaration, ReducibilityHint,
 };
 use fln_checker::term::TermBudget;
 use fln_checker::whnf::{

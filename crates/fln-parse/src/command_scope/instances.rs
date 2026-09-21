@@ -32,7 +32,9 @@ pub(super) fn parse(
         tokens.get(at).map(|token| &token.kind),
         Some(TokenKind::Literal(LiteralKind::Nat))
     ) {
-        let text = view.normalized().span_str(tokens[at].extent)
+        let text = view
+            .normalized()
+            .span_str(tokens[at].extent)
             .ok_or_else(|| bad(at))?;
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(bad(at));
@@ -55,7 +57,10 @@ pub(super) fn parse(
     if declarations.is_empty() {
         return Err(bad(at));
     }
-    Ok(Some(InstanceAttribute { declarations, priority }))
+    Ok(Some(InstanceAttribute {
+        declarations,
+        priority,
+    }))
 }
 
 #[cfg(test)]
@@ -64,8 +69,7 @@ mod tests {
     use crate::command_scope::{parse as parse_command, partition};
 
     fn attribute(source: &str) -> InstanceAttribute {
-        let Some(ScopeCommand::Instance(attribute)) =
-            parse_command(source.as_bytes()).unwrap()
+        let Some(ScopeCommand::Instance(attribute)) = parse_command(source.as_bytes()).unwrap()
         else {
             panic!("instance attribute expected");
         };
@@ -74,17 +78,26 @@ mod tests {
 
     #[test]
     fn priorities_and_structural_names_use_the_real_lexer() {
-        let parsed = attribute(
-            "/- 😀 -/ attribute /- comment -/ [instance /- priority -/ 7] A.«b.c» d",
-        );
+        let parsed =
+            attribute("/- 😀 -/ attribute /- comment -/ [instance /- priority -/ 7] A.«b.c» d");
         assert_eq!(parsed.priority, 7);
-        assert_eq!(parsed.declarations,
-            vec![Name::from_components(["A", "b.c"]), Name::from_components(["d"])]);
+        assert_eq!(
+            parsed.declarations,
+            vec![
+                Name::from_components(["A", "b.c"]),
+                Name::from_components(["d"])
+            ]
+        );
         assert_eq!(attribute("attribute [instance] d").priority, 1000);
         assert_eq!(attribute("attribute [instance 0] d").priority, 0);
-        assert_eq!(attribute("attribute [instance 4294967295] d").priority, u32::MAX);
-        assert!(matches!(parse_command(b"attribute [simp] d").unwrap(),
-            Some(ScopeCommand::Simp(_))));
+        assert_eq!(
+            attribute("attribute [instance 4294967295] d").priority,
+            u32::MAX
+        );
+        assert!(matches!(
+            parse_command(b"attribute [simp] d").unwrap(),
+            Some(ScopeCommand::Simp(_))
+        ));
     }
 
     #[test]
@@ -126,10 +139,15 @@ mod tests {
             reconstructed.extend_from_slice(bytes);
         }
         assert_eq!(reconstructed, source.as_bytes());
-        assert!(matches!(parse_command(commands[2].1).unwrap(),
-            Some(ScopeCommand::Instance(_))));
+        assert!(matches!(
+            parse_command(commands[2].1).unwrap(),
+            Some(ScopeCommand::Instance(_))
+        ));
         let bad = "/- 😀 -/\r\nattribute [instance 4294967296] d";
         let error = parse_command(bad.as_bytes()).unwrap_err();
-        assert_eq!(error.primary_offset(), Some(BytePos(bad.find("4294967296").unwrap())));
+        assert_eq!(
+            error.primary_offset(),
+            Some(BytePos(bad.find("4294967296").unwrap()))
+        );
     }
 }

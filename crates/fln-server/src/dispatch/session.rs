@@ -258,10 +258,7 @@ impl DocumentSession {
     /// Even accounting recovery must retain this fence, or a delayed event
     /// could restore an older snapshot under a newer diagnostic frontier.
     pub(super) fn reject_change(&mut self, uri: &str, version: i64) -> Result<(), SessionRefusal> {
-        let document = self
-            .documents
-            .get_mut(uri)
-            .ok_or(SessionRefusal::NotOpen)?;
+        let document = self.documents.get_mut(uri).ok_or(SessionRefusal::NotOpen)?;
         if version <= document.version {
             return Err(SessionRefusal::NonMonotone);
         }
@@ -305,9 +302,14 @@ impl DocumentSession {
 
 impl DocumentSession {
     pub(super) fn sources(&self) -> Vec<super::OpenDocumentSource<'_>> {
-        self.documents.iter().map(|(uri, document)| super::OpenDocumentSource {
-            uri, version: document.version, text: document.text.as_deref(),
-        }).collect()
+        self.documents
+            .iter()
+            .map(|(uri, document)| super::OpenDocumentSource {
+                uri,
+                version: document.version,
+                text: document.text.as_deref(),
+            })
+            .collect()
     }
 }
 

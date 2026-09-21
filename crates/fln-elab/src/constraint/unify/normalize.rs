@@ -46,11 +46,13 @@ fn compare_names(a: &Name, b: &Name, meter: &mut Meter<'_>) -> Result<Ordering, 
         if order != Ordering::Equal {
             return Ok(order);
         }
-        let leaf_rank = |leaf| -> u8 { match leaf {
-            LeafView::Anonymous => 0,
-            LeafView::Str(_) => 1,
-            LeafView::Num(_) => 2,
-        }};
+        let leaf_rank = |leaf| -> u8 {
+            match leaf {
+                LeafView::Anonymous => 0,
+                LeafView::Str(_) => 1,
+                LeafView::Num(_) => 2,
+            }
+        };
         let order = leaf_rank(a.leaf_view()).cmp(&leaf_rank(b.leaf_view()));
         if order != Ordering::Equal {
             return Ok(order);
@@ -84,7 +86,11 @@ fn compare_names(a: &Name, b: &Name, meter: &mut Meter<'_>) -> Result<Ordering, 
     }
 }
 
-fn compare_atoms(a: &Level, b: &Level, meter: &mut Meter<'_>) -> Result<Ordering, UnificationError> {
+fn compare_atoms(
+    a: &Level,
+    b: &Level,
+    meter: &mut Meter<'_>,
+) -> Result<Ordering, UnificationError> {
     let mut pending = vec![(a, b)];
     let mut seen = HashSet::new();
     while let Some((a, b)) = pending.pop() {
@@ -187,7 +193,8 @@ fn maximum(a: &Form, b: &Form, meter: &mut Meter<'_>) -> Result<Form, Unificatio
             }
         };
         if !next.atom.is_zero() {
-            largest_nonconstant_offset = Some(largest_nonconstant_offset.unwrap_or(0).max(next.offset));
+            largest_nonconstant_offset =
+                Some(largest_nonconstant_offset.unwrap_or(0).max(next.offset));
         }
         out.push(next);
     }
@@ -264,7 +271,9 @@ fn guarded_term(
     let mut left = term.atom.clone();
     for _ in 0..term.offset {
         meter.node()?;
-        left = left.succ().map_err(|error| UnificationError::Universe(error.into()))?;
+        left = left
+            .succ()
+            .map_err(|error| UnificationError::Universe(error.into()))?;
     }
     meter.node()?;
     let atom = Level::imax(left, guard.clone())
@@ -277,7 +286,8 @@ fn impredicative_maximum(
     b: &Form,
     meter: &mut Meter<'_>,
 ) -> Result<Form, UnificationError> {
-    if b.is_empty() || a.is_empty()
+    if b.is_empty()
+        || a.is_empty()
         || (a.len() == 1 && a[0].atom.is_zero() && a[0].offset == 1)
         || equal_forms(a, b, meter)?
     {
@@ -376,7 +386,10 @@ pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, Un
             continue;
         }
         let child = |level: &Level| {
-            Arc::clone(done.get(&std::ptr::from_ref(level)).expect("normalization postorder"))
+            Arc::clone(
+                done.get(&std::ptr::from_ref(level))
+                    .expect("normalization postorder"),
+            )
         };
         let form = match current.view() {
             LevelView::Zero => Arc::from([]),
@@ -391,7 +404,10 @@ pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, Un
                         meter.node()?;
                         shifted.push(Term {
                             atom: term.atom.clone(),
-                            offset: term.offset.checked_add(1).ok_or(UnificationError::ExpressionScope)?,
+                            offset: term
+                                .offset
+                                .checked_add(1)
+                                .ok_or(UnificationError::ExpressionScope)?,
                         });
                     }
                     Arc::from(shifted)
@@ -402,7 +418,11 @@ pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, Un
         };
         done.insert(key, form);
     }
-    rebuild(done.get(&std::ptr::from_ref(level)).expect("normalized root"), meter)
+    rebuild(
+        done.get(&std::ptr::from_ref(level))
+            .expect("normalized root"),
+        meter,
+    )
 }
 
 #[cfg(test)]
@@ -411,14 +431,26 @@ mod tests {
 
     fn meter() -> Meter<'static> {
         Meter {
-            steps: 0, nodes: 0, max_steps: 1_000_000, max_nodes: 1_000_000,
-            heartbeat_bound: false, cancelled: &|| false,
+            steps: 0,
+            nodes: 0,
+            max_steps: 1_000_000,
+            max_nodes: 1_000_000,
+            heartbeat_bound: false,
+            cancelled: &|| false,
         }
     }
-    fn param(text: &str) -> Level { Level::param(Name::from_components([text])) }
-    fn max(a: Level, b: Level) -> Level { Level::max(a, b).unwrap() }
-    fn imax(a: Level, b: Level) -> Level { Level::imax(a, b).unwrap() }
-    fn norm(level: &Level) -> Level { simplify(level, &mut meter()).unwrap() }
+    fn param(text: &str) -> Level {
+        Level::param(Name::from_components([text]))
+    }
+    fn max(a: Level, b: Level) -> Level {
+        Level::max(a, b).unwrap()
+    }
+    fn imax(a: Level, b: Level) -> Level {
+        Level::imax(a, b).unwrap()
+    }
+    fn norm(level: &Level) -> Level {
+        simplify(level, &mut meter()).unwrap()
+    }
     fn evaluate(level: &Level, u: u32, v: u32, m: u32) -> u32 {
         match level.view() {
             LevelView::Zero => 0,
@@ -429,41 +461,74 @@ mod tests {
             LevelView::Max(a, b) => evaluate(a, u, v, m).max(evaluate(b, u, v, m)),
             LevelView::IMax(a, b) => {
                 let right = evaluate(b, u, v, m);
-                if right == 0 { 0 } else { evaluate(a, u, v, m).max(right) }
+                if right == 0 {
+                    0
+                } else {
+                    evaluate(a, u, v, m).max(right)
+                }
             }
         }
     }
 
     #[test]
     fn generated_levels_preserve_semantics_and_reach_a_fixpoint() {
-        let mut levels = vec![Level::zero(), Level::one(), param("u"), param("v"),
-            Level::mvar(LMVarId(Name::from_components(["m"])) )];
+        let mut levels = vec![
+            Level::zero(),
+            Level::one(),
+            param("u"),
+            param("v"),
+            Level::mvar(LMVarId(Name::from_components(["m"]))),
+        ];
         // Deterministically generated DAGs; no external property-testing crate.
         for i in 0..240 {
             let n = levels.len();
             let a = levels[(i * 17 + 3) % n].clone();
             let b = levels[(i * 29 + 1) % n].clone();
-            levels.push(match i % 3 { 0 => a.succ().unwrap(), 1 => max(a, b), _ => imax(a, b) });
+            levels.push(match i % 3 {
+                0 => a.succ().unwrap(),
+                1 => max(a, b),
+                _ => imax(a, b),
+            });
         }
         for level in &levels {
             let normalized = norm(level);
             assert_eq!(norm(&normalized), normalized);
-            for u in 0..=3 { for v in 0..=3 { for m in 0..=3 {
-                assert_eq!(evaluate(level, u, v, m), evaluate(&normalized, u, v, m));
-            }}}
+            for u in 0..=3 {
+                for v in 0..=3 {
+                    for m in 0..=3 {
+                        assert_eq!(evaluate(level, u, v, m), evaluate(&normalized, u, v, m));
+                    }
+                }
+            }
         }
     }
 
     #[test]
     fn all_max_permutations_and_parenthesizations_have_one_form() {
-        let terms = [param("u"), param("v"), param("u").succ().unwrap(), Level::one()];
+        let terms = [
+            param("u"),
+            param("v"),
+            param("u").succ().unwrap(),
+            Level::one(),
+        ];
         let expected = norm(&max(terms[2].clone(), terms[1].clone()));
-        for a in 0..4 { for b in 0..4 { for c in 0..4 { for d in 0..4 {
-            if a == b || a == c || a == d || b == c || b == d || c == d { continue; }
-            let [a,b,c,d] = [a,b,c,d].map(|i| terms[i].clone());
-            assert_eq!(norm(&max(max(a.clone(),b.clone()),max(c.clone(),d.clone()))), expected);
-            assert_eq!(norm(&max(a,max(b,max(c,d)))), expected);
-        }}}}
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        if a == b || a == c || a == d || b == c || b == d || c == d {
+                            continue;
+                        }
+                        let [a, b, c, d] = [a, b, c, d].map(|i| terms[i].clone());
+                        assert_eq!(
+                            norm(&max(max(a.clone(), b.clone()), max(c.clone(), d.clone()))),
+                            expected
+                        );
+                        assert_eq!(norm(&max(a, max(b, max(c, d)))), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -502,15 +567,29 @@ mod tests {
         let (u, v) = (param("u"), param("v"));
         let w = Level::mvar(LMVarId(Name::from_components(["guard"])));
         vec![
-            (imax(max(u.clone(), v.clone()), w.clone()),
-                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone()))),
-            (imax(u.clone(), max(v.clone(), w.clone())),
-                max(imax(u.clone(), v.clone()), imax(u.clone(), w.clone()))),
-            (imax(u.clone(), imax(v.clone(), w.clone())),
-                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone()))),
-            (imax(imax(u.clone(), v.clone()), v.clone()), imax(u.clone(), v.clone())),
-            (imax(max(u.clone().succ().unwrap(), v.clone()), w.clone()),
-                max(imax(u.clone().succ().unwrap(), w.clone()), imax(v.clone(), w))),
+            (
+                imax(max(u.clone(), v.clone()), w.clone()),
+                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone())),
+            ),
+            (
+                imax(u.clone(), max(v.clone(), w.clone())),
+                max(imax(u.clone(), v.clone()), imax(u.clone(), w.clone())),
+            ),
+            (
+                imax(u.clone(), imax(v.clone(), w.clone())),
+                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone())),
+            ),
+            (
+                imax(imax(u.clone(), v.clone()), v.clone()),
+                imax(u.clone(), v.clone()),
+            ),
+            (
+                imax(max(u.clone().succ().unwrap(), v.clone()), w.clone()),
+                max(
+                    imax(u.clone().succ().unwrap(), w.clone()),
+                    imax(v.clone(), w),
+                ),
+            ),
             (max(v.clone(), imax(u.clone(), v.clone())), imax(u, v)),
         ]
     }
@@ -521,13 +600,17 @@ mod tests {
         use fln_env::environment::Environment;
         let mut txn = ElabTxn::new(Environment::new(), KVMap::new(), 79);
         let before = txn.clone();
-        let equations: Vec<_> = guarded_equations().into_iter()
-            .map(|(a, b)| (Expr::sort(a), Expr::sort(b))).collect();
-        let report = txn.unify_many_with(
-            &equations,
-            UnificationBudget::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
-            &|| false,
-        ).unwrap();
+        let equations: Vec<_> = guarded_equations()
+            .into_iter()
+            .map(|(a, b)| (Expr::sort(a), Expr::sort(b)))
+            .collect();
+        let report = txn
+            .unify_many_with(
+                &equations,
+                UnificationBudget::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+                &|| false,
+            )
+            .unwrap();
         assert!(report.expression_assignments.is_empty());
         assert!(report.universe_assignments.is_empty());
         assert_eq!(report.kernel_checks, 0);
@@ -543,10 +626,14 @@ mod tests {
             let normalized = norm(&left);
             assert_eq!(normalized, norm(&right));
             assert_eq!(norm(&normalized), normalized);
-            for u in 0..=4 { for v in 0..=4 { for m in 0..=4 {
-                assert_eq!(evaluate(&left, u, v, m), evaluate(&normalized, u, v, m));
-                assert_eq!(evaluate(&right, u, v, m), evaluate(&normalized, u, v, m));
-            }}}
+            for u in 0..=4 {
+                for v in 0..=4 {
+                    for m in 0..=4 {
+                        assert_eq!(evaluate(&left, u, v, m), evaluate(&normalized, u, v, m));
+                        assert_eq!(evaluate(&right, u, v, m), evaluate(&normalized, u, v, m));
+                    }
+                }
+            }
         }
     }
 
@@ -594,11 +681,23 @@ mod tests {
         assert!(control.nodes > 100);
         let mut limited = meter();
         limited.max_nodes = control.nodes / 2;
-        assert!(matches!(simplify(&input, &mut limited), Err(UnificationError::NodeLimit { .. })));
+        assert!(matches!(
+            simplify(&input, &mut limited),
+            Err(UnificationError::NodeLimit { .. })
+        ));
         let polls = Cell::new(0);
-        let stop = || { polls.set(polls.get() + 1); polls.get() > control.steps / 2 };
-        let mut cancelled = Meter { cancelled: &stop, ..meter() };
-        assert!(matches!(simplify(&input, &mut cancelled), Err(UnificationError::Cancelled)));
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() > control.steps / 2
+        };
+        let mut cancelled = Meter {
+            cancelled: &stop,
+            ..meter()
+        };
+        assert!(matches!(
+            simplify(&input, &mut cancelled),
+            Err(UnificationError::Cancelled)
+        ));
         assert_eq!(norm(&input), expected);
     }
 
@@ -610,7 +709,11 @@ mod tests {
         let before = txn.clone();
         let tentative = LMVarId(Name::from_components(["tentative"]));
         let mut equations = vec![(Expr::sort(Level::mvar(tentative)), Expr::sort(Level::one()))];
-        equations.extend(guarded_equations().into_iter().map(|(a, b)| (Expr::sort(a), Expr::sort(b))));
+        equations.extend(
+            guarded_equations()
+                .into_iter()
+                .map(|(a, b)| (Expr::sort(a), Expr::sort(b))),
+        );
         equations.push((
             Expr::sort(imax(param("u"), param("v"))),
             Expr::sort(max(param("u"), param("v"))),

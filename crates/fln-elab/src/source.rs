@@ -788,7 +788,8 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        enum Task<'a> {            DoAction(&'a [Syntax], Option<Expr>),
+        enum Task<'a> {
+            DoAction(&'a [Syntax], Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -1126,11 +1127,12 @@ impl Context {
                                     let opaque = kind == &parser_kind(&["Term", "have"]);
                                     let recursive = kind == &parser_kind(&["Term", "letrec"]);
                                     let binding = self.let_parts(args, opaque, recursive)?;
-                                    if recursive || !expect_null_args(
-                                        binding.parameters,
-                                        "local function parameters",
-                                    )?
-                                    .is_empty()
+                                    if recursive
+                                        || !expect_null_args(
+                                            binding.parameters,
+                                            "local function parameters",
+                                        )?
+                                        .is_empty()
                                     {
                                         let build = self.start_local_function(binding, expected)?;
                                         if let Some(annotation) = build.binding.annotation {
@@ -1749,7 +1751,10 @@ impl Context {
                             build.result_type = Some(annotation.value.clone());
                             if build.binding.recursive {
                                 let mut checkpoint = local_functions::Checkpoint::new(
-                                    self, build, tasks.len(), values.len(),
+                                    self,
+                                    build,
+                                    tasks.len(),
+                                    values.len(),
                                 )?;
                                 let (build, column) = checkpoint.begin(attempts.len());
                                 attempts.push(Attempt::LocalFunction(Box::new(checkpoint)));
@@ -1774,10 +1779,13 @@ impl Context {
                                 if index + 1 != attempts.len() {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
-                                let Some(Attempt::LocalFunction(checkpoint)) = attempts.pop() else {
+                                let Some(Attempt::LocalFunction(checkpoint)) = attempts.pop()
+                                else {
                                     return Err(failure(SourceInferenceError::Scope));
                                 };
-                                if checkpoint.tasks != tasks.len() || checkpoint.values != values.len() {
+                                if checkpoint.tasks != tasks.len()
+                                    || checkpoint.values != values.len()
+                                {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
                             }

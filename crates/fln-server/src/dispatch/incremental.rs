@@ -49,9 +49,22 @@ fn ordered_utf16_edits_check_only_the_final_snapshot_and_save_it() {
     assert_eq!(seen[1].1, "aX\nYB\r\nc");
     assert_eq!(seen[2], seen[1]);
     assert!(seen.iter().all(|(uri, _)| uri == "untitled:proof%20one"));
-    let wait = frames.iter().position(|s| s.contains(r#""id":"waiting","result":{}"#)).unwrap();
-    assert!(frames[..wait].iter().any(|s| s.contains(r#""processing":[]"#)));
-    assert_eq!(frames.iter().filter(|s| s.contains(r#""id":"waiting""#)).count(), 1);
+    let wait = frames
+        .iter()
+        .position(|s| s.contains(r#""id":"waiting","result":{}"#))
+        .unwrap();
+    assert!(
+        frames[..wait]
+            .iter()
+            .any(|s| s.contains(r#""processing":[]"#))
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|s| s.contains(r#""id":"waiting""#))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -67,9 +80,22 @@ fn a_bad_second_edit_never_checks_the_first_and_full_text_recovers() {
     assert!(outcome.clean);
     assert_eq!(outcome.documents_changed, 1);
     assert_eq!(outcome.documents_saved, 1);
-    assert_eq!(seen.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>(), ["original", "recovered!", "recovered!"]);
-    assert!(frames.iter().any(|s| s.contains("splits a UTF-16 surrogate pair")));
-    assert!(frames.iter().any(|s| s.contains(r#""id":"invalidated","error":{"code":-32803"#)));
+    assert_eq!(
+        seen.iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["original", "recovered!", "recovered!"]
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|s| s.contains("splits a UTF-16 surrogate pair"))
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|s| s.contains(r#""id":"invalidated","error":{"code":-32803"#))
+    );
 }
 
 #[test]
@@ -85,8 +111,18 @@ fn stale_malformed_edits_cannot_invalidate_the_newest_source_or_frontier() {
     assert_eq!(outcome.documents_saved, 1);
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0], seen[1]);
-    assert!(frames.iter().any(|s| s.contains(r#""id":"ready","result":{}"#)));
-    assert_eq!(frames.iter().filter(|s| s.contains("non-monotone didChange version")).count(), 2);
+    assert!(
+        frames
+            .iter()
+            .any(|s| s.contains(r#""id":"ready","result":{}"#))
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|s| s.contains("non-monotone didChange version"))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -100,7 +136,11 @@ fn incremental_changes_without_retained_source_fail_instead_of_replaying_stale_t
     assert_eq!(outcome.documents_changed, 0);
     assert_eq!(outcome.documents_saved, 0);
     assert_eq!(seen.len(), 1);
-    assert!(frames.iter().any(|s| s.contains("requires a retained source snapshot")));
+    assert!(
+        frames
+            .iter()
+            .any(|s| s.contains("requires a retained source snapshot"))
+    );
 }
 
 #[test]
@@ -113,5 +153,9 @@ fn empty_batches_advance_the_version_without_changing_source() {
     assert_eq!(outcome.documents_changed, 1);
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0], seen[1]);
-    assert!(frames.iter().any(|s| s.contains(r#""id":"ready","result":{}"#)));
+    assert!(
+        frames
+            .iter()
+            .any(|s| s.contains(r#""id":"ready","result":{}"#))
+    );
 }

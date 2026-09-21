@@ -155,37 +155,61 @@ fn dependent_pattern_domains_use_the_normalized_arguments() {
     let x = local(&mut txn, "x", a.clone());
     let left = app(
         Expr::mvar(f.clone()),
-        &[beta(Expr::sort(Level::one()), a.clone()), beta(a, x.clone())],
+        &[
+            beta(Expr::sort(Level::one()), a.clone()),
+            beta(a, x.clone()),
+        ],
     );
     let report = txn.unify(&left, &x, budget()).unwrap();
     assert_eq!(report.kernel_checks, 1);
     assert!(report.residual_metavariables.is_empty());
-    txn.unify(&app(Expr::mvar(f), &[nat(), number(19)]), &number(19), budget())
-        .unwrap();
+    txn.unify(
+        &app(Expr::mvar(f), &[nat(), number(19)]),
+        &number(19),
+        budget(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn argument_order_is_preserved_when_rebuilding_the_spine() {
     let mut txn = transaction();
-    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), pi(nat(), nat())),
+        MetavarKind::Natural,
+    );
     let x = local(&mut txn, "x", nat());
     let y = local(&mut txn, "y", nat());
     let report = txn
         .unify(
-            &app(Expr::mvar(f.clone()), &[beta(nat(), x), beta(nat(), y.clone())]),
+            &app(
+                Expr::mvar(f.clone()),
+                &[beta(nat(), x), beta(nat(), y.clone())],
+            ),
             &y,
             budget(),
         )
         .unwrap();
     assert_eq!(report.kernel_checks, 1);
-    txn.unify(&app(Expr::mvar(f), &[number(7), number(9)]), &number(9), budget())
-        .unwrap();
+    txn.unify(
+        &app(Expr::mvar(f), &[number(7), number(9)]),
+        &number(9),
+        budget(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn normalization_does_not_turn_duplicate_arguments_into_a_pattern() {
     let mut txn = transaction();
-    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), pi(nat(), nat())),
+        MetavarKind::Natural,
+    );
     let x = local(&mut txn, "x", nat());
     let before = txn.clone();
     assert!(matches!(
@@ -296,12 +320,10 @@ fn a_late_batch_failure_rolls_back_earlier_normalized_assignments() {
     let (mut txn, _, left, right) = identity_equation();
     let before = txn.clone();
     assert!(
-        txn.unify_many_with(
-            &[(left, right), (number(0), number(1))],
-            budget(),
-            &|| false,
-        )
-        .is_err()
+        txn.unify_many_with(&[(left, right), (number(0), number(1))], budget(), &|| {
+            false
+        },)
+            .is_err()
     );
     unchanged(&txn, &before);
 }
@@ -309,7 +331,12 @@ fn a_late_batch_failure_rolls_back_earlier_normalized_assignments() {
 #[test]
 fn successful_existing_patterns_get_first_choice_before_let_unfolding() {
     let mut txn = transaction();
-    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), pi(nat(), nat())),
+        MetavarKind::Natural,
+    );
     let x = local(&mut txn, "x", nat());
     let alias = FVarId(name("alias"));
     txn.lctx
@@ -324,13 +351,22 @@ fn successful_existing_patterns_get_first_choice_before_let_unfolding() {
         )
         .unwrap();
     assert_eq!(report.kernel_checks, 1);
-    txn.unify(&app(Expr::mvar(f), &[number(7), number(9)]), &number(7), budget())
-        .unwrap();
+    txn.unify(
+        &app(Expr::mvar(f), &[number(7), number(9)]),
+        &number(7),
+        budget(),
+    )
+    .unwrap();
 }
 
 fn pruning_equation() -> (ElabTxn, MVarId, Expr, Expr) {
     let mut txn = transaction();
-    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), pi(nat(), nat())),
+        MetavarKind::Natural,
+    );
     let x = local(&mut txn, "x", nat());
     let y = local(&mut txn, "y", nat());
     let z = local(&mut txn, "z", nat());
@@ -360,8 +396,12 @@ fn normalized_same_head_pruning_replays_the_original_equation() {
         txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), budget())
             .unwrap();
         txn.unify(&left, &right, budget()).unwrap();
-        txn.unify(&app(Expr::mvar(f), &[number(23), number(91)]), &number(23), budget())
-            .unwrap();
+        txn.unify(
+            &app(Expr::mvar(f), &[number(23), number(91)]),
+            &number(23),
+            budget(),
+        )
+        .unwrap();
         assert_eq!(txn.env, environment);
     }
 }
@@ -398,10 +438,18 @@ fn distinct_heads_share_the_normalized_intersection_in_each_argument_order() {
         assert!(txn.mvars.get_decl(&residual).unwrap().lctx.is_empty());
         txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), budget())
             .unwrap();
-        txn.unify(&app(Expr::mvar(f), &[number(7), number(9)]), &number(7), budget())
-            .unwrap();
-        txn.unify(&app(Expr::mvar(g), &[number(9), number(7)]), &number(7), budget())
-            .unwrap();
+        txn.unify(
+            &app(Expr::mvar(f), &[number(7), number(9)]),
+            &number(7),
+            budget(),
+        )
+        .unwrap();
+        txn.unify(
+            &app(Expr::mvar(g), &[number(9), number(7)]),
+            &number(7),
+            budget(),
+        )
+        .unwrap();
         txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(txn.env, environment);
     }
@@ -473,7 +521,10 @@ fn normalization_never_assumes_an_unknown_function_is_injective() {
     unchanged(&txn, &before);
     let report = txn
         .unify_many_with(
-            &[(left, right), (Expr::mvar(f.clone()), lam(nat(), number(0)))],
+            &[
+                (left, right),
+                (Expr::mvar(f.clone()), lam(nat(), number(0))),
+            ],
             budget(),
             &|| false,
         )
@@ -501,12 +552,10 @@ fn a_late_failure_discards_the_residual_and_both_parent_assignments() {
     let (mut txn, _, _, left, right) = distinct_pruning_equation();
     let before = txn.clone();
     assert!(
-        txn.unify_many_with(
-            &[(left, right), (number(0), number(1))],
-            budget(),
-            &|| false,
-        )
-        .is_err()
+        txn.unify_many_with(&[(left, right), (number(0), number(1))], budget(), &|| {
+            false
+        },)
+            .is_err()
     );
     unchanged(&txn, &before);
 }

@@ -832,7 +832,10 @@ fn find_let_separator(
             if local_line_break(view, tokens, keyword, from, index) {
                 return Some((index, None, index));
             }
-            while nested_lets.last().is_some_and(|&nested| local_line_break(view, tokens, nested, nested, index)) {
+            while nested_lets
+                .last()
+                .is_some_and(|&nested| local_line_break(view, tokens, nested, nested, index))
+            {
                 nested_lets.pop();
             }
         }
@@ -958,7 +961,9 @@ fn bounded_let_bindings(
             });
         }
         let value_start = assignment + 1;
-        let Some((value_end, separator, next)) = find_let_separator(view, tokens, keyword, value_start) else {
+        let Some((value_end, separator, next)) =
+            find_let_separator(view, tokens, keyword, value_start)
+        else {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, tokens.len()),
                 expected: NatDefinitionExpectation::LetSeparator,
@@ -967,8 +972,16 @@ fn bounded_let_bindings(
         if recursive.is_some() {
             let mut depth = 0usize;
             for at in value_start..value_end {
-                if depth == 0 && ["termination_by", "decreasing_by", "partial_fixpoint", "coinductive_fixpoint", "inductive_fixpoint"]
-                    .iter().any(|word| term_locals::word(tokens, at, word))
+                if depth == 0
+                    && [
+                        "termination_by",
+                        "decreasing_by",
+                        "partial_fixpoint",
+                        "coinductive_fixpoint",
+                        "inductive_fixpoint",
+                    ]
+                    .iter()
+                    .any(|word| term_locals::word(tokens, at, word))
                 {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, at),

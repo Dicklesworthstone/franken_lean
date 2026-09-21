@@ -2023,8 +2023,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         if levels.len() != level_parameters.len() {
             return Ok(None);
         }
-        self.control
-            .reduction(head.root.index(), self.cancelled)?;
+        self.control.reduction(head.root.index(), self.cancelled)?;
         let instantiated_rhs = match instantiate_term_parameters_from_level_roots_with(
             rule.rhs(),
             level_parameters,
@@ -2594,14 +2593,16 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             )? {
                                 alt_major = Some(replacement);
                             }
-                        } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
-                            &frame.level_parameters,
-                            &frame.recursor_type,
-                            &frame.head,
-                            &frame.levels,
-                            &frame.arguments,
-                            frame.major_index,
-                        )? {
+                        } else if let Some(replacement) = self
+                            .recursor_major_to_structure_constructor(
+                                &frame.level_parameters,
+                                &frame.recursor_type,
+                                &frame.head,
+                                &frame.levels,
+                                &frame.arguments,
+                                frame.major_index,
+                            )?
+                        {
                             alt_major = Some(replacement);
                         }
 

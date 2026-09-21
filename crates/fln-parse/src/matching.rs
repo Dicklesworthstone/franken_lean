@@ -137,11 +137,18 @@ fn plan(
         while lets.last().is_some_and(|&(depth, _, _, keyword)| {
             depth == delimiters.len() && local_line_break(view, tokens, keyword, keyword, at)
         }) {
-            let (_, enclosing, enclosing_conditionals, _) = lets.pop().expect("offside local declaration");
-            while conditionals.len() > enclosing_conditionals && conditionals.last().is_some_and(|p| p.depth == delimiters.len()) {
+            let (_, enclosing, enclosing_conditionals, _) =
+                lets.pop().expect("offside local declaration");
+            while conditionals.len() > enclosing_conditionals
+                && conditionals
+                    .last()
+                    .is_some_and(|p| p.depth == delimiters.len())
+            {
                 close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
             }
-            while active.len() > enclosing && active.last().is_some_and(|p| p.depth == delimiters.len()) {
+            while active.len() > enclosing
+                && active.last().is_some_and(|p| p.depth == delimiters.len())
+            {
                 close(view, tokens, &mut active, &mut done, at)?;
             }
         }
@@ -268,7 +275,8 @@ fn plan(
                 // match whose branch contains the let and its continuation.
                 let (enclosing, enclosing_conditionals) =
                     if lets.last().is_some_and(|(d, _, _, _)| *d == depth) {
-                        let (_, matches, conditionals, _) = lets.pop().expect("let at current depth");
+                        let (_, matches, conditionals, _) =
+                            lets.pop().expect("let at current depth");
                         (matches, conditionals)
                     } else {
                         (0, 0)
@@ -594,7 +602,8 @@ fn let_values(
     splices: &mut Splices,
     updates: &HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    enum Task {        Value(Range<usize>),
+    enum Task {
+        Value(Range<usize>),
         Close(Vec<LetBindingTokens>),
         Parentheses(usize, usize, usize),
     }
@@ -616,12 +625,16 @@ fn let_values(
                     let mut depth = wrappers;
                     let mut enclosed = head < end;
                     for at in head..end {
-                        if is_symbol(tokens, at, "(") { depth += 1; }
-                        if is_symbol(tokens, at, ")") { depth = depth.saturating_sub(1); }
+                        if is_symbol(tokens, at, "(") {
+                            depth += 1;
+                        }
+                        if is_symbol(tokens, at, ")") {
+                            depth = depth.saturating_sub(1);
+                        }
                         enclosed &= depth >= wrappers;
                     }
-                    enclosed &= depth == wrappers
-                        && (end..range.end).all(|at| is_symbol(tokens, at, ")"));
+                    enclosed &=
+                        depth == wrappers && (end..range.end).all(|at| is_symbol(tokens, at, ")"));
                     if enclosed {
                         tasks.push(Task::Parentheses(range.start, range.end, wrappers));
                         tasks.push(Task::Value(head..end));
@@ -637,7 +650,9 @@ fn let_values(
                     continue;
                 }
                 if grammar == DefinitionGrammar::NatOnly
-                    && bindings.iter().any(|b| b.recursive.is_some() || !b.parameters.is_empty())
+                    && bindings
+                        .iter()
+                        .any(|b| b.recursive.is_some() || !b.parameters.is_empty())
                 {
                     return Err(refuse(view, tokens, range.start));
                 }
@@ -696,10 +711,14 @@ fn let_values(
             Task::Parentheses(start, end, count) => {
                 let mut value = values.pop().expect("parenthesized local term");
                 for offset in (0..count).rev() {
-                    value = Syntax::node(parser_kind(&["Term", "paren"]), vec![
-                        hygienic_lparen(leaves.leaf(start + offset)?), value,
-                        leaves.leaf(end - 1 - offset)?,
-                    ]);
+                    value = Syntax::node(
+                        parser_kind(&["Term", "paren"]),
+                        vec![
+                            hygienic_lparen(leaves.leaf(start + offset)?),
+                            value,
+                            leaves.leaf(end - 1 - offset)?,
+                        ],
+                    );
                 }
                 values.push(value);
             }

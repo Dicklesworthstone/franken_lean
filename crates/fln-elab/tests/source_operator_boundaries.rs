@@ -21,5 +21,8 @@ fn absent_numeric_instances_cannot_manufacture_values_of_arbitrary_types() {
         }
     }
     let valid = check_definition_source(b"def valid : Nat := 7", &env, budget).unwrap();
-    assert!(matches!(valid.outcome, Outcome::Complete(Verdict::Accepted { .. })));
+    assert!(matches!(
+        valid.outcome,
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
 }

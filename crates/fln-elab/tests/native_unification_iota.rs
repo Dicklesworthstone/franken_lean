@@ -6,9 +6,7 @@ use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
-use fln_elab::constraint::unify::{
-    UnificationBudget, UnificationError, UnificationTransparency,
-};
+use fln_elab::constraint::unify::{UnificationBudget, UnificationError, UnificationTransparency};
 use fln_elab::mvar::MetavarKind;
 use fln_elab::txn::ElabTxn;
 use fln_env::environment::{DeclarationBudget, Environment};
@@ -102,7 +100,12 @@ fn select(major: Expr) -> Expr {
 fn nat_rec(major: Expr, zero: Expr, successor: Expr) -> Expr {
     apply(
         Expr::const_(name("Nat.rec"), vec![Level::one()]),
-        [lam(constant("Nat"), constant("Nat")), zero, successor, major],
+        [
+            lam(constant("Nat"), constant("Nat")),
+            zero,
+            successor,
+            major,
+        ],
     )
 }
 
@@ -151,7 +154,10 @@ fn an_assignment_exposed_by_iota_still_passes_k1() {
     let report = txn.unify(&expr, &constant("Bool.true"), budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![id.clone()]);
     assert_eq!(report.kernel_checks, 1);
-    assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&constant("Bool.true")));
+    assert_eq!(
+        txn.mvars.get_assigned_expr(&id),
+        Some(&constant("Bool.true"))
+    );
     assert_eq!(txn.env, env);
 }
 
@@ -210,7 +216,14 @@ fn parameterized_indexed_equality_recursor_uses_only_prefix_and_fields() {
     );
     let expr = apply(
         Expr::const_(name("Eq.rec"), vec![Level::one(), Level::one()]),
-        [constant("Nat"), numeral(7), motive, numeral(23), numeral(7), proof],
+        [
+            constant("Nat"),
+            numeral(7),
+            motive,
+            numeral(23),
+            numeral(7),
+            proof,
+        ],
     );
     txn.unify(&expr, &numeral(23), budget()).unwrap();
 }
@@ -293,8 +306,12 @@ fn compact_nat_zero_and_recursive_successor_rules_compute() {
             constant("Nat"),
             lam(constant("Nat"), apply(constant("Nat.succ"), [bvar(0)])),
         );
-        txn.unify(&nat_rec(numeral(n), numeral(0), step), &numeral(n), budget())
-            .unwrap();
+        txn.unify(
+            &nat_rec(numeral(n), numeral(0), step),
+            &numeral(n),
+            budget(),
+        )
+        .unwrap();
     }
 }
 
@@ -305,9 +322,7 @@ fn a_huge_literal_does_not_force_an_unused_induction_hypothesis() {
     let expr = nat_rec(numeral(u64::MAX), numeral(0), step);
     let mut bounded = budget();
     bounded.max_steps = 20_000;
-    let report = txn
-        .unify(&expr, &numeral(u64::MAX - 1), bounded)
-        .unwrap();
+    let report = txn.unify(&expr, &numeral(u64::MAX - 1), bounded).unwrap();
     assert!(report.unifier_steps < bounded.max_steps);
     assert!(report.expression_assignments.is_empty());
 }
@@ -326,7 +341,10 @@ fn universe_assignments_reawaken_constructor_compatibility() {
         [constant("Nat"), numeral(7)],
     );
     let expr = apply(
-        Expr::const_(name("Eq.rec"), vec![Level::one(), Level::mvar(universe.clone())]),
+        Expr::const_(
+            name("Eq.rec"),
+            vec![Level::one(), Level::mvar(universe.clone())],
+        ),
         [
             constant("Nat"),
             numeral(7),
@@ -340,7 +358,10 @@ fn universe_assignments_reawaken_constructor_compatibility() {
         .unify_many_with(
             &[
                 (expr, numeral(23)),
-                (Expr::sort(Level::mvar(universe.clone())), Expr::sort(Level::one())),
+                (
+                    Expr::sort(Level::mvar(universe.clone())),
+                    Expr::sort(Level::one()),
+                ),
             ],
             budget(),
             &|| false,
@@ -365,10 +386,16 @@ fn an_ill_typed_selected_assignment_is_still_vetoed_by_k1() {
             constant("Bool.true"),
         ],
     );
-    match txn.unify(&expr, &constant("Bool.true"), budget()).unwrap_err() {
+    match txn
+        .unify(&expr, &constant("Bool.true"), budget())
+        .unwrap_err()
+    {
         UnificationError::AssignmentCheck { id: found, outcome } => {
             assert_eq!(found, id);
-            assert!(matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })));
+            assert!(matches!(
+                *outcome,
+                Outcome::Complete(Verdict::Rejected { .. })
+            ));
         }
         other => panic!("expected K1 veto, got {other:?}"),
     }
@@ -428,7 +455,10 @@ fn cancellation_discards_speculative_assignments_but_keeps_spent_work() {
     assert!(matches!(result, Err(UnificationError::Cancelled)));
     assert_eq!(calls.get(), stop);
     unchanged(&cancelled, &initial);
-    assert_eq!(cancelled.budget.heartbeats_consumed, control.budget.heartbeats_consumed);
+    assert_eq!(
+        cancelled.budget.heartbeats_consumed,
+        control.budget.heartbeats_consumed
+    );
     assert!(cancelled.budget.heartbeats_consumed > initial.budget.heartbeats_consumed);
 }
 
@@ -440,7 +470,9 @@ fn step_and_node_exhaustion_are_typed_nonanswers_not_partial_success() {
     }
     let initial = transaction();
     let mut control = initial.clone();
-    let report = control.unify(&expr, &constant("Bool.true"), budget()).unwrap();
+    let report = control
+        .unify(&expr, &constant("Bool.true"), budget())
+        .unwrap();
     let mut limited = budget();
     limited.max_steps = report.unifier_steps - 1;
     let mut txn = initial.clone();

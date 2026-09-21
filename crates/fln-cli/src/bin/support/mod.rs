@@ -13,7 +13,6 @@ use fln_core::outcome::BoundedText;
 #[cfg(test)]
 use fln_core::pos::Position;
 
-
 pub(super) fn write_output(output: fln_cli::MultiplexerOutput) -> std::process::ExitCode {
     if std::io::stdout()
         .lock()

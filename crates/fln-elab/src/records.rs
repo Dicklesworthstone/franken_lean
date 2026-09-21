@@ -183,7 +183,10 @@ impl Builder {
                     break;
                 }
                 // The spine was collected in reverse application order.
-                local.type_ = (*arguments.last().expect("recognized annotation has arguments")).clone();
+                local.type_ = (*arguments
+                    .last()
+                    .expect("recognized annotation has arguments"))
+                .clone();
             }
             normalized.push(local);
         }
@@ -492,9 +495,15 @@ mod annotation_tests {
             assert_eq!(unwrap(head.clone(), 100).unwrap(), head);
             let one = Expr::app(head, sort.clone());
             let is_unary = matches!(name, "outParam" | "semiOutParam");
-            assert_eq!(unwrap(one.clone(), 100).unwrap(), if is_unary { sort.clone() } else { one.clone() });
+            assert_eq!(
+                unwrap(one.clone(), 100).unwrap(),
+                if is_unary { sort.clone() } else { one.clone() }
+            );
             let two = Expr::app(one, sort.clone());
-            assert_eq!(unwrap(two.clone(), 100).unwrap(), if is_unary { two.clone() } else { sort.clone() });
+            assert_eq!(
+                unwrap(two.clone(), 100).unwrap(),
+                if is_unary { two.clone() } else { sort.clone() }
+            );
             let three = Expr::app(two, sort.clone());
             assert_eq!(unwrap(three.clone(), 100).unwrap(), three);
             let foreign = Expr::app(

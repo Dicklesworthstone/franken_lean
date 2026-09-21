@@ -85,9 +85,7 @@ impl Engine<'_> {
         else {
             return Ok(None);
         };
-        if name != &Name::from_components(["Quot", "mk"])
-            || constructor_levels.len() != 1
-        {
+        if name != &Name::from_components(["Quot", "mk"]) || constructor_levels.len() != 1 {
             return Ok(None);
         }
         let Some(level) = levels.first() else {

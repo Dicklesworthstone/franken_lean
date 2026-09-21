@@ -213,7 +213,10 @@ impl Context {
             .known_type(&result)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         let result_sort = self.whnf(&result_sort)?;
-        let ExprNode::Sort { level: result_level } = result_sort.node() else {
+        let ExprNode::Sort {
+            level: result_level,
+        } = result_sort.node()
+        else {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
         let witness_name = self.fresh_name()?;
@@ -306,7 +309,13 @@ impl Context {
             };
             function = self.calculation_argument(function, argument)?;
         }
-        for argument in [left.left, left.right, right.right, previous.value, next.value] {
+        for argument in [
+            left.left,
+            left.right,
+            right.right,
+            previous.value,
+            next.value,
+        ] {
             function = self.calculation_argument(function, argument)?;
         }
         // An unresolved dictionary is not transitivity evidence. In particular,

@@ -2733,7 +2733,11 @@ fn nat_reduction_in_eager_whnf_reduces_ble_and_arithmetic_without_unfolding() {
             levels: Vec::new(),
         })
     );
-    assert!(result.steps < 100, "must reduce in O(1) steps without unfolding recursion: took {}", result.steps);
+    assert!(
+        result.steps < 100,
+        "must reduce in O(1) steps without unfolding recursion: took {}",
+        result.steps
+    );
 
     let add_term = decoded(&natural_operation(
         "add",
@@ -2741,5 +2745,9 @@ fn nat_reduction_in_eager_whnf_reduces_ble_and_arithmetic_without_unfolding() {
     ));
     let add_result = complete(whnf(&add_term, &context, WhnfBudget::unlimited()));
     assert_eq!(add_result.term, decoded(&numeric_literal(300)));
-    assert!(add_result.steps < 100, "must reduce addition in O(1) steps: took {}", add_result.steps);
+    assert!(
+        add_result.steps < 100,
+        "must reduce addition in O(1) steps: took {}",
+        add_result.steps
+    );
 }

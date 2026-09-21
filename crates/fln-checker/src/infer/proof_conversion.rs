@@ -327,7 +327,7 @@ impl Probe<'_> {
                     Some(ExprNode::Lambda {
                         binder_type: rt,
                         body: rb,
-                    ..
+                        ..
                     }),
                 )
                 | (

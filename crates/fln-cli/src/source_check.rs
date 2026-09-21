@@ -61,7 +61,11 @@ fn failed(class: &str, detail: &str, authority: bool, json: bool, exit: u8) -> M
         format!(
             "fln check-source: {class}: {}{}\n",
             detail.text(),
-            if detail.truncated() { " [detail truncated]" } else { "" }
+            if detail.truncated() {
+                " [detail truncated]"
+            } else {
+                ""
+            }
         )
     };
     MultiplexerOutput::failure(stderr, exit)
@@ -76,7 +80,15 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
     for path in &paths {
         let bytes = match read_bounded(path, max_bytes - total, "Lean source") {
             Ok(bytes) => bytes,
-            Err(error) => return failed(error.class(), &error.to_string(), false, json, error.exit_code()),
+            Err(error) => {
+                return failed(
+                    error.class(),
+                    &error.to_string(),
+                    false,
+                    json,
+                    error.exit_code(),
+                );
+            }
         };
         total += bytes.len();
         sources.push(bytes);
@@ -119,10 +131,22 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
             MultiplexerOutput::success(stdout)
         });
     match worker {
-        Err(error) => failed("resource", &format!("could not start source-check worker: {error}"), false, json, 3),
+        Err(error) => failed(
+            "resource",
+            &format!("could not start source-check worker: {error}"),
+            false,
+            json,
+            3,
+        ),
         Ok(worker) => match worker.join() {
             Ok(result) => result,
-            Err(_) => failed("internal-fault", "source-check worker panicked", false, json, 4),
+            Err(_) => failed(
+                "internal-fault",
+                "source-check worker panicked",
+                false,
+                json,
+                4,
+            ),
         },
     }
 }

@@ -403,15 +403,18 @@ impl Context {
                     let term = trial.located_rule_term(rule.syntax)?;
                     trial.flush(false)?;
                     let target = trial.instantiate(&local.type_)?;
-                    let Some(RewriteMatch { rule: term, occurrence, premises }) = trial
-                        .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    let Some(RewriteMatch {
+                        rule: term,
+                        occurrence,
+                        premises,
+                    }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     else {
                         return Ok(None);
                     };
-                    let replacement = trial
-                        .rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
-                    let (next, parent, value) = trial
-                        .replace_rewritten_hypothesis(goal.clone(), &local, replacement)?;
+                    let replacement =
+                        trial.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
+                    let (next, parent, value) =
+                        trial.replace_rewritten_hypothesis(goal.clone(), &local, replacement)?;
                     Ok(Some((next, parent, value, premises)))
                 })();
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
@@ -420,7 +423,9 @@ impl Context {
                 };
                 *self = trial;
                 proof.work.push(Work::Close(parent, value));
-                proof.work.extend(premises.into_iter().rev().map(Work::Goal));
+                proof
+                    .work
+                    .extend(premises.into_iter().rev().map(Work::Goal));
                 goal = next;
                 changed = true;
             }
@@ -430,8 +435,11 @@ impl Context {
                 let term = trial.located_rule_term(rule.syntax)?;
                 trial.flush(false)?;
                 let target = trial.instantiate(&goal.target)?;
-                let Some(RewriteMatch { rule: term, occurrence, premises }) = trial
-                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                let Some(RewriteMatch {
+                    rule: term,
+                    occurrence,
+                    premises,
+                }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                 else {
                     return Ok(None);
                 };
@@ -443,7 +451,9 @@ impl Context {
             if let Some((next, value, premises)) = result? {
                 *self = trial;
                 proof.work.push(Work::Close(goal, value));
-                proof.work.extend(premises.into_iter().rev().map(Work::Goal));
+                proof
+                    .work
+                    .extend(premises.into_iter().rev().map(Work::Goal));
                 goal = next;
                 changed = true;
             }

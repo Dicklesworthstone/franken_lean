@@ -7,4 +7,6 @@ mod edits;
 pub(super) use edits::content_changes_text_from;
 
 mod files;
-pub(super) use files::{RegistrationReply, registration_reply, supports_file_registration, watched_file_uris};
+pub(super) use files::{
+    RegistrationReply, registration_reply, supports_file_registration, watched_file_uris,
+};

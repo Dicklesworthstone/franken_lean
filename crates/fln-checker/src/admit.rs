@@ -981,7 +981,9 @@ fn body_matches_declared_type(
         }
         InferenceOutcome::Inconclusive(stop) => {
             if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                eprintln!("fln-checker: admit_definition infer_with INCONCLUSIVE: name={name:?} stop={stop:?}");
+                eprintln!(
+                    "fln-checker: admit_definition infer_with INCONCLUSIVE: name={name:?} stop={stop:?}"
+                );
             }
             return Err(Verdict::Inconclusive(AdmissionStop::BodyTypeInference {
                 name: name.clone(),
@@ -1026,7 +1028,9 @@ fn body_matches_declared_type(
         )),
         DefEqOutcome::Deferred { need, .. } => {
             if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                eprintln!("fln-checker: admit_definition def_eq_with DEFERRED: name={name:?} need={need:?}");
+                eprintln!(
+                    "fln-checker: admit_definition def_eq_with DEFERRED: name={name:?} need={need:?}"
+                );
             }
             let mut probe_budget = budget.inference;
             probe_budget.defeq = budget.conversion;
@@ -6346,13 +6350,9 @@ fn admit_lean_syntax(
                 });
             }
         }
-        if let Err(verdict) = declared_type_is_a_type(
-            &staged,
-            r_name,
-            rec_entry.declaration(),
-            &budget,
-            cancelled,
-        ) {
+        if let Err(verdict) =
+            declared_type_is_a_type(&staged, r_name, rec_entry.declaration(), &budget, cancelled)
+        {
             return map_member_preamble(r_name, verdict);
         }
         staged = match stage_inductive_member(&staged, rec_entry, environment_budget, cancelled) {

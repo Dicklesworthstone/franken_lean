@@ -40,14 +40,14 @@ fn publish(env: &Environment, declaration: Declaration) -> Environment {
         other => panic!("fixture publication: {other:?}"),
     }
 }
-fn parameter(
-    context: &mut LocalContext,
-    name: &str,
-    type_: Expr,
-    style: BinderInfo,
-) -> LocalDecl {
+fn parameter(context: &mut LocalContext, name: &str, type_: Expr, style: BinderInfo) -> LocalDecl {
     context
-        .add_param(FVarId(n(&format!("_calc_fixture.{name}"))), n(name), type_, style)
+        .add_param(
+            FVarId(n(&format!("_calc_fixture.{name}"))),
+            n(name),
+            type_,
+            style,
+        )
         .clone()
 }
 fn variable(local: &LocalDecl) -> Expr {
@@ -85,15 +85,44 @@ fn environment(type_valued: bool) -> Environment {
         env = publish(&env, fln_elab::seed::out_param_seed_declaration());
     }
     let mut context = LocalContext::new();
-    let alpha = parameter(&mut context, "alpha", Expr::sort(Level::one()), BinderInfo::Implicit);
-    let beta = parameter(&mut context, "beta", Expr::sort(Level::one()), BinderInfo::Implicit);
-    let gamma = parameter(&mut context, "gamma", Expr::sort(Level::one()), BinderInfo::Implicit);
-    let level = if type_valued { Level::one() } else { Level::zero() };
+    let alpha = parameter(
+        &mut context,
+        "alpha",
+        Expr::sort(Level::one()),
+        BinderInfo::Implicit,
+    );
+    let beta = parameter(
+        &mut context,
+        "beta",
+        Expr::sort(Level::one()),
+        BinderInfo::Implicit,
+    );
+    let gamma = parameter(
+        &mut context,
+        "gamma",
+        Expr::sort(Level::one()),
+        BinderInfo::Implicit,
+    );
+    let level = if type_valued {
+        Level::one()
+    } else {
+        Level::zero()
+    };
     let relation_type = |a: &LocalDecl, b: &LocalDecl| {
         arrow(variable(a), arrow(variable(b), Expr::sort(level.clone())))
     };
-    let r = parameter(&mut context, "r", relation_type(&alpha, &beta), BinderInfo::Default);
-    let s = parameter(&mut context, "s", relation_type(&beta, &gamma), BinderInfo::Default);
+    let r = parameter(
+        &mut context,
+        "r",
+        relation_type(&alpha, &beta),
+        BinderInfo::Default,
+    );
+    let s = parameter(
+        &mut context,
+        "s",
+        relation_type(&beta, &gamma),
+        BinderInfo::Default,
+    );
     let output = Expr::app(
         Expr::const_(n("outParam"), vec![level.clone().succ().unwrap()]),
         relation_type(&alpha, &gamma),
@@ -102,7 +131,10 @@ fn environment(type_valued: bool) -> Environment {
     let a = parameter(&mut context, "a", variable(&alpha), BinderInfo::Implicit);
     let b = parameter(&mut context, "b", variable(&beta), BinderInfo::Implicit);
     let c = parameter(&mut context, "c", variable(&gamma), BinderInfo::Implicit);
-    let field_type = arrow(relation(&r, &a, &b), arrow(relation(&s, &b, &c), relation(&t, &a, &c)));
+    let field_type = arrow(
+        relation(&r, &a, &b),
+        arrow(relation(&s, &b, &c), relation(&t, &a, &c)),
+    );
     let field_type = close(&[a, b, c], field_type);
     let field = parameter(&mut context, "trans", field_type, BinderInfo::Default);
     let spec = RecordSpec {
@@ -125,9 +157,15 @@ fn contains_trans(expr: &Expr) -> bool {
         match expr.node() {
             ExprNode::Const { name, .. } if name == &n("Trans.trans") => return true,
             ExprNode::App { f, a } => pending.extend([f, a]),
-            ExprNode::Lam { binder_type, body, .. }
-            | ExprNode::ForallE { binder_type, body, .. } => pending.extend([binder_type, body]),
-            ExprNode::LetE { type_, value, body, .. } => pending.extend([type_, value, body]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
             ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
             _ => {}
         }
@@ -139,7 +177,8 @@ fn accepted(env: &Environment, source: &str) {
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
     assert!(
         matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
-        "{source}\n{:?}", checked.outcome
+        "{source}\n{:?}",
+        checked.outcome
     );
     let value = match &checked.declaration {
         Declaration::Thm(value) => &value.value,
@@ -150,43 +189,58 @@ fn accepted(env: &Environment, source: &str) {
     assert!(!value.has_level_mvar());
     assert!(!value.has_fvar());
     assert!(!value.has_loose_bvars());
-    assert!(contains_trans(value), "the retained proof must use the selected dictionary");
+    assert!(
+        contains_trans(value),
+        "the retained proof must use the selected dictionary"
+    );
 }
 
 #[test]
 fn a_local_trans_instance_composes_distinct_relations() {
-    accepted(&environment(false),
-        "theorem chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k");
+    accepted(
+        &environment(false),
+        "theorem chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k",
+    );
 }
 
 #[test]
 fn relation_output_is_inferred_without_a_declared_result() {
-    accepted(&environment(false),
-        "def chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) := calc\n  R a b := h\n  S _ c := k");
+    accepted(
+        &environment(false),
+        "def chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) := calc\n  R a b := h\n  S _ c := k",
+    );
 }
 
 #[test]
 fn transitivity_supports_three_different_endpoint_types() {
-    accepted(&environment(false),
-        "theorem chain (R : Nat -> Bool -> Prop) (S : Bool -> String -> Prop) (T : Nat -> String -> Prop) [dict : Trans R S T] (a : Nat) (b : Bool) (c : String) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k");
+    accepted(
+        &environment(false),
+        "theorem chain (R : Nat -> Bool -> Prop) (S : Bool -> String -> Prop) (T : Nat -> String -> Prop) [dict : Trans R S T] (a : Nat) (b : Bool) (c : String) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k",
+    );
 }
 
 #[test]
 fn an_inferred_output_feeds_the_next_trans_instance() {
-    accepted(&environment(false),
-        "theorem chain (R S T U V : Nat -> Nat -> Prop) [first : Trans R S T] [second : Trans T U V] (a b c d : Nat) (h : R a b) (k : S b c) (l : U c d) : V a d := calc\n  R a b := h\n  S _ c := k\n  U _ d := l");
+    accepted(
+        &environment(false),
+        "theorem chain (R S T U V : Nat -> Nat -> Prop) [first : Trans R S T] [second : Trans T U V] (a b c d : Nat) (h : R a b) (k : S b c) (l : U c d) : V a d := calc\n  R a b := h\n  S _ c := k\n  U _ d := l",
+    );
 }
 
 #[test]
 fn general_transitivity_interleaves_with_equality_transport() {
-    accepted(&environment(false),
-        "theorem chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c d : Nat) (h : R a b) (k : S b c) (e : c = d) : T a d := calc\n  R a b := h\n  S _ c := k\n  _ = d := e");
+    accepted(
+        &environment(false),
+        "theorem chain (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c d : Nat) (h : R a b) (k : S b c) (e : c = d) : T a d := calc\n  R a b := h\n  S _ c := k\n  _ = d := e",
+    );
 }
 
 #[test]
 fn type_valued_relations_use_the_same_typed_operation() {
-    accepted(&environment(true),
-        "def chain (R S T : Nat -> Nat -> Type) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k");
+    accepted(
+        &environment(true),
+        "def chain (R S T : Nat -> Nat -> Type) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k",
+    );
 }
 
 #[test]
@@ -198,10 +252,15 @@ fn a_missing_or_inapplicable_instance_cannot_invent_transitivity() {
         "theorem bad (R S T U : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : U a c := calc\n  R a b := h\n  S _ c := k",
     ] {
         if let Ok(checked) = check_definition_source(source.as_bytes(), &env, budget()) {
-            assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}");
+            assert!(
+                !matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                "{source}"
+            );
         }
     }
     // Failed source transactions must not poison the environment or the next query.
-    accepted(&env,
-        "theorem recovery (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k");
+    accepted(
+        &env,
+        "theorem recovery (R S T : Nat -> Nat -> Prop) [dict : Trans R S T] (a b c : Nat) (h : R a b) (k : S b c) : T a c := calc\n  R a b := h\n  S _ c := k",
+    );
 }

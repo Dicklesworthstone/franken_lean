@@ -10,7 +10,8 @@ fn installed_cli_checks_instance_registration_and_priority_changes() {
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(&source)
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{:?}", output);
     assert!(output.stderr.is_empty());
     let text = String::from_utf8(output.stdout).unwrap();
@@ -34,7 +35,8 @@ fn installed_cli_does_not_publish_success_for_a_nonclass_attribute() {
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(source)
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());

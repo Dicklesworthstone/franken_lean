@@ -342,10 +342,7 @@ fn decoded_open_text(params: RawField<'_>) -> Result<String, &'static str> {
     }
 }
 
-fn decoded_change_text(
-    params: RawField<'_>,
-    source: Option<&str>,
-) -> Result<String, &'static str> {
+fn decoded_change_text(params: RawField<'_>, source: Option<&str>) -> Result<String, &'static str> {
     // Preserve the existing Full-replacement fast path, including the ability
     // to check a snapshot even when the session cannot retain it. Ordered
     // ranged/mixed batches use the same structural decoder and private edit
@@ -451,7 +448,10 @@ fn handle_change(
     };
     // A stale event cannot invalidate newer retained source, even when its
     // payload is malformed or its ranges no longer fit the current snapshot.
-    if session.version(&uri).is_some_and(|current| version <= current) {
+    if session
+        .version(&uri)
+        .is_some_and(|current| version <= current)
+    {
         write_warning(output, SessionRefusal::NonMonotone.message())?;
         return Ok(None);
     }
@@ -459,7 +459,13 @@ fn handle_change(
         Ok(text) => text,
         Err(message) => {
             invalidate_source_and_clear(
-                output, session, waits, frontiers, &uri, Some(version), message,
+                output,
+                session,
+                waits,
+                frontiers,
+                &uri,
+                Some(version),
+                message,
             )?;
             return Ok(None);
         }
@@ -879,7 +885,9 @@ fn serve_inner(
             write_protocol_message(output, response)?;
             continue;
         }
-        if file_watcher.consume(output, &text, &envelope)? { continue; }
+        if file_watcher.consume(output, &text, &envelope)? {
+            continue;
+        }
         let method = match method(&envelope, id) {
             Ok(method) => method,
             Err(response) => {
@@ -905,9 +913,20 @@ fn serve_inner(
             continue;
         }
 
-        let before = if on_did_open.tracks_dependencies() && state == ServerState::Running
-            && id.is_none() && matches!(method.as_str(), "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave" | "textDocument/didClose")
-        { Some(workspace::BeforeChange::capture(&session)) } else { None };
+        let before = if on_did_open.tracks_dependencies()
+            && state == ServerState::Running
+            && id.is_none()
+            && matches!(
+                method.as_str(),
+                "textDocument/didOpen"
+                    | "textDocument/didChange"
+                    | "textDocument/didSave"
+                    | "textDocument/didClose"
+            ) {
+            Some(workspace::BeforeChange::capture(&session))
+        } else {
+            None
+        };
         let mut checked_event = None;
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
@@ -1021,9 +1040,15 @@ fn serve_inner(
                 if on_did_open.tracks_dependencies() {
                     match json::watched_file_uris(envelope.params) {
                         Ok(uris) if !uris.is_empty() => workspace::refresh(
-                            output, &session, &mut waits, &mut frontiers, on_did_open, &uris, None,
+                            output,
+                            &session,
+                            &mut waits,
+                            &mut frontiers,
+                            on_did_open,
+                            &uris,
+                            None,
                         )?,
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(message) => write_warning(output, message)?,
                     }
                 }
@@ -1097,8 +1122,15 @@ fn serve_inner(
         if let Some(before) = before {
             let changed = before.changed(&session, checked_event.as_deref());
             if !changed.is_empty() {
-                workspace::refresh(output, &session, &mut waits, &mut frontiers,
-                    on_did_open, &changed, checked_event.as_deref())?;
+                workspace::refresh(
+                    output,
+                    &session,
+                    &mut waits,
+                    &mut frontiers,
+                    on_did_open,
+                    &changed,
+                    checked_event.as_deref(),
+                )?;
             }
         }
     }
@@ -1430,7 +1462,10 @@ mod tests {
         );
         let barrier = output.find(r#""id":"barrier","result":null"#).unwrap();
         for id in ["pending", "rejected"] {
-            let failure = format!("\"id\":{},\"error\":{{\"code\":-32803", crate::json_string(id));
+            let failure = format!(
+                "\"id\":{},\"error\":{{\"code\":-32803",
+                crate::json_string(id)
+            );
             assert!(
                 output.find(&failure).is_some_and(|index| index < barrier),
                 "{output}"
@@ -1459,12 +1494,17 @@ mod tests {
         assert!(outcome.clean);
         assert_eq!(outcome.documents_changed, 2);
         assert_eq!(
-            seen.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>(),
+            seen.iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
             ["x", "y", "Y", "X"]
         );
         for id in ["future-x", "future-y"] {
             assert!(
-                output.contains(&format!("\"id\":{},\"result\":{{}}", crate::json_string(id))),
+                output.contains(&format!(
+                    "\"id\":{},\"result\":{{}}",
+                    crate::json_string(id)
+                )),
                 "{output}"
             );
             assert!(!output.contains(&format!("\"id\":{},\"error\"", crate::json_string(id))));

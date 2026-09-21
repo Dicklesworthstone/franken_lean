@@ -222,7 +222,12 @@ fn apply_with_limits(
         count += 1;
         let next = parse_value_end(changes, index, 0)
             .ok_or("LSP contentChanges contains a malformed change")?;
-        current = Some(apply_one(current, &changes[index..next], limits, &mut work)?);
+        current = Some(apply_one(
+            current,
+            &changes[index..next],
+            limits,
+            &mut work,
+        )?);
         index = skip_ws(bytes, next);
         if bytes.get(index) == Some(&b',') {
             index = skip_ws(bytes, index + 1);
@@ -253,10 +258,13 @@ mod tests {
     #[test]
     fn ranges_address_each_preceding_result() {
         assert_eq!(
-            apply(Some("abc"), r#"[
+            apply(
+                Some("abc"),
+                r#"[
                 {"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":1}},"text":"\n"},
                 {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"B"}
-            ]"#),
+            ]"#
+            ),
             Ok("a\nBc".to_string())
         );
     }
@@ -265,9 +273,17 @@ mod tests {
     fn utf16_offsets_and_lengths_are_not_utf8_bytes_or_scalar_counts() {
         let valid = r#"[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"rangeLength":2,"text":"X"}]"#;
         assert_eq!(apply(Some("a🤖b"), valid), Ok("aXb".to_string()));
-        assert!(apply(Some("a🤖b"), &valid.replace("\"rangeLength\":2", "\"rangeLength\":1")).is_err());
+        assert!(
+            apply(
+                Some("a🤖b"),
+                &valid.replace("\"rangeLength\":2", "\"rangeLength\":1")
+            )
+            .is_err()
+        );
         for (start, end) in [(1, 2), (2, 3), (2, 2)] {
-            let changes = format!(r#"[{{"range":{{"start":{{"line":0,"character":{start}}},"end":{{"line":0,"character":{end}}}}},"text":"X"}}]"#);
+            let changes = format!(
+                r#"[{{"range":{{"start":{{"line":0,"character":{start}}},"end":{{"line":0,"character":{end}}}}},"text":"X"}}]"#
+            );
             assert!(apply(Some("a🤖b"), &changes).is_err());
         }
     }
@@ -275,11 +291,17 @@ mod tests {
     #[test]
     fn crlf_cr_lf_and_trailing_empty_line_are_addressable() {
         assert_eq!(
-            apply(Some("a\r\nβ\rc\n"), r#"[{"range":{"start":{"line":0,"character":1},"end":{"line":2,"character":1}},"rangeLength":5,"text":"Q"}]"#),
+            apply(
+                Some("a\r\nβ\rc\n"),
+                r#"[{"range":{"start":{"line":0,"character":1},"end":{"line":2,"character":1}},"rangeLength":5,"text":"Q"}]"#
+            ),
             Ok("aQ\n".to_string())
         );
         assert_eq!(
-            apply(Some("x\r\n"), r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"z"}]"#),
+            apply(
+                Some("x\r\n"),
+                r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"z"}]"#
+            ),
             Ok("x\r\nz".to_string())
         );
     }
@@ -287,11 +309,17 @@ mod tests {
     #[test]
     fn oversized_positions_clamp_without_consuming_a_line_ending() {
         assert_eq!(
-            apply(Some("a\nb"), r#"[{"range":{"start":{"line":0,"character":99},"end":{"line":0,"character":99}},"text":"!"}]"#),
+            apply(
+                Some("a\nb"),
+                r#"[{"range":{"start":{"line":0,"character":99},"end":{"line":0,"character":99}},"text":"!"}]"#
+            ),
             Ok("a!\nb".to_string())
         );
         assert_eq!(
-            apply(Some("a\nb"), r#"[{"range":{"start":{"line":99,"character":99},"end":{"line":99,"character":99}},"text":"!"}]"#),
+            apply(
+                Some("a\nb"),
+                r#"[{"range":{"start":{"line":99,"character":99},"end":{"line":99,"character":99}},"text":"!"}]"#
+            ),
             Ok("a\nb!".to_string())
         );
     }
@@ -331,16 +359,25 @@ mod tests {
             r#"[true]"#,
             r#"{}"#,
         ] {
-            assert!(apply(Some(&original), changes).is_err(), "accepted {changes}");
+            assert!(
+                apply(Some(&original), changes).is_err(),
+                "accepted {changes}"
+            );
             assert_eq!(original, "unchanged");
         }
-        let params = RawField::Value(r#"{"contentChanges":[{"text":"x"}],"\u0063ontentChanges":[{"text":"y"}]}"#);
+        let params = RawField::Value(
+            r#"{"contentChanges":[{"text":"x"}],"\u0063ontentChanges":[{"text":"y"}]}"#,
+        );
         assert!(content_changes_text_from(params, Some(&original)).is_err());
     }
 
     #[test]
     fn intermediate_size_change_count_and_work_are_bounded() {
-        let limits = Limits { changes: 2, source_bytes: 8, work_bytes: 128 };
+        let limits = Limits {
+            changes: 2,
+            source_bytes: 8,
+            work_bytes: 128,
+        };
         for changes in [
             r#"[{"text":"123456789"},{"text":"ok"}]"#,
             r#"[{"text":"1"},{"text":"2"},{"text":"3"}]"#,
@@ -349,8 +386,30 @@ mod tests {
             let params = format!("{{\"contentChanges\":{changes}}}");
             assert!(apply_with_limits(RawField::Value(&params), Some("a"), limits).is_err());
         }
-        let params = RawField::Value(r#"{"contentChanges":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"text":""}]}"#);
-        assert!(apply_with_limits(params, Some("12345678"), Limits { work_bytes: 31, ..limits }).is_err());
-        assert_eq!(apply_with_limits(params, Some("12345678"), Limits { work_bytes: 32, ..limits }), Ok("12345678".to_string()));
+        let params = RawField::Value(
+            r#"{"contentChanges":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"text":""}]}"#,
+        );
+        assert!(
+            apply_with_limits(
+                params,
+                Some("12345678"),
+                Limits {
+                    work_bytes: 31,
+                    ..limits
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            apply_with_limits(
+                params,
+                Some("12345678"),
+                Limits {
+                    work_bytes: 32,
+                    ..limits
+                }
+            ),
+            Ok("12345678".to_string())
+        );
     }
 }

@@ -35,7 +35,12 @@ fn constant(value: u64) -> Expr {
     Expr::lam(name("x"), nat(), numeral(value), BinderInfo::Default)
 }
 fn identity() -> Expr {
-    Expr::lam(name("x"), nat(), Expr::bvar(0).unwrap(), BinderInfo::Default)
+    Expr::lam(
+        name("x"),
+        nat(),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    )
 }
 fn budget() -> UnificationBudget {
     UnificationBudget::new(Budget::for_stack_bytes(1024 * 1024))
@@ -178,9 +183,7 @@ fn distinct_flexible_heads_do_not_force_distinct_arguments_equal() {
                 })
                 .collect();
             let env = txn.env.clone();
-            let report = txn
-                .unify_many_with(&selected, budget(), &|| false)
-                .unwrap();
+            let report = txn.unify_many_with(&selected, budget(), &|| false).unwrap();
             assert_eq!(report.expression_assignments.len(), 2);
             assert_eq!(report.kernel_checks, 2);
             assert!(report.residual_metavariables.is_empty());
@@ -222,7 +225,11 @@ fn a_flexible_head_is_not_prematurely_assigned_the_rigid_head() {
 #[test]
 fn constructor_spelling_in_an_opaque_seed_cannot_solve_a_flexible_equation() {
     let mut txn = transaction();
-    assert!(txn.env.find(&Name::from_components(["Nat", "succ"])).is_none());
+    assert!(
+        txn.env
+            .find(&Name::from_components(["Nat", "succ"]))
+            .is_none()
+    );
     let f = goal(&mut txn, "f", function_type());
     let n = goal(&mut txn, "n", nat());
     let before = txn.clone();
@@ -255,7 +262,9 @@ fn nested_constructors_resume_after_flexible_head_assignment() {
         };
         let env = txn.env.clone();
         let report = txn
-            .unify_many_with(&[equation, (Expr::mvar(f), constant(9))], budget(), &|| false)
+            .unify_many_with(&[equation, (Expr::mvar(f), constant(9))], budget(), &|| {
+                false
+            })
             .unwrap();
         assert_eq!(report.kernel_checks, 2);
         assert_eq!(txn.mvars.get_assigned_expr(&n), Some(&numeral(7)));

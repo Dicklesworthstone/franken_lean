@@ -797,7 +797,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Visit(node, _) if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) => {
+                Task::Visit(node, _)
+                    if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) =>
+                {
                     built.push(self.copy_pattern_syntax(node)?);
                 }
                 Task::Visit(node @ Syntax::Node { kind, args, .. }, pattern) => {
@@ -842,11 +844,7 @@ impl Context {
                         } else {
                             None
                         };
-                        self.compile_pattern_matrix(
-                            &node,
-                            &mut required,
-                            column,
-                        )?
+                        self.compile_pattern_matrix(&node, &mut required, column)?
                     } else {
                         node
                     };

@@ -73,13 +73,21 @@ impl Context {
             }
             match expression.node() {
                 ExprNode::Sort { level } => levels.push(level),
-                ExprNode::Const { levels: arguments, .. } => levels.extend(arguments),
+                ExprNode::Const {
+                    levels: arguments, ..
+                } => levels.extend(arguments),
                 ExprNode::App { f, a } => expressions.extend([f, a]),
-                ExprNode::Lam { binder_type, body, .. }
-                | ExprNode::ForallE { binder_type, body, .. } => {
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
                     expressions.extend([binder_type, body]);
                 }
-                ExprNode::LetE { type_, value, body, .. } => {
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
                     expressions.extend([type_, value, body]);
                 }
                 ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
@@ -253,7 +261,10 @@ mod tests {
     use super::*;
 
     fn context() -> Context {
-        Context::new(&Environment::new(), Budget::for_stack_bytes(2 * 1024 * 1024))
+        Context::new(
+            &Environment::new(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        )
     }
 
     #[test]
@@ -307,7 +318,9 @@ mod tests {
         let term = Expr::sort(Level::param(Name::from_components(["u"])));
         assert!(matches!(
             context.decision_level_params(&[&term]),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
     }
 }

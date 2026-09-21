@@ -18,7 +18,11 @@ pub fn parse_source_header(source: &[u8]) -> Result<SourceHeader, DefinitionPars
     // SourceView normalizes line endings, but the underlying token table does
     // not consume a UTF-8 BOM. Strip it only at the file boundary and rebase
     // every returned offset and parser refusal to the original bytes.
-    let bom_bytes = if source.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
+    let bom_bytes = if source.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
     let mut header = parse_header(&source[bom_bytes..])
         .map_err(|error| error.with_original_offset(BytePos(bom_bytes)))?;
     header.body_start.0 += bom_bytes;
@@ -30,9 +34,9 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     let view = SourceView::of(&original);
     let tokens = tokens(&view)?;
     let symbol = |index: usize, wanted: &str| {
-        tokens.get(index).is_some_and(|token| {
-            matches!(&token.kind, TokenKind::Symbol(actual) if actual == wanted)
-        })
+        tokens.get(index).is_some_and(
+            |token| matches!(&token.kind, TokenKind::Symbol(actual) if actual == wanted),
+        )
     };
     let mut cursor = 0;
     let prelude = symbol(cursor, "prelude");
@@ -43,7 +47,11 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     while symbol(cursor, "import") {
         cursor += 1;
         let begin = cursor;
-        while let Some(LexedToken { kind: TokenKind::Ident(name), .. }) = tokens.get(cursor) {
+        while let Some(LexedToken {
+            kind: TokenKind::Ident(name),
+            ..
+        }) = tokens.get(cursor)
+        {
             imports.push(name.clone());
             cursor += 1;
         }
@@ -63,7 +71,11 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
             view.to_original(token.extent.start())
         })
     };
-    Ok(SourceHeader { imports, body_start, prelude })
+    Ok(SourceHeader {
+        imports,
+        body_start,
+        prelude,
+    })
 }
 
 #[cfg(test)]
@@ -75,9 +87,21 @@ mod tests {
         let source = "\u{feff}/- 🤖 import Fake -/\r\nprelude\r\nimport A.B «C.D»\r\nimport A.B\r\nnamespace Proof\r\ndef value := 1\r\nend Proof";
         let header = parse_source_header(source.as_bytes()).unwrap();
         assert!(header.prelude);
-        assert_eq!(header.imports, [Name::from_components(["A", "B"]), Name::from_components(["C.D"]), Name::from_components(["A", "B"])]);
+        assert_eq!(
+            header.imports,
+            [
+                Name::from_components(["A", "B"]),
+                Name::from_components(["C.D"]),
+                Name::from_components(["A", "B"])
+            ]
+        );
         assert_eq!(header.body_start.0, source.find("namespace Proof").unwrap());
-        assert_eq!(partition(&source.as_bytes()[header.body_start.0..]).unwrap().len(), 3);
+        assert_eq!(
+            partition(&source.as_bytes()[header.body_start.0..])
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -93,11 +117,19 @@ mod tests {
 
     #[test]
     fn malformed_headers_are_not_silently_discarded() {
-        for source in ["import", "import -- no name", "import 42", "import\nimport A"] {
+        for source in [
+            "import",
+            "import -- no name",
+            "import 42",
+            "import\nimport A",
+        ] {
             assert!(parse_source_header(source.as_bytes()).is_err(), "{source}");
         }
         for source in ["public import A", "meta import A", "module\nimport A"] {
-            assert_eq!(parse_source_header(source.as_bytes()).unwrap().body_start, BytePos(0));
+            assert_eq!(
+                parse_source_header(source.as_bytes()).unwrap().body_start,
+                BytePos(0)
+            );
         }
     }
 }
