@@ -2606,8 +2606,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             alt_major = Some(replacement);
                         }
 
-                        if let Some(alt_major) = alt_major {
-                            if let Some(reduced) = self.apply_recursor_rule(
+                        if let Some(alt_major) = alt_major
+                            && let Some(reduced) = self.apply_recursor_rule(
                                 &frame.metadata,
                                 &frame.level_parameters,
                                 &frame.head,
@@ -2616,10 +2616,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
                                 frame.major_index,
                                 &alt_major,
                                 frame.prefix,
-                            )? {
-                                current = reduced;
-                                continue 'normalize;
-                            }
+                            )?
+                        {
+                            current = reduced;
+                            continue 'normalize;
                         }
 
                         // Preserve progress within a blocked major:

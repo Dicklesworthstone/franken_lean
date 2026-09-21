@@ -2618,34 +2618,39 @@ fn eta_candidate(
             inside = eta_visible(child(inside, *body)?, sources, control, cancelled)?;
         }
         let sources = TermSources::new(left, right, generated);
-        let inside_term = sources.source(inside)?;
-        let budget = control.begin_normalization(cancelled)?;
-        match whnf_at_with(inside_term, inside.root, context, budget, cancelled) {
-            WhnfOutcome::Complete(result) => {
-                control.absorb_whnf(&result, cancelled)?;
-                if result.reductions != 0 {
-                    inside = retain_generated(generated, lambda.side(), result.term);
+        let has_delta_head =
+            definition_height(inside, sources, context, control, cancelled)?.is_some();
+        if has_delta_head {
+            let sources = TermSources::new(left, right, generated);
+            let inside_term = sources.source(inside)?;
+            let budget = control.begin_normalization(cancelled)?;
+            match whnf_at_with(inside_term, inside.root, context, budget, cancelled) {
+                WhnfOutcome::Complete(result) => {
+                    control.absorb_whnf(&result, cancelled)?;
+                    if result.reductions != 0 {
+                        inside = retain_generated(generated, lambda.side(), result.term);
+                    }
                 }
-            }
-            WhnfOutcome::Refused(refusal) => {
-                return Err(SlowHalt::Refusal {
-                    side: inside.side(),
-                    refusal: Box::new(refusal),
-                    progress: Box::new(control.progress),
-                });
-            }
-            WhnfOutcome::Inconclusive(stop) => {
-                return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
-                    side: inside.side(),
-                    stop,
-                    progress: control.progress,
-                })));
-            }
-            WhnfOutcome::InternalFault(fault) => {
-                return Err(SlowHalt::Fault(DefEqFault::Whnf {
-                    side: inside.side(),
-                    fault,
-                }));
+                WhnfOutcome::Refused(refusal) => {
+                    return Err(SlowHalt::Refusal {
+                        side: inside.side(),
+                        refusal: Box::new(refusal),
+                        progress: Box::new(control.progress),
+                    });
+                }
+                WhnfOutcome::Inconclusive(stop) => {
+                    return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+                        side: inside.side(),
+                        stop,
+                        progress: control.progress,
+                    })));
+                }
+                WhnfOutcome::InternalFault(fault) => {
+                    return Err(SlowHalt::Fault(DefEqFault::Whnf {
+                        side: inside.side(),
+                        fault,
+                    }));
+                }
             }
         }
         for index in 0..width {
@@ -3155,6 +3160,7 @@ fn materialize_subterm_wire(
 /// If all arguments are defeq, congruence proves definitional equality
 /// directly, skipping delta reduction. If argument checking fails,
 /// this returns `Ok(false)` and lazy delta continues with normal height ordering.
+#[allow(clippy::too_many_arguments)]
 fn regular_same_head_apps_def_eq(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
