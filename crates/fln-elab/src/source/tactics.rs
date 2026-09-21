@@ -613,6 +613,8 @@ impl Context {
                     equation,
                     expression,
                 });
+            } else if kind == &parser_kind(&["Tactic", "simpAll"]) {
+                self.simplify_all_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simpa"]) {

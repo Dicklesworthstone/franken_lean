@@ -120,6 +120,7 @@ fn tactic(
             "rw",
             "rewrite",
             "simp",
+            "simp_all",
             "simpa",
             "subst",
             "injection",
@@ -143,6 +144,7 @@ fn tactic(
     };
     match keyword {
         "simp" => simplify(leaves, view, tokens, range, atom),
+        "simp_all" => simplify_all(leaves, view, tokens, range, atom),
         "simpa" => simpa(leaves, view, tokens, range, atom),
         "rw" | "rewrite" => rewrite(leaves, view, tokens, range, atom, keyword == "rw"),
         "generalize" => generalize(leaves, view, tokens, range, atom),
@@ -417,6 +419,29 @@ fn rewrite(
         parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
         vec![keyword, null_node(Vec::new()), rules, location],
     ))
+}
+
+/// Whole-context simplification shares rule syntax with simp, but has no
+/// location suffix. Retain the original keyword and all source attachments.
+#[inline(never)]
+fn simplify_all(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let end = range.end;
+    let mut parsed = simplify(leaves, view, tokens, range, keyword)?;
+    let Syntax::Node { kind, args, .. } = &mut parsed else {
+        unreachable!("simplify builds a tactic node");
+    };
+    if !matches!(&args[5], Syntax::Node { args, .. } if args.is_empty()) {
+        return Err(refusal(view, tokens, end));
+    }
+    *kind = parser_kind(&["Tactic", "simpAll"]);
+    args.pop();
+    Ok(parsed)
 }
 
 /// Separate a top-level evidence clause without splitting identifiers inside
@@ -1156,6 +1181,57 @@ mod search_tests {
         ] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod simp_all_tests {
+    use super::*;
+
+    #[test]
+    fn simp_all_has_its_own_lossless_syntax_and_is_contextual() {
+        for tactic in [
+            "simp_all",
+            "simp_all only",
+            "simp_all only [h, <- k,]",
+            "simp_all [*, -N.rule]",
+        ] {
+            let source = format!("theorem t : True := by\r\n  /- 🦀 -/ {tactic}\r\n");
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+            let mut pending = vec![parsed.syntax()];
+            let mut count = 0;
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    if kind == &parser_kind(&["Tactic", "simpAll"]) {
+                        assert_eq!(args.len(), 5);
+                        assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "simp_all"));
+                        count += 1;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert_eq!(count, 1);
+        }
+        assert!(parse_definition(b"def simp_all (n : Nat) := n").is_ok());
+    }
+
+    #[test]
+    fn unsupported_simp_all_arguments_do_not_disappear() {
+        for tactic in [
+            "simp_all at *",
+            "simp_all only at h",
+            "simp_all [] using h",
+            "simp_all only [by rfl]",
+            "simp_all [h,,k]",
+        ] {
+            let source = format!("theorem t : True := by {tactic}");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
         }
     }
 }
