@@ -16,9 +16,12 @@
 //! freedom would live. The byte-diff at the end then says: parsed semantics plus
 //! declared content classes SUFFICE to regenerate the artifact.
 //!
-//! The file header (88 bytes) is reproduced from the parsed header fields; the
-//! `base_addr` is the original file's own, per the freedom-table row 1 policy
-//! (read→rebuild reproduces; only fresh emission faces the R3 choice).
+//! The original fixed header is preserved, including `base_addr` (read→rebuild
+//! reproduces; only fresh emission faces the R3 choice). The shared envelope
+//! parser determines the payload bounds for both v2 and v3. V3's size prefix and
+//! relocation-table words are re-derived, and library identifiers are a separate
+//! declared copy class, never padding. Nonempty closure-relocation tables remain
+//! a typed refusal: byte identity must not certify unimplemented code relocation.
 
 use crate::format;
 use crate::region::{OleanView, RegionError, WalkBudget};
@@ -65,12 +68,13 @@ pub const SERIALIZATION_FREEDOMS: &[SerializationFreedom] = &[SerializationFreed
             unexercised until Athanor exists",
 }];
 
-/// How the rebuild accounted for each byte of the data region.
+/// How the rebuild accounted for each byte of the file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RebuildReport {
     pub objects: usize,
     /// Bytes re-derived from parsed semantics (headers, pointers, tagged
-    /// scalars, size/capacity words, the root slot, the file header).
+    /// scalars, size/capacity words, the root slot, and v3 framing words), plus
+    /// the preserved fixed file header.
     pub rederived_bytes: u64,
     /// Bytes copied as declared content (strings, scalar arrays, ctor scalar
     /// tails, mpz limbs), by class.
@@ -78,6 +82,9 @@ pub struct RebuildReport {
     pub copied_sarray_bytes: u64,
     pub copied_ctor_tail_bytes: u64,
     pub copied_mpz_limb_bytes: u64,
+    /// Opaque library identifier bytes in the v3 relocation trailer. These
+    /// are metadata content, not object payload or inter-object padding.
+    pub copied_library_id_bytes: u64,
     /// Inter-object padding bytes, and how many of them were NONZERO — the
     /// candidate-freedom count. Zero padding is layout; nonzero padding is a
     /// finding.
@@ -100,13 +107,107 @@ fn header_word(tag: u8, other: u8, cs_sz: u16) -> u64 {
     (packed as u64) << 32
 }
 
+/// Read framing bytes outside the object payload. OleanView intentionally does
+/// not expose these through its object readers. Keep checked reads here even
+/// though the shared envelope parser has already validated the entire frame.
+fn frame_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], RegionError> {
+    let end = cursor.checked_add(len).ok_or(RegionError::DecodeShape {
+        offset: *cursor as u64,
+        reason: "rebuild framing extent overflows",
+    })?;
+    let value = bytes.get(*cursor..end).ok_or(RegionError::DecodeShape {
+        offset: *cursor as u64,
+        reason: "truncated rebuild framing",
+    })?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn frame_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, RegionError> {
+    Ok(u32::from_le_bytes(
+        frame_bytes(bytes, cursor, 4)?
+            .try_into()
+            .expect("checked u32 width"),
+    ))
+}
+
+fn frame_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, RegionError> {
+    Ok(u64::from_le_bytes(
+        frame_bytes(bytes, cursor, 8)?
+            .try_into()
+            .expect("checked u64 width"),
+    ))
+}
+
+fn rebuild_v3_trailer(
+    bytes: &[u8],
+    payload_start: usize,
+    payload_end: usize,
+    report: &mut RebuildReport,
+) -> Result<Vec<u8>, RegionError> {
+    let mut cursor = payload_end;
+    let closure_count = frame_u32(bytes, &mut cursor)?;
+    if closure_count != 0 {
+        // Offsets name m_fun slots relative to the payload, not file offsets
+        // or heap pointers. The shared parser has validated their bounds.
+        let relative = frame_u64(bytes, &mut cursor)?;
+        return Err(RegionError::ClosureUnsupported {
+            offset: payload_start as u64 + relative,
+        });
+    }
+    let mut trailer = Vec::new();
+    trailer.extend_from_slice(&closure_count.to_le_bytes());
+    let library_count = frame_u32(bytes, &mut cursor)?;
+    trailer.extend_from_slice(&library_count.to_le_bytes());
+    report.rederived_bytes += 8;
+    for _ in 0..library_count {
+        let base = frame_u64(bytes, &mut cursor)?;
+        let id_len = frame_u32(bytes, &mut cursor)?;
+        let id = frame_bytes(bytes, &mut cursor, id_len as usize)?;
+        trailer.extend_from_slice(&base.to_le_bytes());
+        trailer.extend_from_slice(&id_len.to_le_bytes());
+        trailer.extend_from_slice(id);
+        report.rederived_bytes += 12;
+        report.copied_library_id_bytes += u64::from(id_len);
+    }
+    if cursor != bytes.len() {
+        return Err(RegionError::DecodeShape {
+            offset: cursor as u64,
+            reason: "trailing bytes follow the rebuilt relocation table",
+        });
+    }
+    Ok(trailer)
+}
+
 /// Rebuild the whole file from its parsed form. Returns the rebuilt bytes and
 /// the accounting report; the caller byte-diffs against the original.
+///
+/// Supports v2 and v3 payload framing. Closure/code relocations are deliberately
+/// refused until their semantic reconstruction is implemented.
 pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
     let view = OleanView::parse(bytes)?;
+    // OleanView uses this same parser, so failures have already been mapped to
+    // its precise public errors above. Reuse the authoritative payload bounds
+    // rather than assuming that the fixed header is followed by the root slot.
+    let envelope = fln_rt::region::parse_olean_envelope(bytes).map_err(|_| {
+        RegionError::DecodeShape {
+            offset: 0,
+            reason: "rebuild envelope disagrees with the parsed view",
+        }
+    })?;
     let base = view.header.base_addr;
-    let data_start = format::OLEAN_HEADER_SIZE as u64;
+    let data_start = envelope.payload_offset as u64;
+    let data_end = envelope.payload_offset + envelope.payload_len;
     let mut report = RebuildReport::default();
+    let trailer = if envelope.version == 3 {
+        rebuild_v3_trailer(bytes, envelope.payload_offset, data_end, &mut report)?
+    } else {
+        Vec::new()
+    };
     let mut spans: Vec<Span> = Vec::new();
 
     let encode_ptr = |file_off: u64| -> Result<u64, RegionError> {
@@ -128,7 +229,7 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
         }
     };
 
-    // The root slot is the first data word.
+    // The root slot is the first data word, after v3's data-size prefix.
     let root_raw = view.read_u64(data_start)?;
     spans.push(Span {
         off: data_start,
@@ -344,10 +445,15 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
         });
     }
 
-    // Assemble: header + spans + measured padding.
+    // Assemble the payload independently of its framing and trailer. Metadata
+    // must never be classified as trailing object padding.
     let mut output = vec![0u8; bytes.len()];
     output[..format::OLEAN_HEADER_SIZE].copy_from_slice(&bytes[..format::OLEAN_HEADER_SIZE]);
-    report.rederived_bytes += format::OLEAN_HEADER_SIZE as u64;
+    if envelope.version == 3 {
+        output[format::OLEAN_HEADER_SIZE..envelope.payload_offset]
+            .copy_from_slice(&(envelope.payload_len as u64).to_le_bytes());
+    }
+    report.rederived_bytes += data_start;
     spans.sort_by_key(|s| s.off);
     let mut cursor = data_start;
     for span in &spans {
@@ -357,8 +463,19 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                 reason: "overlapping object spans in rebuild",
             });
         }
+        let start = usize::try_from(span.off).map_err(|_| RegionError::DecodeShape {
+            offset: span.off,
+            reason: "rebuilt span offset exceeds the host address space",
+        })?;
+        let end = start
+            .checked_add(span.bytes.len())
+            .filter(|&end| end <= data_end)
+            .ok_or(RegionError::DecodeShape {
+                offset: span.off,
+                reason: "rebuilt span exceeds the payload",
+            })?;
         if span.off > cursor {
-            let pad = &bytes[cursor as usize..span.off as usize];
+            let pad = &bytes[cursor as usize..start];
             let nonzero = pad.iter().filter(|&&b| b != 0).count() as u64;
             report.padding_bytes += pad.len() as u64;
             if nonzero > 0 {
@@ -370,20 +487,13 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                     span.off
                 ));
             }
-            output[cursor as usize..span.off as usize].copy_from_slice(pad);
+            output[cursor as usize..start].copy_from_slice(pad);
         }
-        let end = span.off as usize + span.bytes.len();
-        if end > output.len() {
-            return Err(RegionError::DecodeShape {
-                offset: span.off,
-                reason: "rebuilt span exceeds the file",
-            });
-        }
-        output[span.off as usize..end].copy_from_slice(&span.bytes);
+        output[start..end].copy_from_slice(&span.bytes);
         cursor = end as u64;
     }
-    if cursor < bytes.len() as u64 {
-        let pad = &bytes[cursor as usize..];
+    if cursor < data_end as u64 {
+        let pad = &bytes[cursor as usize..data_end];
         let nonzero = pad.iter().filter(|&&b| b != 0).count() as u64;
         report.padding_bytes += pad.len() as u64;
         if nonzero > 0 {
@@ -393,10 +503,11 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                 pad.len()
             ));
         }
-        output[cursor as usize..].copy_from_slice(pad);
+        output[cursor as usize..data_end].copy_from_slice(pad);
     }
+    output[data_end..].copy_from_slice(&trailer);
     // Pointer/scalar re-derivation accounting: everything in spans minus the
-    // declared copy classes.
+    // declared object copy classes. Framing is accounted separately above.
     let span_total: u64 = spans.iter().map(|s| s.bytes.len() as u64).sum();
     report.rederived_bytes += span_total
         - report.copied_string_bytes
@@ -440,6 +551,7 @@ mod tests {
             report.copied_mpz_limb_bytes, 16,
             "mpz-limb census (the big literal)"
         );
+        assert_eq!(report.copied_library_id_bytes, 0, "v2 has no library table");
         assert_eq!(report.padding_bytes, 589, "padding census");
         assert_eq!(
             report.nonzero_padding_bytes, 0,
@@ -668,5 +780,139 @@ mod tests {
             rebuild(&truncated).is_err(),
             "a truncated region must refuse"
         );
+    }
+
+    fn v3_file(payload: &[u8], libraries: &[(u64, &[u8])]) -> Vec<u8> {
+        let mut file = PILOT[..format::OLEAN_HEADER_SIZE].to_vec();
+        let version = format::OLEAN_HEADER_FIELDS
+            .iter()
+            .find(|field| field.name == "version")
+            .expect("generated version field");
+        file[version.offset] = 3;
+        file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        file.extend_from_slice(payload);
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&(libraries.len() as u32).to_le_bytes());
+        for &(base, id) in libraries {
+            file.extend_from_slice(&base.to_le_bytes());
+            file.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            file.extend_from_slice(id);
+        }
+        file
+    }
+
+    fn accounted_bytes(report: &RebuildReport) -> u64 {
+        report.rederived_bytes
+            + report.copied_string_bytes
+            + report.copied_sarray_bytes
+            + report.copied_ctor_tail_bytes
+            + report.copied_mpz_limb_bytes
+            + report.copied_library_id_bytes
+            + report.padding_bytes
+            + report.slack_bytes
+    }
+
+    #[test]
+    fn v3_scalar_roots_rebuild_after_the_size_prefix() {
+        for root in [0u64, 1, 3, u64::MAX] {
+            let file = v3_file(&root.to_le_bytes(), &[]);
+            let (out, report) = rebuild(&file).expect("v3 scalar-root rebuild");
+            assert_eq!(out, file);
+            assert_eq!(report.objects, 0);
+            assert_eq!(report.padding_bytes, 0);
+            assert_eq!(report.rederived_bytes, file.len() as u64);
+            assert_eq!(accounted_bytes(&report), file.len() as u64);
+            assert!(report.findings.is_empty());
+        }
+    }
+
+    #[test]
+    fn v3_rebuild_preserves_shared_object_pointers() {
+        let base = OleanView::parse(PILOT).expect("pilot").header.base_addr;
+        let start = format::OLEAN_HEADER_SIZE as u64 + 8;
+        // Root -> ctor with two pointers to the same zero-field ctor.
+        let child = base + start + 8 + 24;
+        let mut payload = (base + start + 8).to_le_bytes().to_vec();
+        payload.extend_from_slice(&header_word(0, 2, 24).to_le_bytes());
+        payload.extend_from_slice(&child.to_le_bytes());
+        payload.extend_from_slice(&child.to_le_bytes());
+        payload.extend_from_slice(&header_word(0, 0, 8).to_le_bytes());
+        let file = v3_file(&payload, &[]);
+        let (out, report) = rebuild(&file).expect("shared v3 object graph");
+        assert_eq!(out, file);
+        assert_eq!(report.objects, 2, "the shared child is rebuilt once");
+        assert_eq!(report.padding_bytes, 0);
+        assert_eq!(accounted_bytes(&report), file.len() as u64);
+    }
+
+    #[test]
+    fn v3_library_identifiers_are_content_not_padding() {
+        let libraries: &[(u64, &[u8])] = &[
+            (0x1234_0000, b"libleanshared.so"),
+            (0, b""),
+            (u64::MAX, &[0xff, 0, 0x80]),
+        ];
+        let file = v3_file(&1u64.to_le_bytes(), libraries);
+        let (out, report) = rebuild(&file).expect("v3 library metadata rebuild");
+        assert_eq!(out, file);
+        assert_eq!(report.copied_library_id_bytes, 19);
+        assert_eq!(report.padding_bytes, 0);
+        assert_eq!(report.nonzero_padding_bytes, 0);
+        assert!(report.findings.is_empty());
+        assert_eq!(accounted_bytes(&report), file.len() as u64);
+    }
+
+    #[test]
+    fn v3_payload_padding_does_not_absorb_relocation_metadata() {
+        let mut payload = 1u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0, 0xaa, 0, 0, 0, 0, 0, 0]);
+        let file = v3_file(&payload, &[(0x10000, b"library")]);
+        let (out, report) = rebuild(&file).expect("v3 padded payload rebuild");
+        assert_eq!(out, file);
+        assert_eq!(report.padding_bytes, 8);
+        assert_eq!(report.nonzero_padding_bytes, 1);
+        assert_eq!(report.copied_library_id_bytes, 7);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(accounted_bytes(&report), file.len() as u64);
+    }
+
+    #[test]
+    fn v3_code_relocations_refuse_instead_of_becoming_padding() {
+        let mut file = v3_file(&1u64.to_le_bytes(), &[]);
+        let trailer = format::OLEAN_HEADER_SIZE + 8 + 8;
+        file.truncate(trailer);
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            rebuild(&file),
+            Err(RegionError::ClosureUnsupported { offset })
+                if offset == (format::OLEAN_HEADER_SIZE + 8) as u64
+        ));
+    }
+
+    #[test]
+    fn v3_truncation_and_trailing_bytes_refuse_without_panics() {
+        let file = v3_file(&1u64.to_le_bytes(), &[(0x10000, b"library")]);
+        for end in 0..file.len() {
+            assert!(rebuild(&file[..end]).is_err(), "accepted truncation at {end}");
+        }
+        let mut trailing = file.clone();
+        trailing.push(0);
+        assert!(rebuild(&trailing).is_err());
+        let mut oversized = file;
+        oversized[format::OLEAN_HEADER_SIZE..format::OLEAN_HEADER_SIZE + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(rebuild(&oversized).is_err());
+    }
+
+    #[test]
+    fn v3_root_cannot_point_into_the_library_trailer() {
+        let mut file = v3_file(&1u64.to_le_bytes(), &[(0x10000, b"library")]);
+        let base = OleanView::parse(&file).expect("v3 envelope").header.base_addr;
+        let root = format::OLEAN_HEADER_SIZE + 8;
+        let trailer_pointer = base + root as u64 + 8;
+        file[root..root + 8].copy_from_slice(&trailer_pointer.to_le_bytes());
+        assert!(rebuild(&file).is_err(), "metadata is not an object region");
     }
 }
