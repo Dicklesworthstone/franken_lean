@@ -3,9 +3,12 @@
 //! Only saturated, safe, nonrecursive, nonindexed, Type-valued records take
 //! this rung. A neutral's type selects the record; it is not inferred from the
 //! constructor on the other side. Type/parameter/universe equations precede
-//! field equations, including for empty records. No assignment or environment
-//! publication occurs here: every child uses the ordinary solver and every new
-//! assignment still crosses the parent's K1 validation barrier.
+//! field equations, including for empty records. Singleton projection inversion
+//! uses the ordinary pattern solver to reconstruct an unknown non-class record.
+//! Every child uses the ordinary solver, every assignment crosses the parent's
+//! K1 barrier, and neither path has environment-publication authority.
+mod projection;
+
 use super::*;
 
 struct RecordShape {
@@ -43,6 +46,11 @@ impl Engine<'_> {
         locals: &LocalContext,
         pending: &mut VecDeque<Equation>,
     ) -> Result<bool, UnificationError> {
+        if self.invert_singleton_projection(left, right, locals, pending)?
+            || self.invert_singleton_projection(right, left, locals, pending)?
+        {
+            return Ok(true);
+        }
         let (left_head, left_args) = self.eta_spine(left)?;
         let (right_head, right_args) = self.eta_spine(right)?;
         // Constructor/constructor congruence is already handled by the caller.
