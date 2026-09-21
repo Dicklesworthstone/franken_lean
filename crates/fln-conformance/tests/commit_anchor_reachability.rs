@@ -133,11 +133,13 @@ const EXCLUDED: &[&str] = &[":!vendor", ":!.beads/issues.jsonl"];
 /// pane's `br` rewrites the file. Falling below it means the scan broke.
 const BEADS_BACKUP_ONLY_FLOOR: usize = 90;
 
-/// Binary files the harvest cannot parse, asserted so a fourth is a disclosure change rather
-/// than a silent narrowing of the denominator. Ten at `4d6badc5`: the three C3 `.olean`
-/// fixtures, the six real-mathlib G0-1 fixtures under `tribunal/fixtures/mathlib/`, and the
-/// G0-5 re-emit pilot `crates/fln-olean/fixtures/g05_pilot.olean`.
-const BINARY_FILES_SKIPPED: usize = 10;
+/// Binary files the harvest cannot parse, asserted so a fourteenth is a disclosure change rather
+/// than a silent narrowing of the denominator. Thirteen at `HEAD`: the three C3 `.olean`
+/// fixtures, the six real-mathlib G0-1 fixtures under `tribunal/fixtures/mathlib/`, the
+/// G0-5 re-emit pilot `crates/fln-olean/fixtures/g05_pilot.olean`, and the three tag-attribute
+/// fixtures under `crates/fln-conformance/fixtures/tag_attributes/` (`prelude.olean`,
+/// `prelude.olean.private`, `prelude.olean.server`).
+const BINARY_FILES_SKIPPED: usize = 13;
 
 /// Anti-vacuity floors on the *denominator*. A repaired population can legitimately drive the
 /// finding count to zero; nothing can legitimately drive these to zero except a broken scan.
