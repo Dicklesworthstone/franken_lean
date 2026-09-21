@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod tests {
 //! Regression coverage for the inductive-block constructor inventory.
 //!
 //! These tests exercise the real admission engine, not a model of its filter.
@@ -270,4 +272,5 @@ fn unsafe_blocks_still_require_every_constructor_to_have_a_block_parent() {
     forged.is_unsafe = true;
     block.ctors.push(forged);
     assert_membership_rejection(&env, block);
+}
 }
