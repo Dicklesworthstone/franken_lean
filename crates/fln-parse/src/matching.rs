@@ -294,6 +294,13 @@ fn plan(
             "{" | ".{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),
+            ":" if active.last().is_some_and(|p| {
+                p.depth == depth
+                    && p.with.is_none()
+                    && (at == p.start + 2 || at >= 2 && is_symbol(tokens, at - 2, ","))
+                    && (matches!(tokens[at - 1].kind, TokenKind::Ident(_))
+                        || is_symbol(tokens, at - 1, "_"))
+            }) => {}
             ":" if conditionals.last().is_some_and(|p| {
                 p.depth == depth
                     && p.then_at.is_none()
@@ -879,12 +886,32 @@ fn parse_compound(
         } else {
             discriminant_columns.len()
         };
-        for (range, comma) in discriminant_columns {
+        for (mut range, comma) in discriminant_columns {
+            // Preserve the pinned optional binderIdent-colon production instead
+            // of misreading `h : e` as a term ascription. Parenthesized
+            // ascriptions start with `(` and remain ordinary discriminants.
+            let binding = if range.start + 1 < range.end && is_symbol(tokens, range.start + 1, ":")
+            {
+                let binder = leaves.leaf(range.start)?;
+                if !matches!(&binder, Syntax::Ident { .. })
+                    && !matches!(&binder, Syntax::Atom { val, .. } if val == "_")
+                {
+                    return Err(refuse(view, tokens, range.start));
+                }
+                let colon = leaves.leaf(range.start + 1)?;
+                range.start += 2;
+                if range.is_empty() {
+                    return Err(refuse(view, tokens, range.start - 1));
+                }
+                null_node(vec![binder, colon])
+            } else {
+                null_node(vec![])
+            };
             let discriminator =
                 bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
             discriminators.push(Syntax::node(
                 parser_kind(&["Term", "matchDiscr"]),
-                vec![null_node(vec![]), discriminator],
+                vec![binding, discriminator],
             ));
             if let Some(comma) = comma {
                 discriminators.push(leaves.leaf(comma)?);

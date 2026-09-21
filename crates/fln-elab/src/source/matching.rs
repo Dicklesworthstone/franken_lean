@@ -59,6 +59,7 @@ fn error(reason: MatchError) -> NatDefinitionElabError {
 #[derive(Clone, Copy)]
 pub(super) struct MatchParts<'a> {
     pub(super) discriminant: &'a Syntax,
+    pub(super) equation: Option<&'a Syntax>,
     alternatives: &'a [Syntax],
     pub(super) generated: bool,
     conditional: Option<ConditionalParts<'a>>,
@@ -222,6 +223,7 @@ impl Context {
             };
             return Ok(MatchParts {
                 discriminant: &parts[2],
+                equation: None,
                 alternatives: &[],
                 generated: true,
                 conditional: Some(ConditionalParts {
@@ -250,7 +252,18 @@ impl Context {
             2,
             "discriminant",
         )?;
-        expect_empty_null(&discriminant[0], "unsupported pattern equality binder")?;
+        let equation = match expect_null_args(&discriminant[0], "pattern equality binder")? {
+            [] => None,
+            [name, colon]
+                if matches!(name, Syntax::Ident { val, .. }
+                    if !val.is_anonymous() && val.parent().is_anonymous())
+                    || matches!(name, Syntax::Atom { val, .. } if val == "_") =>
+            {
+                expect_atom(colon, ":", "pattern equality colon")?;
+                Some(name)
+            }
+            _ => return Err(error(MatchError::InvalidPattern)),
+        };
         expect_atom(&parts[4], "with", "match alternatives keyword")?;
         let alternatives = expect_node(
             &parts[5],
@@ -267,6 +280,7 @@ impl Context {
         }
         Ok(MatchParts {
             discriminant: &discriminant[1],
+            equation,
             alternatives,
             generated,
             conditional: None,
@@ -372,12 +386,12 @@ impl Context {
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
-        if parts.generated && !recursive {
+        if parts.equation.is_some() || parts.generated && !recursive {
             // Earlier columns may occur in later discriminant types. The
             // shared elimination engine generalizes that entire dependency
             // cone; treating each split as an independent case loses it.
             return self
-                .start_refined_match(parts, major, expected, false)
+                .start_refined_match(parts, major, expected, recursive)
                 .map(MatchStart::Refined);
         }
         let saved = self.clone();

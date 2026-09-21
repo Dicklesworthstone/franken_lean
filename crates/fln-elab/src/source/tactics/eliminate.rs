@@ -394,7 +394,37 @@ impl Context {
             }
         };
         let (root, mut goal) = self.proof_goal(target.clone())?;
-        let local = if recursive
+        let mut proof = ProofState {
+            saved,
+            target,
+            root,
+            instructions: Vec::new(),
+            cursor: 0,
+            work: Vec::new(),
+            controls: Vec::new(),
+        };
+        let local = if let Some(equation) = parts.equation {
+            // Generalize with an actual Eq obligation. Each minor receives
+            // `original = constructor ...`; the parent supplies Eq.refl for
+            // the original discriminant. The source binder has no authority.
+            if recursive {
+                return Err(error(TacticError::UnsupportedEliminator));
+            }
+            let equality = match equation {
+                Syntax::Ident { val, .. } => val.clone(),
+                Syntax::Atom { val, .. } if val == "_" => self.fresh_name()?,
+                _ => return Err(error(TacticError::MalformedScript)),
+            };
+            let name = self.fresh_name()?;
+            let (child, id) =
+                self.generalized_proof_goal(&mut proof, goal, name, Some(equality), major)?;
+            goal = child;
+            self.txn
+                .lctx
+                .find(&id)
+                .cloned()
+                .ok_or_else(|| error(TacticError::EliminationLocal))?
+        } else if recursive
             || parts.generated && matches!(major.value.node(), ExprNode::FVar { .. })
         {
             if recursive {
@@ -442,15 +472,6 @@ impl Context {
             goal.lctx = self.txn.lctx.clone();
             goal.introduced.push(local.clone());
             local
-        };
-        let mut proof = ProofState {
-            saved,
-            target,
-            root,
-            instructions: Vec::new(),
-            cursor: 0,
-            work: Vec::new(),
-            controls: Vec::new(),
         };
         self.eliminate_proof_goal_with_indices(
             &mut proof,
