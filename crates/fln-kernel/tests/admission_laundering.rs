@@ -28,7 +28,7 @@ use fln_kernel::verdict::Budget;
 /// discovery: neither its output layout nor a stale sibling rlib may choose
 /// which version of the capability surface the probe actually checks.
 fn try_compile(root: &Path, name: &str, source: &str) -> (bool, String) {
-    let kernel = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel = fln_core::checked_manifest_dir!();
     let environment = kernel.parent().expect("workspace crates").join("fln-env");
     let quote_path = |path: &Path| {
         path.to_str()

@@ -23,7 +23,7 @@ fn check(paths: &[&Path]) -> Output {
         .unwrap()
 }
 fn example() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_quotients.lean")
+    fln_core::checked_workspace_root!().join("examples/native_quotients.lean")
 }
 #[test]
 fn installed_checker_checks_quotient_proofs_and_computes_expected_types() {

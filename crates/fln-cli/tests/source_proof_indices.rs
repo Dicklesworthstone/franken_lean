@@ -23,7 +23,7 @@ fn check(paths: &[&Path]) -> Output {
         .unwrap()
 }
 fn example() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_proof_indices.lean")
+    fln_core::checked_workspace_root!().join("examples/native_proof_indices.lean")
 }
 #[test]
 fn installed_checker_selects_proof_indexed_instances_and_checks_their_theorems() {

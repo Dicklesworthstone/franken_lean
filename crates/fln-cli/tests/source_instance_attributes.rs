@@ -1,11 +1,11 @@
 //! Installed CLI coverage; no model parser, compiler or fake checker.
 #![forbid(unsafe_code)]
-use std::{path::PathBuf, process::Command};
+use std::process::Command;
 
 #[test]
 fn installed_cli_checks_instance_registration_and_priority_changes() {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/native_instance_attributes.lean");
+    let source =
+        fln_core::checked_workspace_root!().join("examples/native_instance_attributes.lean");
     let before = std::fs::read(&source).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
@@ -30,8 +30,8 @@ fn installed_cli_checks_instance_registration_and_priority_changes() {
 
 #[test]
 fn installed_cli_does_not_publish_success_for_a_nonclass_attribute() {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/instance_attribute_nonclass.lean");
+    let source =
+        fln_core::checked_manifest_dir!().join("tests/fixtures/instance_attribute_nonclass.lean");
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(source)

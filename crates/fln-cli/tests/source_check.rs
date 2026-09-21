@@ -234,8 +234,7 @@ fn unsupported_commands_never_execute_and_end_of_options_preserves_dash_paths() 
 
 #[test]
 fn installed_binary_checks_quantified_simp_and_selected_definition_proofs() {
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/native_simplification.lean");
+    let example = fln_core::checked_workspace_root!().join("examples/native_simplification.lean");
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(example)
@@ -361,8 +360,7 @@ fn installed_binary_checks_local_dictionaries_and_conditional_instance_rewrites(
 
 #[test]
 fn installed_binary_checks_source_defined_records_and_recursive_classes() {
-    let example =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_records.lean");
+    let example = fln_core::checked_workspace_root!().join("examples/native_records.lean");
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(example)

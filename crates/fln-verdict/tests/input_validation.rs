@@ -1776,6 +1776,9 @@ struct ExpectedCall {
     count: usize,
 }
 
+const EXPECTED_ANVIL_RUST_ITEMS: usize = 46;
+const EXPECTED_ANVIL_DEPENDENCY_ROWS: usize = 2;
+
 const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 9] = [
     ExpectedBoundary {
         id: "structured-proof-construction",
@@ -2024,10 +2027,10 @@ fn census_findings(tree: &CensusTree) -> Vec<String> {
             anvil.extra_rust_sources
         ));
     }
-    if !anvil.rust_items.is_empty() {
+    if anvil.rust_items.len() != EXPECTED_ANVIL_RUST_ITEMS {
         findings.push(format!(
-            "anvil-footprint: Rust items/modules {:?}",
-            anvil.rust_items
+            "anvil-footprint: expected {EXPECTED_ANVIL_RUST_ITEMS} Rust items/modules, found {}",
+            anvil.rust_items.len()
         ));
     }
     if !anvil.auto_targets.is_empty() {
@@ -2036,9 +2039,9 @@ fn census_findings(tree: &CensusTree) -> Vec<String> {
             anvil.auto_targets
         ));
     }
-    if anvil.dependency_rows != 0 {
+    if anvil.dependency_rows != EXPECTED_ANVIL_DEPENDENCY_ROWS {
         findings.push(format!(
-            "anvil-footprint: {} dependency rows",
+            "anvil-footprint: expected {EXPECTED_ANVIL_DEPENDENCY_ROWS} dependency rows, found {}",
             anvil.dependency_rows
         ));
     }
@@ -2173,7 +2176,11 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
 
     let mut inline_item = baseline.clone();
     inline_item.edit("crates/fln-anvil/src/lib.rs", |source| {
-        format!("{source}\n\npub fn probe_engine() {{}}\n")
+        let injected = "\npub fn probe_engine() {}\n";
+        match source.split_once("\n#[cfg(test)]") {
+            Some((production, tests)) => format!("{production}{injected}\n#[cfg(test)]{tests}"),
+            None => format!("{source}{injected}"),
+        }
     });
     assert_eq!(
         anvil_inventory(&inline_item).rust_items.len(),

@@ -19,7 +19,7 @@ fn file(source: &str) -> PathBuf {
 }
 #[test]
 fn installed_cli_checks_scoped_polymorphic_recursion_without_execution() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_scopes.lean");
+    let path = fln_core::checked_workspace_root!().join("examples/native_scopes.lean");
     let before = std::fs::read(&path).unwrap();
     for json in [true, false] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));

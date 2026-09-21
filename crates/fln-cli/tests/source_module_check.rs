@@ -216,8 +216,7 @@ fn import_free_batch_behavior_and_root_independent_receipts_are_preserved() {
 
 #[test]
 fn shipped_source_library_example_is_checked_by_the_installed_command() {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_modules/Main.lean");
+    let path = fln_core::checked_workspace_root!().join("examples/native_modules/Main.lean");
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(path)

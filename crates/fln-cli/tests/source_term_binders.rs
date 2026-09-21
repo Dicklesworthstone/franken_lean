@@ -29,8 +29,7 @@ fn check(paths: &[&Path]) -> Output {
 
 #[test]
 fn installed_checker_accepts_the_complete_dependent_binder_example() {
-    let example =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_term_binders.lean");
+    let example = fln_core::checked_workspace_root!().join("examples/native_term_binders.lean");
     let original = std::fs::read(&example).unwrap();
     let result = check(&[&example]);
     assert!(
