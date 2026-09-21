@@ -293,6 +293,7 @@ jobs:
           cargo test --locked -p fln-conformance \
             --test real_attribute_fixtures_e2e \
             --test real_module_fixtures_e2e \
+            --test pinned_nat_council \
             --no-fail-fast -- --include-ignored --nocapture
 
       - name: run the certificate-format independent-checker lane

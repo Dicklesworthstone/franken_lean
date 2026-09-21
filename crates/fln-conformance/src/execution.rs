@@ -447,7 +447,7 @@ pub fn test_function_citation(artifact: &str) -> Option<(&str, &str, &str)> {
 pub fn module_path_prefix(relative_path: &str) -> Option<String> {
     let (_, tail) = relative_path.rsplit_once("/src/")?;
     let tail = tail.strip_suffix(".rs")?;
-    if tail == "main" {
+    if tail == "main" || tail.starts_with("bin/") {
         return None;
     }
     let mut parts: Vec<&str> = tail.split('/').collect();
@@ -1544,6 +1544,7 @@ fn discussion_only() {\n\
         );
         // A binary target is not part of the lib target's test namespace.
         assert_eq!(module_path_prefix("crates/x/src/main.rs"), None);
+        assert_eq!(module_path_prefix("crates/x/src/bin/foo.rs"), None);
         assert_eq!(module_path_prefix("crates/x/tests/foo.rs"), None);
     }
 

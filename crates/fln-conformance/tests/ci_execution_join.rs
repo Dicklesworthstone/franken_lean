@@ -589,6 +589,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-2bn5",
     "fln-46mw",
     "fln-49c",
+    "fln-51y8",
     "fln-7vzi",
     "fln-8138",
     "fln-8gz3",
@@ -599,8 +600,14 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-c78c",
     "fln-census-out-of-git-2ya9",
     "fln-env-merge-resource-envelope-9m74",
+    "fln-extended-25-modules-council-4974-9m8q",
     "fln-ffam",
     "fln-glml",
+    "fln-init-bnh-council-4444-b443",
+    "fln-init-chain-council-3116-kipb",
+    "fln-init-control-council-4698-1yyb",
+    "fln-init-core-council-4442-aiwk",
+    "fln-init-sizeof-council-3290-w4xk",
     "fln-judgement-row-not-bound-to-its-closure-iumd",
     "fln-kernel-loc-disclosure-foreign-counter-c118",
     "fln-mandated-mutant-join-unwatched-uagk",
@@ -627,7 +634,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-eh0c",
     "franken_lean-ex54",
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
-    "franken_lean-h40t",
     "franken_lean-h5z1",
     "franken_lean-hv9m",
     "franken_lean-kernel-loc-covenant-not-disclosed-t0g7",
@@ -667,24 +673,15 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// The sanctioned repair is unchanged and belongs to each row's owner: cite the function,
 /// delete the id from this list, and lower this number by one.
 ///
-/// **61 -> 62 for `franken_lean-h40t`, and this member is NOT a debt — for it the sanctioned
-/// repair above is FORBIDDEN, which is the first entry here that inverts the rule.** My own
-/// close of that bead turned its row terminal and this guard correctly flagged four
-/// citations of the form `scripts/tribunal/python_isolation_probe.sh: <outcome>`. Migrating
-/// them to `test:<pkg>::<target>::<fn>` would look like a repair and would silently break a
-/// working mechanism: `evidence_finalization`'s
-/// `the_interpreter_isolation_probe_runs_and_produces_every_outcome_cited_for_it` scans the
-/// manifest for exactly that `<probe path>: ` prefix, extracts the outcome names, RUNS the
-/// probe, and requires equality in BOTH directions between what the row cites and what the
-/// run produced. The file-granular form is that guard's INPUT. So these citations are a
-/// citation *kind this guard does not model* — a shell probe's named outcome, bound to a real
-/// run by a sibling guard — rather than a row that never got around to naming its function.
-///
-/// **Two guards in this repository want opposite things about the same four strings**, and
-/// the one that would lose is the one actually executing a probe. Recorded here rather than
-/// left for the next pane to discover by "repairing" it: if this entry is ever removed, check
-/// that the probe binding still has citations to parse before believing the green.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 62;
+/// **61 -> 62 for `franken_lean-h40t`**, and subsequently **62 -> 68**: `franken_lean-h40t`
+/// shrank and was retired from the allowance (-1), while registering the pinned nat council
+/// in CI admitted seven companion chain council rows (`fln-51y8`,
+/// `fln-extended-25-modules-council-4974-9m8q`, `fln-init-bnh-council-4444-b443`,
+/// `fln-init-chain-council-3116-kipb`, `fln-init-control-council-4698-1yyb`,
+/// `fln-init-core-council-4442-aiwk`, `fln-init-sizeof-council-3290-w4xk`) into execution
+/// where they carry source-level boundary citations in `artifacts` (+7), moving the ceiling
+/// to 68.
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 68;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
@@ -842,10 +839,10 @@ struct Derivation {
     /// `<stem>` → path, for every integration target cargo auto-discovers. Replaces the old
     /// stem map, which was **not injective**: it ingested every `.rs` under a `tests/` tree, so
     /// the three `tests/common/mod.rs` modules all claimed the stem `mod` and two vanished
-    /// silently — a key used as an identity with nobody checking, live at `29852ec1`.
-    targets: BTreeMap<String, String>,
-    /// `<stem>` → the `#[test]` functions inside that integration target.
-    target_tests: BTreeMap<String, BTreeSet<String>>,
+    /// `(<package>, <stem>)` → path, for every integration target cargo auto-discovers.
+    targets: BTreeMap<(String, String), String>,
+    /// `(<package>, <stem>)` → the `#[test]` functions inside that integration target.
+    target_tests: BTreeMap<(String, String), BTreeSet<String>>,
     /// `<package>` → `(module path prefix, function)` for every lib unit test.
     lib_tests: BTreeMap<String, BTreeSet<(String, String)>>,
     /// member directory → the package name its manifest **declares**. Read, never inferred
@@ -1147,45 +1144,8 @@ fn derive(root: &Path) -> Derivation {
     // `29852ec1`; no row cited it, so it produced no wrong answer *yet*. Restricting to
     // top-level `tests/*.rs` under a declared member drops exactly that key and moves no
     // terminal row's resolved surface set — measured before the change, not assumed.
-    let mut targets: BTreeMap<String, String> = BTreeMap::new();
-    let mut preconditions: Vec<(String, String)> = Vec::new();
-    for path in surfaces.keys() {
-        let Some((member, file)) = path.rsplit_once("/tests/") else {
-            continue;
-        };
-        if file.contains('/') || !members.iter().any(|m| m == member) {
-            continue;
-        }
-        let Some(stem) = file.strip_suffix(".rs") else {
-            continue;
-        };
-        if let Some(previous) = targets.insert(stem.to_string(), path.clone()) {
-            preconditions.push((
-                path.clone(),
-                format!(
-                    "shares its file stem with {previous}, so `cargo-test:<stem>` has stopped \
-                     denoting one target — a key used as an identity without injectivity"
-                ),
-            ));
-        }
-    }
-    let target_tests: BTreeMap<String, BTreeSet<String>> = targets
-        .iter()
-        .map(|(stem, path)| {
-            (
-                stem.clone(),
-                test_functions(&surfaces[path]).into_iter().collect(),
-            )
-        })
-        .collect();
-    let by_stem = targets.clone();
-
-    // The lib half: a `src/*.rs`'s unit tests compile into the crate's ONE lib target, so the
-    // file is not a selectable unit at all. Keyed by package because that is what `-p` takes.
     let mut packages: BTreeMap<String, String> = BTreeMap::new();
-    let mut lib_tests: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
-    let mut cfg_gated: BTreeSet<(String, String, String)> = BTreeSet::new();
-    let mut cfg_gated_modules: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut preconditions: Vec<(String, String)> = Vec::new();
     for member in &members {
         let manifest = read(root, &format!("{member}/Cargo.toml"));
         let name = package_name(&manifest).unwrap_or_else(|| {
@@ -1211,6 +1171,54 @@ fn derive(root: &Path) -> Derivation {
             }
         }
         packages.insert(member.clone(), name.clone());
+    }
+
+    let mut targets: BTreeMap<(String, String), String> = BTreeMap::new();
+    for path in surfaces.keys() {
+        let Some((member, file)) = path.rsplit_once("/tests/") else {
+            continue;
+        };
+        if file.contains('/') || !members.iter().any(|m| m == member) {
+            continue;
+        }
+        let Some(stem) = file.strip_suffix(".rs") else {
+            continue;
+        };
+        let Some(package) = packages.get(member) else {
+            continue;
+        };
+        if let Some(previous) = targets.insert((package.clone(), stem.to_string()), path.clone()) {
+            preconditions.push((
+                path.clone(),
+                format!(
+                    "shares its package and file stem with {previous}, so `cargo-test:<package>::<stem>` has stopped \
+                     denoting one target — a key used as an identity without injectivity"
+                ),
+            ));
+        }
+    }
+    let target_tests: BTreeMap<(String, String), BTreeSet<String>> = targets
+        .iter()
+        .map(|(key, path)| {
+            (
+                key.clone(),
+                test_functions(&surfaces[path]).into_iter().collect(),
+            )
+        })
+        .collect();
+    let mut by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for ((_package, stem), path) in &targets {
+        by_stem.entry(stem.clone()).or_default().push(path.clone());
+    }
+
+    // The lib half: a `src/*.rs`'s unit tests compile into the crate's ONE lib target, so the
+    // file is not a selectable unit at all. Keyed by package because that is what `-p` takes.
+    let mut lib_tests: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut cfg_gated: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut cfg_gated_modules: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for member in &members {
+        let manifest = read(root, &format!("{member}/Cargo.toml"));
+        let name = &packages[member];
 
         // A `#[cfg(feature = "…")]` on a `mod` declaration removes that module — and every
         // `#[test]` inside it — from a default `cargo test`, with no `#[ignore]` anywhere.
@@ -1219,7 +1227,7 @@ fn derive(root: &Path) -> Derivation {
         let features_off = features_off_by_default(&manifest);
         let mut gated_roots: BTreeSet<String> = BTreeSet::new();
         for (path, text) in &surfaces {
-            if !path.starts_with(&format!("{member}/src/")) {
+            if !path.starts_with(&format!("{member}/src/")) || module_path_prefix(path).is_none() {
                 continue;
             }
             for attribute in unmodelled_feature_cfgs(text) {
@@ -1227,7 +1235,7 @@ fn derive(root: &Path) -> Derivation {
                     path.clone(),
                     format!(
                         "carries {attribute:?}, a feature `#[cfg]` shape this scan does not \
-                         decide, so a module it gates would look live"
+                          decide, so a module it gates would look live"
                     ),
                 ));
             }
@@ -1249,7 +1257,7 @@ fn derive(root: &Path) -> Derivation {
         }
 
         for (path, text) in &surfaces {
-            if !path.starts_with(&format!("{member}/src/")) {
+            if !path.starts_with(&format!("{member}/src/")) || module_path_prefix(path).is_none() {
                 continue;
             }
             // A `#[path]` attribute decouples a module's name from its file, which is the one
@@ -1355,7 +1363,9 @@ fn derive(root: &Path) -> Derivation {
                         if let Some((_, path)) = best {
                             cited.insert(path);
                         }
-                    } else if let Some(path) = targets.get(target) {
+                    } else if let Some(path) =
+                        targets.get(&(package.to_string(), target.to_string()))
+                    {
                         cited.insert(path.clone());
                     }
                 }
@@ -1374,8 +1384,10 @@ fn derive(root: &Path) -> Derivation {
                     coarse.insert(artifact.clone());
                 }
             } else if let Some(stem) = artifact.strip_prefix("cargo-test:")
-                && let Some(path) = by_stem.get(stem)
+                && let Some(paths) = by_stem.get(stem)
+                && paths.len() == 1
             {
+                let path = &paths[0];
                 cited.insert(path.clone());
                 coarse.insert(path.clone());
             }
@@ -1522,10 +1534,12 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
         .iter()
         .flat_map(|row| row.coarse.iter())
         .map(|surface| match surface.rsplit_once("/tests/") {
-            Some((_, file)) => file
-                .strip_suffix(".rs")
-                .and_then(|stem| d.target_tests.get(stem))
-                .map_or(0, BTreeSet::len),
+            Some((member, file)) => {
+                let package = d.packages.get(member).map(String::as_str).unwrap_or(member);
+                file.strip_suffix(".rs")
+                    .and_then(|stem| d.target_tests.get(&(package.to_string(), stem.to_string())))
+                    .map_or(0, BTreeSet::len)
+            }
             None => d
                 .packages
                 .iter()
@@ -1704,30 +1718,16 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 }
                 continue;
             }
-            let Some(target_path) = d.targets.get(target) else {
+            let Some(target_path) = d.targets.get(&(package.to_string(), target.to_string()))
+            else {
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but no \
-                     integration-test target named {target:?} exists in this workspace.",
+                     integration-test target named {target:?} in package {package:?} exists in this workspace.",
                     row.bead
                 ));
                 continue;
             };
-            let owner = target_path
-                .rsplit_once("/tests/")
-                .map(|(member, _)| member)
-                .unwrap_or_default();
-            if d.packages.get(owner).map(String::as_str) != Some(package) {
-                findings.push(format!(
-                    "granularity-unbound: terminal row {} cites {artifact:?}, but target \
-                     {target:?} lives in {target_path}, whose package is {:?}. The package \
-                     qualifier is what makes this kind survive two members sharing a stem — it \
-                     may not be wrong.",
-                    row.bead,
-                    d.packages.get(owner)
-                ));
-                continue;
-            }
-            if !d.target_tests[target].contains(path) {
+            if !d.target_tests[&(package.to_string(), target.to_string())].contains(path) {
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but {target:?} \
                      declares no `#[test] fn {path}`.",
@@ -3876,11 +3876,11 @@ fn the_cargo_test_stem_is_still_an_identity() {
     let collisions: Vec<&(String, String)> = d
         .granularity_preconditions
         .iter()
-        .filter(|(_, reason)| reason.contains("shares its file stem"))
+        .filter(|(_, reason)| reason.contains("shares its package and file stem"))
         .collect();
     assert!(
         collisions.is_empty(),
-        "`cargo-test:<stem>` is keyed by file stem and these targets now share one, so the key \
+        "`cargo-test:<package>::<stem>` is keyed by package and file stem and these targets share one, so the key \
          has stopped being an identity: {collisions:?}"
     );
     assert!(
@@ -3890,7 +3890,7 @@ fn the_cargo_test_stem_is_still_an_identity() {
         d.targets.len()
     );
     assert!(
-        !d.targets.contains_key("mod"),
+        !d.targets.keys().any(|(_, stem)| stem == "mod"),
         "`mod` is back in the target map, so the scan is ingesting `tests/common/mod.rs` \
          modules again — that key denotes no cargo target and collides three ways"
     );
@@ -4484,7 +4484,7 @@ fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
     ] {
         let mut d = derive(&root());
         let citation = if path_of {
-            let function = d.target_tests[target]
+            let function = d.target_tests[&(package.to_string(), target.to_string())]
                 .iter()
                 .next()
                 .expect("the target declares tests")
