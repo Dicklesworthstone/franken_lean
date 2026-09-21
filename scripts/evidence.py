@@ -4430,7 +4430,9 @@ def resolve_sealed_toolchain(lock_rows: Mapping[str, Any]) -> dict[str, Any]:
     rustup_home = Path(os.environ.get("RUSTUP_HOME", "") or Path.home() / ".rustup")
     toolchain_root = rustup_home / "toolchains" / f"{lock_rows['rust-nightly']}-{triple}"
     rustc_path = toolchain_root / "bin" / "rustc"
-    cargo_path = toolchain_root / "bin" / "cargo"
+    cargo_path = toolchain_root / "bin" / "cargo-rch-real"
+    if not cargo_path.is_file():
+        cargo_path = toolchain_root / "bin" / "cargo"
     if not rustc_path.is_file() or not cargo_path.is_file():
         raise SealedCompilerRejection(
             "sealed_compiler_toolchain_unresolved",
