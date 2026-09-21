@@ -37,7 +37,7 @@ jobs:
             echo "dispatch.rs moved: expected $expected, observed $actual" >&2
             exit 1
           fi
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
 
           path = Path('crates/fln-server/src/dispatch.rs')

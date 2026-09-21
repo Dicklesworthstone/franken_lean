@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Apply a locally verified source implementation delta; never rewrite drift."""
 import base64
 import gzip

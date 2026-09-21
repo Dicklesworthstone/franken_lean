@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Apply the source equality increment; refuse changed anchors before any write."""
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]

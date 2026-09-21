@@ -35,7 +35,7 @@ jobs:
           status=$?
           printf '%s\n' "$status" > target/defaults-reconciliation/baseline.exit
           cat target/defaults-reconciliation/baseline.log
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import pathlib,re,json
           root=pathlib.Path('target/defaults-reconciliation')
           text=(root/'baseline.log').read_text()
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import pathlib,hashlib,subprocess,json
           root=pathlib.Path('target/defaults-reconciliation')
           patch=pathlib.Path('scripts/field_defaults_reconcile.patch').read_bytes()
@@ -88,7 +88,7 @@ jobs:
           cargo test --locked -p fln-elab -p fln-parse -p fln -p fln-cli -p fln-checker --no-fail-fast > target/defaults-reconciliation/tests.log 2>&1
           printf '%s\n' "$?" > target/defaults-reconciliation/tests.exit
           cat target/defaults-reconciliation/tests.log
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import pathlib,re,json
           root=pathlib.Path('target/defaults-reconciliation')
           text=(root/'tests.log').read_text()
@@ -116,7 +116,7 @@ jobs:
           cargo test --locked -p fln --test source_record_defaults --no-fail-fast 2>&1 | tee target/defaults-reconciliation/feature-tests.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli -p fln-checker --all-targets -- -D warnings 2>&1 | tee target/defaults-reconciliation/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/defaults-reconciliation/workspace.log
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import pathlib,json,subprocess
           paths=json.loads(pathlib.Path('target/defaults-reconciliation/source-digests.json').read_text())
           for path in paths:
@@ -124,7 +124,7 @@ jobs:
                   subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',path],check=True)
           PY
           cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_record_defaults.lean > target/defaults-reconciliation/example.json
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json,pathlib
           result=json.loads(pathlib.Path('target/defaults-reconciliation/example.json').read_text())
           assert result['outcome']=='complete' and result['authority'] is True
@@ -135,7 +135,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import pathlib,json,hashlib,subprocess
           root=pathlib.Path('target/defaults-reconciliation')
           expected=json.loads((root/'source-digests.json').read_text())

@@ -1,3 +1,4 @@
+#!/usr/bin/env -S python3 -I -S
 import importlib.util
 import json
 import subprocess

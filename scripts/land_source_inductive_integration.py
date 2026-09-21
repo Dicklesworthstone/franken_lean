@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Connect the native constructor-family modules at guarded integration points."""
 import json
 import re

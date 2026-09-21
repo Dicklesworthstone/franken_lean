@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Wire native rewriting using exact anchors, preserving concurrent edits."""
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]

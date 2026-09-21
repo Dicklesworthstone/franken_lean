@@ -1,3 +1,4 @@
+#!/usr/bin/env -S python3 -I -S
 import contextlib
 import hashlib
 import importlib.util

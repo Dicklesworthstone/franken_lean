@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Register the admission-only source checker using guarded source anchors."""
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]

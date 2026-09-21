@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
 
           path = Path("crates/fln-server/src/dispatch.rs")

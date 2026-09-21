@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Apply the reviewed simp_all increment; the companion job tests before push."""
 from pathlib import Path
 import hashlib

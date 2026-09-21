@@ -76,7 +76,7 @@ jobs:
             cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee "target/simp-all-landing/source-${attempt}.log"
             engine_status=0
             cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee "target/simp-all-landing/engine-${attempt}.log" || engine_status=$?
-            python3 - "$engine_status" "$attempt" <<'PY'
+            python3 -I - "$engine_status" "$attempt" <<'PY'
           import pathlib, re, sys
           root = pathlib.Path('target/simp-all-landing')
           status = int(sys.argv[1])

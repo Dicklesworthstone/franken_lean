@@ -25,7 +25,7 @@ jobs:
           set -euo pipefail
           mkdir -p target/propositional-landing
           git rev-parse HEAD > target/propositional-landing/input-commit.txt
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import base64,gzip,hashlib,io,json,pathlib,subprocess
           out=pathlib.Path('target/propositional-landing')
           raw=pathlib.Path('scripts/propositional-family-transfer/manifest.json').read_bytes()
@@ -74,13 +74,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/propositional-landing/compiler.txt
           cargo test --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --no-fail-fast 2>&1 | tee target/propositional-landing/tests.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/propositional-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/propositional-landing/workspace.log
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json,pathlib,subprocess
           out=pathlib.Path('target/propositional-landing')
           plan=json.loads((out/'manifest.json').read_text())
@@ -101,7 +101,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib,json,pathlib,subprocess
           out=pathlib.Path('target/propositional-landing')
           plan=json.loads((out/'manifest.json').read_text())

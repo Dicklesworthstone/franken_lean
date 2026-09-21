@@ -1,3 +1,4 @@
+#!/usr/bin/env -S python3 -I -S
 from __future__ import annotations
 
 import hashlib

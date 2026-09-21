@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Run the real pinned Init.Nat two-checker council regression locally.
 
 This is intentionally a thin launcher around the Rust test. It exists so an

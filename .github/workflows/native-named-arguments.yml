@@ -52,7 +52,7 @@ jobs:
                   path.write_bytes(blob(sha))
               script = evidence / 'integrate.py'
               script.write_bytes(blob('22326628a062cb5b8b4bc66034be8183e4ca4c88'))
-              subprocess.run(['python3', '-I', str(script)], check=True)
+              subprocess.run(["python3", "-I", str(script)], check=True)
           (evidence / 'paths.json').write_text(json.dumps(paths))
           for line in open('.beads/issues.jsonl'):
               row = json.loads(line)

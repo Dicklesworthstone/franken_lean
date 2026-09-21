@@ -22,7 +22,7 @@ jobs:
           mkdir -p target/instance-landing
           cp scripts/native_instance_increment.json target/instance-landing/increment.json
           git rev-parse HEAD > target/instance-landing/input-commit.txt
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json,base64,gzip,hashlib,pathlib,subprocess
           plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
           patch=plan['patch_text'].encode() if 'patch_text' in plan else gzip.decompress(base64.b64decode(plan['patch'],validate=True))
@@ -56,10 +56,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/instance-landing/compiler.txt
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json,pathlib,subprocess
           for path in json.loads(pathlib.Path('target/instance-landing/paths.json').read_text()):
               if path.endswith('.rs'):
@@ -88,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json,pathlib,subprocess
           paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
           message=pathlib.Path('target/instance-landing/message.txt').read_text()

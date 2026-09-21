@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import base64, hashlib, pathlib, subprocess, zlib
           expected = {
               'crates/fln-elab/src/lib.rs': '034a84bbe49f3846f539aac3f4ef39a3a149016e',

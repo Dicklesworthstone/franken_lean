@@ -38,7 +38,7 @@ jobs:
             echo "HEq anchors moved: src=$actual_src test=$actual_test" >&2
             exit 1
           fi
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
 
           def bounded(text: str, start_marker: str, end_marker: str) -> tuple[str, str, str]:

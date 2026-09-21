@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           mkdir -p target/membership-evidence
           git rev-parse HEAD > target/membership-evidence/input-commit.txt
-          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/membership-evidence/compiler.txt
           cargo test --locked -p fln-kernel --lib membership_tests -- --nocapture 2>&1 | tee target/membership-evidence/membership.log

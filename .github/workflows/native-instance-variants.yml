@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
           base = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
           headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
@@ -124,7 +124,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import base64, hashlib, json, os, pathlib, urllib.request
           out = pathlib.Path('target/instance-variants')
           manifest = json.loads((out / 'manifest.json').read_text())

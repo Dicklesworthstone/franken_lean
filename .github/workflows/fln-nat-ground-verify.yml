@@ -26,7 +26,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
           path = Path('crates/fln-checker/tests/init_nat.rs')
           text = path.read_text(encoding='utf-8')

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Apply the tested source-lambda patch; the landing workflow rechecks before commit."""
 import base64
 import gzip

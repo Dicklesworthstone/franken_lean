@@ -4907,7 +4907,10 @@ fn every_workflow_python_launch_is_sealed_or_declared() {
             }
             launches += 1;
             // The subprocess list form spells the flag as its own quoted argument.
-            if command.contains("python3 -I") || command.contains(r#""python3","#) {
+            if command.contains("python3 -I")
+                || command.contains(r#""python3","#)
+                || command.contains(r#"'python3',"#)
+            {
                 continue;
             }
             match WORKFLOW_UNSEALED_ALLOWANCE

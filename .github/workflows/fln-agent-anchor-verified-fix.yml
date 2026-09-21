@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
 
           path = Path("tools/structure-guard/src/bin/fln-agent-anchor.rs")
