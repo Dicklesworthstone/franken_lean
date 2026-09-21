@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Client-watched disk changes cross the actual installed server and real filesystem.
 use super::*;
 use std::io::Read;

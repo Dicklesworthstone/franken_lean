@@ -1,5 +1,6 @@
 //! Independent named-local fixtures, shared by checker and two-seat tests.
 //! This does not use either checker's inductive/recursor reconstruction code.
+#![forbid(unsafe_code)]
 #![allow(dead_code)]
 use fln_core::expr::{BinderInfo, Expr, FVarId};
 use fln_core::level::Level;

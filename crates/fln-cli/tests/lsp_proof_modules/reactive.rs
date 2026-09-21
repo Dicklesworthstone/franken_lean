@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Reactive checks must reach installed binaries without touching the importer.
 use super::*;
 
