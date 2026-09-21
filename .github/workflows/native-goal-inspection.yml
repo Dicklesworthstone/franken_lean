@@ -9,6 +9,8 @@ on:
       - 'crates/fln/src/source_check/**'
       - 'crates/fln-server/src/dispatch/**'
       - 'crates/fln-server/src/dispatch.rs'
+      - 'crates/fln-server/src/correlation.rs'
+      - 'crates/fln-server/src/json.rs'
       - 'crates/fln-cli/src/source_check/**'
       - 'crates/fln/tests/source_goal_inspection.rs'
       - 'crates/fln-cli/tests/lsp_goals.rs'
@@ -23,14 +25,14 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Apply exact locally checked native inspection implementation
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-inspection]')
+      - name: Apply exact locally checked native editor implementation
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-editor]')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          chunks = ['e6aeaebe6b3b058c1b59504594279fe839e3d8a3', '81e34afba0244e5483bb9bcab573e14bf8acc53f', 'ef60deada44c2a4a98b0675632abb6b7bc3df2aa', '6056498c516e4c8e3bbec5ccbd27d749fb18dc4d', 'd54262a5a80fdf1bbb6c2ce12ffb34236951384b', 'fbf88c5b8df39f4df7ee70abbb0907649de172c4', '1af21c4322f8eeaaa39722720ebdf14f5b262854']
+          chunks = ['f12d5147884a63bd351a5b290b61073812308cee', '70db6ceba5bb8164a06321d8a20d91bb068e748d', '24a7fd8ddb64c3563a4969b58faaf24055dc152e', '47b34ebacc1709547a89e19fae41a556bce3a829']
           compressed = bytearray()
           for sha in chunks:
               req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
@@ -41,19 +43,19 @@ jobs:
               assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == sha
               compressed.extend(data)
           payload = gzip.decompress(compressed)
-          assert hashlib.sha256(payload).hexdigest() == '025e09866591ad5923239bc8a1aa049f9d123865d83db861826d490e30b1005d'
+          assert hashlib.sha256(payload).hexdigest() == '88df276b524fb82c174799db06a7119b5d25c7c4f11c80f67ba020aac367d4b7'
           bundle = json.loads(payload)
-          allowed = {'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/inspect.rs', 'crates/fln-elab/src/source/tactics.rs', 'crates/fln-elab/src/source/tactics/eliminate.rs', 'crates/fln-elab/src/source/tactics/search.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/tests/term_assertions.rs', 'crates/fln/src/source_check.rs', 'crates/fln/src/source_check/inspect.rs', 'crates/fln/src/source_check/modules/cache.rs', 'crates/fln/tests/source_goal_inspection.rs'}
+          allowed = {'crates/fln-cli/src/source_check/lsp.rs', 'crates/fln-cli/src/source_check/lsp/render.rs', 'crates/fln-cli/tests/lsp_goals.rs', 'crates/fln-server/src/bin/fln-lsp-timeline.rs', 'crates/fln-server/src/correlation.rs', 'crates/fln-server/src/dispatch.rs', 'crates/fln-server/src/dispatch/documents.rs', 'crates/fln-server/src/dispatch/json.rs', 'crates/fln-server/src/dispatch/json/edits.rs', 'crates/fln-server/src/dispatch/semantic.rs', 'crates/fln-server/src/dispatch/workspace.rs', 'crates/fln-server/src/json.rs', 'crates/fln-server/tests/lsp_correlate_cli.rs', 'crates/fln-server/tests/lsp_timeline_cli.rs', 'docs/NATIVE_EDITOR_QUERIES.md'}
           assert set(bundle['preimages']) == allowed
           for name, sha in bundle['preimages'].items():
               path = pathlib.Path(name)
-              assert path.parts[0] == 'crates' and '..' not in path.parts
+              assert path.parts[0] in ('crates', 'docs') and '..' not in path.parts
               if sha is None:
                   assert not path.exists(), name
               else:
                   actual = subprocess.check_output(['git', 'hash-object', '--', name], text=True).strip()
                   assert actual == sha, (name, actual, sha)
-          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-inspection.patch'
+          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-editor.patch'
           patch.write_text(bundle['patch'])
           assert '\ndeleted file mode ' not in bundle['patch']
           subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
@@ -67,23 +69,25 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv
-      - name: Check native goal and protocol consumers
+      - name: Check native goal and installed protocol consumers
         shell: bash
         run: |
           set -euo pipefail
           exec > >(tee "$RUNNER_TEMP/native-inspection-validation.log") 2>&1
           git rev-parse HEAD
+          cargo test --locked -p fln-server --no-fail-fast
+          cargo test --locked -p fln-cli --test lsp_goals --test lsp_stdio_e2e --test lsp_proof_modules --test source_module_check
+          cargo test --locked -p fln-cli --lib source_check::lsp
           cargo test --locked -p fln --test source_goal_inspection --test source_module_check --test source_module_session
-          cargo test --locked -p fln-parse --test term_assertions
-          cargo clippy --locked -p fln-elab -p fln --all-targets -- -D warnings
+          cargo clippy --locked -p fln-elab -p fln-server -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
           git diff --cached --check
       - name: Publish tested implementation directly to main
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-inspection]')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[land-native-editor]')
         shell: bash
         run: |
           set -euo pipefail
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(elab): inspect native proof goals and terms against checked source prefixes'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(lsp): serve native proof goals and hover from checked unsaved source'
           git rev-parse HEAD | tee "$RUNNER_TEMP/native-inspection-commit.txt"
           git push origin HEAD:main
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
