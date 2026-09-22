@@ -65,3 +65,104 @@ jobs:
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo clippy --locked -p fln-cli --test source_closure_data --test source_ground_projections -- -D warnings
           cargo check --locked --workspace --all-targets
+  mutual-function-child-validation:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: d39c7af0f1baf6ed21e6666094b9be61a1649af4
+          persist-credentials: false
+      - name: Restore the exact locally tested mutual function-child patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          out = root / 'target/mutual-function-validation'
+          out.mkdir(parents=True)
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          sha = 'ca736efacd125de8004a63c287d205f06c028922'
+          data = bytearray(base64.b64decode(json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))['content']))
+          assert blob(data) == sha
+          # Restore one transport-byte transcription error, then bind the whole
+          # canonical archive before decompression or any source-file mutation.
+          assert len(data) == 9907 and data[758] == 83
+          data[758] = 116
+          assert blob(data) == 'b2f73399e57afd22b956a5304a4efaa69b01c65c'
+          assert hashlib.sha256(data).hexdigest() == '93424e29f2fe1a6362ba326e3e4ba08bf5b03b98c99b019f393784b4a71c0004'
+          manifest = json.loads(gzip.decompress(data))
+          assert git('rev-parse','HEAD') == manifest['base'] == 'd39c7af0f1baf6ed21e6666094b9be61a1649af4'
+          assert git('rev-parse','HEAD^{tree}') == manifest['base_tree'] == 'e9ccbb365d03eaf77142ab19b00ffeb1037bb4ac'
+          allowed = {'.github/workflows/native-record-runtime.yml', 'crates/fln-cli/src/lib.rs', 'crates/fln-cli/tests/source_mutual_data.rs', 'crates/fln/src/runtime/mutual.rs', 'crates/fln/src/runtime/mutual/fold.rs', 'crates/fln/src/runtime/records.rs', 'crates/fln/tests/runtime_mutual_data.rs', 'crates/fln/tests/runtime_mutual_function_children.rs', 'docs/NATIVE_FUNCTION_CHILDREN.md', 'docs/NATIVE_MUTUAL_RUNTIME.md', 'examples/native_mutual_function_children.lean'}
+          paths = [e['path'] for e in manifest['entries']]
+          assert len(paths) == 11 and set(paths) == allowed
+          for entry in manifest['entries']:
+              path = root / entry['path']
+              assert path.resolve().is_relative_to(root) and not path.is_symlink()
+              assert entry['mode'] == '100644'
+              if entry['before'] is None:
+                  assert not path.exists() and not git('ls-files','--',entry['path'])
+              else:
+                  assert blob(path.read_bytes()) == entry['before'], entry['path']
+          patch = out / 'change.patch'
+          patch.write_text(manifest['patch'])
+          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
+          subprocess.run(['git','apply','--index',str(patch)],check=True)
+          assert set(git('diff','--cached','--name-only').splitlines()) == allowed
+          for entry in manifest['entries']:
+              assert blob((root / entry['path']).read_bytes()) == entry['after']
+          assert git('write-tree') == manifest['tree'] == 'bf0ab55642c421b2c9827a5997b313bf4eb0437a'
+          (out / 'manifest.json').write_text(json.dumps(manifest))
+          (out / 'tree.txt').write_text(git('write-tree')+'\n')
+          print('VALIDATION_TREE',git('write-tree'))
+          PY
+      - name: Check mutual execution, failure atomicity, and installed replay
+        run: |
+          set -euo pipefail
+          channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          cargo test --locked -p fln --lib --test runtime_function_children --test runtime_mutual_function_children --test runtime_mutual_data --test runtime_mutual_recursion --test runtime_recursive_data --test runtime_closure_data --test engine_builder_facade --test source_module_check --test source_module_session 2>&1 | tee target/mutual-function-validation/engine.log
+          cargo test --locked -p fln-cli --test source_mutual_data --test cli_personalities_and_verbs --test lsp_goals 2>&1 | tee target/mutual-function-validation/cli.log
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee target/mutual-function-validation/engine-clippy.log
+          cargo clippy --locked -p fln-cli --test source_mutual_data --test source_closure_data --test source_ground_projections -- -D warnings 2>&1 | tee target/mutual-function-validation/cli-clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/mutual-function-validation/check.log
+          git diff --check --cached
+      - name: Export checked file objects without changing branch references
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, pathlib, subprocess
+          out = pathlib.Path('target/mutual-function-validation')
+          manifest = json.loads((out / 'manifest.json').read_text())
+          for entry in manifest['entries']:
+              data = pathlib.Path(entry['path']).read_bytes()
+              sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              assert sha == entry['after']
+              request = json.dumps({'content':base64.b64encode(data).decode(),'encoding':'base64'}).encode()
+              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
+              assert response['sha'] == sha
+              print('EXPORTED',sha,entry['path'],flush=True)
+          tree = subprocess.check_output(['git','write-tree'],text=True).strip()
+          assert tree == manifest['tree'] == (out / 'tree.txt').read_text().strip()
+          print('VALIDATED_EXPORT_COMPLETE',tree,flush=True)
+          PY
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutual-function-child-validation-${{ github.run_id }}
+          path: target/mutual-function-validation/
+          retention-days: 7
