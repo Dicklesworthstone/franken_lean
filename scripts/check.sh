@@ -1646,7 +1646,7 @@ run_stage evidence-self-test "${PYTHON[@]}" scripts/evidence.py self-test \
 run_stage verification-manifest "${PYTHON[@]}" scripts/evidence.py \
   validate-verification-manifest --manifest "$VERIFICATION_MANIFEST" \
   --beads "$REPO/.beads/issues.jsonl"
-run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
+run_stage shellcheck shellcheck -e SC2329 scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \

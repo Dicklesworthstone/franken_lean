@@ -373,6 +373,8 @@ run_step isolate_candidate \
   -a -s "$CANDIDATE_DIR/SUITE.lock" \
   -a "$OLD_LOCK_ROOT" != "$CANDIDATE_LOCK_ROOT"
 
+# The variables below expand inside the isolated child shell, not in this runner.
+# shellcheck disable=SC2016
 run_step failure_list \
   env CANDIDATE_DIR="$CANDIDATE_DIR" PREFLIGHT="$PREFLIGHT" bash -c '
 set -euo pipefail
