@@ -210,7 +210,7 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
-> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity` are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The remaining verbs above (`goals`, `serve-mcp`, `cache`, `doctor --sql`, `replay`, `build explain`, `diff --level`) and the `lake`/`leanc` binaries are the 1.0 target this README describes, not shipped code.
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `lake` and `leanc` toolchain personalities are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The remaining verbs above (`serve-mcp`, `cache`, `replay`, `build explain`) are the 1.0 target this README describes, not shipped code.
 
 ## Installation
 
