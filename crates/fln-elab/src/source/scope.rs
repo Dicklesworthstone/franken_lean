@@ -17,11 +17,25 @@ pub struct SourceScope {
 pub enum ScopeError {
     InvalidName,
     Ambiguous(Name, Vec<Name>),
+    UnknownVariable(Name),
+    OmittedVariable(Name),
+    VariableSelectionLimit,
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidName => write!(f, "invalid scoped declaration name"),
+            Self::UnknownVariable(name) => write!(
+                f,
+                "section variable `{}` has not been declared in the current scope",
+                name.to_display_string()
+            ),
+            Self::OmittedVariable(name) => write!(
+                f,
+                "cannot omit referenced section variable `{}`",
+                name.to_display_string()
+            ),
+            Self::VariableSelectionLimit => write!(f, "section variable selection limit exceeded"),
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
                 for (i, candidate) in candidates.iter().enumerate() {

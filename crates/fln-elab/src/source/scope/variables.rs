@@ -2,7 +2,7 @@
 //! variable command, not reinterpreted after a later `open` or declaration.
 //! They become ordinary Pi/lambda binders; no section state reaches admission.
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const MAX_SECTION_VARIABLES: usize = 4096;
 
@@ -11,6 +11,8 @@ pub struct SectionVariables {
     locals: LocalContext,
     next: u64,
     levels: Vec<Name>,
+    included: HashSet<FVarId>,
+    omitted: HashSet<FVarId>,
 }
 
 impl SectionVariables {
@@ -20,6 +22,39 @@ impl SectionVariables {
 
     pub fn is_empty(&self) -> bool {
         self.locals.is_empty()
+    }
+
+    /// Selection refers to declared identities, not namespace lookup or future
+    /// binders. Resolve the entire command before changing either set.
+    pub fn select(&mut self, names: &[Name], include: bool) -> Result<(), ScopeError> {
+        if names.len() > MAX_SECTION_VARIABLES {
+            return Err(ScopeError::VariableSelectionLimit);
+        }
+        let by_name: HashMap<_, _> = self
+            .locals
+            .decls()
+            .iter()
+            .map(|local| (&local.user_name, &local.id))
+            .collect();
+        let selected = names
+            .iter()
+            .map(|name| {
+                by_name
+                    .get(name)
+                    .map(|id| (*id).clone())
+                    .ok_or_else(|| ScopeError::UnknownVariable(name.clone()))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        for id in selected {
+            if include {
+                self.omitted.remove(&id);
+                self.included.insert(id);
+            } else {
+                self.included.remove(&id);
+                self.omitted.insert(id);
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::source) fn locals(&self) -> &LocalContext {
@@ -108,6 +143,8 @@ pub fn declare(
         locals: lctx,
         next: context.next,
         levels: context.level_params,
+        included: scope.variables.included.clone(),
+        omitted: scope.variables.omitted.clone(),
     })
 }
 
@@ -166,6 +203,9 @@ impl Context {
     ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
         let locals = self.source_scope.variables.locals.decls().to_vec();
         let mut used = self.section_dependencies(roots)?;
+        if include_instances {
+            used.extend(self.source_scope.variables.included.iter().cloned());
+        }
         for local in locals.iter().rev() {
             self.tick()?;
             if used.contains(&local.id) {
@@ -173,9 +213,20 @@ impl Context {
             }
         }
         if include_instances {
+            // Omitting a signature dependency is an error, not permission to
+            // alter the theorem's type or to leave a dangling free variable.
+            for local in &locals {
+                self.tick()?;
+                if used.contains(&local.id)
+                    && self.source_scope.variables.omitted.contains(&local.id)
+                {
+                    return Err(error(ScopeError::OmittedVariable(local.user_name.clone())));
+                }
+            }
             for local in &locals {
                 self.tick()?;
                 if local.binder_info == BinderInfo::InstImplicit
+                    && !self.source_scope.variables.omitted.contains(&local.id)
                     && self
                         .section_dependencies(std::slice::from_ref(&local.type_))?
                         .iter()
@@ -213,5 +264,42 @@ impl Context {
             }
         }
         self.txn.lctx = lctx;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_is_atomic_bounded_and_idempotent() {
+        let name = Name::from_components(["h"]);
+        let id = FVarId(Name::from_components(["section", "h"]));
+        let mut vars = SectionVariables::default();
+        vars.locals.add_param(
+            id.clone(),
+            name.clone(),
+            Expr::sort(Level::zero()),
+            BinderInfo::Default,
+        );
+        vars.select(std::slice::from_ref(&name), true).unwrap();
+        let before = vars.clone();
+        assert!(
+            vars.select(&[name.clone(), Name::from_components(["missing"])], false)
+                .is_err()
+        );
+        assert_eq!(vars, before);
+        assert!(
+            vars.select(&vec![name.clone(); MAX_SECTION_VARIABLES + 1], false)
+                .is_err()
+        );
+        assert_eq!(vars, before);
+        vars.select(&[name.clone(), name.clone()], true).unwrap();
+        assert_eq!(vars, before);
+        vars.select(std::slice::from_ref(&name), false).unwrap();
+        assert!(vars.omitted.contains(&id));
+        assert!(vars.included.is_empty());
+        vars.select(&[name], true).unwrap();
+        assert_eq!(vars, before);
     }
 }

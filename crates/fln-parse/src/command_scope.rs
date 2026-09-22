@@ -15,6 +15,8 @@ pub enum ScopeCommand {
     Open(Vec<Name>),
     Universe(Vec<Name>),
     Variable(Syntax),
+    Include(Vec<Name>),
+    Omit(Vec<Name>),
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
     Trivia,
@@ -36,6 +38,8 @@ fn table() -> TokenTable {
         "renaming",
         "attribute",
         "variable",
+        "include",
+        "omit",
     ] {
         table.insert(keyword);
     }
@@ -66,7 +70,15 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
 fn control(s: &str) -> bool {
     matches!(
         s,
-        "namespace" | "section" | "end" | "open" | "universe" | "attribute" | "variable"
+        "namespace"
+            | "section"
+            | "end"
+            | "open"
+            | "universe"
+            | "attribute"
+            | "variable"
+            | "include"
+            | "omit"
     )
 }
 fn declaration(s: &str) -> bool {
@@ -118,6 +130,8 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         "section" if names.len() <= 1 => ScopeCommand::Section(names.pop()),
         "end" if names.len() <= 1 => ScopeCommand::End(names.pop()),
         "open" if !names.is_empty() => ScopeCommand::Open(names),
+        "include" if !names.is_empty() => ScopeCommand::Include(names),
+        "omit" if !names.is_empty() => ScopeCommand::Omit(names),
         "universe" if !names.is_empty() && names.iter().all(|n| n.parent().is_anonymous()) => {
             ScopeCommand::Universe(names)
         }

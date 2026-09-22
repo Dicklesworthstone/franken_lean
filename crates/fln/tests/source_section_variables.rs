@@ -237,3 +237,193 @@ fn source_file_boundaries_export_closed_definitions_not_section_state() {
         .is_err()
     );
 }
+
+#[test]
+fn include_closes_dependencies_and_preserves_unused_explicit_assumptions() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable (p : Prop) (h : p)
+include h
+theorem selected : p := by exact h
+variable (unrelated : Nat)
+theorem retained : 7 = 7 := by rfl
+def independent : Nat := 7
+omit h
+theorem unselected : 7 = 7 := by rfl
+end"#,
+    );
+    let expected = vec![(n("p"), BinderInfo::Default), (n("h"), BinderInfo::Default)];
+    assert_eq!(binders(&e, "selected"), expected);
+    assert_eq!(binders(&e, "retained"), expected);
+    assert!(binders(&e, "independent").is_empty());
+    assert!(binders(&e, "unselected").is_empty());
+}
+
+#[test]
+fn omit_filters_automatic_instances_and_nested_scopes_restore_selection() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable {A : Type} [inh : Inhabited A] (x : A)
+theorem automatic : x = x := by rfl
+section Inner
+omit inh
+theorem minimal : x = x := by rfl
+end Inner
+theorem restored : x = x := by rfl
+omit inh
+include inh
+theorem forced : 7 = 7 := by rfl
+end"#,
+    );
+    let automatic = vec![
+        (n("A"), BinderInfo::Implicit),
+        (n("inh"), BinderInfo::InstImplicit),
+        (n("x"), BinderInfo::Default),
+    ];
+    assert_eq!(binders(&e, "automatic"), automatic);
+    assert_eq!(binders(&e, "restored"), automatic);
+    assert_eq!(
+        binders(&e, "minimal"),
+        vec![
+            (n("A"), BinderInfo::Implicit),
+            (n("x"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "forced"),
+        vec![
+            (n("A"), BinderInfo::Implicit),
+            (n("inh"), BinderInfo::InstImplicit)
+        ]
+    );
+}
+
+#[test]
+fn selections_reject_missing_variables_and_omitted_header_dependencies() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "include missing",
+        "omit Nat",
+        "variable (p : Prop) (h : p)\ninclude h missing",
+        "variable (p : Prop) (h : p)\nomit h\ntheorem invalid : p := by exact h",
+        "variable (p : Prop) (h : p)\ninclude h\nomit p\ntheorem invalid : 7 = 7 := by rfl",
+        "variable (p : Prop)\nomit p\ntheorem invalid (h : p) : p := by exact h",
+        "section\nvariable (h : False)\nend\ninclude h",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+    checked(&base, "theorem recovery : 7 = 7 := by rfl");
+}
+
+#[test]
+fn escaped_selection_is_lexical_and_does_not_leak_between_files() {
+    let base = engine();
+    let result = base.check_source_files(&[
+        b"namespace N\nvariable (p : Prop) (\xC2\xABh.p\xC2\xBB : p)\ninclude \xC2\xABh.p\xC2\xBB\ntheorem selected : p := by exact \xC2\xABh.p\xC2\xBB\nend N",
+        b"theorem fresh : 7 = 7 := by rfl",
+    ], &KVMap::new(), limits()).unwrap().into_complete().unwrap();
+    assert_eq!(
+        binders(&result.engine, "N.selected"),
+        vec![
+            (n("p"), BinderInfo::Default),
+            (Name::from_components(["h.p"]), BinderInfo::Default)
+        ]
+    );
+    assert!(binders(&result.engine, "fresh").is_empty());
+}
+
+#[test]
+fn generalized_named_instances_synthesize_after_the_section_ends() {
+    let e = checked(
+        &engine(),
+        r#"class Pick (A : Type) where
+  chosen : A
+section
+variable {A : Type} [inh : Inhabited A]
+instance pickDefault : Pick A := { chosen := default }
+end
+def chosenNat : Nat := Pick.chosen
+theorem chosenWorks : chosenNat = 0 := by rfl"#,
+    );
+    assert_eq!(
+        binders(&e, "pickDefault"),
+        vec![
+            (n("A"), BinderInfo::Implicit),
+            (n("inh"), BinderInfo::InstImplicit)
+        ]
+    );
+}
+
+#[test]
+fn variable_source_edits_invalidate_module_caches_without_leaking_assumptions() {
+    use fln::SourceModuleInput;
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+
+    let names = [n("Base"), n("Main")];
+    let mut session = SourceModuleSession::new(
+        engine(),
+        KVMap::new(),
+        SourceModuleCheckLimits::new(limits()),
+        SourceModuleCacheLimits::default(),
+    );
+    let check = |session: &mut SourceModuleSession, base: &str, main: &str| {
+        session.check_with_cancel(
+            &[
+                SourceModuleInput {
+                    name: &names[0],
+                    source: base.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &names[1],
+                    source: main.as_bytes(),
+                },
+            ],
+            &names[1],
+            None,
+        )
+    };
+    let base = "variable (p : Prop) (h : p)\ninclude h\ntheorem chosen : p := by exact h";
+    let main = "import Base\ntheorem use (p : Prop) (h : p) : p := by exact chosen p h";
+    let cold = check(&mut session, base, main)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warm = check(&mut session, base, main)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((cold.reused_modules, cold.elaborated_modules), (0, 2));
+    assert_eq!((warm.reused_modules, warm.elaborated_modules), (2, 0));
+    assert_eq!(
+        warm.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+    let omitted = "variable (p : Prop) (h : p)\nomit h\ntheorem chosen : p := by exact h";
+    assert!(check(&mut session, omitted, main).is_err());
+    let recovery = check(&mut session, base, main)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        recovery.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+    assert!(
+        check(
+            &mut session,
+            base,
+            "import Base\ntheorem leaked : p := by exact h"
+        )
+        .is_err()
+    );
+}

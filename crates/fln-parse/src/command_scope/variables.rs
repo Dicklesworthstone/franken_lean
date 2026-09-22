@@ -59,4 +59,33 @@ mod tests {
             assert!(super::super::parse(source.as_bytes()).is_err(), "{source}");
         }
     }
+
+    #[test]
+    fn selections_keep_source_boundaries_and_reject_unsupported_suffixes() {
+        let source =
+            "variable (p : Prop) (h «h.p» : p)\ninclude h «h.p»\ntheorem t : p := h\nomit h\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            super::super::parse(commands[1].1).unwrap(),
+            Some(ScopeCommand::Include(vec![
+                Name::from_components(["h"]),
+                Name::from_components(["h.p"])
+            ]))
+        );
+        assert_eq!(
+            super::super::parse(commands[3].1).unwrap(),
+            Some(ScopeCommand::Omit(vec![Name::from_components(["h"])]))
+        );
+        for source in [
+            "include",
+            "omit",
+            "include h in",
+            "omit h garbage := 0",
+            "include 0",
+            "omit [Inhabited Nat]",
+        ] {
+            assert!(super::super::parse(source.as_bytes()).is_err(), "{source}");
+        }
+    }
 }

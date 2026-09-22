@@ -72,6 +72,7 @@ impl Scopes {
         let (old, new) = match command {
             ScopeCommand::Open(names) => (self.current.opened.len(), names.len()),
             ScopeCommand::Universe(names) => (self.current.universes.len(), names.len()),
+            ScopeCommand::Include(names) | ScopeCommand::Omit(names) => (0, names.len()),
             _ => (0, 0),
         };
         if old.saturating_add(new) > MAX_ITEMS {
@@ -88,6 +89,16 @@ impl Scopes {
             ScopeCommand::Variable(_) => {
                 return Err("variable commands require checked telescope elaboration".into());
             }
+            ScopeCommand::Include(names) => self
+                .current
+                .variables
+                .select(&names, true)
+                .map_err(|e| e.to_string())?,
+            ScopeCommand::Omit(names) => self
+                .current
+                .variables
+                .select(&names, false)
+                .map_err(|e| e.to_string())?,
             ScopeCommand::Simp(_) => {
                 return Err("simp attributes require an environment transition".into());
             }
