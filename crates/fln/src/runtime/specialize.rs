@@ -27,6 +27,10 @@ fn application(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
     args.into_iter().fold(head, Expr::app)
 }
 impl Preparation<'_> {
+    pub(super) fn forget_constructor_type(&mut self, name: &Name) {
+        self.specializations.constructor_types.remove(name);
+    }
+
     pub(super) fn remember_constructor_type(
         &mut self,
         name: Name,

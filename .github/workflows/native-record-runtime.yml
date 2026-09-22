@@ -20,6 +20,8 @@ on:
       - 'crates/fln-cli/tests/source_mutual_data.rs'
       - 'examples/native_mutual_data.lean'
       - 'examples/native_mutual_folds.lean'
+      - 'crates/fln/tests/runtime_function_children.rs'
+      - 'examples/native_function_child_runtime.lean'
 permissions:
   contents: read
 jobs:
@@ -56,102 +58,10 @@ jobs:
           cargo test --locked -p fln-parse --test source_mutual_modules
           cargo test --locked -p fln --lib
           cargo test --locked -p fln --test runtime_mutual_data --test runtime_mutual_recursion
+          cargo test --locked -p fln --test runtime_function_children --test source_higher_order_recursion
           cargo test --locked -p fln --test runtime_closure_data --test runtime_record_projection --test runtime_parameterized_data --test runtime_records --test runtime_specialization --test runtime_higher_order
           cargo test --locked -p fln-cli --test source_mutual_data
           cargo test --locked -p fln-cli --test source_closure_data --test source_ground_projections --test source_collections
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo clippy --locked -p fln-cli --test source_closure_data --test source_ground_projections -- -D warnings
           cargo check --locked --workspace --all-targets
-  function-child-validation:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
-    env:
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: 9e02caccf1e7b7604ab44c2b0073c35147f4b63d
-          persist-credentials: false
-      - name: Restore checksum-bound function-child implementation
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          out = root / 'target/function-child-validation'
-          out.mkdir(parents=True)
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          def blob(data):
-              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          sha = '0d22ba33579292ce0c1b2264657bde5c1640a543'
-          data = base64.b64decode(json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))['content'])
-          assert blob(data) == sha
-          assert hashlib.sha256(data).hexdigest() == '1917c27abd1f2c90d66ebb57df81ef023c6aa21fb171991682da0ad7a344554b'
-          manifest = json.loads(gzip.decompress(data))
-          assert git('rev-parse','HEAD') == manifest['base'] == '9e02caccf1e7b7604ab44c2b0073c35147f4b63d'
-          assert git('rev-parse','HEAD^{tree}') == manifest['base_tree'] == '9df798ec2d9eac700672a09ee66c77d8aeb66357'
-          paths = [e['path'] for e in manifest['entries']]
-          assert len(paths) == 8 and len(set(paths)) == 8
-          for entry in manifest['entries']:
-              path = root / entry['path']
-              assert path.resolve().is_relative_to(root) and not path.is_symlink()
-              assert entry['mode'] == '100644'
-              if entry['before'] is None:
-                  assert not path.exists() and not git('ls-files','--',entry['path'])
-              else:
-                  assert blob(path.read_bytes()) == entry['before'], entry['path']
-          patch = out / 'change.patch'
-          patch.write_text(manifest['patch'])
-          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-          subprocess.run(['git','apply','--index',str(patch)],check=True)
-          assert set(git('diff','--cached','--name-only').splitlines()) == set(paths)
-          for entry in manifest['entries']:
-              assert blob((root / entry['path']).read_bytes()) == entry['after']
-          (out / 'manifest.json').write_text(json.dumps(manifest))
-          (out / 'tree.txt').write_text(git('write-tree')+'\n')
-          print('VALIDATION_TREE',git('write-tree'))
-          PY
-      - name: Validate native execution and the concurrent engine builder
-        run: |
-          set -euo pipefail
-          channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
-          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-          cargo test --locked -p fln --lib 2>&1 | tee target/function-child-validation/library.log
-          cargo test --locked -p fln --test runtime_function_children --test runtime_recursive_data --test runtime_closure_data --test runtime_mutual_data --test runtime_mutual_recursion --test source_higher_order_recursion --test engine_builder_facade --test source_module_check --test source_module_session 2>&1 | tee target/function-child-validation/engine.log
-          cargo test --locked -p fln-cli --test source_mutual_data 2>&1 | tee target/function-child-validation/cli.log
-          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee target/function-child-validation/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/function-child-validation/check.log
-      - name: Export validated blobs without moving any branch reference
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, pathlib, subprocess
-          out = pathlib.Path('target/function-child-validation')
-          manifest = json.loads((out / 'manifest.json').read_text())
-          for entry in manifest['entries']:
-              data = pathlib.Path(entry['path']).read_bytes()
-              sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-              assert sha == entry['after']
-              request = json.dumps({'content':base64.b64encode(data).decode(),'encoding':'base64'}).encode()
-              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-              assert response['sha'] == sha
-              print('EXPORTED',sha,entry['path'],flush=True)
-          tree = subprocess.check_output(['git','write-tree'],text=True).strip()
-          assert tree == (out / 'tree.txt').read_text().strip()
-          print('VALIDATED_EXPORT_COMPLETE',tree,flush=True)
-          PY
-      - name: Retain validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: function-child-validation-${{ github.run_id }}
-          path: target/function-child-validation/
-          retention-days: 7

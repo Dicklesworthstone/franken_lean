@@ -93,3 +93,41 @@ grandchild/course-of-values recursion and `termination_by` are separate layers.
 Kernel conversion and source admission are exercised; full execution-backend,
 Reference syntax/generated-name parity and the pinned Prelude council are not
 established by the scoped tests.
+
+
+## Native runtime execution
+
+The native runtime accepts admitted non-indexed, single-family data whose
+recursive fields return that family after taking nondependent runtime arguments.
+For example, `children : Nat -> Branching` is stored as an owned closure, not
+expanded into a tree while compiling or constructing its parent.
+
+Source matches and structural recursive calls on applied children execute through
+the existing checked recursor and native closure paths. Child functions can have
+multiple arguments, including explicitly bound callbacks. Ground type parameters,
+owned string payloads, changing accumulators, and maps returning new child
+closures are supported. `examples/native_function_child_runtime.lean` maps a tree and
+later traverses its returned closures, producing `42`.
+
+The representation worklist uses provisional data anchors to resolve callbacks
+whose result is their enclosing family. A refused or exhausted discovery removes
+every new anchor, callable interface, and constructor binding; it does not expose
+a partially validated runtime layout. This affects post-admission compilation
+only. Both logical checkers still check the original source declarations.
+
+An induction hypothesis for a function field is itself a closure: applying it
+selects the child and invokes the recursive computation. Its native lambda spine
+includes both child arguments and the motive's accumulator arguments. Unused
+hypotheses do not invoke child functions; computed constructor fields remain
+strict. This is not memoization of repeated applications of a child function.
+
+The regression targets are `runtime_function_children` in `fln`, the layout
+discovery unit tests, and `source_mutual_data` in `fln-cli`. The installed tests
+also run serialized FLBC in a new process without the source environment.
+
+Value-dependent fields and motives, indexed runtime families, proof erasure,
+nested recursive containers, and mutually recursive function fields remain
+outside this increment. Inline lambda arguments to dynamic callback calls retain
+the existing runtime limitation; explicitly bound local callbacks are supported.
+No full Reference ABI parity, whole-program performance claim, or Golem parent
+bead closure is implied.

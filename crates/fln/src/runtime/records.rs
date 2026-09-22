@@ -1,8 +1,9 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
 //! Closed type parameters are specialized, never stored as runtime fields.
-//! Direct self- and mutually recursive object fields are supported; value-dependent,
-//! higher-order recursive and proof-valued fields remain explicit refusals.
+//! Direct self- and mutually recursive object fields, and nondependent
+//! function-valued self children are supported. Dependent and
+//! proof-valued fields remain explicit refusals.
 //! Nondependent function fields are owned closures with checked interfaces.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
@@ -60,7 +61,7 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if family.is_unsafe
-            || family.is_reflexive
+            || (family.is_reflexive && family.all.len() != 1)
             || family.num_params as usize != parameters.len()
             || family.num_indices != 0
             || family.num_nested != 0
@@ -244,6 +245,39 @@ impl Preparation<'_> {
     /// alternating those types must not alternate recursive Rust calls.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
         let source = self.normalize_type(source)?;
+        if let Some((value, _)) = executable_value_type(&source, &self.value_types) {
+            return Ok(Some(value));
+        }
+        let first_interface = self.interfaces.len();
+        let first_constructor = self.constructors.len();
+        let mut added_records = Vec::new();
+        let result = self.discover_value_type(source, &mut added_records);
+        if !matches!(result, Ok(Some(_))) {
+            // Data anchors let a callback return its enclosing family without
+            // recursively reentering discovery. They are not valid bindings
+            // until the entire representation graph has finished. Roll back
+            // every dependent interface and constructor on refusal or resource
+            // exhaustion; retain spent work and descriptive normalization caches.
+            for source in added_records {
+                self.value_types.records.remove(&source);
+            }
+            self.value_types.closures.retain(|_, value| {
+                matches!(value, ValueType::Closure(id) if (id.get() as usize) < first_interface)
+            });
+            self.interfaces.truncate(first_interface);
+            while self.constructors.len() > first_constructor {
+                let constructor = self.constructors.pop().expect("new constructor");
+                self.forget_constructor_type(&constructor.name);
+            }
+        }
+        result
+    }
+
+    fn discover_value_type(
+        &mut self,
+        source: Expr,
+        added_records: &mut Vec<Expr>,
+    ) -> Result<Option<ValueType>, IngressError> {
         enum Task {
             Enter(Expr),
             Finish(Vec<Shape>),
@@ -337,6 +371,19 @@ impl Preparation<'_> {
                             })?;
                         active.insert(shape.source.clone());
                     }
+                    for shape in &shapes {
+                        self.tick()?;
+                        reserve(added_records, self.limits.fir.max_constructors)?;
+                        self.value_types.records.try_reserve(1).map_err(|_| {
+                            IngressError::AllocationFailure {
+                                resource: IngressResource::ProgramTables,
+                                requested: self.value_types.records.len().saturating_add(1),
+                            }
+                        })?;
+                        if self.value_types.records.insert(shape.source.clone()) {
+                            added_records.push(shape.source.clone());
+                        }
+                    }
                     let mut dependencies = Vec::new();
                     for field in shapes
                         .iter()
@@ -424,13 +471,6 @@ impl Preparation<'_> {
                             self.remember_constructor_type(ctor.name.clone(), type_)?;
                         }
                         active.remove(&shape.source);
-                        self.value_types.records.try_reserve(1).map_err(|_| {
-                            IngressError::AllocationFailure {
-                                resource: IngressResource::ProgramTables,
-                                requested: self.value_types.records.len().saturating_add(1),
-                            }
-                        })?;
-                        self.value_types.records.insert(shape.source.clone());
                     }
                 }
             }
@@ -737,5 +777,76 @@ mod closure_fields_tests {
         prep.finalize_callables(&mut []).unwrap();
         assert_eq!(prep.constructors[0].fields[0], fields[1]);
         assert_eq!(prep.constructors[1].fields[0], fields[0]);
+    }
+
+    #[test]
+    fn provisional_recursive_layouts_roll_back_on_refusal_and_exhaustion() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .check_source_files(
+                &[b"inductive Good where | leaf | node (f : Nat -> Good)\n\
+                    inductive Bad where | mk (f : Nat -> Bad) (h : 0 = 0)"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let good = Expr::const_(name("Good"), vec![]);
+        let bad = Expr::const_(name("Bad"), vec![]);
+        assert_eq!(
+            prep.value_type(&good).unwrap(),
+            Some(ValueType::Constructor)
+        );
+        let interfaces = prep.interfaces.len();
+        let constructors = prep.constructors.len();
+        let closures = prep.value_types.closures.len();
+        for _ in 0..2 {
+            assert_eq!(prep.value_type(&bad).unwrap(), None);
+            assert!(!prep.value_types.records.contains(&bad));
+            assert_eq!(prep.interfaces.len(), interfaces);
+            assert_eq!(prep.constructors.len(), constructors);
+            assert_eq!(prep.value_types.closures.len(), closures);
+            assert_eq!(
+                prep.value_type(&good).unwrap(),
+                Some(ValueType::Constructor)
+            );
+        }
+        let small = IngressLimits {
+            fir: fln_comp::fir::ValidationLimits {
+                max_constructors: 1,
+                ..IngressLimits::default().fir
+            },
+            ..IngressLimits::default()
+        };
+        let mut stopped = Preparation::new(&engine.environment, small);
+        assert!(matches!(
+            stopped.value_type(&good),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(stopped.value_types.records.is_empty());
+        assert!(stopped.value_types.closures.is_empty());
+        assert!(stopped.interfaces.is_empty());
+        assert!(stopped.constructors.is_empty());
+        stopped.limits = IngressLimits::default();
+        assert_eq!(
+            stopped.value_type(&good).unwrap(),
+            Some(ValueType::Constructor)
+        );
+        let mut clean = Preparation::new(&engine.environment, IngressLimits::default());
+        assert_eq!(
+            clean.value_type(&good).unwrap(),
+            Some(ValueType::Constructor)
+        );
+        assert_eq!(
+            stopped.finalize_callables(&mut []).unwrap(),
+            clean.finalize_callables(&mut []).unwrap()
+        );
+        assert_eq!(stopped.constructors, clean.constructors);
     }
 }

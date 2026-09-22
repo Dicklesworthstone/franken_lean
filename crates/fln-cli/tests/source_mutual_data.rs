@@ -50,6 +50,43 @@ fn heterogeneous_mutual_folds_replay_without_a_source_environment() {
     check_source_and_replay(include_str!("../../../examples/native_mutual_folds.lean"));
 }
 
+#[test]
+fn function_children_survive_mapping_and_independent_bytecode_replay() {
+    check_source_and_replay(include_str!(
+        "../../../examples/native_function_child_runtime.lean"
+    ));
+}
+
+#[test]
+fn imported_function_children_preserve_closures_and_failed_runs_preserve_artifacts() {
+    let dir = directory();
+    let dependency = dir.join("Data.lean");
+    let entry = dir.join("Main.lean");
+    let definitions = include_str!("../../../examples/native_function_child_runtime.lean")
+        .split("#eval")
+        .next()
+        .unwrap();
+    std::fs::write(&dependency, definitions).unwrap();
+    let source = "import Data\n#eval follow (map 3 sample) 19\n";
+    std::fs::write(&entry, source).unwrap();
+    let artifact = dir.join("children.flbc");
+    let output = run(&entry, &artifact);
+    assert!(output.status.success(), "{output:?}");
+    replay(&artifact);
+    let original = std::fs::read(&artifact).unwrap();
+    std::fs::write(&entry, format!("{source}theorem bad : 0 = 1 := by rfl")).unwrap();
+    let failed = dir.join("failed.flbc");
+    let output = run(&entry, &failed);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(!failed.exists());
+    assert_eq!(original, std::fs::read(&artifact).unwrap());
+    std::fs::write(&entry, source).unwrap();
+    let recovered = dir.join("recovered.flbc");
+    assert!(run(&entry, &recovered).status.success());
+    assert_eq!(original, std::fs::read(&recovered).unwrap());
+}
+
 fn check_source_and_replay(source: &str) {
     let path = directory().join("Main.lean");
     let artifact = path.with_extension("flbc");

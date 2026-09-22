@@ -1,4 +1,4 @@
-//! Eliminate admitted direct-self recursive families through native closures.
+//! Eliminate admitted self-recursive families through native closures.
 //! Constructor branches are lazy; each used induction hypothesis is shared in
 //! an ordinary let, while an unused hypothesis never traverses its subtree.
 use super::*;
@@ -14,12 +14,104 @@ pub(super) struct Recursion {
     pub arguments: Vec<Expr>,
 }
 
+/// A positive recursive field may return a family after taking ordinary runtime
+/// arguments. The field itself stays an owned closure; no child is selected or
+/// evaluated while building its layout or induction-hypothesis closure.
+pub(super) struct RecursiveField {
+    pub target: usize,
+    binders: Vec<(Name, Expr, BinderInfo)>,
+}
+
 fn variable(index: usize) -> Result<Expr, IngressError> {
     let index = u32::try_from(index).map_err(|_| unsupported("recursive data binder count"))?;
     Expr::bvar(index).map_err(|_| unsupported("recursive data binder scope"))
 }
 
 impl Preparation<'_> {
+    pub(super) fn recursive_field(
+        &mut self,
+        type_: &Expr,
+        families: &[Expr],
+    ) -> Result<Option<RecursiveField>, IngressError> {
+        let mut result = type_;
+        let mut binders = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = result.node()
+        {
+            self.tick()?;
+            if body.has_loose_bvars() {
+                return Ok(None);
+            }
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            result = body;
+        }
+        for (target, family) in families.iter().enumerate() {
+            self.tick()?;
+            if result == family {
+                return Ok(Some(RecursiveField { target, binders }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn recursive_hypothesis(
+        &mut self,
+        recursive: &RecursiveField,
+        callee: Expr,
+        field: Expr,
+        result_type: &Expr,
+    ) -> Result<(Expr, Expr), IngressError> {
+        if recursive.binders.is_empty() {
+            return Ok((Expr::app(callee, field), result_type.clone()));
+        }
+        let mut binders = recursive.binders.clone();
+        let mut result = result_type;
+        // The native callable interface is flat. Give this generated closure
+        // real binders for every accumulator too, rather than registering a
+        // longer signature against a shorter lambda spine. This does not eta
+        // expand arbitrary user closures or evaluate the child early.
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = result.node()
+        {
+            self.tick()?;
+            if body.has_loose_bvars() {
+                return Err(unsupported("dependent recursive child result"));
+            }
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            result = body;
+        }
+        let count = binders.len();
+        let extra = count - recursive.binders.len();
+        let depth = u32::try_from(count).map_err(|_| unsupported("recursive child arity"))?;
+        let mut child = self.lift(&field, depth)?;
+        for argument in (extra..count).rev() {
+            self.tick()?;
+            child = Expr::app(child, variable(argument)?);
+        }
+        let mut body = Expr::app(self.lift(&callee, depth)?, child);
+        for argument in (0..extra).rev() {
+            self.tick()?;
+            body = Expr::app(body, variable(argument)?);
+        }
+        let mut type_ = self.lift(result, depth)?;
+        for (name, domain, info) in binders.iter().rev() {
+            self.tick()?;
+            body = Expr::lam(name.clone(), domain.clone(), body, *info);
+            type_ = Expr::forall_e(name.clone(), domain.clone(), type_, *info);
+        }
+        Ok((body, type_))
+    }
+
     pub(super) fn data_recursion(
         &mut self,
         name: &Name,
@@ -139,24 +231,33 @@ impl Preparation<'_> {
                 self.tick()?;
                 let field = Expr::proj(shape.projection(ctor), field_index as u64, major.clone());
                 body = self.minor_apply(body, field.clone())?;
-                if field_type == &family {
+                if let Some(recursive) =
+                    self.recursive_field(field_type, std::slice::from_ref(&family))?
+                {
+                    debug_assert_eq!(recursive.target, 0);
                     let marker = FVarId(Name::num(
                         Name::num(case_name.clone(), index as u64),
                         field_index as u64,
                     ));
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;
-                    hypotheses.push((marker, Expr::app(variable(extra + 2)?, field)));
+                    let (hypothesis, type_) = self.recursive_hypothesis(
+                        &recursive,
+                        variable(extra + 2)?,
+                        field,
+                        &hypothesis_type,
+                    )?;
+                    hypotheses.push((marker, hypothesis, type_));
                 }
             }
             // The admitted recursor puts IHs after all constructor fields.
-            for (marker, _) in &hypotheses {
+            for (marker, _, _) in &hypotheses {
                 self.tick()?;
                 body = self.minor_apply(body, Expr::fvar(marker.clone()))?;
             }
             for argument in (0..extra).rev() {
                 body = self.minor_apply(body, variable(argument + 1)?)?;
             }
-            for (marker, hypothesis) in hypotheses.into_iter().rev() {
+            for (marker, hypothesis, type_) in hypotheses.into_iter().rev() {
                 self.tick()?;
                 let abstracted = body
                     .lift_loose(0, 1)
@@ -166,13 +267,7 @@ impl Preparation<'_> {
                 // can only be this marker. Check individually so an ignored
                 // child is not forced merely because another child is used.
                 if abstracted.has_loose_bvar(0) {
-                    body = Expr::let_e(
-                        marker.0,
-                        hypothesis_type.clone(),
-                        hypothesis,
-                        abstracted,
-                        false,
-                    );
+                    body = Expr::let_e(marker.0, type_, hypothesis, abstracted, false);
                 }
             }
             reserve(&mut branches, self.limits.max_lambda_bindings)?;
