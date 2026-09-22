@@ -462,4 +462,107 @@ fn lake_personality_package_lifecycle_init_new_and_clean() {
     assert!(init_dir.join("CoolMath.lean").exists());
 }
 
+#[test]
+fn lake_personality_update_env_and_exe() {
+    let temp_parent = std::env::temp_dir().join(format!(
+        "fln-lake-update-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_parent).unwrap();
+
+    let pkg_dir = temp_parent.join("my_project");
+    let toml_content = r#"
+name = "my_project"
+version = "0.1.0"
+defaultTargets = ["my_project"]
+
+[[require]]
+name = "batteries"
+git = "https://github.com/leanprover-community/batteries.git"
+rev = "v4.32.0"
+"#;
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("lakefile.toml"), toml_content).unwrap();
+
+    // 1. lake update
+    let update_output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "update"])
+        .output()
+        .expect("run lake update");
+    assert!(
+        update_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update_output.stderr)
+    );
+    assert!(pkg_dir.join("lake-manifest.json").exists());
+
+    let manifest_content = std::fs::read_to_string(pkg_dir.join("lake-manifest.json")).unwrap();
+    assert!(manifest_content.contains("\"name\": \"my_project\""));
+    assert!(manifest_content.contains("\"batteries\""));
+
+    // 2. lake update --json
+    let update_json = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "update"])
+        .output()
+        .expect("run lake update --json");
+    assert!(update_json.status.success());
+    let update_json_stdout = String::from_utf8(update_json.stdout).expect("utf8 stdout");
+    assert!(update_json_stdout.contains("\"schema\":\"fln.lake-update/1\""));
+    assert!(update_json_stdout.contains("\"package\":\"my_project\""));
+
+    // 3. lake env (bare)
+    let env_output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("env")
+        .output()
+        .expect("run lake env");
+    assert!(env_output.status.success());
+    let env_stdout = String::from_utf8(env_output.stdout).expect("utf8 stdout");
+    assert!(env_stdout.contains("LEAN_SYSROOT="));
+    assert!(env_stdout.contains("LEAN_PATH="));
+    assert!(env_stdout.contains("ELAN_TOOLCHAIN="));
+
+    // 4. lake env echo hello
+    let env_echo = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["env", "echo", "testing_lake_env_propagation"])
+        .output()
+        .expect("run lake env echo");
+    assert!(env_echo.status.success());
+    let env_echo_stdout = String::from_utf8(env_echo.stdout).expect("utf8 stdout");
+    assert!(env_echo_stdout.contains("testing_lake_env_propagation"));
+
+    // 5. lake env with nonexistent command exits 255
+    let env_missing = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["env", "nonexistent_command_12345_xyz"])
+        .output()
+        .expect("run lake env missing");
+    assert_eq!(env_missing.status.code(), Some(255));
+    let env_missing_stderr = String::from_utf8(env_missing.stderr).expect("utf8 stderr");
+    assert!(env_missing_stderr.contains("could not execute external process"));
+
+    // 6. lake exe without target exits 1 with "missing executable target"
+    let exe_no_target = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("exe")
+        .output()
+        .expect("run lake exe without target");
+    assert_eq!(exe_no_target.status.code(), Some(1));
+    let exe_no_target_stderr = String::from_utf8(exe_no_target.stderr).expect("utf8 stderr");
+    assert!(exe_no_target_stderr.contains("error: missing executable target"));
+
+    // 7. lake exe with target in empty directory exits 1 with "no such file or directory"
+    let empty_dir = temp_parent.join("empty");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let exe_empty = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", empty_dir.to_str().unwrap(), "exe", "my_target"])
+        .output()
+        .expect("run lake exe in empty dir");
+    assert_eq!(exe_empty.status.code(), Some(1));
+    let exe_empty_stderr = String::from_utf8(exe_empty.stderr).expect("utf8 stderr");
+    assert!(exe_empty_stderr.contains("error: no such file or directory"));
+}
+
+
 

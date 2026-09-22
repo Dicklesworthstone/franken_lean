@@ -12159,7 +12159,111 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 }
             }
         }
-        "query" | "check-build" | "test" | "lint" | "env" | "exe" | "lean" => {
+        "update" => {
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            match fln_lake::update_manifest(&target_dir) {
+                Ok(manifest) => {
+                    if is_json {
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"success\",\"package\":\"{}\",\"packages_count\":{}}}\n",
+                            manifest.name,
+                            manifest.packages.len()
+                        ))
+                    } else {
+                        MultiplexerOutput::success(String::new())
+                    }
+                }
+                Err(err) => {
+                    if is_json {
+                        MultiplexerOutput::failure(
+                            format!(
+                                "{{\"schema\":\"fln.lake-update/1\",\"status\":\"error\",\"error\":\"{err}\"}}\n"
+                            ),
+                            1,
+                        )
+                    } else {
+                        MultiplexerOutput::failure(format!("{err}\n"), 1)
+                    }
+                }
+            }
+        }
+        "exe" => {
+            let Some(target) = command_args.first() else {
+                return MultiplexerOutput::failure(
+                    "error: missing executable target\n".to_owned(),
+                    1,
+                );
+            };
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            match fln_lake::LakeConfig::discover(&target_dir) {
+                Ok(_cfg) => MultiplexerOutput::failure(
+                    format!(
+                        "lake exe {target}: executable execution requires Golem G2 execution pipeline (plan §13.3, §17.1)\n"
+                    ),
+                    1,
+                ),
+                Err(fln_lake::LakeDiscoveryError::NotFound(p)) => MultiplexerOutput::failure(
+                    format!(
+                        "error: no such file or directory (error code: 2)\n  file: {}\n",
+                        p.join("lakefile.lean").display()
+                    ),
+                    1,
+                ),
+                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+            }
+        }
+        "env" => {
+            let prefix = std::env::var_os("LEAN_SYSROOT")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|exe| derive_lean_installation_paths(&exe).ok().map(|p| p.prefix))
+                })
+                .unwrap_or_else(|| PathBuf::from("/usr/local"));
+
+            if command_args.is_empty() {
+                let mut out = String::new();
+                out.push_str(&format!(
+                    "ELAN_TOOLCHAIN=leanprover/lean4:{}\n",
+                    fln::OLEAN_PIN_TAG
+                ));
+                out.push_str(&format!("LEAN_SYSROOT={}\n", prefix.display()));
+                out.push_str(&format!(
+                    "LEAN_PATH={}\n",
+                    prefix.join("lib").join("lean").display()
+                ));
+                out.push_str(&format!(
+                    "LEAN_SRC_PATH={}\n",
+                    prefix.join("src").join("lean").display()
+                ));
+                MultiplexerOutput::success(out)
+            } else {
+                let subcmd = &command_args[0];
+                let subargs = &command_args[1..];
+                let mut proc = std::process::Command::new(subcmd);
+                proc.args(subargs);
+                proc.env(
+                    "ELAN_TOOLCHAIN",
+                    format!("leanprover/lean4:{}", fln::OLEAN_PIN_TAG),
+                );
+                proc.env("LEAN_SYSROOT", &prefix);
+                proc.env("LEAN_PATH", prefix.join("lib").join("lean"));
+                proc.env("LEAN_SRC_PATH", prefix.join("src").join("lean"));
+                match proc.output() {
+                    Ok(output) => MultiplexerOutput {
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                        exit_code: output.status.code().unwrap_or(1) as u8,
+                    },
+                    Err(_) => MultiplexerOutput::failure(
+                        format!("could not execute external process '{subcmd}'\n"),
+                        255,
+                    ),
+                }
+            }
+        }
+        "query" | "check-build" | "test" | "lint" | "lean" => {
             MultiplexerOutput::failure(
                 format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
                 1,
