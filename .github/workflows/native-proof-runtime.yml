@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   verify-and-export:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
       contents: write
@@ -137,7 +137,7 @@ jobs:
           python3 -I target/proof-publication/apply.py 1
       - name: Install repository toolchain
         run: |
-          channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
+          channel=$(python3 -I -c 'import re; m=re.findall(r"(?m)^channel\s*=\s*\"([^\"]+)\"", open("rust-toolchain.toml").read()); assert len(m)==1; print(m[0])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv | tee target/proof-publication/compiler.txt
       - name: Validate and export the first feature
