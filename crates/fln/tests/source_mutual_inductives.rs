@@ -267,3 +267,206 @@ fn constructor_collisions_and_resource_stops_leave_the_original_engine_reusable(
     assert_eq!(base.logical_root(&KVMap::new()), root);
     admit(&source, &SourceScope::default());
 }
+
+const MUTUAL_FILE: &str = "mutual
+  inductive Tree (A : Type) where | node (value : A) (children : Forest A)
+  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)
+end
+";
+
+#[test]
+fn source_files_admit_mutual_groups_before_using_their_eliminators() {
+    let e = engine();
+    let source = format!("{MUTUAL_FILE}
+def value (t : Tree Nat) : Nat := match t with | .node n xs => n
+def tree : Tree Nat := Tree.node 7 (@Forest.nil Nat)
+theorem computed : value tree = 7 := by rfl
+theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by cases t with | node n xs => exact h");
+    let root = e.logical_root(&KVMap::new());
+    let checked = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.commands, 5);
+    assert_eq!(checked.theorems, 2);
+    for name in [
+        "Tree",
+        "Forest",
+        "Tree.rec",
+        "Forest.rec",
+        "computed",
+        "keep",
+    ] {
+        assert!(checked.engine.environment().contains(&n(name)), "{name}");
+    }
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    let repeated = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.result_logical_root, repeated.result_logical_root);
+}
+
+#[test]
+fn groups_preserve_namespace_and_universe_scope_and_single_member_groups_work() {
+    let e = engine();
+    let source = "namespace Demo
+universe u
+mutual
+  inductive Tree (A : Type u) where | node (value : A) (xs : Forest A)
+  inductive Forest (B : Type u) where | nil | cons (t : Tree B)
+end
+def tree : Tree Nat := Tree.node 7 (@Forest.nil Nat)
+end Demo
+mutual
+  inductive Flag where | off | on
+end
+def flag : Flag := Flag.on
+def outside : Demo.Tree Nat := Demo.tree";
+    let checked = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for name in [
+        "Demo.Tree",
+        "Demo.Forest",
+        "Demo.tree",
+        "Flag",
+        "flag",
+        "outside",
+    ] {
+        assert!(checked.engine.environment().contains(&n(name)), "{name}");
+    }
+    assert!(!checked.engine.environment().contains(&n("Tree")));
+}
+
+#[test]
+fn source_group_failure_never_publishes_a_family_or_a_prior_file() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    for group in [
+        "mutual inductive A where | mk (f : B -> Nat) inductive B where | mk (a : A) end",
+        "mutual inductive A (T : Type) where | mk (b : B Nat) inductive B (T : Type) where | mk end",
+        "mutual inductive A where | mk inductive A where | other end",
+        "mutual inductive Nat where | fake inductive B where | mk end",
+        "mutual inductive A where | mk inductive B where | mk : Nat end",
+        "mutual inductive A where | mk inductive B where | mk",
+    ] {
+        let result = e.check_source_files(
+            &[b"def prefix := 7", group.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(result.is_err(), "{group}: {result:?}");
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+        assert!(!e.environment().contains(&n("prefix")));
+        assert!(!e.environment().contains(&n("A")));
+    }
+    check(&e, MUTUAL_FILE);
+}
+
+#[test]
+fn mutual_source_budget_stops_are_nonanswers_with_reusable_inputs() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let mut low = SourceCheckLimits::new(limits());
+    low.admission.kernel = low.admission.kernel.narrowed(0, 32);
+    match e.check_source_files(&[MUTUAL_FILE.as_bytes()], &KVMap::new(), low) {
+        Ok(fln::Outcome::Inconclusive(_)) => {}
+        Err(error) => assert!(
+            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+            "{error:?}"
+        ),
+        other => panic!("exhaustion is not a verdict: {other:?}"),
+    }
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    check(&e, MUTUAL_FILE);
+}
+
+#[test]
+fn source_module_cache_reuses_and_invalidates_the_whole_mutual_unit() {
+    use fln::SourceModuleInput;
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+    let mut session = SourceModuleSession::new(
+        engine(),
+        KVMap::new(),
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        SourceModuleCacheLimits::default(),
+    );
+    let main = n("Main");
+    let data = n("Data");
+    let text = "import Data\ndef sample : Tree Nat := Tree.node 7 (@Forest.nil Nat)\ntheorem valid : sample = Tree.node 7 (@Forest.nil Nat) := by rfl";
+    let files = [
+        SourceModuleInput {
+            name: &main,
+            source: text.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &data,
+            source: MUTUAL_FILE.as_bytes(),
+        },
+    ];
+    let cold = session
+        .check_with_cancel(&files, &main, None)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((cold.reused_modules, cold.elaborated_modules), (0, 2));
+    let warm = session
+        .check_with_cancel(&files, &main, None)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((warm.reused_modules, warm.elaborated_modules), (2, 0));
+    assert_eq!(
+        cold.checked.checked.result_logical_root,
+        warm.checked.checked.result_logical_root
+    );
+    let invalid = [files[0], SourceModuleInput { name: &data, source: b"mutual inductive Tree where | mk (f : Forest -> Nat) inductive Forest where | mk end" }];
+    assert!(session.check_with_cancel(&invalid, &main, None).is_err());
+    let recovered = session
+        .check_with_cancel(&files, &main, None)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(recovered.reused_modules, 2);
+    assert_eq!(
+        cold.checked.checked.result_logical_root,
+        recovered.checked.checked.result_logical_root
+    );
+    let revised = format!("{MUTUAL_FILE}\ndef changed : Nat := 9");
+    let revised_files = [
+        files[0],
+        SourceModuleInput {
+            name: &data,
+            source: revised.as_bytes(),
+        },
+    ];
+    let changed = session
+        .check_with_cancel(&revised_files, &main, None)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((changed.reused_modules, changed.elaborated_modules), (0, 2));
+    assert_ne!(
+        changed.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+}

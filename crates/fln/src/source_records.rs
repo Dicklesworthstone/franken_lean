@@ -42,7 +42,8 @@ impl Engine {
         Ok(Outcome::Complete(engine))
     }
 
-    /// Admit one definition, theorem, instance, structure, class or inductive command.
+    /// Admit one definition, theorem, instance, structure, class or inductive command,
+    /// including a complete `mutual ... end` inductive group.
     /// A record's block and projections all pass K1 and the independent checker
     /// before class metadata is registered. No failed prefix is exposed.
     pub fn admit_source_command(
@@ -66,6 +67,33 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        if let Some(members) = fln_parse::command_scope::mutual::parse(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?
+        {
+            let candidate = if members.len() == 1 {
+                fln_elab::source::scope::elaborate_inductive(
+                    &members[0],
+                    self.environment(),
+                    limits.kernel,
+                    fln_elab::records::RecordBudget::default(),
+                    scope,
+                )
+            } else {
+                fln_elab::source::scope::elaborate_mutual_inductives(
+                    &members,
+                    self.environment(),
+                    limits.kernel,
+                    fln_elab::records::RecordBudget::default(),
+                    scope,
+                )
+            }
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+            return self
+                .admit_declarations(&[candidate], options, limits)
+                .map_err(EngineExecutionError::from);
+        }
         let parsed = fln_parse::parse_definition(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;

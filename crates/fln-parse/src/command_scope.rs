@@ -4,6 +4,7 @@ use super::*;
 pub mod attributes;
 pub mod imports;
 pub mod instances;
+pub mod mutual;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
@@ -21,6 +22,7 @@ fn table() -> TokenTable {
     let mut table = source_module_token_table();
     for keyword in [
         "prelude",
+        "mutual",
         "namespace",
         "section",
         "end",
@@ -140,8 +142,22 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     };
     let mut declaration_column = None;
     let mut attribute_prefix = false;
+    let mut mutual_until = 0;
     for (index, token) in tokens.iter().enumerate() {
+        if index < mutual_until {
+            continue;
+        }
         if let TokenKind::Symbol(symbol) = &token.kind {
+            if depth == 0 && symbol == "mutual" {
+                // A mutual group is one admission unit. In particular its end
+                // cannot close the surrounding namespace or section, and no
+                // member may be published before the entire group is checked.
+                starts.push(view.to_original(token.extent.start()).0);
+                mutual_until = mutual::block_end(&view, &tokens, index)? + 1;
+                declaration_column = None;
+                attribute_prefix = false;
+                continue;
+            }
             let command_line = (index == 0
                 || source_view.line_of(token.extent.start())
                     > source_view.line_of(tokens[index - 1].extent.end()))

@@ -39,11 +39,23 @@ theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by
   | node n children => exact h
 ```
 
-The tests construct that block through the existing native mutual-source
-candidate API and ordinary dual-checker admission before checking these source
-functions. They do not claim a new `mutual ... end` parser, full upstream
-eliminator compatibility, general mutual function recursion, termination
-inference, or runtime-code-generator support. Ordinary pattern matching is not
+`fln check-source` also accepts actual `mutual ... end` groups containing one
+to eight inductive declarations. The group is a single source command and a
+single atomic admission unit, including when loaded from an imported source
+module. Namespace and universe scope are inherited by all members; the group's
+`end` does not close its surrounding namespace. Constructors and eliminators
+are available to subsequent commands only after both checkers accept the entire
+group. A malformed or rejected member, duplicate declaration, missing `end`, or
+resource stop exposes no partially admitted family. Cached source modules retain
+and invalidate the whole checked unit.
+
+Run `fln check-source --json examples/native_mutual_groups.lean` for a complete
+source-file example with constructor use, computation proofs and dependent
+`cases`. The programmatic mutual-source candidate API remains available too.
+Nested groups, mixed declaration kinds, mutual function recursion, full upstream
+eliminator compatibility, termination inference, and runtime-code-generator
+support are not established by this source-admission increment.
+Ordinary pattern matching is not
 permission to treat a sibling's induction hypothesis as a recursive call on the
 selected family. General mutual `induction` remains explicitly unsupported;
 ordinary `cases` does not introduce that stronger capability.
