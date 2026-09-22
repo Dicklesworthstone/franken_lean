@@ -18,6 +18,7 @@ mod watch;
 mod workspace;
 pub use workspace::{WorkspaceChecker, serve_workspace};
 mod documents;
+pub mod semantic;
 use documents::CheckSource;
 pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
 mod json;
@@ -931,7 +932,12 @@ fn serve_inner(
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
                 file_watcher.configure(envelope.params, on_did_open.tracks_dependencies());
-                write_protocol_message(output, initialize_response(request_id))?;
+                let response = if on_did_open.semantic_queries() {
+                    semantic::initialize_response(request_id)
+                } else {
+                    initialize_response(request_id)
+                };
+                write_protocol_message(output, response)?;
                 state = ServerState::Initializing;
             }
             ("initialize", Some(request_id), _) => {
@@ -1088,8 +1094,19 @@ fn serve_inner(
                 write_warning(output, message)?;
             }
             ("$/lean/plainGoal", Some(request_id), state)
-            | ("$/lean/plainTermGoal", Some(request_id), state)
-            | ("textDocument/hover", Some(request_id), state)
+            | ("textDocument/hover", Some(request_id), state) => {
+                if running_request(output, state, request_id)? {
+                    semantic::handle(
+                        output,
+                        &session,
+                        on_did_open,
+                        request_id,
+                        &method,
+                        envelope.params,
+                    )?;
+                }
+            }
+            ("$/lean/plainTermGoal", Some(request_id), state)
             | ("textDocument/completion", Some(request_id), state)
             | ("textDocument/definition", Some(request_id), state) => {
                 if running_request(output, state, request_id)? {

@@ -289,3 +289,146 @@ fn inspection_cannot_contaminate_later_checking_or_accept_false_proofs() {
             .contains(&name("good"))
     );
 }
+
+const MUTUAL_DATA: &str = "mutual
+  inductive Tree (A : Type) where | node (value : A) (children : Forest A)
+  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)
+end";
+
+#[test]
+fn mutual_imports_supply_branch_locals_without_publishing_the_observed_proof() {
+    let main = name("Main");
+    let data = name("Data");
+    let source = "import Data\ntheorem pending (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by\n  cases t with\n  | node n xs => exact h";
+    let inputs = [
+        SourceModuleInput {
+            name: &main,
+            source: source.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &data,
+            source: MUTUAL_DATA.as_bytes(),
+        },
+    ];
+    let mut session = session();
+    let result = session
+        .inspect(
+            &inputs,
+            &main,
+            source.find("exact h").unwrap(),
+            ObservationKind::Goals,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let environment = result.prefix.checked.checked.engine.environment();
+    for declaration in ["Tree", "Forest", "Tree.rec", "Forest.rec"] {
+        assert!(environment.contains(&name(declaration)), "{declaration}");
+    }
+    assert!(!environment.contains(&name("pending")));
+    let observed = goals(result);
+    assert_eq!(observed.len(), 1);
+    let goal = &observed[0];
+    assert_eq!(
+        goal.target,
+        goal.locals.find_by_user_name(&name("h")).unwrap().type_
+    );
+    assert!(goal.locals.find_by_user_name(&name("t")).is_none());
+    assert!(goal.locals.find_by_user_name(&name("n")).is_some());
+    assert!(goal.locals.find_by_user_name(&name("xs")).is_some());
+    let checked = session
+        .check(&inputs, &main)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        checked
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("pending"))
+    );
+}
+
+#[test]
+fn an_invalid_mutual_import_cannot_reuse_a_previously_observed_environment() {
+    let main = name("Main");
+    let data = name("Data");
+    let source = "import Data\ndef pending : Tree Nat := by";
+    let inputs = [
+        SourceModuleInput {
+            name: &main,
+            source: source.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &data,
+            source: MUTUAL_DATA.as_bytes(),
+        },
+    ];
+    let mut session = session();
+    let good = session
+        .inspect(&inputs, &main, source.len(), ObservationKind::Goals)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let good_root = good.prefix.checked.checked.result_logical_root;
+    let good_goals = goals(good);
+    assert_eq!(good_goals.len(), 1);
+    let corrupt = [inputs[0], SourceModuleInput { name: &data, source: b"mutual inductive Tree where | mk (f : Forest -> Nat) inductive Forest where | mk (t : Tree) end" }];
+    assert!(
+        session
+            .inspect(&corrupt, &main, source.len(), ObservationKind::Goals)
+            .is_err()
+    );
+    let recovered = session
+        .inspect(&inputs, &main, source.len(), ObservationKind::Goals)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        recovered.prefix.checked.checked.result_logical_root,
+        good_root
+    );
+    assert_eq!(goals(recovered)[0].target, good_goals[0].target);
+    assert!(session.check(&inputs, &main).is_err());
+}
+
+#[test]
+fn empty_nested_assertion_proofs_are_never_successfully_checked() {
+    let main = name("Main");
+    for source in [
+        "def pending : Nat := show Nat by",
+        "theorem pending : False := by",
+        "theorem pending : False := show False by",
+        "theorem pending : True := have missing : False := (by); True.intro",
+    ] {
+        let mut session = session();
+        assert!(
+            session
+                .check(
+                    &[SourceModuleInput {
+                        name: &main,
+                        source: source.as_bytes()
+                    }],
+                    &main
+                )
+                .is_err(),
+            "{source}"
+        );
+        let valid = "theorem recovered : True := by exact True.intro";
+        assert!(
+            session
+                .check(
+                    &[SourceModuleInput {
+                        name: &main,
+                        source: valid.as_bytes()
+                    }],
+                    &main
+                )
+                .unwrap()
+                .into_complete()
+                .is_ok()
+        );
+    }
+}

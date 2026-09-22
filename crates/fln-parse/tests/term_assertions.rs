@@ -28,7 +28,6 @@ fn incomplete_assertions_never_drop_a_type_value_or_continuation() {
         "def x : Nat := show Nat",
         "def x : Nat := show from 0",
         "def x : Nat := show Nat from",
-        "def x : Nat := show Nat by",
         "def x : Nat := have h Nat := 0; h",
     ] {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
@@ -199,4 +198,31 @@ fn deep_multiline_assertions_keep_the_small_stack_bound() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn empty_assertion_proofs_retain_the_unsolved_tactic_sequence() {
+    for source in [
+        "def x : Nat := show Nat by",
+        "theorem pending : False := by",
+        "-- 🦀\r\ntheorem pending : False := by /- no proof yet -/\r\n",
+    ] {
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace("\r\n", "\n").as_bytes()
+        );
+        let mut pending = vec![parsed.syntax()];
+        let mut empty = false;
+        while let Some(node) = pending.pop() {
+            if let fln_syntax::tree::Syntax::Node { kind, args, .. } = node {
+                if kind.to_display_string() == "Lean.Parser.Tactic.tacticSeq1Indented" {
+                    empty |= matches!(args.as_slice(), [fln_syntax::tree::Syntax::Node { args, .. }] if args.is_empty());
+                }
+                pending.extend(args);
+            }
+        }
+        assert!(empty, "{source}");
+    }
 }

@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+pub mod inspect;
 mod instance_attributes;
 pub mod modules;
 mod scopes;

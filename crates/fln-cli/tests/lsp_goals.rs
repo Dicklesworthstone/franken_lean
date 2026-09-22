@@ -262,3 +262,54 @@ fn queries_check_the_current_unsaved_import_closure() {
             || reply(&messages, "changed").contains("value : Bool")
     );
 }
+
+#[test]
+fn mutual_import_goals_use_current_editor_text_and_recover_after_a_bad_group() {
+    let data_uri = "file:///tmp/MutualGoalData.lean";
+    let main_uri = "file:///tmp/MutualGoalMain.lean";
+    let library = "mutual\n  inductive Tree (A : Type) where | node (value : A) (children : Forest A)\n  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)\nend";
+    let source = "import MutualGoalData\ndef pending : Tree Nat := by";
+    let branch = "import MutualGoalData\ntheorem pending (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by\n  cases t with\n  | node n xs => exact h";
+    let messages = run(
+        env!("CARGO_BIN_EXE_fln"),
+        &["serve-lsp"],
+        vec![
+            open(data_uri, library),
+            open(main_uri, source),
+            query("initial", "$/lean/plainGoal", main_uri, 1, 999),
+            change(
+                data_uri,
+                2,
+                "mutual inductive Tree where | mk (f : Forest -> Nat) inductive Forest where | mk (t : Tree) end",
+            ),
+            query("invalid", "$/lean/plainGoal", main_uri, 1, 999),
+            change(data_uri, 3, library),
+            query("recovered", "$/lean/plainGoal", main_uri, 1, 999),
+            change(main_uri, 2, branch),
+            query("field", "$/lean/plainGoal", main_uri, 3, 17),
+            query("evidence", "textDocument/hover", main_uri, 3, 23),
+        ],
+    );
+    for id in ["initial", "recovered"] {
+        assert!(
+            reply(&messages, id).contains("⊢ (Tree Nat)"),
+            "{messages:#?}"
+        );
+    }
+    assert!(
+        reply(&messages, "invalid").contains("\"code\":-32803"),
+        "{messages:#?}"
+    );
+    assert!(
+        reply(&messages, "field").contains("n : Nat"),
+        "{messages:#?}"
+    );
+    assert!(
+        reply(&messages, "field").contains("xs : (Forest Nat)"),
+        "{messages:#?}"
+    );
+    assert!(
+        reply(&messages, "evidence").contains("h : (P"),
+        "{messages:#?}"
+    );
+}

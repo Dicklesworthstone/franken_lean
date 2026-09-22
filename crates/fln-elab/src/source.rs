@@ -22,6 +22,7 @@ mod level_syntax;
 mod levels;
 mod local_functions;
 pub use level_syntax::LevelSyntaxError;
+pub mod inspect;
 mod matching;
 mod patterns;
 mod record;
@@ -54,13 +55,17 @@ pub enum SourceInferenceError {
     Record(crate::records::RecordError),
     TypeObligation(Box<Outcome<Verdict>>),
     Tactic(tactics::TacticError),
-    UnresolvedHoles { count: usize },
+    UnresolvedHoles {
+        count: usize,
+    },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     SimpSet(scope::simp::SimpSetError),
     ResourceLimit,
+    /// Private inspection stopped at a source boundary; never an admitted declaration.
+    ObservationComplete,
     Scope,
     Universe(crate::universe::UniverseInstantiationError),
     Unification(Box<UnificationError>),
@@ -108,6 +113,9 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
+            Self::ObservationComplete => {
+                write!(f, "source observation completed without admission")
+            }
             Self::ResourceLimit => write!(f, "source elaboration work limit reached"),
             Self::Scope => write!(
                 f,
@@ -166,6 +174,7 @@ impl SourceEquation {
 
 #[derive(Clone)]
 struct Context {
+    inspection: Option<inspect::Probe>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -201,6 +210,7 @@ impl Context {
         let mut txn = ElabTxn::new(env.clone(), KVMap::new(), 0);
         txn.budget.max_heartbeats = 1_000_000;
         Self {
+            inspection: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
@@ -806,6 +816,7 @@ impl Context {
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, Expr),
             Visit(&'a Syntax, Option<Expr>, bool),
+            Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
@@ -914,7 +925,14 @@ impl Context {
                                 }
                             }
                         }
+                        Task::Observe(syntax, locals) => {
+                            let term = values.last().expect("observed term visit");
+                            self.observe_term(syntax, term.clone(), locals)?;
+                        }
                         Task::Visit(syntax, expected, finish) => {
+                            if self.observes_term(syntax) {
+                                tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
+                            }
                             if let Some(inner) = parenthesized_inner(syntax)? {
                                 tasks.push(Task::Visit(inner, expected, finish));
                                 continue;
@@ -2252,6 +2270,13 @@ fn definition_scoped(
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     let mut context = Context::scoped(environment, kernel, scope);
+    definition_in_context(syntax, &mut context)
+}
+
+fn definition_in_context(
+    syntax: &Syntax,
+    context: &mut Context,
+) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),

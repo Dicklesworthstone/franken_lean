@@ -890,7 +890,7 @@ mod tests {
         assert!(receipt.contains("\"cancellationsBeforeResponse\":1"));
         assert!(receipt.contains("\"responsesBeforeRequests\":0"));
         assert!(
-            receipt.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\"")
+            receipt.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/6\"")
         );
     }
 

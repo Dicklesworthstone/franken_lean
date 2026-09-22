@@ -232,6 +232,7 @@ impl Context {
             return Ok(vec![Work::Close(goal.clone(), value)]);
         }
         let mut proof = ProofState {
+            extent: None,
             saved: goal.lctx.clone(),
             target: goal.target.clone(),
             root: Expr::mvar(goal.id.clone()),

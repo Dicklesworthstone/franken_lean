@@ -37,6 +37,8 @@ pub struct CorrelationStats {
     pub diagnostic_wait_cancelled_errors: u64,
     pub diagnostic_wait_failed_errors: u64,
     pub no_information_query_results: u64,
+    pub semantic_query_results: u64,
+    pub semantic_query_errors: u64,
     pub rpc_unsupported_errors: u64,
     pub unknown_method_not_found_errors: u64,
     pub cancellation_target_id_bytes: u64,
@@ -51,6 +53,8 @@ enum RequestContract {
     Shutdown,
     DiagnosticWait,
     NoInformationQuery,
+    PlainGoal,
+    Hover,
     UnsupportedRpc,
     UnknownMethod,
 }
@@ -61,11 +65,11 @@ impl RequestContract {
             "initialize" => Self::Initialize,
             "shutdown" => Self::Shutdown,
             "textDocument/waitForDiagnostics" => Self::DiagnosticWait,
-            "$/lean/plainGoal"
-            | "$/lean/plainTermGoal"
-            | "textDocument/hover"
-            | "textDocument/completion"
-            | "textDocument/definition" => Self::NoInformationQuery,
+            "$/lean/plainGoal" => Self::PlainGoal,
+            "textDocument/hover" => Self::Hover,
+            "$/lean/plainTermGoal" | "textDocument/completion" | "textDocument/definition" => {
+                Self::NoInformationQuery
+            }
             "$/lean/rpc/connect" | "$/lean/rpc/call" => Self::UnsupportedRpc,
             _ => Self::UnknownMethod,
         }
@@ -77,6 +81,8 @@ impl RequestContract {
             Self::Shutdown => "shutdown",
             Self::DiagnosticWait => "diagnostic-wait",
             Self::NoInformationQuery => "no-information-query",
+            Self::PlainGoal => "plain-goal",
+            Self::Hover => "hover",
             Self::UnsupportedRpc => "unsupported-rpc",
             Self::UnknownMethod => "unknown-method",
         }
@@ -125,6 +131,8 @@ enum MethodResponseClass {
     DiagnosticWaitCancelledError,
     DiagnosticWaitFailedError,
     NoInformationQueryResult,
+    SemanticQueryResult,
+    SemanticQueryError,
     RpcUnsupportedError,
     UnknownMethodNotFoundError,
 }
@@ -137,6 +145,8 @@ struct MethodResponseStats {
     diagnostic_wait_cancelled_errors: u64,
     diagnostic_wait_failed_errors: u64,
     no_information_query_results: u64,
+    semantic_query_results: u64,
+    semantic_query_errors: u64,
     rpc_unsupported_errors: u64,
     unknown_method_not_found_errors: u64,
 }
@@ -172,6 +182,12 @@ impl MethodResponseStats {
                 &mut self.no_information_query_results,
                 "no-information-query result",
             ),
+            MethodResponseClass::SemanticQueryResult => {
+                Self::bump(&mut self.semantic_query_results, "semantic-query result")
+            }
+            MethodResponseClass::SemanticQueryError => {
+                Self::bump(&mut self.semantic_query_errors, "semantic-query error")
+            }
             MethodResponseClass::RpcUnsupportedError => Self::bump(
                 &mut self.rpc_unsupported_errors,
                 "unsupported-RPC RequestFailed",
@@ -187,14 +203,16 @@ impl MethodResponseStats {
         self.initialize_results
             .checked_add(self.shutdown_results)?
             .checked_add(self.diagnostic_wait_results)?
-            .checked_add(self.no_information_query_results)
+            .checked_add(self.no_information_query_results)?
+            .checked_add(self.semantic_query_results)
     }
 
     fn error_total(self) -> Option<u64> {
         self.diagnostic_wait_cancelled_errors
             .checked_add(self.diagnostic_wait_failed_errors)?
             .checked_add(self.rpc_unsupported_errors)?
-            .checked_add(self.unknown_method_not_found_errors)
+            .checked_add(self.unknown_method_not_found_errors)?
+            .checked_add(self.semantic_query_errors)
     }
 
     fn total(self) -> Option<u64> {
@@ -509,6 +527,37 @@ fn classify_method_response(
             format!("error code {code}"),
             "an object result, RequestCancelled, or RequestFailed",
         ),
+        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Result(value))
+            if value.trim() == "null" =>
+        {
+            Ok(MethodResponseClass::NoInformationQueryResult)
+        }
+        (RequestContract::PlainGoal, ResponseShape::Result(value))
+            if crate::json::plain_goal_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
+        (RequestContract::Hover, ResponseShape::Result(value))
+            if crate::json::hover_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
+        (
+            RequestContract::PlainGoal | RequestContract::Hover,
+            ResponseShape::Error(-32602 | -32803 | -32800),
+        ) => Ok(MethodResponseClass::SemanticQueryError),
+        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Result(value)) => {
+            mismatch(
+                result_kind(value).to_owned(),
+                "null or a typed native semantic result",
+            )
+        }
+        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Error(code)) => {
+            mismatch(
+                format!("error code {code}"),
+                "InvalidParams, RequestFailed, or RequestCancelled",
+            )
+        }
         (RequestContract::NoInformationQuery, ResponseShape::Result(value))
             if value.trim() == "null" =>
         {
@@ -782,6 +831,8 @@ pub fn correlate_transcripts(
         diagnostic_wait_cancelled_errors: method_responses.diagnostic_wait_cancelled_errors,
         diagnostic_wait_failed_errors: method_responses.diagnostic_wait_failed_errors,
         no_information_query_results: method_responses.no_information_query_results,
+        semantic_query_results: method_responses.semantic_query_results,
+        semantic_query_errors: method_responses.semantic_query_errors,
         rpc_unsupported_errors: method_responses.rpc_unsupported_errors,
         unknown_method_not_found_errors: method_responses.unknown_method_not_found_errors,
         cancellation_target_id_bytes: cancellations.id_bytes,
@@ -794,10 +845,10 @@ pub fn correlate_transcripts(
 pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-server-correlation/5\",",
+            "{{\"schema\":\"fln.lsp-client-server-correlation/6\",",
             "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\",",
-            "\"methodResponseSchema\":\"fln.lsp-method-response/1\",",
+            "\"methodResponseSchema\":\"fln.lsp-method-response/2\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -811,6 +862,7 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "\"diagnosticWaitCancelledErrors\":{},",
             "\"diagnosticWaitFailedErrors\":{},",
             "\"noInformationQueryResults\":{},",
+            "\"semanticQueryResults\":{},\"semanticQueryErrors\":{},",
             "\"rpcUnsupportedErrors\":{},",
             "\"unknownMethodNotFoundErrors\":{},",
             "\"clientWireBytes\":{},\"serverWireBytes\":{},",
@@ -846,6 +898,8 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.diagnostic_wait_cancelled_errors,
         stats.diagnostic_wait_failed_errors,
         stats.no_information_query_results,
+        stats.semantic_query_results,
+        stats.semantic_query_errors,
         stats.rpc_unsupported_errors,
         stats.unknown_method_not_found_errors,
         stats.client.lifecycle.transcript.wire_bytes,
@@ -929,8 +983,8 @@ mod tests {
         assert_eq!(stats.no_information_query_results, 1);
         assert_eq!(stats.cancellation_target_id_bytes, 0);
         let receipt = render_correlation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/5\""));
-        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/1\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/6\""));
+        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/2\""));
         assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
         assert!(receipt.contains("\"methodContractResponses\":3"));
@@ -1077,7 +1131,7 @@ mod tests {
                     r#"{"jsonrpc":"2.0","id":1.25e2,"error":{"code":-32601,"message":"method not found"}}"#,
                     r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
                 ]),
-                "no-information-query method contract",
+                "hover method contract",
             ),
             (
                 framed(&[
