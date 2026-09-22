@@ -269,7 +269,7 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
     use fln_hash::cartridge::{
         CartridgeBuilderV1, CartridgeObjectKindV1, ObjectPortabilityV1, ObjectRequirementV1,
     };
-    use fln_hash::{ContentRoot, EpochId};
+    use fln::{ContentRoot, EpochId};
 
     let epoch = EpochId::new(4_032_000);
     let env_root = ContentRoot::new([42; 32]);
