@@ -20,6 +20,12 @@ use fln_core::diag::{
 use fln_core::level::LevelView;
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
+use fln_hash::canon::DecodeBudget;
+use fln_hash::cartridge::{
+    CartridgeArchiveV1, CartridgeDecodeBudgetsV1, CartridgeIndexV1, CartridgeObjectKindV1,
+    CartridgeTransportStateV1, ObjectRequirementV1, WarmDefeqCacheV1,
+};
+use fln_hash::certificate::DeclarationCertificateV1;
 use fln_hash::domain::{Digest, Domain, DomainHasher, hash as domain_hash};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -45,6 +51,8 @@ const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
+const VERIFY_CAPSULE_SCHEMA: &str = "fln.verify-capsule/1";
+const CAPSULE_DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/9";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
@@ -104,6 +112,7 @@ const USAGE: &str = concat!(
     "  fln replay [--json] PATH\n",
     "  fln cache [inspect | clear | stats]\n",
     "  fln build explain\n",
+    "  fln verify-capsule [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
@@ -114,6 +123,7 @@ const USAGE: &str = concat!(
     "`replay` verifies deterministic replay of elaboration bundles.\n",
     "`cache` inspects and manages the Ledger content-addressed artifact cache.\n",
     "`build explain` analyzes the dependency graph and build plan.\n",
+    "`verify-capsule` validates the transport completeness, content hashes, and certificates of a sealed .flnpack capsule.\n",
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
     "With --constants (text mode), it also prints the declaration-order\n",
@@ -354,6 +364,11 @@ enum MultiplexerCommand {
     },
     CapabilityNotice {
         command: String,
+        json: bool,
+    },
+    VerifyCapsule {
+        path: PathBuf,
+        max_bytes: usize,
         json: bool,
     },
 }
@@ -1213,6 +1228,24 @@ fn parse_capability_notice(
     Ok(MultiplexerCommand::CapabilityNotice { command, json })
 }
 
+fn parse_verify_capsule(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(arguments, "verify-capsule", CAPSULE_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "verify-capsule accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::VerifyCapsule {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<MultiplexerCommand, UsageError> {
@@ -1284,6 +1317,9 @@ fn parse_command(
     }
     if command == "goals" {
         return parse_goals(arguments.collect());
+    }
+    if command == "verify-capsule" {
+        return parse_verify_capsule(arguments.collect());
     }
     if command == "doctor"
         || command == "serve-mcp"
@@ -2500,6 +2536,349 @@ fn inspect_ilean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput
     match read_bounded(path, max_bytes, ".ilean artifact") {
         Ok(bytes) => inspect_ilean_bytes(&bytes, max_bytes, json),
         Err(error) => ilean_inspect_failure(IleanInspectFailure::Read(error), json),
+    }
+}
+
+#[derive(Debug)]
+enum VerifyCapsuleFailure {
+    Read(BoundedReadFailure),
+    Refusal(String),
+    Resource(String),
+    Internal(String),
+    IncompleteTransport(CartridgeTransportStateV1),
+    Corrupt(String),
+}
+
+impl VerifyCapsuleFailure {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Read(err) => err.class(),
+            Self::Resource(_) => "resource",
+            Self::Internal(_) => "internal_fault",
+            Self::Refusal(_) => "refusal",
+            Self::IncompleteTransport(_) => "incomplete_transport",
+            Self::Corrupt(_) => "corruption",
+        }
+    }
+}
+
+impl fmt::Display for VerifyCapsuleFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(err) => err.fmt(formatter),
+            Self::Refusal(msg) => write!(formatter, "capsule refusal: {msg}"),
+            Self::Resource(msg) => write!(formatter, "resource limit exceeded: {msg}"),
+            Self::Internal(msg) => write!(formatter, "internal fault: {msg}"),
+            Self::IncompleteTransport(state) => write!(
+                formatter,
+                "transport state {state:?} is incomplete; sealed or complete capsule required"
+            ),
+            Self::Corrupt(msg) => write!(formatter, "corrupt capsule: {msg}"),
+        }
+    }
+}
+
+fn verify_capsule_failure(error: VerifyCapsuleFailure, json: bool) -> MultiplexerOutput {
+    let class = error.class();
+    let detail = BoundedText::new(error.to_string());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":false,",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(VERIFY_CAPSULE_SCHEMA),
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        format!("fln verify-capsule: {class}: {}\n", detail.text())
+    };
+    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
+}
+
+fn verify_capsule_bytes(
+    path: &Path,
+    bytes: &[u8],
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let max_nodes = 4 * 1024 * 1024;
+    let budgets = CartridgeDecodeBudgetsV1 {
+        archive: DecodeBudget::new(bytes.len() as u64, max_nodes),
+        manifest: DecodeBudget::new(bytes.len() as u64, max_nodes),
+    };
+    let archive = match CartridgeArchiveV1::from_canonical_bytes_budgeted(bytes, budgets) {
+        fln::Outcome::Complete(Ok(archive)) => archive,
+        fln::Outcome::Complete(Err(refusal)) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Refusal(format!("{refusal:?}")),
+                json,
+            );
+        }
+        fln::Outcome::Inconclusive(inc) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Resource(format!("{inc:?}")),
+                json,
+            );
+        }
+        fln::Outcome::InternalFault(fault) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Internal(format!("{fault:?}")),
+                json,
+            );
+        }
+    };
+
+    let state = archive.transport_state();
+    if !matches!(state, CartridgeTransportStateV1::Complete | CartridgeTransportStateV1::Sealed { .. }) {
+        return verify_capsule_failure(VerifyCapsuleFailure::IncompleteTransport(state), json);
+    }
+
+    let index = match CartridgeIndexV1::from_canonical_bytes(bytes, budgets) {
+        fln::Outcome::Complete(Ok(index)) => index,
+        fln::Outcome::Complete(Err(refusal)) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Refusal(format!("index decode: {refusal:?}")),
+                json,
+            );
+        }
+        fln::Outcome::Inconclusive(inc) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Resource(format!("index decode: {inc:?}")),
+                json,
+            );
+        }
+        fln::Outcome::InternalFault(fault) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Internal(format!("index decode: {fault:?}")),
+                json,
+            );
+        }
+    };
+
+    let manifest_root = match archive.manifest_root() {
+        Ok(root) => root,
+        Err(refusal) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Refusal(format!("manifest root: {refusal:?}")),
+                json,
+            );
+        }
+    };
+
+    if index.manifest_root != manifest_root || index.chunks.len() != archive.frames.len() {
+        return verify_capsule_failure(
+            VerifyCapsuleFailure::Corrupt(
+                "derived index does not match archive frames or manifest root".into(),
+            ),
+            json,
+        );
+    }
+
+    for frame in &archive.frames {
+        let indexed = match index.read_chunk(bytes, frame.id) {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                return verify_capsule_failure(
+                    VerifyCapsuleFailure::Corrupt(format!("indexed chunk read: {err:?}")),
+                    json,
+                );
+            }
+        };
+        if indexed != frame.bytes {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Corrupt(
+                    "chunk bytes mismatch between index and frame".into(),
+                ),
+                json,
+            );
+        }
+    }
+
+    let mut certificates_verified = 0usize;
+    let mut warm_cache_verified = false;
+    let mut objects_present = 0usize;
+
+    for object in &archive.manifest.objects {
+        let assembled = match archive.assemble_object(object.id, max_bytes as u64) {
+            fln::Outcome::Complete(Ok(assembled)) => assembled,
+            fln::Outcome::Complete(Err(refusal)) => {
+                return verify_capsule_failure(
+                    VerifyCapsuleFailure::Refusal(format!(
+                        "assemble object {:?}: {refusal:?}",
+                        object.kind
+                    )),
+                    json,
+                );
+            }
+            fln::Outcome::Inconclusive(inc) => {
+                return verify_capsule_failure(
+                    VerifyCapsuleFailure::Resource(format!(
+                        "assemble object {:?}: {inc:?}",
+                        object.kind
+                    )),
+                    json,
+                );
+            }
+            fln::Outcome::InternalFault(fault) => {
+                return verify_capsule_failure(
+                    VerifyCapsuleFailure::Internal(format!(
+                        "assemble object {:?}: {fault:?}",
+                        object.kind
+                    )),
+                    json,
+                );
+            }
+        };
+
+        if let Some(object_bytes) = assembled {
+            objects_present += 1;
+            if object.kind == CartridgeObjectKindV1::Certificate {
+                match DeclarationCertificateV1::from_canonical_bytes_budgeted(
+                    &object_bytes,
+                    DecodeBudget::new(object_bytes.len() as u64, max_nodes),
+                ) {
+                    fln::Outcome::Complete(Ok(_cert)) => {
+                        certificates_verified += 1;
+                    }
+                    fln::Outcome::Complete(Err(refusal)) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Refusal(format!(
+                                "certificate codec: {refusal:?}"
+                            )),
+                            json,
+                        );
+                    }
+                    fln::Outcome::Inconclusive(inc) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Resource(format!(
+                                "certificate decode: {inc:?}"
+                            )),
+                            json,
+                        );
+                    }
+                    fln::Outcome::InternalFault(fault) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Internal(format!(
+                                "certificate decode: {fault:?}"
+                            )),
+                            json,
+                        );
+                    }
+                }
+            } else if object.kind == CartridgeObjectKindV1::WarmDefeqCache {
+                match WarmDefeqCacheV1::from_canonical_bytes_budgeted(
+                    &object_bytes,
+                    DecodeBudget::new(object_bytes.len() as u64, max_nodes),
+                ) {
+                    fln::Outcome::Complete(Ok(_cache)) => {
+                        warm_cache_verified = true;
+                    }
+                    fln::Outcome::Complete(Err(refusal)) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Refusal(format!(
+                                "warm cache codec: {refusal:?}"
+                            )),
+                            json,
+                        );
+                    }
+                    fln::Outcome::Inconclusive(inc) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Resource(format!(
+                                "warm cache decode: {inc:?}"
+                            )),
+                            json,
+                        );
+                    }
+                    fln::Outcome::InternalFault(fault) => {
+                        return verify_capsule_failure(
+                            VerifyCapsuleFailure::Internal(format!(
+                                "warm cache decode: {fault:?}"
+                            )),
+                            json,
+                        );
+                    }
+                }
+            }
+        } else if object.requirement == ObjectRequirementV1::Required {
+            return verify_capsule_failure(VerifyCapsuleFailure::IncompleteTransport(state), json);
+        }
+    }
+
+    let archive_digest = match archive.archive_digest() {
+        Ok(digest) => digest,
+        Err(refusal) => {
+            return verify_capsule_failure(
+                VerifyCapsuleFailure::Refusal(format!("archive digest: {refusal:?}")),
+                json,
+            );
+        }
+    };
+
+    let transport_state_str = match state {
+        CartridgeTransportStateV1::Complete => "complete",
+        CartridgeTransportStateV1::Sealed { .. } => "sealed",
+        CartridgeTransportStateV1::Partial { .. } => "partial",
+        CartridgeTransportStateV1::Thin => "thin",
+    };
+
+    if json {
+        let stdout = format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"path\":{},",
+                "\"status\":\"verified\",\"manifest_root\":{},\"archive_digest\":{},",
+                "\"transport_state\":{},\"objects_present\":{},\"objects_declared\":{},",
+                "\"chunk_count\":{},\"bytes\":{},\"certificates_verified\":{},",
+                "\"warm_cache_verified\":{}}}\n"
+            ),
+            json_string(VERIFY_CAPSULE_SCHEMA),
+            json_string(&path.display().to_string()),
+            json_string(&manifest_root.to_hex()),
+            json_string(&archive_digest.to_hex()),
+            json_string(transport_state_str),
+            objects_present,
+            archive.manifest.objects.len(),
+            archive.frames.len(),
+            bytes.len(),
+            certificates_verified,
+            warm_cache_verified,
+        );
+        MultiplexerOutput::success(stdout)
+    } else {
+        let stdout = format!(
+            concat!(
+                "fln verify-capsule: verified capsule at {}\n",
+                "  manifest root: {}\n",
+                "  archive digest: {}\n",
+                "  transport state: {}\n",
+                "  objects: {} present ({} declared)\n",
+                "  chunks: {}\n",
+                "  bytes: {}\n",
+                "  certificates verified: {}\n",
+                "  warm defeq cache: {}\n",
+                "capsule verification passed.\n"
+            ),
+            path.display(),
+            manifest_root.to_hex(),
+            archive_digest.to_hex(),
+            transport_state_str,
+            objects_present,
+            archive.manifest.objects.len(),
+            archive.frames.len(),
+            bytes.len(),
+            certificates_verified,
+            if warm_cache_verified { "verified" } else { "none" },
+        );
+        MultiplexerOutput::success(stdout)
+    }
+}
+
+fn verify_capsule(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    match read_bounded(path, max_bytes, ".flnpack capsule") {
+        Ok(bytes) => verify_capsule_bytes(path, &bytes, max_bytes, json),
+        Err(error) => verify_capsule_failure(VerifyCapsuleFailure::Read(error), json),
     }
 }
 
@@ -11231,6 +11610,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
         Ok(MultiplexerCommand::CapabilityNotice { command, json }) => {
             render_capability_notice(&command, json)
         }
+        Ok(MultiplexerCommand::VerifyCapsule {
+            path,
+            max_bytes,
+            json,
+        }) => verify_capsule(&path, max_bytes, json),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }
