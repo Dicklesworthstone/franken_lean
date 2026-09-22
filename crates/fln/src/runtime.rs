@@ -5,6 +5,7 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
 mod data_recursion;
+mod mutual;
 mod nat;
 mod projections;
 mod records;
@@ -370,6 +371,12 @@ impl<'a> Preparation<'a> {
                                 Expr::app(Expr::const_(name("Nat.add"), vec![]), args[0].clone()),
                                 nat::literal(1),
                             )));
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(case) = self.mutual_case(name, levels, &args)?
+                        {
+                            self.schedule_constructor_case(case, &mut tasks, limit)?;
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()

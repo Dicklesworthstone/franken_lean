@@ -20,25 +20,39 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
             return Ok(None);
         };
-        if rec.is_unsafe || rec.num_indices != 0 || rec.num_motives != 1 || rec.all.len() != 1 {
+        if rec.is_unsafe
+            || rec.num_indices != 0
+            || rec.num_motives as usize != rec.all.len()
+            || rec.all.is_empty()
+        {
             return Ok(None);
         }
-        let Some(ConstantInfo::Induct(family)) = self.environment.find(&rec.all[0]) else {
+        let Some(rule) = rec.rules.first() else {
             return Ok(None);
         };
-        if family.is_rec {
+        let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(&rule.ctor) else {
+            return Ok(None);
+        };
+        let Some(selected) = rec.all.iter().position(|name| name == &ctor.induct) else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Induct(family)) = self.environment.find(&ctor.induct) else {
+            return Ok(None);
+        };
+        if family.is_rec && rec.all.len() == 1 {
             // The recursive paths flatten motives into recursive parameters.
             return Ok(None);
         }
         let parameters = rec.num_params as usize;
         let arity = parameters
             .checked_add(rec.num_minors as usize)
-            .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(rec.num_motives as usize))
+            .and_then(|n| n.checked_add(1))
             .ok_or_else(|| unsupported("eliminator arity"))?;
         if args.len() <= arity {
             return Ok(None);
         }
-        let ExprNode::Lam { body: type_, .. } = args[parameters].node() else {
+        let ExprNode::Lam { body: type_, .. } = args[parameters + selected].node() else {
             return Ok(None);
         };
         if type_.has_loose_bvars() {

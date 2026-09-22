@@ -583,7 +583,14 @@ impl Preparation<'_> {
             let Some(argument) = args.get(consumed) else {
                 break;
             };
-            if self.type_parameter(binder_type)? && closed(argument) {
+            // Constructing a syntactic lambda executes none of its body. It
+            // can be substituted capture-avoidantly without duplicating or
+            // dropping an action. This also exposes mutual-match minor
+            // premises hidden behind the elaborator's local helper lambdas.
+            // A call that *returns* a function must still use the strict let.
+            if matches!(argument.node(), ExprNode::Lam { .. })
+                || self.type_parameter(binder_type)? && closed(argument)
+            {
                 head = self.substitution(body, argument)?;
                 consumed += 1;
                 continue;

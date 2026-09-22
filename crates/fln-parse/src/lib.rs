@@ -2636,7 +2636,9 @@ pub fn partition_source_module(
     };
 
     let (body_start, mut commands) = if let Some(body_start) = definition_start {
-        let commands = partition_definition_commands(&source[body_start..])
+        // A mutual inductive block is one source command and admission unit,
+        // not independent declarations split at its member introducers.
+        let commands = command_scope::partition(&source[body_start..])
             .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
         (body_start, commands)
     } else {
