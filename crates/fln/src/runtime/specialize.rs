@@ -128,7 +128,7 @@ impl Preparation<'_> {
         body.subst_loose(0, std::slice::from_ref(value))
             .map_err(|_| unsupported("runtime substitution scope"))
     }
-    fn lift(&mut self, expr: &Expr, amount: u32) -> Result<Expr, IngressError> {
+    pub(super) fn lift(&mut self, expr: &Expr, amount: u32) -> Result<Expr, IngressError> {
         self.presentations(expr)?;
         expr.lift_loose(0, amount)
             .map_err(|_| unsupported("runtime specialization scope"))
@@ -303,7 +303,7 @@ impl Preparation<'_> {
         for (name, type_, info) in binders.into_iter().rev() {
             body = Expr::lam(name, type_, body, info);
         }
-        result.value = body;
+        result.value = self.lower_projections(&body)?;
         Ok(result)
     }
     /// Recognize inert closed values without running arbitrary functions.

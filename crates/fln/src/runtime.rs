@@ -6,6 +6,7 @@
 mod callables;
 mod data_recursion;
 mod nat;
+mod projections;
 mod records;
 mod specialize;
 mod variants;
@@ -248,6 +249,14 @@ impl<'a> Preparation<'a> {
     /// bodies are transformed so nested closure annotations cannot go stale
     /// under a later de Bruijn lift.
     pub(super) fn expression(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        // Catalog bodies have already had their original binder telescope
+        // removed. Their projections are selected by signature normalization;
+        // closed roots still carry the source context needed for selection.
+        let input = if input.has_loose_bvars() {
+            input.clone()
+        } else {
+            self.lower_projections(input)?
+        };
         let mut tasks = vec![Task::Visit(input.clone())];
         let mut values = Vec::<Expr>::new();
         let limit = self.limits.max_nodes.saturating_mul(3).saturating_add(1);
@@ -737,8 +746,8 @@ mod tests {
         let mut preparation = Preparation::new(&environment, limits);
         assert_eq!(preparation.expression(&expression).unwrap(), expression);
         assert!(
-            preparation.visited < 10_000,
-            "no quadratic rewalk of the application spine"
+            preparation.visited < 13_000,
+            "projection discovery adds one linear pass, not a quadratic spine rewalk"
         );
         limits.max_nodes = 50;
         assert!(matches!(

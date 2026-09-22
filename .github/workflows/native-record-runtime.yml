@@ -1,0 +1,50 @@
+name: Native record runtime
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-record-runtime.yml'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/tests/runtime_record_projection.rs'
+      - 'crates/fln-cli/tests/source_ground_projections.rs'
+      - 'examples/native_ground_projections.lean'
+permissions:
+  contents: read
+jobs:
+  records:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # Preserve the exact inputs for reproducing projection/layout failures
+      # when concurrent source changes make a later checkout differ from CI.
+      - name: Retain exact reproduction inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/record-runtime"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/record-runtime/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/record-runtime/commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: record-runtime-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/record-runtime
+          retention-days: 1
+          compression-level: 0
+      - name: Install repository toolchain
+        run: |
+          channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+      - name: Test source, layouts and installed bytecode consumers
+        run: |
+          cargo test --locked -p fln --lib
+          cargo test --locked -p fln --test runtime_record_projection --test runtime_parameterized_data --test runtime_records --test runtime_specialization --test runtime_higher_order
+          cargo test --locked -p fln-cli --test source_ground_projections --test source_collections
+          cargo clippy --locked -p fln --all-targets -- -D warnings
+          cargo clippy --locked -p fln-cli --test source_ground_projections -- -D warnings
+          cargo check --locked --workspace --all-targets
