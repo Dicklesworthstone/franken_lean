@@ -42,7 +42,15 @@ fn replay(artifact: &Path) {
 
 #[test]
 fn mutual_blocks_execute_through_both_personalities_and_independent_bytecode() {
-    let source = include_str!("../../../examples/native_mutual_data.lean");
+    check_source_and_replay(include_str!("../../../examples/native_mutual_data.lean"));
+}
+
+#[test]
+fn heterogeneous_mutual_folds_replay_without_a_source_environment() {
+    check_source_and_replay(include_str!("../../../examples/native_mutual_folds.lean"));
+}
+
+fn check_source_and_replay(source: &str) {
     let path = directory().join("Main.lean");
     let artifact = path.with_extension("flbc");
     std::fs::write(&path, source).unwrap();
@@ -59,6 +67,40 @@ fn mutual_blocks_execute_through_both_personalities_and_independent_bytecode() {
     assert!(lean.stderr.is_empty());
     assert_eq!(lean.stdout, b"42\n");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+}
+
+#[test]
+fn imported_mutual_folds_keep_peer_captures_and_replayable_artifacts() {
+    let dir = directory();
+    let dependency = dir.join("Data.lean");
+    let entry = dir.join("Main.lean");
+    let definitions = include_str!("../../../examples/native_mutual_folds.lean")
+        .split("#eval")
+        .next()
+        .unwrap();
+    std::fs::write(&dependency, definitions).unwrap();
+    std::fs::write(
+        &entry,
+        "import Data\n#eval total 2 (Forest.cons (Tree.leaf 40) (@Forest.nil Nat))\n",
+    )
+    .unwrap();
+    let artifact = dir.join("fold.flbc");
+    let output = run(&entry, &artifact);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    replay(&artifact);
+    let before = std::fs::read(&artifact).unwrap();
+    std::fs::write(
+        &dependency,
+        format!("{definitions}\ntheorem bad : 0 = 1 := by rfl"),
+    )
+    .unwrap();
+    let rejected = dir.join("rejected.flbc");
+    let output = run(&entry, &rejected);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!rejected.exists());
+    assert_eq!(before, std::fs::read(&artifact).unwrap());
 }
 
 #[test]

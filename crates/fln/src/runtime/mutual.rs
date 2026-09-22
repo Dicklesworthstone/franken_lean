@@ -3,6 +3,22 @@
 use super::*;
 use fln_core::{expr::FVarId, level::Level};
 use fln_env::constants::RecursorVal;
+mod fold;
+
+pub(super) struct Fold {
+    pub group: u32,
+    pub selected: usize,
+    pub members: Vec<Member>,
+    pub arguments: Vec<Expr>,
+}
+
+pub(super) struct Member {
+    pub name: Name,
+    pub self_type: Expr,
+    pub domains: Vec<Expr>,
+    pub parameters: Vec<ValueType>,
+    pub case: variants::Case,
+}
 
 pub(super) struct Group {
     shapes: Vec<records::Shape>,

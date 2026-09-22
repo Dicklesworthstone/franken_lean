@@ -5168,7 +5168,27 @@ fn executable_dependencies(
     let mut scalar_constructors = Vec::new();
     let mut intrinsics = Vec::new();
     let mut functions = Vec::new();
-    while let Some(name) = pending.pop_first() {
+    let mut scanned_lambdas = 0;
+    loop {
+        // A mutual closure group's peers live in the callable catalog, not
+        // necessarily in the selected member's expression. They may introduce
+        // otherwise invisible intrinsics or checked function dependencies.
+        // Scan each newly prepared body exactly once, including peers created
+        // while resolving a dependency, before deciding the worklist is empty.
+        while let Some(lambda) = preparation.lambdas.get(scanned_lambdas) {
+            if matches!(lambda.recursion, LambdaRecursion::MutualMember { .. }) {
+                collect_executable_constants(
+                    &lambda.lambda,
+                    &mut pending,
+                    &mut visited_nodes,
+                    limits,
+                )?;
+            }
+            scanned_lambdas += 1;
+        }
+        let Some(name) = pending.pop_first() else {
+            break;
+        };
         if !resolved.insert(name.clone()) {
             continue;
         }
