@@ -564,5 +564,182 @@ rev = "v4.32.0"
     assert!(exe_empty_stderr.contains("error: no such file or directory"));
 }
 
+#[test]
+fn lake_personality_build_and_check_build() {
+    let temp_parent = std::env::temp_dir().join(format!(
+        "fln-lake-build-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_parent).unwrap();
+
+    let pkg_dir = temp_parent.join("calc_proj");
+    // 1. Scaffold package using lake init
+    let init_res = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "init", "calc_proj"])
+        .output()
+        .expect("run lake init");
+    assert!(init_res.status.success());
+
+    // 2. lake check-build
+    let check_res = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "check-build"])
+        .output()
+        .expect("run lake check-build");
+    assert!(check_res.status.success());
+    let check_stdout = String::from_utf8(check_res.stdout).expect("utf8 stdout");
+    assert!(check_stdout.contains("Build configuration validated"));
+
+    // 3. lake check-build --json
+    let check_json = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "check-build"])
+        .output()
+        .expect("run lake check-build --json");
+    assert!(check_json.status.success());
+    let check_json_stdout = String::from_utf8(check_json.stdout).expect("utf8 stdout");
+    assert!(check_json_stdout.contains("\"schema\":\"fln.lake-check-build/1\""));
+    assert!(check_json_stdout.contains("\"package\":\"calc_proj\""));
+
+    // 4. lake build (initial)
+    let build1 = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "build"])
+        .output()
+        .expect("run lake build 1");
+    assert!(build1.status.success());
+    let build1_stdout = String::from_utf8(build1.stdout).expect("utf8 stdout");
+    assert!(build1_stdout.contains("Built calc_proj (1 built, 0 cached)"));
+    assert!(pkg_dir.join(".lake/build/lib/calc_proj.olean").exists());
+
+    // 5. lake build (cached)
+    let build2 = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "build"])
+        .output()
+        .expect("run lake build 2");
+    assert!(build2.status.success());
+    let build2_stdout = String::from_utf8(build2.stdout).expect("utf8 stdout");
+    assert!(build2_stdout.contains("Built calc_proj (0 built, 1 cached)"));
+
+    // 6. lake build --json
+    let build_json = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "build"])
+        .output()
+        .expect("run lake build --json");
+    assert!(build_json.status.success());
+    let build_json_stdout = String::from_utf8(build_json.stdout).expect("utf8 stdout");
+    assert!(build_json_stdout.contains("\"schema\":\"fln.lake-build/1\""));
+    assert!(build_json_stdout.contains("\"package\":\"calc_proj\""));
+    assert!(build_json_stdout.contains("\"targets_cached\":1"));
+
+    // 7. lake build in unconfigured dir exits 1 with Reference error
+    let empty_dir = temp_parent.join("empty_build");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let build_empty = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", empty_dir.to_str().unwrap(), "build"])
+        .output()
+        .expect("run lake build empty");
+    assert_eq!(build_empty.status.code(), Some(1));
+    let build_empty_stderr = String::from_utf8(build_empty.stderr).expect("utf8 stderr");
+    assert!(build_empty_stderr.contains("error: no such file or directory"));
+}
+
+#[test]
+fn fln_build_explain_dual_rebuild_decisions() {
+    let temp_parent = std::env::temp_dir().join(format!(
+        "fln-build-explain-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_parent).unwrap();
+
+    let pkg_dir = temp_parent.join("geom_pkg");
+    Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "init", "geom_pkg"])
+        .output()
+        .expect("init geom_pkg");
+
+    // 1. fln build explain before build (initial rebuild)
+    let explain_init = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
+        .output()
+        .expect("run fln build explain initial");
+    assert!(explain_init.status.success());
+    let explain_init_stdout = String::from_utf8(explain_init.stdout).expect("utf8 stdout");
+    assert!(explain_init_stdout.contains("Target: geom_pkg"));
+    assert!(explain_init_stdout.contains("Reference decision: rebuild"));
+    assert!(explain_init_stdout.contains("Native decision:    rebuild"));
+    assert!(explain_init_stdout.contains("Cache outcome:      miss"));
+
+    // 2. fln build explain --json
+    let explain_json = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir", pkg_dir.to_str().unwrap()])
+        .output()
+        .expect("run fln build explain --json");
+    assert!(explain_json.status.success());
+    let explain_json_stdout = String::from_utf8(explain_json.stdout).expect("utf8 stdout");
+    assert!(explain_json_stdout.contains("\"schema\":\"fln.build-explain/1\""));
+    assert!(explain_json_stdout.contains("\"reference_decision\":\"rebuild\""));
+    assert!(explain_json_stdout.contains("\"native_decision\":\"rebuild\""));
+    assert!(explain_json_stdout.contains("\"cache_outcome\":\"miss\""));
+
+    // 3. Build package
+    Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "build"])
+        .output()
+        .expect("lake build");
+
+    // 4. fln build explain after build (cached)
+    let explain_cached = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
+        .output()
+        .expect("run fln build explain cached");
+    assert!(explain_cached.status.success());
+    let explain_cached_stdout = String::from_utf8(explain_cached.stdout).expect("utf8 stdout");
+    assert!(explain_cached_stdout.contains("Reference decision: cached"));
+    assert!(explain_cached_stdout.contains("Native decision:    cached"));
+    assert!(explain_cached_stdout.contains("Cache outcome:      hit"));
+
+    // 5. Touch source with internal proof update
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let src = pkg_dir.join("GeomPkg.lean");
+    std::fs::write(&src, "def hello := \"world internal update\"\n").unwrap();
+
+    // 5a. fln build explain in native sound mode: early-cutoff
+    let explain_sound = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
+        .output()
+        .expect("run fln build explain sound");
+    assert!(explain_sound.status.success());
+    let explain_sound_stdout = String::from_utf8(explain_sound.stdout).expect("utf8 stdout");
+    assert!(explain_sound_stdout.contains("Reference decision: rebuild"));
+    assert!(explain_sound_stdout.contains("Native decision:    cached"));
+    assert!(explain_sound_stdout.contains("early-cutoff"));
+    assert!(explain_sound_stdout.contains("Cache outcome:      hit"));
+
+    // 5b. fln build explain with --faithful-invalidation
+    let explain_faithful = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args([
+            "build",
+            "explain",
+            "--faithful-invalidation",
+            "--dir",
+            pkg_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run fln build explain faithful");
+    assert!(explain_faithful.status.success());
+    let explain_faithful_stdout = String::from_utf8(explain_faithful.stdout).expect("utf8 stdout");
+    assert!(explain_faithful_stdout.contains("Reference decision: rebuild"));
+    assert!(explain_faithful_stdout.contains("Native decision:    rebuild"));
+    assert!(explain_faithful_stdout.contains("faithful-invalidation enabled"));
+    assert!(explain_faithful_stdout.contains("Cache outcome:      miss"));
+}
+
+
 
 
