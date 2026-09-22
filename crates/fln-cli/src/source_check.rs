@@ -150,3 +150,163 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
         },
     }
 }
+
+fn failed_goals(class: &str, detail: &str, json: bool, exit: u8) -> MultiplexerOutput {
+    let detail = BoundedText::new(detail.to_owned());
+    let stderr = if json {
+        format!(
+            "{{\"schema\":\"fln.goals/1\",\"outcome\":{},\"detail\":{},\"detailTruncated\":{}}}\n",
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated()
+        )
+    } else {
+        format!(
+            "fln goals: {class}: {}{}\n",
+            detail.text(),
+            if detail.truncated() {
+                " [detail truncated]"
+            } else {
+                ""
+            }
+        )
+    };
+    MultiplexerOutput::failure(stderr, exit)
+}
+
+pub(super) fn run_goals(
+    path: PathBuf,
+    line: Option<usize>,
+    col: Option<usize>,
+    offset: Option<usize>,
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let bytes = match read_bounded(&path, max_bytes, "Lean source") {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return failed_goals(
+                error.class(),
+                &error.to_string(),
+                json,
+                error.exit_code(),
+            );
+        }
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => {
+            return failed_goals("input", "source is not valid UTF-8", json, 2);
+        }
+    };
+    let worker = std::thread::Builder::new()
+        .name("fln-goals".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let target_offset = if let Some(off) = offset {
+                off.min(text.len())
+            } else if let Some(target_line) = line {
+                let target_col = col.unwrap_or(1);
+                let mut cur_line = 1;
+                let mut cur_col = 1;
+                let mut computed_offset = 0;
+                for (idx, ch) in text.char_indices() {
+                    if cur_line == target_line && cur_col >= target_col {
+                        computed_offset = idx;
+                        break;
+                    }
+                    if ch == '\n' {
+                        if cur_line == target_line {
+                            computed_offset = idx;
+                            break;
+                        }
+                        cur_line += 1;
+                        cur_col = 1;
+                    } else {
+                        cur_col += 1;
+                    }
+                    computed_offset = idx + ch.len_utf8();
+                }
+                computed_offset
+            } else {
+                text.trim_end().len()
+            };
+
+            let canonical = match path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    return failed_goals("io", &format!("cannot canonicalize path: {e}"), json, 2);
+                }
+            };
+            let uri = match imports::editor::file_uri(&canonical) {
+                Ok(u) => u,
+                Err(e) => return failed_goals("input", &e.detail, json, 2),
+            };
+
+            use fln_server::dispatch::WorkspaceChecker;
+            let mut checker = lsp::Checker::new();
+            let _ = checker.check(&uri, &text, &[]);
+            let answer = checker.query(
+                fln_server::dispatch::semantic::Query {
+                    kind: fln_server::dispatch::semantic::QueryKind::Goals,
+                    uri: &uri,
+                    version: 1,
+                    text: &text,
+                    offset: target_offset,
+                },
+                &[],
+            );
+
+            match answer {
+                Ok(Some(fln_server::dispatch::semantic::Answer::Goals { goals })) => {
+                    let rendered = if goals.is_empty() {
+                        "no goals".to_owned()
+                    } else {
+                        goals.join("\n\n")
+                    };
+                    let stdout = if json {
+                        let items = goals
+                            .iter()
+                            .map(|g| json_string(g))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!(
+                            "{{\"schema\":\"fln.goals/1\",\"outcome\":\"complete\",\"authority\":true,\"file\":{},\"offset\":{},\"rendered\":{},\"goals\":[{}]}}\n",
+                            json_string(&path.to_string_lossy()),
+                            target_offset,
+                            json_string(&rendered),
+                            items
+                        )
+                    } else {
+                        format!("{rendered}\n")
+                    };
+                    MultiplexerOutput::success(stdout)
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    let stdout = if json {
+                        format!(
+                            "{{\"schema\":\"fln.goals/1\",\"outcome\":\"complete\",\"authority\":true,\"file\":{},\"offset\":{},\"rendered\":\"no goals\",\"goals\":[]}}\n",
+                            json_string(&path.to_string_lossy()),
+                            target_offset
+                        )
+                    } else {
+                        "no goals\n".to_owned()
+                    };
+                    MultiplexerOutput::success(stdout)
+                }
+                Err(err) => failed_goals("engine-error", &err, json, 2),
+            }
+        });
+    match worker {
+        Err(error) => failed_goals(
+            "resource",
+            &format!("could not start goals worker: {error}"),
+            json,
+            3,
+        ),
+        Ok(worker) => match worker.join() {
+            Ok(result) => result,
+            Err(_) => failed_goals("internal-fault", "goals worker panicked", json, 4),
+        },
+    }
+}
