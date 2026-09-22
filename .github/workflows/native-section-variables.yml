@@ -17,6 +17,10 @@ jobs:
   sections:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -80,7 +84,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/section-verification/compiler.txt
           cargo test --locked -p fln-parse --no-fail-fast 2>&1 | tee target/section-verification/parser.log
-          cargo test --locked -p fln --test source_section_variables --test source_scopes --test source_instances --test source_modules --no-fail-fast 2>&1 | tee target/section-verification/source.log
+          cargo test --locked -p fln --test source_section_variables --test source_scopes --test source_instances --test source_module_check --test source_module_session --no-fail-fast 2>&1 | tee target/section-verification/source.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/section-verification/check.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/section-verification/clippy.log
           if test -f target/section-verification/paths.txt; then
