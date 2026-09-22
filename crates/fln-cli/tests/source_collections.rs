@@ -149,3 +149,30 @@ fn lean_personality_executes_owned_collection_payloads() {
     assert_eq!(output.stdout, b"\"hello world\"\n2\n");
     assert_eq!(std::fs::read_to_string(path).unwrap(), program);
 }
+
+#[test]
+fn named_callbacks_and_constructor_closures_survive_bytecode_roundtrip() {
+    let source = "#eval Option.getD (Option.bind (Option.some (List.foldl Nat.add 37 (List.map String.length [\"ab\", \"cde\"]))) Option.some) 0";
+    let path = file(source);
+    let artifact = path.with_extension("flbc");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"finalValue\":42"));
+    let retained = std::fs::read(&artifact).unwrap();
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&artifact)
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{:?}", replay);
+    assert!(replay.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&replay.stdout).contains("\"returnValue\":42"));
+    assert_eq!(std::fs::read(&artifact).unwrap(), retained);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}

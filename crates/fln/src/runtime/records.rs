@@ -273,6 +273,20 @@ impl Preparation<'_> {
                             fields,
                             static_scalar_bytes: Vec::new(),
                         });
+                        // Preserve the checked ground telescope for a constructor
+                        // passed as a function. Its parameters have already been
+                        // erased; every remaining domain is an actual field.
+                        let mut type_ = shape.source.clone();
+                        for field in ctor.fields.iter().rev() {
+                            self.tick()?;
+                            type_ = Expr::forall_e(
+                                Name::anonymous(),
+                                field.clone(),
+                                type_,
+                                BinderInfo::Default,
+                            );
+                        }
+                        self.remember_constructor_type(ctor.name.clone(), type_)?;
                     }
                     active.remove(&shape.source);
                     self.value_types.records.try_reserve(1).map_err(|_| {

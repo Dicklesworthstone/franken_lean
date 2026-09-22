@@ -14,6 +14,7 @@ pub(super) struct Store {
     definitions: BTreeMap<Name, DefinitionVal>,
     instances: HashMap<(Name, Vec<Level>, Vec<Expr>), Name>,
     types: HashMap<Expr, Expr>,
+    constructor_types: HashMap<Name, Expr>,
 }
 fn closed(expr: &Expr) -> bool {
     !expr.has_loose_bvars()
@@ -26,6 +27,25 @@ fn application(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
     args.into_iter().fold(head, Expr::app)
 }
 impl Preparation<'_> {
+    pub(super) fn remember_constructor_type(
+        &mut self,
+        name: Name,
+        type_: Expr,
+    ) -> Result<(), IngressError> {
+        self.specializations
+            .constructor_types
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: self
+                    .specializations
+                    .constructor_types
+                    .len()
+                    .saturating_add(1),
+            })?;
+        self.specializations.constructor_types.insert(name, type_);
+        Ok(())
+    }
     pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
         self.specializations.definitions.get(name).cloned()
     }
@@ -586,6 +606,47 @@ impl Preparation<'_> {
         }
         Ok(Some(application(head, args[consumed..].iter().cloned())))
     }
+    /// Only admitted executable entries can become callable values. A familiar
+    /// axiom name is insufficient: intrinsics require the exact seed contract.
+    /// Ground constructors use the same telescope that produced their layout.
+    fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        self.tick()?;
+        if let Some(definition) = self.definition(name) {
+            return self
+                .universe_instance(
+                    &definition.base.type_,
+                    &definition.base.level_params,
+                    levels,
+                )
+                .map(Some);
+        }
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        if let Some(type_) = self.specializations.constructor_types.get(name) {
+            return Ok(Some(type_.clone()));
+        }
+        if source_intrinsic_binding(self.environment, name).is_some() {
+            return Ok(self
+                .environment
+                .find(name)
+                .map(|info| info.constant_val().type_.clone()));
+        }
+        if let Some(ConstantInfo::Ctor(constructor)) = self.environment.find(name) {
+            if name == &super::name("Nat.succ") {
+                self.check_nat_family()?;
+                return Ok(Some(constructor.base.type_.clone()));
+            }
+            let family = Expr::const_(constructor.induct.clone(), vec![]);
+            self.value_type(&family)?;
+            return Ok(self.specializations.constructor_types.get(name).cloned());
+        }
+        Ok(None)
+    }
+
     /// Global partial applications retain supplied arguments in strict lets and
     /// return a closure over them. The inner call is saturated; neither the
     /// function nor an argument is executed during this transformation.
@@ -594,17 +655,9 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
-        let ExprNode::Const { name, levels } = head.node() else {
+        let Some(mut type_) = self.callable_type(head)? else {
             return Ok(None);
         };
-        let Some(definition) = self.definition(name) else {
-            return Ok(None);
-        };
-        let mut type_ = self.universe_instance(
-            &definition.base.type_,
-            &definition.base.level_params,
-            levels,
-        )?;
         let mut supplied = Vec::new();
         for argument in args {
             self.tick()?;
@@ -770,6 +823,58 @@ impl Preparation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_class_intrinsics_require_the_exact_admitted_seed_contract() {
+        let name = name("Nat.sub");
+        let Declaration::Axiom(mut axiom) =
+            fln_elab::seed::source_intrinsic_seed_declaration(&name).unwrap()
+        else {
+            panic!("intrinsic axiom");
+        };
+        // Imported metadata alone is untrusted. A familiar name with a
+        // different telescope cannot gain code merely by becoming a callback.
+        axiom.base.type_ = Expr::forall_e(
+            Name::anonymous(),
+            Expr::const_(super::name("String"), vec![]),
+            Expr::const_(super::name("Nat"), vec![]),
+            BinderInfo::Default,
+        );
+        let environment = Environment::new()
+            .add_decl(ConstantInfo::Axiom(axiom))
+            .unwrap();
+        let head = Expr::const_(name, vec![]);
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&head, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Preparation::new(&Environment::new(), IngressLimits::default())
+                .partial_call(&head, &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn private_constructor_callback_names_do_not_create_layout_authority() {
+        let environment = Environment::new();
+        let name = Name::num(Name::num(super::name("_fln_runtime_data"), 0), 1);
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&Expr::const_(name, vec![]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&Expr::const_(super::name("Nat.succ"), vec![]), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn deeply_nested_type_normalization_uses_heap_frames_and_a_real_work_limit() {
