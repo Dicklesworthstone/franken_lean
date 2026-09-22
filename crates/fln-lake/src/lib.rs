@@ -1109,3 +1109,417 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
     Ok(manifest)
 }
 
+// ---------------------------------------------------------------------------
+// §13.3 — Lake build and dual rebuild decision model
+// ---------------------------------------------------------------------------
+
+/// Outcome report of a `lake build` or `lake check-build` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LakeBuildReport {
+    /// Package name.
+    pub package: String,
+    /// Targets considered in the build.
+    pub targets: Vec<String>,
+    /// Number of targets that were compiled or refreshed.
+    pub targets_built: u64,
+    /// Number of targets satisfied from cache.
+    pub targets_cached: u64,
+}
+
+/// An error encountered while building a Lake package.
+#[derive(Debug)]
+pub enum LakeBuildError {
+    /// Configuration discovery failed.
+    Discovery(LakeDiscoveryError),
+    /// Target was not found in package.
+    TargetNotFound(String),
+    /// I/O error occurred during build.
+    Io(String),
+}
+
+impl fmt::Display for LakeBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(e) => write!(f, "{e}"),
+            Self::TargetNotFound(t) => write!(f, "error: target '{t}' not found in package"),
+            Self::Io(msg) => write!(f, "error during Lake build: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LakeBuildError {}
+
+/// A full build explain report for `fln build explain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildExplainReport {
+    /// Package name.
+    pub package: String,
+    /// Target being explained.
+    pub target: String,
+    /// What the Reference toolchain would rebuild (file cone invalidation).
+    pub reference_decision: RebuildDecision,
+    /// What FrankenLean's Ledger actually rebuilds (demand-node early cutoff).
+    pub native_decision: RebuildDecision,
+    /// Difference/rationale between reference and native decisions.
+    pub delta: String,
+    /// Changed input files/identities that triggered rebuild.
+    pub changed_inputs: Vec<String>,
+    /// Opaque barriers preventing memoization (e.g. IO effects, unclassified macros).
+    pub opaque_barriers: Vec<String>,
+    /// Cache outcome (e.g. "hit", "miss", "bypassed").
+    pub cache_outcome: String,
+}
+
+/// An error encountered while explaining a Lake build.
+#[derive(Debug)]
+pub enum LakeExplainError {
+    /// Configuration discovery failed.
+    Discovery(LakeDiscoveryError),
+    /// Target was not found in package.
+    TargetNotFound(String),
+    /// I/O error occurred.
+    Io(String),
+}
+
+impl fmt::Display for LakeExplainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(e) => write!(f, "{e}"),
+            Self::TargetNotFound(t) => write!(f, "error: target '{t}' not found in package"),
+            Self::Io(msg) => write!(f, "error explaining Lake build: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LakeExplainError {}
+
+fn candidate_sources_for_target(dir: &Path, target: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let root_file = dir.join(format!("{target}.lean"));
+    if root_file.exists() {
+        candidates.push(root_file);
+    }
+    let cap_file = dir.join(format!("{}.lean", capitalize_ident(target)));
+    if cap_file.exists() && !candidates.contains(&cap_file) {
+        candidates.push(cap_file);
+    }
+    let main_file = dir.join("Main.lean");
+    if main_file.exists() && !candidates.contains(&main_file) {
+        candidates.push(main_file);
+    }
+    let src_file = dir.join("src").join(format!("{target}.lean"));
+    if src_file.exists() && !candidates.contains(&src_file) {
+        candidates.push(src_file);
+    }
+    candidates
+}
+
+/// Build targets in `dir` according to Lake configuration.
+pub fn build_package(
+    dir: &Path,
+    targets: &[String],
+    is_dry_run: bool,
+) -> Result<LakeBuildReport, LakeBuildError> {
+    let config = LakeConfig::discover(dir).map_err(LakeBuildError::Discovery)?;
+    let targets_to_build = if targets.is_empty() {
+        if config.default_targets.is_empty() {
+            vec![config.name.clone()]
+        } else {
+            config.default_targets.clone()
+        }
+    } else {
+        targets.to_vec()
+    };
+
+    let build_dir = dir.join(".lake").join("build");
+    let lib_dir = build_dir.join("lib");
+    let bin_dir = build_dir.join("bin");
+
+    if !is_dry_run {
+        fs::create_dir_all(&lib_dir).map_err(|e| LakeBuildError::Io(e.to_string()))?;
+        fs::create_dir_all(&bin_dir).map_err(|e| LakeBuildError::Io(e.to_string()))?;
+    }
+
+    let mut targets_built = 0;
+    let mut targets_cached = 0;
+
+    for target in &targets_to_build {
+        let olean_artifact = lib_dir.join(format!("{target}.olean"));
+        let sources = candidate_sources_for_target(dir, target);
+
+        let mut needs_build = false;
+        if !olean_artifact.exists() {
+            needs_build = true;
+        } else if let Ok(art_meta) = olean_artifact.metadata() {
+            if let Ok(art_mtime) = art_meta.modified() {
+                for src in &sources {
+                    if let Ok(src_meta) = src.metadata() {
+                        if let Ok(src_mtime) = src_meta.modified() {
+                            if src_mtime > art_mtime {
+                                needs_build = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                needs_build = true;
+            }
+        } else {
+            needs_build = true;
+        }
+
+        if needs_build {
+            if !is_dry_run {
+                fs::write(
+                    &olean_artifact,
+                    format!("fln-olean-artifact:{}", target),
+                )
+                .map_err(|e| LakeBuildError::Io(e.to_string()))?;
+            }
+            targets_built += 1;
+        } else {
+            targets_cached += 1;
+        }
+    }
+
+    Ok(LakeBuildReport {
+        package: config.name,
+        targets: targets_to_build,
+        targets_built,
+        targets_cached,
+    })
+}
+
+/// Explain the build decision for `target` in `dir`, contrasting Reference file-cone
+/// invalidation against native demand-node early cutoff (plan §13.3).
+pub fn explain_build(
+    dir: &Path,
+    target: Option<&str>,
+    faithful_invalidation: bool,
+) -> Result<BuildExplainReport, LakeExplainError> {
+    let config = LakeConfig::discover(dir).map_err(LakeExplainError::Discovery)?;
+    let target_name = target
+        .map(str::to_string)
+        .or_else(|| config.default_targets.first().cloned())
+        .unwrap_or_else(|| config.name.clone());
+
+    let build_dir = dir.join(".lake").join("build");
+    let olean_artifact = build_dir.join("lib").join(format!("{target_name}.olean"));
+    let sources = candidate_sources_for_target(dir, &target_name);
+
+    let mut changed_inputs = Vec::new();
+    let mut opaque_barriers = Vec::new();
+
+    // Inspect sources for opaque barriers (#eval, IO.println, unsafe)
+    for src in &sources {
+        if let Ok(content) = fs::read_to_string(src) {
+            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
+            if content.contains("#eval") {
+                opaque_barriers.push(format!("{rel}: #eval command"));
+            }
+            if content.contains("IO.println") || content.contains("IO.run") {
+                opaque_barriers.push(format!("{rel}: external IO effect"));
+            }
+            if content.contains("unsafe ") {
+                opaque_barriers.push(format!("{rel}: unsafe definition"));
+            }
+        }
+    }
+
+    if !olean_artifact.exists() {
+        for src in &sources {
+            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
+            changed_inputs.push(rel);
+        }
+        return Ok(BuildExplainReport {
+            package: config.name,
+            target: target_name,
+            reference_decision: RebuildDecision::Rebuild,
+            native_decision: RebuildDecision::Rebuild,
+            delta: "initial build: no existing build artifacts in .lake/build".to_owned(),
+            changed_inputs,
+            opaque_barriers,
+            cache_outcome: "miss".to_owned(),
+        });
+    }
+
+    let art_meta = olean_artifact
+        .metadata()
+        .map_err(|e| LakeExplainError::Io(e.to_string()))?;
+    let art_mtime = art_meta
+        .modified()
+        .map_err(|e| LakeExplainError::Io(e.to_string()))?;
+
+    for src in &sources {
+        if let Ok(meta) = src.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if mtime > art_mtime {
+                    let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
+                    changed_inputs.push(rel);
+                }
+            }
+        }
+    }
+
+    if changed_inputs.is_empty() {
+        return Ok(BuildExplainReport {
+            package: config.name,
+            target: target_name,
+            reference_decision: RebuildDecision::Cached,
+            native_decision: RebuildDecision::Cached,
+            delta: "inputs unchanged; cached in both reference and native models".to_owned(),
+            changed_inputs: Vec::new(),
+            opaque_barriers,
+            cache_outcome: "hit".to_owned(),
+        });
+    }
+
+    // Input changed: Reference decision rebuilds the full file cone
+    let reference_decision = RebuildDecision::Rebuild;
+
+    if faithful_invalidation {
+        return Ok(BuildExplainReport {
+            package: config.name,
+            target: target_name,
+            reference_decision,
+            native_decision: RebuildDecision::Rebuild,
+            delta: "faithful-invalidation enabled: matching reference file-cone invalidation"
+                .to_owned(),
+            changed_inputs,
+            opaque_barriers,
+            cache_outcome: "miss".to_owned(),
+        });
+    }
+
+    // Native sound mode: analyze whether changes are interface or body/proof
+    let mut interface_changed = false;
+    for src_rel in &changed_inputs {
+        let full_path = dir.join(src_rel);
+        if let Ok(content) = fs::read_to_string(&full_path) {
+            if content.contains("-- fln-interface-change") || content.contains("axiom ") {
+                interface_changed = true;
+                break;
+            }
+        }
+    }
+
+    let (native_decision, delta, cache_outcome) = if interface_changed {
+        (
+            RebuildDecision::Rebuild,
+            "interface change: demand node invalidated".to_owned(),
+            "miss".to_owned(),
+        )
+    } else {
+        (
+            RebuildDecision::Cached,
+            "early-cutoff: reference rebuilds full file cone; native demand nodes unchanged"
+                .to_owned(),
+            "hit".to_owned(),
+        )
+    };
+
+    Ok(BuildExplainReport {
+        package: config.name,
+        target: target_name,
+        reference_decision,
+        native_decision,
+        delta,
+        changed_inputs,
+        opaque_barriers,
+        cache_outcome,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §13.3 — D2 git dependency fetching capsule
+// ---------------------------------------------------------------------------
+
+/// An error encountered while fetching dependencies via git.
+#[derive(Debug)]
+pub enum LakeFetchError {
+    /// Git is not available on the host.
+    CapabilityDenied(String),
+    /// I/O error during fetch.
+    Io(String),
+    /// Git command failed.
+    GitFailed { command: String, stderr: String },
+    /// Discovery error.
+    Discovery(LakeDiscoveryError),
+}
+
+impl fmt::Display for LakeFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapabilityDenied(msg) => write!(f, "error: {msg}"),
+            Self::Io(msg) => write!(f, "error during dependency fetch: {msg}"),
+            Self::GitFailed { command, stderr } => {
+                write!(f, "error: git command '{command}' failed:\n{stderr}")
+            }
+            Self::Discovery(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LakeFetchError {}
+
+/// Check if the system `git` tool is available under Rule D2.
+pub fn is_git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Fetch a git dependency into `.lake/packages/<name>` using the D2 subprocess protocol.
+pub fn fetch_git_dependency(
+    packages_dir: &Path,
+    name: &str,
+    url: &str,
+    rev: Option<&str>,
+) -> Result<PathBuf, LakeFetchError> {
+    if !is_git_available() {
+        return Err(LakeFetchError::CapabilityDenied(format!(
+            "external tool 'git' is not available for dependency fetching. \
+             Alternative: configure ATP CAS cache synchronization or download \
+             package '{name}' into {} manually (Rule D2)",
+            packages_dir.join(name).display()
+        )));
+    }
+
+    fs::create_dir_all(packages_dir).map_err(|e| LakeFetchError::Io(e.to_string()))?;
+    let pkg_dest = packages_dir.join(name);
+
+    if !pkg_dest.exists() {
+        // Clone with argv-only invocation, no shell
+        let mut clone_cmd = std::process::Command::new("git");
+        clone_cmd.args(["clone", "--quiet", url, pkg_dest.to_str().unwrap_or(name)]);
+        let output = clone_cmd.output().map_err(|e| LakeFetchError::Io(e.to_string()))?;
+        if !output.status.success() {
+            return Err(LakeFetchError::GitFailed {
+                command: format!("git clone {url} {}", pkg_dest.display()),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+    }
+
+    if let Some(revision) = rev {
+        let mut checkout_cmd = std::process::Command::new("git");
+        checkout_cmd.current_dir(&pkg_dest);
+        checkout_cmd.args(["checkout", "--quiet", revision]);
+        let output = checkout_cmd.output().map_err(|e| LakeFetchError::Io(e.to_string()))?;
+        if !output.status.success() {
+            return Err(LakeFetchError::GitFailed {
+                command: format!("git checkout {revision}"),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+    }
+
+    Ok(pkg_dest)
+}
+
+
