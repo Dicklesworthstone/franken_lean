@@ -4,6 +4,7 @@
 target-*/
 target_*/
 crates/*/target/
+tools/**/target/
 a.out
 
 # FrankenLean on-disk state — never commit. Ledger CAS stores, frankensqlite
