@@ -251,7 +251,7 @@ fn multiplexer_verify_capsule_help_and_errors() {
         .expect("run fln verify-capsule nonexistent");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("cannot read"));
+    assert!(stderr.contains("cannot open"));
 
     // Missing file with --json
     let json_output = Command::new(env!("CARGO_BIN_EXE_fln"))
@@ -276,10 +276,17 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
     let mut builder = CartridgeBuilderV1::new(epoch, env_root)
         .with_chunk_size(1024)
         .expect("chunk size");
+    let receipt = builder.add_object(
+        CartridgeObjectKindV1::Receipt,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"receipt-data".to_vec(),
+    );
+    builder.add_root_receipt(receipt);
     builder.add_object(
         CartridgeObjectKindV1::Declaration,
         ObjectRequirementV1::Required,
-        ObjectPortabilityV1::Portable,
+        ObjectPortabilityV1::EpochBound,
         b"def test_const : Nat := 42".to_vec(),
     );
     let archive = builder.build().expect("build archive");
