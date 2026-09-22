@@ -2,14 +2,13 @@
 //! Preserve the ordinary per-declaration evidence and publish only a full batch.
 use super::*;
 
-impl Engine {
-    /// Build the native source environment with the staged coercion library.
-    /// Every class, eliminator, projection and composition instance passes both
-    /// checking engines before any of its registrations become observable.
-    pub fn with_coercion_seed(
+impl EngineBuilder {
+    /// Construct a bounded coercion-seed engine using the specified admission limits.
+    pub fn build_with_coercion_seed(
+        &self,
         limits: EngineAdmissionLimits,
-    ) -> Result<Outcome<Self>, EngineAdmissionError> {
-        let engine = match Self::with_source_seed(limits)? {
+    ) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let engine = match self.build_with_source_seed(limits)? {
             Outcome::Complete(engine) => engine,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -20,7 +19,7 @@ impl Engine {
             }
         })?;
         let mut engine =
-            match engine.admit_declarations(&seed.declarations, &KVMap::new(), limits)? {
+            match engine.admit_declarations(&seed.declarations, &self.options, limits)? {
                 Outcome::Complete(batch) => batch.engine,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -40,6 +39,25 @@ impl Engine {
                 )?;
         }
         Ok(Outcome::Complete(engine))
+    }
+
+    /// Construct a bounded coercion-seed engine using configured or default calibrated limits.
+    pub fn build_coercion_seed(&self) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let limits = self.admission_limits.unwrap_or_else(|| {
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
+        });
+        self.build_with_coercion_seed(limits)
+    }
+}
+
+impl Engine {
+    /// Build the native source environment with the staged coercion library.
+    /// Every class, eliminator, projection and composition instance passes both
+    /// checking engines before any of its registrations become observable.
+    pub fn with_coercion_seed(
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Self>, EngineAdmissionError> {
+        Self::builder().build_with_coercion_seed(limits)
     }
 
     /// Admit one definition, theorem, instance, structure, class or inductive command,

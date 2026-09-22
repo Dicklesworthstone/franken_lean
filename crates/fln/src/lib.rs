@@ -77,7 +77,7 @@ pub use fln_core::mode::{
     ReproducibilityProfile, TargetId,
 };
 pub use fln_core::name::{LeafView, Name};
-pub use fln_core::options::KVMap;
+pub use fln_core::options::{DataValue, KVMap};
 pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 pub use fln_elab::{
     DefinitionFrontendError, NatDefinitionFrontendError, seed::SeedEnvironmentError,
@@ -89,7 +89,12 @@ pub use fln_env::constants::{
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
-pub use fln_env::modules::CancellationProbe;
+pub use fln_env::modules::{CancellationProbe, ModuleEpoch, ModuleGraph, ModuleId};
+pub use fln_env::module_apply::{
+    AppliedExtensionRangeWitness, AppliedModulePayload, ExtensionPayload,
+    ModuleApplyCheckpoint, ModuleApplyPrepareError, ModuleApplyState,
+    ModuleApplyStateError, ModuleApplyTransactionId,
+};
 pub use fln_env::pmap::CollisionBudget;
 pub use fln_hash::canon::CanonError as FlbcProductSidecarCodecError;
 use fln_hash::canon::{CanonWriter, Canonical};
@@ -1861,10 +1866,245 @@ impl std::error::Error for EngineBvDecideError {
 /// is the real Prelude. Successful admission or execution returns a new
 /// `Engine` snapshot containing the published declaration; the receiver is
 /// never mutated.
+/// Configurable builder for embeddable [`Engine`] sessions (plan §17.2).
+///
+/// Follows bead `franken_lean-7kc`: toolchain epoch, semantic mode,
+/// reproducibility profile, options, and admission/execution limits are explicit
+/// configuration inputs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineBuilder {
+    epoch: ModuleEpoch,
+    mode: Mode,
+    reproducibility: ReproducibilityProfile,
+    options: KVMap,
+    admission_limits: Option<EngineAdmissionLimits>,
+    execution_limits: Option<EngineExecutionLimits>,
+}
+
+impl EngineBuilder {
+    /// Create a new builder configured with the toolchain's pinned epoch,
+    /// standard sound mode, standard reproducibility, and empty options.
+    pub fn new() -> Self {
+        Self {
+            epoch: ModuleEpoch::new(OLEAN_PIN_TAG, OLEAN_PIN_COMMIT),
+            mode: Mode::DEFAULT,
+            reproducibility: ReproducibilityProfile::Standard,
+            options: KVMap::new(),
+            admission_limits: None,
+            execution_limits: None,
+        }
+    }
+
+    /// Set the toolchain epoch against which modules and artifacts are validated.
+    pub fn toolchain_epoch(mut self, epoch: ModuleEpoch) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
+    /// Set the semantic mode (Faithful, Sound, or Frontier).
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the reproducibility profile (Standard or Certified).
+    pub fn reproducibility(mut self, profile: ReproducibilityProfile) -> Self {
+        self.reproducibility = profile;
+        self
+    }
+
+    /// Set the options participating in the environment's logical root.
+    pub fn options(mut self, options: KVMap) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set caller-supplied admission bounds.
+    pub fn admission_limits(mut self, limits: EngineAdmissionLimits) -> Self {
+        self.admission_limits = Some(limits);
+        self
+    }
+
+    /// Set caller-supplied execution bounds.
+    pub fn execution_limits(mut self, limits: EngineExecutionLimits) -> Self {
+        self.execution_limits = Some(limits);
+        self
+    }
+
+    /// Set both admission and execution limits from an explicit kernel budget.
+    pub fn kernel_budget(mut self, budget: Budget) -> Self {
+        self.admission_limits = Some(EngineAdmissionLimits::new(budget));
+        self.execution_limits = Some(EngineExecutionLimits::new(budget));
+        self
+    }
+
+    /// The configured toolchain epoch.
+    pub fn epoch(&self) -> &ModuleEpoch {
+        &self.epoch
+    }
+
+    /// The configured semantic mode.
+    pub fn get_mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The configured reproducibility profile.
+    pub fn get_reproducibility(&self) -> ReproducibilityProfile {
+        self.reproducibility
+    }
+
+    /// The configured options map.
+    pub fn get_options(&self) -> &KVMap {
+        &self.options
+    }
+
+    /// The configured admission limits, if set.
+    pub fn get_admission_limits(&self) -> Option<EngineAdmissionLimits> {
+        self.admission_limits
+    }
+
+    /// The configured execution limits, if set.
+    pub fn get_execution_limits(&self) -> Option<EngineExecutionLimits> {
+        self.execution_limits
+    }
+
+    /// Construct an empty engine with an empty environment.
+    pub fn build_empty(&self) -> Engine {
+        Engine {
+            environment: Environment::new(),
+            checker_environment: None,
+            epoch: self.epoch.clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options: self.options.clone(),
+        }
+    }
+
+    /// Attach the configured engine facade to an existing immutable environment.
+    pub fn build_from_environment(&self, environment: Environment) -> Engine {
+        Engine {
+            environment,
+            checker_environment: None,
+            epoch: self.epoch.clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options: self.options.clone(),
+        }
+    }
+
+    /// Attach the configured engine facade to an applied module state,
+    /// adopting its committed environment, epoch, and options (supplemented by
+    /// any non-empty builder options) while preserving the builder's mode and
+    /// reproducibility profile.
+    pub fn build_from_module_state(&self, state: &ModuleApplyState) -> Engine {
+        let mut options = state.options().clone();
+        for (k, v) in self.options.entries() {
+            options.insert(k.clone(), v.clone());
+        }
+        Engine {
+            environment: state.environment().clone(),
+            checker_environment: None,
+            epoch: state.graph().epoch().clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options,
+        }
+    }
+
+    /// Construct a bounded Nat-seed engine using the specified admission limits.
+    pub fn build_with_nat_seed(
+        &self,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        self.build_empty()
+            .admit_declaration(
+                fln_elab::seed::nat_seed_declaration(),
+                &self.options,
+                limits,
+            )
+            .map(|outcome| outcome.map_complete(|admission| admission.engine))
+    }
+
+    /// Construct a bounded Nat-seed engine using configured or default calibrated limits.
+    pub fn build_nat_seed(&self) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let limits = self.admission_limits.unwrap_or_else(|| {
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
+        });
+        self.build_with_nat_seed(limits)
+    }
+
+    /// Construct a bounded source-seed engine using the specified admission limits.
+    pub fn build_with_source_seed(
+        &self,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let mut engine = self.build_empty();
+        for declaration in fln_elab::seed::source_seed_declarations() {
+            let admission = engine.admit_declaration(declaration, &self.options, limits)?;
+            match admission {
+                Outcome::Complete(admission) => engine = admission.engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        }
+        for class in ["Inhabited", "Decidable"] {
+            engine.environment = fln_elab::instances::register_class(
+                &engine.environment,
+                &Name::from_components([class]),
+            )
+            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                detail: "source class registration failed",
+            })?;
+        }
+        for name in [
+            "instInhabitedNat",
+            "instInhabitedString",
+            "instInhabitedBool",
+            "instDecidableTrue",
+            "instDecidableFalse",
+            "instDecidableNot",
+            "instDecidableAnd",
+            "instDecidableOr",
+            "instDecidableImplies",
+            "instDecidableIff",
+            "instDecidableEqBool",
+            "instDecidableEqNat",
+        ] {
+            engine.environment = fln_elab::instances::register_instance(
+                &engine.environment,
+                &Name::from_components([name]),
+                1000,
+            )
+            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                detail: "source instance registration failed",
+            })?;
+        }
+        Ok(Outcome::Complete(engine))
+    }
+
+    /// Construct a bounded source-seed engine using configured or default calibrated limits.
+    pub fn build_source_seed(&self) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let limits = self.admission_limits.unwrap_or_else(|| {
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
+        });
+        self.build_with_source_seed(limits)
+    }
+}
+
+impl Default for EngineBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Engine {
     environment: Environment,
     checker_environment: Option<CheckerConstantEnvironment>,
+    epoch: ModuleEpoch,
+    mode: Mode,
+    reproducibility: ReproducibilityProfile,
+    options: KVMap,
 }
 
 fn bounded_source_module_name_depth(
@@ -2045,6 +2285,17 @@ fn verify_source_module_visibility(
 }
 
 impl Engine {
+    /// Construct a new [`EngineBuilder`] configured with the toolchain's pinned
+    /// epoch, default mode, standard reproducibility, and empty options.
+    pub fn builder() -> EngineBuilder {
+        EngineBuilder::new()
+    }
+
+    /// The pinned toolchain epoch constant.
+    pub fn pinned_epoch() -> ModuleEpoch {
+        ModuleEpoch::new(OLEAN_PIN_TAG, OLEAN_PIN_COMMIT)
+    }
+
     /// Attach the embeddable facade to an existing immutable environment
     /// produced by an importer, module transaction, or earlier engine session.
     /// This performs no admission and grants no new authority. The independent
@@ -2055,7 +2306,51 @@ impl Engine {
         Self {
             environment,
             checker_environment: None,
+            epoch: Self::pinned_epoch(),
+            mode: Mode::DEFAULT,
+            reproducibility: ReproducibilityProfile::Standard,
+            options: KVMap::new(),
         }
+    }
+
+    /// Construct an engine directly from an applied module state, adopting its
+    /// committed environment, epoch, and options while preserving standard mode
+    /// and reproducibility.
+    pub fn from_module_apply_state(state: &ModuleApplyState) -> Self {
+        Self::builder().build_from_module_state(state)
+    }
+
+    /// Advance this engine's environment and epoch from a newly committed
+    /// module state, retaining this engine's mode and reproducibility profile.
+    pub fn apply_module_state(&self, state: &ModuleApplyState) -> Self {
+        Self {
+            environment: state.environment().clone(),
+            checker_environment: None,
+            epoch: state.graph().epoch().clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options: state.options().clone(),
+        }
+    }
+
+    /// The toolchain epoch associated with this engine session.
+    pub fn toolchain_epoch(&self) -> &ModuleEpoch {
+        &self.epoch
+    }
+
+    /// The semantic product mode (Faithful, Sound, or Frontier).
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The reproducibility profile (Standard or Certified).
+    pub fn reproducibility(&self) -> ReproducibilityProfile {
+        self.reproducibility
+    }
+
+    /// The active options contributing to the logical root.
+    pub fn options(&self) -> &KVMap {
+        &self.options
     }
 
     /// Construct the bounded natural-definition engine through the same K1 and
@@ -2069,13 +2364,7 @@ impl Engine {
     pub fn with_nat_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
-        Self::from_environment(Environment::new())
-            .admit_declaration(
-                fln_elab::seed::nat_seed_declaration(),
-                &KVMap::new(),
-                limits,
-            )
-            .map(|outcome| outcome.map_complete(|admission| admission.engine))
+        Self::builder().build_with_nat_seed(limits)
     }
 
     /// Construct the bounded Nat/String/Bool source engine through the ordinary K1
@@ -2091,48 +2380,16 @@ impl Engine {
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
-        let mut engine = Self::from_environment(Environment::new());
-        for declaration in fln_elab::seed::source_seed_declarations() {
-            let admission = engine.admit_declaration(declaration, &KVMap::new(), limits)?;
-            match admission {
-                Outcome::Complete(admission) => engine = admission.engine,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            }
-        }
-        for class in ["Inhabited", "Decidable"] {
-            engine.environment = fln_elab::instances::register_class(
-                &engine.environment,
-                &Name::from_components([class]),
-            )
-            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
-                detail: "source class registration failed",
-            })?;
-        }
-        for name in [
-            "instInhabitedNat",
-            "instInhabitedString",
-            "instInhabitedBool",
-            "instDecidableTrue",
-            "instDecidableFalse",
-            "instDecidableNot",
-            "instDecidableAnd",
-            "instDecidableOr",
-            "instDecidableImplies",
-            "instDecidableIff",
-            "instDecidableEqBool",
-            "instDecidableEqNat",
-        ] {
-            engine.environment = fln_elab::instances::register_instance(
-                &engine.environment,
-                &Name::from_components([name]),
-                1000,
-            )
-            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
-                detail: "source instance registration failed",
-            })?;
-        }
-        Ok(Outcome::Complete(engine))
+        Self::builder().build_with_source_seed(limits)
+    }
+
+    /// Admit one declaration using this engine's active options.
+    pub fn admit_decl(
+        &self,
+        declaration: Declaration,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
+        self.admit_declaration(declaration, &self.options, limits)
     }
 
     /// The immutable environment snapshot against which the next declaration
@@ -2792,6 +3049,10 @@ impl Engine {
             engine: Engine {
                 environment,
                 checker_environment: Some(checker_environment),
+                epoch: self.epoch.clone(),
+                mode: self.mode,
+                reproducibility: self.reproducibility,
+                options: options.clone(),
             },
             declaration,
             base_logical_root,
@@ -5749,6 +6010,11 @@ impl EngineAdmissionLimits {
             collisions: CollisionBudget::default(),
         }
     }
+
+    /// Calibrate admission limits to the specified thread stack size in bytes.
+    pub fn for_stack_bytes(bytes: usize) -> Self {
+        Self::new(Budget::for_stack_bytes(bytes))
+    }
 }
 
 /// Independent caller-supplied bounds for every bounded stage of one execution.
@@ -5781,6 +6047,11 @@ impl EngineExecutionLimits {
             vm: VmExecutionLimits::default(),
             source_modules: SourceModuleLimits::default(),
         }
+    }
+
+    /// Calibrate execution limits to the specified thread stack size in bytes.
+    pub fn for_stack_bytes(bytes: usize) -> Self {
+        Self::new(Budget::for_stack_bytes(bytes))
     }
 
     /// The exact admission subset used before compiler ingress and Golem.
