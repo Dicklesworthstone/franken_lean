@@ -12,6 +12,14 @@ on:
       - 'crates/fln/tests/runtime_closure_data.rs'
       - 'crates/fln-cli/tests/source_closure_data.rs'
       - 'examples/native_closure_data.lean'
+      - 'crates/fln/src/lib.rs'
+      - 'crates/fln-parse/src/lib.rs'
+      - 'crates/fln-parse/tests/source_mutual_modules.rs'
+      - 'crates/fln/tests/runtime_mutual_data.rs'
+      - 'crates/fln/tests/runtime_mutual_recursion.rs'
+      - 'crates/fln-cli/tests/source_mutual_data.rs'
+      - 'examples/native_mutual_data.lean'
+      - 'examples/native_mutual_folds.lean'
 permissions:
   contents: read
 jobs:
@@ -45,8 +53,11 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
       - name: Test source, layouts and installed bytecode consumers
         run: |
+          cargo test --locked -p fln-parse --test source_mutual_modules
           cargo test --locked -p fln --lib
+          cargo test --locked -p fln --test runtime_mutual_data --test runtime_mutual_recursion
           cargo test --locked -p fln --test runtime_closure_data --test runtime_record_projection --test runtime_parameterized_data --test runtime_records --test runtime_specialization --test runtime_higher_order
+          cargo test --locked -p fln-cli --test source_mutual_data
           cargo test --locked -p fln-cli --test source_closure_data --test source_ground_projections --test source_collections
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo clippy --locked -p fln-cli --test source_closure_data --test source_ground_projections -- -D warnings

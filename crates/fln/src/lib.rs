@@ -3414,6 +3414,37 @@ impl Engine {
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
         for (command_index, (original_offset, command_source)) in commands.into_iter().enumerate() {
+            if fln_parse::command_scope::mutual::parse(command_source)
+                .map_err(|error| error.with_original_offset(original_offset))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(error)),
+                    at: Some(original_offset),
+                })?
+                .is_some()
+            {
+                // Keep the whole mutual block on the existing two-checker
+                // admission path. Never publish members sequentially or treat
+                // declarations as VM executions merely to advance the stream.
+                let admission = match engine
+                    .admit_source_command(command_source, options, limits.admission())
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                engine = admission.engine.clone();
+                source_admissions.push(SourceCommandAdmission {
+                    command_index,
+                    admission,
+                });
+                continue;
+            }
             let parsed = fln_parse::parse_source_command(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -5398,7 +5429,27 @@ fn executable_dependencies(
     let mut scalar_constructors = Vec::new();
     let mut intrinsics = Vec::new();
     let mut functions = Vec::new();
-    while let Some(name) = pending.pop_first() {
+    let mut scanned_lambdas = 0;
+    loop {
+        // A mutual closure group's peers live in the callable catalog, not
+        // necessarily in the selected member's expression. They may introduce
+        // otherwise invisible intrinsics or checked function dependencies.
+        // Scan each newly prepared body exactly once, including peers created
+        // while resolving a dependency, before deciding the worklist is empty.
+        while let Some(lambda) = preparation.lambdas.get(scanned_lambdas) {
+            if matches!(lambda.recursion, LambdaRecursion::MutualMember { .. }) {
+                collect_executable_constants(
+                    &lambda.lambda,
+                    &mut pending,
+                    &mut visited_nodes,
+                    limits,
+                )?;
+            }
+            scanned_lambdas += 1;
+        }
+        let Some(name) = pending.pop_first() else {
+            break;
+        };
         if !resolved.insert(name.clone()) {
             continue;
         }

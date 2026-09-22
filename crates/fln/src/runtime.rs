@@ -5,6 +5,7 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
 mod data_recursion;
+mod mutual;
 mod nat;
 mod projections;
 mod records;
@@ -23,6 +24,7 @@ pub(super) struct Preparation<'a> {
     pub(super) cases: Vec<BoolCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
     next_variant: u64,
+    next_mutual: u32,
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
     next_branch: usize,
@@ -45,6 +47,11 @@ enum Task {
     RecursiveLambda {
         parameters: Vec<ValueType>,
         result: ValueType,
+    },
+    MutualLambdas {
+        group: u32,
+        selected: usize,
+        signatures: Vec<(Vec<ValueType>, ValueType)>,
     },
     Visit(Expr),
     Callee(Expr),
@@ -79,6 +86,7 @@ impl<'a> Preparation<'a> {
             cases: Vec::new(),
             variant_cases: Vec::new(),
             next_variant: 0,
+            next_mutual: 0,
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
             next_branch: 0,
@@ -373,6 +381,18 @@ impl<'a> Preparation<'a> {
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(case) = self.mutual_case(name, levels, &args)?
+                        {
+                            self.schedule_constructor_case(case, &mut tasks, limit)?;
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(fold) = self.mutual_fold(name, levels, &args)?
+                        {
+                            self.schedule_mutual_fold(fold, &mut tasks, limit)?;
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
                             && let Some(recursion) = self.data_recursion(name, levels, &args)?
                         {
                             let required = recursion
@@ -543,6 +563,43 @@ impl<'a> Preparation<'a> {
                     let lambda = pop(&mut values)?;
                     values.push(self.register_recursion(lambda, parameters, result)?);
                 }
+                Task::MutualLambdas {
+                    group,
+                    selected,
+                    signatures,
+                } => {
+                    let count = signatures.len();
+                    let start = values
+                        .len()
+                        .checked_sub(count)
+                        .ok_or_else(|| unsupported("mutual lambda result stack"))?;
+                    let selected = values
+                        .get(start + selected)
+                        .ok_or_else(|| unsupported("mutual selected result"))?
+                        .clone();
+                    let members =
+                        u16::try_from(count).map_err(|_| unsupported("mutual member count"))?;
+                    for (index, (lambda, (parameters, result))) in
+                        values.drain(start..).zip(signatures).enumerate()
+                    {
+                        self.tick()?;
+                        reserve(&mut self.lambdas, self.limits.max_lambda_bindings)?;
+                        self.lambdas.push(LambdaBinding {
+                            lambda,
+                            parameter_ownership: borrowed_runtime_parameters(parameters.len())?,
+                            parameters,
+                            result,
+                            result_ownership: result_ownership(result),
+                            recursion: LambdaRecursion::MutualMember {
+                                group,
+                                member: u16::try_from(index)
+                                    .map_err(|_| unsupported("mutual member index"))?,
+                                members,
+                            },
+                        });
+                    }
+                    values.push(selected);
+                }
                 Task::Apply(count) => {
                     let start = values
                         .len()
@@ -591,6 +648,70 @@ impl<'a> Preparation<'a> {
             return Err(unsupported("runtime preparation result"));
         }
         pop(&mut values)
+    }
+
+    /// All members are prepared under their complete peer/argument telescopes
+    /// before registration. The compiler creates their shared acyclic capture
+    /// environment; preparation never recurses on the Rust stack for a fold.
+    fn schedule_mutual_fold(
+        &mut self,
+        fold: mutual::Fold,
+        tasks: &mut Vec<Task>,
+        limit: usize,
+    ) -> Result<(), IngressError> {
+        let mut required = fold.arguments.len().saturating_add(2);
+        let mut peers = Vec::new();
+        let mut signatures = Vec::new();
+        for member in &fold.members {
+            self.tick()?;
+            required = required
+                .saturating_add(fold.members.len())
+                .saturating_add(member.domains.len())
+                .saturating_add(member.case.branches.len())
+                .saturating_add(2);
+            reserve(&mut peers, self.limits.max_context_depth)?;
+            peers.push((member.name.clone(), member.self_type.clone()));
+            reserve(&mut signatures, self.limits.max_lambda_bindings)?;
+            signatures.push((member.parameters.clone(), member.case.result));
+        }
+        if tasks.len().saturating_add(required) > limit {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::PendingTasks,
+                limit,
+                observed: tasks.len().saturating_add(required),
+            });
+        }
+        tasks
+            .try_reserve(required)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::PendingTasks,
+                requested: tasks.len().saturating_add(required),
+            })?;
+        tasks.push(Task::Apply(fold.arguments.len()));
+        tasks.extend(fold.arguments.into_iter().rev().map(Task::Visit));
+        tasks.push(Task::MutualLambdas {
+            group: fold.group,
+            selected: fold.selected,
+            signatures,
+        });
+        for member in fold.members.into_iter().rev() {
+            for (name, type_) in &peers {
+                tasks.push(Task::Lam {
+                    name: name.clone(),
+                    type_: type_.clone(),
+                    info: BinderInfo::Default,
+                });
+            }
+            for domain in member.domains {
+                tasks.push(Task::Lam {
+                    name: Name::anonymous(),
+                    type_: domain,
+                    info: BinderInfo::Default,
+                });
+            }
+            self.schedule_constructor_case(member.case, tasks, limit)?;
+        }
+        Ok(())
     }
 
     fn schedule_constructor_case(

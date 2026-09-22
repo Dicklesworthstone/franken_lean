@@ -1,7 +1,7 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
 //! Closed type parameters are specialized, never stored as runtime fields.
-//! Direct self-recursive object fields are supported; value-dependent,
+//! Direct self- and mutually recursive object fields are supported; value-dependent,
 //! higher-order recursive and proof-valued fields remain explicit refusals.
 //! Nondependent function fields are owned closures with checked interfaces.
 use super::*;
@@ -64,7 +64,7 @@ impl Preparation<'_> {
             || family.num_params as usize != parameters.len()
             || family.num_indices != 0
             || family.num_nested != 0
-            || family.all != [name.clone()]
+            || !family.all.contains(name)
             || family.ctors.is_empty()
             || family.base.level_params.len() != levels.len()
         {
@@ -196,6 +196,49 @@ impl Preparation<'_> {
         Ok(Some(shape))
     }
 
+    /// Resolve one complete admitted mutual block at the same ground type
+    /// arguments. All members must have usable layouts, even when the caller
+    /// initially reaches only one member. No provisional layout is published.
+    pub(super) fn record_group(
+        &mut self,
+        source: &Expr,
+    ) -> Result<Option<Vec<Shape>>, IngressError> {
+        let source = self.normalize_type(source)?;
+        let (head, parameters) = self.spine(&source)?;
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        let mut shapes = Vec::new();
+        let mut seen = HashSet::new();
+        for member in &family.all {
+            self.tick()?;
+            let Some(ConstantInfo::Induct(info)) = self.environment.find(member) else {
+                return Ok(None);
+            };
+            if info.all != family.all
+                || info.num_params != family.num_params
+                || info.base.level_params != family.base.level_params
+                || !seen.insert(member.clone())
+            {
+                return Ok(None);
+            }
+            let mut type_ = Expr::const_(member.clone(), levels.clone());
+            for argument in &parameters {
+                self.tick()?;
+                type_ = Expr::app(type_, argument.clone());
+            }
+            let Some(shape) = self.record_shape(&type_)? else {
+                return Ok(None);
+            };
+            reserve(&mut shapes, self.limits.max_context_depth)?;
+            shapes.push(shape);
+        }
+        Ok(Some(shapes))
+    }
+
     /// Discover data and function representations in one heap worklist. A
     /// record may contain closures whose arguments/results contain more data;
     /// alternating those types must not alternate recursive Rust calls.
@@ -203,7 +246,7 @@ impl Preparation<'_> {
         let source = self.normalize_type(source)?;
         enum Task {
             Enter(Expr),
-            Finish(Shape),
+            Finish(Vec<Shape>),
             Function {
                 source: Expr,
                 domains: Vec<Expr>,
@@ -267,19 +310,49 @@ impl Preparation<'_> {
                         }
                         continue;
                     }
-                    let Some(shape) = self.record_shape(&source)? else {
+                    let Some(shapes) = self.record_group(&source)? else {
                         return Ok(None);
                     };
-                    let mut dependencies = Vec::new();
-                    for field in shape.constructors.iter().flat_map(|ctor| &ctor.fields) {
+                    for shape in &shapes {
                         self.tick()?;
-                        if scalar_type(field).is_none() && field != &shape.source {
+                        if shape.source == source {
+                            continue;
+                        }
+                        if active.contains(&shape.source) {
+                            return Ok(None);
+                        }
+                        let depth = active.len().saturating_add(1);
+                        if depth > self.limits.max_context_depth {
+                            return Err(IngressError::ResourceLimit {
+                                resource: IngressResource::ContextDepth,
+                                limit: self.limits.max_context_depth,
+                                observed: depth,
+                            });
+                        }
+                        active
+                            .try_reserve(1)
+                            .map_err(|_| IngressError::AllocationFailure {
+                                resource: IngressResource::ContextDepth,
+                                requested: depth,
+                            })?;
+                        active.insert(shape.source.clone());
+                    }
+                    let mut dependencies = Vec::new();
+                    for field in shapes
+                        .iter()
+                        .flat_map(|shape| &shape.constructors)
+                        .flat_map(|ctor| &ctor.fields)
+                    {
+                        self.tick()?;
+                        if scalar_type(field).is_none()
+                            && !shapes.iter().any(|shape| &shape.source == field)
+                        {
                             reserve(&mut dependencies, self.limits.max_nodes)?;
                             dependencies.push(field.clone());
                         }
                     }
                     reserve(&mut tasks, self.limits.max_nodes)?;
-                    tasks.push(Task::Finish(shape));
+                    tasks.push(Task::Finish(shapes));
                     for dependency in dependencies.into_iter().rev() {
                         reserve(&mut tasks, self.limits.max_nodes)?;
                         tasks.push(Task::Enter(dependency));
@@ -308,55 +381,57 @@ impl Preparation<'_> {
                     self.register_function_type(source.clone(), parameters, result)?;
                     active.remove(&source);
                 }
-                Task::Finish(shape) => {
-                    for ctor in &shape.constructors {
-                        let mut fields = Vec::new();
-                        for field in &ctor.fields {
-                            self.tick()?;
-                            let value = if field == &shape.source {
-                                ValueType::Constructor
-                            } else if let Some((value, _)) =
-                                executable_value_type(field, &self.value_types)
-                            {
-                                value
-                            } else {
-                                return Ok(None);
-                            };
-                            reserve(&mut fields, self.limits.max_context_depth)?;
-                            fields.push(value);
+                Task::Finish(shapes) => {
+                    for shape in &shapes {
+                        for ctor in &shape.constructors {
+                            let mut fields = Vec::new();
+                            for field in &ctor.fields {
+                                self.tick()?;
+                                let value = if shapes.iter().any(|member| field == &member.source) {
+                                    ValueType::Constructor
+                                } else if let Some((value, _)) =
+                                    executable_value_type(field, &self.value_types)
+                                {
+                                    value
+                                } else {
+                                    return Ok(None);
+                                };
+                                reserve(&mut fields, self.limits.max_context_depth)?;
+                                fields.push(value);
+                            }
+                            reserve(&mut self.constructors, self.limits.fir.max_constructors)?;
+                            self.constructors.push(ConstructorBinding {
+                                name: ctor.name.clone(),
+                                projection_structure: Some(shape.projection(ctor)),
+                                universe_arity: 0,
+                                tag: ctor.tag,
+                                fields,
+                                static_scalar_bytes: Vec::new(),
+                            });
+                            // Preserve the checked ground telescope for a constructor
+                            // passed as a function. Its parameters have already been
+                            // erased; every remaining domain is an actual field.
+                            let mut type_ = shape.source.clone();
+                            for field in ctor.fields.iter().rev() {
+                                self.tick()?;
+                                type_ = Expr::forall_e(
+                                    Name::anonymous(),
+                                    field.clone(),
+                                    type_,
+                                    BinderInfo::Default,
+                                );
+                            }
+                            self.remember_constructor_type(ctor.name.clone(), type_)?;
                         }
-                        reserve(&mut self.constructors, self.limits.fir.max_constructors)?;
-                        self.constructors.push(ConstructorBinding {
-                            name: ctor.name.clone(),
-                            projection_structure: Some(shape.projection(ctor)),
-                            universe_arity: 0,
-                            tag: ctor.tag,
-                            fields,
-                            static_scalar_bytes: Vec::new(),
-                        });
-                        // Preserve the checked ground telescope for a constructor
-                        // passed as a function. Its parameters have already been
-                        // erased; every remaining domain is an actual field.
-                        let mut type_ = shape.source.clone();
-                        for field in ctor.fields.iter().rev() {
-                            self.tick()?;
-                            type_ = Expr::forall_e(
-                                Name::anonymous(),
-                                field.clone(),
-                                type_,
-                                BinderInfo::Default,
-                            );
-                        }
-                        self.remember_constructor_type(ctor.name.clone(), type_)?;
+                        active.remove(&shape.source);
+                        self.value_types.records.try_reserve(1).map_err(|_| {
+                            IngressError::AllocationFailure {
+                                resource: IngressResource::ProgramTables,
+                                requested: self.value_types.records.len().saturating_add(1),
+                            }
+                        })?;
+                        self.value_types.records.insert(shape.source.clone());
                     }
-                    active.remove(&shape.source);
-                    self.value_types.records.try_reserve(1).map_err(|_| {
-                        IngressError::AllocationFailure {
-                            resource: IngressResource::ProgramTables,
-                            requested: self.value_types.records.len().saturating_add(1),
-                        }
-                    })?;
-                    self.value_types.records.insert(shape.source);
                 }
             }
         }
