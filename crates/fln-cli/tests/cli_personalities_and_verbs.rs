@@ -335,3 +335,131 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
     assert!(json_stdout.contains("\"transport_state\":\"complete\""));
 }
 
+#[test]
+fn leanc_personality_print_flags_support() {
+    let output = Command::new(env!("CARGO_BIN_EXE_leanc"))
+        .env("LEAN_SYSROOT", "/custom/lean/sysroot")
+        .arg("--print-cflags")
+        .output()
+        .expect("run leanc --print-cflags");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("-I /custom/lean/sysroot/include"),
+        "stdout: {stdout}"
+    );
+
+    let output_ld = Command::new(env!("CARGO_BIN_EXE_leanc"))
+        .env("LEAN_SYSROOT", "/custom/lean/sysroot")
+        .arg("--print-ldflags")
+        .output()
+        .expect("run leanc --print-ldflags");
+    assert!(
+        output_ld.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output_ld.stderr)
+    );
+    let stdout_ld = String::from_utf8(output_ld.stdout).expect("utf8 stdout");
+    assert!(
+        stdout_ld.contains("-I /custom/lean/sysroot/include"),
+        "stdout: {stdout_ld}"
+    );
+    assert!(
+        stdout_ld.contains("-L /custom/lean/sysroot/lib/lean"),
+        "stdout: {stdout_ld}"
+    );
+}
+
+#[test]
+fn lake_personality_package_lifecycle_init_new_and_clean() {
+    let temp_parent = std::env::temp_dir().join(format!(
+        "fln-lake-cli-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_parent).unwrap();
+
+    // 1. lake clean in empty dir fails with error code 1
+    let empty_dir = temp_parent.join("empty");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let clean_fail = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", empty_dir.to_str().unwrap(), "clean"])
+        .output()
+        .expect("run lake clean in empty dir");
+    assert_eq!(clean_fail.status.code(), Some(1));
+    let clean_fail_stderr = String::from_utf8(clean_fail.stderr).expect("utf8 stderr");
+    assert!(clean_fail_stderr.contains("error: no such file or directory"));
+
+    // 2. lake new my_app in temp_parent
+    let new_output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", temp_parent.to_str().unwrap(), "new", "my_app"])
+        .output()
+        .expect("run lake new my_app");
+    assert!(
+        new_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&new_output.stderr)
+    );
+
+    let pkg_dir = temp_parent.join("my_app");
+    assert!(pkg_dir.join("lakefile.toml").exists());
+    assert!(pkg_dir.join("lean-toolchain").exists());
+    assert!(pkg_dir.join("Main.lean").exists());
+    assert!(pkg_dir.join("MyApp.lean").exists());
+
+    // 3. Create .lake/build and lake clean
+    let build_dir = pkg_dir.join(".lake").join("build");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    std::fs::write(build_dir.join("temp.olean"), b"test").unwrap();
+    assert!(build_dir.exists());
+
+    let clean_output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "clean"])
+        .output()
+        .expect("run lake clean in valid pkg");
+    assert!(
+        clean_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+    assert!(!build_dir.exists());
+
+    // 4. lake clean with --json
+    let clean_json = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "clean"])
+        .output()
+        .expect("run lake clean --json");
+    assert!(clean_json.status.success());
+    let clean_json_stdout = String::from_utf8(clean_json.stdout).expect("utf8 stdout");
+    assert!(clean_json_stdout.contains("\"schema\":\"fln.lake-clean/1\""));
+    assert!(clean_json_stdout.contains("\"status\":\"success\""));
+
+    // 5. lake init in another dir
+    let init_dir = temp_parent.join("init_pkg");
+    std::fs::create_dir_all(&init_dir).unwrap();
+    let init_output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args([
+            "--dir",
+            init_dir.to_str().unwrap(),
+            "--json",
+            "init",
+            "cool_math",
+        ])
+        .output()
+        .expect("run lake init --json");
+    assert!(init_output.status.success());
+    let init_json_stdout = String::from_utf8(init_output.stdout).expect("utf8 stdout");
+    assert!(init_json_stdout.contains("\"schema\":\"fln.lake-init/1\""));
+    assert!(init_json_stdout.contains("\"package\":\"cool_math\""));
+    assert!(init_dir.join("lakefile.toml").exists());
+    assert!(init_dir.join("CoolMath.lean").exists());
+}
+
+
