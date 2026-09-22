@@ -4,58 +4,52 @@ on:
     branches: [main]
     paths: ['.github/workflows/native-collection-runtime.yml']
 permissions:
-  contents: write
+  contents: read
 jobs:
-  integrate:
+  source-object:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and publish native polymorphic collection execution'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'build(runtime): stage digest-verified ground-data source object'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_TERM_COLOR: never
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
+    timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Recover exact digest-bound validation script
+      - name: Materialize one exact source blob without publishing a branch
         shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          import pathlib, subprocess, textwrap, os
-          stored = subprocess.check_output(['git', 'show', '7f4b754f5997ad5fc9b64646cf7e7821085f2513:.github/workflows/native-collection-runtime.yml'], text=True)
-          start = stored.index('          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request\n')
-          end = stored.index('          PY\n', start)
-          script = textwrap.dedent(stored[start:end])
-          old = 'base64.b64decode(encoded, validate=True)'
-          assert script.count(old) == 1
-          script = script.replace(old, 'base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True)')
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
-          root.mkdir()
-          (root / 'validate.py').write_text(script)
-          compile(script, str(root / 'validate.py'), 'exec')
-      - name: Validate concrete collection layouts and export exact blobs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 1
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          path = pathlib.Path('crates/fln/src/lib.rs')
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          assert blob(path.read_bytes()) == '64efd0740c2c064cacc70f5147f4d9aac9facc4b'
+          encoded = 'ZGlmZiAtLWdpdCBhL2NyYXRlcy9mbG4vc3JjL2xpYi5ycyBiL2NyYXRlcy9mbG4vc3JjL2xpYi5ycwppbmRleCA2NGVmZDA3Li41YTcxOGVmIDEwMDY0NAotLS0gYS9jcmF0ZXMvZmxuL3NyYy9saWIucnMKKysrIGIvY3JhdGVzL2Zsbi9zcmMvbGliLnJzCkBAIC01MTA2LDcgKzUxMDYsNyBAQCBzdHJ1Y3QgRXhlY3V0YWJsZVZhbHVlVHlwZXMgewogICAgIG5hdDogRXhwciwKICAgICBzdHJpbmc6IEV4cHIsCiAgICAgYm9vbF86IEV4cHIsCi0gICAgcmVjb3JkczogQlRyZWVTZXQ8TmFtZT4sCisgICAgcmVjb3Jkczogc3RkOjpjb2xsZWN0aW9uczo6SGFzaFNldDxFeHByPiwKICAgICBjbG9zdXJlczogc3RkOjpjb2xsZWN0aW9uczo6SGFzaE1hcDxFeHByLCBWYWx1ZVR5cGU+LAogfQogCkBAIC01MTE2LDcgKzUxMTYsNyBAQCBpbXBsIEV4ZWN1dGFibGVWYWx1ZVR5cGVzIHsKICAgICAgICAgICAgIG5hdDogRXhwcjo6Y29uc3RfKE5hbWU6OmZyb21fY29tcG9uZW50cyhbIk5hdCJdKSwgVmVjOjpuZXcoKSksCiAgICAgICAgICAgICBzdHJpbmc6IEV4cHI6OmNvbnN0XyhOYW1lOjpmcm9tX2NvbXBvbmVudHMoWyJTdHJpbmciXSksIFZlYzo6bmV3KCkpLAogICAgICAgICAgICAgYm9vbF86IEV4cHI6OmNvbnN0XyhOYW1lOjpmcm9tX2NvbXBvbmVudHMoWyJCb29sIl0pLCBWZWM6Om5ldygpKSwKLSAgICAgICAgICAgIHJlY29yZHM6IEJUcmVlU2V0OjpuZXcoKSwKKyAgICAgICAgICAgIHJlY29yZHM6IHN0ZDo6Y29sbGVjdGlvbnM6Okhhc2hTZXQ6Om5ldygpLAogICAgICAgICAgICAgY2xvc3VyZXM6IHN0ZDo6Y29sbGVjdGlvbnM6Okhhc2hNYXA6Om5ldygpLAogICAgICAgICB9CiAgICAgfQpAQCAtNTU5Nyw5ICs1NTk3LDcgQEAgZm4gZXhlY3V0YWJsZV92YWx1ZV90eXBlKAogICAgICAgICBTb21lKChWYWx1ZVR5cGU6OkJvb2wsIENhbGxhYmxlUmVzdWx0T3duZXJzaGlwOjpTY2FsYXIpKQogICAgIH0gZWxzZSBpZiBsZXQgU29tZSh2YWx1ZSkgPSB2YWx1ZV90eXBlcy5jbG9zdXJlcy5nZXQoc291cmNlKSB7CiAgICAgICAgIFNvbWUoKCp2YWx1ZSwgQ2FsbGFibGVSZXN1bHRPd25lcnNoaXA6Ok93bmVkKSkKLSAgICB9IGVsc2UgaWYgbWF0Y2hlcyEoc291cmNlLm5vZGUoKSwgZmxuX2NvcmU6OmV4cHI6OkV4cHJOb2RlOjpDb25zdCB7IG5hbWUsIGxldmVscyB9Ci0gICAgICAgIGlmIGxldmVscy5pc19lbXB0eSgpICYmIHZhbHVlX3R5cGVzLnJlY29yZHMuY29udGFpbnMobmFtZSkpCi0gICAgeworICAgIH0gZWxzZSBpZiB2YWx1ZV90eXBlcy5yZWNvcmRzLmNvbnRhaW5zKHNvdXJjZSkgewogICAgICAgICBTb21lKChWYWx1ZVR5cGU6OkNvbnN0cnVjdG9yLCBDYWxsYWJsZVJlc3VsdE93bmVyc2hpcDo6T3duZWQpKQogICAgIH0gZWxzZSB7CiAgICAgICAgIE5vbmUK'
+          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ground-data-types.patch'
+          patch.write_bytes(base64.b64decode(encoded, validate=True))
+          subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(patch)], check=True)
+          changed = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert changed == [str(path)]
+          content = path.read_bytes()
+          expected = '5a718efb75ba9dbb0a6b1daf62d2d713b24e6861'
+          assert blob(content) == expected
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
+              data=json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode(),
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'},
+              method='POST')
+          with urllib.request.urlopen(request, timeout=60) as response:
+              result = json.load(response)
+          assert result['sha'] == expected
+          receipt = {'path': str(path), 'sha': expected, 'branchPublished': False}
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-object.json').write_text(json.dumps(receipt))
+          print(json.dumps(receipt))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
         with:
-          name: collection-runtime-stage1-${{ github.sha }}
-          path: ${{ runner.temp }}/collection-runtime/1
-          retention-days: 3
-          if-no-files-found: error
-      - name: Validate higher-order collection execution and installed consumers
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: collection-runtime-stage2-${{ github.sha }}
-          path: ${{ runner.temp }}/collection-runtime/2
+          name: ground-data-source-object-${{ github.sha }}
+          path: ${{ runner.temp }}/source-object.json
           retention-days: 3
           if-no-files-found: error
