@@ -231,6 +231,24 @@ impl Engine {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
                     }
+                    if let fln_parse::command_scope::ScopeCommand::Variable(syntax) = control {
+                        scopes.current.variables = fln_elab::source::scope::variables::declare(
+                            &syntax,
+                            engine.environment(),
+                            limits.admission.kernel,
+                            &scopes.current,
+                        )
+                        .map_err(|error| SourceCheckError::Command {
+                            file,
+                            command: count,
+                            offset: start.0,
+                            error: Box::new(EngineExecutionError::Frontend(
+                                DefinitionFrontendError::Elaborate(error),
+                            )),
+                        })?;
+                        count += 1;
+                        continue;
+                    }
                     if let fln_parse::command_scope::ScopeCommand::Instance(attribute) = control {
                         engine.environment = instance_attributes::apply(
                             engine.environment(),

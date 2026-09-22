@@ -85,6 +85,9 @@ impl Scopes {
             ScopeCommand::Instance(_) => {
                 return Err("instance attributes require an environment transition".into());
             }
+            ScopeCommand::Variable(_) => {
+                return Err("variable commands require checked telescope elaboration".into());
+            }
             ScopeCommand::Simp(_) => {
                 return Err("simp attributes require an environment transition".into());
             }

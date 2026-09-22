@@ -2380,6 +2380,15 @@ fn definition_in_context(
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
     }
+    let theorem_section_parameters = if is_theorem {
+        let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
+        roots.extend(expected.iter().cloned());
+        let selected = context.section_parameters(&roots, true)?;
+        context.restrict_section_locals(&selected);
+        Some(selected)
+    } else {
+        None
+    };
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
     let (body, termination, where_clause) = if equations {
         let parts = expect_node(
@@ -2436,6 +2445,18 @@ fn definition_in_context(
     if let Some(expected) = expected {
         term.type_ = expected;
     }
+    // Section variables are fixed during recursion, not recursive arguments.
+    // Only after body elaboration are their used dependencies prepended.
+    context.resolve_instances(true)?;
+    context.flush(true)?;
+    let section_parameters = if let Some(selected) = theorem_section_parameters {
+        selected
+    } else {
+        let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
+        roots.extend([term.type_.clone(), term.value.clone()]);
+        context.section_parameters(&roots, false)?
+    };
+    parameters.splice(0..0, section_parameters);
     let mut universe_roots: Vec<_> = parameters
         .iter()
         .map(|parameter| parameter.type_.clone())

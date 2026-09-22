@@ -5,6 +5,7 @@ pub mod attributes;
 pub mod imports;
 pub mod instances;
 pub mod mutual;
+pub mod variables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
@@ -13,6 +14,7 @@ pub enum ScopeCommand {
     End(Option<Name>),
     Open(Vec<Name>),
     Universe(Vec<Name>),
+    Variable(Syntax),
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
     Trivia,
@@ -33,6 +35,7 @@ fn table() -> TokenTable {
         "hiding",
         "renaming",
         "attribute",
+        "variable",
     ] {
         table.insert(keyword);
     }
@@ -63,7 +66,7 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
 fn control(s: &str) -> bool {
     matches!(
         s,
-        "namespace" | "section" | "end" | "open" | "universe" | "attribute"
+        "namespace" | "section" | "end" | "open" | "universe" | "attribute" | "variable"
     )
 }
 fn declaration(s: &str) -> bool {
@@ -85,6 +88,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if keyword == "variable" {
+        return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
+    }
     if keyword == "attribute" {
         if let Some(attribute) = instances::parse(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Instance(attribute)));

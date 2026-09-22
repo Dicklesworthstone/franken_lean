@@ -1,0 +1,39 @@
+# Native section variables
+
+Source files and source modules accept typed `variable` telescopes. Explicit,
+implicit, strict-implicit, and named or anonymous instance parameters use the
+same parser and elaborator as declaration binders. For example:
+
+```lean
+section
+variable {A : Type u} (x : A)
+def identity := x
+theorem self : x = x := by rfl
+end
+theorem works : identity 7 = 7 := by rfl
+```
+
+The variable command resolves names and checks the entire telescope immediately,
+including unused domains. It creates no global assumptions. Section and namespace
+exit restore the previous parameter context; file boundaries discard it. Checked
+definitions and theorems remain available with ordinary closed Pi/lambda binders,
+and pass the existing kernel plus independent checker admission path.
+
+Definitions and named instances generalize parameters used in their types or
+values, along with transitive type dependencies, in variable declaration order
+before written parameters. Unused variables are not added. Section variables
+stay fixed during recursive calls; explicit declaration parameters can shadow
+them. Resolved variable types are not reparsed after later `open` commands.
+
+Theorem parameters are selected from the header before elaborating the proof.
+Instance-implicit section parameters whose dependencies are all selected are
+also available. Other section locals are removed from the proof context, so
+editing a proof cannot silently introduce additional assumptions. The resulting
+theorem retains the selected header parameters, including unused instances.
+
+This increment covers definitions, theorems, and named instances. Variable
+binder-style changes, `include`/`omit`, generalized record/inductive parameters,
+and command-local `in` scopes are not implemented by this increment. It does not
+claim the whole source elaboration workstream or Reference parity is complete.
+The source regressions are `crates/fln/tests/source_section_variables.rs`;
+parser layout and malformed-input tests live with the variable command parser.

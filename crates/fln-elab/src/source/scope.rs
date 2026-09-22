@@ -2,6 +2,7 @@
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
 pub mod simp;
+pub mod variables;
 use fln_core::name::LeafView;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub struct SourceScope {
     pub namespace: Name,
     pub opened: Vec<Name>,
     pub universes: Vec<Name>,
+    pub variables: variables::SectionVariables,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +121,8 @@ impl Context {
     pub(super) fn scoped(env: &Environment, kernel: Budget, scope: &SourceScope) -> Self {
         let mut context = Self::new(env, kernel);
         context.source_scope = scope.clone();
+        context.txn.lctx = scope.variables.locals().clone();
+        context.next = scope.variables.next();
         context
     }
 
@@ -219,6 +223,7 @@ mod tests {
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
             universes: vec![],
+            variables: variables::SectionVariables::default(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];
         let resolve = |name: &str| scope.resolve(&n(name), |x| names.contains(x));

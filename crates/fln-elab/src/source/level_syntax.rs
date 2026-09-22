@@ -99,6 +99,12 @@ impl Context {
             }
             self.level_params.push(name);
         }
+        for name in self.source_scope.variables.levels().to_vec() {
+            self.tick()?;
+            if !self.level_params.contains(&name) {
+                self.level_params.push(name);
+            }
+        }
         Ok(())
     }
 
