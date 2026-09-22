@@ -8,6 +8,7 @@ mod data_recursion;
 mod mutual;
 mod nat;
 mod projections;
+mod proofs;
 mod records;
 mod specialize;
 mod variants;
@@ -258,13 +259,22 @@ impl<'a> Preparation<'a> {
     /// bodies are transformed so nested closure annotations cannot go stale
     /// under a later de Bruijn lift.
     pub(super) fn expression(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        self.expression_at_type(input, None)
+    }
+
+    pub(super) fn expression_at_type(
+        &mut self,
+        input: &Expr,
+        expected: Option<Expr>,
+    ) -> Result<Expr, IngressError> {
         // Catalog bodies have already had their original binder telescope
         // removed. Their projections are selected by signature normalization;
         // closed roots still carry the source context needed for selection.
         let input = if input.has_loose_bvars() {
             input.clone()
         } else {
-            self.lower_projections(input)?
+            let erased = self.erase_proofs(input, expected)?;
+            self.lower_projections(&erased)?
         };
         let mut tasks = vec![Task::Visit(input.clone())];
         let mut values = Vec::<Expr>::new();

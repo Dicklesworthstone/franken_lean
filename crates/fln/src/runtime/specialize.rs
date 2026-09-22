@@ -137,7 +137,7 @@ impl Preparation<'_> {
         expr.lift_loose(0, amount)
             .map_err(|_| unsupported("runtime specialization scope"))
     }
-    fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
+    pub(super) fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
         let (mut head, mut args) = self.spine(source)?;
         args.reverse();
         loop {
@@ -277,8 +277,8 @@ impl Preparation<'_> {
         definition: &DefinitionVal,
     ) -> Result<DefinitionVal, IngressError> {
         let mut result = definition.clone();
-        result.base.type_ = self.normalize_type(&definition.base.type_)?;
-        let mut body = definition.value.clone();
+        result.base.type_ = self.erase_runtime_type(&definition.base.type_)?;
+        let mut body = self.erase_proofs(&definition.value, Some(definition.base.type_.clone()))?;
         let mut binders = Vec::new();
         while let ExprNode::Lam {
             binder_name,
@@ -621,6 +621,12 @@ impl Preparation<'_> {
     /// axiom name is insufficient: intrinsics require the exact seed contract.
     /// Ground constructors use the same telescope that produced their layout.
     fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
+        self.original_callable_type(head)?
+            .map(|type_| self.erase_runtime_type(&type_))
+            .transpose()
+    }
+
+    fn original_callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };

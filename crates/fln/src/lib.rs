@@ -4644,7 +4644,7 @@ impl Engine {
             .normalize_type(&declared_type)
             .map_err(EngineExecutionError::Ingress)?;
         let expression = preparation
-            .expression(&expression)
+            .expression_at_type(&expression, Some(declared_type.clone()))
             .map_err(EngineExecutionError::Ingress)?;
         let mut catalog = executable_dependencies(
             &self.environment,

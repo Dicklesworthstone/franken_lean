@@ -6,6 +6,7 @@
 //! not another checker: no executable receiver is reduced, copied or discarded.
 use super::*;
 use fln_core::expr::Literal;
+use fln_core::level::Level;
 
 // Types here are relative to the context *before* their binder was introduced.
 // Lifting by index + 1 reopens a selected domain in the current context.
@@ -29,7 +30,7 @@ impl Preparation<'_> {
     /// Reconstruct a source type using explicit continuations. In particular,
     /// applications and nested projections do not recurse on the host stack.
     /// Unknown or genuinely dependent representations are left unsupported.
-    fn projection_receiver_type(
+    pub(super) fn projection_receiver_type(
         &mut self,
         source: &Expr,
         context: &[Expr],
@@ -45,6 +46,11 @@ impl Preparation<'_> {
         let mut type_ = loop {
             self.tick()?;
             let frame = match head.node() {
+                ExprNode::Sort { level } => {
+                    break Expr::sort(
+                        Level::succ(level.clone()).map_err(|_| unsupported("proof sort depth"))?,
+                    );
+                }
                 ExprNode::BVar { idx } => {
                     let Some(position) = locals.len().checked_sub(*idx as usize + 1) else {
                         return Ok(None);
