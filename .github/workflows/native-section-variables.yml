@@ -8,6 +8,7 @@ on:
       - 'crates/fln-parse/**'
       - 'crates/fln/src/**'
       - 'crates/fln/tests/source_section_variables.rs'
+      - 'crates/fln/tests/source_section_records.rs'
   workflow_dispatch:
 permissions:
   contents: read
@@ -34,7 +35,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/section-verification/compiler.txt
           cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/section-verification/frontend.log
-          cargo test --locked -p fln --test source_section_variables --test source_scopes --test source_instances --test source_module_check --test source_module_session --no-fail-fast 2>&1 | tee target/section-verification/source.log
+          cargo test --locked -p fln --test source_section_variables --test source_section_records --test source_record_defaults --test source_inheritance --test source_scopes --test source_instances --test source_module_check --test source_module_session --no-fail-fast 2>&1 | tee target/section-verification/source.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/section-verification/check.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/section-verification/clippy.log
           rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/scope/variables.rs crates/fln-parse/src/command_scope/variables.rs crates/fln/tests/source_section_variables.rs

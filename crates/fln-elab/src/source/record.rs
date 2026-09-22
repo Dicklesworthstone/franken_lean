@@ -205,12 +205,15 @@ pub(super) fn elaborate_record_scoped(
             })?;
             term.value = context.expand_record_aliases(term.value, &inheritance.aliases)?;
             term.type_ = context.expand_record_aliases(term.type_, &inheritance.aliases)?;
-            let locals = context
-                .txn
-                .lctx
-                .decls()
+            // Close only the written record parameters, physical fields and
+            // method arguments now. Section dependencies are selected across
+            // the whole record (including every default) before closing them.
+            // Closing the whole lctx here would capture unused section locals
+            // and put helpers out of agreement with the constructor telescope.
+            let locals = parameters
                 .iter()
-                .filter(|l| !l.is_let())
+                .chain(&output)
+                .chain(&arguments)
                 .cloned()
                 .collect::<Vec<_>>();
             for (index, local) in locals.iter().enumerate().rev() {
@@ -323,13 +326,43 @@ pub(super) fn elaborate_record_scoped(
             roots.extend([definition.base.type_.clone(), definition.value.clone()]);
         }
     }
+    // Defaults may mention section parameters absent from the field types.
+    // Compute one dependency-closed telescope for the family and all helpers,
+    // rather than giving each helper a different (and unusable) interface.
+    let mut section = context.section_parameters(&roots, false)?;
+    for param in &mut section {
+        context.tick()?;
+        param.type_ = context.instantiate(&param.type_)?;
+        context.require_resolved(std::slice::from_ref(&param.type_))?;
+        roots.push(param.type_.clone());
+    }
+    if section
+        .len()
+        .saturating_add(parameters.len())
+        .saturating_add(output.len())
+        > budget.max_binders
+    {
+        return Err(failure(SourceInferenceError::ResourceLimit));
+    }
     let level_params = context.declaration_levels(&roots)?;
+    let mut closer = crate::records::Builder {
+        remaining: budget.max_nodes,
+    };
     // Helpers are instantiated at the record's levels by the default registry.
+    // Constructor parameters, including explicit section variables, are implicit
+    // in its helpers too; retain strict/instance binder styles unchanged.
     for helper in &mut helpers {
         if let Declaration::Defn(definition) = helper {
             definition.base.level_params = level_params.clone();
+            definition.base.type_ = closer
+                .close(&section, definition.base.type_.clone(), false, true)
+                .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+            definition.value = closer
+                .close(&section, definition.value.clone(), true, true)
+                .map_err(|e| failure(SourceInferenceError::Record(e)))?;
         }
     }
+    parameters.splice(0..0, section);
     let spec = RecordSpec {
         name: name.clone(),
         level_params,

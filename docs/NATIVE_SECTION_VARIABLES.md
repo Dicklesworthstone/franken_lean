@@ -52,10 +52,37 @@ errors, and are restored on section/namespace exit. They affect theorem headers,
 not the used-variable generalization of definitions. Named selections persist
 across later `variable` commands but never across source-file boundaries.
 
-This increment covers definitions, theorems, and named instances. Variable
-binder-style changes, instance-pattern `omit [Class ...]`, generalized
-record/inductive parameters, and command-local `in` scopes are not implemented
-by this increment. It does not
+This increment covers definitions, theorems, named instances, records and classes.
+Variable binder-style changes, instance-pattern `omit [Class ...]`, generalized
+inductive parameters, and command-local `in` scopes are not implemented by this
+increment. It does not
 claim the whole source elaboration workstream or Reference parity is complete.
 The source regressions are `crates/fln/tests/source_section_variables.rs`;
 parser layout and malformed-input tests live with the variable command parser.
+## Records and classes
+
+Section parameters also generalize `structure` and `class` declarations. The
+selection spans written parameter types, physical parent/field types, and all
+field-default bodies. Its transitive type dependencies are included in section
+order before the written parameters. Unused variables and theorem-only
+`include`/`omit` selections do not affect the record.
+
+```lean
+section
+variable {A : Type} [inh : Inhabited A] (unused : Nat)
+structure Defaulted where
+  value : A := default
+end
+def defaulted : Defaulted (A := Nat) := {}
+theorem works : defaulted.value = 0 := by rfl
+```
+
+Default helpers are closed only after the entire record's parameter list is
+known. Even an early, constant default receives parameters discovered in a later
+field or default. They use the same constructor-prefix telescope, including
+inherited physical fields and dependent method arguments. This supports defaults,
+updates, parent coercions and class instance search without leaking section locals
+into the checked environment. Both checkers and the complete-batch publication
+rule are unchanged. Generalized parameters count toward the record binder budget.
+
+The additional regressions are `fln::source_section_records`.
