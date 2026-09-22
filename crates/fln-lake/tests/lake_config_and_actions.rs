@@ -183,3 +183,46 @@ fn test_new_package_and_clean() {
     let clean_err = clean(&empty_dir).unwrap_err();
     assert!(matches!(clean_err, LakeCleanError::NoConfigFile(_)));
 }
+
+#[test]
+fn test_manifest_serialization_and_update() {
+    let dir = fresh_temp_dir("manifest-test");
+    let toml = r#"
+name = "math_project"
+version = "0.1.0"
+defaultTargets = ["math_project"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.32.0"
+"#;
+    std::fs::write(dir.join("lakefile.toml"), toml).unwrap();
+
+    let manifest = fln_lake::update_manifest(&dir).expect("update manifest");
+    assert_eq!(manifest.name, "math_project");
+    assert_eq!(manifest.version, "1.1.0");
+    assert_eq!(manifest.packages.len(), 1);
+    assert_eq!(manifest.packages[0].name, "mathlib");
+    assert_eq!(
+        manifest.packages[0].url.as_deref(),
+        Some("https://github.com/leanprover-community/mathlib4.git")
+    );
+    assert_eq!(manifest.packages[0].rev.as_deref(), Some("v4.32.0"));
+
+    // Verify written lake-manifest.json
+    let loaded = fln_lake::Manifest::load_from_dir(&dir)
+        .expect("load manifest")
+        .expect("manifest exists");
+    assert_eq!(loaded.name, "math_project");
+    assert_eq!(loaded.packages.len(), 1);
+    assert_eq!(loaded.packages[0].name, "mathlib");
+
+    // Test parse_json with version 7 integer format for backwards compatibility
+    let v7_json = r#"{"version": 7, "packagesDir": ".lake/packages", "packages": [], "name": "legacy_pkg", "lakeDir": ".lake"}"#;
+    let parsed_v7 = fln_lake::Manifest::parse_json(v7_json).expect("parse v7 manifest");
+    assert_eq!(parsed_v7.name, "legacy_pkg");
+    assert_eq!(parsed_v7.version, "7");
+    assert_eq!(parsed_v7.packages.len(), 0);
+}
+

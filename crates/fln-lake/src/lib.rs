@@ -827,3 +827,285 @@ pub fn new_package(
     Ok(target_dir)
 }
 
+// ---------------------------------------------------------------------------
+// §13.3 — Lake manifest (lake-manifest.json)
+// ---------------------------------------------------------------------------
+
+/// A package entry within `lake-manifest.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPackageEntry {
+    pub name: String,
+    pub scope: String,
+    pub entry_type: String,
+    pub url: Option<String>,
+    pub rev: Option<String>,
+    pub input_rev: Option<String>,
+    pub subdir: Option<String>,
+    pub inherited: bool,
+    pub config_file: String,
+}
+
+/// The serialized Lake package manifest (`lake-manifest.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub name: String,
+    pub lake_dir: PathBuf,
+    pub packages_dir: PathBuf,
+    pub version: String,
+    pub packages: Vec<ManifestPackageEntry>,
+}
+
+#[derive(Debug)]
+pub enum LakeUpdateError {
+    Discovery(LakeDiscoveryError),
+    Io(String),
+    Parse(String),
+}
+
+impl fmt::Display for LakeUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(e) => write!(f, "error discovering Lake configuration: {e}"),
+            Self::Io(msg) => write!(f, "I/O error updating Lake manifest: {msg}"),
+            Self::Parse(msg) => write!(f, "error parsing Lake manifest: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LakeUpdateError {}
+
+fn json_extract_field<'a>(obj: &'a str, field: &str) -> Option<&'a str> {
+    let key_pattern = format!("\"{}\"", field);
+    let key_pos = obj.find(&key_pattern)?;
+    let after_key = &obj[key_pos + key_pattern.len()..];
+    let colon_pos = after_key.find(':')?;
+    let after_colon = after_key[colon_pos + 1..].trim_start();
+    let mut end = after_colon.len();
+    let mut in_str = false;
+    let mut depth = 0;
+    for (i, c) in after_colon.char_indices() {
+        if c == '"' {
+            in_str = !in_str;
+        } else if !in_str {
+            if c == '{' || c == '[' {
+                depth += 1;
+            } else if c == '}' || c == ']' {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            } else if c == ',' && depth == 0 {
+                end = i;
+                break;
+            }
+        }
+    }
+    Some(after_colon[..end].trim())
+}
+
+fn json_extract_string(obj: &str, field: &str) -> Option<String> {
+    let val = json_extract_field(obj, field)?;
+    if val == "null" {
+        return None;
+    }
+    parse_string_val(val)
+}
+
+fn json_extract_bool(obj: &str, field: &str) -> Option<bool> {
+    let val = json_extract_field(obj, field)?;
+    match val {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn extract_json_objects(array_str: &str) -> Vec<&str> {
+    let mut objs = Vec::new();
+    let mut depth = 0;
+    let mut start = None;
+    let mut in_str = false;
+    for (i, c) in array_str.char_indices() {
+        if c == '"' {
+            in_str = !in_str;
+        } else if !in_str {
+            if c == '{' {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        objs.push(&array_str[s..=i]);
+                    }
+                    start = None;
+                }
+            }
+        }
+    }
+    objs
+}
+
+impl Manifest {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            lake_dir: PathBuf::from(".lake"),
+            packages_dir: PathBuf::from(".lake/packages"),
+            version: "1.1.0".to_owned(),
+            packages: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str(&format!("  \"name\": \"{}\",\n", self.name));
+        out.push_str(&format!("  \"version\": \"{}\",\n", self.version));
+        out.push_str(&format!("  \"lakeDir\": \"{}\",\n", self.lake_dir.display()));
+        out.push_str(&format!(
+            "  \"packagesDir\": \"{}\",\n",
+            self.packages_dir.display()
+        ));
+        out.push_str("  \"packages\": [\n");
+        for (i, pkg) in self.packages.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!("      \"name\": \"{}\",\n", pkg.name));
+            out.push_str(&format!("      \"scope\": \"{}\",\n", pkg.scope));
+            out.push_str(&format!("      \"type\": \"{}\",\n", pkg.entry_type));
+            if let Some(url) = &pkg.url {
+                out.push_str(&format!("      \"url\": \"{url}\",\n"));
+            } else {
+                out.push_str("      \"url\": null,\n");
+            }
+            if let Some(rev) = &pkg.rev {
+                out.push_str(&format!("      \"rev\": \"{rev}\",\n"));
+            } else {
+                out.push_str("      \"rev\": null,\n");
+            }
+            if let Some(input_rev) = &pkg.input_rev {
+                out.push_str(&format!("      \"inputRev\": \"{input_rev}\",\n"));
+            } else {
+                out.push_str("      \"inputRev\": null,\n");
+            }
+            if let Some(sub) = &pkg.subdir {
+                out.push_str(&format!("      \"subDir\": \"{sub}\",\n"));
+            } else {
+                out.push_str("      \"subDir\": null,\n");
+            }
+            out.push_str(&format!("      \"inherited\": {},\n", pkg.inherited));
+            out.push_str(&format!("      \"configFile\": \"{}\"\n", pkg.config_file));
+            if i + 1 < self.packages.len() {
+                out.push_str("    },\n");
+            } else {
+                out.push_str("    }\n");
+            }
+        }
+        out.push_str("  ]\n");
+        out.push_str("}\n");
+        out
+    }
+
+    pub fn parse_json(content: &str) -> Result<Self, String> {
+        let name = json_extract_string(content, "name")
+            .ok_or_else(|| "missing 'name' field in manifest".to_owned())?;
+        let version = json_extract_string(content, "version")
+            .or_else(|| {
+                // If version is numeric (e.g. 7)
+                json_extract_field(content, "version").map(|v| v.to_owned())
+            })
+            .unwrap_or_else(|| "1.1.0".to_owned());
+        let lake_dir = json_extract_string(content, "lakeDir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".lake"));
+        let packages_dir = json_extract_string(content, "packagesDir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".lake/packages"));
+
+        let mut packages = Vec::new();
+        if let Some(packages_str) = json_extract_field(content, "packages") {
+            for obj_str in extract_json_objects(packages_str) {
+                let pkg_name = json_extract_string(obj_str, "name").unwrap_or_default();
+                let scope = json_extract_string(obj_str, "scope").unwrap_or_default();
+                let entry_type = json_extract_string(obj_str, "type")
+                    .unwrap_or_else(|| "git".to_owned());
+                let url = json_extract_string(obj_str, "url");
+                let rev = json_extract_string(obj_str, "rev");
+                let input_rev = json_extract_string(obj_str, "inputRev");
+                let subdir = json_extract_string(obj_str, "subDir");
+                let inherited = json_extract_bool(obj_str, "inherited").unwrap_or(false);
+                let config_file = json_extract_string(obj_str, "configFile")
+                    .unwrap_or_else(|| "lakefile.toml".to_owned());
+
+                packages.push(ManifestPackageEntry {
+                    name: pkg_name,
+                    scope,
+                    entry_type,
+                    url,
+                    rev,
+                    input_rev,
+                    subdir,
+                    inherited,
+                    config_file,
+                });
+            }
+        }
+
+        Ok(Self {
+            name,
+            lake_dir,
+            packages_dir,
+            version,
+            packages,
+        })
+    }
+
+    pub fn load_from_dir(dir: &Path) -> Result<Option<Self>, LakeUpdateError> {
+        let manifest_path = dir.join("lake-manifest.json");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| LakeUpdateError::Io(e.to_string()))?;
+        let manifest = Self::parse_json(&content)
+            .map_err(LakeUpdateError::Parse)?;
+        Ok(Some(manifest))
+    }
+
+    pub fn save_to_dir(&self, dir: &Path) -> Result<(), io::Error> {
+        let manifest_path = dir.join("lake-manifest.json");
+        let tmp_path = dir.join(".lake-manifest.json.tmp");
+        let content = self.to_json();
+        fs::write(&tmp_path, content)?;
+        fs::rename(tmp_path, manifest_path)?;
+        Ok(())
+    }
+}
+
+/// Update dependencies and write `lake-manifest.json`.
+pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
+    let config = LakeConfig::discover(dir).map_err(LakeUpdateError::Discovery)?;
+    let mut manifest = Manifest::new(&config.name);
+    for req in &config.requires {
+        let entry = ManifestPackageEntry {
+            name: req.name.clone(),
+            scope: String::new(),
+            entry_type: "git".to_owned(),
+            url: req.url.clone(),
+            rev: req.rev.clone(),
+            input_rev: req.rev.clone(),
+            subdir: req.subdir.clone(),
+            inherited: false,
+            config_file: "lakefile.toml".to_owned(),
+        };
+        manifest.packages.push(entry);
+    }
+    manifest
+        .save_to_dir(dir)
+        .map_err(|e| LakeUpdateError::Io(e.to_string()))?;
+    Ok(manifest)
+}
+
