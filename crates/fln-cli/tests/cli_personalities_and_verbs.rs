@@ -76,14 +76,31 @@ fn multiplexer_diff_verb_routes_to_olean_diff() {
     assert!(stdout.contains("Usage:"));
 }
 
+fn temp_file(text: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "fln-goals-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("goal_test.lean");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
 #[test]
 fn multiplexer_goals_verb_inspects_proof_goals() {
-    let example_path = "examples/native_goal_control.lean";
+    let text = include_str!("../../../examples/native_goal_control.lean");
+    let file_path = temp_file(text);
+    let path_str = file_path.to_str().unwrap();
 
     // Test with PATH:LINE:COL
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("goals")
-        .arg(format!("{example_path}:7:3"))
+        .arg(format!("{path_str}:7:3"))
         .output()
         .expect("run fln goals");
     assert!(
@@ -96,7 +113,7 @@ fn multiplexer_goals_verb_inspects_proof_goals() {
 
     // Test with --json and --line --col
     let json_output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["goals", "--json", "--line", "7", "--col", "3", example_path])
+        .args(["goals", "--json", "--line", "7", "--col", "3", path_str])
         .output()
         .expect("run fln goals --json");
     assert!(
