@@ -85,7 +85,7 @@ pub(in crate::source_check) fn document_path(uri: &str) -> Result<PathBuf, Failu
     }
 }
 
-fn file_uri(path: &Path) -> Result<String, Failure> {
+pub(in crate::source_check) fn file_uri(path: &Path) -> Result<String, Failure> {
     let text = path
         .to_str()
         .ok_or_else(|| Failure::input("source path is not UTF-8"))?;

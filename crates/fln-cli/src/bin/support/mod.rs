@@ -62,6 +62,7 @@ fn project_snapshot(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
     fln_cli::serve_lsp()
 }

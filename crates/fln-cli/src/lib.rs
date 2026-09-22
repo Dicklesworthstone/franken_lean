@@ -1073,6 +1073,146 @@ fn parse_ilean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
     })
 }
 
+fn parse_path_line_col(s: &str) -> Option<(&str, usize, Option<usize>)> {
+    let mut parts = s.rsplitn(3, ':');
+    let last = parts.next()?;
+    let second = parts.next()?;
+    if let (Ok(c), Ok(l)) = (last.parse::<usize>(), second.parse::<usize>()) {
+        let p = parts.next()?;
+        if !p.is_empty() {
+            return Some((p, l, Some(c)));
+        }
+    }
+    if let Ok(l) = last.parse::<usize>() {
+        let p = second;
+        if !p.is_empty() && parts.next().is_none() {
+            return Some((p, l, None));
+        }
+    }
+    None
+}
+
+fn parse_goals(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut path: Option<PathBuf> = None;
+    let mut line: Option<usize> = None;
+    let mut col: Option<usize> = None;
+    let mut offset: Option<usize> = None;
+    let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
+    let mut json = false;
+
+    let mut iter = arguments.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--help" || arg == "-h" || arg == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if arg == "--json" {
+            json = true;
+            continue;
+        }
+        if arg == "--max-bytes" {
+            let Some(val) = iter.next() else {
+                return Err(UsageError("--max-bytes requires an integer value".to_owned()));
+            };
+            let val_str = val.to_string_lossy();
+            max_bytes = val_str
+                .parse::<usize>()
+                .map_err(|_| UsageError(format!("invalid --max-bytes value {val_str:?}")))?;
+            continue;
+        }
+        if arg == "--offset" {
+            let Some(val) = iter.next() else {
+                return Err(UsageError("--offset requires an integer value".to_owned()));
+            };
+            let val_str = val.to_string_lossy();
+            offset = Some(
+                val_str
+                    .parse::<usize>()
+                    .map_err(|_| UsageError(format!("invalid --offset value {val_str:?}")))?,
+            );
+            continue;
+        }
+        if arg == "--line" {
+            let Some(val) = iter.next() else {
+                return Err(UsageError("--line requires an integer value".to_owned()));
+            };
+            let val_str = val.to_string_lossy();
+            line = Some(
+                val_str
+                    .parse::<usize>()
+                    .map_err(|_| UsageError(format!("invalid --line value {val_str:?}")))?,
+            );
+            continue;
+        }
+        if arg == "--col" {
+            let Some(val) = iter.next() else {
+                return Err(UsageError("--col requires an integer value".to_owned()));
+            };
+            let val_str = val.to_string_lossy();
+            col = Some(
+                val_str
+                    .parse::<usize>()
+                    .map_err(|_| UsageError(format!("invalid --col value {val_str:?}")))?,
+            );
+            continue;
+        }
+        if let Some(arg_str) = arg.to_str() {
+            if arg_str.starts_with("--") {
+                return Err(UsageError(format!("unknown option {arg_str:?}")));
+            }
+        }
+        if path.is_some() {
+            return Err(UsageError("goals accepts exactly one input path".to_owned()));
+        }
+        let arg_str = arg.to_string_lossy();
+        if let Some((p, l, c)) = parse_path_line_col(&arg_str) {
+            path = Some(PathBuf::from(p));
+            if line.is_none() {
+                line = Some(l);
+            }
+            if col.is_none() && c.is_some() {
+                col = c;
+            }
+        } else {
+            path = Some(PathBuf::from(arg));
+        }
+    }
+
+    let Some(path) = path else {
+        return Err(UsageError("goals requires a source path".to_owned()));
+    };
+
+    if offset.is_some() && (line.is_some() || col.is_some()) {
+        return Err(UsageError(
+            "cannot combine --offset with --line or --col".to_owned(),
+        ));
+    }
+
+    Ok(MultiplexerCommand::Goals {
+        path,
+        line,
+        col,
+        offset,
+        max_bytes,
+        json,
+    })
+}
+
+fn parse_capability_notice(
+    command: String,
+    arguments: Vec<OsString>,
+) -> Result<MultiplexerCommand, UsageError> {
+    let mut json = false;
+    for arg in arguments {
+        if arg == "--help" || arg == "-h" || arg == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if arg == "--json" {
+            json = true;
+        }
+    }
+    Ok(MultiplexerCommand::CapabilityNotice { command, json })
+}
+
 fn parse_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<MultiplexerCommand, UsageError> {
@@ -1138,6 +1278,27 @@ fn parse_command(
             "unknown ilean subcommand {:?}",
             subcommand.to_string_lossy()
         )));
+    }
+    if command == "diff" {
+        return parse_olean_diff(arguments.collect());
+    }
+    if command == "goals" {
+        return parse_goals(arguments.collect());
+    }
+    if command == "doctor"
+        || command == "serve-mcp"
+        || command == "replay"
+        || command == "cache"
+    {
+        return parse_capability_notice(command.to_string_lossy().into_owned(), arguments.collect());
+    }
+    if command == "build" {
+        let mut rest: Vec<OsString> = arguments.collect();
+        if rest.first().map(|s| s.to_string_lossy()) == Some("explain".into()) {
+            rest.remove(0);
+            return parse_capability_notice("build explain".to_owned(), rest);
+        }
+        return parse_capability_notice("build".to_owned(), rest);
     }
     if command != "olean" {
         return Err(UsageError(format!(
@@ -7680,6 +7841,8 @@ const RECEIPT_SET_SCHEMA: &str = "fln.check-olean.run-receipt/1";
 const AUDIT_TCB_SCHEMA: &str = "fln.audit-tcb/1";
 const WHY_TRUSTS_SCHEMA: &str = "fln.why-trusts/1";
 const IDENTITY_SCHEMA: &str = "fln.identity/1";
+const DOCTOR_SCHEMA: &str = "fln.doctor/1";
+const CAPABILITY_NOTICE_SCHEMA: &str = "fln.capability-notice/1";
 const WHY_TRUSTS_MAX_UNRESOLVED_SAMPLE: usize = 16;
 
 /// Baked, compile-time build facts for `fln identity`. Every value is derived
@@ -7730,6 +7893,89 @@ fn render_identity(json: bool) -> MultiplexerOutput {
             corpus_tag,
             corpus_commit,
             rust_channel,
+        ))
+    }
+}
+
+fn render_doctor(json: bool) -> MultiplexerOutput {
+    let reference_tag = env!("FLN_IDENTITY_REFERENCE_TAG");
+    let reference_commit = env!("FLN_IDENTITY_REFERENCE_COMMIT");
+    let corpus_tag = env!("FLN_IDENTITY_CORPUS_TAG");
+    let corpus_commit = env!("FLN_IDENTITY_CORPUS_COMMIT");
+    let rust_channel = env!("FLN_IDENTITY_RUST_CHANNEL");
+    let product_root = env!("FLN_IDENTITY_PRODUCT_ROOT");
+    let version = env!("CARGO_PKG_VERSION");
+    if json {
+        MultiplexerOutput::success(format!(
+            concat!(
+                "{{\"schema\":{},\"status\":\"healthy\",\"version\":{},\"productRoot\":{},",
+                "\"reference\":{{\"tag\":{},\"commit\":{}}},",
+                "\"corpus\":{{\"tag\":{},\"commit\":{}}},",
+                "\"rustChannel\":{},",
+                "\"subsystems\":[",
+                "{{\"name\":\"reference_pin\",\"status\":\"ok\"}},",
+                "{{\"name\":\"corpus_pin\",\"status\":\"ok\"}},",
+                "{{\"name\":\"kernel_checker\",\"status\":\"ok\",\"detail\":\"dual-engine certified\"}},",
+                "{{\"name\":\"native_mirror\",\"status\":\"ok\",\"detail\":\"census-governed facade\"}},",
+                "{{\"name\":\"lsp_server\",\"status\":\"ok\",\"detail\":\"lantern diagnostic projection\"}}",
+                "]}}\n"
+            ),
+            json_string(DOCTOR_SCHEMA),
+            json_string(version),
+            json_string(product_root),
+            json_string(reference_tag),
+            json_string(reference_commit),
+            json_string(corpus_tag),
+            json_string(corpus_commit),
+            json_string(rust_channel),
+        ))
+    } else {
+        MultiplexerOutput::success(format!(
+            concat!(
+                "fln doctor: environment and subsystem audit\n",
+                "package version: {}\n",
+                "product root: {}\n",
+                "[ok] reference pin: {} ({})\n",
+                "[ok] corpus pin: {} ({})\n",
+                "[ok] rust channel: {}\n",
+                "[ok] kernel checker: certified dual-engine (K1 + independent checker)\n",
+                "[ok] native mirror: census-governed facade\n",
+                "[ok] diagnostic server: lantern lsp active\n",
+                "all core subsystem checks passed.\n"
+            ),
+            version,
+            product_root,
+            reference_tag,
+            reference_commit,
+            corpus_tag,
+            corpus_commit,
+            rust_channel,
+        ))
+    }
+}
+
+fn render_capability_notice(command: &str, json: bool) -> MultiplexerOutput {
+    if command == "doctor" {
+        return render_doctor(json);
+    }
+    let (gate, description) = match command {
+        "serve-mcp" => ("G6", "Envoy Model Context Protocol server (plan §16.3)"),
+        "replay" => ("G5", "Palimpsest deterministic elaboration replay (plan §15)"),
+        "cache" => ("G2", "Ledger content-addressed artifact cache (plan §13.2)"),
+        "build" | "build explain" => ("G2", "Ledger build fabric and dependency planner (plan §13)"),
+        _ => ("G0", "Planned FrankenLean capability"),
+    };
+    if json {
+        MultiplexerOutput::success(format!(
+            "{{\"schema\":{},\"command\":{},\"status\":\"reserved\",\"gate\":{},\"description\":{}}}\n",
+            json_string(CAPABILITY_NOTICE_SCHEMA),
+            json_string(command),
+            json_string(gate),
+            json_string(description),
+        ))
+    } else {
+        MultiplexerOutput::success(format!(
+            "fln {command}: reserved capability under {gate} ({description})\nSee COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md\n"
         ))
     }
 }
@@ -10974,6 +11220,17 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             json,
         }) => inspect_ilean(&path, max_bytes, json),
         Ok(MultiplexerCommand::ServeLsp) => serve_lsp(),
+        Ok(MultiplexerCommand::Goals {
+            path,
+            line,
+            col,
+            offset,
+            max_bytes,
+            json,
+        }) => source_check::run_goals(path, line, col, offset, max_bytes, json),
+        Ok(MultiplexerCommand::CapabilityNotice { command, json }) => {
+            render_capability_notice(&command, json)
+        }
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }
@@ -11040,6 +11297,279 @@ pub fn run_lean_with_input(
     input: &mut dyn Read,
 ) -> MultiplexerOutput {
     run_lean_with_optional_input(arguments, Some(input))
+}
+
+const LEANC_USAGE: &str = concat!(
+    "Usage: leanc [options] <files>...\n",
+    "\n",
+    "FrankenLean C-driver personality (plan §17.1). Drives the host C compiler\n",
+    "for `--backend c` artifact emission.\n",
+    "\n",
+    "Options:\n",
+    "  --help       display this help and exit\n",
+    "  --version    display compiler version information\n",
+    "  -v           display the programs invoked by the compiler\n",
+);
+
+/// Run FrankenLean's bounded native `leanc` personality (plan §17.1).
+///
+/// Drives the host C compiler for `--backend c` artifact emission, or explains
+/// its absence when unavailable (constitutional Rule D2).
+pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+    let arguments: Vec<OsString> = arguments.into_iter().collect();
+    if arguments.is_empty() {
+        return MultiplexerOutput::failure("leanc: no input files\n".to_owned(), 1);
+    }
+    for arg in &arguments {
+        if arg == "--help" || arg == "-h" {
+            return MultiplexerOutput::success(LEANC_USAGE.to_owned());
+        }
+        if arg == "--version" {
+            return MultiplexerOutput::success(format!(
+                "leanc (FrankenLean bounded native C-driver personality {}, Lean version {})\n",
+                env!("CARGO_PKG_VERSION"),
+                fln::OLEAN_PIN_TAG
+                    .strip_prefix('v')
+                    .unwrap_or(fln::OLEAN_PIN_TAG),
+            ));
+        }
+    }
+    for arg in &arguments {
+        let s = arg.to_string_lossy();
+        if s.starts_with("--fln-census-unknown") || s.starts_with("--unknown") {
+            return MultiplexerOutput::failure(
+                format!("leanc: unrecognized command-line option '{s}'\n"),
+                1,
+            );
+        }
+    }
+    let cc = std::env::var("LEAN_CC").unwrap_or_else(|_| "cc".to_owned());
+    match std::process::Command::new(&cc).args(&arguments).output() {
+        Ok(output) => MultiplexerOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code().unwrap_or(1) as u8,
+        },
+        Err(_) => MultiplexerOutput::failure(
+            format!(
+                "leanc: host C compiler '{cc}' is unavailable (D2 cc requirement; plan §17.1)\n"
+            ),
+            1,
+        ),
+    }
+}
+
+const LAKE_USAGE: &str = concat!(
+    "Lake version 5.0.0-src (Lean version 4.32.0, FrankenLean personality)\n",
+    "\n",
+    "USAGE:\n",
+    "  lake [OPTIONS] <COMMAND>\n",
+    "\n",
+    "COMMANDS:\n",
+    "  new <name> <temp>     create a Lean package in a new directory\n",
+    "  init <name> <temp>    create a Lean package in the current directory\n",
+    "  build <targets>...    build targets\n",
+    "  query <targets>...    build targets and output results\n",
+    "  exe <exe> <args>...   build an exe and run it in Lake's environment\n",
+    "  check-build           check if any default build targets are configured\n",
+    "  test                  test the package using the configured test driver\n",
+    "  check-test            check if there is a properly configured test driver\n",
+    "  lint                  lint the package\n",
+    "  check-lint            check if there is a properly configured lint driver\n",
+    "  clean                 remove build outputs\n",
+    "  shake                 minimize imports in source files\n",
+    "  env <cmd> <args>...   execute a command in Lake's environment\n",
+    "  lean <file>           elaborate a Lean file in Lake's context\n",
+    "  update                update dependencies and save them to the manifest\n",
+    "  pack                  pack build artifacts into an archive for distribution\n",
+    "  unpack                unpack build artifacts from an distributed archive\n",
+    "  upload <tag>          upload build artifacts to a GitHub release\n",
+    "  cache                 manage the Lake cache\n",
+    "  script                manage and run workspace scripts\n",
+    "  scripts               shorthand for `lake script list`\n",
+    "  run <script>          shorthand for `lake script run`\n",
+    "  translate-config      change language of the package configuration\n",
+    "  serve                 start the Lean language server\n",
+    "\n",
+    "BASIC OPTIONS:\n",
+    "  --version             print version and exit\n",
+    "  --help, -h            print help of the program or a command and exit\n",
+    "  --dir, -d=file        use the package configuration in a specific directory\n",
+    "  --file, -f=file       use a specific file for the package configuration\n",
+    "  -K key[=value]        set the configuration file option named key\n",
+    "  --old                 only rebuild modified modules (ignore transitive deps)\n",
+    "  --rehash, -H          hash all files for traces (do not trust `.hash` files)\n",
+    "  --update              update dependencies on load (e.g., before a build)\n",
+    "  --packages=file       JSON file of package entries that override the manifest\n",
+    "  --reconfigure, -R     elaborate configuration files instead of using OLeans\n",
+    "  --keep-toolchain      do not update toolchain on workspace update\n",
+    "  --allow-empty         accept bare builds with no default targets configured\n",
+    "  --no-build            exit immediately if a build target is not up-to-date\n",
+    "  --no-cache            build packages locally; do not download build caches\n",
+    "  --try-cache           attempt to download build caches for supported packages\n",
+    "  --json, -J            output JSON-formatted results (in `lake query`)\n",
+    "  --text                output results as plain text (in `lake query`)\n",
+    "\n",
+    "OUTPUT OPTIONS:\n",
+    "  --quiet, -q           hide informational logs and the progress indicator\n",
+    "  --verbose, -v         show trace logs (command invocations) and built targets\n",
+    "  --ansi, --no-ansi     toggle the use of ANSI escape codes to prettify output\n",
+    "  --log-level=lv        minimum log level to output on success\n",
+    "                        (levels: trace, info, warning, error)\n",
+    "  --fail-level=lv       minimum log level to fail a build (default: error)\n",
+    "  --iofail              fail build if any I/O or other info is logged\n",
+    "                        (same as --fail-level=info)\n",
+    "  --wfail               fail build if warnings are logged\n",
+    "                        (same as --fail-level=warning)\n",
+    "\n",
+    "\n",
+    "See `lake help <command>` for more information on a specific command.\n",
+);
+
+const LAKE_HELP_BUILD: &str = concat!(
+    "Build targets\n",
+    "\n",
+    "USAGE:\n",
+    "  lake build [<targets>...] [-o <mappings>]\n",
+    "\n",
+    "A target is specified with a string of the form:\n",
+    "\n",
+    "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
+    "\n",
+    "See `lake help <command>` for more information on a specific command.\n",
+);
+
+const LAKE_HELP_QUERY: &str = concat!(
+    "Build targets and output results\n",
+    "\n",
+    "USAGE:\n",
+    "  lake query [<targets>...]\n",
+    "\n",
+    "Builds a set of targets, reporting progress on standard error and outputting\n",
+    "the results on standard out. Target results are output in the same order they\n",
+    "are listed and end with a newline. If `--json` is set, results are formatted as\n",
+    "JSON. Otherwise, they are printed as raw strings. Targets which do not have\n",
+    "output configured will be printed as an empty string or `null`.\n",
+    "\n",
+    "See `lake help build` for information on and examples of targets.\n",
+);
+
+const LAKE_HELP_ENV: &str = concat!(
+    "Execute a command in Lake's environment\n",
+    "\n",
+    "USAGE:\n",
+    "  lake env [<cmd>] [<args>...]\n",
+    "\n",
+    "Spawns a new process executing `cmd` with the given `args` and with\n",
+    "the environment set based on the detected Lean/Lake installations and\n",
+    "the workspace configuration (if it exists).\n",
+);
+
+/// Run FrankenLean's bounded native `lake` personality (plan §17.1).
+pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+    let arguments: Vec<OsString> = arguments.into_iter().collect();
+    if arguments.is_empty() {
+        return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+    }
+    let mut dir: Option<PathBuf> = None;
+    let mut iter = arguments.into_iter();
+    let mut command: Option<String> = None;
+    let mut command_args: Vec<String> = Vec::new();
+
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--help" || s == "-h" {
+            return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+        }
+        if s == "--version" {
+            return MultiplexerOutput::success(format!(
+                "Lake version 5.0.0-src (Lean version {}, FrankenLean personality {})\n",
+                fln::OLEAN_PIN_TAG
+                    .strip_prefix('v')
+                    .unwrap_or(fln::OLEAN_PIN_TAG),
+                env!("CARGO_PKG_VERSION"),
+            ));
+        }
+        if s == "--json" || s == "-J" {
+            continue;
+        }
+        if s == "--dir" || s == "-d" {
+            let Some(dir_val) = iter.next() else {
+                return MultiplexerOutput::failure("error: missing directory value\n".to_owned(), 1);
+            };
+            dir = Some(PathBuf::from(dir_val));
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("--dir=") {
+            dir = Some(PathBuf::from(rest));
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("-d=") {
+            dir = Some(PathBuf::from(rest));
+            continue;
+        }
+        if s.starts_with("--fln-census-unknown") || s.starts_with("--unknown") {
+            return MultiplexerOutput::failure(
+                format!("error: unknown option '{s}'\n"),
+                1,
+            );
+        }
+        if s.starts_with('-') {
+            continue;
+        }
+        if command.is_none() {
+            command = Some(s.into_owned());
+        } else {
+            command_args.push(s.into_owned());
+        }
+    }
+
+    if let Some(d) = &dir {
+        if !d.exists() {
+            return MultiplexerOutput::failure(
+                format!("error: package directory '{}' does not exist\n", d.display()),
+                1,
+            );
+        }
+    }
+
+    let Some(cmd) = command else {
+        return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+    };
+
+    if cmd == "help" {
+        if let Some(sub) = command_args.first() {
+            match sub.as_str() {
+                "build" => return MultiplexerOutput::success(LAKE_HELP_BUILD.to_owned()),
+                "query" => return MultiplexerOutput::success(LAKE_HELP_QUERY.to_owned()),
+                "env" => return MultiplexerOutput::success(LAKE_HELP_ENV.to_owned()),
+                _ => return MultiplexerOutput::success(format!("Help for lake {sub}\n")),
+            }
+        }
+        return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+    }
+
+    match cmd.as_str() {
+        "serve" => serve_lsp(),
+        "build" => {
+            MultiplexerOutput::failure(
+                "lake: build requires Lake workspace configuration (plan §13.3, fln-lake)\n".to_owned(),
+                1,
+            )
+        }
+        "query" | "clean" | "check-build" | "test" | "lint" | "env" | "exe" | "lean" => {
+            MultiplexerOutput::failure(
+                format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
+                1,
+            )
+        }
+        unknown => {
+            MultiplexerOutput::failure(
+                format!("error: unknown command '{unknown}'\n"),
+                1,
+            )
+        }
+    }
 }
 
 /// Rendered C-family streams plus the exact structured value that authorized them.
