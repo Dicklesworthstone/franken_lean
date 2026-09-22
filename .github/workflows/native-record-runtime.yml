@@ -67,7 +67,7 @@ jobs:
           cargo check --locked --workspace --all-targets
   mutual-function-child-validation:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: macos-latest
     timeout-minutes: 25
     permissions:
       contents: write
