@@ -371,6 +371,12 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
     },
+    BuildExplain {
+        target: Option<String>,
+        dir: Option<PathBuf>,
+        faithful_invalidation: bool,
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1246,6 +1252,59 @@ fn parse_verify_capsule(arguments: Vec<OsString>) -> Result<MultiplexerCommand, 
     })
 }
 
+fn parse_build_explain(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut dir: Option<PathBuf> = None;
+    let mut target: Option<String> = None;
+    let mut faithful_invalidation = false;
+    let mut json = false;
+    let mut iter = arguments.into_iter();
+
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--help" || s == "-h" || s == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if s == "--json" || s == "-J" {
+            json = true;
+            continue;
+        }
+        if s == "--faithful-invalidation" {
+            faithful_invalidation = true;
+            continue;
+        }
+        if s == "--dir" || s == "-d" {
+            let Some(d) = iter.next() else {
+                return Err(UsageError("missing directory argument for --dir".to_owned()));
+            };
+            dir = Some(PathBuf::from(d));
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("--dir=") {
+            dir = Some(PathBuf::from(rest));
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("-d=") {
+            dir = Some(PathBuf::from(rest));
+            continue;
+        }
+        if s.starts_with('-') {
+            return Err(UsageError(format!("unknown option '{s}' for build explain")));
+        }
+        if target.is_none() {
+            target = Some(s.into_owned());
+        } else {
+            return Err(UsageError(format!("unexpected argument '{s}' for build explain")));
+        }
+    }
+
+    Ok(MultiplexerCommand::BuildExplain {
+        target,
+        dir,
+        faithful_invalidation,
+        json,
+    })
+}
+
 fn parse_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<MultiplexerCommand, UsageError> {
@@ -1332,7 +1391,7 @@ fn parse_command(
         let mut rest: Vec<OsString> = arguments.collect();
         if rest.first().map(|s| s.to_string_lossy()) == Some("explain".into()) {
             rest.remove(0);
-            return parse_capability_notice("build explain".to_owned(), rest);
+            return parse_build_explain(rest);
         }
         return parse_capability_notice("build".to_owned(), rest);
     }
@@ -11622,7 +11681,72 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => verify_capsule(&path, max_bytes, json),
+        Ok(MultiplexerCommand::BuildExplain {
+            target,
+            dir,
+            faithful_invalidation,
+            json,
+        }) => run_build_explain(target.as_deref(), dir.as_deref(), faithful_invalidation, json),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
+    }
+}
+
+fn run_build_explain(
+    target: Option<&str>,
+    dir: Option<&Path>,
+    faithful_invalidation: bool,
+    json: bool,
+) -> MultiplexerOutput {
+    let base_dir = dir.unwrap_or_else(|| Path::new("."));
+    match fln_lake::explain_build(base_dir, target, faithful_invalidation) {
+        Ok(report) => {
+            if json {
+                let changed_json = report
+                    .changed_inputs
+                    .iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let barriers_json = report
+                    .opaque_barriers
+                    .iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                MultiplexerOutput::success(format!(
+                    "{{\"schema\":\"fln.build-explain/1\",\"status\":\"success\",\"package\":\"{}\",\"target\":\"{}\",\"reference_decision\":\"{}\",\"native_decision\":\"{}\",\"delta\":\"{}\",\"changed_inputs\":[{changed_json}],\"opaque_barriers\":[{barriers_json}],\"cache_outcome\":\"{}\"}}\n",
+                    report.package,
+                    report.target,
+                    report.reference_decision,
+                    report.native_decision,
+                    report.delta,
+                    report.cache_outcome,
+                ))
+            } else {
+                let changed_str = if report.changed_inputs.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    report.changed_inputs.join(", ")
+                };
+                let barriers_str = if report.opaque_barriers.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    report.opaque_barriers.join(", ")
+                };
+                MultiplexerOutput::success(format!(
+                    "Target: {} (package: {})\n  Reference decision: {}\n  Native decision:    {}\n  Delta:              {}\n  Changed inputs:     {}\n  Opaque barriers:    {}\n  Cache outcome:      {}\n",
+                    report.target,
+                    report.package,
+                    report.reference_decision,
+                    report.native_decision,
+                    report.delta,
+                    changed_str,
+                    barriers_str,
+                    report.cache_outcome,
+                ))
+            }
+        }
+        Err(err) => MultiplexerOutput::failure(format!("fln build explain: {err}\n"), 1),
     }
 }
 
@@ -12045,10 +12169,40 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     match cmd.as_str() {
         "serve" => serve_lsp(),
         "build" => {
-            MultiplexerOutput::failure(
-                "lake: build requires Lake workspace configuration (plan §13.3, fln-lake)\n".to_owned(),
-                1,
-            )
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            match fln_lake::build_package(&target_dir, &command_args, false) {
+                Ok(report) => {
+                    if is_json {
+                        let targets_json = report
+                            .targets
+                            .iter()
+                            .map(|s| format!("\"{s}\""))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-build/1\",\"status\":\"success\",\"package\":\"{}\",\"targets\":[{targets_json}],\"targets_built\":{},\"targets_cached\":{}}}\n",
+                            report.package,
+                            report.targets_built,
+                            report.targets_cached
+                        ))
+                    } else {
+                        MultiplexerOutput::success(format!(
+                            "Built {} ({} built, {} cached)\n",
+                            report.package, report.targets_built, report.targets_cached
+                        ))
+                    }
+                }
+                Err(fln_lake::LakeBuildError::Discovery(fln_lake::LakeDiscoveryError::NotFound(p))) => {
+                    MultiplexerOutput::failure(
+                        format!(
+                            "error: no such file or directory (error code: 2)\n  file: {}\n",
+                            p.join("lakefile.lean").display()
+                        ),
+                        1,
+                    )
+                }
+                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+            }
         }
         "clean" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
@@ -12263,7 +12417,38 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 }
             }
         }
-        "query" | "check-build" | "test" | "lint" | "lean" => {
+        "check-build" => {
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            match fln_lake::build_package(&target_dir, &command_args, true) {
+                Ok(report) => {
+                    if is_json {
+                        let targets_json = report
+                            .targets
+                            .iter()
+                            .map(|s| format!("\"{s}\""))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"package\":\"{}\",\"targets\":[{targets_json}]}}\n",
+                            report.package
+                        ))
+                    } else {
+                        MultiplexerOutput::success("Build configuration validated.\n".to_owned())
+                    }
+                }
+                Err(fln_lake::LakeBuildError::Discovery(fln_lake::LakeDiscoveryError::NotFound(p))) => {
+                    MultiplexerOutput::failure(
+                        format!(
+                            "error: no such file or directory (error code: 2)\n  file: {}\n",
+                            p.join("lakefile.lean").display()
+                        ),
+                        1,
+                    )
+                }
+                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+            }
+        }
+        "query" | "test" | "lint" | "lean" => {
             MultiplexerOutput::failure(
                 format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
                 1,
