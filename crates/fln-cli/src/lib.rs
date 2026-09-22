@@ -1555,6 +1555,13 @@ struct LeanInstallationPaths {
 }
 
 fn derive_lean_installation_paths(executable: &Path) -> Result<LeanInstallationPaths, String> {
+    if let Some(sysroot) = std::env::var_os("LEAN_SYSROOT") {
+        if !sysroot.is_empty() {
+            let prefix = PathBuf::from(sysroot);
+            let libdir = prefix.join("lib").join("lean");
+            return Ok(LeanInstallationPaths { prefix, libdir });
+        }
+    }
     let bin = executable.parent().ok_or_else(|| {
         format!(
             "current executable {} has no parent directory",
@@ -11717,6 +11724,42 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
                     .unwrap_or(fln::OLEAN_PIN_TAG),
             ));
         }
+        if arg == "--print-cflags" {
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    return MultiplexerOutput::failure(
+                        format!("leanc: installation: cannot locate the running executable: {error}\n"),
+                        1,
+                    );
+                }
+            };
+            let paths = match derive_lean_installation_paths(&executable) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return MultiplexerOutput::failure(format!("leanc: installation: {error}\n"), 1);
+                }
+            };
+            return MultiplexerOutput::success(leanc_cflags(&paths.prefix));
+        }
+        if arg == "--print-ldflags" {
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    return MultiplexerOutput::failure(
+                        format!("leanc: installation: cannot locate the running executable: {error}\n"),
+                        1,
+                    );
+                }
+            };
+            let paths = match derive_lean_installation_paths(&executable) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return MultiplexerOutput::failure(format!("leanc: installation: {error}\n"), 1);
+                }
+            };
+            return MultiplexerOutput::success(leanc_ldflags(&paths.prefix));
+        }
     }
     for arg in &arguments {
         let s = arg.to_string_lossy();
@@ -11740,6 +11783,70 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
             ),
             1,
         ),
+    }
+}
+
+fn leanc_cflags(prefix: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        format!(
+            "-I {}/include -fstack-clash-protection -fPIC -fvisibility=hidden\n",
+            prefix.display()
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "-I {}/include -fPIC -fvisibility=hidden\n",
+            prefix.display()
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "-I {}/include\n",
+            prefix.display()
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        format!(
+            "-I {}/include -fPIC\n",
+            prefix.display()
+        )
+    }
+}
+
+fn leanc_ldflags(prefix: &Path) -> String {
+    let cflags = leanc_cflags(prefix);
+    let cflags_trimmed = cflags.trim_end_matches(['\n', '\r']);
+    #[cfg(target_os = "linux")]
+    {
+        format!(
+            "{cflags_trimmed} -L {}/lib/lean -Wl,--start-group -lleancpp -lLean -Wl,--end-group -Wl,--start-group -lInit -lleanrt -Wl,--end-group -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic -lLake -Wl,--as-needed -lgmp -Wl,--no-as-needed -lm -ldl -pthread\n",
+            prefix.display()
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "{cflags_trimmed} -L {}/lib/lean -lleancpp -lLean -lInit -lleanrt -lc++ -lLake -lgmp -lm -ldl -pthread\n",
+            prefix.display()
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "{cflags_trimmed} -L {}/lib/lean -lleancpp -lLean -lInit -lleanrt -lLake -lgmp -lm -ldl -Wl,--whole-archive -lleanmanifest -Wl,--no-whole-archive\n",
+            prefix.display()
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        format!(
+            "{cflags_trimmed} -L {}/lib/lean -lleancpp -lLean -lInit -lleanrt -lLake -lgmp -lm -ldl -pthread\n",
+            prefix.display()
+        )
     }
 }
 
@@ -11859,6 +11966,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut iter = arguments.into_iter();
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
+    let mut is_json = false;
 
     while let Some(arg) = iter.next() {
         let s = arg.to_string_lossy();
@@ -11875,6 +11983,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             ));
         }
         if s == "--json" || s == "-J" {
+            is_json = true;
             continue;
         }
         if s == "--dir" || s == "-d" {
@@ -11941,7 +12050,116 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 1,
             )
         }
-        "query" | "clean" | "check-build" | "test" | "lint" | "env" | "exe" | "lean" => {
+        "clean" => {
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            match fln_lake::clean(&target_dir) {
+                Ok(report) => {
+                    if is_json {
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-clean/1\",\"status\":\"success\",\"dir\":\"{}\",\"build_dir_removed\":{}}}\n",
+                            target_dir.display(),
+                            report.build_dir_removed
+                        ))
+                    } else {
+                        MultiplexerOutput::success(String::new())
+                    }
+                }
+                Err(err) => {
+                    if is_json {
+                        MultiplexerOutput::failure(
+                            format!(
+                                "{{\"schema\":\"fln.lake-clean/1\",\"status\":\"error\",\"error\":\"{err}\"}}\n"
+                            ),
+                            1,
+                        )
+                    } else {
+                        MultiplexerOutput::failure(format!("{err}\n"), 1)
+                    }
+                }
+            }
+        }
+        "init" => {
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            let pkg_name = if let Some(name) = command_args.first() {
+                name.clone()
+            } else {
+                target_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("pkg")
+                    .to_owned()
+            };
+            let template = command_args.get(1).map(|s| s.as_str());
+            match fln_lake::init_package(
+                &target_dir,
+                &pkg_name,
+                template,
+                fln_lake::LakeConfigFormat::Toml,
+            ) {
+                Ok(()) => {
+                    if is_json {
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-init/1\",\"status\":\"success\",\"package\":\"{pkg_name}\",\"dir\":\"{}\"}}\n",
+                            target_dir.display()
+                        ))
+                    } else {
+                        MultiplexerOutput::success(String::new())
+                    }
+                }
+                Err(err) => {
+                    if is_json {
+                        MultiplexerOutput::failure(
+                            format!(
+                                "{{\"schema\":\"fln.lake-init/1\",\"status\":\"error\",\"error\":\"{err}\"}}\n"
+                            ),
+                            1,
+                        )
+                    } else {
+                        MultiplexerOutput::failure(format!("{err}\n"), 1)
+                    }
+                }
+            }
+        }
+        "new" => {
+            let parent_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            let Some(pkg_name) = command_args.first() else {
+                return MultiplexerOutput::failure(
+                    "error: missing package name for lake new\n".to_owned(),
+                    1,
+                );
+            };
+            let template = command_args.get(1).map(|s| s.as_str());
+            match fln_lake::new_package(
+                &parent_dir,
+                pkg_name,
+                template,
+                fln_lake::LakeConfigFormat::Toml,
+            ) {
+                Ok(created_dir) => {
+                    if is_json {
+                        MultiplexerOutput::success(format!(
+                            "{{\"schema\":\"fln.lake-new/1\",\"status\":\"success\",\"package\":\"{pkg_name}\",\"dir\":\"{}\"}}\n",
+                            created_dir.display()
+                        ))
+                    } else {
+                        MultiplexerOutput::success(String::new())
+                    }
+                }
+                Err(err) => {
+                    if is_json {
+                        MultiplexerOutput::failure(
+                            format!(
+                                "{{\"schema\":\"fln.lake-new/1\",\"status\":\"error\",\"error\":\"{err}\"}}\n"
+                            ),
+                            1,
+                        )
+                    } else {
+                        MultiplexerOutput::failure(format!("{err}\n"), 1)
+                    }
+                }
+            }
+        }
+        "query" | "check-build" | "test" | "lint" | "env" | "exe" | "lean" => {
             MultiplexerOutput::failure(
                 format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
                 1,
