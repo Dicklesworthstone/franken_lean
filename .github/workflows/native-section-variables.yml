@@ -1,0 +1,109 @@
+name: Native section variables
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-section-variables.yml'
+      - 'crates/fln/tests/source_section_variables.rs'
+      - 'crates/fln-elab/src/source/scope/variables.rs'
+      - 'crates/fln-parse/src/command_scope/variables.rs'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: native-section-variables
+  cancel-in-progress: false
+jobs:
+  sections:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+      - name: Restore the reviewed implementation without overwriting concurrent edits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/section-verification
+          git rev-parse HEAD > target/section-verification/input-commit.txt
+          if test -f crates/fln-elab/src/source/scope/variables.rs; then
+            exit 0
+          fi
+          gh api repos/Dicklesworthstone/franken_lean/git/blobs/6d88391d102ac40920280598b595a79ea89457cf --jq .content | base64 --decode > target/section-verification/change.gz
+          test "$(git hash-object target/section-verification/change.gz)" = 6d88391d102ac40920280598b595a79ea89457cf
+          gzip -dc target/section-verification/change.gz > target/section-verification/change.patch
+          python3 -I - <<'PY'
+          import pathlib, subprocess
+          old = {
+            'crates/fln-elab/src/source.rs': '1312205e7378750776322f646dbcb8a50c88153b',
+            'crates/fln-elab/src/source/level_syntax.rs': 'bb8964e27f8b3dcf70ae62ad7eb247b9fdc9f0d9',
+            'crates/fln-elab/src/source/scope.rs': '113d891c4bc0b6d237425c0666f8f1199f1c9ef9',
+            'crates/fln-parse/src/command_scope.rs': '5adcfe6b755bf792d7a43c574359980ce339e566',
+            'crates/fln/src/source_check/scopes.rs': '8a2bc97d810920794a70cc73df0743d52d3d641b',
+            'crates/fln/src/source_check.rs': '9ac7834d31689f8c7ca543016d70e89d2e8ecd98',
+          }
+          new = {
+            'crates/fln-elab/src/source/scope/variables.rs',
+            'crates/fln-parse/src/command_scope/variables.rs',
+            'crates/fln/tests/source_section_variables.rs',
+            'docs/NATIVE_SECTION_VARIABLES.md',
+          }
+          for path, expected in old.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == expected, 'concurrent edit: ' + path
+          for path in new:
+              assert not pathlib.Path(path).exists(), 'concurrent addition: ' + path
+          patch = pathlib.Path('target/section-verification/change.patch').read_text()
+          paths = [line[6:] for line in patch.splitlines() if line.startswith('+++ b/')]
+          assert len(paths) == 10 and set(paths) == set(old) | new
+          assert '+++ /dev/null' not in patch
+          subprocess.run(['git', 'apply', '--check', '--index', 'target/section-verification/change.patch'], check=True)
+          subprocess.run(['git', 'apply', '--index', 'target/section-verification/change.patch'], check=True)
+          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert set(actual) == set(paths)
+          pathlib.Path('target/section-verification/paths.txt').write_text('\n'.join(sorted(paths)) + '\n')
+          PY
+      - name: Retain the exact implementation inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: section-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/section-verification/
+          retention-days: 7
+      - name: Check parser, elaboration, source admission, and downstream compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/section-verification/compiler.txt
+          cargo test --locked -p fln-parse --no-fail-fast 2>&1 | tee target/section-verification/parser.log
+          cargo test --locked -p fln --test source_section_variables --test source_scopes --test source_instances --test source_modules --no-fail-fast 2>&1 | tee target/section-verification/source.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/section-verification/check.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/section-verification/clippy.log
+          if test -f target/section-verification/paths.txt; then
+            while read -r path; do
+              case "$path" in *.rs) rustfmt --edition 2024 --check --config skip_children=true "$path" ;; esac
+            done < target/section-verification/paths.txt
+          fi
+      - name: Commit the validated implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached --check
+          git write-tree > target/section-verification/validated-tree.txt
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(elab): elaborate checked section variables and generalize declarations' -m 'Add native typed variable telescopes with lexical scope restoration, immediate type validation, dependency-closed definition generalization, and theorem-header-only parameter selection. Preserve fixed section parameters during structural recursion and include only eligible local instance parameters. Section assumptions never enter the global environment. Add eight end-to-end regressions and parser boundary tests. Validate parser tests, scope/instance/module integrations, workspace all-target compilation, targeted all-target Clippy, and changed-file formatting. No full-workspace test or Reference-parity claim.'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/section-verification/published-commit.txt
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: section-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/section-verification/
+          retention-days: 14
