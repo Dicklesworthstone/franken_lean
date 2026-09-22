@@ -124,7 +124,9 @@ pub(in crate::source) fn elaborate_mutual(
             h.context.require_resolved(std::slice::from_ref(&ty))?;
             index.type_ = rename(&mut h.context, ty, &replacements)?;
         }
-        h.context.txn.lctx = LocalContext::new();
+        // Canonicalize written parameters without discarding the lexical
+        // section context used by their domains and by later constructor fields.
+        h.context.txn.lctx = scope.variables.locals().clone();
         for (i, p) in h.parameters.iter_mut().enumerate() {
             if family == 0 {
                 common.push(p.clone());
@@ -230,20 +232,25 @@ pub(in crate::source) fn elaborate_mutual(
             checked_type(&mut h.context, annotation, budget)?;
         }
     }
-    let level_params = headers[0].context.declaration_levels(&roots)?;
-    let replacements: Vec<_> = ids
-        .into_iter()
-        .zip(&family_names)
-        .map(|(id, name)| {
-            (
-                id,
-                Expr::const_(
-                    name.clone(),
-                    level_params.iter().cloned().map(Level::param).collect(),
-                ),
-            )
-        })
-        .collect();
+    // All members share one uniform section telescope, including dependencies
+    // used only by a sibling. Provisional local family types intentionally had
+    // only written parameters; supply the captured prefix at every replacement.
+    let context = &mut headers[0].context;
+    let section = section_prefix(context, &mut roots)?;
+    let level_params = context.declaration_levels(&roots)?;
+    let mut replacements = Vec::new();
+    for (id, name) in ids.into_iter().zip(&family_names) {
+        context.tick()?;
+        let mut value = Expr::const_(
+            name.clone(),
+            level_params.iter().cloned().map(Level::param).collect(),
+        );
+        for parameter in &section {
+            context.tick()?;
+            value = Expr::app(value, Expr::fvar(parameter.id.clone()));
+        }
+        replacements.push((id, value));
+    }
     let mut specs = Vec::new();
     for (mut h, mut body) in headers.into_iter().zip(all_bodies) {
         for ctor in &mut body.constructors {
@@ -254,6 +261,7 @@ pub(in crate::source) fn elaborate_mutual(
                 *index = rename(&mut h.context, index.clone(), &replacements)?;
             }
         }
+        h.parameters.splice(0..0, section.iter().cloned());
         specs.push(InductiveSpec {
             name: h.name,
             level_params: level_params.clone(),

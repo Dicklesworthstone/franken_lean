@@ -328,11 +328,20 @@ pub(super) fn elaborate_inductive_scoped(
         roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
         roots.extend(ctor.result_indices.iter().cloned());
     }
+    // Local recursive references keep the written-parameter interface until
+    // every constructor is elaborated. Only then can field-only dependencies
+    // determine the shared section prefix for the family and its constructors.
+    let section = section_prefix(&mut context, &mut roots)?;
     let level_params = context.declaration_levels(&roots)?;
-    let family_constant = Expr::const_(
+    let mut family_constant = Expr::const_(
         name.clone(),
         level_params.iter().cloned().map(Level::param).collect(),
     );
+    for parameter in &section {
+        context.tick()?;
+        family_constant = Expr::app(family_constant, Expr::fvar(parameter.id.clone()));
+    }
+    parameters.splice(0..0, section);
     for ctor in &mut constructors {
         for field in &mut ctor.fields {
             field.type_ = field
@@ -360,6 +369,23 @@ pub(super) fn elaborate_inductive_scoped(
     };
     inductive_with_field_universes(&specification, budget, &field_universes)
         .map_err(|e| failure(SourceInferenceError::Inductive(e)))
+}
+
+/// Select actual type/constructor dependencies, not theorem-only include/omit
+/// choices. Domains contribute universe dependencies even when a selected local
+/// appears only as a free-variable leaf in the constructor types.
+fn section_prefix(
+    context: &mut Context,
+    roots: &mut Vec<Expr>,
+) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
+    let mut section = context.section_parameters(roots, false)?;
+    for parameter in &mut section {
+        context.tick()?;
+        parameter.type_ = context.instantiate(&parameter.type_)?;
+        context.require_resolved(std::slice::from_ref(&parameter.type_))?;
+        roots.push(parameter.type_.clone());
+    }
+    Ok(section)
 }
 
 struct Bodies {

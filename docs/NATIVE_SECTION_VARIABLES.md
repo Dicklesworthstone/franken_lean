@@ -52,11 +52,11 @@ errors, and are restored on section/namespace exit. They affect theorem headers,
 not the used-variable generalization of definitions. Named selections persist
 across later `variable` commands but never across source-file boundaries.
 
-This increment covers definitions, theorems, named instances, records and classes.
-Variable binder-style changes, instance-pattern `omit [Class ...]`, generalized
-inductive parameters, and command-local `in` scopes are not implemented by this
-increment. It does not
-claim the whole source elaboration workstream or Reference parity is complete.
+This increment covers definitions, theorems, named instances, records, classes,
+and supported single or mutual inductive families. Variable binder-style changes,
+instance-pattern `omit [Class ...]`, and command-local `in` scopes remain
+unimplemented. This does not claim the whole source elaboration workstream or
+Reference parity is complete.
 The source regressions are `crates/fln/tests/source_section_variables.rs`;
 parser layout and malformed-input tests live with the variable command parser.
 ## Records and classes
@@ -86,3 +86,39 @@ into the checked environment. Both checkers and the complete-batch publication
 rule are unchanged. Generalized parameters count toward the record binder budget.
 
 The additional regressions are `fln::source_section_records`.
+
+## Inductive families
+
+Supported single and mutual inductive declarations select section parameters from
+the family signatures and every constructor field and result index. Type
+dependencies and their universes close transitively. The selected parameters
+precede written parameters and retain their original binder styles on the family;
+constructor and recursor parameter conventions follow the existing generator.
+
+```lean
+section
+variable (A : Type) (unused : Nat)
+inductive Chain where
+  | nil
+  | cons (head : A) (tail : Chain)
+end
+def sum (xs : Chain Nat) : Nat := match xs with
+  | .nil => 0
+  | .cons n tail => n + sum tail
+theorem computes : sum (Chain.cons 20 (Chain.cons 22 Chain.nil)) = 42 := by rfl
+```
+
+Recursive references inside a declaration still use its written-parameter
+interface. When producing the closed candidate, each local family reference is
+replaced by its constant applied to the captured section prefix. This is also
+necessary for mutual blocks: every member shares the union of dependencies, even
+when only a sibling's constructor mentions a section variable. Canonicalizing
+written mutual parameters preserves the lexical section context.
+
+The existing generator's positivity, uniformity, universe and binder-budget
+checks and both admission engines remain authoritative. Invalid members, invalid
+result ascriptions and late false proofs cannot publish a prefix. Indexed data,
+proposition-valued single families, local dictionaries in constructor indices, and
+namespace-qualified mutual groups have executable source-checking regressions
+in `fln::source_section_inductives`. This does not expand the generator's supported
+recursion shapes or provide general mutual-function execution.
