@@ -40,8 +40,10 @@ Type-indexed GADTs, index domains depending on prior indices, mutually indexed
 families, indexed function-valued recursive children and genuinely value-dependent
 field representations remain unsupported. Scalar indices alone are not sufficient:
 the full constructor layout must be representable. This is a native FIR profile,
-not Reference packed-ABI parity. Some source matches which require explicit
-equality transport may additionally need a runtime transport lowering.
+not Reference packed-ABI parity. Index-refining matches using canonical equality transports are supported when
+the erased source and target layouts agree; see `NATIVE_EQUALITY_TRANSPORT.md`.
+Elimination requiring impossible branches may still need an empty-eliminator
+runtime lowering.
 
 Regression coverage includes invalid-length rejection, preserved logical roots,
 strict ordinary computation, shared recursive work, deterministic resource-stop

@@ -559,6 +559,30 @@ impl Preparation<'_> {
         if args.is_empty() {
             return Ok(None);
         }
+        // A let in function position must finish its strict initializer before
+        // evaluating any application argument. Reassociate without substituting
+        // the initializer, preserving sharing and exposing literal lambda tails.
+        if let ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } = head.node()
+        {
+            let mut lifted = Vec::new();
+            for argument in args {
+                reserve(&mut lifted, self.limits.max_application_args)?;
+                lifted.push(self.lift(argument, 1)?);
+            }
+            return Ok(Some(Expr::let_e(
+                decl_name.clone(),
+                type_.clone(),
+                value.clone(),
+                application(body.clone(), lifted),
+                *non_dep,
+            )));
+        }
         let original = head.clone();
         let mut head = head.clone();
         if let ExprNode::Proj {

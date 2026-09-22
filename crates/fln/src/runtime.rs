@@ -12,6 +12,7 @@ mod projections;
 mod proofs;
 mod records;
 mod specialize;
+mod transport;
 mod variants;
 
 use super::*;
@@ -29,6 +30,7 @@ pub(super) struct Preparation<'a> {
     next_mutual: u32,
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
+    equality_family_checked: bool,
     next_branch: usize,
     next_local: u64,
     next_nat: u64,
@@ -91,6 +93,7 @@ impl<'a> Preparation<'a> {
             next_mutual: 0,
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
+            equality_family_checked: false,
             next_branch: 0,
             next_local: 0,
             next_nat: 0,
@@ -300,6 +303,10 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(transported) = self.equality_transport(&head, &args)? {
+                            tasks.push(Task::Visit(transported));
+                            continue;
+                        }
                         if let Some(constructor) = self.specialize_constructor(&head, &args)? {
                             tasks.push(Task::Visit(constructor));
                             continue;
