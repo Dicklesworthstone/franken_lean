@@ -12,4 +12,6 @@ default-run = "fln"
 fln = { path = "../fln" }
 fln-core = { path = "../fln-core" }
 fln-hash = { path = "../fln-hash" }
+fln-lake = { path = "../fln-lake" }
 fln-server = { path = "../fln-server" }
+
