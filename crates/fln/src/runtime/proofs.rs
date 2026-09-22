@@ -4,6 +4,7 @@
 //! Reference's packed ABI and does not change any declaration sent to a checker.
 use super::*;
 use fln_core::level::Level;
+mod projections;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
 // observing a proof as a Bool; this representation exists only after admission.
@@ -350,3 +351,6 @@ impl Preparation<'_> {
         Ok(values.pop().expect("one proof-erased expression"))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -30,6 +30,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
       - name: Test checked proof erasure and execution boundaries
         run: |
-          cargo test --locked -p fln --lib --test runtime_proof_erasure
+          cargo test --locked -p fln --lib --test runtime_proof_erasure --test runtime_proof_data
+          cargo test --locked -p fln-cli --test source_proof_runtime --test source_mutual_data --test source_closure_data
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets

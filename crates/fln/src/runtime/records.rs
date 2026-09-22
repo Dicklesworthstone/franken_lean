@@ -1,9 +1,9 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
 //! Closed type parameters are specialized, never stored as runtime fields.
-//! Direct self- and mutually recursive object fields, and nondependent
-//! function-valued self children are supported. Dependent and
-//! proof-valued fields remain explicit refusals.
+//! Direct self- and mutually recursive fields and nondependent function-valued
+//! self children are supported. Proof fields keep inert scalar slots; other
+//! value-dependent fields and function-valued mutual children remain refusals.
 //! Nondependent function fields are owned closures with checked interfaces.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
@@ -140,6 +140,11 @@ impl Preparation<'_> {
                 };
                 type_ = self.substitution(body, parameter)?;
             }
+            // Erase the checked telescope before deciding whether a field's
+            // representation depends on an earlier runtime value. A proof may
+            // mention that value, but its inert slot never depends on it. The
+            // logical field count/order is retained for projections and minors.
+            type_ = self.erase_runtime_type(&type_)?;
             while let ExprNode::ForallE {
                 binder_type, body, ..
             } = type_.node()
@@ -788,7 +793,9 @@ mod closure_fields_tests {
             .unwrap()
             .check_source_files(
                 &[b"inductive Good where | leaf | node (f : Nat -> Good)\n\
-                    inductive Bad where | mk (f : Nat -> Bad) (h : 0 = 0)"],
+                    structure Payload where\n  carrier : Type\n  value : carrier\n\
+                    inductive Bad where | mk (f : Nat -> Bad) (payload : Payload)\n\
+                    inductive ProofChild where | leaf | node (f : Nat -> ProofChild) (h : 0 = 0)"],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits),
             )
@@ -803,6 +810,21 @@ mod closure_fields_tests {
             prep.value_type(&good).unwrap(),
             Some(ValueType::Constructor)
         );
+        // Proof payloads now have a valid representation. Keep a positive
+        // counterexample alongside the refusal fixture; the latter must fail
+        // after anchoring Bad, when its value-dependent Payload is discovered.
+        let proof_child = Expr::const_(name("ProofChild"), vec![]);
+        assert_eq!(
+            prep.value_type(&proof_child).unwrap(),
+            Some(ValueType::Constructor)
+        );
+        assert!(prep.constructors.iter().any(|ctor| {
+            ctor.name == name("ProofChild.node")
+                && matches!(
+                    ctor.fields.as_slice(),
+                    [ValueType::Closure(_), ValueType::Bool]
+                )
+        }));
         let interfaces = prep.interfaces.len();
         let constructors = prep.constructors.len();
         let closures = prep.value_types.closures.len();

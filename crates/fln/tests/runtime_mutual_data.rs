@@ -144,10 +144,8 @@ fn stopped_mutual_layouts_do_not_publish_and_retries_are_identical() {
 }
 #[test]
 fn unsupported_sibling_layouts_and_false_source_never_gain_runtime_authority() {
-    for source in [
-        "mutual\ninductive A where | mk (b : B)\ninductive B where | nil | proof (p : 0 = 0)\nend\ndef ignore (b : B) : Nat := 42\n#eval ignore B.nil",
-        "mutual\ninductive A where | mk (f : Nat -> B)\ninductive B where | nil | cons (a : A)\nend\ndef ignore (b : B) : Nat := 42\n#eval ignore B.nil",
-    ] {
+    {
+        let source = "mutual\ninductive A where | mk (f : Nat -> B)\ninductive B where | nil | cons (a : A)\nend\ndef ignore (b : B) : Nat := 42\n#eval ignore B.nil";
         let base = engine();
         let root = base.logical_root(&KVMap::new());
         assert!(

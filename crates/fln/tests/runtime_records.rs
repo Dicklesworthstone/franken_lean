@@ -104,30 +104,21 @@ fn distinct_record_layouts_do_not_alias_by_constructor_tag() {
     );
 }
 #[test]
-fn unsupported_dependent_and_proof_fields_do_not_become_unchecked_objects() {
-    for declarations in [
-        "structure Package where\n  carrier : Type\n  value : carrier",
-        "structure Certified where\n  value : Nat\n  proof : value = value",
-    ] {
-        let engine = base(declarations);
-        let source = if declarations.contains("Package") {
-            "def p : Package := { carrier := Nat, value := 42 }"
-        } else {
-            "def p : Certified := { value := 42, proof := by rfl }"
-        };
-        let root = engine.logical_root(&KVMap::new());
-        assert!(
-            engine
-                .execute_source_definitions(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    EngineExecutionLimits::new(admission().kernel)
-                )
-                .is_err()
-        );
-        assert_eq!(engine.logical_root(&KVMap::new()), root);
-        run(&engine, "#eval 42", "42");
-    }
+fn unsupported_value_dependent_fields_do_not_become_unchecked_objects() {
+    let engine = base("structure Package where\n  carrier : Type\n  value : carrier");
+    let source = "def p : Package := { carrier := Nat, value := 42 }";
+    let root = engine.logical_root(&KVMap::new());
+    assert!(
+        engine
+            .execute_source_definitions(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                EngineExecutionLimits::new(admission().kernel)
+            )
+            .is_err()
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    run(&engine, "#eval 42", "42");
 }
 #[test]
 fn layout_budget_refusal_and_late_type_errors_preserve_the_engine() {

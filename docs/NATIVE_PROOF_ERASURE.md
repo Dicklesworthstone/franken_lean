@@ -38,3 +38,39 @@ runtime integration workstream, not full Lean runtime parity. Dependent runtime
 representations and general proof-to-data eliminators remain outside this
 increment. Checked proof arguments are not permission to execute arbitrary
 axioms such as `Classical.choice`.
+
+
+## Proof-bearing native objects
+
+Uniform ground records, classes, variants, direct recursive and mutual families
+now admit proof fields, including predicates depending on earlier runtime fields.
+The bridge erases the checked constructor telescope before testing whether the
+remaining field representations are dependent. It preserves each logical field
+position as an inert scalar, so constructor fields, projections, recursive
+hypotheses, and callback interfaces agree without changing the bytecode format.
+
+Original projection types are reconstructed from the admitted constructor's
+original telescope, using syntactic projections for earlier fields. They are
+not taken from the already-erased runtime layout: doing so would misclassify
+proof fields as ordinary Boolean computations. The receiver is not evaluated
+during this reconstruction. Runtime projections still retain strict receivers.
+
+Defaults, inherited class fields, nested objects, proof-accepting function fields,
+and ground proposition parameters are supported. Erased proof domains also compose
+with the native single-family function-child recursor path; recursive child
+selection remains lazy and its ordinary runtime inputs are retained. A `Decidable p` is data, not
+a proof: its constructor tag remains observable while its evidence is erased.
+This does not yet implement every source proposition conditional or generated
+decision procedure. Real value-dependent data layouts remain unsupported.
+Updating a field does not authorize reuse of an old proof about a different
+value; replacement evidence must pass the unchanged admission checks.
+
+See `examples/native_proof_erasure.lean` and `examples/native_proof_data.lean`.
+Engine regressions cover runtime strictness versus erased evidence, full mutual
+folds, nested proof projections, decision tags, rejected proofs, resource stops,
+and repeatable bytecode. A successful execution also reproduces the check-only
+logical environment exactly. Installed CLI tests cover both source personalities,
+imports, invalid-suffix nonpublication, recovery, and independent FLBC replay.
+Small-stack unit tests also bind classification to original local types and test
+context/node budget boundaries. These observations do not claim full-workspace
+or Reference compatibility verification.

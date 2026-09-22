@@ -12,7 +12,7 @@ use fln_core::level::Level;
 // Lifting by index + 1 reopens a selected domain in the current context.
 enum TypeFrame {
     Apply(Expr),
-    Projection(Name, u64),
+    Projection(Name, u64, Expr),
     Lambda(Name, Expr, BinderInfo),
     Let(Expr),
 }
@@ -93,7 +93,7 @@ impl Preparation<'_> {
                     idx,
                     expr,
                 } => {
-                    let frame = TypeFrame::Projection(struct_name.clone(), *idx);
+                    let frame = TypeFrame::Projection(struct_name.clone(), *idx, expr.clone());
                     head = expr.clone();
                     frame
                 }
@@ -134,8 +134,10 @@ impl Preparation<'_> {
                     };
                     self.substitution(body, &argument)?
                 }
-                TypeFrame::Projection(family, index) => {
-                    let Some((_, field)) = self.projection_slot(&type_, &family, index)? else {
+                TypeFrame::Projection(family, index, receiver) => {
+                    let Some(field) =
+                        self.original_projection_type(&type_, &family, index, &receiver)?
+                    else {
                         return Ok(None);
                     };
                     field
