@@ -37,7 +37,7 @@ impl Preparation<'_> {
             _ => self.specialized_definition(name),
         }
     }
-    fn universe_instance(
+    pub(super) fn universe_instance(
         &mut self,
         source: &Expr,
         params: &[Name],
@@ -91,7 +91,7 @@ impl Preparation<'_> {
         }
         Ok(count)
     }
-    fn substitution(&mut self, body: &Expr, value: &Expr) -> Result<Expr, IngressError> {
+    pub(super) fn substitution(&mut self, body: &Expr, value: &Expr) -> Result<Expr, IngressError> {
         let body_nodes = self.presentations(body)?;
         let value_nodes = self.presentations(value)?;
         // A replacement can require a distinct lifted DAG at every binder depth.
@@ -147,7 +147,7 @@ impl Preparation<'_> {
         }
         Ok(application(head, args.into_iter().rev()))
     }
-    fn type_parameter(&mut self, type_: &Expr) -> Result<bool, IngressError> {
+    pub(super) fn type_parameter(&mut self, type_: &Expr) -> Result<bool, IngressError> {
         let mut type_ = self.type_head(type_)?;
         loop {
             self.tick()?;

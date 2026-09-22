@@ -5106,7 +5106,7 @@ struct ExecutableValueTypes {
     nat: Expr,
     string: Expr,
     bool_: Expr,
-    records: BTreeSet<Name>,
+    records: std::collections::HashSet<Expr>,
     closures: std::collections::HashMap<Expr, ValueType>,
 }
 
@@ -5116,7 +5116,7 @@ impl ExecutableValueTypes {
             nat: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
             string: Expr::const_(Name::from_components(["String"]), Vec::new()),
             bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
-            records: BTreeSet::new(),
+            records: std::collections::HashSet::new(),
             closures: std::collections::HashMap::new(),
         }
     }
@@ -5597,9 +5597,7 @@ fn executable_value_type(
         Some((ValueType::Bool, CallableResultOwnership::Scalar))
     } else if let Some(value) = value_types.closures.get(source) {
         Some((*value, CallableResultOwnership::Owned))
-    } else if matches!(source.node(), fln_core::expr::ExprNode::Const { name, levels }
-        if levels.is_empty() && value_types.records.contains(name))
-    {
+    } else if value_types.records.contains(source) {
         Some((ValueType::Constructor, CallableResultOwnership::Owned))
     } else {
         None

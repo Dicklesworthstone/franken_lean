@@ -1,18 +1,24 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
-//! Direct self-recursive object fields are supported; dependent, polymorphic,
+//! Closed type parameters are specialized, never stored as runtime fields.
+//! Direct self-recursive object fields are supported; value-dependent,
 //! higher-order recursive and proof-valued fields remain explicit refusals.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
-use std::collections::BTreeSet;
+use fln_core::level::Level;
+use fln_env::constants::RecursorVal;
 
+#[derive(Clone)]
 pub(super) struct Shape {
+    pub source: Expr,
     pub name: Name,
     pub recursive: bool,
     pub constructors: Vec<ShapeConstructor>,
 }
 
+#[derive(Clone)]
 pub(super) struct ShapeConstructor {
+    pub original: Name,
     pub name: Name,
     pub tag: u8,
     pub fields: Vec<Expr>,
@@ -31,23 +37,79 @@ impl Shape {
 }
 
 impl Preparation<'_> {
-    pub(super) fn record_shape(&mut self, name: &Name) -> Result<Option<Shape>, IngressError> {
+    pub(super) fn record_shape(&mut self, source: &Expr) -> Result<Option<Shape>, IngressError> {
         self.tick()?;
+        let source = self.normalize_type(source)?;
+        if source.has_loose_bvars()
+            || source.has_fvar()
+            || source.has_expr_mvar()
+            || source.has_level_mvar()
+            || source.has_level_param()
+        {
+            return Ok(None);
+        }
+        if let Some(shape) = self.data_shapes.get(&source) {
+            return Ok(Some(shape.clone()));
+        }
+        let (head, parameters) = self.spine(&source)?;
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
             return Ok(None);
         };
         if family.is_unsafe
             || family.is_reflexive
-            || family.num_params != 0
+            || family.num_params as usize != parameters.len()
             || family.num_indices != 0
             || family.num_nested != 0
             || family.all != [name.clone()]
             || family.ctors.is_empty()
-            || !family.base.level_params.is_empty()
-            || !matches!(family.base.type_.node(), ExprNode::Sort { level } if level.is_never_zero())
+            || family.base.level_params.len() != levels.len()
         {
             return Ok(None);
         }
+        let mut family_type =
+            self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
+        for parameter in &parameters {
+            self.tick()?;
+            let normal = self.normalize_type(&family_type)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            // Erasing a static type argument is not permission to discard a
+            // value parameter, even when that value happens to be closed.
+            if !self.type_parameter(binder_type)? {
+                return Ok(None);
+            }
+            family_type = self.substitution(body, parameter)?;
+        }
+        let family_type = self.normalize_type(&family_type)?;
+        if !matches!(family_type.node(), ExprNode::Sort { level } if level.is_never_zero()) {
+            return Ok(None);
+        }
+        let specialized = !parameters.is_empty() || !levels.is_empty();
+        let layout_name = if specialized {
+            if self.data_shapes.len() >= self.limits.fir.max_constructors {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ProgramTables,
+                    limit: self.limits.fir.max_constructors,
+                    observed: self.data_shapes.len().saturating_add(1),
+                });
+            }
+            let serial = u64::try_from(self.data_shapes.len())
+                .map_err(|_| unsupported("data specialization identity"))?;
+            let name = Name::num(super::name("_fln_runtime_data"), serial);
+            if self.environment.contains(&name) {
+                return Err(unsupported("runtime data name collision"));
+            }
+            name
+        } else {
+            name.clone()
+        };
         let mut constructors = Vec::new();
         for (index, ctor_name) in family.ctors.iter().enumerate() {
             self.tick()?;
@@ -60,76 +122,104 @@ impl Preparation<'_> {
             // FIR ingress validates the ABI tag ceiling before execution.
             if ctor.is_unsafe
                 || ctor.induct != *name
-                || ctor.num_params != 0
+                || ctor.num_params != family.num_params
                 || ctor.cidx as usize != index
-                || !ctor.base.level_params.is_empty()
+                || ctor.base.level_params != family.base.level_params
             {
                 return Ok(None);
             }
             let mut fields = Vec::new();
-            let mut type_ = &ctor.base.type_;
+            let mut type_ =
+                self.universe_instance(&ctor.base.type_, &ctor.base.level_params, levels)?;
+            for parameter in &parameters {
+                self.tick()?;
+                let ExprNode::ForallE { body, .. } = type_.node() else {
+                    return Ok(None);
+                };
+                type_ = self.substitution(body, parameter)?;
+            }
             while let ExprNode::ForallE {
                 binder_type, body, ..
             } = type_.node()
             {
                 self.tick()?;
-                // Types, indices and proofs are not guessed runtime fields.
-                if !matches!(binder_type.node(), ExprNode::Const { levels, .. } if levels.is_empty())
-                {
+                // A later field's representation may not depend on a runtime
+                // field. Retain that boundary after substituting type params.
+                if body.has_loose_bvars() {
+                    return Ok(None);
+                }
+                let field = self.normalize_type(binder_type)?;
+                let (head, _) = self.spine(&field)?;
+                if !matches!(head.node(), ExprNode::Const { .. }) {
                     return Ok(None);
                 }
                 reserve(&mut fields, self.limits.max_context_depth)?;
-                fields.push(binder_type.clone());
-                type_ = body;
+                fields.push(field);
+                type_ = body.clone();
             }
-            if fields.len() != ctor.num_fields as usize
-                || !matches!(type_.node(), ExprNode::Const { name: result, levels } if result == name && levels.is_empty())
-            {
+            if fields.len() != ctor.num_fields as usize || self.normalize_type(&type_)? != source {
                 return Ok(None);
+            }
+            let constructor_name = if specialized {
+                Name::num(layout_name.clone(), index as u64)
+            } else {
+                ctor.base.name.clone()
+            };
+            if specialized && self.environment.contains(&constructor_name) {
+                return Err(unsupported("runtime data constructor collision"));
             }
             reserve(&mut constructors, self.limits.fir.max_constructors)?;
             constructors.push(ShapeConstructor {
-                name: ctor.base.name.clone(),
+                original: ctor.base.name.clone(),
+                name: constructor_name,
                 tag,
                 fields,
             });
         }
-        Ok(Some(Shape {
-            name: name.clone(),
+        let shape = Shape {
+            source: source.clone(),
+            name: layout_name,
             recursive: family.is_rec,
             constructors,
-        }))
+        };
+        self.data_shapes
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: self.data_shapes.len().saturating_add(1),
+            })?;
+        self.data_shapes.insert(source, shape.clone());
+        Ok(Some(shape))
     }
 
     /// Discover nested record dependencies in postorder on the heap. All roots
     /// refer to the immutable, dual-checked environment, never caller layouts.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
+        let normalized = self.normalize_type(source)?;
+        let source = &normalized;
         if matches!(source.node(), ExprNode::ForallE { .. }) {
             return self.function_value_type(source);
         }
         if let Some(value) = scalar_type(source) {
             return Ok(Some(value));
         }
-        let ExprNode::Const { name, levels } = source.node() else {
-            return Ok(None);
-        };
-        if !levels.is_empty() {
+        if source.has_loose_bvars() {
             return Ok(None);
         }
         enum Task {
-            Enter(Name),
+            Enter(Expr),
             Finish(Shape),
         }
-        let mut tasks = vec![Task::Enter(name.clone())];
-        let mut active = BTreeSet::new();
+        let mut tasks = vec![Task::Enter(source.clone())];
+        let mut active = HashSet::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Enter(name) => {
-                    if self.value_types.records.contains(&name) {
+                Task::Enter(source) => {
+                    if self.value_types.records.contains(&source) {
                         continue;
                     }
-                    if !active.insert(name.clone()) {
+                    if !active.insert(source.clone()) {
                         return Ok(None);
                     }
                     if active.len() > self.limits.max_context_depth {
@@ -139,25 +229,17 @@ impl Preparation<'_> {
                             observed: active.len(),
                         });
                     }
-                    let Some(shape) = self.record_shape(&name)? else {
+                    let Some(shape) = self.record_shape(&source)? else {
                         return Ok(None);
                     };
-                    let dependencies: Vec<_> = shape
-                        .constructors
-                        .iter()
-                        .flat_map(|ctor| &ctor.fields)
-                        .filter_map(|field| {
-                            if scalar_type(field).is_some() {
-                                return None;
-                            }
-                            match field.node() {
-                                ExprNode::Const { name, .. } if name != &shape.name => {
-                                    Some(name.clone())
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect();
+                    let mut dependencies = Vec::new();
+                    for field in shape.constructors.iter().flat_map(|ctor| &ctor.fields) {
+                        self.tick()?;
+                        if scalar_type(field).is_none() && field != &shape.source {
+                            reserve(&mut dependencies, self.limits.max_nodes)?;
+                            dependencies.push(field.clone());
+                        }
+                    }
                     reserve(&mut tasks, self.limits.max_nodes)?;
                     tasks.push(Task::Finish(shape));
                     for dependency in dependencies.into_iter().rev() {
@@ -170,9 +252,7 @@ impl Preparation<'_> {
                         let mut fields = Vec::new();
                         for field in &ctor.fields {
                             self.tick()?;
-                            let value = if matches!(field.node(), ExprNode::Const { name, levels }
-                                if name == &shape.name && levels.is_empty())
-                            {
+                            let value = if field == &shape.source {
                                 ValueType::Constructor
                             } else if let Some((value, _)) =
                                 executable_value_type(field, &self.value_types)
@@ -194,8 +274,14 @@ impl Preparation<'_> {
                             static_scalar_bytes: Vec::new(),
                         });
                     }
-                    active.remove(&shape.name);
-                    self.value_types.records.insert(shape.name);
+                    active.remove(&shape.source);
+                    self.value_types.records.try_reserve(1).map_err(|_| {
+                        IngressError::AllocationFailure {
+                            resource: IngressResource::ProgramTables,
+                            requested: self.value_types.records.len().saturating_add(1),
+                        }
+                    })?;
+                    self.value_types.records.insert(shape.source);
                 }
             }
         }
@@ -240,6 +326,99 @@ impl Preparation<'_> {
         )
     }
 
+    /// Select a ground layout from the recursor's own admitted parameter and
+    /// universe telescope. The motive universe is not a family parameter.
+    pub(super) fn recursor_shape(
+        &mut self,
+        rec: &RecursorVal,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Result<Option<Shape>, IngressError> {
+        if rec.is_unsafe
+            || rec.all.len() != 1
+            || rec.num_motives != 1
+            || rec.num_indices != 0
+            || rec.base.level_params.len() != levels.len()
+            || args.len() < rec.num_params as usize
+        {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Induct(family)) = self.environment.find(&rec.all[0]) else {
+            return Ok(None);
+        };
+        if rec.num_params != family.num_params || rec.num_minors as usize != family.ctors.len() {
+            return Ok(None);
+        }
+        let mut family_levels = Vec::new();
+        for parameter in &family.base.level_params {
+            self.tick()?;
+            let mut selected = None;
+            for (index, name) in rec.base.level_params.iter().enumerate() {
+                self.tick()?;
+                if name == parameter {
+                    selected = Some(levels[index].clone());
+                    break;
+                }
+            }
+            let Some(level) = selected else {
+                return Ok(None);
+            };
+            reserve(&mut family_levels, self.limits.max_context_depth)?;
+            family_levels.push(level);
+        }
+        let mut source = Expr::const_(family.base.name.clone(), family_levels);
+        for parameter in &args[..rec.num_params as usize] {
+            self.tick()?;
+            source = Expr::app(source, parameter.clone());
+        }
+        let source = self.normalize_type(&source)?;
+        if self.value_type(&source)? != Some(ValueType::Constructor) {
+            return Ok(None);
+        }
+        self.record_shape(&source)
+    }
+
+    /// Type parameters and universes choose a private constructor binding;
+    /// runtime fields stay in their original order and are never evaluated or
+    /// duplicated here. No specialized name enters the logical environment.
+    pub(super) fn specialize_constructor(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        let parameters = ctor.num_params as usize;
+        if parameters == 0 && levels.is_empty() || args.len() < parameters {
+            return Ok(None);
+        }
+        let mut family = Expr::const_(ctor.induct.clone(), levels.clone());
+        for parameter in &args[..parameters] {
+            self.tick()?;
+            family = Expr::app(family, parameter.clone());
+        }
+        let family = self.normalize_type(&family)?;
+        if self.value_type(&family)? != Some(ValueType::Constructor) {
+            return Ok(None);
+        }
+        let Some(shape) = self.record_shape(&family)? else {
+            return Ok(None);
+        };
+        let Some(binding) = shape.constructors.iter().find(|c| c.original == *name) else {
+            return Ok(None);
+        };
+        let mut value = Expr::const_(binding.name.clone(), vec![]);
+        for field in &args[parameters..] {
+            self.tick()?;
+            value = Expr::app(value, field.clone());
+        }
+        Ok(Some(value))
+    }
+
     /// A nonrecursive singleton eliminator becomes one let-bound major and
     /// projections into its checked layout. Keep the major shared even when
     /// several fields or the same field are used by the minor premise.
@@ -253,31 +432,29 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if rec.is_unsafe
-            || rec.num_params != 0
             || rec.num_indices != 0
             || rec.num_motives != 1
             || rec.num_minors != 1
             || rec.all.len() != 1
             || rec.rules.len() != 1
             || levels.len() != rec.base.level_params.len()
-            || args.len() != 3
+            || args.len() != rec.num_params as usize + 3
         {
             return Ok(None);
         }
-        let family = Expr::const_(rec.all[0].clone(), vec![]);
-        if self.value_type(&family)? != Some(ValueType::Constructor) {
-            return Ok(None);
-        }
-        let Some(shape) = self.record_shape(&rec.all[0])? else {
+        let Some(shape) = self.recursor_shape(rec, levels, args)? else {
             return Ok(None);
         };
+        let family = shape.source.clone();
+        let args = &args[rec.num_params as usize..];
         if shape.recursive {
             return Ok(None);
         }
         let [ctor] = shape.constructors.as_slice() else {
             return Ok(None);
         };
-        if rec.rules[0].ctor != ctor.name || rec.rules[0].nfields as usize != ctor.fields.len() {
+        if rec.rules[0].ctor != ctor.original || rec.rules[0].nfields as usize != ctor.fields.len()
+        {
             return Ok(None);
         }
         let ExprNode::Lam { body: motive, .. } = args[0].node() else {

@@ -31,6 +31,7 @@ pub(super) struct Preparation<'a> {
     value_types: ExecutableValueTypes,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
     specializations: specialize::Store,
+    data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
 
@@ -86,6 +87,7 @@ impl<'a> Preparation<'a> {
             value_types: ExecutableValueTypes::bounded_source(),
             interfaces: Vec::new(),
             specializations: specialize::Store::default(),
+            data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
     }
@@ -269,6 +271,10 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(constructor) = self.specialize_constructor(&head, &args)? {
+                            tasks.push(Task::Visit(constructor));
+                            continue;
+                        }
                         if let Some(specialized) = self.specialize_call(&head, &args)? {
                             tasks.push(Task::Visit(specialized));
                             continue;
@@ -472,6 +478,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(expr.clone()));
                         }
                         ExprNode::Const { name, .. } => {
+                            if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
+                                tasks.push(Task::Visit(constructor));
+                                continue;
+                            }
                             if let Some(partial) = self.partial_call(&expr, &[])? {
                                 tasks.push(Task::Visit(partial));
                                 continue;

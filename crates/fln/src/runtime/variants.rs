@@ -22,24 +22,26 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if rec.is_unsafe
-            || rec.num_params != 0
             || rec.num_indices != 0
             || rec.num_motives != 1
             || rec.num_minors < 2
             || rec.all.len() != 1
             || rec.rules.len() != rec.num_minors as usize
             || levels.len() != rec.base.level_params.len()
-            || args.len() != rec.rules.len().saturating_add(2)
+            || args.len()
+                != rec
+                    .rules
+                    .len()
+                    .saturating_add(rec.num_params as usize)
+                    .saturating_add(2)
         {
             return Ok(None);
         }
-        let family = Expr::const_(rec.all[0].clone(), vec![]);
-        if self.value_type(&family)? != Some(ValueType::Constructor) {
-            return Ok(None);
-        }
-        let Some(shape) = self.record_shape(&rec.all[0])? else {
+        let Some(shape) = self.recursor_shape(rec, levels, args)? else {
             return Ok(None);
         };
+        let family = shape.source.clone();
+        let args = &args[rec.num_params as usize..];
         if shape.recursive || shape.constructors.len() != rec.rules.len() {
             return Ok(None);
         }
@@ -62,7 +64,7 @@ impl Preparation<'_> {
         let mut constructors = Vec::new();
         for (index, (ctor, rule)) in shape.constructors.iter().zip(&rec.rules).enumerate() {
             self.tick()?;
-            if rule.ctor != ctor.name || rule.nfields as usize != ctor.fields.len() {
+            if rule.ctor != ctor.original || rule.nfields as usize != ctor.fields.len() {
                 return Ok(None);
             }
             let mut body = args[index + 1]

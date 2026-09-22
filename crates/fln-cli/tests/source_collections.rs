@@ -81,3 +81,71 @@ fn false_collection_suffixes_emit_no_partial_success_and_allow_recovery() {
         }
     }
 }
+
+#[test]
+fn installed_collection_execution_exports_and_replays_native_bytecode() {
+    let program = include_str!("../../../examples/native_collection_runtime.lean");
+    let path = file(program);
+    let artifact = path.with_extension("flbc");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("\"finalValue\":42"), "{report}");
+    let retained = std::fs::read(&artifact).unwrap();
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&artifact)
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{:?}", replay);
+    assert!(replay.stderr.is_empty());
+    let report = String::from_utf8(replay.stdout).unwrap();
+    assert!(report.contains("\"returnValue\":42"), "{report}");
+
+    let failed = path.with_extension("failed.flbc");
+    std::fs::write(
+        &path,
+        format!("{program}\ntheorem falseSuffix : 0 = 1 := by rfl"),
+    )
+    .unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&failed)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(!refused.stderr.is_empty());
+    assert!(!failed.exists());
+    assert_eq!(std::fs::read(&artifact).unwrap(), retained);
+    std::fs::write(&path, program).unwrap();
+    let recovered = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{:?}", recovered);
+    assert!(recovered.stderr.is_empty());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), program);
+}
+
+#[test]
+fn lean_personality_executes_owned_collection_payloads() {
+    let program = "#eval List.foldl (fun (acc s : String) => acc ++ s) \"\" [\"hello\", \" world\"]\n#eval List.length [true, false]\n";
+    let path = file(program);
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"\"hello world\"\n2\n");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), program);
+}
