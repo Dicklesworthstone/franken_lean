@@ -1,0 +1,173 @@
+name: Verify saved proof runtime publication
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-proof-runtime.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-and-export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 3ddb4d0859bf76a2619e5c0649b3f473b73259ae
+          persist-credentials: false
+      - name: Restore checksum-bound publication inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, lzma, pathlib, subprocess
+          out = pathlib.Path('target/proof-publication')
+          out.mkdir(parents=True)
+          chunks = ['33b1b160a43133a3486017d9d2bae80fca4bb0cf', '34399194cf50c389699c0f4a9dfd8e6c2b53963b', '5beb5fa8bc590363d8e0249ec154f0cc4c9d2504']
+          packed = bytearray()
+          for sha in chunks:
+              obj = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
+              data = base64.b64decode(obj['content'])
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == sha
+              packed.extend(data)
+          assert hashlib.sha256(packed).hexdigest() == 'de949872c1a1960e51a8b4dc9ca9702384ec91d8ff29d00f569a6efcfb5a9da8'
+          raw = lzma.decompress(packed, memlimit=256*1024*1024)
+          assert len(raw) < 200000
+          (out / 'manifest.json').write_bytes(raw)
+          PY
+          cat > target/proof-publication/apply.py <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          root = pathlib.Path.cwd()
+          out = root / 'target/proof-publication'
+          m = json.loads((out / 'manifest.json').read_text())
+          def git(*args):
+              return subprocess.check_output(['git',*args], text=True).strip()
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          stage = int(sys.argv[1])
+          assert stage in (1,2) and len(m['features']) == 2
+          assert m['repository'] == 'Dicklesworthstone/franken_lean'
+          assert git('rev-parse','HEAD') == m['publication_base'] == '3ddb4d0859bf76a2619e5c0649b3f473b73259ae'
+          assert git('rev-parse','HEAD^{tree}') == m['publication_base_tree'] == '5c2314ea5c60fda55cdf697926f3b15a43d7ac8e'
+          allowed = {'crates/fln/src/lib.rs','crates/fln/src/runtime.rs','crates/fln/src/runtime/projections.rs','crates/fln/src/runtime/proofs.rs','crates/fln/src/runtime/specialize.rs','crates/fln/tests/runtime_proof_erasure.rs','docs/NATIVE_PROOF_ERASURE.md','.github/workflows/native-record-runtime.yml','crates/fln-cli/tests/source_proof_runtime.rs','crates/fln/src/runtime/proofs/projections.rs','crates/fln/src/runtime/proofs/tests.rs','crates/fln/src/runtime/records.rs','crates/fln/tests/runtime_mutual_data.rs','crates/fln/tests/runtime_proof_data.rs','crates/fln/tests/runtime_records.rs','examples/native_proof_data.lean','examples/native_proof_erasure.lean'}
+          assert {e['path'] for f in m['features'] for e in f['changes']} == allowed
+          workflow = m['workflow_path']
+          existing = m['existing_workflow_path']
+          assert workflow == '.github/workflows/native-proof-runtime.yml'
+          assert existing == '.github/workflows/native-record-runtime.yml'
+          f = m['features'][stage-1]
+          assert f['sequence'] == stage
+          assert len({e['path'] for e in f['changes']}) == len(f['changes'])
+          if stage == 1:
+              assert not git('status','--porcelain','--untracked-files=no')
+              assert not (root / workflow).exists()
+          else:
+              first = json.loads((out / 'stage1.json').read_text())
+              assert git('write-tree') == first['tree']
+              assert blob((root / workflow).read_bytes()) == first['workflow_blob']
+          suffix = b''
+          for e in f['changes']:
+              path = root / e['path']
+              assert path.resolve().is_relative_to(root) and not path.is_symlink()
+              assert e['mode'] == '100644'
+              if e['path'] == existing:
+                  current = path.read_bytes()
+                  assert blob(current) == m['existing_workflow_before'] == 'ae52750e4bfcab1a020f812b66a308a22a239fb7'
+                  prefix = m['original_workflow'].encode()
+                  assert blob(prefix) == e['before_blob']
+                  assert current.startswith(prefix)
+                  suffix = current[len(prefix):]
+                  assert suffix.startswith(b'  mutual-function-child-validation:\n')
+              elif e['before_blob'] is None:
+                  assert not path.exists() and not git('ls-files','--',e['path']), e['path']
+              else:
+                  assert blob(path.read_bytes()) == e['before_blob'], e['path']
+                  assert git('ls-files','--stage','--',e['path']).split()[:3] == ['100644',e['before_blob'],'0']
+          patch = out / f'stage{stage}.patch'
+          patch.write_text(f['patch'])
+          args = ['git','apply','--index','--exclude='+existing]
+          subprocess.run(args+['--check',str(patch)], check=True)
+          subprocess.run(args+[str(patch)], check=True)
+          entries = []
+          for e in f['changes']:
+              if e['path'] == existing:
+                  replacement = m['saved_workflow'].encode()
+                  assert blob(replacement) == e['after_blob']
+                  (root / existing).write_bytes(replacement+suffix)
+                  subprocess.run(['git','add','--',existing],check=True)
+              data = (root / e['path']).read_bytes()
+              sha = blob(data)
+              if e['path'] != existing:
+                  assert sha == e['after_blob'], e['path']
+                  assert hashlib.sha256(data).hexdigest() == e['sha256'], e['path']
+              entries.append({'path':e['path'],'mode':'100644','type':'blob','sha':sha})
+          data = f['readonly_workflow'].encode()
+          sha = blob(data)
+          assert sha == f['readonly_workflow_blob'] == ['0bda937456d416080916b8925aafc4bb6add25b9','4fa370add2b916532c3e369b87066962d72bf708'][stage-1]
+          (root / workflow).write_bytes(data)
+          subprocess.run(['git','add','--',workflow],check=True)
+          entries.append({'path':workflow,'mode':'100644','type':'blob','sha':sha})
+          expected_paths = {e['path'] for feature in m['features'][:stage] for e in feature['changes']} | {workflow}
+          assert set(git('diff','--cached','--name-only').splitlines()) == expected_paths
+          subprocess.run(['git','diff','--cached','--check'],check=True)
+          result = {'stage':stage,'tree':git('write-tree'),'workflow_blob':sha,'entries':entries}
+          (out / f'stage{stage}.json').write_text(json.dumps(result))
+          print('VERIFIED_STAGE',json.dumps(result),flush=True)
+          PY
+          cat > target/proof-publication/export.py <<'PY'
+          import base64, hashlib, json, pathlib, subprocess, sys
+          stage = int(sys.argv[1])
+          m = json.loads(pathlib.Path(f'target/proof-publication/stage{stage}.json').read_text())
+          assert subprocess.check_output(['git','write-tree'],text=True).strip() == m['tree']
+          for e in m['entries']:
+              data = pathlib.Path(e['path']).read_bytes()
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['sha']
+              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
+              obj = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
+              assert obj['sha'] == e['sha']
+              print('EXPORTED',e['sha'],e['path'],flush=True)
+          print('VALIDATED_FEATURE',stage,m['tree'],flush=True)
+          PY
+          python3 -I target/proof-publication/apply.py 1
+      - name: Install repository toolchain
+        run: |
+          channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          rustc -Vv | tee target/proof-publication/compiler.txt
+      - name: Validate and export the first feature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test runtime_proof_erasure 2>&1 | tee target/proof-publication/first.log
+          python3 -I target/proof-publication/export.py 1
+      - name: Restore and validate proof-bearing data with current consumers
+        run: |
+          set -euo pipefail
+          python3 -I target/proof-publication/apply.py 2
+          args=()
+          for path in crates/fln/tests/runtime_*.rs; do
+            name=${path##*/}
+            args+=(--test "${name%.rs}")
+          done
+          cargo test --locked -p fln --lib "${args[@]}" --test source_module_check --test source_module_session --test engine_builder_facade --no-fail-fast 2>&1 | tee target/proof-publication/engine.log
+          cargo test --locked -p fln-cli --test source_proof_runtime --test source_mutual_data --test source_closure_data --no-fail-fast 2>&1 | tee target/proof-publication/cli.log
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee target/proof-publication/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/proof-publication/check.log
+      - name: Export the second validated feature without moving any ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I target/proof-publication/export.py 2
+      - name: Retain publication and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: proof-runtime-publication-${{ github.run_id }}
+          path: target/proof-publication/
+          retention-days: 14
