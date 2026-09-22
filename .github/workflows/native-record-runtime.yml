@@ -9,6 +9,9 @@ on:
       - 'crates/fln/tests/runtime_record_projection.rs'
       - 'crates/fln-cli/tests/source_ground_projections.rs'
       - 'examples/native_ground_projections.lean'
+      - 'crates/fln/tests/runtime_closure_data.rs'
+      - 'crates/fln-cli/tests/source_closure_data.rs'
+      - 'examples/native_closure_data.lean'
 permissions:
   contents: read
 jobs:
@@ -43,8 +46,8 @@ jobs:
       - name: Test source, layouts and installed bytecode consumers
         run: |
           cargo test --locked -p fln --lib
-          cargo test --locked -p fln --test runtime_record_projection --test runtime_parameterized_data --test runtime_records --test runtime_specialization --test runtime_higher_order
-          cargo test --locked -p fln-cli --test source_ground_projections --test source_collections
+          cargo test --locked -p fln --test runtime_closure_data --test runtime_record_projection --test runtime_parameterized_data --test runtime_records --test runtime_specialization --test runtime_higher_order
+          cargo test --locked -p fln-cli --test source_closure_data --test source_ground_projections --test source_collections
           cargo clippy --locked -p fln --all-targets -- -D warnings
-          cargo clippy --locked -p fln-cli --test source_ground_projections -- -D warnings
+          cargo clippy --locked -p fln-cli --test source_closure_data --test source_ground_projections -- -D warnings
           cargo check --locked --workspace --all-targets

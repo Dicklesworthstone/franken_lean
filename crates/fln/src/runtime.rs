@@ -149,6 +149,7 @@ impl<'a> Preparation<'a> {
             ValueType::String => 1,
             ValueType::Bool => 2,
             ValueType::Constructor => 3,
+            ValueType::Closure(id) => 4 + u64::from(id.get()),
             _ => return Err(unsupported("conditional result representation")),
         };
         let name = Name::num(Name::from_components(["_fln_runtime_bool_case"]), index);
@@ -300,6 +301,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(annotated));
                             continue;
                         }
+                        if let Some(applied) = self.overapplied_data_recursor(&head, &args)? {
+                            tasks.push(Task::Visit(applied));
+                            continue;
+                        }
                         if matches!(head.node(), ExprNode::Const { name: n, levels }
                             if n == &name("Bool.rec") && levels.len() == 1)
                             && args.len() == 4
@@ -312,9 +317,19 @@ impl<'a> Preparation<'a> {
                                 .value_type(motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
                             let case = self.branch_name(result)?;
+                            let yes = self.typed_callable_result(
+                                args[2].clone(),
+                                motive.clone(),
+                                result,
+                            )?;
+                            let no = self.typed_callable_result(
+                                args[1].clone(),
+                                motive.clone(),
+                                result,
+                            )?;
                             tasks.push(Task::Case { name: case, result });
-                            tasks.push(Task::Visit(self.thunk(&args[2])?));
-                            tasks.push(Task::Visit(self.thunk(&args[1])?));
+                            tasks.push(Task::Visit(self.thunk(&yes)?));
+                            tasks.push(Task::Visit(self.thunk(&no)?));
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
                         }

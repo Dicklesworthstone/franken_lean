@@ -78,6 +78,7 @@ impl Preparation<'_> {
                 )?;
             }
             reserve(&mut branches, self.limits.max_lambda_bindings)?;
+            let body = self.typed_callable_result(body, motive.clone(), result)?;
             branches.push(Expr::lam(
                 Name::num(case_name.clone(), index as u64),
                 family.clone(),

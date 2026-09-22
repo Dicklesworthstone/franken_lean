@@ -3,6 +3,7 @@
 //! Closed type parameters are specialized, never stored as runtime fields.
 //! Direct self-recursive object fields are supported; value-dependent,
 //! higher-order recursive and proof-valued fields remain explicit refusals.
+//! Nondependent function fields are owned closures with checked interfaces.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
 use fln_core::level::Level;
@@ -150,7 +151,10 @@ impl Preparation<'_> {
                 }
                 let field = self.normalize_type(binder_type)?;
                 let (head, _) = self.spine(&field)?;
-                if !matches!(head.node(), ExprNode::Const { .. }) {
+                if !matches!(
+                    head.node(),
+                    ExprNode::Const { .. } | ExprNode::ForallE { .. }
+                ) {
                     return Ok(None);
                 }
                 reserve(&mut fields, self.limits.max_context_depth)?;
@@ -192,23 +196,19 @@ impl Preparation<'_> {
         Ok(Some(shape))
     }
 
-    /// Discover nested record dependencies in postorder on the heap. All roots
-    /// refer to the immutable, dual-checked environment, never caller layouts.
+    /// Discover data and function representations in one heap worklist. A
+    /// record may contain closures whose arguments/results contain more data;
+    /// alternating those types must not alternate recursive Rust calls.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
-        let normalized = self.normalize_type(source)?;
-        let source = &normalized;
-        if matches!(source.node(), ExprNode::ForallE { .. }) {
-            return self.function_value_type(source);
-        }
-        if let Some(value) = scalar_type(source) {
-            return Ok(Some(value));
-        }
-        if source.has_loose_bvars() {
-            return Ok(None);
-        }
+        let source = self.normalize_type(source)?;
         enum Task {
             Enter(Expr),
             Finish(Shape),
+            Function {
+                source: Expr,
+                domains: Vec<Expr>,
+                result: Expr,
+            },
         }
         let mut tasks = vec![Task::Enter(source.clone())];
         let mut active = HashSet::new();
@@ -216,18 +216,56 @@ impl Preparation<'_> {
             self.tick()?;
             match task {
                 Task::Enter(source) => {
-                    if self.value_types.records.contains(&source) {
+                    if executable_value_type(&source, &self.value_types).is_some() {
                         continue;
                     }
-                    if !active.insert(source.clone()) {
+                    if source.has_loose_bvars() || active.contains(&source) {
                         return Ok(None);
                     }
-                    if active.len() > self.limits.max_context_depth {
+                    let depth = active.len().saturating_add(1);
+                    if depth > self.limits.max_context_depth {
                         return Err(IngressError::ResourceLimit {
                             resource: IngressResource::ContextDepth,
                             limit: self.limits.max_context_depth,
-                            observed: active.len(),
+                            observed: depth,
                         });
+                    }
+                    active
+                        .try_reserve(1)
+                        .map_err(|_| IngressError::AllocationFailure {
+                            resource: IngressResource::ContextDepth,
+                            requested: depth,
+                        })?;
+                    active.insert(source.clone());
+                    if matches!(source.node(), ExprNode::ForallE { .. }) {
+                        let mut remaining = &source;
+                        let mut domains = Vec::new();
+                        while let ExprNode::ForallE {
+                            binder_type, body, ..
+                        } = remaining.node()
+                        {
+                            self.tick()?;
+                            if body.has_loose_bvars() {
+                                return Ok(None);
+                            }
+                            reserve(&mut domains, self.limits.max_context_depth)?;
+                            domains.push(binder_type.clone());
+                            remaining = body;
+                        }
+                        let result = remaining.clone();
+                        reserve(&mut tasks, self.limits.max_nodes)?;
+                        tasks.push(Task::Function {
+                            source,
+                            domains: domains.clone(),
+                            result: result.clone(),
+                        });
+                        reserve(&mut tasks, self.limits.max_nodes)?;
+                        tasks.push(Task::Enter(result));
+                        for domain in domains.into_iter().rev() {
+                            reserve(&mut tasks, self.limits.max_nodes)?;
+                            tasks.push(Task::Enter(domain));
+                        }
+                        continue;
                     }
                     let Some(shape) = self.record_shape(&source)? else {
                         return Ok(None);
@@ -246,6 +284,29 @@ impl Preparation<'_> {
                         reserve(&mut tasks, self.limits.max_nodes)?;
                         tasks.push(Task::Enter(dependency));
                     }
+                }
+                Task::Function {
+                    source,
+                    domains,
+                    result,
+                } => {
+                    let Some((result, _)) = executable_value_type(&result, &self.value_types)
+                    else {
+                        return Ok(None);
+                    };
+                    let mut parameters = Vec::new();
+                    for domain in domains {
+                        self.tick()?;
+                        let Some((parameter, _)) =
+                            executable_value_type(&domain, &self.value_types)
+                        else {
+                            return Ok(None);
+                        };
+                        reserve(&mut parameters, self.limits.max_context_depth)?;
+                        parameters.push(parameter);
+                    }
+                    self.register_function_type(source.clone(), parameters, result)?;
+                    active.remove(&source);
                 }
                 Task::Finish(shape) => {
                     for ctor in &shape.constructors {
@@ -299,7 +360,7 @@ impl Preparation<'_> {
                 }
             }
         }
-        Ok(Some(ValueType::Constructor))
+        Ok(executable_value_type(&source, &self.value_types).map(|(value, _)| value))
     }
 
     pub(crate) fn signature(
@@ -474,9 +535,9 @@ impl Preparation<'_> {
         let ExprNode::Lam { body: motive, .. } = args[0].node() else {
             return Ok(None);
         };
-        if self.value_type(motive)?.is_none() {
-            return Err(unsupported("dependent record recursor result"));
-        }
+        let result = self
+            .value_type(motive)?
+            .ok_or_else(|| unsupported("dependent record recursor result"))?;
         let major = Expr::bvar(0).map_err(|_| unsupported("record major scope"))?;
         let mut body = args[1]
             .lift_loose(0, 1)
@@ -486,6 +547,7 @@ impl Preparation<'_> {
             let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
             body = self.minor_apply(body, field)?;
         }
+        let body = self.typed_callable_result(body, motive.clone(), result)?;
         Ok(Some(Expr::let_e(
             Name::anonymous(),
             family,
@@ -504,5 +566,101 @@ impl Preparation<'_> {
         // refused by ingress rather than assigned a made-up layout.
         self.value_type(&family)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod closure_fields_tests {
+    use super::*;
+
+    fn box_engine() -> Engine {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .check_source_files(
+                &[b"structure Box (A : Type) where\n  value : A"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine
+    }
+
+    fn alternating_type(depth: usize) -> Expr {
+        let scalar = Expr::const_(name("Nat"), vec![]);
+        (0..depth).fold(scalar.clone(), |value, _| {
+            Expr::app(
+                Expr::const_(name("Box"), vec![]),
+                Expr::forall_e(
+                    Name::anonymous(),
+                    scalar.clone(),
+                    value,
+                    BinderInfo::Default,
+                ),
+            )
+        })
+    }
+
+    #[test]
+    fn mixed_data_function_type_dependencies_are_discovered_on_the_heap() {
+        let engine = box_engine();
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let type_ = alternating_type(200);
+                let limits = IngressLimits {
+                    max_context_depth: 16,
+                    max_nodes: 500_000,
+                    ..IngressLimits::default()
+                };
+                assert!(matches!(
+                    Preparation::new(&engine.environment, limits).value_type(&type_),
+                    Err(IngressError::ResourceLimit { .. })
+                ));
+                let mut normal = Preparation::new(&engine.environment, IngressLimits::default());
+                assert_eq!(
+                    normal.value_type(&alternating_type(8)).unwrap(),
+                    Some(ValueType::Constructor)
+                );
+                assert_eq!(normal.constructors.len(), 8);
+                assert!(
+                    normal
+                        .constructors
+                        .iter()
+                        .all(|c| matches!(c.fields.as_slice(), [ValueType::Closure(_)]))
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn canonicalization_remaps_field_interfaces_not_just_call_sites() {
+        let engine = box_engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let mut fields = Vec::new();
+        for (argument, result) in [("String", "String"), ("Nat", "Nat")] {
+            let type_ = Expr::forall_e(
+                Name::anonymous(),
+                Expr::const_(name(argument), vec![]),
+                Expr::const_(name(result), vec![]),
+                BinderInfo::Default,
+            );
+            assert_eq!(
+                prep.value_type(&Expr::app(Expr::const_(name("Box"), vec![]), type_))
+                    .unwrap(),
+                Some(ValueType::Constructor)
+            );
+            fields.push(prep.constructors.last().unwrap().fields[0]);
+        }
+        assert_ne!(fields[0], fields[1]);
+        prep.finalize_callables(&mut []).unwrap();
+        assert_eq!(prep.constructors[0].fields[0], fields[1]);
+        assert_eq!(prep.constructors[1].fields[0], fields[0]);
     }
 }

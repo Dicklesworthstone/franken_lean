@@ -276,12 +276,23 @@ def useProbe [chosen : Probe Nat] (n : Nat) : Nat := Probe.call n
 "#;
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    // Inspect all fields, not just `call`: compiling a selected projection is
-    // not permission to evaluate or erase an arbitrary dictionary initializer.
+    // Computed dictionaries are not statically erased. They now have a real
+    // runtime representation: the unused field must consume VM work, even
+    // though the selected method is just the identity. Compare execution, not
+    // mere acceptance, to guard against premature dictionary evaluation.
+    let idle = execute(&source.replace("count 30", "count 0"), "42");
+    let busy = execute(source, "42");
     assert!(
-        base.execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
-            .is_err()
+        busy > idle + 30,
+        "initializer disappeared: {idle} vs {busy}"
     );
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle;
+    assert!(matches!(
+        base.execute_source_definitions(&[source.as_bytes()], &KVMap::new(), bounded)
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }
 

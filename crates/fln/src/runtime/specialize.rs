@@ -764,17 +764,9 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let ExprNode::Const { name, levels } = head.node() else {
+        let Some(mut type_) = self.callable_type(head)? else {
             return Ok(None);
         };
-        let Some(definition) = self.definition(name) else {
-            return Ok(None);
-        };
-        let mut type_ = self.universe_instance(
-            &definition.base.type_,
-            &definition.base.level_params,
-            levels,
-        )?;
         let mut bindings = Vec::new();
         for argument in args {
             self.tick()?;

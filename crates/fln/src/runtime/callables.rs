@@ -6,103 +6,142 @@ use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
 impl Preparation<'_> {
-    /// Use a heap stack for nested higher-order domains. Function values carry
-    /// no new source declarations, axioms, or trusted type-conversion rules.
-    pub(super) fn function_value_type(
+    /// Keep an application of a data eliminator's returned closure distinct
+    /// from the eliminator's own arguments. The let evaluates the selected
+    /// function once, before its arguments, without evaluating either branch.
+    pub(super) fn overapplied_data_recursor(
         &mut self,
-        source: &Expr,
-    ) -> Result<Option<ValueType>, IngressError> {
-        enum Work {
-            Enter(Expr),
-            Finish { source: Expr, parameters: usize },
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        if rec.is_unsafe || rec.num_indices != 0 || rec.num_motives != 1 || rec.all.len() != 1 {
+            return Ok(None);
         }
-        let mut work = vec![Work::Enter(source.clone())];
-        let mut values = Vec::new();
-        while let Some(item) = work.pop() {
+        let Some(ConstantInfo::Induct(family)) = self.environment.find(&rec.all[0]) else {
+            return Ok(None);
+        };
+        if family.is_rec {
+            // The recursive paths flatten motives into recursive parameters.
+            return Ok(None);
+        }
+        let parameters = rec.num_params as usize;
+        let arity = parameters
+            .checked_add(rec.num_minors as usize)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| unsupported("eliminator arity"))?;
+        if args.len() <= arity {
+            return Ok(None);
+        }
+        let ExprNode::Lam { body: type_, .. } = args[parameters].node() else {
+            return Ok(None);
+        };
+        if type_.has_loose_bvars() {
+            return Ok(None);
+        }
+        let type_ = type_.clone();
+        let mut function = head.clone();
+        for argument in &args[..arity] {
             self.tick()?;
-            match item {
-                Work::Enter(source) => {
-                    if let Some(&value) = self.value_types.closures.get(&source) {
-                        reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(value);
-                        continue;
-                    }
-                    if !matches!(source.node(), ExprNode::ForallE { .. }) {
-                        let Some(value) = self.value_type(&source)? else {
-                            return Ok(None);
-                        };
-                        reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(value);
-                        continue;
-                    }
-                    let mut remaining = &source;
-                    let mut domains = Vec::new();
-                    while let ExprNode::ForallE {
-                        binder_type, body, ..
-                    } = remaining.node()
-                    {
-                        self.tick()?;
-                        // A type parameter or value-dependent representation is
-                        // not an erased scalar or callback interface.
-                        if body.has_loose_bvars() {
-                            return Ok(None);
-                        }
-                        reserve(&mut domains, self.limits.max_context_depth)?;
-                        domains.push(binder_type.clone());
-                        remaining = body;
-                    }
-                    let result = remaining.clone();
-                    reserve(&mut work, self.limits.max_nodes)?;
-                    work.push(Work::Finish {
-                        source,
-                        parameters: domains.len(),
-                    });
-                    reserve(&mut work, self.limits.max_nodes)?;
-                    work.push(Work::Enter(result));
-                    for domain in domains.into_iter().rev() {
-                        reserve(&mut work, self.limits.max_nodes)?;
-                        work.push(Work::Enter(domain));
-                    }
+            function = Expr::app(function, argument.clone());
+        }
+        let mut body = Expr::bvar(0).map_err(|_| unsupported("eliminator result scope"))?;
+        for argument in &args[arity..] {
+            self.tick()?;
+            body = Expr::app(body, self.lift(argument, 1)?);
+        }
+        Ok(Some(Expr::let_e(
+            Name::anonymous(),
+            type_,
+            function,
+            body,
+            false,
+        )))
+    }
+
+    /// A function-valued minor can be a literal lambda. Retain its checked
+    /// motive as a local type so ordinary closure conversion owns its captures.
+    pub(super) fn typed_callable_result(
+        &mut self,
+        value: Expr,
+        type_: Expr,
+        result: ValueType,
+    ) -> Result<Expr, IngressError> {
+        if !matches!(result, ValueType::Closure(_)) {
+            return Ok(value);
+        }
+        // Source case elaboration can retain constructor aliases as leading
+        // lets. Place the annotation at their result, not outside the whole
+        // telescope; otherwise a literal result lambda has no local type when
+        // the ordinary closure converter visits it. All strict lets survive.
+        let mut value = value;
+        let mut bindings = Vec::new();
+        loop {
+            self.tick()?;
+            match value.node() {
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value: local,
+                    body,
+                    non_dep,
+                } => {
+                    reserve(&mut bindings, self.limits.max_context_depth)?;
+                    bindings.push((decl_name.clone(), type_.clone(), local.clone(), *non_dep));
+                    value = body.clone();
                 }
-                Work::Finish { source, parameters } => {
-                    let result = values
-                        .pop()
-                        .ok_or_else(|| unsupported("callback result stack"))?;
-                    let start = values
-                        .len()
-                        .checked_sub(parameters)
-                        .ok_or_else(|| unsupported("callback parameter stack"))?;
-                    let mut arguments = Vec::new();
-                    for value in values.drain(start..) {
-                        reserve(&mut arguments, self.limits.max_context_depth)?;
-                        arguments.push(value);
-                    }
-                    reserve(&mut self.interfaces, self.limits.fir.max_closure_types)?;
-                    let id = u32::try_from(self.interfaces.len())
-                        .map_err(|_| unsupported("callback interface identity"))?;
-                    self.interfaces.push(ClosureSignature {
-                        parameter_ownership: borrowed_runtime_parameters(arguments.len())?,
-                        parameters: arguments,
-                        result,
-                        result_ownership: result_ownership(result),
-                    });
-                    let value = ValueType::Closure(ClosureTypeId::new(id));
-                    self.value_types.closures.try_reserve(1).map_err(|_| {
-                        IngressError::AllocationFailure {
-                            resource: IngressResource::ProgramTables,
-                            requested: self.value_types.closures.len().saturating_add(1),
-                        }
-                    })?;
-                    self.value_types.closures.insert(source, value);
-                    reserve(&mut values, self.limits.max_nodes)?;
-                    values.push(value);
-                }
+                ExprNode::MData { expr, .. } => value = expr.clone(),
+                _ => break,
             }
         }
-        if values.len() != 1 {
-            return Err(unsupported("callback type stack"));
+        let depth =
+            u32::try_from(bindings.len()).map_err(|_| unsupported("branch result depth"))?;
+        let mut result = Expr::let_e(
+            Name::anonymous(),
+            self.lift(&type_, depth)?,
+            value,
+            Expr::bvar(0).map_err(|_| unsupported("branch result scope"))?,
+            false,
+        );
+        for (name, type_, value, nondep) in bindings.into_iter().rev() {
+            self.tick()?;
+            result = Expr::let_e(name, type_, value, result, nondep);
         }
-        Ok(values.pop())
+        Ok(result)
+    }
+
+    /// Register an interface after the shared data/function worklist has
+    /// resolved all of its dependencies. Discovery never reenters itself.
+    pub(super) fn register_function_type(
+        &mut self,
+        source: Expr,
+        parameters: Vec<ValueType>,
+        result: ValueType,
+    ) -> Result<ValueType, IngressError> {
+        reserve(&mut self.interfaces, self.limits.fir.max_closure_types)?;
+        let id = u32::try_from(self.interfaces.len())
+            .map_err(|_| unsupported("callback interface identity"))?;
+        self.interfaces.push(ClosureSignature {
+            parameter_ownership: borrowed_runtime_parameters(parameters.len())?,
+            parameters,
+            result,
+            result_ownership: result_ownership(result),
+        });
+        let value = ValueType::Closure(ClosureTypeId::new(id));
+        self.value_types
+            .closures
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: self.value_types.closures.len().saturating_add(1),
+            })?;
+        self.value_types.closures.insert(source, value);
+        Ok(value)
     }
 
     /// Resolve source-local callback ids to the exact canonical FIR ids. The
@@ -200,6 +239,20 @@ impl Preparation<'_> {
                 *parameter = remap_type(*parameter, &ranks)?;
             }
             lambda.result = remap_type(lambda.result, &ranks)?;
+        }
+        // Object fields participate in the very same canonical interface
+        // table as calls and lambdas. Discovery order is not a runtime ABI.
+        for constructor in &mut self.constructors {
+            for field in &mut constructor.fields {
+                charge_catalog_node(&mut self.visited, self.limits)?;
+                *field = remap_type(*field, &ranks)?;
+            }
+        }
+        for case in &mut self.cases {
+            case.result = remap_type(case.result, &ranks)?;
+        }
+        for case in &mut self.variant_cases {
+            case.result = remap_type(case.result, &ranks)?;
         }
         self.interfaces
             .iter()
