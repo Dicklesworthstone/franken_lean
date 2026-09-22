@@ -1,0 +1,81 @@
+name: Export saved mutual runtime objects
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mutual-runtime-publication-once.yml']
+permissions:
+  contents: write
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: e91da19970591cf5c0ed0c113b475d748577291c
+          persist-credentials: false
+      - name: Validate exact saved trees and upload their blobs without moving any ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, lzma, os, pathlib, subprocess, tempfile
+          repo = 'Dicklesworthstone/franken_lean'
+          base = 'e91da19970591cf5c0ed0c113b475d748577291c'
+          base_tree = '3af2fb8697888eeb772379af092a85f180e7476a'
+          expected_trees = ['fa4657c2e85f120971e8dcec586567dee76f5fa0', 'a77be56453bbef645a010ba11c13dfdab57a2648']
+          chunks = ['53297e8c7bbaa0a1fb9ae335025d062e34072621', '3e72f27d2fc9d1172ee8bd695525b0af0cccc1a7', '06e07edda0e69c3c3e9aeb5a6ccf3ddb68b155af', 'cbf97dc91f95c8f26038ca3f32e6e6f22c6da36d']
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def blob_hash(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          assert git('rev-parse', 'HEAD') == base
+          assert git('rev-parse', 'HEAD^{tree}') == base_tree
+          packed = bytearray()
+          for sha in chunks:
+              response = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/blobs/{sha}']))
+              data = base64.b64decode(response['content'])
+              assert blob_hash(data) == sha
+              packed.extend(data)
+          assert hashlib.sha256(packed).hexdigest() == '5241ea7d951782b89efb1d8c485f88b7150ca0ff6d7a16120782676beaef9aa3'
+          manifest = json.loads(lzma.decompress(packed, memlimit=256 * 1024 * 1024))
+          assert manifest['base'] == base and manifest['base_tree'] == base_tree
+          assert len(manifest['features']) == 2
+          exported = set()
+          root = pathlib.Path.cwd()
+          with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as temp:
+              for index, feature in enumerate(manifest['features']):
+                  assert feature['sequence'] == index + 1
+                  assert feature['tree'] == expected_trees[index]
+                  changes = feature['changes']
+                  assert len({entry['path'] for entry in changes}) == len(changes)
+                  for entry in changes:
+                      path = root / entry['path']
+                      assert path.resolve().is_relative_to(root) and not path.is_symlink()
+                      assert entry['mode'] == '100644'
+                      tracked = git('ls-files', '--stage', '--', entry['path'])
+                      if entry['before_blob'] is None:
+                          assert not tracked and not path.exists(), entry['path']
+                      else:
+                          assert tracked.split()[:3] == ['100644', entry['before_blob'], '0'], entry['path']
+                          assert blob_hash(path.read_bytes()) == entry['before_blob'], entry['path']
+                  patch = pathlib.Path(temp) / f'{index + 1}.patch'
+                  patch.write_text(feature['patch'], encoding='utf-8')
+                  subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
+                  subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+                  assert git('write-tree') == expected_trees[index], 'complete tree mismatch'
+                  for entry in changes:
+                      sha = entry['after_blob']
+                      data = (root / entry['path']).read_bytes()
+                      assert blob_hash(data) == sha, entry['path']
+                      if sha not in exported:
+                          request = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
+                          response = json.loads(subprocess.check_output(['gh', 'api', '--method', 'POST', f'repos/{repo}/git/blobs', '--input', '-'], input=request))
+                          assert response['sha'] == sha, entry['path']
+                          exported.add(sha)
+                      print('EXPORTED', sha, entry['path'], flush=True)
+                  print('FEATURE_TREE_VERIFIED', index + 1, expected_trees[index], flush=True)
+          print('EXPORT_COMPLETE', len(exported), 'unique blobs; no branch refs changed', flush=True)
+          PY
