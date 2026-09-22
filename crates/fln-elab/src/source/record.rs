@@ -114,7 +114,13 @@ pub(super) fn elaborate_record_scoped(
     context.infer_level_params = true;
     let parameters = context.bind_parameters(&signature[0])?;
     let explicit = optional_type_syntax(&signature[1])?
-        .map(|s| context.term(s, None))
+        .map(|syntax| {
+            let term = context.term(syntax, None)?;
+            // Inspecting only the reduced Sort would discard invalid ascriptions
+            // or unused let initializers. Check the original type before any
+            // record-field locals enter the telescope. This publishes nothing.
+            inductive::checked_type(&mut context, term.value, budget)
+        })
         .transpose()?;
     let inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = inheritance.labels;
@@ -301,9 +307,8 @@ pub(super) fn elaborate_record_scoped(
         );
     }
     let result_level = match explicit {
-        Some(term) => {
-            let term = context.finish(term)?;
-            let sort = context.whnf(&term.value)?;
+        Some(value) => {
+            let sort = context.whnf(&value)?;
             let ExprNode::Sort { level } = sort.node() else {
                 return Err(failure(SourceInferenceError::ExpectedType));
             };

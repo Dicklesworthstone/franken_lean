@@ -22,7 +22,7 @@ fn invalid() -> NatDefinitionElabError {
 /// Reduction may discard source ascriptions and unused arguments. Check the
 /// unreduced type in its complete telescope first; this candidate is never
 /// published, and a non-answer retains its kernel outcome.
-fn checked_type(
+pub(super) fn checked_type(
     context: &mut Context,
     value: Expr,
     budget: RecordBudget,

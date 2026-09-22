@@ -122,3 +122,22 @@ proposition-valued single families, local dictionaries in constructor indices, a
 namespace-qualified mutual groups have executable source-checking regressions
 in `fln::source_section_inductives`. This does not expand the generator's supported
 recursion shapes or provide general mutual-function execution.
+
+
+### Original record annotations and end-to-end regressions
+
+Record result-sort annotations are kernel-checked before reduction, using the
+same nonpublishing type guard as inductive headers. Invalid ascriptions such as
+`(Type : Nat)` or an ill-typed unused let initializer cannot disappear into an
+accepted `Sort`. Kernel resource and internal nonanswers retain their original
+outcomes, and no temporary validation axiom enters the environment.
+
+`source_section_inductive_regressions` and `source_section_record_regressions`
+exercise the section-data consumers beyond declaration admission: structural
+recursion and induction, equality of checked worlds with explicitly parameterized
+controls, inherited default metadata, cold/warm module replay, invalidation and
+recovery, resource refusals, and native closure execution with independent FLBC
+replay. The installed CLI checks are `source_section_data`; the checked source
+examples are `native_section_inductives.lean` and `native_section_records.lean`.
+These checks do not add scope commands to the separate source execution parser
+or expand its representation of proof/value-dependent runtime fields.

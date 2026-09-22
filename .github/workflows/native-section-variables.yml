@@ -9,6 +9,11 @@ on:
       - 'crates/fln/src/**'
       - 'crates/fln/tests/source_section_variables.rs'
       - 'crates/fln/tests/source_section_records.rs'
+      - 'crates/fln/tests/source_section_inductive_regressions.rs'
+      - 'crates/fln/tests/source_section_record_regressions.rs'
+      - 'crates/fln-cli/tests/source_section_data.rs'
+      - 'examples/native_section_inductives.lean'
+      - 'examples/native_section_records.lean'
       - 'crates/fln/tests/source_section_inductives.rs'
   workflow_dispatch:
 permissions:
@@ -36,10 +41,11 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/section-verification/compiler.txt
           cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/section-verification/frontend.log
-          cargo test --locked -p fln --test source_section_variables --test source_section_records --test source_section_inductives --test source_inductive --test source_indexed --test source_mutual_inductives --test source_mutual_matching --test source_mutual_cases --test source_record_defaults --test source_inheritance --test source_scopes --test source_instances --test source_module_check --test source_module_session --no-fail-fast 2>&1 | tee target/section-verification/source.log
+          cargo test --locked -p fln --test source_section_variables --test source_section_records --test source_section_inductive_regressions --test source_section_record_regressions --test source_section_inductives --test source_inductive --test source_indexed --test source_mutual_inductives --test source_mutual_matching --test source_mutual_cases --test source_record_defaults --test source_inheritance --test source_scopes --test source_instances --test source_module_check --test source_module_session --no-fail-fast 2>&1 | tee target/section-verification/source.log
+          cargo test --locked -p fln-cli --test source_section_data 2>&1 | tee target/section-verification/cli.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/section-verification/check.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/section-verification/clippy.log
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/scope/variables.rs crates/fln-parse/src/command_scope/variables.rs crates/fln/tests/source_section_variables.rs crates/fln/tests/source_section_records.rs crates/fln/tests/source_section_inductives.rs
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/scope/variables.rs crates/fln-parse/src/command_scope/variables.rs crates/fln/tests/source_section_variables.rs crates/fln/tests/source_section_records.rs crates/fln/tests/source_section_inductives.rs crates/fln-elab/src/source/inductive.rs crates/fln-elab/src/source/record.rs crates/fln/tests/source_section_inductive_regressions.rs crates/fln/tests/source_section_record_regressions.rs crates/fln-cli/tests/source_section_data.rs
       - name: Retain validation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
