@@ -5,6 +5,7 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
 mod data_recursion;
+mod indexed;
 mod mutual;
 mod nat;
 mod projections;

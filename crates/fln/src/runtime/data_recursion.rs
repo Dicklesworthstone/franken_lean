@@ -122,7 +122,6 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if rec.is_unsafe
-            || rec.num_indices != 0
             || rec.num_motives != 1
             || rec.num_minors == 0
             || rec.all.len() != 1
@@ -133,6 +132,7 @@ impl Preparation<'_> {
                     .rules
                     .len()
                     .saturating_add(rec.num_params as usize)
+                    .saturating_add(rec.num_indices as usize)
                     .saturating_add(2)
         {
             return Ok(None);
@@ -140,25 +140,43 @@ impl Preparation<'_> {
         let Some(shape) = self.recursor_shape(rec, levels, args)? else {
             return Ok(None);
         };
-        if !shape.recursive || shape.constructors.len() != rec.rules.len() {
+        if (!shape.recursive && rec.num_indices == 0) || shape.constructors.len() != rec.rules.len()
+        {
             return Ok(None);
         }
         let family = shape.source.clone();
         let args = &args[rec.num_params as usize..];
-        let ExprNode::Lam {
-            binder_type,
-            body: motive,
-            ..
-        } = args[0].node()
+        let (family_head, family_parameters) = self.spine(&family)?;
+        let ExprNode::Const {
+            name: family_name,
+            levels: family_levels,
+        } = family_head.node()
         else {
             return Ok(None);
         };
-        if self.normalize_type(binder_type)? != family {
+        let Some(ConstantInfo::Induct(info)) = self.environment.find(family_name) else {
             return Ok(None);
+        };
+        let Some(mut domains) = self.index_domains(info, family_levels, &family_parameters)? else {
+            return Ok(None);
+        };
+        let Some(motive) = self.indexed_motive(&args[0], &domains, &family)? else {
+            return Ok(None);
+        };
+        let mut parameters = Vec::new();
+        for domain in &domains {
+            reserve(&mut parameters, self.limits.max_context_depth)?;
+            parameters.push(
+                self.value_type(domain)?
+                    .ok_or_else(|| unsupported("index representation"))?,
+            );
         }
-        let mut domains = vec![family.clone()];
-        let mut parameters = vec![ValueType::Constructor];
-        let mut result_type = motive;
+        reserve(&mut domains, self.limits.max_context_depth)?;
+        reserve(&mut parameters, self.limits.max_context_depth)?;
+        domains.push(family.clone());
+        parameters.push(ValueType::Constructor);
+        let first_extra = domains.len();
+        let mut result_type = &motive;
         loop {
             self.tick()?;
             match result_type.node() {
@@ -181,7 +199,7 @@ impl Preparation<'_> {
         let result = self
             .value_type(result_type)?
             .ok_or_else(|| unsupported("dependent recursive data result"))?;
-        let extra = parameters.len() - 1;
+        let extra = parameters.len() - first_extra;
         let depth = parameters.len().saturating_add(2); // self, runtime arguments, branch major
         if depth > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
@@ -200,7 +218,7 @@ impl Preparation<'_> {
             return Err(unsupported("runtime variant name collision"));
         }
         let mut hypothesis_type = result_type.clone();
-        for domain in domains[1..].iter().rev() {
+        for domain in domains[first_extra..].iter().rev() {
             self.tick()?;
             hypothesis_type = Expr::forall_e(
                 Name::anonymous(),
@@ -209,12 +227,16 @@ impl Preparation<'_> {
                 BinderInfo::Default,
             );
         }
-        let self_type = Expr::forall_e(
-            Name::anonymous(),
-            family.clone(),
-            hypothesis_type.clone(),
-            BinderInfo::Default,
-        );
+        let mut self_type = hypothesis_type.clone();
+        for domain in domains[..first_extra].iter().rev() {
+            self.tick()?;
+            self_type = Expr::forall_e(
+                Name::anonymous(),
+                domain.clone(),
+                self_type,
+                BinderInfo::Default,
+            );
+        }
         let major = variable(0)?;
         let mut branches = Vec::new();
         let mut constructors = Vec::new();
@@ -227,10 +249,21 @@ impl Preparation<'_> {
                 .lift_loose(0, lift)
                 .map_err(|_| unsupported("recursive data minor scope"))?;
             let mut hypotheses = Vec::new();
+            let mut logical_fields = self.indexed_constructor_telescope(&shape, ctor)?;
             for (field_index, field_type) in ctor.fields.iter().enumerate() {
                 self.tick()?;
                 let field = Expr::proj(shape.projection(ctor), field_index as u64, major.clone());
                 body = self.minor_apply(body, field.clone())?;
+                let logical = self.type_head(&logical_fields)?;
+                let ExprNode::ForallE {
+                    binder_type: logical_type,
+                    body: next_field,
+                    ..
+                } = logical.node()
+                else {
+                    return Err(unsupported("indexed constructor field telescope"));
+                };
+                logical_fields = self.substitution(next_field, &field)?;
                 if let Some(recursive) =
                     self.recursive_field(field_type, std::slice::from_ref(&family))?
                 {
@@ -240,12 +273,20 @@ impl Preparation<'_> {
                         field_index as u64,
                     ));
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;
-                    let (hypothesis, type_) = self.recursive_hypothesis(
-                        &recursive,
-                        variable(extra + 2)?,
-                        field,
-                        &hypothesis_type,
-                    )?;
+                    let mut callee = variable(parameters.len() + 1)?;
+                    if rec.num_indices != 0 {
+                        let indices = self.indexed_field_arguments(
+                            logical_type,
+                            &family,
+                            rec.num_indices as usize,
+                        )?;
+                        for index in indices {
+                            self.tick()?;
+                            callee = Expr::app(callee, index);
+                        }
+                    }
+                    let (hypothesis, type_) =
+                        self.recursive_hypothesis(&recursive, callee, field, &hypothesis_type)?;
                     hypotheses.push((marker, hypothesis, type_));
                 }
             }

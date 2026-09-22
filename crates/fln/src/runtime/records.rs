@@ -41,7 +41,7 @@ impl Shape {
 impl Preparation<'_> {
     pub(super) fn record_shape(&mut self, source: &Expr) -> Result<Option<Shape>, IngressError> {
         self.tick()?;
-        let source = self.normalize_type(source)?;
+        let source = self.erase_data_indices(source)?;
         if source.has_loose_bvars()
             || source.has_fvar()
             || source.has_expr_mvar()
@@ -63,7 +63,7 @@ impl Preparation<'_> {
         if family.is_unsafe
             || (family.is_reflexive && family.all.len() != 1)
             || family.num_params as usize != parameters.len()
-            || family.num_indices != 0
+            || (family.num_indices != 0 && family.all.len() != 1)
             || family.num_nested != 0
             || !family.all.contains(name)
             || family.ctors.is_empty()
@@ -89,9 +89,15 @@ impl Preparation<'_> {
             }
             family_type = self.substitution(body, parameter)?;
         }
-        let family_type = self.normalize_type(&family_type)?;
-        if !matches!(family_type.node(), ExprNode::Sort { level } if level.is_never_zero()) {
-            return Ok(None);
+        if family.num_indices != 0 {
+            if self.index_domains(family, levels, &parameters)?.is_none() {
+                return Ok(None);
+            }
+        } else {
+            let family_type = self.normalize_type(&family_type)?;
+            if !matches!(family_type.node(), ExprNode::Sort { level } if level.is_never_zero()) {
+                return Ok(None);
+            }
         }
         let specialized = !parameters.is_empty() || !levels.is_empty();
         let layout_name = if specialized {
@@ -209,7 +215,7 @@ impl Preparation<'_> {
         &mut self,
         source: &Expr,
     ) -> Result<Option<Vec<Shape>>, IngressError> {
-        let source = self.normalize_type(source)?;
+        let source = self.erase_data_indices(source)?;
         let (head, parameters) = self.spine(&source)?;
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
@@ -249,7 +255,7 @@ impl Preparation<'_> {
     /// record may contain closures whose arguments/results contain more data;
     /// alternating those types must not alternate recursive Rust calls.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
-        let source = self.normalize_type(source)?;
+        let source = self.erase_data_indices(source)?;
         if let Some((value, _)) = executable_value_type(&source, &self.value_types) {
             return Ok(Some(value));
         }
@@ -532,7 +538,6 @@ impl Preparation<'_> {
         if rec.is_unsafe
             || rec.all.len() != 1
             || rec.num_motives != 1
-            || rec.num_indices != 0
             || rec.base.level_params.len() != levels.len()
             || args.len() < rec.num_params as usize
         {
@@ -541,7 +546,10 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(family)) = self.environment.find(&rec.all[0]) else {
             return Ok(None);
         };
-        if rec.num_params != family.num_params || rec.num_minors as usize != family.ctors.len() {
+        if rec.num_params != family.num_params
+            || rec.num_indices != family.num_indices
+            || rec.num_minors as usize != family.ctors.len()
+        {
             return Ok(None);
         }
         let mut family_levels = Vec::new();

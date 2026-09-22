@@ -98,7 +98,7 @@ impl Preparation<'_> {
     /// retain their original syntax for monomorphization and layout discovery.
     pub(super) fn erase_runtime_type(&mut self, input: &Expr) -> Result<Expr, IngressError> {
         if !self.proof_erasure_available() {
-            return self.normalize_type(input);
+            return self.erase_data_indices(input);
         }
         self.erase_type_in(input, &[])
     }
@@ -144,7 +144,7 @@ impl Preparation<'_> {
                         work.push(Work::Visit(binder_type.clone()));
                     } else {
                         reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(self.normalize_type(&normal)?);
+                        values.push(self.erase_data_indices(&normal)?);
                     }
                 }
                 Work::Domain(name, original, body, info) => {
@@ -267,6 +267,16 @@ impl Preparation<'_> {
                             body,
                             non_dep: nondep,
                         } => {
+                            if self.type_parameter(type_)? {
+                                // Source matching retains type-valued let obligations
+                                // for both checkers. After admission they are static
+                                // type bindings, not executable callbacks. Substitute
+                                // capture-avoidantly before erasing runtime annotations.
+                                let body = self.substitution(body, value)?;
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(body, expected));
+                                continue;
+                            }
                             let runtime_type = self.erase_type_in(type_, &context)?;
                             reserve(&mut work, self.limits.max_nodes)?;
                             work.push(Frame::LetValue(

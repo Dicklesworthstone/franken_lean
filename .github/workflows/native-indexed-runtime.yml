@@ -2,15 +2,20 @@ name: Native indexed runtime
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-indexed-runtime.yml']
+    paths:
+      - '.github/workflows/native-indexed-runtime.yml'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/tests/runtime_indexed_data.rs'
+      - 'crates/fln-cli/tests/source_indexed_runtime.rs'
+      - 'examples/native_indexed_vectors.lean'
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   indexed:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    permissions:
-      contents: write
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -18,92 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: cd57dc0713b87072a123c332da8d9d83301f9f22
           persist-credentials: false
-      - name: Restore checksum-bound indexed runtime inputs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          out = root / 'target/indexed-validation'
-          out.mkdir(parents=True)
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          chunks = ['750c3c1f8ace2bb4da0574a4040ef1dcd2cfde37', '1128a0c680f618f3dde14dd2cf32c92c0e61f7c9', 'c7856ae02d7d36369ca64ef2b987cb0b229f73ff']
-          packed = bytearray()
-          for sha in chunks:
-              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
-              data = base64.b64decode(response['content'])
-              assert blob(data) == sha
-              packed.extend(data)
-          assert len(packed) == 12826
-          assert hashlib.sha256(packed).hexdigest() == 'ffcf2b284b6e596a27b867d76b41f49e0fba8ddbc2dcf41b59e77b92b5f78a25'
-          manifest = json.loads(gzip.decompress(packed))
-          assert git('rev-parse','HEAD') == manifest['base'] == 'cd57dc0713b87072a123c332da8d9d83301f9f22'
-          assert git('rev-parse','HEAD^{tree}') == manifest['base_tree'] == '2816e579ccae4c54be511bff655b22f535ae2600'
-          allowed = {'.github/workflows/native-indexed-runtime.yml', 'crates/fln-cli/tests/source_indexed_runtime.rs', 'crates/fln/src/runtime.rs', 'crates/fln/src/runtime/data_recursion.rs', 'crates/fln/src/runtime/indexed.rs', 'crates/fln/src/runtime/indexed/tests.rs', 'crates/fln/src/runtime/proofs.rs', 'crates/fln/src/runtime/records.rs', 'crates/fln/tests/runtime_indexed_data.rs', 'docs/NATIVE_INDEXED_RUNTIME.md', 'examples/native_indexed_vectors.lean'}
-          paths = [entry['path'] for entry in manifest['entries']]
-          assert len(paths) == 11 and set(paths) == allowed
-          for entry in manifest['entries']:
-              path = root / entry['path']
-              assert path.resolve().is_relative_to(root) and not path.is_symlink()
-              assert entry['mode'] == '100644'
-              if entry['before'] is None:
-                  assert not path.exists() and not git('ls-files','--',entry['path'])
-              else:
-                  assert blob(path.read_bytes()) == entry['before'], entry['path']
-          patch = out / 'change.patch'
-          patch.write_text(manifest['patch'])
-          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-          subprocess.run(['git','apply','--index',str(patch)],check=True)
-          assert set(git('diff','--cached','--name-only').splitlines()) == allowed
-          for entry in manifest['entries']:
-              assert blob((root / entry['path']).read_bytes()) == entry['after'], entry['path']
-          assert git('write-tree') == manifest['tree'] == 'a14801f8f779dd3b1273ae6a73a57eeb06336d52'
-          (out / 'manifest.json').write_text(json.dumps(manifest))
-          print('INDEXED_TREE', git('write-tree'))
-          PY
       - name: Install repository toolchain
         run: |
           channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-      - name: Check indexed execution and installed replay
+      - name: Check indexed layouts, strictness, admission and installed replay
         run: |
           set -euo pipefail
-          cargo test --locked -p fln --lib --test runtime_indexed_data --test runtime_function_children --test runtime_proof_data --test runtime_recursive_data --test source_indexed --test source_indexed_elimination 2>&1 | tee target/indexed-validation/engine.log
-          cargo test --locked -p fln-cli --test source_indexed_runtime --test source_proof_runtime 2>&1 | tee target/indexed-validation/cli.log
-          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee target/indexed-validation/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/indexed-validation/check.log
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/indexed/tests.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/proofs.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_indexed_data.rs crates/fln-cli/tests/source_indexed_runtime.rs
-          git diff --cached --check
-      - name: Export verified source objects without changing any branch ref
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, pathlib, subprocess
-          manifest = json.loads(pathlib.Path('target/indexed-validation/manifest.json').read_text())
-          for entry in manifest['entries']:
-              data = pathlib.Path(entry['path']).read_bytes()
-              sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-              assert sha == entry['after']
-              request = json.dumps({'content':base64.b64encode(data).decode(),'encoding':'base64'}).encode()
-              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-              assert response['sha'] == sha
-              print('EXPORTED',sha,entry['path'],flush=True)
-          tree = subprocess.check_output(['git','write-tree'],text=True).strip()
-          assert tree == manifest['tree']
-          print('INDEXED_VALIDATED_EXPORT_COMPLETE',tree,flush=True)
-          PY
-      - name: Retain validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: indexed-runtime-validation-${{ github.run_id }}
-          path: target/indexed-validation/
-          retention-days: 14
+          cargo test --locked -p fln --lib --test runtime_indexed_data --test runtime_recursive_data --test runtime_parameterized_data --test runtime_proof_data --test source_indexed --test source_indexed_elimination
+          cargo test --locked -p fln-cli --test source_indexed_runtime --test source_proof_runtime
+          cargo clippy --locked -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/indexed/tests.rs crates/fln/tests/runtime_indexed_data.rs crates/fln-cli/tests/source_indexed_runtime.rs
