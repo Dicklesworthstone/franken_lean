@@ -47,3 +47,100 @@ jobs:
           cargo test --locked -p fln-cli --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime
           cargo clippy --locked -p fln-comp -p fln-vm -p fln-elab -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
+  staged-callback-validation:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ec1f83867e7767b4e42467b941287bd6318a4f5f
+          persist-credentials: false
+      - name: Restore checksum-bound callback implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          def blob(d):
+              return hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()
+          def git(*args):
+              return subprocess.check_output(['git',*args],text=True).strip()
+          chunks = ['5b7ccf6ec620b386efabfe69b0aef5f58c0adf03','dcfdaf07219f65140e627edf32bcb8c24c72c771','4c122892944a3fc8a3f6fd2a84f80cc9658cec5f']
+          payload = bytearray()
+          for sha in chunks:
+              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
+              data = base64.b64decode(response['content'])
+              assert blob(data) == sha
+              payload.extend(data)
+          assert len(payload) == 7629
+          assert hashlib.sha256(payload).hexdigest() == '0057605539cb93b91aff24d04fbaef3fc10da56b301723491687a9493939984c'
+          manifest = json.loads(gzip.decompress(payload))
+          assert git('rev-parse','HEAD') == manifest['base'] == 'ec1f83867e7767b4e42467b941287bd6318a4f5f'
+          assert git('write-tree') == manifest['base_tree'] == 'c05567ee9a6fc28437a6c9ca13d13345024311fe'
+          allowed = {'.github/workflows/native-empty-runtime.yml','crates/fln-cli/tests/source_empty_runtime.rs','crates/fln/src/lib.rs','crates/fln/src/runtime.rs','crates/fln/src/runtime/callables.rs','crates/fln/src/runtime/records.rs','crates/fln/tests/runtime_impossible_patterns.rs','crates/fln/tests/runtime_staged_closures.rs','docs/NATIVE_EMPTY_ELIMINATION.md','examples/native_staged_callbacks.lean'}
+          assert len(manifest['entries']) == len(allowed)
+          assert {e['path'] for e in manifest['entries']} == allowed
+          for e in manifest['entries']:
+              path = root/e['path']
+              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
+              if e['before'] is None:
+                  assert not path.exists() and not git('ls-files','--',e['path'])
+              else:
+                  assert blob(path.read_bytes()) == e['before'], e['path']
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'staged-validation'
+          out.mkdir()
+          patch = out/'change.patch'
+          patch.write_text(manifest['patch'])
+          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
+          subprocess.run(['git','apply','--index',str(patch)],check=True)
+          assert git('write-tree') == manifest['tree'] == '9b6b648694821ae743b9941b3d323a9e0513e5e7'
+          for e in manifest['entries']:
+              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
+          (out/'manifest.json').write_text(json.dumps(manifest))
+          print('VALIDATION_TREE',git('write-tree'))
+          PY
+      - name: Validate staging, sharing, ownership and independent replay
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          tests=(); for f in crates/fln/tests/runtime_*.rs; do tests+=(--test "$(basename "$f" .rs)"); done
+          cargo test --locked -p fln --lib "${tests[@]}" --test source_module_check --test source_module_session --test engine_builder_facade 2>&1 | tee "$RUNNER_TEMP/staged-validation/engine.log"
+          cargo test --locked -p fln-cli --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime 2>&1 | tee "$RUNNER_TEMP/staged-validation/cli.log"
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/staged-validation/clippy.log"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/staged-validation/check.log"
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/lib.rs crates/fln/src/runtime.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_impossible_patterns.rs crates/fln/tests/runtime_staged_closures.rs crates/fln-cli/tests/source_empty_runtime.rs
+          git diff --check --cached
+      - name: Export checked file objects without moving branch refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'staged-validation'
+          manifest = json.loads((out/'manifest.json').read_text())
+          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
+          for e in manifest['entries']:
+              data = pathlib.Path(e['path']).read_bytes()
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['after']
+              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
+              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
+              assert response['sha'] == e['after']
+              print('EXPORTED',e['path'],e['after'],flush=True)
+          PY
+      - name: Retain exact validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: staged-callback-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/staged-validation
+          retention-days: 14
