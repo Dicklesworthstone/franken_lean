@@ -529,7 +529,7 @@ impl<'a> Preparation<'a> {
                                 nondep: *nondep,
                             });
                             tasks.push(Task::Visit(body.clone()));
-                            tasks.push(Task::Visit(value.clone()));
+                            tasks.push(Task::Visit(self.annotate_callable_tail(value, type_)?));
                         }
                         ExprNode::MData { expr, .. } => tasks.push(Task::Visit(expr.clone())),
                         ExprNode::Proj {

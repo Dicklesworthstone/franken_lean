@@ -129,6 +129,58 @@ impl Preparation<'_> {
         Ok(result)
     }
 
+    /// A real lambda spine may end before its Pi telescope: applying that
+    /// prefix computes a callback, rather than consuming all of its arguments.
+    /// Retain the suffix type inside the prefix, before visiting its body. A
+    /// strict let between stages must not be eta-expanded across the boundary.
+    pub(super) fn annotate_callable_tail(
+        &mut self,
+        value: &Expr,
+        type_: &Expr,
+    ) -> Result<Expr, IngressError> {
+        if !matches!(value.node(), ExprNode::Lam { .. }) {
+            return Ok(value.clone());
+        }
+        let mut body = value.clone();
+        let mut result_type = self.normalize_type(type_)?;
+        let mut binders = Vec::new();
+        while let (
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body: next_body,
+                binder_info,
+            },
+            ExprNode::ForallE {
+                binder_type: domain,
+                body: next_type,
+                ..
+            },
+        ) = (body.node(), result_type.node())
+        {
+            self.tick()?;
+            if self.normalize_type(binder_type)? != self.normalize_type(domain)? {
+                return Ok(value.clone());
+            }
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            body = next_body.clone();
+            result_type = next_type.clone();
+        }
+        if binders.is_empty() || !matches!(result_type.node(), ExprNode::ForallE { .. }) {
+            return Ok(value.clone());
+        }
+        let Some(result @ ValueType::Closure(_)) = self.value_type(&result_type)? else {
+            return Ok(value.clone());
+        };
+        body = self.typed_callable_result(body, result_type, result)?;
+        for (name, type_, info) in binders.into_iter().rev() {
+            self.tick()?;
+            body = Expr::lam(name, type_, body, info);
+        }
+        Ok(body)
+    }
+
     /// Register an interface after the shared data/function worklist has
     /// resolved all of its dependencies. Discovery never reenters itself.
     pub(super) fn register_function_type(

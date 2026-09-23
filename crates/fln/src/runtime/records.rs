@@ -517,6 +517,20 @@ impl Preparation<'_> {
                 }
             }
         }
+        // Register a local stage's callback suffix before deriving metadata.
+        // This does not change any global function's flat calling interface.
+        let mut result_type = &definition.base.type_;
+        let mut value = &definition.value;
+        while let (ExprNode::ForallE { body: result, .. }, ExprNode::Lam { body, .. }) =
+            (result_type.node(), value.node())
+        {
+            self.tick()?;
+            result_type = result;
+            value = body;
+        }
+        if !eta_expand && matches!(result_type.node(), ExprNode::ForallE { .. }) {
+            self.value_type(result_type)?;
+        }
         executable_signature(
             &definition,
             &self.value_types,

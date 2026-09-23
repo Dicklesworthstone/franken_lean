@@ -94,8 +94,24 @@ one-million-node preparation budget. The scope-transform preflight charges the
 subtrees the core actually visits rather than a product including unrelated
 closed proofs; see `NATIVE_DEPENDENT_PROGRAMS.md`. Genuine preparation exhaustion
 still refuses without publication and recovers with a sufficient caller budget.
-An escaping generated proof continuation that performs strict work and then
-returns another closure remains a flat-callable conversion refusal. This is
-covered by a valid-source/refused-runtime regression, not presented as executed
-callback support for ordinary omitted patterns. The explicit proof-constrained
-vector API above separately supports captured callback results.
+Escaping generated proof continuations can now perform strict work and return
+owned callbacks. Ordinary omitted-pattern vector heads therefore also support
+captured and multiargument callback payloads. Local lambda spines are registered
+at their real arity, with a represented function suffix returned as a closure;
+strict work is not eta-expanded across this local boundary. Typed annotations
+inside the prefix let the existing compiler independently check the returned
+lambda, captures, calls and ownership. The global flat-function ABI is unchanged.
+
+`examples/native_staged_callbacks.lean` combines a strict local factory with an
+ordinary nonempty-vector head and independent installed FLBC replay. Tests compare
+VM work for cheap/costly prefixes to verify that discarding the returned callback
+does not discard prefix computation, repeated invocations share it, and merely
+constructing the outer lambda does not run its body. Returned callbacks can be
+stored in records and collections after their prefix has completed.
+
+This does not coerce different closure ABIs. A recursively staged returned
+callback has a different interface from a flat multiargument callback; the
+compiler still rejects a mismatched return interface. General adaptation between
+these interfaces is outside this increment and is covered as a typed refusal,
+not as supported execution. Neither checker nor the compiler's exact lambda-spine,
+return-type, capture, argument or ownership checks were weakened.

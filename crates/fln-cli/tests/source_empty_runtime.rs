@@ -142,3 +142,45 @@ fn imported_impossible_patterns_reject_reachable_omissions_and_recover() {
     assert_eq!(before, std::fs::read(&recovered).unwrap());
     replay(&recovered);
 }
+
+#[test]
+fn staged_callbacks_escape_impossible_patterns_and_replay_independently() {
+    personalities_and_replay(include_str!(
+        "../../../examples/native_staged_callbacks.lean"
+    ));
+}
+
+#[test]
+fn imported_staged_callbacks_reject_invalid_types_and_recover_artifacts() {
+    let dir = directory();
+    let dependency = dir.join("Callbacks.lean");
+    let entry = dir.join("Main.lean");
+    let example = include_str!("../../../examples/native_staged_callbacks.lean");
+    let (definitions, expression) = example.split_once("#eval").unwrap();
+    std::fs::write(&dependency, definitions).unwrap();
+    std::fs::write(&entry, format!("import Callbacks\n#eval {expression}")).unwrap();
+    let artifact = dir.join("good.flbc");
+    let output = run(&entry, &artifact);
+    assert!(output.status.success(), "{output:?}");
+    replay(&artifact);
+    let before = std::fs::read(&artifact).unwrap();
+    for invalid in [
+        definitions.replace("let subtotal :=", "let subtotal : String :="),
+        format!("{definitions}\ndef invalid : Nat -> Nat := first 0 Vec.nil\n"),
+        format!("{definitions}\ndef invalid : False := by rfl\n"),
+    ] {
+        std::fs::write(&dependency, invalid).unwrap();
+        let failed = dir.join("failed.flbc");
+        let output = run(&entry, &failed);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(!failed.exists());
+        assert_eq!(before, std::fs::read(&artifact).unwrap());
+    }
+    std::fs::write(&dependency, definitions).unwrap();
+    let recovered = dir.join("recovered.flbc");
+    let output = run(&entry, &recovered);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(before, std::fs::read(&recovered).unwrap());
+    replay(&recovered);
+}

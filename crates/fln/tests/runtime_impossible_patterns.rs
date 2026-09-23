@@ -126,16 +126,13 @@ fn nonanswer_in_constructor_discrimination_keeps_the_input_and_recovers() {
 }
 
 #[test]
-fn escaping_proof_continuations_remain_an_explicit_closure_conversion_boundary() {
+fn escaping_proof_continuations_return_owned_callbacks_after_strict_work() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
     let definitions = format!(
         "{VEC}{HEAD}def use (offset : Nat) : Nat := let f := first 0 (Vec.cons 0 (fun (n : Nat) => n + offset) Vec.nil); f 2"
     );
-    // This is valid logical source. The generated same-constructor proof
-    // continuation performs strict work and returns a closure: the flat native
-    // callable interface cannot represent that escaping intermediate yet.
     base.check_source_files(
         &[definitions.as_bytes()],
         &options,
@@ -144,13 +141,6 @@ fn escaping_proof_continuations_remain_an_explicit_closure_conversion_boundary()
     .unwrap()
     .into_complete()
     .unwrap();
-    let source = format!("{definitions}\n#eval use 40");
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .unwrap_err();
-    assert!(
-        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. }
-        if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::UnknownLambda { .. })))
-    );
+    run(&format!("{definitions}\n#eval use 40"), "42");
     assert_eq!(base.logical_root(&options), root);
 }

@@ -89,12 +89,11 @@ pub use fln_env::constants::{
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
-pub use fln_env::modules::{CancellationProbe, ModuleEpoch, ModuleGraph, ModuleId};
 pub use fln_env::module_apply::{
-    AppliedExtensionRangeWitness, AppliedModulePayload, ExtensionPayload,
-    ModuleApplyCheckpoint, ModuleApplyPrepareError, ModuleApplyState,
-    ModuleApplyStateError, ModuleApplyTransactionId,
+    AppliedExtensionRangeWitness, AppliedModulePayload, ExtensionPayload, ModuleApplyCheckpoint,
+    ModuleApplyPrepareError, ModuleApplyState, ModuleApplyStateError, ModuleApplyTransactionId,
 };
+pub use fln_env::modules::{CancellationProbe, ModuleEpoch, ModuleGraph, ModuleId};
 pub use fln_env::pmap::CollisionBudget;
 pub use fln_hash::canon::CanonError as FlbcProductSidecarCodecError;
 use fln_hash::canon::{CanonWriter, Canonical};
@@ -5715,11 +5714,13 @@ struct ExecutableSignature {
 
 /// Bind one checked definition to the compiler's exact first-order runtime ABI.
 ///
-/// Pi binders and lambda binders must match structurally and in count. K1 has
-/// already proved the declaration well typed, but the runtime bridge accepts a
-/// deliberately narrower representation than definitional equality so it
-/// never invents an erasure rule. The returned body has its top-level lambdas
-/// removed, as required by [`FunctionBinding`].
+/// Every real lambda binder must match its Pi binder structurally. A local
+/// lambda may end its spine with a represented callback result: its strict body
+/// runs when that prefix is applied, not when the returned callback is called.
+/// Global definitions keep their existing flat ABI and eta-expansion policy.
+/// K1 has already proved the declaration well typed, but this bridge still
+/// requires exact runtime representations. The returned body has its real
+/// top-level lambdas removed, as required by [`FunctionBinding`].
 fn executable_signature(
     definition: &DefinitionVal,
     value_types: &ExecutableValueTypes,
@@ -5761,6 +5762,18 @@ fn executable_signature(
                     // Local-closure execution must not eta: it binds the
                     // source lambda spine, whose binder count would then
                     // disagree with the expanded signature.
+                    if !eta_expand
+                        && !parameters.is_empty()
+                        && matches!(
+                            executable_value_type(declared_type, value_types),
+                            Some((ValueType::Closure(_), _))
+                        )
+                    {
+                        // This is a real stage boundary, not missing lambdas.
+                        // FIR owns and returns the suffix closure. Do not move
+                        // the strict prefix body beneath invented binders.
+                        break;
+                    }
                     if eta_expand {
                         return eta_expand_signature(
                             body,
