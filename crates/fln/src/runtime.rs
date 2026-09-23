@@ -802,6 +802,7 @@ impl<'a> Preparation<'a> {
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
             constructor_cases: &self.variant_cases,
+            empty_cases: &[],
         }
     }
 }

@@ -39,8 +39,10 @@ use std::fmt;
 
 mod branch;
 mod constructor_case;
+mod empty_case;
 pub use branch::{BoolCaseBinding, CallableBindings};
 pub use constructor_case::ConstructorCaseBinding;
+pub use empty_case::EmptyCaseBinding;
 
 /// Explicit ceilings for the core-expression ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1178,8 +1180,14 @@ struct PreparedFunction<'a> {
     parameter_ownership: Vec<crate::flbc::ArgumentOwnership>,
     result: fir::ValueType,
     result_ownership: crate::flbc::CallableResultOwnership,
-    body: Option<&'a Expr>,
-    case_constructors: Option<Vec<fir::ConstructorId>>,
+    body: PreparedFunctionBody<'a>,
+}
+
+enum PreparedFunctionBody<'a> {
+    Expression(&'a Expr),
+    BoolCase,
+    ConstructorCase(Vec<fir::ConstructorId>),
+    EmptyCase,
 }
 
 struct PreparedLambda<'a> {
@@ -2465,6 +2473,7 @@ fn prepare_catalog<'a>(
         lambdas,
         bool_cases,
         constructor_cases,
+        empty_cases,
     } = callables;
     let constructor_count = scalar_constructors.len().saturating_add(constructors.len());
     charge_fir(
@@ -2476,6 +2485,7 @@ fn prepare_catalog<'a>(
         .len()
         .saturating_add(bool_cases.len())
         .saturating_add(constructor_cases.len())
+        .saturating_add(empty_cases.len())
         .saturating_add(1);
     charge_fir(
         fir::ValidationResource::Functions,
@@ -2560,8 +2570,7 @@ fn prepare_catalog<'a>(
             parameter_ownership: clone_argument_ownership(&binding.parameter_ownership)?,
             result: binding.result,
             result_ownership: binding.result_ownership,
-            body: Some(&binding.body),
-            case_constructors: None,
+            body: PreparedFunctionBody::Expression(&binding.body),
         });
     }
 
@@ -2571,6 +2580,16 @@ fn prepare_catalog<'a>(
         &mut catalog,
         constructor_cases,
         functions.len().saturating_add(bool_cases.len()),
+        limits,
+    )?;
+
+    empty_case::prepare(
+        &mut catalog,
+        empty_cases,
+        functions
+            .len()
+            .saturating_add(bool_cases.len())
+            .saturating_add(constructor_cases.len()),
         limits,
     )?;
 
@@ -4595,6 +4614,7 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
             lambdas,
             bool_cases: &[],
             constructor_cases: &[],
+            empty_cases: &[],
         },
         limits,
     )
@@ -4713,14 +4733,15 @@ pub fn lower_closed_expr_with_closure_interfaces<'a>(
         entry_body,
     )?);
     for function in &catalog.functions {
-        let Some(expression) = function.body else {
-            let (lowered, values) = if let Some(constructors) = &function.case_constructors {
-                (
+        let PreparedFunctionBody::Expression(expression) = &function.body else {
+            let (lowered, values) = match &function.body {
+                PreparedFunctionBody::ConstructorCase(constructors) => (
                     constructor_case::assemble(function, constructors, limits)?,
                     constructors.len().saturating_mul(2).saturating_add(1),
-                )
-            } else {
-                (branch::assemble(function)?, 2)
+                ),
+                PreparedFunctionBody::BoolCase => (branch::assemble(function)?, 2),
+                PreparedFunctionBody::EmptyCase => (empty_case::assemble(function, limits)?, 1),
+                PreparedFunctionBody::Expression(_) => unreachable!("handled expression body"),
             };
             work.generated_values = work.generated_values.saturating_add(values);
             charge_fir(

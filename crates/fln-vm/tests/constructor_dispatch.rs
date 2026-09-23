@@ -178,6 +178,7 @@ fn dispatch(
             functions: &[],
             lambdas: &lambdas,
             bool_cases: &[],
+            empty_cases: &[],
             constructor_cases: &[ingress::ConstructorCaseBinding {
                 name: name("cases"),
                 constructors: cases,
