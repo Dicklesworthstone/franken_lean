@@ -39,6 +39,6 @@ ABI parity. Representation-changing casts, opaque or noncanonical equality
 families, unresolved type parameters and unsupported carrier/result layouts are
 refused. Bare partially supplied recursor constants are not a new callable
 surface; ordinary checked wrapper functions and transported callbacks can be
-partially applied. Source elimination requiring proof of impossible branches may
-still need a separate runtime lowering for the empty eliminator. Neither checker
-nor logical environment semantics are changed.
+partially applied. Checked eliminations of supported empty families now execute in impossible
+branches; see `NATIVE_EMPTY_ELIMINATION.md`. General automatic proofs for omitted
+source branches are not added. Neither checker is changed.

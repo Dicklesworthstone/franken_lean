@@ -5,6 +5,7 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
 mod data_recursion;
+mod empty;
 mod indexed;
 mod mutual;
 mod nat;
@@ -26,6 +27,8 @@ pub(super) struct Preparation<'a> {
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
+    empty_cases: Vec<fln_comp::ingress::EmptyCaseBinding>,
+    false_family_checked: bool,
     next_variant: u64,
     next_mutual: u32,
     lambda_keys: HashSet<Expr>,
@@ -89,6 +92,8 @@ impl<'a> Preparation<'a> {
             lambdas: Vec::new(),
             cases: Vec::new(),
             variant_cases: Vec::new(),
+            empty_cases: Vec::new(),
+            false_family_checked: false,
             next_variant: 0,
             next_mutual: 0,
             lambda_keys: HashSet::new(),
@@ -303,6 +308,10 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(empty) = self.empty_recursor(&head, &args)? {
+                            tasks.push(Task::Visit(empty));
+                            continue;
+                        }
                         if let Some(transported) = self.equality_transport(&head, &args)? {
                             tasks.push(Task::Visit(transported));
                             continue;
@@ -802,7 +811,7 @@ impl<'a> Preparation<'a> {
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
             constructor_cases: &self.variant_cases,
-            empty_cases: &[],
+            empty_cases: &self.empty_cases,
         }
     }
 }

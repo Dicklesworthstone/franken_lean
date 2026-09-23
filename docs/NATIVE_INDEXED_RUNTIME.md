@@ -42,8 +42,9 @@ field representations remain unsupported. Scalar indices alone are not sufficien
 the full constructor layout must be representable. This is a native FIR profile,
 not Reference packed-ABI parity. Index-refining matches using canonical equality transports are supported when
 the erased source and target layouts agree; see `NATIVE_EQUALITY_TRANSPORT.md`.
-Elimination requiring impossible branches may still need an empty-eliminator
-runtime lowering.
+Checked eliminations of supported zero-constructor families can execute in
+impossible branches; see `NATIVE_EMPTY_ELIMINATION.md`. This does not add general
+source-pattern coverage or automatic proofs for omitted branches.
 
 Regression coverage includes invalid-length rejection, preserved logical roots,
 strict ordinary computation, shared recursive work, deterministic resource-stop

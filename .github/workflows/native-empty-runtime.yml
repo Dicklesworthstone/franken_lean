@@ -1,17 +1,26 @@
-name: Validate native empty runtime publication
+name: Native empty elimination
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-empty-runtime.yml']
+    paths:
+      - '.github/workflows/native-empty-runtime.yml'
+      - 'crates/fln-comp/src/ingress/**'
+      - 'crates/fln-comp/src/ingress.rs'
+      - 'crates/fln-elab/src/seed/**'
+      - 'crates/fln-elab/src/seed.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/tests/runtime_empty_elimination.rs'
+      - 'crates/fln-vm/tests/empty_elimination.rs'
+      - 'crates/fln-cli/tests/source_empty_runtime.rs'
+      - 'examples/native_empty_elimination.lean'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  validate:
+  empty:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
+    timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -19,121 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 549b62aa643635d8d78a004359854b1fa6f6f513
           persist-credentials: false
-      - name: Restore and bind the saved publication inputs
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install repository toolchain
         run: |
-          python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess
-          def blob(d):
-              return hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()
-          parts = ['f16e5cb2f082f742a46ddb251b3c3b8478c2093a','c49ae28d57988fc2c184f0506a03b4b546b15ad0','76a8b331ec5f1c8cd843f87a9c887d98ba4eb1df','e7aac71c944b83bf7dca2b9a6da3ec636a8a131a','333d8fb14d67ea5f253aac14c3d666fa2e179d92','4e3fa74e3f463059b7e733552c6aeb90c04d9023','a740aa7993ce9fa51593a4d953cc5bbd9c0db9fb']
-          payload = bytearray()
-          for i, sha in enumerate(parts):
-              row = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
-              data = base64.b64decode(row['content'])
-              assert blob(data) == sha
-              if i == 0:
-                  # Correct two known transport transcription errors. Bind the
-                  # complete canonical chunk and archive before decompression.
-                  text = base64.b64encode(data).decode()
-                  assert text.count('PZeBbDyI+qw') == text.count('Icu4JhXwe') == 1
-                  text = text.replace('PZeBbDyI+qw','PZeDYI+qw').replace('Icu4JhXwe','Icu4NhXwe').rstrip('=')
-                  data = base64.b64decode(text+'='*((-len(text))%4))
-                  assert len(data) == 7000 and blob(data) == '5c0c2dc281b87ebfba8c2b3fe4a42e7330d7351c'
-              payload.extend(data)
-          assert len(payload) == 24119
-          assert hashlib.sha256(payload).hexdigest() == 'f30a90c6ba6d69ddafc59b81a39f33fcbf192e7452fdd04d6ce2917212c0519b'
-          manifest = json.loads(gzip.decompress(payload))
-          assert manifest['base'] == '549b62aa643635d8d78a004359854b1fa6f6f513'
-          assert manifest['base_tree'] == '8299a85b5e389339085f87de5e8f719cda085c18'
-          assert len(manifest['stages']) == 3
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'empty-publication'
-          out.mkdir()
-          (out/'manifest.json').write_text(json.dumps(manifest))
-          PY
-      - name: Prepare guarded apply and object export helpers
-        run: |
-          cat > "$RUNNER_TEMP/empty-publication/stage.py" <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, sys
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'empty-publication'
-          manifest = json.loads((out/'manifest.json').read_text())
-          index = int(sys.argv[1]); mode = sys.argv[2]
-          assert index in range(3) and mode in ('apply','export')
-          stage = manifest['stages'][index]
-          root = pathlib.Path.cwd()
-          def git(*args):
-              return subprocess.check_output(['git',*args],text=True).strip()
-          def blob(d):
-              return hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()
-          for e in stage['entries']:
-              p = root/e['path']
-              assert p.resolve().is_relative_to(root) and not p.is_symlink()
-              assert e['mode'] == '100644'
-          if mode == 'apply':
-              previous = manifest['base_tree'] if index == 0 else manifest['stages'][index-1]['tree']
-              assert git('write-tree') == previous
-              for e in stage['entries']:
-                  p = root/e['path']
-                  if e['before'] is None:
-                      assert not p.exists() and not git('ls-files','--',e['path'])
-                  else:
-                      assert blob(p.read_bytes()) == e['before'], e['path']
-              patch = out/('stage-'+str(index)+'.patch')
-              patch.write_text(stage['patch'])
-              subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-              subprocess.run(['git','apply','--index',str(patch)],check=True)
-          assert git('write-tree') == stage['tree']
-          for e in stage['entries']:
-              data = (root/e['path']).read_bytes()
-              assert blob(data) == e['after'], e['path']
-              if mode == 'export':
-                  request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
-                  response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-                  assert response['sha'] == e['after']
-                  print('EXPORTED',index,e['path'],e['after'],flush=True)
-          print(mode.upper(),index,stage['tree'],flush=True)
-          PY
-          channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-      - name: Validate and export typed nonreturning compiler support
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check non-returning bytecode and source admission
         run: |
           set -euo pipefail
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 0 apply
-          cargo test --locked -p fln-comp -p fln-vm --lib --test empty_elimination --test constructor_dispatch 2>&1 | tee "$RUNNER_TEMP/empty-publication/compiler.log"
-          cargo clippy --locked -p fln-comp -p fln-vm --all-targets -- -D warnings
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 0 export
-      - name: Validate and export checked source empty elimination
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 1 apply
-          cargo test --locked -p fln --lib --test runtime_empty_elimination 2>&1 | tee "$RUNNER_TEMP/empty-publication/runtime.log"
-          cargo test --locked -p fln-cli --test source_empty_runtime 2>&1 | tee "$RUNNER_TEMP/empty-publication/cli-stage2.log"
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 1 export
-      - name: Validate and export natural impossible patterns
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 2 apply
-          cargo test --locked -p fln-elab 2>&1 | tee "$RUNNER_TEMP/empty-publication/elab.log"
-          tests=(); for f in crates/fln/tests/runtime_*.rs; do tests+=(--test "$(basename "$f" .rs)"); done
-          cargo test --locked -p fln --lib "${tests[@]}" --test source_module_check --test source_module_session --test engine_builder_facade 2>&1 | tee "$RUNNER_TEMP/empty-publication/engine.log"
-          cargo test --locked -p fln-cli --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime --test source_mutual_data 2>&1 | tee "$RUNNER_TEMP/empty-publication/cli.log"
-          cargo clippy --locked -p fln-comp -p fln-vm -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/empty-publication/clippy.log"
-          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/empty-publication/check.log"
-          git diff --check --cached
-          python3 -I "$RUNNER_TEMP/empty-publication/stage.py" 2 export
-      - name: Retain publication and validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: empty-runtime-publication-${{ github.run_id }}
-          path: ${{ runner.temp }}/empty-publication
-          retention-days: 14
+          cargo test --locked -p fln-comp -p fln-vm --lib --test empty_elimination --test constructor_dispatch --test closure_interfaces
+          cargo test --locked -p fln-elab
+          cargo test --locked -p fln --lib --test runtime_empty_elimination --test runtime_indexed_data --test runtime_equality_transport --test runtime_proof_data --test runtime_recursive_data --test runtime_mutual_recursion
+          cargo test --locked -p fln-cli --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime
+          cargo clippy --locked -p fln-comp -p fln-vm -p fln-elab -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

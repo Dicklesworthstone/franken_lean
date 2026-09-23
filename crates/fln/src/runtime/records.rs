@@ -66,7 +66,6 @@ impl Preparation<'_> {
             || (family.num_indices != 0 && family.all.len() != 1)
             || family.num_nested != 0
             || !family.all.contains(name)
-            || family.ctors.is_empty()
             || family.base.level_params.len() != levels.len()
         {
             return Ok(None);

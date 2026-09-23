@@ -30,6 +30,8 @@
 mod collections;
 mod decidable;
 mod logic;
+mod logic_support;
+pub use decidable::false_declaration as false_seed_declaration;
 pub use decidable_eq::equality_decision_seed_declarations;
 pub use decidable_generic::generic_equality_decision_seed_declarations;
 pub use logic::propext_seed_declaration;
@@ -667,7 +669,8 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// frontend. Order is part of the deterministic seed contract: scalar types
 /// precede intrinsic signatures, and collection families precede their checked
 /// operation bodies. This is not a complete Prelude ingestion path.
-pub fn source_seed_declarations() -> [Declaration; 89] {
+pub fn source_seed_declarations() -> [Declaration; 91] {
+    let [false_elim, ne] = logic_support::logical_support_seed_declarations();
     let [
         and,
         and_left,
@@ -747,6 +750,8 @@ pub fn source_seed_declarations() -> [Declaration; 89] {
         decidable::false_declaration(),
         decidable::true_declaration(),
         decidable::not_declaration(),
+        false_elim,
+        ne,
         decidable::decidable_declaration(),
         decidable::conditional_declaration(false),
         decidable::conditional_declaration(true),
@@ -892,11 +897,15 @@ mod tests {
         assert_eq!(declarations[24], string_dec_eq_seed_declaration());
         assert_eq!(declarations[25], eq_seed_declaration());
         assert_eq!(declarations[26], rfl_seed_declaration());
-        assert_eq!(declarations[51], out_param_seed_declaration());
-        assert_eq!(declarations[52], semi_out_param_seed_declaration());
-        assert_eq!(declarations[71], quotient_seed_declaration());
-        assert_eq!(declarations[72], quotient_sound_seed_declaration());
-        assert_eq!(declarations[73], propext_seed_declaration());
+        let [false_elim, ne] = logic_support::logical_support_seed_declarations();
+        assert_eq!(declarations[43], false_elim);
+        assert_eq!(declarations[44], ne);
+        assert_eq!(declarations[45], decidable::decidable_declaration());
+        assert_eq!(declarations[53], out_param_seed_declaration());
+        assert_eq!(declarations[54], semi_out_param_seed_declaration());
+        assert_eq!(declarations[73], quotient_seed_declaration());
+        assert_eq!(declarations[74], quotient_sound_seed_declaration());
+        assert_eq!(declarations[75], propext_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"

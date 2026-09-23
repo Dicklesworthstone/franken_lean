@@ -268,6 +268,9 @@ impl Preparation<'_> {
         for case in &mut self.variant_cases {
             case.result = remap_type(case.result, &ranks)?;
         }
+        for case in &mut self.empty_cases {
+            case.result = remap_type(case.result, &ranks)?;
+        }
         self.interfaces
             .iter()
             .map(|signature| remap_signature(signature, &ranks))
