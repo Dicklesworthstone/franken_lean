@@ -10,6 +10,9 @@ on:
       - 'crates/fln/tests/runtime_impossible_patterns.rs'
       - 'crates/fln-cli/tests/source_dependent_programs.rs'
       - 'examples/native_dependent_vector_pipeline.lean'
+      - 'crates/fln/tests/runtime_indexed_function_children.rs'
+      - 'crates/fln-cli/tests/source_indexed_function_children.rs'
+      - 'examples/native_indexed_function_children.lean'
   workflow_dispatch:
 permissions:
   contents: read
@@ -33,7 +36,7 @@ jobs:
       - name: Check scope bounds, dependent pipelines and installed replay
         run: |
           set -euo pipefail
-          cargo test --locked -p fln --lib --test runtime_dependent_programs --test runtime_impossible_patterns --test runtime_indexed_data --test runtime_equality_transport --test runtime_empty_elimination --test runtime_proof_data
-          cargo test --locked -p fln-cli --test source_dependent_programs --test source_empty_runtime --test source_indexed_runtime
+          cargo test --locked -p fln --lib --test runtime_dependent_programs --test runtime_indexed_function_children --test runtime_impossible_patterns --test runtime_indexed_data --test runtime_equality_transport --test runtime_empty_elimination --test runtime_proof_data
+          cargo test --locked -p fln-cli --test source_dependent_programs --test source_indexed_function_children --test source_empty_runtime --test source_indexed_runtime
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets

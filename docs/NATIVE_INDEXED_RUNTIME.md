@@ -37,8 +37,9 @@ as a logical declaration.
 ## Boundaries
 
 Type-indexed GADTs, index domains depending on prior indices, mutually indexed
-families, indexed function-valued recursive children and genuinely value-dependent
-field representations remain unsupported. Scalar indices alone are not sufficient:
+families and genuinely value-dependent field representations remain unsupported.
+Function-valued indexed children are supported when their argument representations
+are nondependent; see `NATIVE_INDEXED_FUNCTION_CHILDREN.md`. Scalar indices alone are not sufficient:
 the full constructor layout must be representable. This is a native FIR profile,
 not Reference packed-ABI parity. Index-refining matches using canonical equality transports are supported when
 the erased source and target layouts agree; see `NATIVE_EQUALITY_TRANSPORT.md`.

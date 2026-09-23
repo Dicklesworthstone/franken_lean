@@ -65,8 +65,14 @@ impl Preparation<'_> {
         callee: Expr,
         field: Expr,
         result_type: &Expr,
+        indices: &[Expr],
     ) -> Result<(Expr, Expr), IngressError> {
         if recursive.binders.is_empty() {
+            let mut callee = callee;
+            for index in indices {
+                self.tick()?;
+                callee = Expr::app(callee, index.clone());
+            }
             return Ok((Expr::app(callee, field), result_type.clone()));
         }
         let mut binders = recursive.binders.clone();
@@ -98,7 +104,18 @@ impl Preparation<'_> {
             self.tick()?;
             child = Expr::app(child, variable(argument)?);
         }
-        let mut body = Expr::app(self.lift(&callee, depth)?, child);
+        let mut body = self.lift(&callee, depth)?;
+        // These indices are scoped inside the child argument telescope. The
+        // accumulator binders are inserted after it, so lift by only `extra`,
+        // not by the entire generated closure depth. Prior constructor fields
+        // and callback arguments remain ordinary runtime values.
+        let extra_depth =
+            u32::try_from(extra).map_err(|_| unsupported("child accumulator arity"))?;
+        for index in indices {
+            self.tick()?;
+            body = Expr::app(body, self.lift(index, extra_depth)?);
+        }
+        let mut body = Expr::app(body, child);
         for argument in (0..extra).rev() {
             self.tick()?;
             body = Expr::app(body, variable(argument)?);
@@ -110,6 +127,36 @@ impl Preparation<'_> {
             type_ = Expr::forall_e(name.clone(), domain.clone(), type_, *info);
         }
         Ok((body, type_))
+    }
+
+    /// Recover the actual child indices under its checked function telescope.
+    /// Do not substitute dummy arguments or evaluate a child to infer its type.
+    /// Indices stay under these binders until the generated IH is called.
+    fn indexed_recursive_field_arguments(
+        &mut self,
+        recursive: &RecursiveField,
+        type_: &Expr,
+        family: &Expr,
+        count: usize,
+    ) -> Result<Vec<Expr>, IngressError> {
+        let mut result = type_.clone();
+        for (_, domain, _) in &recursive.binders {
+            self.tick()?;
+            let normal = self.type_head(&result)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Err(unsupported("indexed child argument telescope"));
+            };
+            if self.erase_runtime_type(binder_type)? != *domain {
+                return Err(unsupported(
+                    "dependent indexed child argument representation",
+                ));
+            }
+            result = body.clone();
+        }
+        self.indexed_field_arguments(&result, family, count)
     }
 
     pub(super) fn data_recursion(
@@ -273,20 +320,24 @@ impl Preparation<'_> {
                         field_index as u64,
                     ));
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;
-                    let mut callee = variable(parameters.len() + 1)?;
-                    if rec.num_indices != 0 {
-                        let indices = self.indexed_field_arguments(
+                    let callee = variable(parameters.len() + 1)?;
+                    let indices = if rec.num_indices == 0 {
+                        Vec::new()
+                    } else {
+                        self.indexed_recursive_field_arguments(
+                            &recursive,
                             logical_type,
                             &family,
                             rec.num_indices as usize,
-                        )?;
-                        for index in indices {
-                            self.tick()?;
-                            callee = Expr::app(callee, index);
-                        }
-                    }
-                    let (hypothesis, type_) =
-                        self.recursive_hypothesis(&recursive, callee, field, &hypothesis_type)?;
+                        )?
+                    };
+                    let (hypothesis, type_) = self.recursive_hypothesis(
+                        &recursive,
+                        callee,
+                        field,
+                        &hypothesis_type,
+                        &indices,
+                    )?;
                     hypotheses.push((marker, hypothesis, type_));
                 }
             }
@@ -347,3 +398,6 @@ impl Preparation<'_> {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;
