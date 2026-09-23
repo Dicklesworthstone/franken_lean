@@ -125,8 +125,9 @@ The regression targets are `runtime_function_children` in `fln`, the layout
 discovery unit tests, and `source_mutual_data` in `fln-cli`. The installed tests
 also run serialized FLBC in a new process without the source environment.
 
-Value-dependent field representations, nested recursive containers, and mutually
-recursive function fields remain outside this increment. Proof erasure now uses
+Value-dependent field representations and nested recursive containers remain
+outside this increment. Mutually recursive function fields are now supported in
+the uniform-layout profile in `NATIVE_MUTUAL_FUNCTION_CHILDREN.md`. Proof erasure uses
 the post-admission path in `NATIVE_PROOF_ERASURE.md`. Single-family scalar-indexed
 function children are described in `NATIVE_INDEXED_FUNCTION_CHILDREN.md`. Inline lambda arguments to dynamic callback calls retain
 the existing runtime limitation; explicitly bound local callbacks are supported.

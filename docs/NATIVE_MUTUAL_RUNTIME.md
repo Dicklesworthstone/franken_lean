@@ -57,7 +57,8 @@ that are independent of runtime values after proof and scalar-index erasure.
 Mutually indexed families now execute through the same peer-closure machinery;
 see `NATIVE_MUTUAL_INDEXED_RUNTIME.md` for their per-member index telescopes and
 supported dependent motives. Checked proof fields keep their inert slots.
-Function-valued mutual recursive children, nested recursive type constructors,
+Function-valued mutual recursive children execute through checked peer callbacks;
+see `NATIVE_MUTUAL_FUNCTION_CHILDREN.md`. Nested recursive type constructors
 and representation-dependent fields/motives remain unsupported. Source-level
 mutually recursive `def` groups are not added: full folds use the already checked
 primitive mutual recursors. Unsupported layouts and incompatible callable

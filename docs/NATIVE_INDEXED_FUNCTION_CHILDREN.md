@@ -43,7 +43,7 @@ Both original admission engines check the complete source first. Invalid child
 indices, nonpositive fields and nondecreasing recursion still fail without
 publication. Resource exhaustion retains the logical input; a successful retry
 produces byte-identical artifacts. Mutually indexed families with direct recursive
-fields are supported separately (`NATIVE_MUTUAL_INDEXED_RUNTIME.md`); function-valued
-mutual recursive children, type-indexed GADTs, dependent callback argument
+fields are supported separately (`NATIVE_MUTUAL_INDEXED_RUNTIME.md`), as are
+function-valued mutual children (`NATIVE_MUTUAL_FUNCTION_CHILDREN.md`). Type-indexed GADTs, dependent callback argument
 representations, and value-dependent runtime layouts remain unsupported. Neither checker, the logical constructor or
 recursor metadata, nor the runtime representation-equality guard is weakened.

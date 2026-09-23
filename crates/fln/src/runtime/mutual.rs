@@ -160,6 +160,11 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let shape = &group.shapes[group.selected];
+        let families: Vec<_> = group
+            .shapes
+            .iter()
+            .map(|shape| shape.source.clone())
+            .collect();
         let Some(motive) = self.indexed_motive(
             &args[rec.num_params as usize + group.selected],
             &group.indices[group.selected],
@@ -193,7 +198,7 @@ impl Preparation<'_> {
                     body,
                     Expr::proj(shape.projection(ctor), field as u64, major.clone()),
                 )?;
-                if group.shapes.iter().any(|shape| &shape.source == type_) {
+                if self.recursive_field(type_, &families)?.is_some() {
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;
                     hypotheses.push(FVarId(Name::num(case_name.clone(), field as u64)));
                 }

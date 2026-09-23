@@ -73,3 +73,56 @@ fn inconsistent_recursor_index_metadata_is_not_a_new_admission_path() {
     assert!(prep.mutual_group(&bad, &levels, &args).unwrap().is_none());
     assert!(prep.constructors.is_empty());
 }
+
+#[test]
+fn function_child_discovery_rolls_back_every_peer_on_interface_exhaustion() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let env = Engine::with_source_seed(limits).unwrap().into_complete().unwrap()
+        .check_source_files(&[b"mutual\ninductive T : Nat -> Type where | leaf (n : Nat) : T n | node (f : (i : Nat) -> F i) : T 0\ninductive F : Nat -> Type where | node (f : (i : Nat) -> T i) : F 0\nend"],
+            &KVMap::new(), SourceCheckLimits::new(limits))
+        .unwrap().into_complete().unwrap().engine.environment().clone();
+    let source = Expr::app(Expr::const_(name("T"), vec![]), nat::literal(0));
+    let mut bounded = IngressLimits::default();
+    bounded.fir.max_closure_types = 0;
+    let mut prep = Preparation::new(&env, bounded);
+    assert!(matches!(
+        prep.value_type(&source),
+        Err(IngressError::ResourceLimit { .. })
+    ));
+    assert!(prep.value_types.records.is_empty());
+    assert!(prep.value_types.closures.is_empty());
+    assert!(prep.interfaces.is_empty());
+    assert!(prep.constructors.is_empty());
+    // Descriptive shape caches are not executable anchors. Reusing them on a
+    // retry must produce exactly the same bindings as clean discovery.
+    prep.limits = IngressLimits::default();
+    assert_eq!(
+        prep.value_type(&source).unwrap(),
+        Some(ValueType::Constructor)
+    );
+    let mut clean = Preparation::new(&env, IngressLimits::default());
+    assert_eq!(
+        clean.value_type(&source).unwrap(),
+        Some(ValueType::Constructor)
+    );
+    assert_eq!(prep.constructors, clean.constructors);
+    assert_eq!(prep.interfaces, clean.interfaces);
+}
+
+#[test]
+fn polymorphic_child_argument_layouts_remain_a_precise_refusal() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let env = Engine::with_source_seed(limits).unwrap().into_complete().unwrap()
+        .check_source_files(&[b"mutual\ninductive T : Type 1 where | node (f : (A : Type) -> A -> F)\ninductive F : Type 1 where | leaf | node (t : T)\nend"],
+            &KVMap::new(), SourceCheckLimits::new(limits))
+        .unwrap().into_complete().unwrap().engine.environment().clone();
+    let mut prep = Preparation::new(&env, IngressLimits::default());
+    assert_eq!(
+        prep.value_type(&Expr::const_(name("T"), vec![])).unwrap(),
+        None
+    );
+    assert!(prep.value_types.records.is_empty());
+    assert!(prep.value_types.closures.is_empty());
+    assert!(prep.interfaces.is_empty());
+    assert!(prep.constructors.is_empty());
+}

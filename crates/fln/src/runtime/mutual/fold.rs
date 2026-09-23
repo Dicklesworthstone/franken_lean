@@ -131,6 +131,11 @@ impl Preparation<'_> {
             u64::from(id),
         );
         let mut members = Vec::new();
+        let families: Vec<_> = group
+            .shapes
+            .iter()
+            .map(|shape| shape.source.clone())
+            .collect();
         let mut minor_index = rec.num_params as usize + motives.len();
         for (index, (shape, motive)) in group.shapes.iter().zip(&motives).enumerate() {
             self.tick()?;
@@ -177,29 +182,36 @@ impl Preparation<'_> {
                         return Err(unsupported("mutual constructor field telescope"));
                     };
                     logical_fields = self.substitution(next_field, &field)?;
-                    if let Some(target) = group
-                        .shapes
-                        .iter()
-                        .position(|peer| &peer.source == field_type)
-                    {
+                    if let Some(recursive) = self.recursive_field(field_type, &families)? {
+                        let target = recursive.target;
                         let marker = FVarId(Name::num(
                             Name::num(case_name.clone(), constructor_index as u64),
                             field_index as u64,
                         ));
-                        let mut peer = variable(motives.len() + motive.parameters.len() - target)?;
+                        let peer = variable(motives.len() + motive.parameters.len() - target)?;
                         // The child belongs to its own sibling's index space.
                         // Reconstruct its real indices from admitted field
                         // types with preceding fields rebound to projections.
-                        for arg in self.indexed_field_arguments(
+                        let indices = self.indexed_recursive_field_arguments(
+                            &recursive,
                             logical_type,
                             &group.shapes[target].source,
                             group.indices[target].len(),
-                        )? {
-                            self.tick()?;
-                            peer = Expr::app(peer, arg);
-                        }
+                        )?;
+                        // A function-valued child supplies a function-valued
+                        // IH. Capture the peer and prior fields, but defer
+                        // child selection and its indices until invocation.
+                        // The target's accumulator interface need not match
+                        // the current member's interface.
+                        let (hypothesis, type_) = self.recursive_hypothesis(
+                            &recursive,
+                            peer,
+                            field,
+                            &motives[target].hypothesis_type,
+                            &indices,
+                        )?;
                         reserve(&mut hypotheses, self.limits.max_context_depth)?;
-                        hypotheses.push((marker, Expr::app(peer, field), target));
+                        hypotheses.push((marker, hypothesis, type_));
                     }
                 }
                 for (marker, _, _) in &hypotheses {
@@ -211,20 +223,14 @@ impl Preparation<'_> {
                 // A sibling may have a different result or accumulator
                 // telescope. Use its interface, and share only the IHs that
                 // survive beta reduction of the checked minor premise.
-                for (marker, hypothesis, target) in hypotheses.into_iter().rev() {
+                for (marker, hypothesis, type_) in hypotheses.into_iter().rev() {
                     self.tick()?;
                     let abstracted = body
                         .lift_loose(0, 1)
                         .and_then(|lifted| lifted.abstract_fvar(&marker, 0))
                         .map_err(|_| unsupported("mutual hypothesis scope"))?;
                     if abstracted.has_loose_bvar(0) {
-                        body = Expr::let_e(
-                            marker.0,
-                            motives[target].hypothesis_type.clone(),
-                            hypothesis,
-                            abstracted,
-                            false,
-                        );
+                        body = Expr::let_e(marker.0, type_, hypothesis, abstracted, false);
                     }
                 }
                 let body =

@@ -143,15 +143,22 @@ fn stopped_mutual_layouts_do_not_publish_and_retries_are_identical() {
     );
 }
 #[test]
-fn unsupported_sibling_layouts_and_false_source_never_gain_runtime_authority() {
+fn uniform_sibling_callback_layouts_execute_but_false_source_never_gains_authority() {
     {
         let source = "mutual\ninductive A where | mk (f : Nat -> B)\ninductive B where | nil | cons (a : A)\nend\ndef ignore (b : B) : Nat := 42\n#eval ignore B.nil";
         let base = engine();
         let root = base.logical_root(&KVMap::new());
-        assert!(
-            base.execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
-                .is_err(),
-            "{source}"
+        let batch = base
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let VmExit::Returned(value) = &batch.executions.last().unwrap().exit else {
+            panic!("native return")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42")
         );
         assert_eq!(root, base.logical_root(&KVMap::new()));
     }

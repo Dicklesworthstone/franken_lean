@@ -62,8 +62,9 @@ refusal rather than claiming that shape executes.
 ## Boundaries and validation
 
 Type-indexed GADTs, dependent index domains, genuinely value-dependent layouts,
-function-valued mutual recursive children and mutually defined empty groups
-remain unsupported. This change does not add mutually recursive source `def`
+and mutually defined empty groups remain unsupported. Function-valued mutual
+children now execute in the uniform-layout profile described in
+`NATIVE_MUTUAL_FUNCTION_CHILDREN.md`. This does not add mutually recursive source `def`
 syntax, Reference packed-ABI compatibility, or a new logical admission path.
 
 Regressions additionally cover inconsistent recursor metadata, group layout

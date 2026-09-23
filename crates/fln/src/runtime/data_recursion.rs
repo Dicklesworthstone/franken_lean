@@ -132,7 +132,7 @@ impl Preparation<'_> {
     /// Recover the actual child indices under its checked function telescope.
     /// Do not substitute dummy arguments or evaluate a child to infer its type.
     /// Indices stay under these binders until the generated IH is called.
-    fn indexed_recursive_field_arguments(
+    pub(super) fn indexed_recursive_field_arguments(
         &mut self,
         recursive: &RecursiveField,
         type_: &Expr,

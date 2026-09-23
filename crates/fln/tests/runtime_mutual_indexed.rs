@@ -320,12 +320,12 @@ fn group_resource_stops_recover_identical_artifacts_and_logical_roots() {
 }
 
 #[test]
-fn changing_runtime_layouts_and_higher_order_mutual_fields_are_still_refused() {
+fn changing_runtime_layouts_are_still_refused() {
     let base = engine();
     let options = KVMap::new();
     for source in [
         "mutual\ninductive A : Type -> Type 1 where | leaf (T : Type) (value : T) : A T | node (T : Type) (b : B T) : A T\ninductive B : Type -> Type 1 where | node (T : Type) (a : A T) : B T\nend\ndef read (x : A Nat) : Nat := match x with | .leaf T value => 42 | .node T b => 42\n#eval read (A.leaf Nat 42)",
-        "mutual\ninductive A : Nat -> Type where | leaf (n : Nat) : A n | node (f : (n : Nat) -> B n) : A 0\ninductive B : Nat -> Type where | node (n : Nat) (a : A n) : B n\nend\ndef ignore (x : A 0) : Nat := 42\n#eval ignore (A.node (fun n => B.node n (A.leaf n)))",
+        "mutual\ninductive A : Type 1 where | node (f : (T : Type) -> T -> B)\ninductive B : Type 1 where | leaf | node (a : A)\nend\ndef ignore (a : A) : Nat := 42\n#eval ignore (A.node (fun T v => B.leaf))",
     ] {
         // Refusal must be in preparation, not a vacuous parser/kernel failure.
         let checked = base.check_source_files(
@@ -342,6 +342,14 @@ fn changing_runtime_layouts_and_higher_order_mutual_fields_are_still_refused() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn formerly_refused_mutual_function_fields_have_uniform_layouts() {
+    run(
+        "mutual\ninductive A : Nat -> Type where | leaf (n : Nat) : A n | node (f : (n : Nat) -> B n) : A 0\ninductive B : Nat -> Type where | node (n : Nat) (a : A n) : B n\nend\ndef ignore (x : A 0) : Nat := 42\n#eval ignore (A.node (fun n => B.node n (A.leaf n)))",
+        "42",
+    );
 }
 
 #[test]

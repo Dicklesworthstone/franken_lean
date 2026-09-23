@@ -1,9 +1,9 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
 //! Closed type parameters are specialized, never stored as runtime fields.
-//! Direct self- and mutually recursive fields and nondependent function-valued
-//! self children are supported. Proof fields keep inert scalar slots; other
-//! value-dependent fields and function-valued mutual children remain refusals.
+//! Direct and function-valued self- and mutually recursive fields are supported.
+//! Proof fields keep inert scalar slots; other value-dependent fields remain
+//! refusals unless their checked indices erase to a uniform representation.
 //! Nondependent function fields are owned closures with checked interfaces.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
@@ -61,7 +61,6 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if family.is_unsafe
-            || (family.is_reflexive && family.all.len() != 1)
             || family.num_params as usize != parameters.len()
             || family.num_nested != 0
             || !family.all.contains(name)
