@@ -89,10 +89,11 @@ impossible, and invalid applications never produce an executable artifact.
 Engine and installed-command regressions cover scalar, String and object heads,
 large literal index clashes, imports, independent replay and failure recovery.
 
-Two remaining restrictions are recorded explicitly. Nested dependent tail/head
-composition currently exceeds the default one-million-node preparation budget;
-its test requires a caller-supplied ten-million-node budget and also checks that
-the default resource stop publishes nothing. The product default is unchanged.
+Nested dependent tail/head composition now executes with the unchanged default
+one-million-node preparation budget. The scope-transform preflight charges the
+subtrees the core actually visits rather than a product including unrelated
+closed proofs; see `NATIVE_DEPENDENT_PROGRAMS.md`. Genuine preparation exhaustion
+still refuses without publication and recovers with a sufficient caller budget.
 An escaping generated proof continuation that performs strict work and then
 returns another closure remains a flat-callable conversion refusal. This is
 covered by a valid-source/refused-runtime regression, not presented as executed

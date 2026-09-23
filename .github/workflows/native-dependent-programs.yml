@@ -1,0 +1,39 @@
+name: Native dependent program composition
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-dependent-programs.yml'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/tests/runtime_dependent_programs.rs'
+      - 'crates/fln/tests/runtime_impossible_patterns.rs'
+      - 'crates/fln-cli/tests/source_dependent_programs.rs'
+      - 'examples/native_dependent_vector_pipeline.lean'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependent:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install repository toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+      - name: Check scope bounds, dependent pipelines and installed replay
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test runtime_dependent_programs --test runtime_impossible_patterns --test runtime_indexed_data --test runtime_equality_transport --test runtime_empty_elimination --test runtime_proof_data
+          cargo test --locked -p fln-cli --test source_dependent_programs --test source_empty_runtime --test source_indexed_runtime
+          cargo clippy --locked -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

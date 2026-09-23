@@ -4,6 +4,8 @@
 //! permitted only for closed constructor values with inert fields, and runtime
 //! beta reduction introduces strict lets: it never duplicates or drops an
 //! action. Both the original theorem checking and FIR validation remain intact.
+mod scope;
+
 use super::*;
 use fln_core::level::Level;
 use fln_env::constants::DefinitionSafety;
@@ -75,65 +77,13 @@ impl Preparation<'_> {
             levels,
         )
     }
-    // Bound the input envelope before the core's nonrecursive substitution and
-    // lifting operations. A deep DAG cannot turn one compile step into free work.
-    fn presentations(&mut self, expr: &Expr) -> Result<usize, IngressError> {
-        let mut work = vec![expr];
-        let mut count = 0usize;
-        while let Some(expr) = work.pop() {
-            self.tick()?;
-            count += 1;
-            let mut push = |child| -> Result<(), IngressError> {
-                reserve(&mut work, self.limits.max_nodes)?;
-                work.push(child);
-                Ok(())
-            };
-            match expr.node() {
-                ExprNode::App { f, a } => {
-                    push(f)?;
-                    push(a)?;
-                }
-                ExprNode::Lam {
-                    binder_type, body, ..
-                }
-                | ExprNode::ForallE {
-                    binder_type, body, ..
-                } => {
-                    push(binder_type)?;
-                    push(body)?;
-                }
-                ExprNode::LetE {
-                    type_, value, body, ..
-                } => {
-                    push(type_)?;
-                    push(value)?;
-                    push(body)?;
-                }
-                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => push(expr)?,
-                _ => {}
-            }
-        }
-        Ok(count)
-    }
     pub(super) fn substitution(&mut self, body: &Expr, value: &Expr) -> Result<Expr, IngressError> {
-        let body_nodes = self.presentations(body)?;
-        let value_nodes = self.presentations(value)?;
-        // A replacement can require a distinct lifted DAG at every binder depth.
-        let extra = body_nodes
-            .checked_mul(value_nodes)
-            .ok_or(IngressError::ResourceLimit {
-                resource: IngressResource::Nodes,
-                limit: self.limits.max_nodes,
-                observed: usize::MAX,
-            })?;
-        for _ in 0..extra {
-            self.tick()?;
-        }
+        scope::charge(self, body, scope::Operation::Substitute(value))?;
         body.subst_loose(0, std::slice::from_ref(value))
             .map_err(|_| unsupported("runtime substitution scope"))
     }
     pub(super) fn lift(&mut self, expr: &Expr, amount: u32) -> Result<Expr, IngressError> {
-        self.presentations(expr)?;
+        scope::charge(self, expr, scope::Operation::Lift(amount))?;
         expr.lift_loose(0, amount)
             .map_err(|_| unsupported("runtime specialization scope"))
     }
@@ -961,8 +911,33 @@ mod tests {
             max_nodes: 200,
             ..IngressLimits::default()
         };
+        // A closed replacement at depth zero is cloned, not copied into a new
+        // tree per occurrence. Keep this original fixture as the positive
+        // control: its former product-of-tree-sizes rejection was spurious.
+        let mut expected = replacement.clone();
+        for _ in 0..30 {
+            expected = Expr::app(expected, replacement.clone());
+        }
+        assert_eq!(
+            Preparation::new(&environment, limits)
+                .substitution(&body, &replacement)
+                .unwrap(),
+            expected
+        );
+        // An open replacement under a binder genuinely must be lifted. Its
+        // work is still charged before invoking the core transform.
+        let mut open = Expr::bvar(0).unwrap();
+        for _ in 0..30 {
+            open = Expr::app(open, scalar.clone());
+        }
+        let under_binder = Expr::lam(
+            Name::anonymous(),
+            scalar,
+            body.lift_loose(0, 1).unwrap(),
+            BinderInfo::Default,
+        );
         assert!(matches!(
-            Preparation::new(&environment, limits).substitution(&body, &replacement),
+            Preparation::new(&environment, limits).substitution(&under_binder, &open),
             Err(IngressError::ResourceLimit {
                 resource: IngressResource::Nodes,
                 ..

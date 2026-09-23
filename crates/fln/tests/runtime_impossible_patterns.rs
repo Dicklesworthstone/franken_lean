@@ -67,24 +67,12 @@ fn several_omitted_literal_index_arms_are_proof_checked() {
 }
 #[test]
 fn dependent_tail_results_and_nested_matches_preserve_the_refined_index() {
-    let mut expanded = limits();
-    expanded.ingress.max_nodes = 10_000_000;
     let source = format!(
         "{VEC}{HEAD}def rest (n : Nat) (xs : Vec Nat (Nat.succ n)) : Vec Nat n := match xs with | .cons k x tail => tail\n#eval first 0 (rest 1 (Vec.cons 1 7 (Vec.cons 0 42 Vec.nil)))"
     );
-    // Nested dependent refinements currently need a larger caller budget. Do
-    // not increase the product default or mistake a resource stop for success.
-    let base = engine();
-    let root = base.logical_root(&KVMap::new());
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
-        .unwrap_err();
-    assert!(
-        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. }
-        if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::ResourceLimit { .. })))
-    );
-    assert_eq!(base.logical_root(&KVMap::new()), root);
-    run_with_limits(&source, "42", expanded);
+    // Scope-transform preflight now charges only work the core actually visits.
+    // The default preparation budget is unchanged; this composition fits it.
+    run(&source, "42");
 }
 #[test]
 fn source_cases_and_contradiction_tactics_use_the_same_checked_empty_path() {
