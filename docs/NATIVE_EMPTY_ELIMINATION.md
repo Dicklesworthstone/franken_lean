@@ -49,9 +49,10 @@ The source seed now wires in the existing ordinary definitions `False.elim` and
 ## Boundaries and evidence
 
 This is a bounded native runtime surface, not complete dependent-pattern
-compilation or Reference ABI parity. It does not automatically prove omitted
-source branches impossible. Arbitrary impossible index combinations of an
-otherwise inhabited family do not become empty-case bindings. Mutually defined
+compilation or Reference ABI parity. The existing source branch-omission prover
+can now compile its supported constructor clashes through the empty eliminator;
+see the section below. Arbitrary impossible index combinations of an otherwise
+inhabited family do not become empty-case bindings. Mutually defined
 empty groups, unresolved or representation-dependent result types, and bare
 partially supplied recursor constants are outside this increment. A checked
 wrapper can be partially applied using the existing callable machinery.
@@ -65,3 +66,35 @@ Regressions exercise proof-constrained vector heads, empty data nested inside
 inhabited values, indexed empty data, erased proofs, strict ordinary fields,
 owned and callable results, metadata/name guards, bounded preparation, unchanged
 logical environments, invalid-evidence nonpublication and deterministic recovery.
+
+## Ordinary nonempty patterns
+
+`examples/native_impossible_patterns.lean` uses an ordinary `match` to obtain
+`A` from `Vec A (Nat.succ n)` without writing a dummy nil arm or a manual proof
+argument. It also selects the sole possible constructor of a Boolean-indexed
+sum whose other constructor has a different payload type. Both logical checkers
+still check the elaborator's generated evidence before runtime preparation.
+
+Constructor discrimination now first derives `False` in `Prop`, then uses the
+ordinary `False.rec` at a data-valued target. Previously, its intermediate type
+code could require an impossible transport between incompatible data layouts.
+The runtime representation-equality guard was correct and is unchanged. The
+new proof construction also serves `cases`, `contradiction`, and `injection`.
+Minimal embedding environments without the exact False family and recursor keep
+the prior proof-construction scheme; no seed or assumption is synthesized there.
+
+No source coverage shortcut was added: omitting an inhabited arm is still an
+error, explicitly supplied arms remain type-checked even when their index is
+impossible, and invalid applications never produce an executable artifact.
+Engine and installed-command regressions cover scalar, String and object heads,
+large literal index clashes, imports, independent replay and failure recovery.
+
+Two remaining restrictions are recorded explicitly. Nested dependent tail/head
+composition currently exceeds the default one-million-node preparation budget;
+its test requires a caller-supplied ten-million-node budget and also checks that
+the default resource stop publishes nothing. The product default is unchanged.
+An escaping generated proof continuation that performs strict work and then
+returns another closure remains a flat-callable conversion refusal. This is
+covered by a valid-source/refused-runtime regression, not presented as executed
+callback support for ordinary omitted patterns. The explicit proof-constrained
+vector API above separately supports captured callback results.

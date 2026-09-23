@@ -8,12 +8,16 @@ on:
       - 'crates/fln-comp/src/ingress.rs'
       - 'crates/fln-elab/src/seed/**'
       - 'crates/fln-elab/src/seed.rs'
+      - 'crates/fln-elab/src/source/tactics/constructors.rs'
+      - 'crates/fln-elab/src/source/tactics/constructor_transport.rs'
       - 'crates/fln/src/runtime/**'
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/tests/runtime_empty_elimination.rs'
+      - 'crates/fln/tests/runtime_impossible_patterns.rs'
       - 'crates/fln-vm/tests/empty_elimination.rs'
       - 'crates/fln-cli/tests/source_empty_runtime.rs'
       - 'examples/native_empty_elimination.lean'
+      - 'examples/native_impossible_patterns.lean'
   workflow_dispatch:
 permissions:
   contents: read
@@ -39,7 +43,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p fln-comp -p fln-vm --lib --test empty_elimination --test constructor_dispatch --test closure_interfaces
           cargo test --locked -p fln-elab
-          cargo test --locked -p fln --lib --test runtime_empty_elimination --test runtime_indexed_data --test runtime_equality_transport --test runtime_proof_data --test runtime_recursive_data --test runtime_mutual_recursion
+          cargo test --locked -p fln --lib --test runtime_empty_elimination --test runtime_impossible_patterns --test runtime_indexed_data --test runtime_equality_transport --test runtime_proof_data --test runtime_recursive_data --test runtime_mutual_recursion
           cargo test --locked -p fln-cli --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime
           cargo clippy --locked -p fln-comp -p fln-vm -p fln-elab -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets

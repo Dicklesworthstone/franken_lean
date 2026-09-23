@@ -96,3 +96,49 @@ fn imported_empty_elimination_rejects_false_evidence_and_recovers_deterministica
     assert_eq!(source, std::fs::read_to_string(&entry).unwrap());
     replay(&recovered);
 }
+
+#[test]
+fn constructor_clash_evidence_enables_ordinary_nonempty_patterns_and_bytecode_replay() {
+    personalities_and_replay(include_str!(
+        "../../../examples/native_impossible_patterns.lean"
+    ));
+}
+
+#[test]
+fn imported_impossible_patterns_reject_reachable_omissions_and_recover() {
+    let dir = directory();
+    let dependency = dir.join("Patterns.lean");
+    let entry = dir.join("Main.lean");
+    let example = include_str!("../../../examples/native_impossible_patterns.lean");
+    let (definitions, expression) = example.split_once("#eval").unwrap();
+    std::fs::write(&dependency, definitions).unwrap();
+    std::fs::write(&entry, format!("import Patterns\n#eval {expression}")).unwrap();
+    let artifact = dir.join("good.flbc");
+    let output = run(&entry, &artifact);
+    assert!(output.status.success(), "{output:?}");
+    replay(&artifact);
+    let before = std::fs::read(&artifact).unwrap();
+    for invalid in [
+        format!("{definitions}\ndef invalid : Nat := first 0 Vec.nil\n"),
+        format!(
+            "{definitions}\ndef invalid (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .cons k x tail => x\n"
+        ),
+        format!(
+            "{definitions}\ndef invalid (x : Choice true) : Nat := match x with | .yes n => n | .no text => text\n"
+        ),
+    ] {
+        std::fs::write(&dependency, invalid).unwrap();
+        let failed = dir.join("failed.flbc");
+        let output = run(&entry, &failed);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(!failed.exists());
+        assert_eq!(before, std::fs::read(&artifact).unwrap());
+    }
+    std::fs::write(&dependency, definitions).unwrap();
+    let recovered = dir.join("recovered.flbc");
+    let output = run(&entry, &recovered);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(before, std::fs::read(&recovered).unwrap());
+    replay(&recovered);
+}

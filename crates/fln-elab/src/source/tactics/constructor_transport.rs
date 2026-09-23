@@ -303,6 +303,35 @@ impl Context {
         result
     }
 
+    /// A constructor clash should first prove False when the native logical
+    /// seed is present. Transporting a data-valued type code directly can cast
+    /// between incompatible runtime representations in an impossible branch.
+    /// Keeping that discrimination in Prop makes the evidence erasable, while
+    /// False.rec remains an explicit checked empty elimination at the target.
+    /// Minimal embedders without this seed retain the original proof scheme.
+    pub(super) fn has_empty_proposition_seed(&mut self) -> Result<bool, NatDefinitionElabError> {
+        let Declaration::Inductive(block) = crate::seed::false_seed_declaration() else {
+            return Ok(false);
+        };
+        for expected in &block.types {
+            self.tick()?;
+            if !matches!(self.txn.env.find(&expected.base.name),
+                Some(ConstantInfo::Induct(actual)) if actual == expected)
+            {
+                return Ok(false);
+            }
+        }
+        for expected in &block.recursors {
+            self.tick()?;
+            if !matches!(self.txn.env.find(&expected.base.name),
+                Some(ConstantInfo::Rec(actual)) if actual == expected)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn constructor_evidence_inner(
         &mut self,
         witness: &Typed,
@@ -315,6 +344,20 @@ impl Context {
         let right = self.constructor_view(&original_right)?;
         let family = self.equality_family(&alpha, &left, &right)?;
         let universe = self.type_universe(target)?;
+        let clash = left.constructor.base.name != right.constructor.base.name;
+        let empty_target = if clash && !universe.is_zero() && self.has_empty_proposition_seed()? {
+            Some((target.clone(), universe.clone()))
+        } else {
+            None
+        };
+        let (target, universe) = if empty_target.is_some() {
+            (
+                Expr::const_(Name::from_components(["False"]), vec![]),
+                Level::zero(),
+            )
+        } else {
+            (target.clone(), universe)
+        };
         let code_universe = universe
             .clone()
             .succ()
@@ -472,7 +515,7 @@ impl Context {
             true,
         )?;
         let motive = self.close_equality_binder(&endpoint, motive, true)?;
-        let proof = apps(
+        let mut proof = apps(
             Expr::const_(Name::from_components(["Eq", "rec"]), vec![universe, level]),
             [
                 alpha,
@@ -483,7 +526,15 @@ impl Context {
                 witness.value.clone(),
             ],
         );
-        let clash = left.constructor.base.name != right.constructor.base.name;
+        if let Some((target, universe)) = empty_target {
+            let empty =
+                self.equality_local(Expr::const_(Name::from_components(["False"]), vec![]))?;
+            let motive = self.close_equality_binder(&empty, target, true)?;
+            proof = apps(
+                Expr::const_(Name::from_components(["False", "rec"]), vec![universe]),
+                [motive, proof],
+            );
+        }
         let relations = if clash {
             Vec::new()
         } else {
@@ -596,6 +647,95 @@ mod tests {
         Typed {
             value: fv(&h),
             type_: h.type_,
+        }
+    }
+
+    fn with_false_seed(mut env: Environment) -> Environment {
+        let Outcome::Complete(admitted) =
+            admit(&env, crate::seed::false_seed_declaration(), Budget::DEFAULT)
+        else {
+            panic!("False seed nonanswer");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("False seed rejected");
+        };
+        let Outcome::Complete(Published::BlockCommitted(published)) = checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) else {
+            panic!("False seed publication");
+        };
+        env = published.environment;
+        env
+    }
+    fn head(expr: &Expr) -> &Expr {
+        let mut head = expr;
+        while let ExprNode::App { f, .. } = head.node() {
+            head = f;
+        }
+        head
+    }
+
+    #[test]
+    fn constructor_clashes_use_checked_empty_elimination_only_with_its_seed() {
+        let minimal = environment();
+        let seeded = with_false_seed(minimal.clone());
+        for (env, empty) in [(&minimal, false), (&seeded, true)] {
+            let mut ctx = Context::new(env, Budget::DEFAULT);
+            let h = witness(&mut ctx, false);
+            let locals = ctx.txn.lctx.clone();
+            let evidence = ctx.constructor_evidence(&h, &constant(&["Nat"])).unwrap();
+            assert!(evidence.clash && evidence.relations.is_empty());
+            let expected = if empty {
+                ["False", "rec"]
+            } else {
+                ["Eq", "rec"]
+            };
+            assert!(
+                matches!(head(&evidence.proof).node(), ExprNode::Const { name, .. }
+                if name == &Name::from_components(expected))
+            );
+            assert_eq!(ctx.txn.lctx, locals);
+            assert_eq!(&ctx.txn.env, env);
+            assert!(ctx.txn.mvars.is_empty());
+            // An ordinary equal-constructor continuation is not rewritten as
+            // an impossible branch merely because False is available.
+            let h = witness(&mut ctx, true);
+            assert!(
+                !ctx.constructor_evidence(&h, &constant(&["Nat"]))
+                    .unwrap()
+                    .clash
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_discrimination_checks_the_complete_false_metadata() {
+        for mutation in 0..5 {
+            let Declaration::Inductive(mut block) = crate::seed::false_seed_declaration() else {
+                panic!("False block");
+            };
+            match mutation {
+                0 => {}
+                1 => block.types[0].num_indices += 1,
+                2 => block.types[0].is_unsafe = true,
+                3 => block.recursors[0].k = true,
+                _ => block.recursors[0].base.type_ = constant(&["Nat"]),
+            }
+            // Unadmitted fixtures test the recognizer, not logical validity.
+            let mut env = environment();
+            for family in block.types {
+                env = env.add_decl(ConstantInfo::Induct(family)).unwrap();
+            }
+            for recursor in block.recursors {
+                env = env.add_decl(ConstantInfo::Rec(recursor)).unwrap();
+            }
+            let mut ctx = Context::new(&env, Budget::DEFAULT);
+            assert_eq!(ctx.has_empty_proposition_seed().unwrap(), mutation == 0);
+            assert_eq!(ctx.txn.env, env);
+            assert!(ctx.txn.lctx.is_empty());
         }
     }
 

@@ -426,6 +426,19 @@ impl Context {
             value: target.clone(),
             type_,
         })?;
+        let empty_target = if !universe.is_zero() && self.has_empty_proposition_seed()? {
+            Some((target.clone(), universe.clone()))
+        } else {
+            None
+        };
+        let (target, universe) = if empty_target.is_some() {
+            (
+                Expr::const_(Name::from_components(["False"]), vec![]),
+                Level::zero(),
+            )
+        } else {
+            (target.clone(), universe)
+        };
         let local = self.equality_local(target.clone())?;
         let identity_type = self.close_equality_binder(&local, target.clone(), false)?;
         let identity = self.close_equality_binder(&local, Expr::fvar(local.id.clone()), true)?;
@@ -434,16 +447,24 @@ impl Context {
             &Expr::sort(universe.clone()),
             Selection::Tag {
                 ctor: right,
-                selected: target,
+                selected: &target,
                 other: &identity_type,
             },
         )?
         else {
             return Ok(None);
         };
-        Ok(Some(self.equality_transport(
-            equality, &selector, identity, universe,
-        )?))
+        let mut proof = self.equality_transport(equality, &selector, identity, universe)?;
+        if let Some((target, universe)) = empty_target {
+            let empty =
+                self.equality_local(Expr::const_(Name::from_components(["False"]), vec![]))?;
+            let motive = self.close_equality_binder(&empty, target, true)?;
+            proof = [motive, proof].into_iter().fold(
+                Expr::const_(Name::from_components(["False", "rec"]), vec![universe]),
+                Expr::app,
+            );
+        }
+        Ok(Some(proof))
     }
 
     fn constructor_field_equality(
