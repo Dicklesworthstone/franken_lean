@@ -39,3 +39,105 @@ jobs:
           cargo test --locked -p fln-cli --test source_mutual_indexed --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
+  mutual-function-child-validation:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TEST_THREADS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ff82de5ebaa8d024d1a554dfb12c1a3baafd8b5f
+          persist-credentials: false
+      - name: Restore checksum-bound mutual recursive callback implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PYCODE'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          chunks = ['ecc395607dd72fdd45eedc749de3906226fcf4c5', 'f6e063c8e331e99662b57ba0db4c76bb8719cfa9', 'f44c57ed0cc2b315e461a4ea0a1052fef7abb87f']
+          archive = bytearray()
+          for sha in chunks:
+              response = json.loads(subprocess.check_output(['gh', 'api', 'repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
+              data = base64.b64decode(response['content'])
+              assert blob(data) == sha
+              archive.extend(data)
+          assert len(archive) == 12153
+          assert hashlib.sha256(archive).hexdigest() == '97d98e60fd21abb048dd2b3f3f6fd11002eb9dd14719fe890d719008bcd00bc5'
+          manifest = json.loads(gzip.decompress(archive))
+          assert git('rev-parse','HEAD') == manifest['base'] == 'ff82de5ebaa8d024d1a554dfb12c1a3baafd8b5f'
+          assert git('write-tree') == manifest['base_tree'] == 'a9afabc2a42a9c7e2194d682f19a07caed29fa7a'
+          allowed = {'.github/workflows/native-mutual-indexed-runtime.yml', 'crates/fln-cli/tests/source_mutual_function_children.rs', 'crates/fln/src/runtime/data_recursion.rs', 'crates/fln/src/runtime/mutual.rs', 'crates/fln/src/runtime/mutual/fold.rs', 'crates/fln/src/runtime/mutual/tests.rs', 'crates/fln/src/runtime/records.rs', 'crates/fln/tests/runtime_mutual_data.rs', 'crates/fln/tests/runtime_mutual_function_children.rs', 'crates/fln/tests/runtime_mutual_indexed.rs', 'docs/NATIVE_FUNCTION_CHILDREN.md', 'docs/NATIVE_INDEXED_FUNCTION_CHILDREN.md', 'docs/NATIVE_MUTUAL_FUNCTION_CHILDREN.md', 'docs/NATIVE_MUTUAL_INDEXED_RUNTIME.md', 'docs/NATIVE_MUTUAL_RUNTIME.md', 'examples/native_mutual_function_children.lean'}
+          assert len(manifest['entries']) == len(allowed)
+          assert {e['path'] for e in manifest['entries']} == allowed
+          for e in manifest['entries']:
+              path = root/e['path']
+              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
+              if e['before'] is None:
+                  assert not path.exists() and not git('ls-files','--',e['path'])
+              else:
+                  assert blob(path.read_bytes()) == e['before'], e['path']
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-child-validation'
+          out.mkdir()
+          patch = out/'change.patch'
+          patch.write_text(manifest['patch'])
+          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
+          subprocess.run(['git','apply','--index',str(patch)],check=True)
+          assert set(git('diff','--cached','--name-only').splitlines()) == allowed
+          for e in manifest['entries']:
+              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
+          assert git('write-tree') == manifest['tree'] == '6f34dd0678a42e8fb9147e3b2b7098b0b75c6de2'
+          (out/'manifest.json').write_text(json.dumps(manifest))
+          print('VALIDATION_TREE',git('write-tree'))
+          PYCODE
+      - name: Check recursive callbacks, admission, sharing and independent replay
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          tests=(); for f in crates/fln/tests/runtime_*.rs; do tests+=(--test "$(basename "$f" .rs)"); done
+          cargo test --locked -p fln --lib "${tests[@]}" --test source_module_check --test source_module_session --test engine_builder_facade 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/engine.log"
+          cargo test --locked -p fln-elab 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/elab.log"
+          cargo test --locked -p fln-comp -p fln-vm --lib --test empty_elimination --test constructor_dispatch --test closure_interfaces 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/compiler-vm.log"
+          cargo test --locked -p fln-cli --test source_mutual_function_children --test source_mutual_indexed --test source_mutual_data --test source_indexed_function_children --test source_empty_runtime --test source_proof_runtime 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/cli.log"
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/clippy.log"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/mutual-child-validation/check.log"
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-cli/tests/source_mutual_function_children.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/mutual.rs crates/fln/src/runtime/mutual/fold.rs crates/fln/src/runtime/mutual/tests.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_mutual_data.rs crates/fln/tests/runtime_mutual_function_children.rs crates/fln/tests/runtime_mutual_indexed.rs
+          git diff --check --cached
+      - name: Export checked source objects without moving branch references
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PYCODE'
+          import base64, hashlib, json, os, pathlib, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-child-validation'
+          manifest = json.loads((out/'manifest.json').read_text())
+          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
+          for e in manifest['entries']:
+              data = pathlib.Path(e['path']).read_bytes()
+              sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              assert sha == e['after']
+              payload = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
+              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=payload))
+              assert response['sha'] == sha
+              print('EXPORTED',e['path'],sha,flush=True)
+          PYCODE
+      - name: Retain exact validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutual-child-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/mutual-child-validation
+          retention-days: 14
