@@ -63,7 +63,6 @@ impl Preparation<'_> {
         if family.is_unsafe
             || (family.is_reflexive && family.all.len() != 1)
             || family.num_params as usize != parameters.len()
-            || (family.num_indices != 0 && family.all.len() != 1)
             || family.num_nested != 0
             || !family.all.contains(name)
             || family.base.level_params.len() != levels.len()

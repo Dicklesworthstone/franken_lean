@@ -23,6 +23,7 @@ pub(super) struct Member {
 pub(super) struct Group {
     shapes: Vec<records::Shape>,
     selected: usize,
+    indices: Vec<Vec<Expr>>,
     minor_offset: usize,
     arity: usize,
 }
@@ -35,7 +36,6 @@ impl Preparation<'_> {
         args: &[Expr],
     ) -> Result<Option<Group>, IngressError> {
         if rec.is_unsafe
-            || rec.num_indices != 0
             || rec.all.len() < 2
             || rec.num_motives as usize != rec.all.len()
             || levels.len() != rec.base.level_params.len()
@@ -52,7 +52,10 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(family)) = self.environment.find(&ctor.induct) else {
             return Ok(None);
         };
-        if family.all != rec.all || family.num_params != rec.num_params {
+        if family.all != rec.all
+            || family.num_params != rec.num_params
+            || family.num_indices != rec.num_indices
+        {
             return Ok(None);
         }
         let Some(selected) = rec.all.iter().position(|name| name == &ctor.induct) else {
@@ -72,7 +75,7 @@ impl Preparation<'_> {
             reserve(&mut family_levels, self.limits.max_context_depth)?;
             family_levels.push(levels[index].clone());
         }
-        let mut source = Expr::const_(family.base.name.clone(), family_levels);
+        let mut source = Expr::const_(family.base.name.clone(), family_levels.clone());
         for parameter in &args[..rec.num_params as usize] {
             self.tick()?;
             source = Expr::app(source, parameter.clone());
@@ -83,6 +86,22 @@ impl Preparation<'_> {
         let Some(shapes) = self.record_group(&source)? else {
             return Ok(None);
         };
+        // Each sibling has its own index telescope. Sharing a mutual block
+        // does not imply equal index arities or equal scalar domains.
+        let mut indices = Vec::new();
+        for member in &rec.all {
+            self.tick()?;
+            let Some(ConstantInfo::Induct(info)) = self.environment.find(member) else {
+                return Ok(None);
+            };
+            let Some(domains) =
+                self.index_domains(info, &family_levels, &args[..rec.num_params as usize])?
+            else {
+                return Ok(None);
+            };
+            reserve(&mut indices, self.limits.max_context_depth)?;
+            indices.push(domains);
+        }
         let mut total = 0usize;
         let mut minor_offset = 0;
         for (index, shape) in shapes.iter().enumerate() {
@@ -110,11 +129,13 @@ impl Preparation<'_> {
         let arity = (rec.num_params as usize)
             .checked_add(shapes.len())
             .and_then(|n| n.checked_add(total))
+            .and_then(|n| n.checked_add(rec.num_indices as usize))
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| unsupported("mutual recursor arity"))?;
         Ok(Some(Group {
             shapes,
             selected,
+            indices,
             minor_offset,
             arity,
         }))
@@ -139,19 +160,16 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let shape = &group.shapes[group.selected];
-        let ExprNode::Lam {
-            binder_type,
-            body: motive,
-            ..
-        } = args[rec.num_params as usize + group.selected].node()
+        let Some(motive) = self.indexed_motive(
+            &args[rec.num_params as usize + group.selected],
+            &group.indices[group.selected],
+            &shape.source,
+        )?
         else {
             return Ok(None);
         };
-        if self.normalize_type(binder_type)? != shape.source || motive.has_loose_bvars() {
-            return Ok(None);
-        }
         let result = self
-            .value_type(motive)?
+            .value_type(&motive)?
             .ok_or_else(|| unsupported("dependent mutual match result"))?;
         let id = self.next_variant;
         self.next_variant = id
@@ -206,11 +224,32 @@ impl Preparation<'_> {
             constructors,
             result,
         });
+        // Index arguments are ordinary computations, not disposable type
+        // syntax. Evaluate each once, in order, before selecting the major.
+        let indices = &group.indices[group.selected];
+        let count =
+            u32::try_from(indices.len()).map_err(|_| unsupported("mutual case index depth"))?;
+        let mut major = self.lift(&args[group.arity - 1], count)?;
+        for (index, domain) in indices.iter().enumerate().rev() {
+            self.tick()?;
+            let depth = u32::try_from(index).map_err(|_| unsupported("mutual case index depth"))?;
+            let arg = &args[group.arity - 1 - indices.len() + index];
+            major = Expr::let_e(
+                Name::anonymous(),
+                self.lift(domain, depth)?,
+                self.lift(arg, depth)?,
+                major,
+                false,
+            );
+        }
         Ok(Some(variants::Case {
             name: case_name,
-            major: args[group.arity - 1].clone(),
+            major,
             branches,
             result,
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

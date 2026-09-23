@@ -1,7 +1,7 @@
 # Native execution of value-indexed data
 
-The native runtime accepts admitted single inductive families with independent
-`Nat`, `Bool`, or `String` index domains and uniform executable field layouts at
+The native runtime accepts admitted single or mutually recursive inductive
+families with independent `Nat`, `Bool`, or `String` index domains and uniform executable field layouts at
 fixed type parameters. Length-indexed vectors can be constructed, matched,
 folded, mapped and returned at refined indices. Multiple indices and multiple
 direct recursive fields are supported. The seed's ordinary kernel and independent
@@ -36,8 +36,9 @@ as a logical declaration.
 
 ## Boundaries
 
-Type-indexed GADTs, index domains depending on prior indices, mutually indexed
-families and genuinely value-dependent field representations remain unsupported.
+Type-indexed GADTs, index domains depending on prior indices, function-valued
+mutual recursive children and genuinely value-dependent field representations
+remain unsupported.
 Function-valued indexed children are supported when their argument representations
 are nondependent; see `NATIVE_INDEXED_FUNCTION_CHILDREN.md`. Scalar indices alone are not sufficient:
 the full constructor layout must be representable. This is a native FIR profile,
@@ -51,3 +52,7 @@ Regression coverage includes invalid-length rejection, preserved logical roots,
 strict ordinary computation, shared recursive work, deterministic resource-stop
 recovery, type-indexed/existential representation refusal, small-stack type erasure,
 both installed entry points, imports and independent serialized FLBC replay.
+
+Mutually indexed groups may mix independent scalar index telescopes, including
+unindexed siblings; see `NATIVE_MUTUAL_INDEXED_RUNTIME.md`. Each member retains
+its own checked indices and recursive interface, not those of the entry member.

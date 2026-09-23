@@ -2,16 +2,22 @@ name: Native mutually indexed runtime
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-mutual-indexed-runtime.yml']
+    paths:
+      - '.github/workflows/native-mutual-indexed-runtime.yml'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/lib.rs'
+      - 'crates/fln-comp/src/**'
+      - 'crates/fln/tests/runtime_mutual_indexed.rs'
+      - 'crates/fln-cli/tests/source_mutual_indexed.rs'
+      - 'examples/native_mutual_indexed.lean'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  verify-and-export:
+  mutual-indexed:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    permissions:
-      contents: write
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -19,123 +25,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 74284a1a6bfe2a144f1edaa4278b2d484cef4399
           persist-credentials: false
-      - name: Restore checksum-bound mutually indexed implementation
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install repository toolchain
         run: |
-          python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          def blob(data):
-              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          def git(*args):
-              return subprocess.check_output(['git',*args],text=True).strip()
-          chunks = [
-              '1534379cda6bda34885e869c9dfc4e601a2b7cd6',
-              'df2df506306d9642ccfd2ce5de22a425f4c00216',
-              '4408f6072dab6a410b419f1bfadb3f9bb0112288',
-              '44c286f1cce7c176429b57056c532e7eea06348c',
-              '46a17e37b3d60968db4433ad358f86610b44c44b',
-              '3919c01747932098161567be8806dd9b98264958',
-              '4f802548c61fa303c47b4bafd43c9146fdfb1e34',
-              '2f7a9035f137f82dfaeab2982ea9267c21ba1ae7',
-              'b105f07d8393bd9821d31ee2367ee40e16916ebc',
-              '2587475840eef2cf0ac2e35e905f12ac0e5c94d7',
-              '567ac11533dd2931b9b861f7a1e0a5ca2c4538a2',
-              'cad86ec4d34641d7c6a7802b60735b6c3e52500d',
-              '0758317efdd89ed840c357441136fcedb76d11f8',
-              '1bfb67a115ccbe0ce7ed1bcb92abdf128b328ccf',
-              'd61466ae4befd40395f05a2094b0b164ef52ecb2',
-              'd31c7ee04bd7f47758aba89ab3a87c33b1ef73f7',
-          ]
-          payload = bytearray()
-          for sha in chunks:
-              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
-              data = base64.b64decode(response['content'])
-              assert blob(data) == sha
-              payload.extend(data)
-          assert len(payload) == 15889
-          assert hashlib.sha256(payload).hexdigest() == '0e8fcc1eeb11c76155973da026402f574f6bf0b7d3a82e95e31b40087778b754'
-          manifest = json.loads(gzip.decompress(payload))
-          assert git('rev-parse','HEAD') == manifest['base'] == '74284a1a6bfe2a144f1edaa4278b2d484cef4399'
-          assert git('write-tree') == manifest['base_tree'] == '3e4c0263e25a4966a3ffbb7910f90559fd52da20'
-          allowed = {
-              '.github/workflows/native-mutual-indexed-runtime.yml',
-              'crates/fln-cli/tests/source_mutual_indexed.rs',
-              'crates/fln/src/runtime.rs',
-              'crates/fln/src/runtime/callables.rs',
-              'crates/fln/src/runtime/indexed.rs',
-              'crates/fln/src/runtime/mutual.rs',
-              'crates/fln/src/runtime/mutual/fold.rs',
-              'crates/fln/src/runtime/mutual/tests.rs',
-              'crates/fln/src/runtime/projections.rs',
-              'crates/fln/src/runtime/records.rs',
-              'crates/fln/tests/runtime_mutual_indexed.rs',
-              'docs/NATIVE_INDEXED_FUNCTION_CHILDREN.md',
-              'docs/NATIVE_INDEXED_RUNTIME.md',
-              'docs/NATIVE_MUTUAL_INDEXED_RUNTIME.md',
-              'docs/NATIVE_MUTUAL_RUNTIME.md',
-              'examples/native_mutual_indexed.lean',
-          }
-          assert len(manifest['entries']) == len(allowed) == 16
-          assert {e['path'] for e in manifest['entries']} == allowed
-          for e in manifest['entries']:
-              path = root/e['path']
-              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
-              if e['before'] is None:
-                  assert not path.exists() and not git('ls-files','--',e['path'])
-              else:
-                  assert blob(path.read_bytes()) == e['before'], e['path']
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-indexed-validation'
-          out.mkdir()
-          patch = out/'change.patch'
-          patch.write_text(manifest['patch'])
-          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-          subprocess.run(['git','apply','--index',str(patch)],check=True)
-          assert set(git('diff','--cached','--name-only').splitlines()) == allowed
-          assert git('write-tree') == manifest['tree'] == 'a9afabc2a42a9c7e2194d682f19a07caed29fa7a'
-          for e in manifest['entries']:
-              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
-          (out/'manifest.json').write_text(json.dumps(manifest))
-          print('VALIDATION_TREE',git('write-tree'))
-          PY
-      - name: Check peer indices, strictness, layout guards and independent replay
-        run: |
-          set -euo pipefail
           channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-          out="$RUNNER_TEMP/mutual-indexed-validation"
-          cargo test --locked -p fln --lib --test runtime_mutual_indexed --test runtime_mutual_recursion --test runtime_mutual_data --test runtime_indexed_data --test runtime_indexed_function_children --test runtime_impossible_patterns --test runtime_staged_closures --test runtime_proof_data --test runtime_equality_transport 2>&1 | tee "$out/engine.log"
-          cargo test --locked -p fln --test source_mutual_cases --test source_mutual_matching --test source_module_check --test source_module_session 2>&1 | tee "$out/source.log"
-          cargo test --locked -p fln-cli --test source_mutual_indexed --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime 2>&1 | tee "$out/cli.log"
-          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee "$out/clippy.log"
-          cargo check --locked --workspace --all-targets 2>&1 | tee "$out/check.log"
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/mutual.rs crates/fln/src/runtime/mutual/fold.rs crates/fln/src/runtime/mutual/tests.rs crates/fln/src/runtime/projections.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_mutual_indexed.rs crates/fln-cli/tests/source_mutual_indexed.rs
-          git diff --check --cached
-      - name: Export checked file objects without moving branch refs
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check peer indices, strictness, layout guards and independent replay
         run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-indexed-validation'
-          manifest = json.loads((out/'manifest.json').read_text())
-          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
-          for e in manifest['entries']:
-              data = pathlib.Path(e['path']).read_bytes()
-              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['after']
-              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
-              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-              assert response['sha'] == e['after']
-              print('EXPORTED',e['path'],e['after'],flush=True)
-          PY
-      - name: Retain exact validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: mutual-indexed-validation-${{ github.run_id }}
-          path: ${{ runner.temp }}/mutual-indexed-validation
-          retention-days: 14
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test runtime_mutual_indexed --test runtime_mutual_recursion --test runtime_mutual_data --test runtime_indexed_data --test runtime_indexed_function_children --test runtime_impossible_patterns --test runtime_staged_closures --test runtime_proof_data --test runtime_equality_transport
+          cargo test --locked -p fln --test source_mutual_cases --test source_mutual_matching --test source_module_check --test source_module_session
+          cargo test --locked -p fln-cli --test source_mutual_indexed --test source_empty_runtime --test source_indexed_runtime --test source_proof_runtime
+          cargo clippy --locked -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

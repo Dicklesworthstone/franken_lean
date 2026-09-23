@@ -345,11 +345,11 @@ impl<'a> Preparation<'a> {
                             && args.len() == 4
                         {
                             self.check_bool_recursor()?;
-                            let ExprNode::Lam { body: motive, .. } = args[0].node() else {
-                                return Err(unsupported("Boolean motive"));
-                            };
+                            let motive = self
+                                .indexed_motive(&args[0], &[], &Expr::const_(name("Bool"), vec![]))?
+                                .ok_or_else(|| unsupported("dependent Boolean motive"))?;
                             let result = self
-                                .value_type(motive)?
+                                .value_type(&motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
                             let case = self.branch_name(result)?;
                             let yes = self.typed_callable_result(

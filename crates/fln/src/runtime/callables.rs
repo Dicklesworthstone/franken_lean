@@ -20,11 +20,7 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
             return Ok(None);
         };
-        if rec.is_unsafe
-            || rec.num_indices != 0
-            || rec.num_motives as usize != rec.all.len()
-            || rec.all.is_empty()
-        {
+        if rec.is_unsafe || rec.num_motives as usize != rec.all.len() || rec.all.is_empty() {
             return Ok(None);
         }
         let Some(rule) = rec.rules.first() else {
@@ -39,7 +35,7 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(family)) = self.environment.find(&ctor.induct) else {
             return Ok(None);
         };
-        if family.is_rec && rec.all.len() == 1 {
+        if (family.is_rec || rec.num_indices != 0) && rec.all.len() == 1 {
             // The recursive paths flatten motives into recursive parameters.
             return Ok(None);
         }
@@ -47,18 +43,22 @@ impl Preparation<'_> {
         let arity = parameters
             .checked_add(rec.num_minors as usize)
             .and_then(|n| n.checked_add(rec.num_motives as usize))
+            .and_then(|n| n.checked_add(rec.num_indices as usize))
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| unsupported("eliminator arity"))?;
         if args.len() <= arity {
             return Ok(None);
         }
-        let ExprNode::Lam { body: type_, .. } = args[parameters + selected].node() else {
-            return Ok(None);
-        };
-        if type_.has_loose_bvars() {
-            return Ok(None);
+        // Apply only the static motive to recover the result annotation.
+        // Its logical dependence on scalar indices (including the major of a
+        // Bool case) can disappear after representation erasure. The original
+        // recursor application below still evaluates all actual arguments.
+        let mut type_ = args[parameters + selected].clone();
+        for arg in &args[arity - 1 - rec.num_indices as usize..arity] {
+            self.tick()?;
+            type_ = self.minor_apply(type_, arg.clone())?;
         }
-        let type_ = type_.clone();
+        let type_ = self.erase_runtime_type(&type_)?;
         let mut function = head.clone();
         for argument in &args[..arity] {
             self.tick()?;

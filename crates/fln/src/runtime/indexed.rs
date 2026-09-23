@@ -7,7 +7,7 @@ use fln_env::constants::InductiveVal;
 use std::collections::HashMap;
 
 impl Preparation<'_> {
-    /// The initial indexed profile has independent scalar index domains. Type
+    /// The indexed profile has independent scalar index domains. Type
     /// indices and domains depending on earlier indices are not layout evidence.
     /// This is deliberately nonrecursive: discovering an index type must not
     /// recursively start discovery of the family whose layout is being built.
@@ -18,7 +18,6 @@ impl Preparation<'_> {
         parameters: &[Expr],
     ) -> Result<Option<Vec<Expr>>, IngressError> {
         if family.is_unsafe
-            || family.all.len() != 1
             || family.num_nested != 0
             || family.base.level_params.len() != levels.len()
             || family.num_params as usize != parameters.len()

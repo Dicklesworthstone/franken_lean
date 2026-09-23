@@ -171,7 +171,13 @@ impl Preparation<'_> {
         };
         // An already-specialized projection can be visited a second time by
         // expression preparation. Its private key must still select this type.
-        if name != structure && &shape.name != structure {
+        if name != structure
+            && &shape.name != structure
+            && !shape
+                .constructors
+                .iter()
+                .any(|ctor| &shape.projection(ctor) == structure)
+        {
             return Err(unsupported("projection receiver family mismatch"));
         }
         if shape.recursive || shape.constructors.len() != 1 {
@@ -437,6 +443,38 @@ mod tests {
             assert!(prep.constructors.is_empty());
         }
     }
+    #[test]
+    fn private_variant_projection_keys_must_belong_to_the_selected_family() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(limits)
+            .unwrap().into_complete().unwrap()
+            .check_source_files(
+                &[b"mutual\ninductive T : Nat -> Type where | leaf (n : Nat) : T n | node (n : Nat) (f : F n) : T n\ninductive F : Nat -> Type where | nil (n : Nat) : F n | cons (n : Nat) (t : T n) : F n\nend"],
+                &KVMap::new(), SourceCheckLimits::new(limits),
+            ).unwrap().into_complete().unwrap().engine;
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let t = Expr::app(Expr::const_(name("T"), vec![]), nat::literal(7));
+        let f = Expr::app(Expr::const_(name("F"), vec![]), nat::literal(7));
+        let t_shape = prep.record_shape(&t).unwrap().unwrap();
+        let f_shape = prep.record_shape(&f).unwrap().unwrap();
+        for ctor in &t_shape.constructors {
+            // Valid variant projections remain for constructor-case lowering;
+            // they are not incorrectly converted into single-record projections.
+            assert!(
+                prep.projection_slot(&t, &t_shape.projection(ctor), 0)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for ctor in &f_shape.constructors {
+            assert!(
+                prep.projection_slot(&t, &f_shape.projection(ctor), 0)
+                    .is_err()
+            );
+        }
+        assert!(prep.projection_slot(&t, &name("Missing"), 0).is_err());
+    }
+
     #[test]
     fn local_telescope_and_type_synthesis_are_heap_bounded() {
         std::thread::Builder::new()

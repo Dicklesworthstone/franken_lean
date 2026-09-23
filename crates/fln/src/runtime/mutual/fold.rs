@@ -21,19 +21,25 @@ impl Preparation<'_> {
         &mut self,
         syntax: &Expr,
         family: &Expr,
+        indices: &[Expr],
     ) -> Result<Option<Motive>, IngressError> {
-        let ExprNode::Lam {
-            binder_type, body, ..
-        } = syntax.node()
-        else {
+        let Some(body) = self.indexed_motive(syntax, indices, family)? else {
             return Ok(None);
         };
-        if self.normalize_type(binder_type)? != *family || body.has_loose_bvars() {
-            return Ok(None);
+        let mut domains = Vec::new();
+        let mut parameters = Vec::new();
+        for domain in indices.iter().chain(std::iter::once(family)) {
+            self.tick()?;
+            let Some(parameter) = self.value_type(domain)? else {
+                return Ok(None);
+            };
+            reserve(&mut domains, self.limits.max_context_depth)?;
+            reserve(&mut parameters, self.limits.max_context_depth)?;
+            domains.push(domain.clone());
+            parameters.push(parameter);
         }
-        let mut domains = vec![family.clone()];
-        let mut parameters = vec![ValueType::Constructor];
-        let mut result_type = body;
+        let first_extra = domains.len();
+        let mut result_type = &body;
         loop {
             self.tick()?;
             match result_type.node() {
@@ -57,7 +63,7 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let mut hypothesis_type = result_type.clone();
-        for domain in domains[1..].iter().rev() {
+        for domain in domains[first_extra..].iter().rev() {
             self.tick()?;
             hypothesis_type = Expr::forall_e(
                 Name::anonymous(),
@@ -66,12 +72,16 @@ impl Preparation<'_> {
                 BinderInfo::Default,
             );
         }
-        let self_type = Expr::forall_e(
-            Name::anonymous(),
-            family.clone(),
-            hypothesis_type.clone(),
-            BinderInfo::Default,
-        );
+        let mut self_type = hypothesis_type.clone();
+        for domain in domains[..first_extra].iter().rev() {
+            self.tick()?;
+            self_type = Expr::forall_e(
+                Name::anonymous(),
+                domain.clone(),
+                self_type,
+                BinderInfo::Default,
+            );
+        }
         Ok(Some(Motive {
             domains,
             parameters,
@@ -100,8 +110,11 @@ impl Preparation<'_> {
         let mut motives = Vec::new();
         for (index, shape) in group.shapes.iter().enumerate() {
             self.tick()?;
-            let Some(motive) =
-                self.mutual_motive(&args[rec.num_params as usize + index], &shape.source)?
+            let Some(motive) = self.mutual_motive(
+                &args[rec.num_params as usize + index],
+                &shape.source,
+                &group.indices[index],
+            )?
             else {
                 return Ok(None);
             };
@@ -140,7 +153,7 @@ impl Preparation<'_> {
                 });
             }
             let lift = u32::try_from(depth).map_err(|_| unsupported("mutual minor scope"))?;
-            let extra = motive.parameters.len() - 1;
+            let extra = motive.parameters.len() - 1 - group.indices[index].len();
             let mut branches = Vec::new();
             let mut constructors = Vec::new();
             for (constructor_index, ctor) in shape.constructors.iter().enumerate() {
@@ -148,11 +161,22 @@ impl Preparation<'_> {
                 let mut body = self.lift(&args[minor_index], lift)?;
                 minor_index += 1;
                 let mut hypotheses = Vec::new();
+                let mut logical_fields = self.indexed_constructor_telescope(shape, ctor)?;
                 for (field_index, field_type) in ctor.fields.iter().enumerate() {
                     self.tick()?;
                     let field =
                         Expr::proj(shape.projection(ctor), field_index as u64, variable(0)?);
                     body = self.minor_apply(body, field.clone())?;
+                    let logical = self.type_head(&logical_fields)?;
+                    let ExprNode::ForallE {
+                        binder_type: logical_type,
+                        body: next_field,
+                        ..
+                    } = logical.node()
+                    else {
+                        return Err(unsupported("mutual constructor field telescope"));
+                    };
+                    logical_fields = self.substitution(next_field, &field)?;
                     if let Some(target) = group
                         .shapes
                         .iter()
@@ -162,7 +186,18 @@ impl Preparation<'_> {
                             Name::num(case_name.clone(), constructor_index as u64),
                             field_index as u64,
                         ));
-                        let peer = variable(motives.len() + motive.parameters.len() - target)?;
+                        let mut peer = variable(motives.len() + motive.parameters.len() - target)?;
+                        // The child belongs to its own sibling's index space.
+                        // Reconstruct its real indices from admitted field
+                        // types with preceding fields rebound to projections.
+                        for arg in self.indexed_field_arguments(
+                            logical_type,
+                            &group.shapes[target].source,
+                            group.indices[target].len(),
+                        )? {
+                            self.tick()?;
+                            peer = Expr::app(peer, arg);
+                        }
                         reserve(&mut hypotheses, self.limits.max_context_depth)?;
                         hypotheses.push((marker, Expr::app(peer, field), target));
                     }
@@ -225,7 +260,7 @@ impl Preparation<'_> {
             });
         }
         let mut arguments = Vec::new();
-        for arg in &args[group.arity - 1..] {
+        for arg in &args[group.arity - 1 - group.indices[group.selected].len()..] {
             reserve(&mut arguments, self.limits.max_application_args)?;
             arguments.push(arg.clone());
         }

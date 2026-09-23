@@ -52,10 +52,14 @@ and preparation in a 128 KiB host thread. The shared-IH regression computes
 duplicating a used hypothesis. It does not claim global memoization across
 separate constructor fields.
 
-This increment supports closed, non-indexed families with uniform static type
-parameters and representable, nondependent fields. Proof/value-dependent fields,
-higher-order recursive fields, nested recursive type constructors, and dependent
-motives remain unsupported. Source-level mutually recursive `def` groups are not
-added: full folds use the already checked primitive mutual recursors. Unsupported
-layouts or folds remain typed refusals. These are native FIR layouts, not a claim of Reference
+The native profile supports closed type parameters and field representations
+that are independent of runtime values after proof and scalar-index erasure.
+Mutually indexed families now execute through the same peer-closure machinery;
+see `NATIVE_MUTUAL_INDEXED_RUNTIME.md` for their per-member index telescopes and
+supported dependent motives. Checked proof fields keep their inert slots.
+Function-valued mutual recursive children, nested recursive type constructors,
+and representation-dependent fields/motives remain unsupported. Source-level
+mutually recursive `def` groups are not added: full folds use the already checked
+primitive mutual recursors. Unsupported layouts and incompatible callable
+interfaces remain typed refusals. These are native FIR layouts, not Reference
 packed-object ABI parity or completion of the Golem integration workstream.
