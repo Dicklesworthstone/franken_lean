@@ -10,6 +10,7 @@ impl Plan {
     pub(super) fn new(
         modules: &[SourceModuleInput<'_>],
         entry: &Name,
+        provided: &std::collections::BTreeSet<Name>,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
         if modules.is_empty() {
@@ -66,6 +67,11 @@ impl Plan {
             let mut direct = Vec::new();
             for name in &header.imports {
                 validate_name(name, meter)?;
+                // An import the base engine already admitted from `.olean`
+                // artifacts is satisfied there and adds no source edge.
+                if !by_name.contains_key(name) && provided.contains(name) {
+                    continue;
+                }
                 direct.push(by_name.get(name).copied().ok_or_else(|| {
                     SourceModuleCheckError::MissingModule {
                         importer: module.name.clone(),

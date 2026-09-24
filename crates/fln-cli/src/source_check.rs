@@ -104,14 +104,18 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES));
-            let engine = match fln::Engine::with_coercion_seed(admission) {
-                Ok(fln::Outcome::Complete(engine)) => engine,
-                Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source prelude could not complete", false, json, 3),
-                Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source prelude faulted", false, json, 4),
+            let seed = || match fln::Engine::with_coercion_seed(admission) {
+                Ok(fln::Outcome::Complete(engine)) => Ok(engine),
+                Ok(fln::Outcome::Inconclusive(_)) => Err(imports::Failure::new("inconclusive", "source prelude could not complete", false, 3)),
+                Ok(fln::Outcome::InternalFault(_)) => Err(imports::Failure::new("internal-fault", "source prelude faulted", false, 4)),
                 Err(error) => {
                     let (class, authority, exit) = admission_error_disposition(&error);
-                    return failed(class, &error.to_string(), authority, json, exit);
+                    Err(imports::Failure::new(class, &error.to_string(), authority, exit))
                 }
+            };
+            let (engine, olean_base) = match loaded.base_engine(seed) {
+                Ok(base) => base,
+                Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
@@ -121,12 +125,18 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source check encountered an internal fault", false, json, 4),
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
+            let olean_json = olean_base.as_ref().map_or(String::new(), |base| {
+                format!(",\"oleanImports\":{{\"trust\":\"recheck\",\"modules\":{},\"declarations\":{}}}", base.modules, base.declarations)
+            });
             let stdout = if json {
-                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false}}\n",
+                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,
-                    json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()))
+                    json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
-                format!("Checked {} source commands ({} theorems) in {} files; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
+                let base = olean_base.as_ref().map_or(String::new(), |base| {
+                    format!(" against {} imported .olean modules ({} declarations, each admitted by K1 and the independent checker)", base.modules, base.declarations)
+                });
+                format!("Checked {} source commands ({} theorems) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
             MultiplexerOutput::success(stdout)
         });

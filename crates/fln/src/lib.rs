@@ -635,6 +635,28 @@ pub fn decode_olean_artifact(
     })
 }
 
+/// The direct imports of one `.olean`, read from its exported part without
+/// decoding its declarations: enough to compute an import closure before
+/// deciding which artifacts to read in full.
+pub fn olean_module_imports(
+    artifact: &[u8],
+    limits: OleanDecodeLimits,
+) -> Result<Vec<Name>, OleanDecodeError> {
+    if artifact.len() > limits.max_bytes {
+        return Err(OleanDecodeError::ArtifactTooLarge {
+            bytes: artifact.len(),
+            limit: limits.max_bytes,
+        });
+    }
+    let view = OleanView::parse(artifact)?;
+    let module = view.module_data(limits.module)?;
+    Ok(module
+        .imports
+        .iter()
+        .map(|import| import.module.clone())
+        .collect())
+}
+
 /// Audit and decode one complete module-system `.olean` artifact chain.
 ///
 /// The exported part supplies the import graph and public module metadata.
@@ -1986,6 +2008,7 @@ impl EngineBuilder {
         Engine {
             environment: Environment::new(),
             checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -1998,6 +2021,7 @@ impl EngineBuilder {
         Engine {
             environment,
             checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2017,6 +2041,7 @@ impl EngineBuilder {
         Engine {
             environment: state.environment().clone(),
             checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2114,6 +2139,10 @@ impl Default for EngineBuilder {
 pub struct Engine {
     environment: Environment,
     checker_environment: Option<CheckerConstantEnvironment>,
+    /// Modules whose `.olean` declarations this engine's environment admitted
+    /// through [`Engine::check_olean_modules`]; source imports of them are
+    /// satisfied by the base rather than by a source module.
+    imported_modules: std::sync::Arc<BTreeSet<Name>>,
     epoch: ModuleEpoch,
     mode: Mode,
     reproducibility: ReproducibilityProfile,
@@ -2319,6 +2348,7 @@ impl Engine {
         Self {
             environment,
             checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
             epoch: Self::pinned_epoch(),
             mode: Mode::DEFAULT,
             reproducibility: ReproducibilityProfile::Standard,
@@ -2339,6 +2369,7 @@ impl Engine {
         Self {
             environment: state.environment().clone(),
             checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2409,6 +2440,11 @@ impl Engine {
     /// will be checked.
     pub fn environment(&self) -> &Environment {
         &self.environment
+    }
+
+    /// Modules admitted from `.olean` artifacts into this engine's environment.
+    pub fn imported_modules(&self) -> &BTreeSet<Name> {
+        &self.imported_modules
     }
 
     /// The deterministic identity of this snapshot under the caller's exact
@@ -2605,6 +2641,54 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        let ordered = self.decode_olean_module_set(modules, limits)?;
+        let base_logical_root = self.logical_root(options);
+        let mut engine = self.clone();
+        let mut checked_modules = Vec::new();
+        checked_modules
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean checked module records",
+                requested: ordered.len(),
+            })?;
+        for (name, artifact) in ordered {
+            let checked = match engine.check_decoded_olean(artifact, options, limits)? {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            engine = checked.engine;
+            checked_modules.push(CheckedOleanModule {
+                name,
+                decoded: checked.decoded,
+                base_logical_root: checked.base_logical_root,
+                result_logical_root: checked.result_logical_root,
+                declarations: checked.declarations,
+            });
+        }
+        let mut imported = (*engine.imported_modules).clone();
+        imported.extend(checked_modules.iter().map(|module| module.name.clone()));
+        engine.imported_modules = std::sync::Arc::new(imported);
+        let result_logical_root = engine.logical_root(options);
+        Ok(Outcome::Complete(CheckedOleanSet {
+            engine,
+            base_logical_root,
+            result_logical_root,
+            modules: checked_modules,
+        }))
+    }
+
+    /// Decode a closed set of named `.olean` modules and return them in the
+    /// deterministic import-topological order both import trust levels use.
+    ///
+    /// Every direct import must name another input row, and a name declared by
+    /// several modules must be a repeat the Reference's import accepts
+    /// (`subsumesInfo`); nothing is admitted here.
+    fn decode_olean_module_set(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+    ) -> Result<Vec<(Name, DecodedOlean)>, OleanCheckError> {
         if modules.is_empty() {
             return Err(OleanCheckError::EmptyModuleSet);
         }
@@ -2840,14 +2924,12 @@ impl Engine {
             });
         }
 
-        let base_logical_root = self.logical_root(options);
-        let mut engine = self.clone();
-        let mut checked_modules = Vec::new();
-        checked_modules
-            .try_reserve_exact(modules.len())
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(order.len())
             .map_err(|_| OleanCheckError::AllocationFailure {
-                resource: ".olean checked module records",
-                requested: modules.len(),
+                resource: ".olean ordered module set",
+                requested: order.len(),
             })?;
         for index in order {
             let Some(slot) = decoded.get_mut(index) else {
@@ -2855,32 +2937,14 @@ impl Engine {
                     detail: "topological module is outside the decoded table",
                 });
             };
-            let Some((name, artifact)) = slot.take() else {
+            let Some(module) = slot.take() else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "topological module was consumed more than once",
                 });
             };
-            let checked = match engine.check_decoded_olean(artifact, options, limits)? {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            engine = checked.engine;
-            checked_modules.push(CheckedOleanModule {
-                name,
-                decoded: checked.decoded,
-                base_logical_root: checked.base_logical_root,
-                result_logical_root: checked.result_logical_root,
-                declarations: checked.declarations,
-            });
+            ordered.push(module);
         }
-        let result_logical_root = engine.logical_root(options);
-        Ok(Outcome::Complete(CheckedOleanSet {
-            engine,
-            base_logical_root,
-            result_logical_root,
-            modules: checked_modules,
-        }))
+        Ok(ordered)
     }
 
     pub fn check_decoded_olean(
@@ -3147,6 +3211,7 @@ impl Engine {
             engine: Engine {
                 environment,
                 checker_environment: Some(checker_environment),
+                imported_modules: std::sync::Arc::clone(&self.imported_modules),
                 epoch: self.epoch.clone(),
                 mode: self.mode,
                 reproducibility: self.reproducibility,

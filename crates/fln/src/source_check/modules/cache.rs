@@ -184,7 +184,7 @@ pub(super) fn run(
         bytes: 0,
         limits,
     };
-    let plan = graph::Plan::new(modules, entry, &mut meter)?;
+    let plan = graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?;
     let base_logical_root = base.logical_root(options);
     let mut exports: BTreeMap<usize, Arc<replay::Export>> = BTreeMap::new();
     let mut stamps: BTreeMap<usize, Arc<()>> = BTreeMap::new();
