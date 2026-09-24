@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+mod olean_imports;
 pub mod source_check;
 mod source_execution;
 mod source_records;
@@ -912,15 +913,16 @@ pub enum OleanCheckError {
     DuplicateDeclaration {
         name: Name,
     },
-    /// Two modules of one closed set decode to DIFFERENT declarations sharing
-    /// a name.
+    /// Two modules of one closed set decode to declarations sharing a name
+    /// where neither subsumes the other.
     ///
     /// Re-generated equation and congruence lemmas legitimately repeat a name
-    /// across modules, so a name collision alone is not a fault. A collision
-    /// whose two sides disagree is: the set has no single coherent meaning for
-    /// that name, and admitting it in dependency order would let whichever
-    /// module sorted first silently win while the other was rejected as
-    /// already-declared — a kernel-shaped complaint about what is really a
+    /// across modules, so a name collision alone is not a fault, and neither
+    /// is a repeat the Reference's import accepts (`subsumesInfo`). A
+    /// collision neither side subsumes is: the set has no single coherent
+    /// meaning for that name, and admitting it in dependency order would let
+    /// whichever module sorted first silently win while the other was rejected
+    /// as already-declared — a kernel-shaped complaint about what is really a
     /// property of the input set.
     ConflictingModuleDeclaration {
         name: Name,
@@ -1137,6 +1139,9 @@ struct OleanDeclarationPlan {
     units: Vec<OleanDeclarationUnit>,
     order: Vec<usize>,
     already_present: Vec<(Name, CheckerAgreement)>,
+    /// Non-identical repeats of an admitted name that the Reference's import
+    /// accepts (`subsumesInfo`); their own bodies still need a check.
+    subsumed: Vec<ConstantInfo>,
 }
 
 fn unsupported_mutual_envelope(value: &DefinitionVal) -> OleanCheckError {
@@ -1574,6 +1579,7 @@ fn plan_olean_declarations(
     let mut seen_names = BTreeSet::new();
     let mut owners = BTreeMap::new();
     let mut already_present = Vec::new();
+    let mut subsumed = Vec::new();
     let mut new_constants = Vec::new();
 
     for info in constants {
@@ -1585,6 +1591,13 @@ fn plan_olean_declarations(
 
         if let Some(existing) = base.find(info.name()) {
             if *existing != *info {
+                let lookup = |name: &Name| base.find(name);
+                if olean_imports::subsumes_info(&lookup, existing, info)
+                    || olean_imports::subsumes_info(&lookup, info, existing)
+                {
+                    subsumed.push(info.clone());
+                    continue;
+                }
                 return Err(OleanCheckError::DuplicateDeclaration {
                     name: info.name().clone(),
                 });
@@ -1730,6 +1743,7 @@ fn plan_olean_declarations(
         units,
         order,
         already_present,
+        subsumed,
     })
 }
 
@@ -2679,12 +2693,19 @@ impl Engine {
         // lemmas.
         //
         // A repeat is therefore NOT a fault by itself, and refusing one would
-        // reject the real corpus. A repeat whose two sides DISAGREE is a fault:
-        // the set has no single meaning for that name, and admission in
-        // dependency order would let whichever module sorted first silently win
-        // while the loser surfaced as an already-declared rejection from the
-        // kernel — attributing to the kernel what is a property of the input.
-        // This names both modules instead, at decode time.
+        // reject the real corpus. Nor does a repeat need to be byte-identical:
+        // the Reference's import accepts one copy that subsumes the other
+        // (`subsumesInfo`: the same name, level parameters, and a statement
+        // equal up to binder names and binder info, with the kind rules in
+        // `olean_imports`), and the pinned `Init` closure carries 16 such pairs:
+        // identical statements, different proof terms, so the per-module plan
+        // rechecks each repeat's own proof. A repeat that
+        // neither side subsumes is a fault: the set has no single meaning for
+        // that name, and admission in dependency order would let whichever
+        // module sorted first silently win while the loser surfaced as an
+        // already-declared rejection from the kernel — attributing to the
+        // kernel what is a property of the input. This names both modules
+        // instead, at decode time.
         let mut declared: BTreeMap<&Name, (&Name, &ConstantInfo)> = BTreeMap::new();
         for entry in &decoded {
             let Some((module_name, artifact)) = entry.as_ref() else {
@@ -2694,16 +2715,26 @@ impl Engine {
             };
             for info in &artifact.constants {
                 match declared.get(info.name()) {
-                    Some((owner, previous)) if *previous != info => {
-                        return Err(OleanCheckError::ConflictingModuleDeclaration {
-                            name: info.name().clone(),
-                            first_module: (*owner).clone(),
-                            second_module: module_name.clone(),
-                        });
+                    Some(&(owner, previous)) if previous != info => {
+                        let lookup = |name: &Name| {
+                            declared
+                                .get(name)
+                                .map(|entry| entry.1)
+                                .or_else(|| self.environment.find(name))
+                        };
+                        if !olean_imports::subsumes_info(&lookup, previous, info)
+                            && !olean_imports::subsumes_info(&lookup, info, previous)
+                        {
+                            return Err(OleanCheckError::ConflictingModuleDeclaration {
+                                name: info.name().clone(),
+                                first_module: owner.clone(),
+                                second_module: module_name.clone(),
+                            });
+                        }
                     }
-                    // An identical repeat is benign: both modules mean the same
-                    // declaration, so the set stays coherent. Keep the first
-                    // owner so a later conflict is reported against it.
+                    // An identical or subsuming repeat is coherent. Keep the
+                    // first owner so a later conflict is reported against it;
+                    // the per-module plan rechecks a subsuming copy's body.
                     Some(_) => {}
                     None => {
                         declared.insert(info.name(), (module_name, info));
@@ -2861,11 +2892,16 @@ impl Engine {
         let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
         let base_logical_root = self.logical_root(options);
         if plan.order.is_empty() {
-            let checked = plan
+            let mut checked: Vec<OleanCheckedDeclaration> = plan
                 .already_present
                 .into_iter()
                 .map(|(name, checker)| OleanCheckedDeclaration { name, checker })
                 .collect();
+            match self.recheck_subsumed_repeats(plan.subsumed, options, limits.admission)? {
+                Outcome::Complete(rechecked) => checked.extend(rechecked),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
             return Ok(Outcome::Complete(CheckedOlean {
                 engine: self.clone(),
                 decoded,
@@ -2926,6 +2962,14 @@ impl Engine {
         for (name, checker) in plan.already_present {
             checked.push(OleanCheckedDeclaration { name, checker });
         }
+        match admitted
+            .engine
+            .recheck_subsumed_repeats(plan.subsumed, options, limits.admission)?
+        {
+            Outcome::Complete(rechecked) => checked.extend(rechecked),
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        }
         if checked.len() != decoded.constants.len() {
             return Err(OleanCheckError::InternalInvariant {
                 detail: "checked declaration count differs from the decoded declaration table",
@@ -2938,6 +2982,61 @@ impl Engine {
             result_logical_root: admitted.result_logical_root,
             declarations: checked,
         }))
+    }
+
+    /// Check the body of each repeat the Reference's import accepts over an
+    /// already admitted copy (`subsumesInfo`), so that "checked" stays literal.
+    ///
+    /// A theorem is admitted under a fresh scratch name against this engine and
+    /// the successor is discarded: the published environment keeps the first
+    /// copy. An axiom repeat has no body, and its statement is equal up to
+    /// binder names and binder info to one already checked.
+    fn recheck_subsumed_repeats(
+        &self,
+        repeats: Vec<ConstantInfo>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Vec<OleanCheckedDeclaration>>, OleanCheckError> {
+        let mut checked = Vec::new();
+        for repeat in repeats {
+            let name = repeat.name().clone();
+            let checker = match repeat {
+                ConstantInfo::Thm(mut theorem) => {
+                    let mut scratch = Name::str(name.clone(), "_fln_subsumed_repeat");
+                    let mut suffix = 0_u64;
+                    while self.environment.contains(&scratch) {
+                        suffix += 1;
+                        scratch =
+                            Name::num(Name::str(name.clone(), "_fln_subsumed_repeat"), suffix);
+                    }
+                    theorem.base.name = scratch.clone();
+                    for member in &mut theorem.all {
+                        if *member == name {
+                            *member = scratch.clone();
+                        }
+                    }
+                    match self
+                        .admit_declaration(Declaration::Thm(theorem), options, limits)
+                        .map_err(OleanCheckError::Admission)?
+                    {
+                        Outcome::Complete(admission) => admission.checker,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+                ConstantInfo::Axiom(_) => CheckerAgreement {
+                    schema: "fln-checker/v1",
+                    ground: CheckerAdmissionGround::AxiomPreamble,
+                },
+                _ => {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "only theorems and axioms can subsume an admitted repeat",
+                    });
+                }
+            };
+            checked.push(OleanCheckedDeclaration { name, checker });
+        }
+        Ok(Outcome::Complete(checked))
     }
 
     /// Admit and publish one declaration without compiling or executing it.
@@ -9725,6 +9824,111 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["second_postulate"]))
         );
+    }
+
+    #[test]
+    fn a_subsuming_olean_repeat_is_planned_then_its_own_body_is_rechecked() {
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let admit = |engine: &Engine, declaration: Declaration| -> Engine {
+            match engine.admit_declaration(declaration, &options, limits) {
+                Ok(Outcome::Complete(admitted)) => Some(admitted.engine),
+                _ => None,
+            }
+            .expect("setup admission must complete")
+        };
+        let nat = nat_type();
+        let proposition = Expr::const_(Name::from_components(["P"]), Vec::new());
+        let proof = Expr::const_(Name::from_components(["h"]), Vec::new());
+        let statement = |binder: &str, info: BinderInfo| {
+            Expr::forall_e(
+                Name::from_components([binder]),
+                nat.clone(),
+                proposition.clone(),
+                info,
+            )
+        };
+        let engine = admit(
+            &seeded_engine(),
+            typed_axiom("P", Expr::sort(Level::zero())),
+        );
+        let engine = admit(&engine, typed_axiom("h", proposition.clone()));
+        let first_body = Expr::lam(
+            Name::from_components(["x"]),
+            nat.clone(),
+            proof.clone(),
+            BinderInfo::Default,
+        );
+        let engine = admit(
+            &engine,
+            theorem("t", statement("x", BinderInfo::Default), first_body),
+        );
+        let root = engine.logical_root(&options);
+
+        // A repeat the Reference's rule admits: renamed binders and a different
+        // binder style in the statement, and its own proof term.
+        let repeat = |value: Expr| match theorem("t", statement("y", BinderInfo::Implicit), value) {
+            Declaration::Thm(theorem) => ConstantInfo::Thm(theorem),
+            _ => unreachable!("theorem() builds a theorem"),
+        };
+        let own_body = Expr::lam(
+            Name::from_components(["y"]),
+            nat.clone(),
+            proof.clone(),
+            BinderInfo::Implicit,
+        );
+        let olean_limits = OleanCheckLimits::new(1 << 20, test_budget());
+        let plan =
+            super::plan_olean_declarations(engine.environment(), &[repeat(own_body)], olean_limits)
+                .expect("the Reference's import accepts a subsuming repeat");
+        assert!(plan.order.is_empty() && plan.already_present.is_empty());
+        assert_eq!(plan.subsumed.len(), 1);
+
+        let rechecked = match engine
+            .recheck_subsumed_repeats(plan.subsumed, &options, limits)
+            .expect("a well-typed repeat body rechecks")
+        {
+            Outcome::Complete(rechecked) => Some(rechecked),
+            _ => None,
+        }
+        .expect("the recheck answers completely");
+        assert_eq!(rechecked.len(), 1);
+        assert_eq!(rechecked[0].name, Name::from_components(["t"]));
+        assert_eq!(
+            rechecked[0].checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert_eq!(
+            engine.logical_root(&options),
+            root,
+            "the recheck publishes nothing"
+        );
+
+        // The repeat's own body is what gets checked: a proof of `P` where a
+        // proof of `∀ y, P` is due is refused.
+        let bad =
+            super::plan_olean_declarations(engine.environment(), &[repeat(proof)], olean_limits)
+                .expect("the statement still subsumes");
+        assert!(
+            engine
+                .recheck_subsumed_repeats(bad.subsumed, &options, limits)
+                .is_err(),
+            "an ill-typed repeat body must not be counted as checked"
+        );
+
+        // A repeat whose statement differs is not subsumed.
+        let other = match theorem(
+            "t",
+            proposition.clone(),
+            Expr::const_(Name::from_components(["h"]), Vec::new()),
+        ) {
+            Declaration::Thm(theorem) => ConstantInfo::Thm(theorem),
+            _ => unreachable!("theorem() builds a theorem"),
+        };
+        assert!(matches!(
+            super::plan_olean_declarations(engine.environment(), &[other], olean_limits),
+            Err(OleanCheckError::DuplicateDeclaration { .. })
+        ));
     }
 
     #[test]
