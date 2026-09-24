@@ -1375,9 +1375,16 @@ impl Expr {
         if self.loose_bvar_range() <= idx {
             return false;
         }
+        // One allocation can occur at several binder depths. Remember the
+        // effective index as well, or a miss outside a binder could hide a hit
+        // inside it. The borrowed root keeps every identity live for this walk.
+        let mut visited = HashSet::new();
         let mut stack = vec![(self, idx)];
         while let Some((current, i)) = stack.pop() {
             if current.loose_bvar_range() <= i {
+                continue;
+            }
+            if !visited.insert((current.allocation_identity(), i)) {
                 continue;
             }
             match current.node() {

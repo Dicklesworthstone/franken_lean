@@ -461,8 +461,14 @@ impl Level {
 
     /// `Level.isNeverZero` (Level.lean:210-217).
     pub fn is_never_zero(&self) -> bool {
+        // Predicate results are independent of the path to an immutable node.
+        // Keep this call-local: no address escapes the borrowed root's lifetime.
+        let mut visited = HashSet::new();
         let mut stack = vec![self];
         while let Some(current) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(current.node_arc())) {
+                continue;
+            }
             match current.node() {
                 Node::Succ(_) => return true,
                 Node::Max(u, v) => {
@@ -478,8 +484,14 @@ impl Level {
 
     /// `Level.isAlwaysZero` (Level.lean:199-208).
     pub fn is_always_zero(&self) -> bool {
+        // Predicate results are independent of the path to an immutable node.
+        // Keep this call-local: no address escapes the borrowed root's lifetime.
+        let mut visited = HashSet::new();
         let mut stack = vec![self];
         while let Some(current) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(current.node_arc())) {
+                continue;
+            }
             match current.node() {
                 Node::Zero => {}
                 Node::Max(u, v) => {
@@ -495,8 +507,14 @@ impl Level {
 
     /// `Level.occurs u v` — does `self` occur (as a subterm) in `inside`?
     pub fn occurs_in(&self, inside: &Level) -> bool {
+        // Predicate results are independent of the path to an immutable node.
+        // Keep this call-local: no address escapes the borrowed root's lifetime.
+        let mut visited = HashSet::new();
         let mut stack = vec![inside];
         while let Some(current) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(current.node_arc())) {
+                continue;
+            }
             if self == current {
                 return true;
             }
@@ -516,14 +534,46 @@ impl Level {
     /// through `mkLevelMax` — faithful, not a typo here.
     pub fn dec(&self) -> Option<Level> {
         match self.node() {
-            Node::Zero | Node::Param(_) | Node::MVar(_) => None,
-            Node::Succ(u) => Some(u.clone()),
-            Node::Max(u, v) | Node::IMax(u, v) => {
-                let du = u.dec()?;
-                let dv = v.dec()?;
-                Some(Level::max(du, dv).expect("dec cannot deepen"))
-            }
+            Node::Succ(inner) => return Some(inner.clone()),
+            Node::Zero | Node::Param(_) | Node::MVar(_) => return None,
+            Node::Max(..) | Node::IMax(..) => {}
         }
+        // Post-order over allocations, not occurrences: decrementing a diamond
+        // must preserve its sharing instead of building an exponential tree.
+        // Only Max/IMax descend. A non-decrementable leaf on this frontier makes
+        // the entire result None; a Succ retains its child without descending.
+        let mut done: HashMap<*const Node, Level> = HashMap::new();
+        let mut stack = vec![(self, false)];
+        while let Some((current, exit)) = stack.pop() {
+            let key = Arc::as_ptr(current.node_arc());
+            if done.contains_key(&key) {
+                continue;
+            }
+            let value = match current.node() {
+                Node::Zero | Node::Param(_) | Node::MVar(_) => return None,
+                Node::Succ(inner) => inner.clone(),
+                Node::Max(left, right) | Node::IMax(left, right) => {
+                    if !exit {
+                        stack.push((current, true));
+                        stack.push((right, false));
+                        stack.push((left, false));
+                        continue;
+                    }
+                    let left = done
+                        .get(&Arc::as_ptr(left.node_arc()))
+                        .expect("dec scheduled the left child")
+                        .clone();
+                    let right = done
+                        .get(&Arc::as_ptr(right.node_arc()))
+                        .expect("dec scheduled the right child")
+                        .clone();
+                    // The pin uses MAX even when the input constructor is IMAX.
+                    Level::max(left, right).expect("dec cannot deepen")
+                }
+            };
+            done.insert(key, value);
+        }
+        done.remove(&Arc::as_ptr(self.node_arc()))
     }
 
     // ---- normalization -----------------------------------------------------------------
@@ -542,51 +592,45 @@ impl Level {
 
     /// `normLtAux` (Level.lean:274-293).
     fn norm_lt_aux(mut l1: &Level, mut k1: u32, mut l2: &Level, mut k2: u32) -> bool {
-        // Peel succ towers on the heap. A 24-bit-legal tower would blow the
-        // host stack if this stayed recursive (FL-INV-07).
+        // Every descent is a tail step, including Max/IMax (not only Succ).
+        // Unequal, deeply nested levels must not consume the native call stack.
         loop {
-            if let Node::Succ(u1) = l1.node() {
-                l1 = u1;
+            while let Node::Succ(inner) = l1.node() {
+                l1 = inner;
                 k1 += 1;
-                continue;
             }
-            if let Node::Succ(u2) = l2.node() {
-                l2 = u2;
+            while let Node::Succ(inner) = l2.node() {
+                l2 = inner;
                 k2 += 1;
-                continue;
             }
-            break;
-        }
-        match (l1.node(), l2.node()) {
-            (Node::Max(a1, b1), Node::Max(a2, b2)) | (Node::IMax(a1, b1), Node::IMax(a2, b2)) => {
-                if l1 == l2 {
-                    k1 < k2
-                } else if a1 != a2 {
-                    Level::norm_lt_aux(a1, 0, a2, 0)
-                } else {
-                    Level::norm_lt_aux(b1, 0, b2, 0)
+            match (l1.node(), l2.node()) {
+                (Node::Max(a1, b1), Node::Max(a2, b2))
+                | (Node::IMax(a1, b1), Node::IMax(a2, b2)) => {
+                    if l1 == l2 {
+                        return k1 < k2;
+                    }
+                    if a1 != a2 {
+                        l1 = a1;
+                        l2 = a2;
+                    } else {
+                        l1 = b1;
+                        l2 = b2;
+                    }
+                    k1 = 0;
+                    k2 = 0;
                 }
-            }
-            (Node::Param(n1), Node::Param(n2)) => {
-                if n1 == n2 {
-                    k1 < k2
-                } else {
-                    // Name.lt (lexicographical): stable across shifted mvar indexes.
-                    n1.lt(n2)
+                (Node::Param(n1), Node::Param(n2)) => {
+                    return if n1 == n2 { k1 < k2 } else { n1.lt(n2) };
                 }
-            }
-            (Node::MVar(m1), Node::MVar(m2)) => {
-                if m1 == m2 {
-                    k1 < k2
-                } else {
-                    m1.0.lt(&m2.0)
+                (Node::MVar(m1), Node::MVar(m2)) => {
+                    return if m1 == m2 { k1 < k2 } else { m1.0.lt(&m2.0) };
                 }
-            }
-            _ => {
-                if l1 == l2 {
-                    k1 < k2
-                } else {
-                    l1.ctor_rank() < l2.ctor_rank()
+                _ => {
+                    return if l1 == l2 {
+                        k1 < k2
+                    } else {
+                        l1.ctor_rank() < l2.ctor_rank()
+                    };
                 }
             }
         }
@@ -625,16 +669,24 @@ impl Level {
     }
 
     /// Flatten nested `max` without normalizing. Left child first.
+    ///
+    /// Repeated allocations contribute the same leaves. Max is idempotent and
+    /// finish_max_normalize sorts and coalesces equal bases, so retaining the
+    /// first visit preserves the pin's output while avoiding tree expansion.
     fn raw_max_leaves(level: &Level) -> Vec<Level> {
         let mut out = Vec::new();
-        let mut stack = vec![level.clone()];
+        let mut visited = HashSet::new();
+        let mut stack = vec![level];
         while let Some(current) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(current.node_arc())) {
+                continue;
+            }
             match current.node() {
                 Node::Max(a, b) => {
-                    stack.push(b.clone());
-                    stack.push(a.clone());
+                    stack.push(b);
+                    stack.push(a);
                 }
-                _ => out.push(current),
+                _ => out.push(current.clone()),
             }
         }
         out
@@ -654,9 +706,16 @@ impl Level {
     /// form, then flatten any `max` that normalization produced (`already =
     /// true` — no second normalize).
     fn append_normed_max_args(done: &HashMap<Level, Level>, level: &Level, out: &mut Vec<Level>) {
+        // Normalization can expose another shared Max graph. All nodes here
+        // remain owned by `level` or `done`, so pointer identities stay live even
+        // after a temporary `normalized` clone is dropped.
+        let mut visited = HashSet::new();
         for leaf in Level::raw_max_leaves(level) {
             let mut rest = vec![Level::lookup_norm(done, &leaf)];
             while let Some(normalized) = rest.pop() {
+                if !visited.insert(Arc::as_ptr(normalized.node_arc())) {
+                    continue;
+                }
                 match normalized.node() {
                     Node::Max(a, b) => {
                         rest.push(b.clone());
