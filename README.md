@@ -210,7 +210,7 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
-> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `lake` and `leanc` toolchain personalities are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The remaining verbs above (`serve-mcp`, `cache`, `replay`, `build explain`) are the 1.0 target this README describes, not shipped code.
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `lake` and `leanc` toolchain personalities are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate, and `build explain` runs but derives its rebuild decisions from heuristics rather than the native decision engine (franken_lean-z8j.1.2).
 
 ## Installation
 

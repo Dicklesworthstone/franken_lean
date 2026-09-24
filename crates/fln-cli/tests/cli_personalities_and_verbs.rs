@@ -117,7 +117,10 @@ fn unimplemented_verbs_exit_five_with_a_typed_notice() {
     for (args, expected_gate) in [
         (vec!["serve-mcp"], "G6"),
         (vec!["replay"], "G5"),
+        (vec!["replay", "trace.bundle"], "G5"),
         (vec!["cache", "stats"], "G2"),
+        (vec!["cache", "inspect"], "G2"),
+        (vec!["cache", "clear"], "G2"),
         (vec!["doctor", "--sql"], "G5"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
