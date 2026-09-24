@@ -889,6 +889,23 @@ pub struct OleanFrontierRow {
     pub elapsed: std::time::Duration,
 }
 
+/// What a frontier observer is told, in order: `Started` just before a module's
+/// declarations go to the council, `Decided` once its row exists. A module that is
+/// blocked, or that failed to decode, is decided without ever starting.
+#[derive(Debug, Clone, Copy)]
+pub enum OleanFrontierEvent<'a> {
+    Started {
+        position: usize,
+        total: usize,
+        module: &'a Name,
+    },
+    Decided {
+        position: usize,
+        total: usize,
+        row: &'a OleanFrontierRow,
+    },
+}
+
 /// Per-module result of checking a closed `.olean` set without stopping at the first
 /// failure. `engine` holds exactly the accepted modules.
 #[derive(Debug)]
@@ -2810,6 +2827,20 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_observed(modules, options, limits, &mut |_| {})
+    }
+
+    /// [`Engine::check_olean_frontier`], reporting each [`OleanFrontierEvent`] as it
+    /// happens, so a long lane always names the module in flight and a run stopped
+    /// part-way still leaves the rows it had decided. The observer sees the rows in
+    /// the order of the returned frontier and cannot change them.
+    pub fn check_olean_frontier_observed(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
         let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> = modules
             .iter()
@@ -2903,6 +2934,11 @@ impl Engine {
                             by: modules[*blocker].name.clone(),
                         }
                     } else {
+                        on_event(OleanFrontierEvent::Started {
+                            position: rows.len() + 1,
+                            total: modules.len(),
+                            module: &name,
+                        });
                         match engine.check_decoded_olean(artifact, options, limits) {
                             Ok(Outcome::Complete(checked)) => {
                                 let declarations = checked.declarations.len();
@@ -2924,11 +2960,17 @@ impl Engine {
                     }
                 }
             };
-            rows.push(OleanFrontierRow {
+            let row = OleanFrontierRow {
                 name,
                 verdict,
                 elapsed: started.elapsed(),
+            };
+            on_event(OleanFrontierEvent::Decided {
+                position: rows.len() + 1,
+                total: modules.len(),
+                row: &row,
             });
+            rows.push(row);
         }
         Ok(OleanFrontier { engine, rows })
     }

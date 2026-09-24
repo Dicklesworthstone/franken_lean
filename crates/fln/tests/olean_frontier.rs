@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use fln::{
-    Budget, Engine, Environment, KVMap, Name, OleanCheckError, OleanCheckLimits, OleanModuleInput,
-    OleanModuleVerdict,
+    Budget, Engine, Environment, KVMap, Name, OleanCheckError, OleanCheckLimits,
+    OleanFrontierEvent, OleanModuleInput, OleanModuleVerdict,
 };
 
 const STACK: usize = 256 * 1024 * 1024;
@@ -91,11 +91,43 @@ fn a_failing_module_blocks_only_its_dependents() {
                     private_artifact: Some(private),
                 })
                 .collect();
+            let mut observed = Vec::new();
+            let mut started = Vec::new();
             let frontier = Engine::from_environment(Environment::new())
-                .check_olean_frontier(&inputs, &KVMap::new(), limits)
+                .check_olean_frontier_observed(&inputs, &KVMap::new(), limits, &mut |event| {
+                    match event {
+                        OleanFrontierEvent::Started {
+                            position, module, ..
+                        } => started.push((position, module.clone())),
+                        OleanFrontierEvent::Decided {
+                            position,
+                            total,
+                            row,
+                        } => observed.push((position, total, row.name.clone())),
+                    }
+                })
                 .expect("the set itself is well formed");
 
             assert_eq!(frontier.rows.len(), 4, "every module gets exactly one row");
+            // The observer (behind `check-olean --continue --progress`) sees every
+            // row once, in the returned order, as it is decided.
+            let expected: Vec<(usize, usize, Name)> = frontier
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (index + 1, 4, row.name.clone()))
+                .collect();
+            assert_eq!(observed, expected);
+            // Only modules that reach the council start: the undecodable Init.Coe and
+            // its blocked dependent are decided without starting.
+            let accepted: Vec<(usize, Name)> = frontier
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches!(row.verdict, OleanModuleVerdict::Accepted { .. }))
+                .map(|(index, row)| (index + 1, row.name.clone()))
+                .collect();
+            assert_eq!(started, accepted);
             let verdict = |module: &str| {
                 &frontier
                     .rows

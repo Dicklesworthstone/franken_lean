@@ -201,6 +201,22 @@ fn check_olean_continue_refuses_receipts_a_single_file_and_repeats() {
         stderr.contains("--continue may be supplied at most once"),
         "{stderr}"
     );
+
+    // --progress streams frontier rows, so it means nothing without --continue.
+    let (code, stderr) = run(&["--progress".as_ref(), crate_dir.as_os_str()]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("it requires --continue"), "{stderr}");
+    let (code, stderr) = run(&[
+        "--continue".as_ref(),
+        "--progress".as_ref(),
+        "--progress".as_ref(),
+        crate_dir.as_os_str(),
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--progress may be supplied at most once"),
+        "{stderr}"
+    );
 }
 
 /// A3 criterion 2: the K2 line is tied to the engines the kernel crate exports, in
