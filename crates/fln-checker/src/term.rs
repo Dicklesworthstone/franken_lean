@@ -499,7 +499,7 @@ struct Transformer<'a, 'c> {
     nodes: Vec<ExprNode>,
     levels: Vec<LevelNode>,
     level_maps: [Option<Vec<LevelId>>; 2],
-    compact_level_maps: [BTreeMap<usize, LevelId>; 2],
+    compact_level_maps: [CompactLevelMap; 2],
     compact_levels: bool,
     values: Vec<ExprId>,
     tasks: Vec<Task>,
@@ -666,8 +666,8 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
     fn ensure_compact_level(&mut self, input: TermInput, root: LevelId) -> Result<LevelId, Halt> {
         let map_index = Self::map_index(input);
-        if let Some(mapped) = self.compact_level_maps[map_index].get(&root.index()) {
-            return Ok(*mapped);
+        if let Some(mapped) = self.compact_level_maps[map_index].get(root.index()) {
+            return Ok(mapped);
         }
         if self.input(input)?.level(root).is_none() {
             return Err(Halt::Fault(TermFault::MissingLevel {
@@ -678,7 +678,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
         let mut stack = vec![(root, false)];
         while let Some((id, expanded)) = stack.pop() {
-            if self.compact_level_maps[map_index].contains_key(&id.index()) {
+            if self.compact_level_maps[map_index].contains(id.index()) {
                 continue;
             }
             let node = self
@@ -714,7 +714,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
             if !expanded {
                 stack.push((id, true));
                 for child in children.into_iter().rev() {
-                    if !self.compact_level_maps[map_index].contains_key(&child.index()) {
+                    if !self.compact_level_maps[map_index].contains(child.index()) {
                         stack.push((child, false));
                     }
                 }
@@ -771,8 +771,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
         }
 
         self.compact_level_maps[map_index]
-            .get(&root.index())
-            .copied()
+            .get(root.index())
             .ok_or(Halt::Fault(TermFault::MissingLevel {
                 input,
                 index: root.index(),
@@ -802,7 +801,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
     }
 
     fn mapped_compact_level(
-        mapping: &BTreeMap<usize, LevelId>,
+        mapping: &CompactLevelMap,
         input: TermInput,
         parent: usize,
         child: LevelId,
@@ -815,8 +814,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
             }));
         }
         mapping
-            .get(&child.index())
-            .copied()
+            .get(child.index())
             .ok_or(Halt::Fault(TermFault::MissingLevel {
                 input,
                 index: child.index(),
@@ -1228,6 +1226,31 @@ impl<'a, 'c> Transformer<'a, 'c> {
     }
 }
 
+/// Source level index to output level, filled as referenced levels are copied.
+/// Indexed directly: compact copies look a level up once per occurrence, and a
+/// tree map there was a fifth of the checker's time on WF-recursion lemmas.
+#[derive(Default)]
+struct CompactLevelMap(Vec<Option<LevelId>>);
+
+impl CompactLevelMap {
+    fn get(&self, index: usize) -> Option<LevelId> {
+        self.0.get(index).copied().flatten()
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    fn insert(&mut self, index: usize, level: LevelId) {
+        if self.0.len() <= index {
+            self.0.resize(index + 1, None);
+        }
+        if let Some(slot) = self.0.get_mut(index) {
+            *slot = Some(level);
+        }
+    }
+}
+
 fn transform_with(
     subject: &WireExpr,
     replacement: Option<&WireExpr>,
@@ -1266,7 +1289,7 @@ fn transform_subterms_with(
         nodes: Vec::new(),
         levels: Vec::new(),
         level_maps: [None, None],
-        compact_level_maps: [BTreeMap::new(), BTreeMap::new()],
+        compact_level_maps: [CompactLevelMap::default(), CompactLevelMap::default()],
         compact_levels: plan.compact_levels,
         values: Vec::new(),
         tasks: Vec::new(),
