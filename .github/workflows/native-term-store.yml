@@ -1,0 +1,99 @@
+name: Native term store
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-term-store.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: native-term-store
+  cancel-in-progress: false
+jobs:
+  implement-and-validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_TERM_COLOR: never
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Apply reviewed source implementation
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/term-store"
+          git rev-parse HEAD > "$RUNNER_TEMP/term-store/base.txt"
+          gh api repos/Dicklesworthstone/franken_lean/git/blobs/95b5814b23a7d5eaf68f4405040c35cb72846f89 > "$RUNNER_TEMP/term-store/payload.json"
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os
+          from pathlib import Path
+          out = Path(os.environ['RUNNER_TEMP'])/'term-store'
+          response = json.loads((out/'payload.json').read_text())
+          raw = base64.b64decode(response['content'])
+          assert hashlib.sha256(raw).hexdigest() == '286a2f6d7ed68f09b3e6e6321d501e6c5dee6f12a2611ac53184a50f13a05e21'
+          payload = json.loads(gzip.decompress(raw))
+          assert set(payload['files']) == {
+              'crates/fln-core/src/term_store.rs',
+              'crates/fln-core/tests/term_store.rs',
+              'crates/fln-olean/tests/term_interning.rs',
+          }
+          for path, content in payload['files'].items():
+              p = Path(path)
+              assert not p.exists(), f'refuse overwrite of {path}'
+              p.write_text(content)
+          exec(compile(payload['apply'], '<reviewed-term-store-integration>', 'exec'))
+          PY
+      - name: Install pinned toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Format changed implementation
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 crates/fln-core/src/name.rs crates/fln-core/src/level.rs crates/fln-core/src/term_store.rs crates/fln-core/tests/term_store.rs crates/fln-olean/src/decl.rs crates/fln-olean/tests/term_interning.rs
+          git diff --check
+          cargo fmt --check -p fln-core -p fln-olean
+      - name: Core terms and hostile graph regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-core --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/term-store/core-tests.log"
+      - name: Real decoder integration and codec regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-olean --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/term-store/olean-tests.log"
+      - name: Kernel acceptance and resource regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-kernel --lib --test k1_judgments --test large_elimination_imax --test admission_laundering --test definition_body_stripping --test budget_parity --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/term-store/kernel-tests.log"
+      - name: Strict lints and whole-workspace compilation
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln-core -p fln-olean --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/term-store/clippy.log"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/term-store/workspace-check.log"
+      - name: Publish tested source directly to main
+        run: |
+          set -euo pipefail
+          base=$(cat "$RUNNER_TEMP/term-store/base.txt")
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$base" || { echo 'main advanced; refusing untested integration' >&2; exit 1; }
+          git diff --check
+          git config user.name 'FrankenLean automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/fln-core/src/lib.rs crates/fln-core/src/name.rs crates/fln-core/src/level.rs crates/fln-core/src/term_store.rs crates/fln-core/tests/term_store.rs crates/fln-olean/src/decl.rs crates/fln-olean/tests/term_interning.rs
+          git commit -m 'feat(core): intern native names, levels and expressions during olean decoding (franken_lean-z8j.1.13)' -m 'Explicitly owned exact hash-consing with iterative postorder traversal, full payload keys, node/key-payload/work limits and sharing statistics. All decoded offsets still pass their original shape, data-word and budget checks before deduplication. Tested on the pinned nightly: core and codec packages, selected kernel authority/resource regressions, strict core/codec clippy and all-target workspace compilation. This is per-decoder structural interning, not process-wide term identity, full G1 convergence or a measured performance claim.'
+          git push origin HEAD:main
+          git rev-parse HEAD > "$RUNNER_TEMP/term-store/published.txt"
+      - name: Retain exact validation evidence
+        if: always()
+        run: |
+          git diff --binary > "$RUNNER_TEMP/term-store/worktree.patch"
+          git status --short > "$RUNNER_TEMP/term-store/status.txt"
+          git log -1 --format='%H %s' > "$RUNNER_TEMP/term-store/head.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-term-store-${{ github.run_id }}
+          path: ${{ runner.temp }}/term-store
+          retention-days: 14
