@@ -40,6 +40,8 @@ pub struct LakeConfig {
     pub build_dir: PathBuf,
     /// Package dependencies declared via `require`.
     pub requires: Vec<LakeRequire>,
+    /// Declared `lean_lib` and `lean_exe` targets, in declaration order.
+    pub targets: Vec<LakeTarget>,
     /// Configuration format that was parsed.
     pub format: LakeConfigFormat,
 }
@@ -288,6 +290,9 @@ pub enum LakeDiscoveryError {
     Io(io::Error),
     /// A parsing error occurred.
     Parse(LakeParseError),
+    /// Only `lakefile.lean` exists. Evaluating it requires running Lean code on
+    /// Golem, which is not implemented, so its targets are unknown.
+    LeanConfigUnsupported(PathBuf),
 }
 
 impl fmt::Display for LakeDiscoveryError {
@@ -296,6 +301,11 @@ impl fmt::Display for LakeDiscoveryError {
             Self::NotFound(p) => write!(f, "no Lake configuration found in '{}'", p.display()),
             Self::Io(e) => write!(f, "I/O error discovering Lake configuration: {e}"),
             Self::Parse(e) => write!(f, "error parsing Lake configuration: {e}"),
+            Self::LeanConfigUnsupported(p) => write!(
+                f,
+                "{} requires evaluating Lean code, which is not implemented; use lakefile.toml",
+                p.display()
+            ),
         }
     }
 }
@@ -475,12 +485,14 @@ impl LakeConfig {
         let mut src_dir = PathBuf::from(".");
         let mut build_dir = PathBuf::from(".lake/build");
         let mut requires: Vec<LakeRequire> = Vec::new();
+        let mut targets: Vec<LakeTarget> = Vec::new();
 
         #[derive(PartialEq)]
         enum Section {
             Top,
             Package,
             Require,
+            Target,
             Other,
         }
 
@@ -501,6 +513,18 @@ impl LakeConfig {
                         url: None,
                         rev: None,
                         subdir: None,
+                    });
+                } else if section_name == "lean_lib" || section_name == "lean_exe" {
+                    current_section = Section::Target;
+                    targets.push(LakeTarget {
+                        name: String::new(),
+                        kind: if section_name == "lean_lib" {
+                            TargetKind::Library
+                        } else {
+                            TargetKind::Executable
+                        },
+                        roots: Vec::new(),
+                        src_dir: None,
                     });
                 } else {
                     current_section = Section::Other;
@@ -579,14 +603,50 @@ impl LakeConfig {
                             }
                         }
                     }
+                    Section::Target => {
+                        if let Some(target) = targets.last_mut() {
+                            let invalid = |what: &str| {
+                                LakeParseError::InvalidSyntax(format!(
+                                    "line {}: invalid {what}: {val}",
+                                    line_idx + 1
+                                ))
+                            };
+                            match key {
+                                "name" => {
+                                    target.name =
+                                        parse_string_val(val).ok_or_else(|| invalid("target name"))?;
+                                }
+                                "root" if target.kind == TargetKind::Executable => {
+                                    target.roots =
+                                        vec![parse_string_val(val).ok_or_else(|| invalid("root"))?];
+                                }
+                                "roots" if target.kind == TargetKind::Library => {
+                                    target.roots =
+                                        parse_string_array(val).ok_or_else(|| invalid("roots"))?;
+                                }
+                                "srcDir" | "src_dir" => {
+                                    target.src_dir = Some(PathBuf::from(
+                                        parse_string_val(val).ok_or_else(|| invalid("srcDir"))?,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     Section::Other => {}
                 }
             }
         }
 
         let name = name.ok_or(LakeParseError::MissingField("name"))?;
-        if default_targets.is_empty() {
-            default_targets.push(name.clone());
+        for target in &mut targets {
+            if target.name.is_empty() {
+                return Err(LakeParseError::MissingField("lean_lib/lean_exe name"));
+            }
+            // Lake's defaults: a library's roots and an executable's root are its name.
+            if target.roots.is_empty() {
+                target.roots.push(target.name.clone());
+            }
         }
 
         Ok(LakeConfig {
@@ -596,6 +656,7 @@ impl LakeConfig {
             src_dir,
             build_dir,
             requires,
+            targets,
             format: LakeConfigFormat::Toml,
         })
     }
@@ -623,20 +684,7 @@ impl LakeConfig {
             cfg.lean_toolchain = lean_toolchain;
             Ok(cfg)
         } else if lean_path.exists() {
-            let name = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unnamed")
-                .to_owned();
-            Ok(LakeConfig {
-                name: name.clone(),
-                default_targets: vec![name],
-                lean_toolchain,
-                src_dir: dir.to_path_buf(),
-                build_dir: dir.join(".lake").join("build"),
-                requires: Vec::new(),
-                format: LakeConfigFormat::Lean,
-            })
+            Err(LakeDiscoveryError::LeanConfigUnsupported(lean_path))
         } else {
             Err(LakeDiscoveryError::NotFound(dir.to_path_buf()))
         }
