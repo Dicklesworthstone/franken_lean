@@ -7,112 +7,44 @@ on:
 permissions:
   contents: read
 jobs:
-  validate-and-export:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  integration-inputs:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    env:
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 072c460b124883d0c5d0c18a54beb3397d745f4a
+          ref: 17a8cd578ee6857392326870f5ea24635900331d
+          fetch-depth: 20
           persist-credentials: false
-      - name: Restore checksum-bound command integrity implementation
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Retain exact concurrent changes and full metadata
         run: |
           python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'lake-validation'
+          import hashlib, json, os, pathlib, subprocess, tarfile
+          base = 'f863cd4a5ca297286d074b02804d65fe2db60408'
+          head = '17a8cd578ee6857392326870f5ea24635900331d'
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'lake-integration'
           out.mkdir()
-          def blob(d):
-              return hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()
           def git(*args):
-              return subprocess.check_output(['git',*args],text=True).strip()
-          chunks = [('a9b9e9ea7b5efde81869558f7e758b5b2e20f960',5909,'49d7bf63569e0422c8a680a2c0333f68864a7fca'),('c55cff61dbaaa8fd15ddd2721918bc18d8b32c6c',None,'c55cff61dbaaa8fd15ddd2721918bc18d8b32c6c'),('ea45850338d4a115c72f329a9329be454bf9ea21',4697,'0a8b404f9e9f9e33d744d59a20268cc80b56baf8')]
-          payload = bytearray()
-          for sha, inserted, expected in chunks:
-              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
-              data = base64.b64decode(response['content'])
-              assert blob(data) == sha
-              if inserted is not None:
-                  # Correct a single spurious base64 character in transport,
-                  # then bind the recovered bytes to the original local object.
-                  encoded = base64.b64encode(data).decode()
-                  assert encoded[inserted] == 'e'
-                  encoded = (encoded[:inserted]+encoded[inserted+1:]).rstrip('=')
-                  data = base64.b64decode(encoded+'='*((-len(encoded))%4))
-              assert blob(data) == expected
-              payload.extend(data)
-          assert len(payload) == 17336
-          assert hashlib.sha256(payload).hexdigest() == 'e24ef20da1147a9871e4a4e576001a52ca04b96f007e8e0afda502504820be10'
-          manifest = json.loads(gzip.decompress(payload))
-          assert git('rev-parse','HEAD') == manifest['base'] == '072c460b124883d0c5d0c18a54beb3397d745f4a'
-          assert git('write-tree') == manifest['base_tree'] == 'aa77b45f0d3198a56b1a7ff07f893917093f100d'
-          allowed = {'.github/workflows/native-lake-integrity.yml','README.md','crates/fln-cli/src/lib.rs','crates/fln-cli/tests/cli_personalities_and_verbs.rs','crates/fln-cli/tests/lake_integrity.rs','crates/fln-lake/src/lib.rs','crates/fln-lake/tests/lake_config_and_actions.rs','docs/NATIVE_LAKE.md'}
-          assert len(manifest['entries']) == len(allowed)
-          assert {e['path'] for e in manifest['entries']} == allowed
-          for e in manifest['entries']:
-              path = root/e['path']
-              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
-              if e['before'] is None:
-                  assert not path.exists() and not git('ls-files','--',e['path'])
-              else:
-                  assert blob(path.read_bytes()) == e['before'], e['path']
-          patch = out/'change.patch'
-          patch.write_text(manifest['patch'])
-          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-          subprocess.run(['git','apply','--index',str(patch)],check=True)
-          for e in manifest['entries']:
-              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
-          manifest['tree'] = git('write-tree')
-          (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
-          for name in ['.beads/issues.jsonl','ci/KERNEL_CONTRACT_OWNERSHIP.jsonl','ci/VERIFICATION_MANIFEST.jsonl']:
-              dest = out/'baseline-metadata'/name
-              dest.parent.mkdir(parents=True,exist_ok=True)
-              dest.write_bytes((root/name).read_bytes())
-          beads = [json.loads(line) for line in (root/'.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          (out/'reality-check-beads.json').write_text(json.dumps([b for b in beads if b['id'].startswith('franken_lean-z8j.1')],indent=2))
-          print('VALIDATION_TREE',manifest['tree'])
+              return subprocess.check_output(['git',*args])
+          assert git('rev-parse','HEAD').decode().strip() == head
+          paths = git('diff','--name-only','-z',base,head).decode().rstrip('\0').split('\0')
+          patch = git('diff','--binary',base,head)
+          (out/'concurrent.patch').write_bytes(patch)
+          entries = []
+          with tarfile.open(out/'current-files.tar.gz','w:gz') as archive:
+              for name in paths:
+                  p = pathlib.Path(name)
+                  assert p.is_file() and not p.is_symlink()
+                  data = p.read_bytes()
+                  sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+                  assert sha == git('rev-parse',head+':'+name).decode().strip()
+                  archive.add(p,arcname=name,recursive=False)
+                  entries.append({'path':name,'sha':sha})
+          (out/'manifest.json').write_text(json.dumps({'base':base,'head':head,'tree':git('rev-parse','HEAD^{tree}').decode().strip(),'entries':entries,'patch_sha256':hashlib.sha256(patch).hexdigest()},indent=2))
+          print('Retained concurrent inputs, not a functional validation:',head,len(entries))
           PY
-      - name: Validate real command outcomes and nonpublication
-        run: |
-          set -euo pipefail
-          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
-          test -n "$channel"
-          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-          cargo test --locked -p fln-lake -p fln-cli --lib --test lake_config_and_actions --test lake_integrity --test cli_personalities_and_verbs 2>&1 | tee "$RUNNER_TEMP/lake-validation/tests.log"
-          cargo clippy --locked -p fln-lake -p fln-cli --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/lake-validation/clippy.log"
-          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/lake-validation/check.log"
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln-cli/src/lib.rs crates/fln-cli/tests/cli_personalities_and_verbs.rs crates/fln-cli/tests/lake_integrity.rs crates/fln-lake/src/lib.rs crates/fln-lake/tests/lake_config_and_actions.rs
-          git diff --check --cached
-      - name: Export checked source objects without moving refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'lake-validation'
-          manifest = json.loads((out/'manifest.json').read_text())
-          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
-          for e in manifest['entries']:
-              data = pathlib.Path(e['path']).read_bytes()
-              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['after']
-              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
-              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-              assert response['sha'] == e['after']
-              print('EXPORTED',e['path'],e['after'],flush=True)
-          PY
-      - name: Retain exact validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: lake-integrity-validation-${{ github.run_id }}
-          path: ${{ runner.temp }}/lake-validation
+          name: lake-integration-inputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/lake-integration
           retention-days: 14
