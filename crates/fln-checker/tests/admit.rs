@@ -16,6 +16,8 @@ mod higher_order;
 #[path = "admit/propositions.rs"]
 mod propositions;
 
+#[path = "admit/function_eta.rs"]
+mod function_eta;
 #[path = "admit/indexed.rs"]
 mod indexed;
 #[path = "admit/quotient_computation.rs"]

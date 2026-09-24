@@ -1,9 +1,11 @@
 //! A typed, sufficient KR-305 conversion lane. The untyped converter cannot
 //! identify proofs under binders because it has no local type context. This
 //! worklist opens matching binders hygienically and uses checker-owned typing
-//! to compare proofs of the same proposition, and (KR-315) values of the same
-//! unit-like structure type. Probes explicitly disable this lane, so nested
-//! conversion never recursively reenters typed inference.
+//! to compare proofs of the same proposition, (KR-315) values of the same
+//! unit-like structure type, and (KR-312) a lambda against a function that is
+//! not one, by eta-expanding the latter through its Π-type. Probes explicitly
+//! disable this lane, so nested conversion never recursively reenters typed
+//! inference.
 use super::*;
 use crate::universe::{NormalNode, normalize};
 use crate::wire::WireLevel;
@@ -272,6 +274,41 @@ impl Probe<'_> {
         };
         Ok(Some((left_type, right_type)))
     }
+    /// The domain of `term`'s type when that type normalizes to a Π, which is
+    /// what eta expansion through the type needs. `None` means it does not.
+    fn pi_domain(
+        &mut self,
+        term: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<WireExpr>> {
+        let Some(type_) = self.infer(term, context)? else {
+            return Ok(None);
+        };
+        let Some(type_) = self.whnf(&type_, context)? else {
+            return Ok(None);
+        };
+        let Some(ExprNode::Forall { binder_type, .. }) = type_.node(type_.root()) else {
+            return Ok(None);
+        };
+        let binder_type = *binder_type;
+        Ok(Some(self.piece(&type_, binder_type)?))
+    }
+    /// `term x` for the fresh local `x`, built by extending a copy of `term`'s
+    /// own arena, so no subterm is re-copied.
+    fn apply_to_free(&mut self, term: &WireExpr, name: WireName) -> Result<WireExpr> {
+        self.tick()?;
+        let mut nodes = term.nodes().to_vec();
+        let local = ExprId::from_index(nodes.len())
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        nodes.push(ExprNode::Free { name });
+        let root = ExprId::from_index(nodes.len())
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        nodes.push(ExprNode::Apply {
+            function: term.root(),
+            argument: local,
+        });
+        Ok(WireExpr::from_parts(nodes, term.levels().to_vec(), root))
+    }
     fn run(
         &mut self,
         left: &WireExpr,
@@ -288,6 +325,16 @@ impl Probe<'_> {
                 WireExpr,
                 InferenceContext,
             ),
+            /// KR-312: open `lambda`'s body at a fresh local `x : domain` and
+            /// compare it with `other x`, keeping the original sides.
+            Eta {
+                lambda: WireExpr,
+                body: ExprId,
+                other: WireExpr,
+                domain: WireExpr,
+                lambda_on_left: bool,
+                context: InferenceContext,
+            },
         }
         self.reserve(left)?;
         self.reserve(right)?;
@@ -317,6 +364,36 @@ impl Probe<'_> {
                     .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name }))?;
                     let left = self.open(&left, lb, &local)?;
                     let right = self.open(&right, rb, &local)?;
+                    work.push(Work::Pair(left, right, context));
+                    continue;
+                }
+                Work::Eta {
+                    lambda,
+                    body,
+                    other,
+                    domain,
+                    lambda_on_left,
+                    context,
+                } => {
+                    let (name, local) = self.local()?;
+                    let mut locals = context.locals().to_vec();
+                    locals.push(LocalDeclaration::assumption(name.clone(), domain));
+                    let context = InferenceContext::new_with_projection_rules(
+                        locals,
+                        context.level_parameters().to_vec(),
+                        context.projection_rules().to_vec(),
+                        context.constants().clone(),
+                    )
+                    .map_err(|_| {
+                        self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() })
+                    })?;
+                    let opened = self.open(&lambda, body, &local)?;
+                    let applied = self.apply_to_free(&other, name)?;
+                    let (left, right) = if lambda_on_left {
+                        (opened, applied)
+                    } else {
+                        (applied, opened)
+                    };
                     work.push(Work::Pair(left, right, context));
                     continue;
                 }
@@ -422,6 +499,51 @@ impl Probe<'_> {
                 (_, Some(ExprNode::Metadata { expression: re, .. })) => {
                     let re = self.piece(&r, *re)?;
                     work.push(Work::Pair(l, re, context));
+                }
+                // KR-312, the pin's `try_eta_expansion_core` (type_checker.cpp:797):
+                // a lambda against a non-lambda compares with the latter's eta
+                // expansion through its Π-type, in either direction.
+                (
+                    Some(ExprNode::Lambda {
+                        binder_type, body, ..
+                    }),
+                    _,
+                ) => {
+                    let (binder_type, body) = (*binder_type, *body);
+                    let Some(other_domain) = self.pi_domain(&r, &context)? else {
+                        return Ok(false);
+                    };
+                    let domain = self.piece(&l, binder_type)?;
+                    work.push(Work::Eta {
+                        lambda: l,
+                        body,
+                        other: r,
+                        domain: domain.clone(),
+                        lambda_on_left: true,
+                        context: context.clone(),
+                    });
+                    work.push(Work::Pair(domain, other_domain, context));
+                }
+                (
+                    _,
+                    Some(ExprNode::Lambda {
+                        binder_type, body, ..
+                    }),
+                ) => {
+                    let (binder_type, body) = (*binder_type, *body);
+                    let Some(other_domain) = self.pi_domain(&l, &context)? else {
+                        return Ok(false);
+                    };
+                    let domain = self.piece(&r, binder_type)?;
+                    work.push(Work::Eta {
+                        lambda: r,
+                        body,
+                        other: l,
+                        domain: domain.clone(),
+                        lambda_on_left: false,
+                        context: context.clone(),
+                    });
+                    work.push(Work::Pair(other_domain, domain, context));
                 }
                 _ => return Ok(false),
             }
