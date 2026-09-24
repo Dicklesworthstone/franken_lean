@@ -284,6 +284,7 @@ impl PreparedDeclarationAdmission {
         // `CollisionBudget::max_expanded_weight` is now a `u64` limit and the numbers fit by
         // construction (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`). Deleting it
         // is how that bead proves it closed the gap instead of papering it.
+        let digests = env.digests.insert(name.clone(), self.provisional_digest);
         env.constants
             .try_insert_with_budget(
                 name,
@@ -295,6 +296,7 @@ impl PreparedDeclarationAdmission {
                 DeclarationCommitted::Published(DeclarationPublication {
                     environment: Environment {
                         constants,
+                        digests,
                         extensions: env.extensions.clone(),
                     },
                     digest: self.provisional_digest,
@@ -887,6 +889,10 @@ impl DeclAdmission {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
     constants: PMap<Name, Arc<ConstantInfo>>,
+    /// `decl_content_digest` of every constant, computed once when it is inserted.
+    /// `logical_root` combines these instead of re-serializing every constant on
+    /// every call, which made admitting n declarations O(n^2) in hashing.
+    digests: PMap<Name, Digest>,
     extensions: PMap<Name, Arc<ExtensionState>>,
 }
 
@@ -1028,7 +1034,9 @@ impl Environment {
         if self.constants.contains_key(&name) {
             return Err(EnvError::DuplicateDeclaration { name });
         }
+        let digest = Environment::decl_content_digest(&info);
         Ok(Environment {
+            digests: self.digests.insert(name.clone(), digest),
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
         })
@@ -1083,11 +1091,15 @@ impl Environment {
         // into local ones. There is no arm here that could launder a fault into "this
         // declaration is inadmissible" or report it as a budget stop, because there is no
         // longer anywhere local for either to go.
+        let digests = self
+            .digests
+            .insert(name.clone(), Environment::decl_content_digest(&info));
         self.constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
             .map_complete(|constants| {
                 DeclAdmission::Admitted(Environment {
                     constants,
+                    digests,
                     extensions: self.extensions.clone(),
                 })
             })
@@ -1178,6 +1190,7 @@ impl Environment {
         }
         Ok(Environment {
             constants: self.constants.clone(),
+            digests: self.digests.clone(),
             extensions: self
                 .extensions
                 .insert(name, Arc::new(ExtensionState::new(descriptor))),
@@ -1198,6 +1211,7 @@ impl Environment {
         let next = state.push_entry(payload);
         Ok(Environment {
             constants: self.constants.clone(),
+            digests: self.digests.clone(),
             extensions: self.extensions.insert(extension.clone(), Arc::new(next)),
         })
     }
@@ -1287,6 +1301,7 @@ impl Environment {
                 restored
                     .map(|state| Environment {
                         constants: self.constants.clone(),
+                        digests: self.digests.clone(),
                         extensions: self.extensions.insert(name.clone(), Arc::new(state)),
                     })
                     .map_err(EnvError::Checkpoint)
@@ -1390,8 +1405,8 @@ impl Environment {
     /// and nothing else (wall-clock, paths, and schedule have no way in).
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
         let mut builder = LogicalRootBuilder::new();
-        for (name, info) in self.constants.iter() {
-            builder.add_decl(name, Environment::decl_content_digest(info));
+        for (name, digest) in self.digests.iter() {
+            builder.add_decl(name, *digest);
         }
         for (name, state) in self.extensions.iter() {
             builder.add_extension_delta(name, state.content_digest());
@@ -2162,6 +2177,52 @@ mod tests {
         let mut opts2 = KVMap::new();
         opts2.insert(n("maxHeartbeats"), DataValue::OfNat(400_000));
         assert_ne!(forward.logical_root(&opts), forward.logical_root(&opts2));
+    }
+
+    /// The digest cache must never disagree with the constants it summarizes, on every
+    /// path that builds an environment: plain insertion, budgeted insertion, a planned
+    /// commit, and extension-only successors.
+    #[test]
+    fn cached_declaration_digests_match_a_full_recomputation_on_every_path() {
+        fn recomputed(env: &Environment, options: &KVMap) -> LogicalRoot {
+            let mut builder = LogicalRootBuilder::new();
+            for (name, info) in env.constants() {
+                builder.add_decl(name, Environment::decl_content_digest(info));
+            }
+            for (name, state) in env.extensions() {
+                builder.add_extension_delta(name, state.content_digest());
+            }
+            builder.set_options(options);
+            builder.finalize()
+        }
+        let options = KVMap::new();
+        let plain = Environment::new().add_decl(axiom("a")).expect("adds");
+        let budgeted = match plain
+            .try_add_decl_with_budget(axiom("b"), 1, CollisionBudget::UNBOUNDED)
+            .into_complete()
+            .expect("completes")
+        {
+            DeclAdmission::Admitted(env) => Some(env),
+            DeclAdmission::Rejected(_) => None,
+        }
+        .expect("a fresh name is admitted");
+        let committed = match prepared(&budgeted, axiom("c"), DeclarationBudget::UNBOUNDED)
+            .commit(&budgeted, None)
+            .into_complete()
+            .expect("commits")
+        {
+            DeclarationCommitted::Published(publication) => Some(publication.environment),
+            _ => None,
+        }
+        .expect("a fresh planned declaration publishes");
+        let extended = committed
+            .register_extension(descriptor("simpExt"))
+            .expect("registers")
+            .push_extension_entry(&n("simpExt"), &b"e1"[..])
+            .expect("pushes");
+        for env in [&plain, &budgeted, &committed, &extended] {
+            assert_eq!(env.logical_root(&options), recomputed(env, &options));
+        }
     }
 
     #[test]
