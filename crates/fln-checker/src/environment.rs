@@ -806,6 +806,10 @@ impl ExactSizeIterator for ConstantIter<'_> {}
 #[derive(Clone, Default)]
 pub struct ConstantEnvironment {
     constants: Option<Arc<ConstantNode>>,
+    /// Names occurring as free variables in any constant's type or body, kept
+    /// incrementally so fresh local names can avoid them without walking every
+    /// constant for every declaration. Empty whenever the constants are closed.
+    free_names: Arc<BTreeSet<WireName>>,
 }
 
 impl fmt::Debug for ConstantEnvironment {
@@ -849,6 +853,11 @@ impl ConstantEnvironment {
 
     pub fn constants(&self) -> ConstantIter<'_> {
         ConstantIter::new(&self.constants)
+    }
+
+    /// Whether `name` occurs as a free variable in any constant's type or body.
+    pub fn has_free_name(&self, name: &WireName) -> bool {
+        self.free_names.contains(name)
     }
 
     pub fn build(entries: Vec<ConstantEntry>, budget: EnvironmentBudget) -> EnvironmentOutcome {
@@ -1511,6 +1520,20 @@ fn validation_outcome(
     }
 }
 
+/// Free-variable names in one constant's type and body, the terms fresh local
+/// names must avoid.
+fn declaration_free_names(declaration: &ConstantDeclaration) -> Vec<WireName> {
+    let mut names = Vec::new();
+    for term in std::iter::once(declaration.type_()).chain(declaration.body_value()) {
+        for node in term.nodes() {
+            if let ExprNode::Free { name } = node {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
 fn extend_environment(
     environment: &ConstantEnvironment,
     entry: ConstantEntry,
@@ -1542,6 +1565,14 @@ fn extend_environment(
     if let Err(failure) = validate_constant(&mut control, 0, &declaration) {
         return validation_outcome(failure, control.progress);
     }
+    let added = declaration_free_names(&declaration);
+    let free_names = if added.is_empty() {
+        Arc::clone(&environment.free_names)
+    } else {
+        let mut names = (*environment.free_names).clone();
+        names.extend(added);
+        Arc::new(names)
+    };
     let constants = match insert_constant(&environment.constants, name, Arc::new(declaration)) {
         Ok(constants) => constants,
         Err(name) => {
@@ -1552,7 +1583,10 @@ fn extend_environment(
         }
     };
     EnvironmentOutcome::Complete {
-        environment: ConstantEnvironment { constants },
+        environment: ConstantEnvironment {
+            constants,
+            free_names,
+        },
         progress: control.progress,
     }
 }
@@ -1605,6 +1639,10 @@ fn build_environment(
         }
     }
 
+    let mut free_names = BTreeSet::new();
+    for declaration in constants.values() {
+        free_names.extend(declaration_free_names(declaration));
+    }
     let mut persistent = None;
     for (name, declaration) in constants {
         persistent = match insert_constant(&persistent, name, Arc::new(declaration)) {
@@ -1621,6 +1659,7 @@ fn build_environment(
     EnvironmentOutcome::Complete {
         environment: ConstantEnvironment {
             constants: persistent,
+            free_names: Arc::new(free_names),
         },
         progress: control.progress,
     }

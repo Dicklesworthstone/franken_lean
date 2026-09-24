@@ -2322,24 +2322,6 @@ impl<'a> InferenceEngine<'a> {
                 reserve_free_names_in_term(value, &mut names, self.control, self.cancelled)?;
             }
         }
-        for (name, declaration) in self.context.constants().constants() {
-            self.control
-                .step(self.cancelled, InferencePhase::LocalIdentity, names.len())
-                .map_err(LeafHalt::stop)?;
-            if names.insert(name.clone()) {
-                self.control.progress.reserved_free_names =
-                    self.control.progress.reserved_free_names.saturating_add(1);
-            }
-            reserve_free_names_in_term(
-                declaration.type_(),
-                &mut names,
-                self.control,
-                self.cancelled,
-            )?;
-            if let Some(body) = declaration.body_value() {
-                reserve_free_names_in_term(body, &mut names, self.control, self.cancelled)?;
-            }
-        }
         self.reserved_names = Some(names);
         Ok(())
     }
@@ -2370,6 +2352,10 @@ impl<'a> InferenceEngine<'a> {
                 .next_local_identity
                 .checked_add(1)
                 .ok_or(LeafHalt::Fault(InferenceFault::FreshLocalIdentityExhausted))?;
+            let constants = self.context.constants();
+            if constants.find(&candidate).is_some() || constants.has_free_name(&candidate) {
+                continue;
+            }
             let names = self
                 .reserved_names
                 .as_mut()
