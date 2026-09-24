@@ -44,8 +44,8 @@ fn doctor_json(cwd: &std::path::Path, elan_home: Option<&std::path::Path>) -> (i
 #[test]
 fn doctor_runs_the_real_pipeline_and_checks_the_checkout_pins() {
     // The test runs inside the franken_lean checkout, so the pin check applies.
-    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let (code, stdout) = doctor_json(checkout, None);
+    let checkout = fln_core::checked_manifest_dir!();
+    let (code, stdout) = doctor_json(&checkout, None);
     assert_eq!(code, 0, "{stdout}");
     assert!(stdout.contains("\"schema\":\"fln.doctor/2\""), "{stdout}");
     assert!(stdout.contains("\"status\":\"ok\""), "{stdout}");
@@ -68,7 +68,7 @@ fn doctor_runs_the_real_pipeline_and_checks_the_checkout_pins() {
 fn doctor_fails_when_run_in_a_checkout_pinned_to_another_reference() {
     let dir = TempDir::new("doctor-pins");
     let real_lock = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SUITE.lock"),
+        fln_core::checked_workspace_root!().join("SUITE.lock"),
     )
     .expect("read SUITE.lock");
     let other_lock: String = real_lock

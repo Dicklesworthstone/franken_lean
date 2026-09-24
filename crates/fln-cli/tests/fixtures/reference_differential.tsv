@@ -1,0 +1,115 @@
+# Reference differential ledger (bead franken_lean-z8j.1.5), checked by
+# crates/fln-cli/tests/source_reference_differential.rs against the pinned Reference lean.
+# Columns (tab-separated): file  reference  frankenlean  output  class  note
+#   reference: accept | reject
+#   frankenlean: accept (drop-in `lean` exits 0) | check-only (only `fln check-source` exits 0) | reject
+#   output: match | differ | n/a  (#eval/#check output, compared only when both lean binaries accept)
+#   class: agree | unsupported | output-defect | fln-defect | missing-prelude | behavior-note | oracle-investigation
+# A Reference-rejected file FrankenLean accepts must be fln-defect, missing-prelude, behavior-note or
+# oracle-investigation, with a note naming the Reference's first error and the owning bead.
+# Fixing a divergence changes the observed outcome, so its row must be updated in the same change.
+crates/fln-cli/tests/fixtures/source_ladder/eval_and_check_output.lean	accept	accept	match	agree	
+crates/fln-cli/tests/fixtures/source_ladder/example_by_decide.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/io_main.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/list_literal_length.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/nat_definitions_eval_check.lean	accept	accept	match	agree	
+crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+examples/native_closure_data.lean	reject	accept	n/a	fln-defect	Reference 11: unexpected token 'prefix'; expected '_' or identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_collection_notation.lean	accept	accept	match	agree	
+examples/native_collection_runtime.lean	accept	accept	match	agree	
+examples/native_collections.lean	accept	accept	match	agree	
+examples/native_conditionals.lean	accept	accept	match	agree	
+examples/native_constrained_induction.lean	reject	accept	n/a	fln-defect	Reference 6: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_constrained_matching.lean	reject	accept	n/a	fln-defect	Reference 12: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_constrained_recursion.lean	reject	accept	n/a	fln-defect	Reference 6: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_constructor_equalities.lean	reject	accept	n/a	fln-defect	Reference 7: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_constructor_equality.lean	reject	accept	n/a	fln-defect	Reference 9: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_constructor_tactics.lean	reject	check-only	n/a	fln-defect	Reference 21: numerals are data in Lean, but the expected type is a proposition | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_context_generalization.lean	accept	accept	match	agree	
+examples/native_decidable_cases.lean	reject	check-only	n/a	fln-defect	Reference 18: unexpected token 'scoped'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_decision_proofs.lean	reject	accept	n/a	missing-prelude	Reference 2: `not_false` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_decisions.lean	accept	accept	match	agree	
+examples/native_default_simp.lean	reject	check-only	n/a	fln-defect	Reference 9: unexpected token 'universe'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_dependent_indices.lean	reject	accept	n/a	fln-defect	Reference 5: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_dependent_vector_pipeline.lean	accept	accept	match	agree	
+examples/native_do.lean	reject	accept	n/a	missing-prelude	Reference 1: `Pure` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_empty_elimination.lean	reject	accept	n/a	fln-defect	Reference 6: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_equality.lean	accept	accept	match	agree	
+examples/native_equality_transport.lean	reject	accept	n/a	fln-defect	Reference 9: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_equations.lean	reject	accept	n/a	missing-prelude	Reference 2: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_expression_elimination.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_function_child_runtime.lean	accept	accept	match	agree	
+examples/native_function_children.lean	reject	accept	n/a	fln-defect	Reference 24: code generator does not support recursor `Accessible.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_goal_control.lean	reject	check-only	n/a	fln-defect	Reference 39: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_ground_projections.lean	accept	accept	match	agree	
+examples/native_heterogeneous_equality.lean	reject	accept	n/a	fln-defect	Reference 22: Tactic `subst` failed: did not find equation for eliminating 'h' | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_hypothesis_rewriting.lean	accept	accept	match	agree	
+examples/native_impossible_patterns.lean	accept	accept	match	agree	
+examples/native_index_refinement.lean	reject	accept	n/a	fln-defect	Reference 15: unsolved goals | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_indexed.lean	reject	accept	n/a	fln-defect	Reference 12: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_indexed_elimination.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_indexed_function_children.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Tree.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_indexed_recursion.lean	accept	accept	match	agree	
+examples/native_indexed_vectors.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_induction.lean	reject	check-only	n/a	fln-defect	Reference 43: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_induction_specialization.lean	reject	accept	n/a	fln-defect	Reference 6: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_instance_attributes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_instance_output_search.lean	accept	accept	match	agree	
+examples/native_instances.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_literal_patterns.lean	accept	accept	match	agree	
+examples/native_local_helpers.lean	accept	accept	match	agree	
+examples/native_local_proofs.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_local_recursion.lean	accept	accept	match	agree	
+examples/native_logical_rewriting.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_match_equations.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_matrix_recursion.lean	reject	accept	n/a	missing-prelude	Reference 2: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_multistage_callbacks.lean	accept	accept	match	agree	
+examples/native_mutual_data.lean	reject	accept	n/a	fln-defect	Reference 4: Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match | mutual-block parameter rule not enforced (franken_lean-z8j.1.6.5)
+examples/native_mutual_folds.lean	reject	accept	n/a	fln-defect	Reference 5: Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match | mutual-block parameter rule not enforced (franken_lean-z8j.1.6.5)
+examples/native_mutual_function_children.lean	reject	accept	n/a	fln-defect	Reference 10: code generator does not support recursor `Tree.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
+examples/native_mutual_groups.lean	reject	accept	n/a	fln-defect	Reference 5: Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match | mutual-block parameter rule not enforced (franken_lean-z8j.1.6.5)
+examples/native_mutual_indexed.lean	reject	accept	n/a	fln-defect	Reference 11: Application type mismatch: The argument | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_nat_recursion.lean	accept	accept	match	agree	
+examples/native_nested_lets.lean	accept	accept	match	agree	
+examples/native_parameterized_recursion.lean	reject	accept	n/a	missing-prelude	Reference 1: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_pattern_functions.lean	accept	accept	match	agree	
+examples/native_pattern_matching.lean	reject	check-only	n/a	fln-defect	Reference 37: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_pattern_matrices.lean	reject	accept	n/a	fln-defect	Reference 28: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_proof_data.lean	accept	accept	match	agree	
+examples/native_proof_erasure.lean	accept	accept	match	agree	
+examples/native_proof_indices.lean	accept	accept	match	agree	
+examples/native_proposition_conditionals.lean	reject	check-only	n/a	fln-defect	Reference 14: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_propositional_logic.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_propositions.lean	accept	accept	match	agree	
+examples/native_quotients.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_record_defaults.lean	accept	accept	match	agree	
+examples/native_record_runtime.lean	accept	accept	match	agree	
+examples/native_record_values.lean	reject	check-only	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_records.lean	reject	check-only	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 18: unexpected token 'repeat'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_recursive_data.lean	accept	accept	match	agree	
+examples/native_refinement.lean	reject	check-only	n/a	fln-defect	Reference 26: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_scopes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_section_records.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_simp_all.lean	accept	accept	match	agree	
+examples/native_simp_hypotheses.lean	reject	accept	n/a	fln-defect	Reference 11: unsolved goals | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_simpa.lean	reject	check-only	n/a	fln-defect	Reference 16: Tactic `assumption` failed | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_simplification.lean	accept	accept	match	agree	
+examples/native_singleton_inference.lean	accept	accept	match	agree	
+examples/native_staged_callbacks.lean	accept	accept	match	agree	
+examples/native_structural_selection.lean	accept	accept	match	agree	
+examples/native_tactic_alternatives.lean	reject	check-only	n/a	fln-defect	Reference 38: unexpected token 'local'; expected '(', ':=', '|' or term | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_tactic_repetition.lean	reject	check-only	n/a	fln-defect	Reference 47: unexpected token 'local'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_tactic_sequencing.lean	accept	accept	match	agree	
+examples/native_term_binders.lean	accept	accept	match	agree	
+examples/native_variants.lean	accept	accept	match	agree	
