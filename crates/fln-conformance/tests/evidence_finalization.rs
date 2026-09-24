@@ -5715,6 +5715,64 @@ fn the_rch_fuzz_corpus_exclusion_is_still_inert() {
 /// assignment, and a lane governing through a different idiom entirely. So the primary needle is
 /// checked against an independent one, and a file the second finds that the first misses is a
 /// broken scan rather than a clean tree.
+/// Lines the independent git spelling matches that name `git` without running it, each
+/// bound to its file. A declared line is cut out before the file is re-scanned, so any OTHER
+/// git mention in the same file is still a miss; and a declaration whose line has moved or
+/// gone is refused as stale.
+const NAMES_GIT_WITHOUT_RUNNING_IT: &[(&str, &str)] = &[(
+    // `fln doctor` reports whether the optional D2 `git` is on PATH by a PATH lookup; it
+    // never spawns it (the probe is `doctor_path_tool`).
+    "crates/fln-cli/src/lib.rs",
+    r#"doctor_path_tool("git", "optional D2 tool for Lake dependency fetching")"#,
+)];
+
+/// The independent spelling: chosen to overlap the primary needle rather than to agree by
+/// construction.
+fn mentions_git(text: &str) -> bool {
+    text.contains("run_git") || text.contains("fn git(") || text.contains(r#""git","#)
+}
+
+/// Whether `text` still mentions git once the declared non-running lines are cut out.
+/// `None` when a declaration for `path` no longer matches its file (a stale entry).
+fn mentions_git_beyond_declared(path: &str, text: &str, declared: &[(&str, &str)]) -> Option<bool> {
+    let mut remainder = text.to_owned();
+    for (file, line) in declared.iter().filter(|(file, _)| *file == path) {
+        let _ = file;
+        if !remainder.contains(line) {
+            return None;
+        }
+        remainder = remainder.replace(line, "");
+    }
+    Some(mentions_git(&remainder))
+}
+
+#[test]
+fn a_declared_non_running_git_line_masks_nothing_else_in_its_file() {
+    let line = r#"doctor_path_tool("git", "probe")"#;
+    let declared = [("a.rs", line)];
+    let alone = format!("fn f() {{ {line}; }}");
+    assert_eq!(
+        mentions_git_beyond_declared("a.rs", &alone, &declared),
+        Some(false)
+    );
+    let with_a_real_call = format!("fn f() {{ {line}; x.args([\"git\", \"status\"]); }}");
+    assert_eq!(
+        mentions_git_beyond_declared("a.rs", &with_a_real_call, &declared),
+        Some(true),
+        "a second git spelling in a declared file is still a miss"
+    );
+    assert_eq!(
+        mentions_git_beyond_declared("a.rs", "fn f() {}", &declared),
+        None,
+        "a declaration whose line is gone is stale"
+    );
+    assert_eq!(
+        mentions_git_beyond_declared("b.rs", &alone, &declared),
+        Some(true),
+        "a declaration binds one file, not the line anywhere"
+    );
+}
+
 #[test]
 fn the_git_shelling_population_is_derived_and_reconciled() {
     const FLOOR: usize = 8;
@@ -5730,6 +5788,8 @@ fn the_git_shelling_population_is_derived_and_reconciled() {
 
     let mut primary = std::collections::BTreeSet::new();
     let mut secondary = std::collections::BTreeSet::new();
+    let mut stale = Vec::new();
+    let mut declared_seen = Vec::new();
     let mut scanned = 0usize;
     for path in String::from_utf8_lossy(&listed.stdout).lines() {
         if !path.ends_with(".rs") {
@@ -5742,9 +5802,18 @@ fn the_git_shelling_population_is_derived_and_reconciled() {
         if text.contains(r#"Command::new("git")"#) {
             primary.insert(path.to_string());
         }
-        // A different spelling, chosen to overlap rather than to agree by construction.
-        if text.contains("run_git") || text.contains("fn git(") || text.contains(r#""git","#) {
-            secondary.insert(path.to_string());
+        match mentions_git_beyond_declared(path, &text, NAMES_GIT_WITHOUT_RUNNING_IT) {
+            Some(true) => {
+                secondary.insert(path.to_string());
+            }
+            Some(false) => {}
+            None => stale.push(path.to_string()),
+        }
+        if NAMES_GIT_WITHOUT_RUNNING_IT
+            .iter()
+            .any(|(file, _)| *file == path)
+        {
+            declared_seen.push(path.to_string());
         }
     }
 
@@ -5759,6 +5828,28 @@ fn the_git_shelling_population_is_derived_and_reconciled() {
          population is a broken extractor, not a repository that stopped using git",
         primary.len()
     );
+
+    assert!(
+        stale.is_empty(),
+        "NAMES_GIT_WITHOUT_RUNNING_IT declares a line these files no longer contain: {stale:?}. \
+         Remove or update the declaration in the same change that moved the line"
+    );
+    let declared_files: Vec<&str> = NAMES_GIT_WITHOUT_RUNNING_IT
+        .iter()
+        .map(|(file, _)| *file)
+        .collect();
+    assert_eq!(
+        declared_seen.len(),
+        declared_files.len(),
+        "every NAMES_GIT_WITHOUT_RUNNING_IT file must be a tracked Rust file: declared \
+         {declared_files:?}, scanned {declared_seen:?}"
+    );
+    for (file, _) in NAMES_GIT_WITHOUT_RUNNING_IT {
+        assert!(
+            !primary.contains(*file),
+            "{file} shells out to git after all, so its non-running declaration is wrong"
+        );
+    }
 
     // The reconciliation, in the direction that catches a false zero: anything the independent
     // spelling finds must already be in the primary set.
