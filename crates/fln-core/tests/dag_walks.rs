@@ -1,6 +1,8 @@
 //! Graph-sized core operations for franken_lean-z8j.1.13.
 //! Large shared inputs intentionally have astronomical tree expansions; these
 //! exercise the real methods without timing assertions or ignored regressions.
+#![forbid(unsafe_code)]
+
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::level::{LMVarId, Level, LevelView};
 use fln_core::name::Name;

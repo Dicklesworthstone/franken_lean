@@ -345,6 +345,32 @@ pub fn release_authority_source(text: &str) -> &str {
     text
 }
 
+/// Whether `parent` declares `module` out of line as exactly `#[cfg(test)] mod <module>;`
+/// at top level. The file behind such a declaration is compiled only for tests, so it is
+/// absent from the release build for the same reason [`release_authority_source`] drops a
+/// `#[cfg(test)] mod tests { ... }` tail. Any other spelling (an extra attribute, a
+/// visibility, a `#[path]`) is not recognised, so the file stays in scope.
+pub fn declares_test_only_module(parent: &str, module: &str) -> bool {
+    let spelling = [
+        ("#", 0),
+        ("[", 0),
+        ("cfg", 1),
+        ("(", 1),
+        ("test", 2),
+        (")", 2),
+        ("]", 1),
+        ("mod", 0),
+        (module, 0),
+        (";", 0),
+    ];
+    rust_lexemes(parent).windows(spelling.len()).any(|window| {
+        window
+            .iter()
+            .zip(spelling)
+            .all(|(lexeme, (text, depth))| lexeme.text == text && lexeme.delimiter_depth == depth)
+    })
+}
+
 fn attributes(text: &str) -> Vec<Attribute> {
     let lexemes = rust_lexemes(text);
     let mut out = Vec::new();

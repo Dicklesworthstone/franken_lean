@@ -1,5 +1,7 @@
 //! Regressions for the term-store prerequisite in franken_lean-z8j.1.13.
 //! These exercise the actual core equality implementations, not a model or timer.
+#![forbid(unsafe_code)]
+
 use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;

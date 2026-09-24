@@ -1205,6 +1205,34 @@ fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &
     }
 }
 
+/// Whether `source` is an out-of-line module that its parent declares as exactly
+/// `#[cfg(test)] mod <stem>;`, and so is absent from the release build.
+///
+/// The parent is looked up where Rust looks for it (`dir.rs`, `dir/mod.rs`, or the crate
+/// root when the file sits beside `lib.rs`/`main.rs`); an unreadable or undeclaring parent
+/// keeps the file in scope. A file that some OTHER, non-test declaration also includes via
+/// `#[path]` would be skipped here while shipping in release; no such inclusion exists
+/// today and the shape is not detected.
+fn is_test_only_module_file(source: &Path) -> bool {
+    let (Some(stem), Some(dir)) = (source.file_stem().and_then(OsStr::to_str), source.parent())
+    else {
+        return false;
+    };
+    if matches!(stem, "mod" | "lib" | "main") {
+        return false;
+    }
+    [
+        dir.with_extension("rs"),
+        dir.join("mod.rs"),
+        dir.join("lib.rs"),
+        dir.join("main.rs"),
+    ]
+    .iter()
+    .any(|parent| {
+        fs::read_to_string(parent).is_ok_and(|text| ledger::declares_test_only_module(&text, stem))
+    })
+}
+
 /// Name an unresolved call shape in the finding rather than dropping the site.
 ///
 /// An arity this scanner could not compute is reported, never skipped: a guard that
@@ -2630,6 +2658,9 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
                 continue;
             };
+            if is_test_only_module_file(&source) {
+                continue;
+            }
             audit_declaration_admission_surface(
                 ledger::release_authority_source(&text),
                 &source_rel,

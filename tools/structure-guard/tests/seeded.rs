@@ -1442,6 +1442,69 @@ fn raw_declaration_admission_is_refused_outside_fln_env() {
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-038"]);
 }
 
+/// An out-of-line module declared `#[cfg(test)] mod tests;` never ships, exactly like an
+/// inline `#[cfg(test)] mod tests { ... }` tail, so a fixture there may build an
+/// environment by hand.
+#[test]
+fn a_test_only_out_of_line_module_is_not_production_admission() {
+    let ws = TempWs::new("admission-test-module");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {\n    true\n}\n\n\
+         #[cfg(test)]\nmod tests;\n",
+    );
+    ws.write(
+        "crates/fln-kernel/src/tests.rs",
+        "fn fixture(env: &Env, info: Info) -> Env {\n    env.add_decl(info)\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "a module compiled only for tests is not production admission: {:?}",
+        out.findings
+    );
+}
+
+/// The exclusion is the declaration's `#[cfg(test)]`, not the file name: the same file
+/// declared as an ordinary module ships, and is the violation.
+#[test]
+fn an_ungated_tests_module_is_still_production_admission() {
+    let ws = TempWs::new("admission-ungated-module");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {\n    true\n}\n\nmod tests;\n",
+    );
+    ws.write(
+        "crates/fln-kernel/src/tests.rs",
+        "fn fixture(env: &Env, info: Info) -> Env {\n    env.add_decl(info)\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-038"]);
+}
+
+/// The gate must name THIS file's module: a `#[cfg(test)]` on a sibling says nothing
+/// about it.
+#[test]
+fn a_test_gate_on_another_module_does_not_exempt_this_one() {
+    let ws = TempWs::new("admission-other-gate");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {\n    true\n}\n\n\
+         #[cfg(test)]\nmod other;\nmod tests;\n",
+    );
+    ws.write("crates/fln-kernel/src/other.rs", "fn nothing() {}\n");
+    ws.write(
+        "crates/fln-kernel/src/tests.rs",
+        "fn fixture(env: &Env, info: Info) -> Env {\n    env.add_decl(info)\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-038"]);
+}
+
 /// THE DISCRIMINATION TEST, and the reason this rule matches arity rather than a name.
 ///
 /// `fln_hash::LogicalRootBuilder::add_decl(name, digest)` is an unrelated method that
