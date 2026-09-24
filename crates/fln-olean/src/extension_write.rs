@@ -713,7 +713,7 @@ mod tests {
             entries: &entries,
         }];
         let header = OleanWriteHeader {
-            base_addr: u64::MAX & !(format::REGION_ALIGN as u64 - 1),
+            base_addr: !(format::REGION_ALIGN as u64 - 1),
             ..header(3)
         };
         assert!(matches!(

@@ -1190,10 +1190,10 @@ fn parse_goals(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageErro
             );
             continue;
         }
-        if let Some(arg_str) = arg.to_str() {
-            if arg_str.starts_with("--") {
-                return Err(UsageError(format!("unknown option {arg_str:?}")));
-            }
+        if let Some(arg_str) = arg.to_str()
+            && arg_str.starts_with("--")
+        {
+            return Err(UsageError(format!("unknown option {arg_str:?}")));
         }
         if path.is_some() {
             return Err(UsageError(
@@ -1662,12 +1662,12 @@ struct LeanInstallationPaths {
 }
 
 fn derive_lean_installation_paths(executable: &Path) -> Result<LeanInstallationPaths, String> {
-    if let Some(sysroot) = std::env::var_os("LEAN_SYSROOT") {
-        if !sysroot.is_empty() {
-            let prefix = PathBuf::from(sysroot);
-            let libdir = prefix.join("lib").join("lean");
-            return Ok(LeanInstallationPaths { prefix, libdir });
-        }
+    if let Some(sysroot) = std::env::var_os("LEAN_SYSROOT")
+        && !sysroot.is_empty()
+    {
+        let prefix = PathBuf::from(sysroot);
+        let libdir = prefix.join("lib").join("lean");
+        return Ok(LeanInstallationPaths { prefix, libdir });
     }
     let bin = executable.parent().ok_or_else(|| {
         format!(
@@ -12512,16 +12512,16 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         }
     }
 
-    if let Some(d) = &dir {
-        if !d.exists() {
-            return MultiplexerOutput::failure(
-                format!(
-                    "error: package directory '{}' does not exist\n",
-                    d.display()
-                ),
-                1,
-            );
-        }
+    if let Some(d) = &dir
+        && !d.exists()
+    {
+        return MultiplexerOutput::failure(
+            format!(
+                "error: package directory '{}' does not exist\n",
+                d.display()
+            ),
+            1,
+        );
     }
 
     let Some(cmd) = command else {

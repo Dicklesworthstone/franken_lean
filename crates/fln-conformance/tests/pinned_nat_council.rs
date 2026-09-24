@@ -24,6 +24,9 @@ use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
+/// A module name with its exported, server and private `.olean` parts.
+type RawModule = (fln_core::name::Name, Vec<u8>, Vec<u8>, Vec<u8>);
+
 fn reference_lib() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("FLN_REFERENCE_LIB") {
         let path = PathBuf::from(path);
@@ -176,9 +179,7 @@ fn pinned_init_prelude_reaches_two_checker_council_frontier() {
 }
 
 fn check_decl_closure(target: &[&str]) -> Option<Outcome<fln::CheckedOlean>> {
-    let Some(lib) = reference_lib() else {
-        return None;
-    };
+    let lib = reference_lib()?;
     let base = lib.join("Init/Prelude.olean");
     let exported = std::fs::read(&base).expect("read exported Prelude");
     let server_path = base.with_extension("olean.server");
@@ -301,17 +302,15 @@ fn check_decl_closure(target: &[&str]) -> Option<Outcome<fln::CheckedOlean>> {
                         }
                     }
                 }
-                ConstantInfo::Quot(_) => {
-                    if needed.contains(info.name()) {
-                        for q in [
-                            fln_core::name::Name::from_components(["Quot"]),
-                            fln_core::name::Name::from_components(["Quot", "mk"]),
-                            fln_core::name::Name::from_components(["Quot", "lift"]),
-                            fln_core::name::Name::from_components(["Quot", "ind"]),
-                        ] {
-                            if !needed.contains(&q) {
-                                queue.push(q);
-                            }
+                ConstantInfo::Quot(_) if needed.contains(info.name()) => {
+                    for q in [
+                        fln_core::name::Name::from_components(["Quot"]),
+                        fln_core::name::Name::from_components(["Quot", "mk"]),
+                        fln_core::name::Name::from_components(["Quot", "lift"]),
+                        fln_core::name::Name::from_components(["Quot", "ind"]),
+                    ] {
+                        if !needed.contains(&q) {
+                            queue.push(q);
                         }
                     }
                 }
@@ -5687,7 +5686,7 @@ fn pinned_extended_60_module_companion_chain_council_run() {
         ("Init/Data/UInt/BasicAux", 89),
     ];
 
-    let raw_modules: Vec<(fln_core::name::Name, Vec<u8>, Vec<u8>, Vec<u8>)> = module_specs
+    let raw_modules: Vec<RawModule> = module_specs
         .iter()
         .map(|(path, _)| {
             let name = fln_core::name::Name::from_components(path.split('/'));
@@ -5834,7 +5833,7 @@ fn pinned_extended_63_module_companion_chain_council_run() {
         ("Init/MethodSpecsSimp", 16),
     ];
 
-    let raw_modules: Vec<(fln_core::name::Name, Vec<u8>, Vec<u8>, Vec<u8>)> = module_specs
+    let raw_modules: Vec<RawModule> = module_specs
         .iter()
         .map(|(path, _)| {
             let name = fln_core::name::Name::from_components(path.split('/'));
