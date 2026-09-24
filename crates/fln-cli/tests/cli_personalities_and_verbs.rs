@@ -805,7 +805,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
         .output()
         .expect("run fln build explain initial");
-    assert_eq!(explain_init.status.code(), Some(1));
+    assert_eq!(explain_init.status.code(), Some(5));
     let explain_init_stdout = String::from_utf8(explain_init.stdout).expect("utf8 stdout");
     assert!(explain_init_stdout.is_empty());
     assert!(String::from_utf8_lossy(&explain_init.stderr).contains("provenance is unavailable"));
@@ -821,7 +821,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         ])
         .output()
         .expect("run fln build explain --json");
-    assert_eq!(explain_json.status.code(), Some(1));
+    assert_eq!(explain_json.status.code(), Some(5));
     let explain_json_stdout = String::from_utf8(explain_json.stdout).expect("utf8 stdout");
     assert!(explain_json_stdout.is_empty());
     let explain_json_stderr = String::from_utf8(explain_json.stderr).unwrap();
@@ -840,7 +840,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
         .output()
         .expect("run fln build explain cached");
-    assert_eq!(explain_cached.status.code(), Some(1));
+    assert_eq!(explain_cached.status.code(), Some(5));
     let explain_cached_stdout = String::from_utf8(explain_cached.stdout).expect("utf8 stdout");
     assert!(explain_cached_stdout.is_empty());
 
@@ -853,7 +853,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         .args(["build", "explain", "--dir", pkg_dir.to_str().unwrap()])
         .output()
         .expect("run fln build explain sound");
-    assert_eq!(explain_sound.status.code(), Some(1));
+    assert_eq!(explain_sound.status.code(), Some(5));
     let explain_sound_stdout = String::from_utf8(explain_sound.stdout).expect("utf8 stdout");
     assert!(explain_sound_stdout.is_empty());
 
@@ -868,7 +868,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         ])
         .output()
         .expect("run fln build explain faithful");
-    assert_eq!(explain_faithful.status.code(), Some(1));
+    assert_eq!(explain_faithful.status.code(), Some(5));
     let explain_faithful_stdout = String::from_utf8(explain_faithful.stdout).expect("utf8 stdout");
     assert!(explain_faithful_stdout.is_empty());
     assert!(

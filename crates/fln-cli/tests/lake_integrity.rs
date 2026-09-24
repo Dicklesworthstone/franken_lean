@@ -94,7 +94,7 @@ fn stale_or_forged_artifacts_cannot_authorize_builds_or_cache_reports() {
                     cmd.arg("--faithful-invalidation");
                 }
                 let out = cmd.output().unwrap();
-                assert_eq!(out.status.code(), Some(1), "{out:?}");
+                assert_eq!(out.status.code(), Some(5), "{out:?}");
                 assert!(out.stdout.is_empty());
                 let err = String::from_utf8(out.stderr).unwrap();
                 assert!(err.contains("\"status\":\"unsupported\""), "{err}");

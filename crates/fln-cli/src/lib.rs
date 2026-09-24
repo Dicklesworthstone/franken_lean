@@ -127,7 +127,8 @@ const USAGE: &str = concat!(
     "names the planned subsystems that are not implemented yet.\n",
     "`serve-mcp`, `replay`, and `cache` are planned capabilities that are not\n",
     "implemented; they print a typed notice and exit 5.\n",
-    "`build explain` currently refuses: recorded build provenance is unavailable.\n",
+    "`build explain` exits 5: recorded build provenance is unavailable, so it\n",
+    "reports no rebuild decision.\n",
     "`verify-capsule` checks the transport completeness and content-hash integrity\n",
     "of a sealed .flnpack capsule and decodes its certificate objects; it does not\n",
     "replay certificates through a checker.\n",
@@ -12353,18 +12354,24 @@ fn run_build_explain(
                 ))
             }
         }
-        Err(err) => lake_operation_failure(
-            "fln.build-explain/1",
-            &err.to_string(),
-            matches!(
+        Err(err) => {
+            let unsupported = matches!(
                 err,
                 fln_lake::LakeExplainError::Unavailable
                     | fln_lake::LakeExplainError::Discovery(
                         fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)
                     )
-            ),
-            json,
-        ),
+            );
+            let mut output =
+                lake_operation_failure("fln.build-explain/1", &err.to_string(), unsupported, json);
+            // `build explain` is an `fln` verb, so a missing capability takes the
+            // multiplexer's documented exit 5, never the 1 that means "rejected
+            // or failed". The `lake` personality keeps Lake's own exit 1.
+            if unsupported {
+                output.exit_code = 5;
+            }
+            output
+        }
     }
 }
 
