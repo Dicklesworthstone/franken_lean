@@ -286,13 +286,10 @@ mod tests {
     #[test]
     fn nested_lexical_contexts_prepare_mutual_groups_on_a_small_host_stack() {
         let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/native_mutual_folds.lean"
-        ))
-        .split("#eval")
-        .next()
-        .unwrap();
+        let example = fln_core::checked_workspace_root!().join("examples/native_mutual_folds.lean");
+        let text = std::fs::read_to_string(&example)
+            .expect("examples/native_mutual_folds.lean is readable");
+        let source = text.split("#eval").next().unwrap();
         let engine = Engine::with_source_seed(limits)
             .unwrap()
             .into_complete()
