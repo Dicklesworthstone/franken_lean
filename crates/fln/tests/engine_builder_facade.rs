@@ -4,9 +4,8 @@
 #![forbid(unsafe_code)]
 
 use fln::{
-    DataValue, Declaration, Engine, EngineAdmissionLimits, EngineBuilder,
-    EngineExecutionLimits, Environment, KVMap, Mode, ModuleApplyState, ModuleEpoch, Name, Outcome,
-    ReproducibilityProfile,
+    DataValue, Declaration, Engine, EngineAdmissionLimits, EngineBuilder, EngineExecutionLimits,
+    Environment, KVMap, Mode, ModuleApplyState, ModuleEpoch, Name, Outcome, ReproducibilityProfile,
 };
 
 #[test]
@@ -14,7 +13,10 @@ fn engine_builder_defaults() {
     let builder = Engine::builder();
     assert_eq!(builder.epoch(), &Engine::pinned_epoch());
     assert_eq!(builder.get_mode(), Mode::DEFAULT);
-    assert_eq!(builder.get_reproducibility(), ReproducibilityProfile::Standard);
+    assert_eq!(
+        builder.get_reproducibility(),
+        ReproducibilityProfile::Standard
+    );
     assert!(builder.get_options().is_empty());
     assert!(builder.get_admission_limits().is_none());
     assert!(builder.get_execution_limits().is_none());
@@ -25,7 +27,10 @@ fn engine_builder_defaults() {
     let empty_engine = builder.build_empty();
     assert_eq!(empty_engine.toolchain_epoch(), &Engine::pinned_epoch());
     assert_eq!(empty_engine.mode(), Mode::DEFAULT);
-    assert_eq!(empty_engine.reproducibility(), ReproducibilityProfile::Standard);
+    assert_eq!(
+        empty_engine.reproducibility(),
+        ReproducibilityProfile::Standard
+    );
     assert!(empty_engine.options().is_empty());
     assert!(empty_engine.environment().is_empty());
 }
@@ -34,7 +39,10 @@ fn engine_builder_defaults() {
 fn engine_builder_custom_configuration() {
     let custom_epoch = ModuleEpoch::new("v4.32.0", "8c9756b28d64dab099da31a4c09229a9e6a2ef35");
     let mut options = KVMap::new();
-    options.insert(Name::from_components(["pp", "all"]), DataValue::OfBool(true));
+    options.insert(
+        Name::from_components(["pp", "all"]),
+        DataValue::OfBool(true),
+    );
 
     let limits = EngineAdmissionLimits::for_stack_bytes(4 * 1024 * 1024);
     let exec_limits = EngineExecutionLimits::for_stack_bytes(4 * 1024 * 1024);
@@ -49,7 +57,10 @@ fn engine_builder_custom_configuration() {
 
     assert_eq!(builder.epoch(), &custom_epoch);
     assert_eq!(builder.get_mode(), Mode::Faithful);
-    assert_eq!(builder.get_reproducibility(), ReproducibilityProfile::Certified);
+    assert_eq!(
+        builder.get_reproducibility(),
+        ReproducibilityProfile::Certified
+    );
     assert_eq!(builder.get_options(), &options);
     assert_eq!(builder.get_admission_limits(), Some(limits));
     assert_eq!(builder.get_execution_limits(), Some(exec_limits));
@@ -95,7 +106,11 @@ fn engine_builder_seeded_nat_and_admission_continuity() {
     assert_eq!(engine.mode(), Mode::Sound);
     assert_eq!(engine.toolchain_epoch(), &Engine::pinned_epoch());
     assert_eq!(engine.options(), &options);
-    assert!(engine.environment().contains(&Name::from_components(["Nat"])));
+    assert!(
+        engine
+            .environment()
+            .contains(&Name::from_components(["Nat"]))
+    );
 
     // Verify admit_decl preserves configuration and advances the environment
     let axiom = Declaration::Axiom(fln::AxiomVal {
@@ -117,7 +132,11 @@ fn engine_builder_seeded_nat_and_admission_continuity() {
     assert_eq!(successor.mode(), Mode::Sound);
     assert_eq!(successor.toolchain_epoch(), &Engine::pinned_epoch());
     assert_eq!(successor.options(), &options);
-    assert!(successor.environment().contains(&Name::from_components(["postulate_foo"])));
+    assert!(
+        successor
+            .environment()
+            .contains(&Name::from_components(["postulate_foo"]))
+    );
 }
 
 #[test]
@@ -135,7 +154,10 @@ fn engine_module_apply_state_integration() {
 
     // builder.build_from_module_state with custom mode and options
     let mut extra_options = KVMap::new();
-    extra_options.insert(Name::from_components(["extra", "opt"]), DataValue::OfBool(true));
+    extra_options.insert(
+        Name::from_components(["extra", "opt"]),
+        DataValue::OfBool(true),
+    );
     let custom_engine = Engine::builder()
         .mode(Mode::Faithful)
         .reproducibility(ReproducibilityProfile::Certified)
@@ -144,12 +166,22 @@ fn engine_module_apply_state_integration() {
 
     assert_eq!(custom_engine.toolchain_epoch(), &epoch);
     assert_eq!(custom_engine.mode(), Mode::Faithful);
-    assert_eq!(custom_engine.reproducibility(), ReproducibilityProfile::Certified);
-    assert!(custom_engine.options().contains(&Name::from_components(["extra", "opt"])));
+    assert_eq!(
+        custom_engine.reproducibility(),
+        ReproducibilityProfile::Certified
+    );
+    assert!(
+        custom_engine
+            .options()
+            .contains(&Name::from_components(["extra", "opt"]))
+    );
 
     // engine.apply_module_state
     let advanced = custom_engine.apply_module_state(&state);
     assert_eq!(advanced.toolchain_epoch(), &epoch);
     assert_eq!(advanced.mode(), Mode::Faithful);
-    assert_eq!(advanced.reproducibility(), ReproducibilityProfile::Certified);
+    assert_eq!(
+        advanced.reproducibility(),
+        ReproducibilityProfile::Certified
+    );
 }

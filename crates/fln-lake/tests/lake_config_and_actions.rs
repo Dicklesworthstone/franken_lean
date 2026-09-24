@@ -3,11 +3,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
 use fln_lake::{
-    clean, init_package, new_package, validate_package_name, LakeCleanError, LakeConfig,
-    LakeConfigFormat, LakeInitError, LakeParseError,
+    LakeCleanError, LakeConfig, LakeConfigFormat, LakeInitError, LakeParseError, clean,
+    init_package, new_package, validate_package_name,
 };
+use std::path::PathBuf;
 
 fn fresh_temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -114,7 +114,9 @@ fn test_validate_package_names() {
     ));
 
     // Reserved identifiers
-    for reserved in ["init", "lean", "lake", "main", "Init", "LEAN", "Lake", "MAIN"] {
+    for reserved in [
+        "init", "lean", "lake", "main", "Init", "LEAN", "Lake", "MAIN",
+    ] {
         assert!(matches!(
             validate_package_name(reserved),
             Err(LakeInitError::ReservedName(_))
@@ -158,8 +160,8 @@ fn test_init_and_discover_package() {
 #[test]
 fn test_new_package_and_clean() {
     let parent = fresh_temp_dir("new-parent");
-    let pkg_dir = new_package(&parent, "calc_app", None, LakeConfigFormat::Toml)
-        .expect("create new package");
+    let pkg_dir =
+        new_package(&parent, "calc_app", None, LakeConfigFormat::Toml).expect("create new package");
     assert_eq!(pkg_dir, parent.join("calc_app"));
     assert!(pkg_dir.join("lakefile.toml").exists());
 
@@ -232,30 +234,29 @@ fn test_build_package_and_caching() {
     init_package(&dir, "tensor_lib", None, LakeConfigFormat::Toml).expect("init package");
 
     // 1. Initial build: builds 1 target
-    let report1 = fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false)
-        .expect("initial build");
+    let report1 =
+        fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false).expect("initial build");
     assert_eq!(report1.package, "tensor_lib");
     assert_eq!(report1.targets_built, 1);
     assert_eq!(report1.targets_cached, 0);
     assert!(dir.join(".lake/build/lib/tensor_lib.olean").exists());
 
     // 2. Second build without touching source: cached
-    let report2 = fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false)
-        .expect("cached build");
+    let report2 =
+        fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false).expect("cached build");
     assert_eq!(report2.targets_built, 0);
     assert_eq!(report2.targets_cached, 1);
 
     // 3. Dry-run does not write new files
-    let report3 = fln_lake::build_package(&dir, &["tensor_lib".to_owned()], true)
-        .expect("dry run");
+    let report3 = fln_lake::build_package(&dir, &["tensor_lib".to_owned()], true).expect("dry run");
     assert_eq!(report3.targets_cached, 1);
 
     // 4. Modifying source triggers rebuild
     std::thread::sleep(std::time::Duration::from_millis(50));
     let main_lean = dir.join("Main.lean");
     std::fs::write(&main_lean, "def main : IO Unit := IO.println \"Updated\"\n").unwrap();
-    let report4 = fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false)
-        .expect("rebuild");
+    let report4 =
+        fln_lake::build_package(&dir, &["tensor_lib".to_owned()], false).expect("rebuild");
     assert_eq!(report4.targets_built, 1);
     assert_eq!(report4.targets_cached, 0);
 }
@@ -266,11 +267,14 @@ fn test_explain_build_dual_rebuild_decisions() {
     init_package(&dir, "algebra_geom", None, LakeConfigFormat::Toml).expect("init package");
 
     // 1. Before build: initial build (rebuild in both models)
-    let explain1 = fln_lake::explain_build(&dir, Some("algebra_geom"), false)
-        .expect("explain initial");
+    let explain1 =
+        fln_lake::explain_build(&dir, Some("algebra_geom"), false).expect("explain initial");
     assert_eq!(explain1.package, "algebra_geom");
     assert_eq!(explain1.target, "algebra_geom");
-    assert_eq!(explain1.reference_decision, fln_lake::RebuildDecision::Rebuild);
+    assert_eq!(
+        explain1.reference_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
     assert_eq!(explain1.native_decision, fln_lake::RebuildDecision::Rebuild);
     assert_eq!(explain1.cache_outcome, "miss");
     assert!(explain1.delta.contains("initial build"));
@@ -279,9 +283,12 @@ fn test_explain_build_dual_rebuild_decisions() {
     fln_lake::build_package(&dir, &["algebra_geom".to_owned()], false).expect("build");
 
     // 3. After build: cached in both models
-    let explain2 = fln_lake::explain_build(&dir, Some("algebra_geom"), false)
-        .expect("explain cached");
-    assert_eq!(explain2.reference_decision, fln_lake::RebuildDecision::Cached);
+    let explain2 =
+        fln_lake::explain_build(&dir, Some("algebra_geom"), false).expect("explain cached");
+    assert_eq!(
+        explain2.reference_decision,
+        fln_lake::RebuildDecision::Cached
+    );
     assert_eq!(explain2.native_decision, fln_lake::RebuildDecision::Cached);
     assert_eq!(explain2.cache_outcome, "hit");
 
@@ -291,29 +298,49 @@ fn test_explain_build_dual_rebuild_decisions() {
     std::fs::write(&src, "def hello := \"world updated internal\"\n").unwrap();
 
     // 4a. With faithful invalidation: native matches reference file-cone invalidation
-    let explain_faithful = fln_lake::explain_build(&dir, Some("algebra_geom"), true)
-        .expect("explain faithful");
-    assert_eq!(explain_faithful.reference_decision, fln_lake::RebuildDecision::Rebuild);
-    assert_eq!(explain_faithful.native_decision, fln_lake::RebuildDecision::Rebuild);
+    let explain_faithful =
+        fln_lake::explain_build(&dir, Some("algebra_geom"), true).expect("explain faithful");
+    assert_eq!(
+        explain_faithful.reference_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
+    assert_eq!(
+        explain_faithful.native_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
     assert_eq!(explain_faithful.cache_outcome, "miss");
 
     // 4b. With native sound mode: early-cutoff skips rebuild of demand node
-    let explain_native = fln_lake::explain_build(&dir, Some("algebra_geom"), false)
-        .expect("explain native");
-    assert_eq!(explain_native.reference_decision, fln_lake::RebuildDecision::Rebuild);
-    assert_eq!(explain_native.native_decision, fln_lake::RebuildDecision::Cached);
+    let explain_native =
+        fln_lake::explain_build(&dir, Some("algebra_geom"), false).expect("explain native");
+    assert_eq!(
+        explain_native.reference_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
+    assert_eq!(
+        explain_native.native_decision,
+        fln_lake::RebuildDecision::Cached
+    );
     assert_eq!(explain_native.cache_outcome, "hit");
     assert!(explain_native.delta.contains("early-cutoff"));
 
     // 5. Modify source with interface change marker
     std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::write(&src, "-- fln-interface-change\ndef hello := \"signature changed\"\n").unwrap();
+    std::fs::write(
+        &src,
+        "-- fln-interface-change\ndef hello := \"signature changed\"\n",
+    )
+    .unwrap();
     let explain_interface = fln_lake::explain_build(&dir, Some("algebra_geom"), false)
         .expect("explain interface change");
-    assert_eq!(explain_interface.reference_decision, fln_lake::RebuildDecision::Rebuild);
-    assert_eq!(explain_interface.native_decision, fln_lake::RebuildDecision::Rebuild);
+    assert_eq!(
+        explain_interface.reference_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
+    assert_eq!(
+        explain_interface.native_decision,
+        fln_lake::RebuildDecision::Rebuild
+    );
     assert_eq!(explain_interface.cache_outcome, "miss");
     assert!(explain_interface.delta.contains("interface change"));
 }
-
-

@@ -193,12 +193,11 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
     // OleanView uses this same parser, so failures have already been mapped to
     // its precise public errors above. Reuse the authoritative payload bounds
     // rather than assuming that the fixed header is followed by the root slot.
-    let envelope = fln_rt::region::parse_olean_envelope(bytes).map_err(|_| {
-        RegionError::DecodeShape {
+    let envelope =
+        fln_rt::region::parse_olean_envelope(bytes).map_err(|_| RegionError::DecodeShape {
             offset: 0,
             reason: "rebuild envelope disagrees with the parsed view",
-        }
-    })?;
+        })?;
     let base = view.header.base_addr;
     let data_start = envelope.payload_offset as u64;
     let data_end = envelope.payload_offset + envelope.payload_len;
@@ -895,7 +894,10 @@ mod tests {
     fn v3_truncation_and_trailing_bytes_refuse_without_panics() {
         let file = v3_file(&1u64.to_le_bytes(), &[(0x10000, b"library")]);
         for end in 0..file.len() {
-            assert!(rebuild(&file[..end]).is_err(), "accepted truncation at {end}");
+            assert!(
+                rebuild(&file[..end]).is_err(),
+                "accepted truncation at {end}"
+            );
         }
         let mut trailing = file.clone();
         trailing.push(0);
@@ -909,7 +911,10 @@ mod tests {
     #[test]
     fn v3_root_cannot_point_into_the_library_trailer() {
         let mut file = v3_file(&1u64.to_le_bytes(), &[(0x10000, b"library")]);
-        let base = OleanView::parse(&file).expect("v3 envelope").header.base_addr;
+        let base = OleanView::parse(&file)
+            .expect("v3 envelope")
+            .header
+            .base_addr;
         let root = format::OLEAN_HEADER_SIZE + 8;
         let trailer_pointer = base + root as u64 + 8;
         file[root..root + 8].copy_from_slice(&trailer_pointer.to_le_bytes());

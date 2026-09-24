@@ -286,7 +286,9 @@ pub enum LakeParseError {
 impl fmt::Display for LakeParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingField(field) => write!(f, "missing required field '{field}' in lakefile.toml"),
+            Self::MissingField(field) => {
+                write!(f, "missing required field '{field}' in lakefile.toml")
+            }
             Self::InvalidSyntax(msg) => write!(f, "syntax error in lakefile.toml: {msg}"),
         }
     }
@@ -377,7 +379,11 @@ impl fmt::Display for LakeInitError {
             Self::IllegalName(msg) => write!(f, "error: {msg}"),
             Self::ReservedName(name) => write!(f, "error: reserved package name '{name}'"),
             Self::AlreadyExists(p) => {
-                write!(f, "error: package directory '{}' already exists", p.display())
+                write!(
+                    f,
+                    "error: package directory '{}' already exists",
+                    p.display()
+                )
             }
             Self::Io(msg) => write!(f, "error initializing Lake package: {msg}"),
         }
@@ -626,8 +632,8 @@ impl LakeConfig {
                             };
                             match key {
                                 "name" => {
-                                    target.name =
-                                        parse_string_val(val).ok_or_else(|| invalid("target name"))?;
+                                    target.name = parse_string_val(val)
+                                        .ok_or_else(|| invalid("target name"))?;
                                 }
                                 "root" if target.kind == TargetKind::Executable => {
                                     target.roots =
@@ -690,10 +696,8 @@ impl LakeConfig {
         };
 
         if toml_path.exists() {
-            let content =
-                fs::read_to_string(&toml_path).map_err(LakeDiscoveryError::Io)?;
-            let mut cfg =
-                Self::parse_toml(&content).map_err(LakeDiscoveryError::Parse)?;
+            let content = fs::read_to_string(&toml_path).map_err(LakeDiscoveryError::Io)?;
+            let mut cfg = Self::parse_toml(&content).map_err(LakeDiscoveryError::Parse)?;
             cfg.lean_toolchain = lean_toolchain;
             Ok(cfg)
         } else if lean_path.exists() {
@@ -793,8 +797,7 @@ pub fn init_package(
     // Write .gitignore
     let gitignore_file = dir.join(".gitignore");
     if !gitignore_file.exists() {
-        fs::write(&gitignore_file, "/.lake\n")
-            .map_err(|e| LakeInitError::Io(e.to_string()))?;
+        fs::write(&gitignore_file, "/.lake\n").map_err(|e| LakeInitError::Io(e.to_string()))?;
     }
 
     // Write config file
@@ -849,24 +852,21 @@ pub fn init_package(
              def main : IO Unit :=\n\
                IO.println s!\"Hello, {{hello}}!\"\n"
         );
-        fs::write(&main_file, main_content)
-            .map_err(|e| LakeInitError::Io(e.to_string()))?;
+        fs::write(&main_file, main_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
     }
 
     // Write <lib_name>.lean
     let lib_file = dir.join(format!("{lib_name}.lean"));
     if !lib_file.exists() {
         let lib_content = "def hello := \"world\"\n";
-        fs::write(&lib_file, lib_content)
-            .map_err(|e| LakeInitError::Io(e.to_string()))?;
+        fs::write(&lib_file, lib_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
     }
 
     // Write README.md
     let readme_file = dir.join("README.md");
     if !readme_file.exists() {
         let readme_content = format!("# {name}\n");
-        fs::write(&readme_file, readme_content)
-            .map_err(|e| LakeInitError::Io(e.to_string()))?;
+        fs::write(&readme_file, readme_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
     }
 
     Ok(())
@@ -1026,7 +1026,10 @@ impl Manifest {
         out.push_str("{\n");
         out.push_str(&format!("  \"name\": \"{}\",\n", self.name));
         out.push_str(&format!("  \"version\": \"{}\",\n", self.version));
-        out.push_str(&format!("  \"lakeDir\": \"{}\",\n", self.lake_dir.display()));
+        out.push_str(&format!(
+            "  \"lakeDir\": \"{}\",\n",
+            self.lake_dir.display()
+        ));
         out.push_str(&format!(
             "  \"packagesDir\": \"{}\",\n",
             self.packages_dir.display()
@@ -1091,8 +1094,8 @@ impl Manifest {
             for obj_str in extract_json_objects(packages_str) {
                 let pkg_name = json_extract_string(obj_str, "name").unwrap_or_default();
                 let scope = json_extract_string(obj_str, "scope").unwrap_or_default();
-                let entry_type = json_extract_string(obj_str, "type")
-                    .unwrap_or_else(|| "git".to_owned());
+                let entry_type =
+                    json_extract_string(obj_str, "type").unwrap_or_else(|| "git".to_owned());
                 let url = json_extract_string(obj_str, "url");
                 let rev = json_extract_string(obj_str, "rev");
                 let input_rev = json_extract_string(obj_str, "inputRev");
@@ -1129,10 +1132,9 @@ impl Manifest {
         if !manifest_path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|e| LakeUpdateError::Io(e.to_string()))?;
-        let manifest = Self::parse_json(&content)
-            .map_err(LakeUpdateError::Parse)?;
+        let content =
+            fs::read_to_string(&manifest_path).map_err(|e| LakeUpdateError::Io(e.to_string()))?;
+        let manifest = Self::parse_json(&content).map_err(LakeUpdateError::Parse)?;
         Ok(Some(manifest))
     }
 
@@ -1331,11 +1333,8 @@ pub fn build_package(
 
         if needs_build {
             if !is_dry_run {
-                fs::write(
-                    &olean_artifact,
-                    format!("fln-olean-artifact:{}", target),
-                )
-                .map_err(|e| LakeBuildError::Io(e.to_string()))?;
+                fs::write(&olean_artifact, format!("fln-olean-artifact:{}", target))
+                    .map_err(|e| LakeBuildError::Io(e.to_string()))?;
             }
             targets_built += 1;
         } else {
@@ -1556,7 +1555,9 @@ pub fn fetch_git_dependency(
         // Clone with argv-only invocation, no shell
         let mut clone_cmd = std::process::Command::new("git");
         clone_cmd.args(["clone", "--quiet", url, pkg_dest.to_str().unwrap_or(name)]);
-        let output = clone_cmd.output().map_err(|e| LakeFetchError::Io(e.to_string()))?;
+        let output = clone_cmd
+            .output()
+            .map_err(|e| LakeFetchError::Io(e.to_string()))?;
         if !output.status.success() {
             return Err(LakeFetchError::GitFailed {
                 command: format!("git clone {url} {}", pkg_dest.display()),
@@ -1569,7 +1570,9 @@ pub fn fetch_git_dependency(
         let mut checkout_cmd = std::process::Command::new("git");
         checkout_cmd.current_dir(&pkg_dest);
         checkout_cmd.args(["checkout", "--quiet", revision]);
-        let output = checkout_cmd.output().map_err(|e| LakeFetchError::Io(e.to_string()))?;
+        let output = checkout_cmd
+            .output()
+            .map_err(|e| LakeFetchError::Io(e.to_string()))?;
         if !output.status.success() {
             return Err(LakeFetchError::GitFailed {
                 command: format!("git checkout {revision}"),
@@ -1580,5 +1583,3 @@ pub fn fetch_git_dependency(
 
     Ok(pkg_dest)
 }
-
-

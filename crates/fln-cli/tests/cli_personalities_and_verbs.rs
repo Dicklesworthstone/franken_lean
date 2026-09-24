@@ -50,9 +50,7 @@ fn doctor_runs_the_real_pipeline_and_checks_the_checkout_pins() {
     assert!(stdout.contains("\"schema\":\"fln.doctor/2\""), "{stdout}");
     assert!(stdout.contains("\"status\":\"ok\""), "{stdout}");
     assert!(
-        stdout.contains(
-            "{\"name\":\"source_pipeline_smoke\",\"required\":true,\"status\":\"ok\""
-        ),
+        stdout.contains("{\"name\":\"source_pipeline_smoke\",\"required\":true,\"status\":\"ok\""),
         "{stdout}"
     );
     assert!(
@@ -67,10 +65,8 @@ fn doctor_runs_the_real_pipeline_and_checks_the_checkout_pins() {
 #[test]
 fn doctor_fails_when_run_in_a_checkout_pinned_to_another_reference() {
     let dir = TempDir::new("doctor-pins");
-    let real_lock = std::fs::read_to_string(
-        fln_core::checked_workspace_root!().join("SUITE.lock"),
-    )
-    .expect("read SUITE.lock");
+    let real_lock = std::fs::read_to_string(fln_core::checked_workspace_root!().join("SUITE.lock"))
+        .expect("read SUITE.lock");
     let other_lock: String = real_lock
         .lines()
         .map(|line| {
@@ -98,7 +94,10 @@ fn doctor_reports_a_missing_reference_toolchain_without_failing() {
     let outside = TempDir::new("doctor-outside");
     let empty_elan = TempDir::new("doctor-elan");
     let (code, stdout) = doctor_json(&outside.0, Some(&empty_elan.0));
-    assert_eq!(code, 0, "the Reference is oracle apparatus, not a product dependency: {stdout}");
+    assert_eq!(
+        code, 0,
+        "the Reference is oracle apparatus, not a product dependency: {stdout}"
+    );
     assert!(
         stdout.contains(
             "{\"name\":\"reference_oracle_toolchain\",\"required\":false,\"status\":\"missing\""
@@ -106,7 +105,9 @@ fn doctor_reports_a_missing_reference_toolchain_without_failing() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("{\"name\":\"checkout_pins\",\"required\":false,\"status\":\"not_applicable\""),
+        stdout.contains(
+            "{\"name\":\"checkout_pins\",\"required\":false,\"status\":\"not_applicable\""
+        ),
         "{stdout}"
     );
 }
@@ -206,7 +207,10 @@ fn multiplexer_goals_verb_inspects_proof_goals() {
         String::from_utf8_lossy(&json_output.stderr)
     );
     let json_stdout = String::from_utf8(json_output.stdout).expect("utf8 stdout");
-    assert!(json_stdout.contains("\"schema\":\"fln.goals/1\""), "{json_stdout}");
+    assert!(
+        json_stdout.contains("\"schema\":\"fln.goals/1\""),
+        "{json_stdout}"
+    );
     assert!(json_stdout.contains("\"goals\""), "{json_stdout}");
 }
 
@@ -350,10 +354,10 @@ fn multiplexer_verify_capsule_help_and_errors() {
 
 #[test]
 fn multiplexer_verify_capsule_verifies_valid_cartridge() {
+    use fln::{ContentRoot, EpochId};
     use fln_hash::cartridge::{
         CartridgeBuilderV1, CartridgeObjectKindV1, ObjectPortabilityV1, ObjectRequirementV1,
     };
-    use fln::{ContentRoot, EpochId};
 
     let epoch = EpochId::new(4_032_000);
     let env_root = ContentRoot::new([42; 32]);
@@ -733,7 +737,13 @@ fn fln_build_explain_dual_rebuild_decisions() {
 
     // 2. fln build explain --json
     let explain_json = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["build", "explain", "--json", "--dir", pkg_dir.to_str().unwrap()])
+        .args([
+            "build",
+            "explain",
+            "--json",
+            "--dir",
+            pkg_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("run fln build explain --json");
     assert!(explain_json.status.success());
@@ -795,7 +805,3 @@ fn fln_build_explain_dual_rebuild_decisions() {
     assert!(explain_faithful_stdout.contains("faithful-invalidation enabled"));
     assert!(explain_faithful_stdout.contains("Cache outcome:      miss"));
 }
-
-
-
-

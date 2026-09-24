@@ -177,7 +177,9 @@ impl Builder {
                     .ok_or_else(|| contract("invalid extension big integer"))?;
                 let size = extent(24, limbs.len(), 8)?;
                 if size > u64::from(u16::MAX) {
-                    return Err(contract("extension big integer exceeds the small-object ABI"));
+                    return Err(contract(
+                        "extension big integer exceeds the small-object ABI",
+                    ));
                 }
                 size
             } else {
@@ -359,12 +361,22 @@ pub fn encode_module_with_extensions(
         .filter(|field| field.lean_type != "Bool")
         .map(|field| field.name)
         .collect();
-    if fields != ["imports", "constNames", "constants", "extraConstNames", "entries"] {
+    if fields
+        != [
+            "imports",
+            "constNames",
+            "constants",
+            "extraConstNames",
+            "entries",
+        ]
+    {
         return Err(contract("generated ModuleData object-field layout changed"));
     }
     let root_header = original.header();
     if root_header.tag != 0 || usize::from(root_header.other) != fields.len() {
-        return Err(contract("basic writer returned an unexpected ModuleData root"));
+        return Err(contract(
+            "basic writer returned an unexpected ModuleData root",
+        ));
     }
     let root_offset = usize::try_from(encoded.root - header.base_addr)
         .map_err(|_| contract("ModuleData root offset exceeds the host address space"))?;
@@ -383,7 +395,9 @@ pub fn encode_module_with_extensions(
         );
     }
     if children[4].try_array_view().is_none_or(|(len, _)| len != 0) {
-        return Err(contract("basic writer did not provide an empty entries array"));
+        return Err(contract(
+            "basic writer did not provide an empty entries array",
+        ));
     }
     children[4] = entries;
     let root = Obj::mk_ctor(0, children, scalars);
@@ -393,7 +407,9 @@ pub fn encode_module_with_extensions(
     if checked.objects != objects
         || envelope.payload_offset as u64 + payload.len() as u64 + framing != file_bytes
     {
-        return Err(contract("extended module census differs from the shared compactor"));
+        return Err(contract(
+            "extended module census differs from the shared compactor",
+        ));
     }
     encoded.bytes.truncate(envelope.payload_offset);
     if envelope.version == 3 {
@@ -570,7 +586,10 @@ mod tests {
                 WriteBudget::default(),
             )
             .expect("repeat emission");
-            assert_eq!(repeated.bytes, encoded.bytes, "fresh emission is deterministic");
+            assert_eq!(
+                repeated.bytes, encoded.bytes,
+                "fresh emission is deterministic"
+            );
         }
     }
 
@@ -654,8 +673,15 @@ mod tests {
             },
         ];
         assert!(matches!(
-            encode_module_with_extensions(empty_input(), &extensions, header(3), WriteBudget::default()),
-            Err(WriteError::Contract { what: "duplicate persistent extension name" })
+            encode_module_with_extensions(
+                empty_input(),
+                &extensions,
+                header(3),
+                WriteBudget::default()
+            ),
+            Err(WriteError::Contract {
+                what: "duplicate persistent extension name"
+            })
         ));
     }
 
@@ -668,7 +694,12 @@ mod tests {
             entries: &entries,
         }];
         assert!(matches!(
-            encode_module_with_extensions(empty_input(), &extensions, header(3), WriteBudget::default()),
+            encode_module_with_extensions(
+                empty_input(),
+                &extensions,
+                header(3),
+                WriteBudget::default()
+            ),
             Err(WriteError::Unsupported { .. })
         ));
     }
@@ -686,8 +717,15 @@ mod tests {
             ..header(3)
         };
         assert!(matches!(
-            encode_module_with_extensions(empty_input(), &extensions, header, WriteBudget::default()),
-            Err(WriteError::Contract { what: "extended module mapped address range overflows" })
+            encode_module_with_extensions(
+                empty_input(),
+                &extensions,
+                header,
+                WriteBudget::default()
+            ),
+            Err(WriteError::Contract {
+                what: "extended module mapped address range overflows"
+            })
         ));
     }
 }

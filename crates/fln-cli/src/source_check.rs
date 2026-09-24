@@ -195,12 +195,7 @@ pub(super) fn run_goals(
     let bytes = match read_bounded(&path, max_bytes, "Lean source") {
         Ok(bytes) => bytes,
         Err(error) => {
-            return failed_goals(
-                error.class(),
-                &error.to_string(),
-                json,
-                error.exit_code(),
-            );
+            return failed_goals(error.class(), &error.to_string(), json, error.exit_code());
         }
     };
     let text = match std::str::from_utf8(&bytes) {

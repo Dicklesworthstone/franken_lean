@@ -1144,7 +1144,9 @@ fn parse_goals(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageErro
         }
         if arg == "--max-bytes" {
             let Some(val) = iter.next() else {
-                return Err(UsageError("--max-bytes requires an integer value".to_owned()));
+                return Err(UsageError(
+                    "--max-bytes requires an integer value".to_owned(),
+                ));
             };
             let val_str = val.to_string_lossy();
             max_bytes = val_str
@@ -1194,7 +1196,9 @@ fn parse_goals(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageErro
             }
         }
         if path.is_some() {
-            return Err(UsageError("goals accepts exactly one input path".to_owned()));
+            return Err(UsageError(
+                "goals accepts exactly one input path".to_owned(),
+            ));
         }
         let arg_str = arg.to_string_lossy();
         if let Some((p, l, c)) = parse_path_line_col(&arg_str) {
@@ -1310,7 +1314,9 @@ fn parse_build_explain(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
         }
         if s == "--dir" || s == "-d" {
             let Some(d) = iter.next() else {
-                return Err(UsageError("missing directory argument for --dir".to_owned()));
+                return Err(UsageError(
+                    "missing directory argument for --dir".to_owned(),
+                ));
             };
             dir = Some(PathBuf::from(d));
             continue;
@@ -1324,12 +1330,16 @@ fn parse_build_explain(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
             continue;
         }
         if s.starts_with('-') {
-            return Err(UsageError(format!("unknown option '{s}' for build explain")));
+            return Err(UsageError(format!(
+                "unknown option '{s}' for build explain"
+            )));
         }
         if target.is_none() {
             target = Some(s.into_owned());
         } else {
-            return Err(UsageError(format!("unexpected argument '{s}' for build explain")));
+            return Err(UsageError(format!(
+                "unexpected argument '{s}' for build explain"
+            )));
         }
     }
 
@@ -1420,7 +1430,10 @@ fn parse_command(
         return parse_doctor(arguments.collect());
     }
     if command == "serve-mcp" || command == "replay" || command == "cache" {
-        return parse_capability_notice(command.to_string_lossy().into_owned(), arguments.collect());
+        return parse_capability_notice(
+            command.to_string_lossy().into_owned(),
+            arguments.collect(),
+        );
     }
     if command == "build" {
         let mut rest: Vec<OsString> = arguments.collect();
@@ -2733,7 +2746,10 @@ fn verify_capsule_bytes(
     };
 
     let state = archive.transport_state();
-    if !matches!(state, CartridgeTransportStateV1::Complete | CartridgeTransportStateV1::Sealed { .. }) {
+    if !matches!(
+        state,
+        CartridgeTransportStateV1::Complete | CartridgeTransportStateV1::Sealed { .. }
+    ) {
         return verify_capsule_failure(VerifyCapsuleFailure::IncompleteTransport(state), json);
     }
 
@@ -2854,9 +2870,7 @@ fn verify_capsule_bytes(
                     }
                     fln::Outcome::Inconclusive(inc) => {
                         return verify_capsule_failure(
-                            VerifyCapsuleFailure::Resource(format!(
-                                "certificate decode: {inc:?}"
-                            )),
+                            VerifyCapsuleFailure::Resource(format!("certificate decode: {inc:?}")),
                             json,
                         );
                     }
@@ -2879,25 +2893,19 @@ fn verify_capsule_bytes(
                     }
                     fln::Outcome::Complete(Err(refusal)) => {
                         return verify_capsule_failure(
-                            VerifyCapsuleFailure::Refusal(format!(
-                                "warm cache codec: {refusal:?}"
-                            )),
+                            VerifyCapsuleFailure::Refusal(format!("warm cache codec: {refusal:?}")),
                             json,
                         );
                     }
                     fln::Outcome::Inconclusive(inc) => {
                         return verify_capsule_failure(
-                            VerifyCapsuleFailure::Resource(format!(
-                                "warm cache decode: {inc:?}"
-                            )),
+                            VerifyCapsuleFailure::Resource(format!("warm cache decode: {inc:?}")),
                             json,
                         );
                     }
                     fln::Outcome::InternalFault(fault) => {
                         return verify_capsule_failure(
-                            VerifyCapsuleFailure::Internal(format!(
-                                "warm cache decode: {fault:?}"
-                            )),
+                            VerifyCapsuleFailure::Internal(format!("warm cache decode: {fault:?}")),
                             json,
                         );
                     }
@@ -2971,7 +2979,11 @@ fn verify_capsule_bytes(
             archive.frames.len(),
             bytes.len(),
             certificates_decoded,
-            if warm_cache_decoded { "decoded" } else { "none" },
+            if warm_cache_decoded {
+                "decoded"
+            } else {
+                "none"
+            },
         );
         MultiplexerOutput::success(stdout)
     }
@@ -8393,7 +8405,10 @@ struct DoctorCheck {
 const DOCTOR_NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("kernel engine K2 (NbE accelerator)", "franken_lean-g3k"),
     ("native Mirror facade implementations", "franken_lean-epx"),
-    ("Lantern daemon with shared import heap and RPC sessions", "franken_lean-v2p"),
+    (
+        "Lantern daemon with shared import heap and RPC sessions",
+        "franken_lean-v2p",
+    ),
     ("Ledger content-addressed build store", "franken_lean-xy6"),
     ("Envoy MCP server", "franken_lean-87av"),
     ("doctor --sql build database", "franken_lean-05g"),
@@ -8406,7 +8421,10 @@ fn render_doctor(json: bool) -> MultiplexerOutput {
     let rust_channel = env!("FLN_IDENTITY_RUST_CHANNEL");
 
     let mut checks = vec![doctor_pipeline_smoke()];
-    match std::env::current_dir().ok().and_then(|dir| doctor_checkout_root(&dir)) {
+    match std::env::current_dir()
+        .ok()
+        .and_then(|dir| doctor_checkout_root(&dir))
+    {
         Some(root) => {
             checks.push(doctor_pin_agreement(
                 &root,
@@ -8426,7 +8444,10 @@ fn render_doctor(json: bool) -> MultiplexerOutput {
     }
     checks.push(doctor_reference_toolchain(reference_tag));
     checks.push(doctor_path_tool("cc", "optional D2 tool for --backend c"));
-    checks.push(doctor_path_tool("git", "optional D2 tool for Lake dependency fetching"));
+    checks.push(doctor_path_tool(
+        "git",
+        "optional D2 tool for Lake dependency fetching",
+    ));
 
     let failed = checks
         .iter()
@@ -8596,7 +8617,12 @@ fn doctor_pin_agreement(
             text.lines()
                 .map(str::trim)
                 .find_map(|line| line.strip_prefix("channel"))
-                .map(|rest| rest.trim_start_matches([' ', '=']).trim().trim_matches('"').to_owned())
+                .map(|rest| {
+                    rest.trim_start_matches([' ', '='])
+                        .trim()
+                        .trim_matches('"')
+                        .to_owned()
+                })
         });
     let mut mismatches = Vec::new();
     if lock_reference.as_deref() != Some(reference_commit) {
@@ -8654,7 +8680,10 @@ fn doctor_census_shards(root: &Path) -> DoctorCheck {
         detail: if missing.is_empty() {
             "builtin and extern census shards present".to_owned()
         } else {
-            format!("absent (untracked shards are regenerated by the census extractor): {}", missing.join(", "))
+            format!(
+                "absent (untracked shards are regenerated by the census extractor): {}",
+                missing.join(", ")
+            )
         },
     }
 }
@@ -8677,16 +8706,26 @@ fn doctor_reference_toolchain(tag: &str) -> DoctorCheck {
         .join("toolchains")
         .join(format!("leanprover--lean4---{tag}"));
     let lean = root.join("bin").join("lean");
-    let prelude = root.join("lib").join("lean").join("Init").join("Prelude.olean");
+    let prelude = root
+        .join("lib")
+        .join("lean")
+        .join("Init")
+        .join("Prelude.olean");
     let present = lean.is_file() && prelude.is_file();
     DoctorCheck {
         name: "reference_oracle_toolchain",
         required: false,
         status: if present { "ok" } else { "missing" },
         detail: if present {
-            format!("{} (Tribunal oracle only; never executed by the product)", root.display())
+            format!(
+                "{} (Tribunal oracle only; never executed by the product)",
+                root.display()
+            )
         } else {
-            format!("{} not found; pin-dependent Tribunal rigs will skip", root.display())
+            format!(
+                "{} not found; pin-dependent Tribunal rigs will skip",
+                root.display()
+            )
         },
     }
 }
@@ -8714,10 +8753,16 @@ fn render_capability_notice(command: &str, json: bool) -> MultiplexerOutput {
     }
     let (gate, description) = match command {
         "serve-mcp" => ("G6", "Envoy Model Context Protocol server (plan §16.3)"),
-        "replay" => ("G5", "Palimpsest deterministic elaboration replay (plan §15)"),
+        "replay" => (
+            "G5",
+            "Palimpsest deterministic elaboration replay (plan §15)",
+        ),
         "cache" => ("G2", "Ledger content-addressed artifact cache (plan §13.2)"),
         "doctor --sql" => ("G5", "SQL surface over the build database (plan §15.5)"),
-        "build" | "build explain" => ("G2", "Ledger build fabric and dependency planner (plan §13)"),
+        "build" | "build explain" => (
+            "G2",
+            "Ledger build fabric and dependency planner (plan §13)",
+        ),
         _ => ("G0", "Planned FrankenLean capability"),
     };
     if json {
@@ -12003,7 +12048,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             dir,
             faithful_invalidation,
             json,
-        }) => run_build_explain(target.as_deref(), dir.as_deref(), faithful_invalidation, json),
+        }) => run_build_explain(
+            target.as_deref(),
+            dir.as_deref(),
+            faithful_invalidation,
+            json,
+        ),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }
@@ -12170,7 +12220,9 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
                 Ok(executable) => executable,
                 Err(error) => {
                     return MultiplexerOutput::failure(
-                        format!("leanc: installation: cannot locate the running executable: {error}\n"),
+                        format!(
+                            "leanc: installation: cannot locate the running executable: {error}\n"
+                        ),
                         1,
                     );
                 }
@@ -12178,7 +12230,10 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
             let paths = match derive_lean_installation_paths(&executable) {
                 Ok(paths) => paths,
                 Err(error) => {
-                    return MultiplexerOutput::failure(format!("leanc: installation: {error}\n"), 1);
+                    return MultiplexerOutput::failure(
+                        format!("leanc: installation: {error}\n"),
+                        1,
+                    );
                 }
             };
             return MultiplexerOutput::success(leanc_cflags(&paths.prefix));
@@ -12188,7 +12243,9 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
                 Ok(executable) => executable,
                 Err(error) => {
                     return MultiplexerOutput::failure(
-                        format!("leanc: installation: cannot locate the running executable: {error}\n"),
+                        format!(
+                            "leanc: installation: cannot locate the running executable: {error}\n"
+                        ),
                         1,
                     );
                 }
@@ -12196,7 +12253,10 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
             let paths = match derive_lean_installation_paths(&executable) {
                 Ok(paths) => paths,
                 Err(error) => {
-                    return MultiplexerOutput::failure(format!("leanc: installation: {error}\n"), 1);
+                    return MultiplexerOutput::failure(
+                        format!("leanc: installation: {error}\n"),
+                        1,
+                    );
                 }
             };
             return MultiplexerOutput::success(leanc_ldflags(&paths.prefix));
@@ -12244,17 +12304,11 @@ fn leanc_cflags(prefix: &Path) -> String {
     }
     #[cfg(windows)]
     {
-        format!(
-            "-I {}/include\n",
-            prefix.display()
-        )
+        format!("-I {}/include\n", prefix.display())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        format!(
-            "-I {}/include -fPIC\n",
-            prefix.display()
-        )
+        format!("-I {}/include -fPIC\n", prefix.display())
     }
 }
 
@@ -12429,7 +12483,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         }
         if s == "--dir" || s == "-d" {
             let Some(dir_val) = iter.next() else {
-                return MultiplexerOutput::failure("error: missing directory value\n".to_owned(), 1);
+                return MultiplexerOutput::failure(
+                    "error: missing directory value\n".to_owned(),
+                    1,
+                );
             };
             dir = Some(PathBuf::from(dir_val));
             continue;
@@ -12443,10 +12500,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             continue;
         }
         if s.starts_with("--fln-census-unknown") || s.starts_with("--unknown") {
-            return MultiplexerOutput::failure(
-                format!("error: unknown option '{s}'\n"),
-                1,
-            );
+            return MultiplexerOutput::failure(format!("error: unknown option '{s}'\n"), 1);
         }
         if s.starts_with('-') {
             continue;
@@ -12461,7 +12515,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     if let Some(d) = &dir {
         if !d.exists() {
             return MultiplexerOutput::failure(
-                format!("error: package directory '{}' does not exist\n", d.display()),
+                format!(
+                    "error: package directory '{}' does not exist\n",
+                    d.display()
+                ),
                 1,
             );
         }
@@ -12498,9 +12555,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                             .join(",");
                         MultiplexerOutput::success(format!(
                             "{{\"schema\":\"fln.lake-build/1\",\"status\":\"success\",\"package\":\"{}\",\"targets\":[{targets_json}],\"targets_built\":{},\"targets_cached\":{}}}\n",
-                            report.package,
-                            report.targets_built,
-                            report.targets_cached
+                            report.package, report.targets_built, report.targets_cached
                         ))
                     } else {
                         MultiplexerOutput::success(format!(
@@ -12509,15 +12564,15 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                         ))
                     }
                 }
-                Err(fln_lake::LakeBuildError::Discovery(fln_lake::LakeDiscoveryError::NotFound(p))) => {
-                    MultiplexerOutput::failure(
-                        format!(
-                            "error: no such file or directory (error code: 2)\n  file: {}\n",
-                            p.join("lakefile.lean").display()
-                        ),
-                        1,
-                    )
-                }
+                Err(fln_lake::LakeBuildError::Discovery(
+                    fln_lake::LakeDiscoveryError::NotFound(p),
+                )) => MultiplexerOutput::failure(
+                    format!(
+                        "error: no such file or directory (error code: 2)\n  file: {}\n",
+                        p.join("lakefile.lean").display()
+                    ),
+                    1,
+                ),
                 Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
             }
         }
@@ -12753,30 +12808,23 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                         MultiplexerOutput::success("Build configuration validated.\n".to_owned())
                     }
                 }
-                Err(fln_lake::LakeBuildError::Discovery(fln_lake::LakeDiscoveryError::NotFound(p))) => {
-                    MultiplexerOutput::failure(
-                        format!(
-                            "error: no such file or directory (error code: 2)\n  file: {}\n",
-                            p.join("lakefile.lean").display()
-                        ),
-                        1,
-                    )
-                }
+                Err(fln_lake::LakeBuildError::Discovery(
+                    fln_lake::LakeDiscoveryError::NotFound(p),
+                )) => MultiplexerOutput::failure(
+                    format!(
+                        "error: no such file or directory (error code: 2)\n  file: {}\n",
+                        p.join("lakefile.lean").display()
+                    ),
+                    1,
+                ),
                 Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
             }
         }
-        "query" | "test" | "lint" | "lean" => {
-            MultiplexerOutput::failure(
-                format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
-                1,
-            )
-        }
-        unknown => {
-            MultiplexerOutput::failure(
-                format!("error: unknown command '{unknown}'\n"),
-                1,
-            )
-        }
+        "query" | "test" | "lint" | "lean" => MultiplexerOutput::failure(
+            format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
+            1,
+        ),
+        unknown => MultiplexerOutput::failure(format!("error: unknown command '{unknown}'\n"), 1),
     }
 }
 
