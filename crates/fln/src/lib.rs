@@ -4931,29 +4931,232 @@ fn checker_entry(
     Ok(CheckerConstantEntry::new(name, declaration))
 }
 
-fn checker_environment(
+/// Constants the independent checker resolves by spelling (literal typing and
+/// the Nat, String and Bool reducers) rather than by a reference in the term,
+/// so a projection covering a candidate carries them whenever they exist.
+const CHECKER_BUILTIN_NAMES: &[&[&str]] = &[
+    &["Nat"],
+    &["Nat", "zero"],
+    &["Nat", "succ"],
+    &["Nat", "rec"],
+    &["Bool"],
+    &["Bool", "true"],
+    &["Bool", "false"],
+    &["Eq"],
+    &["Eq", "refl"],
+    &["String"],
+    &["String", "ofList"],
+    &["Char"],
+    &["Char", "ofNat"],
+    &["List"],
+    &["List", "nil"],
+    &["List", "cons"],
+];
+
+const QUOTIENT_FAMILY: &[&[&str]] = &[
+    &["Quot"],
+    &["Quot", "mk"],
+    &["Quot", "lift"],
+    &["Quot", "ind"],
+];
+
+fn collect_constant_names(
+    root: &Expr,
+    seen: &mut std::collections::HashSet<*const ExprNode>,
+    out: &mut Vec<Name>,
+) {
+    let mut stack = vec![root];
+    while let Some(expr) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.node())) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::Const { name, .. } => out.push(name.clone()),
+            ExprNode::Proj {
+                struct_name, expr, ..
+            } => {
+                out.push(struct_name.clone());
+                stack.push(expr);
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::MData { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+}
+
+/// Queue what the checker can reach through one projected base constant.
+/// Theorem and opaque bodies are never unfolded by the checker, so they are
+/// not followed (and [`checker_base_entry`] does not project them).
+fn queue_base_dependencies(
+    info: &ConstantInfo,
+    seen: &mut std::collections::HashSet<*const ExprNode>,
+    pending: &mut Vec<Name>,
+) {
+    collect_constant_names(&info.constant_val().type_, seen, pending);
+    match info {
+        ConstantInfo::Defn(value) => collect_constant_names(&value.value, seen, pending),
+        ConstantInfo::Induct(value) => {
+            pending.extend(value.all.iter().cloned());
+            pending.extend(value.ctors.iter().cloned());
+        }
+        ConstantInfo::Ctor(value) => pending.push(value.induct.clone()),
+        ConstantInfo::Rec(value) => {
+            pending.extend(value.all.iter().cloned());
+            for rule in &value.rules {
+                pending.push(rule.ctor.clone());
+                collect_constant_names(&rule.rhs, seen, pending);
+            }
+        }
+        ConstantInfo::Quot(_) => pending.extend(
+            QUOTIENT_FAMILY
+                .iter()
+                .map(|parts| Name::from_components(parts.iter().copied())),
+        ),
+        ConstantInfo::Axiom(_) | ConstantInfo::Thm(_) | ConstantInfo::Opaque(_) => {}
+    }
+}
+
+/// A base constant as the checker sees it: theorem and opaque bodies are
+/// dropped because the checker only delta-unfolds safe definitions, which keeps
+/// proof terms whose tree encoding runs to hundreds of megabytes out of every
+/// check that merely cites them.
+fn checker_base_entry(
+    info: &ConstantInfo,
+    budget: CheckerDecodeBudget,
+) -> Result<CheckerConstantEntry, String> {
+    let (kind, safety) = match info {
+        ConstantInfo::Thm(_) => (CheckerConstantKind::Theorem, CheckerConstantSafety::Safe),
+        ConstantInfo::Opaque(value) => (
+            CheckerConstantKind::Opaque,
+            checker_constant_safety(value.is_unsafe),
+        ),
+        _ => return checker_entry(info, budget),
+    };
+    let base = info.constant_val();
+    Ok(CheckerConstantEntry::new(
+        decode_checker_name(&base.name, budget)?,
+        CheckerConstantDeclaration::header(
+            decode_checker_names(&base.level_params, budget)?,
+            decode_checker_expr(&base.type_, budget)?,
+            kind,
+            safety,
+        ),
+    ))
+}
+
+/// The checker environment a candidate is reviewed against: `retained` (or an
+/// empty projection) extended with every base constant the candidate's terms
+/// can reach and that is not projected yet.
+///
+/// A constant this walk misses can only make the checker report an unknown
+/// constant, which is a non-answer and never an admission. With no retained
+/// projection the aggregate environment budget bounds the whole closure; with
+/// one, the constants added here are counted against `max_constants` because
+/// each `extend` bounds only its own entry.
+fn checker_environment_covering(
     environment: &Environment,
+    retained: Option<&CheckerConstantEnvironment>,
+    roots: &[&Expr],
     limits: CheckerExecutionLimits,
 ) -> Result<CheckerConstantEnvironment, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for root in roots {
+        collect_constant_names(root, &mut seen, &mut pending);
+    }
+    pending.extend(
+        CHECKER_BUILTIN_NAMES
+            .iter()
+            .map(|parts| Name::from_components(parts.iter().copied())),
+    );
+    let mut visited = BTreeSet::new();
     let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(environment.len())
-        .map_err(|_| format!("could not reserve {} checker constants", environment.len()))?;
-    for (_, info) in environment.constants() {
-        entries.push(checker_entry(info, limits.decode)?);
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = environment.find(&name) else {
+            continue;
+        };
+        if let Some(retained) = retained
+            && retained
+                .find(&decode_checker_name(&name, limits.decode)?)
+                .is_some()
+        {
+            continue;
+        }
+        entries.push(checker_base_entry(info, limits.decode)?);
+        queue_base_dependencies(info, &mut seen, &mut pending);
     }
-    match CheckerConstantEnvironment::build(entries, limits.environment) {
+    let outcome = match retained {
+        None => CheckerConstantEnvironment::build(entries, limits.environment),
+        Some(retained) => {
+            let added = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            if added > limits.environment.max_constants {
+                return Err(format!(
+                    "covering {added} base constants exceeds the checker constant budget {}",
+                    limits.environment.max_constants
+                ));
+            }
+            let mut projected = retained.clone();
+            for entry in entries {
+                match projected.extend(entry, limits.environment) {
+                    CheckerEnvironmentOutcome::Complete { environment, .. } => {
+                        projected = environment;
+                    }
+                    other => return checker_projection_failure(other),
+                }
+            }
+            return Ok(projected);
+        }
+    };
+    match outcome {
         CheckerEnvironmentOutcome::Complete { environment, .. } => Ok(environment),
-        CheckerEnvironmentOutcome::Refused { refusal, .. } => Err(format!(
-            "checker environment refused its projection: {refusal:?}"
-        )),
-        CheckerEnvironmentOutcome::Inconclusive(stop) => Err(format!(
-            "checker environment projection did not finish: {stop:?}"
-        )),
-        CheckerEnvironmentOutcome::InternalFault { fault, .. } => Err(format!(
-            "checker environment projection hit an internal fault: {fault:?}"
-        )),
+        other => checker_projection_failure(other),
     }
+}
+
+fn checker_projection_failure(
+    outcome: CheckerEnvironmentOutcome,
+) -> Result<CheckerConstantEnvironment, String> {
+    Err(match outcome {
+        CheckerEnvironmentOutcome::Complete { .. } => {
+            "checker environment projection completed where a failure was reported".to_owned()
+        }
+        CheckerEnvironmentOutcome::Refused { refusal, .. } => {
+            format!("checker environment refused its projection: {refusal:?}")
+        }
+        CheckerEnvironmentOutcome::Inconclusive(stop) => {
+            format!("checker environment projection did not finish: {stop:?}")
+        }
+        CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
+            format!("checker environment projection hit an internal fault: {fault:?}")
+        }
+    })
 }
 
 fn review_mutual_with_independent_checker(
@@ -4980,17 +5183,19 @@ fn review_mutual_with_independent_checker(
         }
     }
 
-    let environment = match retained_environment {
-        Some(environment) => environment.clone(),
-        None => match checker_environment(environment, limits) {
+    let roots: Vec<&Expr> = definitions
+        .iter()
+        .flat_map(|definition| [&definition.base.type_, &definition.value])
+        .collect();
+    let environment =
+        match checker_environment_covering(environment, retained_environment, &roots, limits) {
             Ok(environment) => environment,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
                 ));
             }
-        },
-    };
+        };
 
     match fln_checker::admit::admit_block(&environment, &candidates, limits.admission) {
         CheckerBlockVerdict::Admitted(admission) => {
@@ -5076,17 +5281,19 @@ fn review_quotient_with_independent_checker(
         }
     }
 
-    let environment = match retained_environment {
-        Some(environment) => environment.clone(),
-        None => match checker_environment(environment, limits) {
+    let roots: Vec<&Expr> = declarations
+        .iter()
+        .map(|declaration| &declaration.base.type_)
+        .collect();
+    let environment =
+        match checker_environment_covering(environment, retained_environment, &roots, limits) {
             Ok(environment) => environment,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
                 ));
             }
-        },
-    };
+        };
 
     match fln_checker::admit::admit_quotient(&environment, &candidates, limits.admission) {
         CheckerQuotientVerdict::Admitted(admission) => {
@@ -5186,17 +5393,30 @@ fn review_inductive_with_independent_checker(
         }
     }
 
-    let environment = match retained_environment {
-        Some(environment) => environment.clone(),
-        None => match checker_environment(environment, limits) {
+    let mut roots: Vec<&Expr> = block
+        .types
+        .iter()
+        .map(|declaration| &declaration.base.type_)
+        .chain(
+            block
+                .ctors
+                .iter()
+                .map(|declaration| &declaration.base.type_),
+        )
+        .collect();
+    for recursor in &block.recursors {
+        roots.push(&recursor.base.type_);
+        roots.extend(recursor.rules.iter().map(|rule| &rule.rhs));
+    }
+    let environment =
+        match checker_environment_covering(environment, retained_environment, &roots, limits) {
             Ok(environment) => environment,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
                 ));
             }
-        },
-    };
+        };
 
     match fln_checker::admit::admit_inductive(
         &environment,
@@ -5323,17 +5543,22 @@ fn review_with_independent_checker(
             ));
         }
     };
-    let environment = match retained_environment {
-        Some(environment) => environment.clone(),
-        None => match checker_environment(environment, limits) {
+    let roots: Vec<&Expr> = match declaration {
+        Declaration::Axiom(axiom) => vec![&axiom.base.type_],
+        Declaration::Defn(definition) => vec![&definition.base.type_, &definition.value],
+        Declaration::Thm(theorem) => vec![&theorem.base.type_, &theorem.value],
+        Declaration::Opaque(opaque) => vec![&opaque.base.type_, &opaque.value],
+        _ => Vec::new(),
+    };
+    let environment =
+        match checker_environment_covering(environment, retained_environment, &roots, limits) {
             Ok(environment) => environment,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
                 ));
             }
-        },
-    };
+        };
 
     match fln_checker::admit::admit(&environment, &candidate, limits.admission) {
         CheckerVerdict::Admitted(admission) => {
@@ -9457,9 +9682,18 @@ mod tests {
             u64::MAX,
             u64::MAX,
         );
+        // The candidate cites `first_postulate`, whose own type cites `Nat`: a
+        // two-row base that only a retained projection can supply under a
+        // one-row budget.
+        let cites_first = || {
+            definition(
+                "second_postulate",
+                Expr::const_(Name::from_components(["first_postulate"]), Vec::new()),
+            )
+        };
         let second = first
             .engine
-            .admit_declaration(axiom("second_postulate"), &options, candidate_only)
+            .admit_declaration(cites_first(), &options, candidate_only)
             .expect("the retained projection leaves the one-row budget for the candidate");
         assert!(
             matches!(&second, Outcome::Complete(_)),
@@ -9478,7 +9712,7 @@ mod tests {
         let uncached = Engine::from_environment(first.engine.environment().clone());
         let uncached_root = uncached.logical_root(&options);
         let error = uncached
-            .admit_declaration(axiom("uncached_postulate"), &options, candidate_only)
+            .admit_declaration(cites_first(), &options, candidate_only)
             .expect_err("the same budget cannot reconstruct the multi-row base");
         assert!(matches!(
             error,
@@ -9489,7 +9723,76 @@ mod tests {
         assert!(
             !uncached
                 .environment()
-                .contains(&Name::from_components(["uncached_postulate"]))
+                .contains(&Name::from_components(["second_postulate"]))
+        );
+    }
+
+    #[test]
+    fn checker_projection_covers_reachable_constants_and_drops_base_proofs() {
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let admit = |engine: &Engine, declaration: Declaration| -> Engine {
+            match engine.admit_declaration(declaration, &options, limits) {
+                Ok(Outcome::Complete(admitted)) => Some(admitted.engine),
+                _ => None,
+            }
+            .expect("setup admission must complete")
+        };
+        let proposition = Name::from_components(["P"]);
+        let engine = admit(&engine, typed_axiom("P", Expr::sort(Level::zero())));
+        let engine = admit(
+            &engine,
+            typed_axiom("h", Expr::const_(proposition.clone(), Vec::new())),
+        );
+        let engine = admit(
+            &engine,
+            theorem(
+                "proved",
+                Expr::const_(proposition.clone(), Vec::new()),
+                Expr::const_(Name::from_components(["h"]), Vec::new()),
+            ),
+        );
+
+        let uncached = Engine::from_environment(engine.environment().clone());
+        let cited = admit(
+            &uncached,
+            theorem(
+                "again",
+                Expr::const_(proposition, Vec::new()),
+                Expr::const_(Name::from_components(["proved"]), Vec::new()),
+            ),
+        );
+        let projection = cited
+            .checker_environment
+            .as_ref()
+            .expect("admission retains the projection it checked against");
+        let wire = |name: &str| {
+            super::decode_checker_name(
+                &Name::from_components([name]),
+                super::CheckerExecutionLimits::default().decode,
+            )
+            .expect("test names project")
+        };
+        let proved = projection
+            .find(&wire("proved"))
+            .expect("the cited theorem is projected");
+        assert_eq!(proved.kind(), super::CheckerConstantKind::Theorem);
+        assert!(
+            proved.body_value().is_none(),
+            "a base theorem is projected without its proof"
+        );
+        assert!(
+            projection.find(&wire("h")).is_none(),
+            "a constant reached only through a base proof is not projected"
+        );
+        assert!(projection.find(&wire("P")).is_some());
+        assert!(
+            projection
+                .find(&wire("again"))
+                .and_then(|again| again.body_value())
+                .is_some(),
+            "the admitted candidate itself keeps its checked body"
         );
     }
 
@@ -9695,21 +9998,35 @@ mod tests {
         };
         assert!(retained.engine.environment().contains(&follower_name));
 
+        // The follower cites nothing, so an uncached engine projects none of
+        // the block: the checker base covers what a candidate reaches, not the
+        // whole environment. (The checker quarantines partial definitions, so
+        // no admissible candidate can cite this block to force it back in.)
         let uncached = Engine::from_environment(admitted.engine.environment().clone());
         let uncached_name = Name::from_components(["uncachedMutualFollower"]);
-        let error = uncached
+        let unrelated = uncached
             .admit_declaration(
                 typed_axiom("uncachedMutualFollower", Expr::sort(Level::zero())),
                 &options,
                 candidate_only,
             )
-            .expect_err("one row cannot reconstruct an uncached two-member checker base");
-        assert!(matches!(
-            error,
-            EngineAdmissionError::CouncilHalted { ref summary }
-                if summary.contains("fln-checker") && summary.contains("no answer")
-        ));
-        assert!(!uncached.environment().contains(&uncached_name));
+            .expect("an unrelated candidate does not pay to project the block");
+        let unrelated = match unrelated {
+            Outcome::Complete(unrelated) => Some(unrelated),
+            _ => None,
+        }
+        .expect("the uncached admission must answer completely");
+        assert!(unrelated.engine.environment().contains(&uncached_name));
+        let projection = unrelated
+            .engine
+            .checker_environment
+            .as_ref()
+            .expect("admission retains the projection it checked against");
+        assert_eq!(
+            projection.len(),
+            1,
+            "only the candidate itself is projected"
+        );
 
         let bad_left_name = Name::from_components(["badMutualLeft"]);
         let bad_right_name = Name::from_components(["badMutualRight"]);
