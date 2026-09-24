@@ -5723,7 +5723,10 @@ const NAMES_GIT_WITHOUT_RUNNING_IT: &[(&str, &str)] = &[(
     // `fln doctor` reports whether the optional D2 `git` is on PATH by a PATH lookup; it
     // never spawns it (the probe is `doctor_path_tool`).
     "crates/fln-cli/src/lib.rs",
-    r#"doctor_path_tool("git", "optional D2 tool for Lake dependency fetching")"#,
+    r#"doctor_path_tool(
+        "git",
+        "optional D2 tool for Lake dependency fetching",
+    )"#,
 )];
 
 /// The independent spelling: chosen to overlap the primary needle rather than to agree by
