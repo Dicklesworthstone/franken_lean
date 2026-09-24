@@ -3483,87 +3483,58 @@ fn run_slow(
                     let term = TermSources::new(left, right, &generated).source(right_reference)?;
                     is_potential_nat_reduction(term, right_reference.root)
                 };
-                let mut left_height_cache = None;
-                let mut right_height_cache = None;
-                let mut unfold_before_nat = false;
-                if left_is_nat || right_is_nat {
-                    if !left_is_nat {
-                        let height = definition_height(
-                            left_reference,
-                            TermSources::new(left, right, &generated),
-                            context,
-                            &mut control,
-                            cancelled,
-                        )?;
-                        unfold_before_nat |= height.is_some();
-                        left_height_cache = Some(height);
-                    }
-                    if !right_is_nat {
-                        let height = definition_height(
-                            right_reference,
-                            TermSources::new(left, right, &generated),
-                            context,
-                            &mut control,
-                            cancelled,
-                        )?;
-                        unfold_before_nat |= height.is_some();
-                        right_height_cache = Some(height);
-                    }
-                }
-
-                if !unfold_before_nat {
-                    if left_is_nat
-                        && let Some(term) = reduce_nat_candidate(
-                            left_reference,
-                            right_reference,
-                            TermSources::new(left, right, &generated),
-                            context,
-                            nat_scope,
-                            &mut control,
-                            cancelled,
-                        )?
-                    {
-                        let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
-                        pending.push((next_left, right_reference, offset_context, string_context));
-                        continue;
-                    }
-                    if right_is_nat
-                        && let Some(term) = reduce_nat_candidate(
-                            right_reference,
-                            left_reference,
-                            TermSources::new(left, right, &generated),
-                            context,
-                            nat_scope,
-                            &mut control,
-                            cancelled,
-                        )?
-                    {
-                        let next_right = retain_generated(&mut generated, DefEqSide::Right, term);
-                        pending.push((left_reference, next_right, offset_context, string_context));
-                        continue;
-                    }
-                }
-
-                let left_height = match left_height_cache {
-                    Some(height) => height,
-                    None => definition_height(
+                // The pin's `lazy_delta_reduction` tries `reduce_nat` on the
+                // left and then the right before *every* delta step, whatever
+                // the other side's definition height. Deferring it while the
+                // companion can still unfold lets height order delta-unfold a
+                // closed `Nat.add`/`Nat.sub`/`Nat.pow` application itself, which
+                // walks its structural recursion over the literal's magnitude
+                // (`Char.toUpper._proof_1`, `2^32` fuel) instead of evaluating it.
+                if left_is_nat
+                    && let Some(term) = reduce_nat_candidate(
                         left_reference,
-                        TermSources::new(left, right, &generated),
-                        context,
-                        &mut control,
-                        cancelled,
-                    )?,
-                };
-                let right_height = match right_height_cache {
-                    Some(height) => height,
-                    None => definition_height(
                         right_reference,
                         TermSources::new(left, right, &generated),
                         context,
+                        nat_scope,
                         &mut control,
                         cancelled,
-                    )?,
-                };
+                    )?
+                {
+                    let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
+                    pending.push((next_left, right_reference, offset_context, string_context));
+                    continue;
+                }
+                if right_is_nat
+                    && let Some(term) = reduce_nat_candidate(
+                        right_reference,
+                        left_reference,
+                        TermSources::new(left, right, &generated),
+                        context,
+                        nat_scope,
+                        &mut control,
+                        cancelled,
+                    )?
+                {
+                    let next_right = retain_generated(&mut generated, DefEqSide::Right, term);
+                    pending.push((left_reference, next_right, offset_context, string_context));
+                    continue;
+                }
+
+                let left_height = definition_height(
+                    left_reference,
+                    TermSources::new(left, right, &generated),
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
+                let right_height = definition_height(
+                    right_reference,
+                    TermSources::new(left, right, &generated),
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
                 let (unfold_left, unfold_right) = match (left_height, right_height) {
                     (None, None) => {
                         if exact_function_eta(

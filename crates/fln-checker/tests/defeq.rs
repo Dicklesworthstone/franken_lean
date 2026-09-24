@@ -1186,13 +1186,47 @@ fn delta_exposed_nat_offsets_rerun_before_the_next_definition_step() {
         ),
     ]);
 
+    // A closed successor chain is a `reduce_nat` candidate, and the pin tries
+    // that before every delta step: the chain collapses to `2` and no offset
+    // is ever peeled. Two reductions, because the outer successor's operand
+    // WHNF reduces the inner `Nat.succ Nat.zero` first.
     let two = slow_equal(
         &decoded(&constant("two")),
         &decoded(&nat_succ(nat_succ(nat_zero()))),
         &context,
     );
     assert_eq!(two.delta_unfolds, 1);
-    assert_eq!(two.nat_offset_steps, 2);
+    assert_eq!(two.nat_offset_steps, 0);
+    assert_eq!(two.nat_reductions, 2);
+
+    // The same chain over a let-bound free variable is outside `reduce_nat`
+    // (the pin requires both sides free of `fvar`s, bound or not), so the
+    // delta step is what exposes the offsets, and both peels must run before
+    // the zeta step that finally reaches `Nat.zero`.
+    let open_context = WhnfContext::new(
+        vec![FreeBinding::new(checker_name("x"), decoded(&nat_zero()))],
+        Vec::new(),
+        match ConstantEnvironment::build(
+            vec![definition_entry(
+                "two",
+                decoded(&nat_literal(2)),
+                ReducibilityHint::Regular(8),
+                DefinitionSafety::Safe,
+            )],
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("constant environment did not build: {other:?}"),
+        },
+    );
+    let exposed = slow_equal(
+        &decoded(&constant("two")),
+        &decoded(&nat_succ(nat_succ(Expr::fvar(FVarId(name("x")))))),
+        &open_context,
+    );
+    assert_eq!(exposed.delta_unfolds, 1);
+    assert_eq!(exposed.nat_offset_steps, 2);
+    assert_eq!(exposed.nat_reductions, 0);
 
     let zero = slow_equal(
         &decoded(&constant("zero_alias")),

@@ -17,7 +17,7 @@ use fln_checker::whnf::{WhnfBudget, WhnfContext};
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, ExprNode, NamePart, WireExpr, WireName, decode_expr, decode_name,
 };
-use fln_core::expr::{Expr, FVarId, Literal, NatLit};
+use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_hash::canon::Canonical;
@@ -813,6 +813,66 @@ fn conversion_dispatch_reduces_closed_nat_and_bool_pairs_after_core_and_delta_wh
     };
     assert!(progress.delta_unfolds >= 1);
     assert!(progress.nat_reductions >= 1);
+}
+
+/// The pin's `lazy_delta_reduction` tries `reduce_nat` on each closed side
+/// before *every* delta step, whatever the companion's definition height.
+/// Here `Nat.add` carries a body that disagrees with the accelerated
+/// operation and outranks the companion alias, so a height-ordered unfold of
+/// `Nat.add` would compare `7` with `5`: the verdict observably depends on
+/// which step runs first. With the real `Nat.add` the same misordering walks
+/// its structural recursion over the literal's magnitude instead
+/// (`Char.toUpper._proof_1`, whose `2^32` exhausted the checker while K1
+/// accepted).
+#[test]
+fn closed_nat_reduction_runs_before_delta_even_when_the_companion_can_unfold() {
+    let entry = |name: &Name, value: Expr, height: u32| {
+        ConstantEntry::new(
+            checker_name(name),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                decoded(&Expr::sort(Level::zero())),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    decoded(&value),
+                    ReducibilityHint::Regular(height),
+                    DefinitionSafety::Safe,
+                    Vec::new(),
+                ),
+            ),
+        )
+    };
+    let nat = Expr::const_(Name::str(Name::anonymous(), "Nat"), Vec::new());
+    let binder = |body: Expr| {
+        Expr::lam(
+            Name::str(Name::anonymous(), "n"),
+            nat.clone(),
+            body,
+            BinderInfo::Default,
+        )
+    };
+    let alias = qualified("Fixture", "five");
+    let context = WhnfContext::new(
+        Vec::new(),
+        Vec::new(),
+        constant_environment(vec![
+            entry(&qualified("Nat", "add"), binder(binder(literal(7))), 100),
+            entry(&alias, literal(5), 1),
+        ]),
+    );
+    let sum = decoded(&binary("add", literal(2), literal(3)));
+    let five = decoded(&Expr::const_(alias, Vec::new()));
+    for (left, right) in [(&sum, &five), (&five, &sum)] {
+        let progress = match def_eq(left, right, &context, DefEqBudget::unlimited()) {
+            DefEqOutcome::Equal(progress) => progress,
+            other => panic!("closed Nat operand was unfolded before reduction: {other:?}"),
+        };
+        assert_eq!(progress.nat_reductions, 1);
+        assert_eq!(
+            progress.delta_unfolds, 1,
+            "only the alias may unfold; `Nat.add` must be evaluated, never unfolded"
+        );
+    }
 }
 
 #[test]
