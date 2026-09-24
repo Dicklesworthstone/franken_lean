@@ -1,16 +1,30 @@
 name: Native term graph integrity
+
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-term-graph-integrity.yml']
+    paths:
+      - '.github/workflows/native-term-graph-integrity.yml'
+      - 'crates/fln-core/**'
+      - 'crates/fln-kernel/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-bignum/**'
+      - 'crates/fln-hash/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
   workflow_dispatch:
+
 permissions:
-  contents: write
+  contents: read
+
 concurrency:
   group: native-term-graph-integrity
   cancel-in-progress: false
+
 jobs:
-  dag-walks:
+  graph-and-kernel-regressions:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -19,441 +33,23 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          fetch-depth: 1
-      - name: Apply reviewed graph-sized core operations
-        run: |
-          python3 -I - <<'PY'
-          from pathlib import Path
-          def once(text, old, new):
-              if text.count(old) != 1:
-                  raise RuntimeError(f'expected exactly one reviewed match: {old[:100]!r}')
-              return text.replace(old, new, 1)
-          def method(text, start, end, edit):
-              a = text.index(start)
-              b = text.index(end, a)
-              return text[:a] + edit(text[a:b]) + text[b:]
-          expr = Path('crates/fln-core/src/expr.rs')
-          text = expr.read_text()
-          assert 'use std::collections::{HashMap, HashSet};' in text, 'DAG equality prerequisite missing'
-          text = method(text, '    pub fn has_loose_bvar(', '    /// The structural node', lambda body:
-              once(once(body,
-                  '        let mut stack = vec![(self, idx)];',
-                  '''        // One allocation can occur at several binder depths. Remember the
-                  // effective index as well, or a miss outside a binder could hide a hit
-                  // inside it. The borrowed root keeps every identity live for this walk.
-                  let mut visited = HashSet::new();
-                  let mut stack = vec![(self, idx)];'''),
-                  '            match current.node() {',
-                  '''            if !visited.insert((current.allocation_identity(), i)) {
-                          continue;
-                      }
-                      match current.node() {'''))
-          expr.write_text(text)
-          level = Path('crates/fln-core/src/level.rs')
-          text = level.read_text()
-          for start, end in [
-              ('    pub fn is_never_zero(', '    /// `Level.isAlwaysZero`'),
-              ('    pub fn is_always_zero(', '    /// `Level.occurs u v`'),
-              ('    pub fn occurs_in(', '    /// `Level.dec`'),
-          ]:
-              def edit(body):
-                  body = once(body, '        let mut stack = ', '''        // Predicate results are independent of the path to an immutable node.
-                  // Keep this call-local: no address escapes the borrowed root's lifetime.
-                  let mut visited = HashSet::new();
-                  let mut stack = ''')
-                  return once(body, '        while let Some(current) = stack.pop() {', '''        while let Some(current) = stack.pop() {
-                      if !visited.insert(Arc::as_ptr(current.node_arc())) {
-                          continue;
-                      }''')
-              text = method(text, start, end, edit)
-          text = method(text, '    pub fn dec(&self)', '    // ---- normalization', lambda _: '''    pub fn dec(&self) -> Option<Level> {
-                  match self.node() {
-                      Node::Succ(inner) => return Some(inner.clone()),
-                      Node::Zero | Node::Param(_) | Node::MVar(_) => return None,
-                      Node::Max(..) | Node::IMax(..) => {}
-                  }
-                  // Post-order over allocations, not occurrences: decrementing a diamond
-                  // must preserve its sharing instead of building an exponential tree.
-                  // Only Max/IMax descend. A non-decrementable leaf on this frontier makes
-                  // the entire result None; a Succ retains its child without descending.
-                  let mut done: HashMap<*const Node, Level> = HashMap::new();
-                  let mut stack = vec![(self, false)];
-                  while let Some((current, exit)) = stack.pop() {
-                      let key = Arc::as_ptr(current.node_arc());
-                      if done.contains_key(&key) {
-                          continue;
-                      }
-                      let value = match current.node() {
-                          Node::Zero | Node::Param(_) | Node::MVar(_) => return None,
-                          Node::Succ(inner) => inner.clone(),
-                          Node::Max(left, right) | Node::IMax(left, right) => {
-                              if !exit {
-                                  stack.push((current, true));
-                                  stack.push((right, false));
-                                  stack.push((left, false));
-                                  continue;
-                              }
-                              let left = done
-                                  .get(&Arc::as_ptr(left.node_arc()))
-                                  .expect("dec scheduled the left child")
-                                  .clone();
-                              let right = done
-                                  .get(&Arc::as_ptr(right.node_arc()))
-                                  .expect("dec scheduled the right child")
-                                  .clone();
-                              // The pin uses MAX even when the input constructor is IMAX.
-                              Level::max(left, right).expect("dec cannot deepen")
-                          }
-                      };
-                      done.insert(key, value);
-                  }
-                  done.remove(&Arc::as_ptr(self.node_arc()))
-              }
-
-          ''')
-          text = method(text, '    fn norm_lt_aux(', '    /// `normLt`', lambda _: '''    fn norm_lt_aux(mut l1: &Level, mut k1: u32, mut l2: &Level, mut k2: u32) -> bool {
-                  // Every descent is a tail step, including Max/IMax (not only Succ).
-                  // Unequal, deeply nested levels must not consume the native call stack.
-                  loop {
-                      while let Node::Succ(inner) = l1.node() {
-                          l1 = inner;
-                          k1 += 1;
-                      }
-                      while let Node::Succ(inner) = l2.node() {
-                          l2 = inner;
-                          k2 += 1;
-                      }
-                      match (l1.node(), l2.node()) {
-                          (Node::Max(a1, b1), Node::Max(a2, b2))
-                          | (Node::IMax(a1, b1), Node::IMax(a2, b2)) => {
-                              if l1 == l2 {
-                                  return k1 < k2;
-                              }
-                              if a1 != a2 {
-                                  l1 = a1;
-                                  l2 = a2;
-                              } else {
-                                  l1 = b1;
-                                  l2 = b2;
-                              }
-                              k1 = 0;
-                              k2 = 0;
-                          }
-                          (Node::Param(n1), Node::Param(n2)) => {
-                              return if n1 == n2 { k1 < k2 } else { n1.lt(n2) };
-                          }
-                          (Node::MVar(m1), Node::MVar(m2)) => {
-                              return if m1 == m2 { k1 < k2 } else { m1.0.lt(&m2.0) };
-                          }
-                          _ => {
-                              return if l1 == l2 {
-                                  k1 < k2
-                              } else {
-                                  l1.ctor_rank() < l2.ctor_rank()
-                              };
-                          }
-                      }
-                  }
-              }
-
-          ''')
-          text = method(text, '    /// Flatten nested `max`', '    fn lookup_norm(', lambda _: '''    /// Flatten nested `max` without normalizing. Left child first.
-              ///
-              /// Repeated allocations contribute the same leaves. Max is idempotent and
-              /// finish_max_normalize sorts and coalesces equal bases, so retaining the
-              /// first visit preserves the pin's output while avoiding tree expansion.
-              fn raw_max_leaves(level: &Level) -> Vec<Level> {
-                  let mut out = Vec::new();
-                  let mut visited = HashSet::new();
-                  let mut stack = vec![level];
-                  while let Some(current) = stack.pop() {
-                      if !visited.insert(Arc::as_ptr(current.node_arc())) {
-                          continue;
-                      }
-                      match current.node() {
-                          Node::Max(a, b) => {
-                              stack.push(b);
-                              stack.push(a);
-                          }
-                          _ => out.push(current.clone()),
-                      }
-                  }
-                  out
-              }
-
-          ''')
-          text = method(text, '    fn append_normed_max_args(', '    fn finish_max_normalize(', lambda body:
-              once(once(body,
-                  '        for leaf in Level::raw_max_leaves(level) {',
-                  '''        // Normalization can expose another shared Max graph. All nodes here
-                  // remain owned by `level` or `done`, so pointer identities stay live even
-                  // after a temporary `normalized` clone is dropped.
-                  let mut visited = HashSet::new();
-                  for leaf in Level::raw_max_leaves(level) {'''),
-                  '            while let Some(normalized) = rest.pop() {',
-                  '''            while let Some(normalized) = rest.pop() {
-                          if !visited.insert(Arc::as_ptr(normalized.node_arc())) {
-                              continue;
-                          }'''))
-          level.write_text(text)
-          path = Path('crates/fln-core/tests/dag_walks.rs')
-          assert not path.exists(), 'refuse to overwrite existing graph regressions'
-          path.write_text(r'''//! Graph-sized core operations for franken_lean-z8j.1.13.
-          //! Large shared inputs intentionally have astronomical tree expansions; these
-          //! exercise the real methods without timing assertions or ignored regressions.
-          use fln_core::expr::{BinderInfo, Expr, ExprNode};
-          use fln_core::level::{LMVarId, Level, LevelView};
-          use fln_core::name::Name;
-          use fln_core::options::KVMap;
-          fn name(s: &str) -> Name { Name::str(Name::anonymous(), s) }
-          fn expr_diamond(mut leaf: Expr, depth: usize) -> Expr {
-              for _ in 0..depth { leaf = Expr::app(leaf.clone(), leaf); }
-              leaf
-          }
-          fn level_diamond(mut leaf: Level, depth: usize, imax: bool) -> Level {
-              for _ in 0..depth {
-                  leaf = if imax { Level::imax(leaf.clone(), leaf) }
-                      else { Level::max(leaf.clone(), leaf) }.unwrap();
-              }
-              leaf
-          }
-          #[test]
-          fn absent_bound_variable_query_does_not_expand_a_diamond() {
-              let expression = expr_diamond(Expr::bvar(1).unwrap(), 96);
-              assert!(!expression.has_loose_bvar(0));
-              assert!(expression.has_loose_bvar(1));
-              assert!(!expression.has_loose_bvar(2));
-              assert!(!expression.has_loose_bvar(u32::MAX));
-              let wrapped = Expr::mdata(KVMap::default(), Expr::proj(name("S"), 0, expression));
-              assert!(!wrapped.has_loose_bvar(0));
-              assert!(wrapped.has_loose_bvar(1));
-          }
-          #[test]
-          fn bound_variable_seen_keys_include_the_effective_binder_index() {
-              let shared = Expr::bvar(1).unwrap();
-              let closed = Expr::sort(Level::zero());
-              // The first visit misses at index 0; the second must test index 1.
-              for binder in [
-                  Expr::lam(name("x"), closed.clone(), shared.clone(), BinderInfo::Default),
-                  Expr::forall_e(name("x"), closed.clone(), shared.clone(), BinderInfo::Default),
-                  Expr::let_e(name("x"), closed.clone(), closed.clone(), shared.clone(), false),
-              ] { assert!(Expr::app(shared.clone(), binder).has_loose_bvar(0)); }
-              // Reverse depth order: visit the shared application inside a binder first.
-              let shared = Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(2).unwrap());
-              let bound = Expr::lam(name("x"), closed, shared.clone(), BinderInfo::Default);
-              assert!(Expr::app(bound, shared).has_loose_bvar(0));
-          }
-          #[test]
-          fn universe_predicates_and_occurrence_queries_walk_shared_nodes_once() {
-              let u = Level::param(name("u"));
-              let graph = level_diamond(u.clone(), 96, false);
-              assert!(!graph.is_never_zero());
-              assert!(!graph.is_always_zero());
-              assert!(u.occurs_in(&graph));
-              assert!(!Level::param(name("absent")).occurs_in(&graph));
-              assert!(!Level::one().occurs_in(&graph));
-              let zeros = level_diamond(Level::zero(), 96, false);
-              assert!(zeros.is_always_zero());
-              assert!(!zeros.is_never_zero());
-              assert!(!u.occurs_in(&zeros));
-          }
-          #[test]
-          fn imax_zero_predicates_ignore_only_the_left_argument_not_occurrence_queries() {
-              let one = Level::one();
-              let level = Level::imax(one.clone(), level_diamond(Level::zero(), 96, false)).unwrap();
-              assert!(level.is_always_zero());
-              assert!(!level.is_never_zero());
-              assert!(one.occurs_in(&level));
-              let level = Level::imax(Level::zero(), one).unwrap();
-              assert!(!level.is_always_zero());
-              assert!(level.is_never_zero());
-          }
-          #[test]
-          fn universe_normalization_does_not_flatten_an_exponential_max_tree() {
-              let u = Level::param(name("u"));
-              for imax in [false, true] {
-                  let graph = level_diamond(u.clone(), 96, imax);
-                  assert!(graph.normalize() == u);
-                  assert!(graph.normalize_fixpoint() == u);
-              }
-              let shifted = level_diamond(u.clone(), 96, false).add_offset(7).unwrap();
-              assert!(shifted.normalize() == u.add_offset(7).unwrap());
-          }
-          #[test]
-          fn normalization_preserves_distinct_offsets_and_imax_leaves() {
-              let u = Level::param(name("u"));
-              let v = Level::param(name("v"));
-              let inner = Level::imax(u.clone(), v.clone()).unwrap();
-              let leaf = Level::max(inner.clone(), u.clone().add_offset(3).unwrap()).unwrap();
-              let shared = level_diamond(leaf.clone(), 96, false);
-              assert!(shared.normalize() == leaf.normalize());
-              let mixed = Level::max(shared, Level::max(v, inner).unwrap()).unwrap();
-              let unshared_small = Level::max(leaf, Level::max(Level::param(name("v")),
-                  Level::imax(u, Level::param(name("v"))).unwrap()).unwrap()).unwrap();
-              assert!(mixed.normalize() == unshared_small.normalize());
-          }
-          #[test]
-          fn decrement_preserves_sharing_and_the_pins_imax_to_max_rule() {
-              let u = Level::param(name("u"));
-              for imax in [false, true] {
-                  let graph = level_diamond(u.clone().succ().unwrap(), 96, imax);
-                  let result = graph.dec().expect("all leaves are successors");
-                  assert!(result == level_diamond(u.clone(), 96, false));
-                  // Equality alone does not ensure the output retained the diamond.
-                  let mut current = &result;
-                  for _ in 0..96 {
-                      let LevelView::Max(left, right) = current.view() else {
-                          panic!("decrement must retain the raw Max structure");
-                      };
-                      let (LevelView::Max(ll, _), LevelView::Max(rl, _)) = (left.view(), right.view()) else {
-                          assert!(left == &u && right == &u);
-                          break;
-                      };
-                      assert!(std::ptr::eq(ll, rl), "a shared child was copied");
-                      current = left;
-                  }
-              }
-              assert!(level_diamond(u, 96, false).dec().is_none());
-              assert!(Level::max(Level::one(), Level::param(name("v"))).unwrap().dec().is_none());
-          }
-          #[test]
-          fn deeply_nested_universe_decrement_and_ordering_are_stack_safe() {
-              std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
-                  let mut left = Level::param(name("a"));
-                  let mut right = Level::param(name("b"));
-                  let common = Level::param(name("common"));
-                  let mut decrementable = Level::one();
-                  for _ in 0..12_000 {
-                      left = Level::imax(common.clone(), left).unwrap();
-                      right = Level::imax(common.clone(), right).unwrap();
-                      decrementable = Level::imax(Level::one(), decrementable).unwrap();
-                  }
-                  assert!(left.norm_lt(&right));
-                  assert!(!right.norm_lt(&left));
-                  assert!(!left.norm_lt(&left));
-                  let decremented = decrementable.dec().expect("successor frontier");
-                  assert_eq!(decremented.depth(), 12_000);
-                  assert!(decremented.is_always_zero());
-                  assert!(!decremented.is_never_zero());
-              }).expect("small-stack worker").join()
-                  .expect("graph operations and destruction are stack safe");
-          }
-          // Small independent recursive models are confined to bounded test inputs.
-          fn model_dec(level: &Level) -> Option<Level> {
-              match level.view() {
-                  LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => None,
-                  LevelView::Succ(child) => Some(child.clone()),
-                  LevelView::Max(left, right) | LevelView::IMax(left, right) => {
-                      Some(Level::max(model_dec(left)?, model_dec(right)?).unwrap())
-                  }
-              }
-          }
-          fn model_never(level: &Level) -> bool {
-              match level.view() {
-                  LevelView::Succ(_) => true,
-                  LevelView::Max(left, right) => model_never(left) || model_never(right),
-                  LevelView::IMax(_, right) => model_never(right),
-                  _ => false,
-              }
-          }
-          fn model_always(level: &Level) -> bool {
-              match level.view() {
-                  LevelView::Zero => true,
-                  LevelView::Max(left, right) => model_always(left) && model_always(right),
-                  LevelView::IMax(_, right) => model_always(right),
-                  _ => false,
-              }
-          }
-          fn unshare(level: &Level) -> Level {
-              match level.view() {
-                  LevelView::Zero => Level::zero(),
-                  LevelView::Param(name) => Level::param(name.clone()),
-                  LevelView::MVar(id) => Level::mvar(id.clone()),
-                  LevelView::Succ(child) => unshare(child).succ().unwrap(),
-                  LevelView::Max(left, right) => Level::max(unshare(left), unshare(right)).unwrap(),
-                  LevelView::IMax(left, right) => Level::imax(unshare(left), unshare(right)).unwrap(),
-              }
-          }
-          #[test]
-          fn generated_small_universes_match_recursive_models_and_ignore_sharing_topology() {
-              let mut levels = vec![Level::zero(), Level::one(), Level::param(name("u")),
-                  Level::param(name("v")), Level::mvar(LMVarId(name("m")))];
-              for _ in 0..3 {
-                  let previous = levels.clone();
-                  for (i, left) in previous.iter().enumerate().take(64) {
-                      let right = &previous[(i * 17 + 3) % previous.len()];
-                      levels.push(left.clone().succ().unwrap());
-                      levels.push(Level::max(left.clone(), right.clone()).unwrap());
-                      levels.push(Level::imax(left.clone(), right.clone()).unwrap());
-                      levels.push(Level::max(left.clone(), left.clone()).unwrap());
-                  }
-              }
-              for level in levels {
-                  assert_eq!(level.is_never_zero(), model_never(&level));
-                  assert_eq!(level.is_always_zero(), model_always(&level));
-                  assert!(level.dec() == model_dec(&level));
-                  assert!(level.normalize() == unshare(&level).normalize());
-              }
-          }
-          fn model_occurs(expr: &Expr, index: u32) -> bool {
-              match expr.node() {
-                  ExprNode::BVar { idx } => *idx == index,
-                  ExprNode::App { f, a } => model_occurs(f, index) || model_occurs(a, index),
-                  ExprNode::Lam { binder_type, body, .. } | ExprNode::ForallE { binder_type, body, .. } => {
-                      model_occurs(binder_type, index) || model_occurs(body, index.saturating_add(1))
-                  }
-                  ExprNode::LetE { type_, value, body, .. } => model_occurs(type_, index)
-                      || model_occurs(value, index) || model_occurs(body, index.saturating_add(1)),
-                  ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => model_occurs(expr, index),
-                  _ => false,
-              }
-          }
-          #[test]
-          fn generated_bound_variable_queries_match_a_binder_sensitive_model() {
-              let mut expressions = vec![Expr::sort(Level::zero())];
-              expressions.extend((0..5).map(|i| Expr::bvar(i).unwrap()));
-              for _ in 0..3 {
-                  let previous = expressions.clone();
-                  for (i, left) in previous.iter().enumerate().take(64) {
-                      let right = previous[(i * 13 + 1) % previous.len()].clone();
-                      expressions.push(Expr::app(left.clone(), right.clone()));
-                      expressions.push(Expr::lam(name("x"), left.clone(), right.clone(), BinderInfo::Default));
-                      expressions.push(Expr::forall_e(name("x"), left.clone(), right.clone(), BinderInfo::Implicit));
-                      expressions.push(Expr::let_e(name("x"), left.clone(), left.clone(), right, false));
-                  }
-              }
-              for expression in expressions {
-                  for index in 0..8 {
-                      assert_eq!(expression.has_loose_bvar(index), model_occurs(&expression, index));
-                  }
-              }
-          }
-          ''')
-          PY
+          persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-      - name: Format and test actual core and kernel operations
+      - name: Check core formatting
+        run: cargo fmt --check -p fln-core
+      - name: Test core graphs and pinned observables
+        run: cargo test --locked -p fln-core --no-fail-fast
+      - name: Test public kernel acceptance and universe elimination
         run: |
-          set -euo pipefail
-          rustfmt --edition 2024 crates/fln-core/src/expr.rs crates/fln-core/src/level.rs crates/fln-core/tests/dag_walks.rs
-          cargo fmt --check -p fln-core
-          cargo test --locked -p fln-core --no-fail-fast
-          cargo test --locked -p fln-kernel --lib --no-fail-fast
-          cargo clippy --locked -p fln-core --all-targets -- -D warnings
-          git diff --check
-      - name: Publish tested graph operations directly to main
-        run: |
-          set -euo pipefail
-          base=$(git rev-parse HEAD)
-          git fetch origin main
-          if [ "$(git rev-parse origin/main)" != "$base" ]; then
-            echo 'main advanced during validation; refusing to publish untested integration' >&2
-            exit 1
-          fi
-          git config user.name 'FrankenLean automation'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/fln-core/src/expr.rs crates/fln-core/src/level.rs crates/fln-core/tests/dag_walks.rs
-          git commit -m 'fix(core): keep universe normalization and term walks graph-sized (franken_lean-z8j.1.13)' -m 'Deduplicate occurrence and zero-predicate walks, retaining binder indices in loose-variable keys. Decrement universes with a sharing-preserving postorder walk; make Max/IMax ordering iterative; deduplicate raw and normalized max expansion without changing one-pass Reference semantics. Add depth-96 diamonds, 12000-deep small-stack checks and bounded independent models. Validated with core tests, kernel library tests, core clippy and fmt on nightly-2026-08-31. This is a graph-safety prerequisite, not a claim of total interning or G1 closure.'
-          git push origin HEAD:main
-          git log -1 --format='%H %s'
+          cargo test --locked -p fln-kernel --lib \
+            --test k1_judgments \
+            --test large_elimination_imax \
+            --test admission_laundering \
+            --test definition_body_stripping \
+            --test budget_parity \
+            --no-fail-fast
+      - name: Check core lints
+        run: cargo clippy --locked -p fln-core --all-targets -- -D warnings
+      - name: Verify validation did not modify tracked files
+        run: git diff --exit-code
