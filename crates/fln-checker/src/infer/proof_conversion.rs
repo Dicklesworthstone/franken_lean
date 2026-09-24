@@ -1,8 +1,9 @@
 //! A typed, sufficient KR-305 conversion lane. The untyped converter cannot
 //! identify proofs under binders because it has no local type context. This
 //! worklist opens matching binders hygienically and uses checker-owned typing
-//! to compare proofs of the same proposition. Probes explicitly disable this
-//! lane, so nested conversion never recursively reenters typed inference.
+//! to compare proofs of the same proposition, and (KR-315) values of the same
+//! unit-like structure type. Probes explicitly disable this lane, so nested
+//! conversion never recursively reenters typed inference.
 use super::*;
 use crate::universe::{NormalNode, normalize};
 use crate::wire::WireLevel;
@@ -226,6 +227,51 @@ impl Probe<'_> {
             .filter(|n| matches!(n.nodes().get(n.root().index()), Some(NormalNode::Zero)))
             .map(|_| type_))
     }
+    /// KR-315, the pin's `is_def_eq_unit_like` (type_checker.cpp:1073): when
+    /// `left`'s type normalizes to a non-recursive, index-free, one-constructor
+    /// inductive whose constructor has no fields, the two sides are convertible
+    /// exactly when their types are. Like the pin, only `left`'s type is
+    /// examined. `None` means the rule does not apply.
+    fn unit_like_obligation(
+        &mut self,
+        left: &WireExpr,
+        right: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<(WireExpr, WireExpr)>> {
+        let Some(left_type) = self.infer(left, context)? else {
+            return Ok(None);
+        };
+        let Some(left_type) = self.whnf(&left_type, context)? else {
+            return Ok(None);
+        };
+        let Some(head) = head_constant(&left_type) else {
+            return Ok(None);
+        };
+        let constants = context.constants();
+        let Some(inductive) = constants.find(head).and_then(|d| d.inductive_metadata()) else {
+            return Ok(None);
+        };
+        let [constructor] = inductive.constructors() else {
+            return Ok(None);
+        };
+        if inductive.num_indices() != 0 || inductive.is_recursive() {
+            return Ok(None);
+        }
+        let Some(fields) = constants
+            .find(constructor)
+            .and_then(|d| d.constructor_metadata())
+            .map(|c| c.num_fields())
+        else {
+            return Ok(None);
+        };
+        if fields != 0 {
+            return Ok(None);
+        }
+        let Some(right_type) = self.infer(right, context)? else {
+            return Ok(None);
+        };
+        Ok(Some((left_type, right_type)))
+    }
     fn run(
         &mut self,
         left: &WireExpr,
@@ -286,6 +332,10 @@ impl Probe<'_> {
             if let Some(lt) = self.proof_type(&left, &context)?
                 && let Some(rt) = self.proof_type(&right, &context)?
             {
+                work.push(Work::Pair(lt, rt, context));
+                continue;
+            }
+            if let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)? {
                 work.push(Work::Pair(lt, rt, context));
                 continue;
             }
@@ -377,6 +427,18 @@ impl Probe<'_> {
             }
         }
         Ok(true)
+    }
+}
+
+/// The constant at the head of `term`'s application spine, if there is one.
+fn head_constant(term: &WireExpr) -> Option<&WireName> {
+    let mut id = term.root();
+    loop {
+        match term.node(id)? {
+            ExprNode::Apply { function, .. } => id = *function,
+            ExprNode::Constant { name, .. } => return Some(name),
+            _ => return None,
+        }
     }
 }
 

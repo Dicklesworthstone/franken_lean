@@ -22,6 +22,8 @@ mod indexed;
 mod quotient_computation;
 #[path = "admit/recursor_conversion.rs"]
 mod recursor_conversion;
+#[path = "admit/unit_like.rs"]
+mod unit_like;
 
 use std::cell::Cell;
 use std::path::PathBuf;
