@@ -145,6 +145,11 @@ impl EngineId {
     /// not an implementation that decides verdicts).
     pub const K1: EngineId = EngineId("fln-kernel/k1");
 
+    /// Every checking engine this crate implements. Status surfaces derive what they
+    /// report from this list (`fln doctor` names K2 as not implemented only while it is
+    /// absent here), so a claim about which engines exist cannot drift from the code.
+    pub const IMPLEMENTED: &'static [EngineId] = &[EngineId::K1];
+
     /// Name another engine. Public because a second engine has to be able to
     /// state its own identity, and stating one grants nothing — exactly as
     /// stating a [`crate::council::SeatVerdict`] grants nothing.

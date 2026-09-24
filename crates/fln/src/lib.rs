@@ -108,7 +108,7 @@ use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{
     Council, CouncilOutcome, Seat, SeatBounds, SeatOrigin, SeatVerdict, convene,
 };
-pub use fln_kernel::verdict::{Budget, RejectClass};
+pub use fln_kernel::verdict::{Budget, EngineId, RejectClass};
 pub use fln_olean::artifact::{
     ArtifactByteHash, ArtifactError, ArtifactIdentityPlane, ArtifactLimits, ArtifactMemberInput,
     ArtifactMemberRecord, ArtifactPointer, ArtifactPublication, ArtifactResource,

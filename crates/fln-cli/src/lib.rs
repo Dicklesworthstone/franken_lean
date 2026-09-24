@@ -8619,7 +8619,6 @@ struct DoctorCheck {
 
 /// Planned subsystems `fln doctor` names instead of claiming, with owning beads.
 const DOCTOR_NOT_IMPLEMENTED: &[(&str, &str)] = &[
-    ("kernel engine K2 (NbE accelerator)", "franken_lean-g3k"),
     ("native Mirror facade implementations", "franken_lean-epx"),
     (
         "Lantern daemon with shared import heap and RPC sessions",
@@ -8629,6 +8628,22 @@ const DOCTOR_NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("Envoy MCP server", "franken_lean-87av"),
     ("doctor --sql build database", "franken_lean-05g"),
 ];
+
+/// The K2 row of `fln doctor`'s not-implemented list, derived from the engines the
+/// kernel crate says it implements rather than written down beside them.
+const DOCTOR_K2: (&str, &str) = ("kernel engine K2 (NbE accelerator)", "franken_lean-g3k");
+
+fn doctor_not_implemented() -> Vec<(&'static str, &'static str)> {
+    let single_engine = fln::EngineId::IMPLEMENTED
+        .iter()
+        .all(|engine| engine.is(fln::EngineId::K1));
+    let mut planned = Vec::with_capacity(DOCTOR_NOT_IMPLEMENTED.len() + 1);
+    if single_engine {
+        planned.push(DOCTOR_K2);
+    }
+    planned.extend_from_slice(DOCTOR_NOT_IMPLEMENTED);
+    planned
+}
 
 fn render_doctor(json: bool) -> MultiplexerOutput {
     let reference_tag = env!("FLN_IDENTITY_REFERENCE_TAG");
@@ -8684,7 +8699,7 @@ fn render_doctor(json: bool) -> MultiplexerOutput {
                 )
             })
             .collect();
-        let planned: Vec<String> = DOCTOR_NOT_IMPLEMENTED
+        let planned: Vec<String> = doctor_not_implemented()
             .iter()
             .map(|(subsystem, bead)| {
                 format!(
@@ -8717,7 +8732,7 @@ fn render_doctor(json: bool) -> MultiplexerOutput {
             ));
         }
         text.push_str("not implemented yet:\n");
-        for (subsystem, bead) in DOCTOR_NOT_IMPLEMENTED {
+        for (subsystem, bead) in doctor_not_implemented() {
             text.push_str(&format!("  - {subsystem} (bead {bead})\n"));
         }
         text.push_str(if failed {
@@ -8974,7 +8989,10 @@ fn render_capability_notice(command: &str, json: bool) -> MultiplexerOutput {
             "Palimpsest deterministic elaboration replay (plan §15)",
         ),
         "cache" => ("G2", "Ledger content-addressed artifact cache (plan §13.2)"),
-        "doctor --sql" => ("G5", "SQL surface over the build database (plan §15.5)"),
+        "doctor --sql" => (
+            "G5",
+            "SQL surface over the build database (plan §15.5; bead franken_lean-05g)",
+        ),
         "build" | "build explain" => (
             "G2",
             "Ledger build fabric and dependency planner (plan §13)",

@@ -150,6 +150,14 @@ fn unimplemented_verbs_exit_five_with_a_typed_notice() {
         .output()
         .expect("run build");
     assert_eq!(output.status.code(), Some(5));
+
+    // A3: the --sql refusal points at the bead that owns the build database.
+    let sql = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["doctor", "--sql"])
+        .output()
+        .expect("run doctor --sql");
+    assert_eq!(sql.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&sql.stderr).contains("franken_lean-05g"));
 }
 
 #[test]
@@ -192,6 +200,26 @@ fn check_olean_continue_refuses_receipts_a_single_file_and_repeats() {
     assert!(
         stderr.contains("--continue may be supplied at most once"),
         "{stderr}"
+    );
+}
+
+/// A3 criterion 2: the K2 line is tied to the engines the kernel crate exports, in
+/// both directions, so doctor cannot claim or deny a second engine the code lacks.
+#[test]
+fn doctor_k2_line_follows_the_kernel_engine_list() {
+    let crate_dir = fln_core::checked_manifest_dir!();
+    let (code, stdout) = doctor_json(&crate_dir, None);
+    assert!(code == 0 || code == 1, "{stdout}");
+    let k2_row =
+        "{\"subsystem\":\"kernel engine K2 (NbE accelerator)\",\"bead\":\"franken_lean-g3k\"}";
+    let kernel_has_only_k1 = fln::EngineId::IMPLEMENTED
+        .iter()
+        .all(|engine| engine.is(fln::EngineId::K1));
+    assert!(kernel_has_only_k1, "the kernel still implements only K1");
+    assert_eq!(
+        stdout.contains(k2_row),
+        kernel_has_only_k1,
+        "doctor lists K2 as not implemented exactly while the kernel lacks it: {stdout}"
     );
 }
 
