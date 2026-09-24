@@ -409,34 +409,34 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_string_val(s: &str) -> Option<String> {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        if s.len() >= 2 {
-            let inner = &s[1..s.len() - 1];
-            if s.starts_with('"') {
-                let mut out = String::with_capacity(inner.len());
-                let mut chars = inner.chars();
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        match chars.next() {
-                            Some('n') => out.push('\n'),
-                            Some('r') => out.push('\r'),
-                            Some('t') => out.push('\t'),
-                            Some('\\') => out.push('\\'),
-                            Some('"') => out.push('"'),
-                            Some(other) => {
-                                out.push('\\');
-                                out.push(other);
-                            }
-                            None => out.push('\\'),
+    if ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+        && s.len() >= 2
+    {
+        let inner = &s[1..s.len() - 1];
+        if s.starts_with('"') {
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('r') => out.push('\r'),
+                        Some('t') => out.push('\t'),
+                        Some('\\') => out.push('\\'),
+                        Some('"') => out.push('"'),
+                        Some(other) => {
+                            out.push('\\');
+                            out.push(other);
                         }
-                    } else {
-                        out.push(c);
+                        None => out.push('\\'),
                     }
+                } else {
+                    out.push(c);
                 }
-                return Some(out);
-            } else {
-                return Some(inner.to_owned());
             }
+            return Some(out);
+        } else {
+            return Some(inner.to_owned());
         }
     }
     None
@@ -482,10 +482,10 @@ fn parse_string_array(s: &str) -> Option<Vec<String>> {
             current.push(ch);
         }
     }
-    if !current.trim().is_empty() {
-        if let Some(val) = parse_string_val(&current) {
-            result.push(val);
-        }
+    if !current.trim().is_empty()
+        && let Some(val) = parse_string_val(&current)
+    {
+        result.push(val);
     }
     Some(result)
 }
@@ -1314,13 +1314,12 @@ pub fn build_package(
         } else if let Ok(art_meta) = olean_artifact.metadata() {
             if let Ok(art_mtime) = art_meta.modified() {
                 for src in &sources {
-                    if let Ok(src_meta) = src.metadata() {
-                        if let Ok(src_mtime) = src_meta.modified() {
-                            if src_mtime > art_mtime {
-                                needs_build = true;
-                                break;
-                            }
-                        }
+                    if let Ok(src_meta) = src.metadata()
+                        && let Ok(src_mtime) = src_meta.modified()
+                        && src_mtime > art_mtime
+                    {
+                        needs_build = true;
+                        break;
                     }
                 }
             } else {
@@ -1413,13 +1412,12 @@ pub fn explain_build(
         .map_err(|e| LakeExplainError::Io(e.to_string()))?;
 
     for src in &sources {
-        if let Ok(meta) = src.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime > art_mtime {
-                    let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
-                    changed_inputs.push(rel);
-                }
-            }
+        if let Ok(meta) = src.metadata()
+            && let Ok(mtime) = meta.modified()
+            && mtime > art_mtime
+        {
+            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
+            changed_inputs.push(rel);
         }
     }
 
@@ -1457,11 +1455,11 @@ pub fn explain_build(
     let mut interface_changed = false;
     for src_rel in &changed_inputs {
         let full_path = dir.join(src_rel);
-        if let Ok(content) = fs::read_to_string(&full_path) {
-            if content.contains("-- fln-interface-change") || content.contains("axiom ") {
-                interface_changed = true;
-                break;
-            }
+        if let Ok(content) = fs::read_to_string(&full_path)
+            && (content.contains("-- fln-interface-change") || content.contains("axiom "))
+        {
+            interface_changed = true;
+            break;
         }
     }
 
