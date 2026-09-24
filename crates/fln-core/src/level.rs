@@ -17,7 +17,7 @@
 //! `LMVarId` is a `Name` wrapper whose derived hash is `mixHash 0 name.hash`
 //! (deriving-handler semantics, src/Lean/Elab/Deriving/Hashable.lean).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::debug_walk::FlatDebug;
@@ -196,6 +196,12 @@ impl std::fmt::Debug for Level {
 
 impl PartialEq for Level {
     fn eq(&self, other: &Level) -> bool {
+        if self.data != other.data {
+            return false;
+        }
+        if Arc::ptr_eq(self.node_arc(), other.node_arc()) {
+            return true;
+        }
         // Data word first (hash/depth/flags reject fast), then structure — the same
         // discipline as lean_level_eq (kernel/level.cpp:125-150).
         //
@@ -205,12 +211,22 @@ impl PartialEq for Level {
         // reached at every node and a recursive comparison would consume the stack
         // in proportion to input depth.  Equality is a pure predicate, so visiting
         // the pending pairs in any order yields the same verdict.
+        // A worklist alone is stack-safe but still expands a shared DAG as a
+        // tree. Visit each allocation PAIR once, never just a node or a hash.
+        // Both immutable roots stay borrowed for this walk, so identities cannot
+        // be reused. Set iteration never determines the result, and the table
+        // does not escape this call (franken_lean-z8j.1.13).
+        let mut visited = HashSet::new();
         let mut pending: Vec<(&Level, &Level)> = vec![(self, other)];
         while let Some((left, right)) = pending.pop() {
             if left.data != right.data {
                 return false;
             }
             if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            let pair = (Arc::as_ptr(left.node_arc()), Arc::as_ptr(right.node_arc()));
+            if !visited.insert(pair) {
                 continue;
             }
             match (left.node(), right.node()) {

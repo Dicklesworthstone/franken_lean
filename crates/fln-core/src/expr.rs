@@ -21,7 +21,7 @@
 //! * `Nat` hash = the value mod 2^64 (src/Init/Data/Hashable.lean:15-16); `List` hash
 //!   = left fold of `mixHash` from seed 7 (Hashable.lean:37-38).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::debug_walk::FlatDebug;
@@ -510,6 +510,12 @@ impl std::fmt::Debug for Expr {
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Expr) -> bool {
+        if self.data != other.data {
+            return false;
+        }
+        if Arc::ptr_eq(self.node_arc(), other.node_arc()) {
+            return true;
+        }
         // Data word first (hash and packed flags reject fast), then structure.
         //
         // The structural arm walks an explicit heap worklist instead of recursing
@@ -519,12 +525,22 @@ impl PartialEq for Expr {
         // proportion to input depth (the term-plane analogue of the `Name` fix in
         // bead franken_lean-p8a.1).  Equality is a pure predicate, so the order in
         // which pending pairs are visited does not change the verdict.
+        // A worklist alone is stack-safe but still expands a shared DAG as a
+        // tree. Visit each allocation PAIR once, never just a node or a hash.
+        // Both immutable roots stay borrowed for this walk, so identities cannot
+        // be reused. Set iteration never determines the result, and the table
+        // does not escape this call (franken_lean-z8j.1.13).
+        let mut visited = HashSet::new();
         let mut pending: Vec<(&Expr, &Expr)> = vec![(self, other)];
         while let Some((left, right)) = pending.pop() {
             if left.data != right.data {
                 return false;
             }
             if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            let pair = (Arc::as_ptr(left.node_arc()), Arc::as_ptr(right.node_arc()));
+            if !visited.insert(pair) {
                 continue;
             }
             match (left.node(), right.node()) {
