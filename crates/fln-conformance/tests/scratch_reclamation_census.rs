@@ -86,11 +86,17 @@ const SELF_CLEANING: &[(&str, &str)] = &[
     ),
     ("crates/fln-server/tests/lsp_replay_cli.rs", "remove_file"),
     ("crates/fln-server/tests/lsp_timeline_cli.rs", "remove_file"),
+    // The verbs/personalities tests: every root is a `TempDir` removed on drop.
+    (
+        "crates/fln-cli/tests/cli_personalities_and_verbs.rs",
+        "remove_dir_all",
+    ),
 ];
 
-/// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits).
-/// These call `std::env::temp_dir()` directly and do not yet route through `ScratchRoot`
-/// or self-clean.
+/// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits, and
+/// the 2026-09 runtime, lake and LSP batches). These call `std::env::temp_dir()` directly
+/// and do not yet route through `ScratchRoot` or self-clean: every run leaves its roots
+/// behind. Declared here so the leak is visible, not repaired.
 const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/instance_dependent_outputs.rs",
     "crates/fln-cli/tests/instance_output_search.rs",
@@ -100,29 +106,47 @@ const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/lsp_proof_modules.rs",
     "crates/fln-cli/tests/runtime_conditionals.rs",
     "crates/fln-cli/tests/source_check.rs",
+    "crates/fln-cli/tests/source_closure_data.rs",
     "crates/fln-cli/tests/source_collection_notation.rs",
     "crates/fln-cli/tests/source_collections.rs",
     "crates/fln-cli/tests/source_constrained_simplification.rs",
     "crates/fln-cli/tests/source_context_generalization.rs",
     "crates/fln-cli/tests/source_default_simp.rs",
     "crates/fln-cli/tests/source_delta_inference.rs",
+    "crates/fln-cli/tests/source_dependent_programs.rs",
     "crates/fln-cli/tests/source_do_runtime.rs",
+    "crates/fln-cli/tests/source_empty_runtime.rs",
     "crates/fln-cli/tests/source_equality_decisions.rs",
     "crates/fln-cli/tests/source_expression_elimination.rs",
+    "crates/fln-cli/tests/source_ground_projections.rs",
     "crates/fln-cli/tests/source_hypothesis_rewriting.rs",
+    "crates/fln-cli/tests/source_indexed_function_children.rs",
+    "crates/fln-cli/tests/source_indexed_runtime.rs",
     "crates/fln-cli/tests/source_local_helpers.rs",
     "crates/fln-cli/tests/source_logic.rs",
     "crates/fln-cli/tests/source_logical_rewriting.rs",
+    "crates/fln-cli/tests/source_match_equations.rs",
+    "crates/fln-cli/tests/source_multistage_callbacks.rs",
+    "crates/fln-cli/tests/source_mutual_data.rs",
+    "crates/fln-cli/tests/source_mutual_function_children.rs",
+    "crates/fln-cli/tests/source_mutual_groups.rs",
+    "crates/fln-cli/tests/source_mutual_indexed.rs",
     "crates/fln-cli/tests/source_nat_runtime.rs",
+    "crates/fln-cli/tests/source_nested_lets.rs",
     "crates/fln-cli/tests/source_proof_indices.rs",
+    "crates/fln-cli/tests/source_proof_runtime.rs",
     "crates/fln-cli/tests/source_quotients.rs",
     "crates/fln-cli/tests/source_record_runtime.rs",
     "crates/fln-cli/tests/source_scopes.rs",
     "crates/fln-cli/tests/source_search_reflexivity.rs",
+    "crates/fln-cli/tests/source_section_data.rs",
     "crates/fln-cli/tests/source_simp_hypotheses.rs",
     "crates/fln-cli/tests/source_simpa.rs",
+    "crates/fln-cli/tests/source_singleton_inference.rs",
     "crates/fln-cli/tests/source_term_binders.rs",
     "crates/fln-cli/tests/source_variant_runtime.rs",
+    "crates/fln-lake/tests/lake_config_and_actions.rs",
+    "crates/fln-server/tests/lsp_semantic_correlation.rs",
 ];
 
 /// Files whose needle sites materialize nothing: fence probes building synthetic

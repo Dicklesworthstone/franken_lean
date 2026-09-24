@@ -168,25 +168,17 @@ fn multiplexer_diff_verb_routes_to_olean_diff() {
     assert!(stdout.contains("Usage:"));
 }
 
-fn temp_file(text: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "fln-goals-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("goal_test.lean");
+fn temp_file(text: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new("goals");
+    let path = dir.0.join("goal_test.lean");
     std::fs::write(&path, text).unwrap();
-    path
+    (dir, path)
 }
 
 #[test]
 fn multiplexer_goals_verb_inspects_proof_goals() {
     let text = include_str!("../../../examples/native_goal_control.lean");
-    let file_path = temp_file(text);
+    let (_dir, file_path) = temp_file(text);
     let path_str = file_path.to_str().unwrap();
 
     // Test with PATH:LINE:COL
@@ -384,15 +376,8 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
     let archive = builder.build().expect("build archive");
     let bytes = archive.to_canonical_bytes().expect("encode archive");
 
-    let temp_dir = std::env::temp_dir().join(format!(
-        "fln-capsule-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    let temp_dir_guard = TempDir::new("capsule");
+    let temp_dir = temp_dir_guard.0.clone();
     let capsule_path = temp_dir.join("test.flnpack");
     std::fs::write(&capsule_path, &bytes).unwrap();
 
@@ -472,15 +457,8 @@ fn leanc_personality_print_flags_support() {
 
 #[test]
 fn lake_personality_package_lifecycle_init_new_and_clean() {
-    let temp_parent = std::env::temp_dir().join(format!(
-        "fln-lake-cli-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_parent).unwrap();
+    let temp_parent_guard = TempDir::new("lake-cli");
+    let temp_parent = temp_parent_guard.0.clone();
 
     // 1. lake clean in empty dir fails with error code 1
     let empty_dir = temp_parent.join("empty");
@@ -560,15 +538,8 @@ fn lake_personality_package_lifecycle_init_new_and_clean() {
 
 #[test]
 fn lake_personality_update_env_and_exe() {
-    let temp_parent = std::env::temp_dir().join(format!(
-        "fln-lake-update-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_parent).unwrap();
+    let temp_parent_guard = TempDir::new("lake-update");
+    let temp_parent = temp_parent_guard.0.clone();
 
     let pkg_dir = temp_parent.join("my_project");
     let toml_content = r#"
@@ -662,15 +633,8 @@ rev = "v4.32.0"
 
 #[test]
 fn lake_personality_build_and_check_build() {
-    let temp_parent = std::env::temp_dir().join(format!(
-        "fln-lake-build-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_parent).unwrap();
+    let temp_parent_guard = TempDir::new("lake-build");
+    let temp_parent = temp_parent_guard.0.clone();
 
     let pkg_dir = temp_parent.join("calc_proj");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -744,15 +708,8 @@ fn lake_personality_build_and_check_build() {
 
 #[test]
 fn fln_build_explain_dual_rebuild_decisions() {
-    let temp_parent = std::env::temp_dir().join(format!(
-        "fln-build-explain-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_parent).unwrap();
+    let temp_parent_guard = TempDir::new("build-explain");
+    let temp_parent = temp_parent_guard.0.clone();
 
     let pkg_dir = temp_parent.join("geom_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
