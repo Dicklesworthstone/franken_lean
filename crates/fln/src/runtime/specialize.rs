@@ -594,7 +594,7 @@ impl Preparation<'_> {
     /// Only admitted executable entries can become callable values. A familiar
     /// axiom name is insufficient: intrinsics require the exact seed contract.
     /// Ground constructors use the same telescope that produced their layout.
-    fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
+    pub(super) fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
         self.original_callable_type(head)?
             .map(|type_| self.erase_runtime_type(&type_))
             .transpose()

@@ -231,12 +231,13 @@ impl<'a> Preparation<'a> {
             safety: fln_env::constants::DefinitionSafety::Safe,
             all: Vec::new(),
         };
-        let Some(signature) = self.signature(&definition, false)? else {
+        let Some(mut signature) = self.signature(&definition, false)? else {
             return Ok(value.clone());
         };
         if signature.parameters.is_empty() {
             return Ok(value.clone());
         }
+        self.refine_local_result(&mut signature)?;
         reserve(&mut self.lambdas, self.limits.max_lambda_bindings)?;
         let id = self.next_local;
         self.next_local = id

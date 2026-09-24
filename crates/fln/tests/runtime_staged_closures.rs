@@ -42,34 +42,11 @@ fn nonempty_vector_heads_return_captured_callbacks() {
 }
 
 #[test]
-fn recursively_staged_result_abis_are_not_coerced_to_flat_interfaces() {
-    let definitions = "def use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat -> Nat := (by intro x; let a := x + offset; intro y; let b := a + y; intro z; exact b + z); let g := f 1; let h := g 2; h 3";
-    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits.kernel))
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    let options = KVMap::new();
-    let root = engine.logical_root(&options);
-    engine
-        .check_source_files(
-            &[definitions.as_bytes()],
-            &options,
-            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits.kernel)),
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    let source = format!("{definitions}\n#eval use 36");
-    let error = engine
-        .execute_source_definitions(&[source.as_bytes()], &options, limits)
-        .unwrap_err();
-    assert!(
-        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. }
-        if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::LambdaResultType { .. })))
+fn recursively_staged_results_keep_each_actual_call_boundary() {
+    run(
+        "def use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat -> Nat := (by intro x; let a := x + offset; intro y; let b := a + y; intro z; exact b + z); let g := f 1; let h := g 2; h 3\n#eval use 36",
+        "42",
     );
-    assert_eq!(root, engine.logical_root(&options));
-    run("#eval 42", "42");
 }
 
 #[test]
@@ -149,4 +126,81 @@ fn invalid_callback_types_and_budget_exhaustion_leave_the_input_unchanged() {
     ));
     assert_eq!(root, engine.logical_root(&options));
     run(source, "42");
+}
+
+#[test]
+fn four_stages_support_aliases_mixed_arities_and_direct_saturation() {
+    let definitions = "def use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat -> Nat -> Nat -> Nat := (by intro a; let first := a + offset; intro b c; let middle := first + b + c; intro d; let last := middle + d; intro e; exact last + e); let g := f 1; let alias := g; let h := alias 2; let i := h 3; let j := i 4; j 5";
+    run(&format!("{definitions}\n#eval use 27"), "42");
+    run(
+        &format!(
+            "{}\n#eval use 27",
+            definitions.replace(
+                "let g := f 1; let alias := g; let h := alias 2; let i := h 3; let j := i 4; j 5",
+                "f 1 2 3 4 5"
+            )
+        ),
+        "42",
+    );
+}
+
+#[test]
+fn nested_stages_keep_owned_strings_records_and_returned_payloads_alive() {
+    run(
+        "structure Box where value : Nat\ndef use (prefix : String) : Nat := let f : String -> Nat -> Nat -> Box := (by intro suffix; let text := prefix ++ suffix; intro n; let box := Box.mk (n + String.length text); intro k; exact Box.mk (box.value + k)); let g := f \"abcd\"; let h := g 30; let a := h 3; let b := h 4; a.value + b.value\n#eval use \"x\"",
+        "77",
+    );
+}
+
+#[test]
+fn nested_stages_capture_callbacks_from_the_outer_scope() {
+    run(
+        "def use (offset : Nat) : Nat := let add : Nat -> Nat := fun n => n + offset; let f : Nat -> Nat -> Nat -> Nat := (by intro x; let a := add x; intro y; let b := a + y; intro z; exact b + z); let p := f 1; let q := p 2; q 3\n#eval use 36",
+        "42",
+    );
+}
+
+#[test]
+fn each_completed_stage_keeps_its_own_strict_work_and_sharing() {
+    let definitions = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\ndef use (a b c : Nat) : Nat := let f : Nat -> Nat -> Nat -> Nat := (by intro x; let first := expensive a; intro y; let second := expensive b; intro z; let third := expensive c; exact first + second + third + x + y + z); let g := f 10; let h := g 20; h 12";
+    let steps = |a, b, c, source: &str| run(&format!("{source}\n#eval use {a} {b} {c}"), "42");
+    let baseline = steps(0, 0, 0, definitions);
+    let deltas: Vec<_> = [(20, 0, 0), (0, 20, 0), (0, 0, 20)]
+        .into_iter()
+        .map(|(a, b, c)| steps(a, b, c, definitions) - baseline)
+        .collect();
+    assert!(deltas.iter().all(|d| *d > 20));
+    assert!(deltas.iter().all(|d| *d == deltas[0]));
+    let twice = definitions
+        .replace("h 12", "h 0 + h (0 - 1)")
+        .replace("f 10", "f 1");
+    let zero = steps(0, 0, 0, &twice);
+    assert_eq!(steps(20, 0, 0, &twice) - zero, deltas[0]);
+    assert_eq!(steps(0, 20, 0, &twice) - zero, deltas[1]);
+    assert_eq!(steps(0, 0, 20, &twice) - zero, 2 * deltas[2]);
+    // The third stage is never called: discard the completed second stage.
+    let unused = definitions.replace("h 12", "42");
+    let zero = steps(0, 0, 0, &unused);
+    assert_eq!(steps(20, 0, 0, &unused) - zero, deltas[0]);
+    assert_eq!(steps(0, 20, 0, &unused) - zero, deltas[1]);
+    assert_eq!(steps(0, 0, 10000, &unused), zero);
+}
+
+#[test]
+fn nested_stages_are_not_silently_converted_to_flat_callback_arguments() {
+    let source = "def apply (f : Nat -> Nat -> Nat) : Nat := f 1 2\ndef use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat := (by intro x; let n := x + offset; intro y; exact n + y); apply f\n#eval use 39";
+    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits.kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let error = engine
+        .execute_source_definitions(&[source.as_bytes()], &options, limits)
+        .unwrap_err();
+    assert!(
+        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. } if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::FunctionArgumentType { .. })))
+    );
+    assert_eq!(engine.logical_root(&options), root);
 }

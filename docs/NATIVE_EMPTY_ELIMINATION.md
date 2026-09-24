@@ -109,9 +109,9 @@ does not discard prefix computation, repeated invocations share it, and merely
 constructing the outer lambda does not run its body. Returned callbacks can be
 stored in records and collections after their prefix has completed.
 
-This does not coerce different closure ABIs. A recursively staged returned
-callback has a different interface from a flat multiargument callback; the
-compiler still rejects a mismatched return interface. General adaptation between
-these interfaces is outside this increment and is covered as a typed refusal,
-not as supported execution. Neither checker nor the compiler's exact lambda-spine,
-return-type, capture, argument or ownership checks were weakened.
+Local callbacks can now return further strictly computed stages; see
+`NATIVE_MULTISTAGE_CALLBACKS.md`. Their actual return interfaces are derived
+from prepared syntax, not coerced to flat multiargument interfaces. Fixed
+callback parameters, constructor fields and incompatible branch joins retain
+their exact interface checks. Neither checker nor the compiler's lambda-spine,
+return-type, capture, argument or ownership checks are weakened.

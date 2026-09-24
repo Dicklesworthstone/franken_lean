@@ -2,6 +2,8 @@
 //! types. Source-local ids are resolved only after every lambda (including
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
+mod stages;
+
 use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
