@@ -156,7 +156,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:542`, where
+//! matrix row was corrected for once already (`witness.rs:544`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -324,7 +324,7 @@
 //! cite crates/fln-hash/src/canon.rs:1160 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:658 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:542 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite crates/fln-conformance/src/witness.rs:544 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1116 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1332 :: fn every_semantic_item_is_refused_inside_fln_checker
