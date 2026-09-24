@@ -68,6 +68,19 @@ pub struct LakeRequire {
     pub subdir: Option<String>,
 }
 
+/// One `lean_lib` / `lean_exe` target declared in `lakefile.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LakeTarget {
+    /// Target name as written in the configuration.
+    pub name: String,
+    /// `Library` for `lean_lib`, `Executable` for `lean_exe`.
+    pub kind: TargetKind,
+    /// Dotted root module names. A `lean_exe` has exactly one.
+    pub roots: Vec<String>,
+    /// Per-target source directory, relative to the package source directory.
+    pub src_dir: Option<PathBuf>,
+}
+
 // ---------------------------------------------------------------------------
 // §13.3 — build targets and facets
 // ---------------------------------------------------------------------------
