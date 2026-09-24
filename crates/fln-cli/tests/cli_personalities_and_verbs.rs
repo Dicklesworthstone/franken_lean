@@ -4,65 +4,157 @@
 
 use std::process::Command;
 
-#[test]
-fn multiplexer_doctor_verb_reports_healthy_audit() {
-    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .arg("doctor")
-        .output()
-        .expect("run fln doctor");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("fln doctor: environment and subsystem audit"));
-    assert!(stdout.contains("reference pin: v4.32.0"));
-    assert!(stdout.contains("all core subsystem checks passed"));
+/// A fresh directory under the system temp root, removed when dropped.
+struct TempDir(std::path::PathBuf);
 
-    let json_output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["doctor", "--json"])
-        .output()
-        .expect("run fln doctor --json");
-    assert!(json_output.status.success());
-    let json_stdout = String::from_utf8(json_output.stdout).expect("utf8 stdout");
-    assert!(json_stdout.contains("\"schema\":\"fln.doctor/1\""));
-    assert!(json_stdout.contains("\"status\":\"healthy\""));
-    assert!(json_stdout.contains("\"kernel_checker\""));
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "fln-cli-verbs-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn doctor_json(cwd: &std::path::Path, elan_home: Option<&std::path::Path>) -> (i32, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+    command.args(["doctor", "--json"]).current_dir(cwd);
+    if let Some(elan_home) = elan_home {
+        command.env("ELAN_HOME", elan_home);
+    }
+    let output = command.output().expect("run fln doctor --json");
+    (
+        output.status.code().expect("exit code"),
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+    )
 }
 
 #[test]
-fn multiplexer_capability_notices_are_typed_and_exit_cleanly() {
-    for (verb, expected_gate, expected_desc) in [
-        ("serve-mcp", "G6", "Envoy"),
-        ("replay", "G5", "Palimpsest"),
-        ("cache", "G2", "Ledger"),
+fn doctor_runs_the_real_pipeline_and_checks_the_checkout_pins() {
+    // The test runs inside the franken_lean checkout, so the pin check applies.
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout) = doctor_json(checkout, None);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("\"schema\":\"fln.doctor/2\""), "{stdout}");
+    assert!(stdout.contains("\"status\":\"ok\""), "{stdout}");
+    assert!(
+        stdout.contains(
+            "{\"name\":\"source_pipeline_smoke\",\"required\":true,\"status\":\"ok\""
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("{\"name\":\"checkout_pins\",\"required\":true,\"status\":\"ok\""),
+        "{stdout}"
+    );
+    // Planned subsystems are named, never claimed.
+    assert!(stdout.contains("\"bead\":\"franken_lean-g3k\""), "{stdout}");
+    assert!(!stdout.contains("dual-engine"), "{stdout}");
+}
+
+#[test]
+fn doctor_fails_when_run_in_a_checkout_pinned_to_another_reference() {
+    let dir = TempDir::new("doctor-pins");
+    let real_lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SUITE.lock"),
+    )
+    .expect("read SUITE.lock");
+    let other_lock: String = real_lock
+        .lines()
+        .map(|line| {
+            if line.starts_with("reference ") {
+                "reference leanprover/lean4 tag=v4.99.0 commit=0000000000000000000000000000000000000000 tree=0000000000000000000000000000000000000000".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.0.join("SUITE.lock"), other_lock).unwrap();
+    std::fs::write(dir.0.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let (code, stdout) = doctor_json(&dir.0, None);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("\"status\":\"failed\""), "{stdout}");
+    assert!(
+        stdout.contains("{\"name\":\"checkout_pins\",\"required\":true,\"status\":\"mismatch\""),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_missing_reference_toolchain_without_failing() {
+    let outside = TempDir::new("doctor-outside");
+    let empty_elan = TempDir::new("doctor-elan");
+    let (code, stdout) = doctor_json(&outside.0, Some(&empty_elan.0));
+    assert_eq!(code, 0, "the Reference is oracle apparatus, not a product dependency: {stdout}");
+    assert!(
+        stdout.contains(
+            "{\"name\":\"reference_oracle_toolchain\",\"required\":false,\"status\":\"missing\""
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("{\"name\":\"checkout_pins\",\"required\":false,\"status\":\"not_applicable\""),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn unimplemented_verbs_exit_five_with_a_typed_notice() {
+    for (args, expected_gate) in [
+        (vec!["serve-mcp"], "G6"),
+        (vec!["replay"], "G5"),
+        (vec!["cache", "stats"], "G2"),
+        (vec!["doctor", "--sql"], "G5"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-            .arg(verb)
+            .args(&args)
             .output()
             .expect("run verb");
-        assert!(output.status.success());
-        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-        assert!(stdout.contains(expected_gate), "verb {verb}: {stdout}");
-        assert!(stdout.contains(expected_desc), "verb {verb}: {stdout}");
+        assert_eq!(output.status.code(), Some(5), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(stderr.contains("not implemented"), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected_gate), "{args:?}: {stderr}");
 
+        let mut json_args = args.clone();
+        json_args.push("--json");
         let json_output = Command::new(env!("CARGO_BIN_EXE_fln"))
-            .args([verb, "--json"])
+            .args(&json_args)
             .output()
             .expect("run verb --json");
-        assert!(json_output.status.success());
-        let json_stdout = String::from_utf8(json_output.stdout).expect("utf8 stdout");
-        assert!(json_stdout.contains("\"schema\":\"fln.capability-notice/1\""));
-        assert!(json_stdout.contains(&format!("\"command\":\"{verb}\"")));
-        assert!(json_stdout.contains(&format!("\"gate\":\"{expected_gate}\"")));
+        assert_eq!(json_output.status.code(), Some(5), "{json_args:?}");
+        let json_stderr = String::from_utf8(json_output.stderr).expect("utf8 stderr");
+        assert!(json_stderr.contains("\"schema\":\"fln.capability-notice/2\""));
+        assert!(json_stderr.contains("\"status\":\"not_implemented\""));
+        assert!(json_stderr.contains("\"exit_code\":5"));
     }
 
-    // Test build capability notice
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("build")
         .output()
         .expect("run build");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("G2"));
-    assert!(stdout.contains("Ledger"));
+    assert_eq!(output.status.code(), Some(5));
+}
+
+#[test]
+fn doctor_refuses_unknown_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["doctor", "--all-systems-go"])
+        .output()
+        .expect("run doctor with a bogus flag");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
@@ -260,7 +352,7 @@ fn multiplexer_verify_capsule_help_and_errors() {
         .expect("run fln verify-capsule --json nonexistent");
     assert_eq!(json_output.status.code(), Some(1));
     let json_stderr = String::from_utf8(json_output.stderr).expect("utf8 stderr");
-    assert!(json_stderr.contains("\"schema\":\"fln.verify-capsule/1\""));
+    assert!(json_stderr.contains("\"schema\":\"fln.verify-capsule/2\""));
     assert!(json_stderr.contains("\"outcome\":\"error\""));
 }
 
@@ -315,8 +407,9 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("fln verify-capsule: verified capsule at"));
-    assert!(stdout.contains("capsule verification passed."));
+    assert!(stdout.contains("fln verify-capsule: integrity verified for capsule at"));
+    assert!(stdout.contains("not replayed through a checker"));
+    assert!(stdout.contains("capsule integrity verification passed."));
 
     // JSON output
     let json_output = Command::new(env!("CARGO_BIN_EXE_fln"))
@@ -329,10 +422,13 @@ fn multiplexer_verify_capsule_verifies_valid_cartridge() {
         String::from_utf8_lossy(&json_output.stderr)
     );
     let json_stdout = String::from_utf8(json_output.stdout).expect("utf8 stdout");
-    assert!(json_stdout.contains("\"schema\":\"fln.verify-capsule/1\""));
+    assert!(json_stdout.contains("\"schema\":\"fln.verify-capsule/2\""));
     assert!(json_stdout.contains("\"outcome\":\"complete\""));
-    assert!(json_stdout.contains("\"status\":\"verified\""));
+    assert!(json_stdout.contains("\"status\":\"integrity_verified\""));
     assert!(json_stdout.contains("\"transport_state\":\"complete\""));
+    // A decoded certificate is not a replayed one; the report must say so.
+    assert!(json_stdout.contains("\"certificate_replay\":\"not_implemented\""));
+    assert!(!json_stdout.contains("certificates_verified"));
 }
 
 #[test]

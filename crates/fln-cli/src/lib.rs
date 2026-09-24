@@ -51,7 +51,7 @@ const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
-const VERIFY_CAPSULE_SCHEMA: &str = "fln.verify-capsule/1";
+const VERIFY_CAPSULE_SCHEMA: &str = "fln.verify-capsule/2";
 const CAPSULE_DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/9";
@@ -118,12 +118,20 @@ const USAGE: &str = concat!(
     "\n",
     "`diff` compares two pinned-format .oleans (alias for `olean diff`).\n",
     "`goals` inspects proof goals at a specified source line/column or byte offset.\n",
-    "`doctor` audits subsystem integrity and environment health.\n",
-    "`serve-mcp` starts the Envoy Model Context Protocol server for agent proof assistance.\n",
-    "`replay` verifies deterministic replay of elaboration bundles.\n",
-    "`cache` inspects and manages the Ledger content-addressed artifact cache.\n",
-    "`build explain` analyzes the dependency graph and build plan.\n",
-    "`verify-capsule` validates the transport completeness, content hashes, and certificates of a sealed .flnpack capsule.\n",
+    "`doctor` probes the local toolchain environment (pinned Reference toolchain,\n",
+    "pin agreement, census shards, optional D2 tools, a live kernel admission) and\n",
+    "names the planned subsystems that are not implemented yet.\n",
+    "`serve-mcp`, `replay`, and `cache` are planned capabilities that are not\n",
+    "implemented; they print a typed notice and exit 5.\n",
+    "`build explain` reports which package sources changed since the last\n",
+    "successful `lake build` check, by content hash.\n",
+    "`verify-capsule` checks the transport completeness and content-hash integrity\n",
+    "of a sealed .flnpack capsule and decodes its certificate objects; it does not\n",
+    "replay certificates through a checker.\n",
+    "\n",
+    "Exit codes: 0 success; 1 rejected or failed; 2 usage error; 3 inconclusive or\n",
+    "resource limit; 4 internal fault; 5 capability not implemented.\n",
+    "\n",
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
     "With --constants (text mode), it also prints the declaration-order\n",
@@ -1234,6 +1242,30 @@ fn parse_capability_notice(
     Ok(MultiplexerCommand::CapabilityNotice { command, json })
 }
 
+fn parse_doctor(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut json = false;
+    let mut sql = false;
+    for arg in arguments {
+        if arg == "--help" || arg == "-h" || arg == "help" {
+            return Ok(MultiplexerCommand::Help);
+        } else if arg == "--json" {
+            json = true;
+        } else if arg == "--sql" {
+            sql = true;
+        } else {
+            return Err(UsageError(format!(
+                "doctor accepts only --json (and the unimplemented --sql), got {:?}",
+                arg.to_string_lossy()
+            )));
+        }
+    }
+    let command = if sql { "doctor --sql" } else { "doctor" };
+    Ok(MultiplexerCommand::CapabilityNotice {
+        command: command.to_owned(),
+        json,
+    })
+}
+
 fn parse_verify_capsule(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let Some((paths, max_bytes, json)) =
         parse_path_options(arguments, "verify-capsule", CAPSULE_DEFAULT_MAX_BYTES)?
@@ -1380,11 +1412,10 @@ fn parse_command(
     if command == "verify-capsule" {
         return parse_verify_capsule(arguments.collect());
     }
-    if command == "doctor"
-        || command == "serve-mcp"
-        || command == "replay"
-        || command == "cache"
-    {
+    if command == "doctor" {
+        return parse_doctor(arguments.collect());
+    }
+    if command == "serve-mcp" || command == "replay" || command == "cache" {
         return parse_capability_notice(command.to_string_lossy().into_owned(), arguments.collect());
     }
     if command == "build" {
@@ -2763,8 +2794,8 @@ fn verify_capsule_bytes(
         }
     }
 
-    let mut certificates_verified = 0usize;
-    let mut warm_cache_verified = false;
+    let mut certificates_decoded = 0usize;
+    let mut warm_cache_decoded = false;
     let mut objects_present = 0usize;
 
     for object in &archive.manifest.objects {
@@ -2807,7 +2838,7 @@ fn verify_capsule_bytes(
                     DecodeBudget::new(object_bytes.len() as u64, max_nodes),
                 ) {
                     fln::Outcome::Complete(Ok(_cert)) => {
-                        certificates_verified += 1;
+                        certificates_decoded += 1;
                     }
                     fln::Outcome::Complete(Err(refusal)) => {
                         return verify_capsule_failure(
@@ -2840,7 +2871,7 @@ fn verify_capsule_bytes(
                     DecodeBudget::new(object_bytes.len() as u64, max_nodes),
                 ) {
                     fln::Outcome::Complete(Ok(_cache)) => {
-                        warm_cache_verified = true;
+                        warm_cache_decoded = true;
                     }
                     fln::Outcome::Complete(Err(refusal)) => {
                         return verify_capsule_failure(
@@ -2894,10 +2925,11 @@ fn verify_capsule_bytes(
         let stdout = format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"path\":{},",
-                "\"status\":\"verified\",\"manifest_root\":{},\"archive_digest\":{},",
+                "\"status\":\"integrity_verified\",\"manifest_root\":{},\"archive_digest\":{},",
                 "\"transport_state\":{},\"objects_present\":{},\"objects_declared\":{},",
-                "\"chunk_count\":{},\"bytes\":{},\"certificates_verified\":{},",
-                "\"warm_cache_verified\":{}}}\n"
+                "\"chunk_count\":{},\"bytes\":{},\"certificates_decoded\":{},",
+                "\"certificate_replay\":\"not_implemented\",",
+                "\"warm_cache_decoded\":{}}}\n"
             ),
             json_string(VERIFY_CAPSULE_SCHEMA),
             json_string(&path.display().to_string()),
@@ -2908,23 +2940,23 @@ fn verify_capsule_bytes(
             archive.manifest.objects.len(),
             archive.frames.len(),
             bytes.len(),
-            certificates_verified,
-            warm_cache_verified,
+            certificates_decoded,
+            warm_cache_decoded,
         );
         MultiplexerOutput::success(stdout)
     } else {
         let stdout = format!(
             concat!(
-                "fln verify-capsule: verified capsule at {}\n",
+                "fln verify-capsule: integrity verified for capsule at {}\n",
                 "  manifest root: {}\n",
                 "  archive digest: {}\n",
                 "  transport state: {}\n",
                 "  objects: {} present ({} declared)\n",
                 "  chunks: {}\n",
                 "  bytes: {}\n",
-                "  certificates verified: {}\n",
+                "  certificates decoded: {} (not replayed through a checker)\n",
                 "  warm defeq cache: {}\n",
-                "capsule verification passed.\n"
+                "capsule integrity verification passed.\n"
             ),
             path.display(),
             manifest_root.to_hex(),
@@ -2934,8 +2966,8 @@ fn verify_capsule_bytes(
             archive.manifest.objects.len(),
             archive.frames.len(),
             bytes.len(),
-            certificates_verified,
-            if warm_cache_verified { "verified" } else { "none" },
+            certificates_decoded,
+            if warm_cache_decoded { "decoded" } else { "none" },
         );
         MultiplexerOutput::success(stdout)
     }
@@ -8286,8 +8318,10 @@ const RECEIPT_SET_SCHEMA: &str = "fln.check-olean.run-receipt/1";
 const AUDIT_TCB_SCHEMA: &str = "fln.audit-tcb/1";
 const WHY_TRUSTS_SCHEMA: &str = "fln.why-trusts/1";
 const IDENTITY_SCHEMA: &str = "fln.identity/1";
-const DOCTOR_SCHEMA: &str = "fln.doctor/1";
-const CAPABILITY_NOTICE_SCHEMA: &str = "fln.capability-notice/1";
+const DOCTOR_SCHEMA: &str = "fln.doctor/2";
+const CAPABILITY_NOTICE_SCHEMA: &str = "fln.capability-notice/2";
+/// Documented exit code for a verb whose capability is planned but not built.
+const CAPABILITY_NOT_IMPLEMENTED_EXIT: u8 = 5;
 const WHY_TRUSTS_MAX_UNRESOLVED_SAMPLE: usize = 16;
 
 /// Baked, compile-time build facts for `fln identity`. Every value is derived
@@ -8342,60 +8376,331 @@ fn render_identity(json: bool) -> MultiplexerOutput {
     }
 }
 
+/// One probed fact reported by `fln doctor`. Only `required` checks decide the
+/// exit code; informational checks describe the environment without failing it.
+struct DoctorCheck {
+    name: &'static str,
+    required: bool,
+    status: &'static str,
+    detail: String,
+}
+
+/// Planned subsystems `fln doctor` names instead of claiming, with owning beads.
+const DOCTOR_NOT_IMPLEMENTED: &[(&str, &str)] = &[
+    ("kernel engine K2 (NbE accelerator)", "franken_lean-g3k"),
+    ("native Mirror facade implementations", "franken_lean-epx"),
+    ("Lantern daemon with shared import heap and RPC sessions", "franken_lean-v2p"),
+    ("Ledger content-addressed build store", "franken_lean-xy6"),
+    ("Envoy MCP server", "franken_lean-87av"),
+    ("doctor --sql build database", "franken_lean-05g"),
+];
+
 fn render_doctor(json: bool) -> MultiplexerOutput {
     let reference_tag = env!("FLN_IDENTITY_REFERENCE_TAG");
     let reference_commit = env!("FLN_IDENTITY_REFERENCE_COMMIT");
-    let corpus_tag = env!("FLN_IDENTITY_CORPUS_TAG");
     let corpus_commit = env!("FLN_IDENTITY_CORPUS_COMMIT");
     let rust_channel = env!("FLN_IDENTITY_RUST_CHANNEL");
-    let product_root = env!("FLN_IDENTITY_PRODUCT_ROOT");
-    let version = env!("CARGO_PKG_VERSION");
-    if json {
-        MultiplexerOutput::success(format!(
-            concat!(
-                "{{\"schema\":{},\"status\":\"healthy\",\"version\":{},\"productRoot\":{},",
-                "\"reference\":{{\"tag\":{},\"commit\":{}}},",
-                "\"corpus\":{{\"tag\":{},\"commit\":{}}},",
-                "\"rustChannel\":{},",
-                "\"subsystems\":[",
-                "{{\"name\":\"reference_pin\",\"status\":\"ok\"}},",
-                "{{\"name\":\"corpus_pin\",\"status\":\"ok\"}},",
-                "{{\"name\":\"kernel_checker\",\"status\":\"ok\",\"detail\":\"dual-engine certified\"}},",
-                "{{\"name\":\"native_mirror\",\"status\":\"ok\",\"detail\":\"census-governed facade\"}},",
-                "{{\"name\":\"lsp_server\",\"status\":\"ok\",\"detail\":\"lantern diagnostic projection\"}}",
-                "]}}\n"
-            ),
+
+    let mut checks = vec![doctor_pipeline_smoke()];
+    match std::env::current_dir().ok().and_then(|dir| doctor_checkout_root(&dir)) {
+        Some(root) => {
+            checks.push(doctor_pin_agreement(
+                &root,
+                reference_commit,
+                corpus_commit,
+                rust_channel,
+            ));
+            checks.push(doctor_census_shards(&root));
+        }
+        None => checks.push(DoctorCheck {
+            name: "checkout_pins",
+            required: false,
+            status: "not_applicable",
+            detail: "not run inside a franken_lean checkout (no SUITE.lock in any ancestor)"
+                .to_owned(),
+        }),
+    }
+    checks.push(doctor_reference_toolchain(reference_tag));
+    checks.push(doctor_path_tool("cc", "optional D2 tool for --backend c"));
+    checks.push(doctor_path_tool("git", "optional D2 tool for Lake dependency fetching"));
+
+    let failed = checks
+        .iter()
+        .any(|check| check.required && check.status != "ok");
+    let status = if failed { "failed" } else { "ok" };
+    let exit_code = u8::from(failed);
+
+    let stdout = if json {
+        let rows: Vec<String> = checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "{{\"name\":{},\"required\":{},\"status\":{},\"detail\":{}}}",
+                    json_string(check.name),
+                    check.required,
+                    json_string(check.status),
+                    json_string(&check.detail),
+                )
+            })
+            .collect();
+        let planned: Vec<String> = DOCTOR_NOT_IMPLEMENTED
+            .iter()
+            .map(|(subsystem, bead)| {
+                format!(
+                    "{{\"subsystem\":{},\"bead\":{}}}",
+                    json_string(subsystem),
+                    json_string(bead)
+                )
+            })
+            .collect();
+        format!(
+            "{{\"schema\":{},\"status\":{},\"version\":{},\"reference\":{{\"tag\":{},\"commit\":{}}},\"checks\":[{}],\"not_implemented\":[{}]}}\n",
             json_string(DOCTOR_SCHEMA),
-            json_string(version),
-            json_string(product_root),
+            json_string(status),
+            json_string(env!("CARGO_PKG_VERSION")),
             json_string(reference_tag),
             json_string(reference_commit),
-            json_string(corpus_tag),
-            json_string(corpus_commit),
-            json_string(rust_channel),
-        ))
+            rows.join(","),
+            planned.join(","),
+        )
     } else {
-        MultiplexerOutput::success(format!(
-            concat!(
-                "fln doctor: environment and subsystem audit\n",
-                "package version: {}\n",
-                "product root: {}\n",
-                "[ok] reference pin: {} ({})\n",
-                "[ok] corpus pin: {} ({})\n",
-                "[ok] rust channel: {}\n",
-                "[ok] kernel checker: certified dual-engine (K1 + independent checker)\n",
-                "[ok] native mirror: census-governed facade\n",
-                "[ok] diagnostic server: lantern lsp active\n",
-                "all core subsystem checks passed.\n"
-            ),
-            version,
-            product_root,
-            reference_tag,
-            reference_commit,
-            corpus_tag,
-            corpus_commit,
-            rust_channel,
-        ))
+        let mut text = format!(
+            "fln doctor: environment probe (package {}, reference {reference_tag})\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        for check in &checks {
+            let kind = if check.required { "required" } else { "info" };
+            text.push_str(&format!(
+                "[{}] {} ({kind}): {}\n",
+                check.status, check.name, check.detail
+            ));
+        }
+        text.push_str("not implemented yet:\n");
+        for (subsystem, bead) in DOCTOR_NOT_IMPLEMENTED {
+            text.push_str(&format!("  - {subsystem} (bead {bead})\n"));
+        }
+        text.push_str(if failed {
+            "doctor: a required check failed.\n"
+        } else {
+            "doctor: all required checks passed.\n"
+        });
+        text
+    };
+    MultiplexerOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code,
+    }
+}
+
+/// Runs one definition through the real source pipeline: parser, elaborator,
+/// K1, the independent checker, compiler, canonical FLBC, and Golem.
+fn doctor_pipeline_smoke() -> DoctorCheck {
+    let name = "source_pipeline_smoke";
+    let budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+    let failed = |detail: String| DoctorCheck {
+        name,
+        required: true,
+        status: "failed",
+        detail,
+    };
+    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(budget)) {
+        Ok(fln::Outcome::Complete(engine)) => engine,
+        Ok(other) => return failed(format!("source seed did not complete: {other:?}")),
+        Err(error) => return failed(format!("source seed refused: {error}")),
+    };
+    let sources: [&[u8]; 1] = [b"def doctorProbe : Nat := 6 * 7"];
+    let completed = match engine.execute_source_definitions(
+        &sources,
+        &fln::KVMap::new(),
+        fln::EngineExecutionLimits::new(budget),
+    ) {
+        Ok(fln::Outcome::Complete(completed)) => completed,
+        Ok(other) => return failed(format!("probe execution did not complete: {other:?}")),
+        Err(error) => return failed(format!("probe execution refused: {error}")),
+    };
+    let returned = completed
+        .executions
+        .last()
+        .map(|execution| fln::closed_vm_value(&execution.exit));
+    let admitted = completed
+        .engine
+        .environment()
+        .find(&fln::Name::from_components(["doctorProbe"]))
+        .is_some();
+    match returned {
+        Some(Ok(Some(fln::ClosedVmValue::Scalar(42)))) if admitted => DoctorCheck {
+            name,
+            required: true,
+            status: "ok",
+            detail: "def doctorProbe : Nat := 6 * 7 admitted by K1 and the independent checker and returned 42 on Golem".to_owned(),
+        },
+        other => failed(format!(
+            "probe returned {other:?} (admitted: {admitted}); expected Nat 42"
+        )),
+    }
+}
+
+fn doctor_checkout_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .take(64)
+        .find(|dir| dir.join("SUITE.lock").is_file() && dir.join("Cargo.toml").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// A binary built for one pin but run inside a checkout pinned elsewhere answers
+/// for the wrong epoch; that is a required failure.
+fn doctor_pin_agreement(
+    root: &Path,
+    reference_commit: &str,
+    corpus_commit: &str,
+    rust_channel: &str,
+) -> DoctorCheck {
+    let name = "checkout_pins";
+    let lock = match std::fs::read_to_string(root.join("SUITE.lock")) {
+        Ok(text) => text,
+        Err(error) => {
+            return DoctorCheck {
+                name,
+                required: true,
+                status: "failed",
+                detail: format!("cannot read {}: {error}", root.join("SUITE.lock").display()),
+            };
+        }
+    };
+    let field = |row: &str, key: &str| -> Option<String> {
+        lock.lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(row))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix(key))
+                    .map(str::to_owned)
+            })
+    };
+    let lock_reference = field("reference ", "commit=");
+    let lock_corpus = field("corpus ", "commit=");
+    let lock_rust = lock
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("rust-nightly "))
+        .map(|rest| rest.trim().to_owned());
+    let toolchain_channel = std::fs::read_to_string(root.join("rust-toolchain.toml"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find_map(|line| line.strip_prefix("channel"))
+                .map(|rest| rest.trim_start_matches([' ', '=']).trim().trim_matches('"').to_owned())
+        });
+    let mut mismatches = Vec::new();
+    if lock_reference.as_deref() != Some(reference_commit) {
+        mismatches.push(format!(
+            "reference commit: binary {reference_commit}, SUITE.lock {lock_reference:?}"
+        ));
+    }
+    if lock_corpus.as_deref() != Some(corpus_commit) {
+        mismatches.push(format!(
+            "corpus commit: binary {corpus_commit}, SUITE.lock {lock_corpus:?}"
+        ));
+    }
+    if lock_rust.as_deref() != Some(rust_channel) {
+        mismatches.push(format!(
+            "rust channel: binary {rust_channel}, SUITE.lock {lock_rust:?}"
+        ));
+    }
+    if toolchain_channel.is_some() && toolchain_channel != lock_rust {
+        mismatches.push(format!(
+            "rust-toolchain.toml channel {toolchain_channel:?} differs from SUITE.lock {lock_rust:?}"
+        ));
+    }
+    if mismatches.is_empty() {
+        DoctorCheck {
+            name,
+            required: true,
+            status: "ok",
+            detail: format!("binary pins match {}", root.join("SUITE.lock").display()),
+        }
+    } else {
+        DoctorCheck {
+            name,
+            required: true,
+            status: "mismatch",
+            detail: mismatches.join("; "),
+        }
+    }
+}
+
+fn doctor_census_shards(root: &Path) -> DoctorCheck {
+    let shards = [
+        "contracts/builtin_partition.tsv",
+        "contracts/builtin_environment.tsv",
+        "contracts/extern_census.tsv",
+    ];
+    let missing: Vec<&str> = shards
+        .iter()
+        .copied()
+        .filter(|shard| !root.join(shard).is_file())
+        .collect();
+    DoctorCheck {
+        name: "census_shards",
+        required: false,
+        status: if missing.is_empty() { "ok" } else { "missing" },
+        detail: if missing.is_empty() {
+            "builtin and extern census shards present".to_owned()
+        } else {
+            format!("absent (untracked shards are regenerated by the census extractor): {}", missing.join(", "))
+        },
+    }
+}
+
+/// The Reference is Tribunal oracle apparatus, never a product dependency, so
+/// its absence is reported but never fails the product.
+fn doctor_reference_toolchain(tag: &str) -> DoctorCheck {
+    let elan_home = std::env::var_os("ELAN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elan")));
+    let Some(elan_home) = elan_home else {
+        return DoctorCheck {
+            name: "reference_oracle_toolchain",
+            required: false,
+            status: "missing",
+            detail: "neither ELAN_HOME nor HOME is set".to_owned(),
+        };
+    };
+    let root = elan_home
+        .join("toolchains")
+        .join(format!("leanprover--lean4---{tag}"));
+    let lean = root.join("bin").join("lean");
+    let prelude = root.join("lib").join("lean").join("Init").join("Prelude.olean");
+    let present = lean.is_file() && prelude.is_file();
+    DoctorCheck {
+        name: "reference_oracle_toolchain",
+        required: false,
+        status: if present { "ok" } else { "missing" },
+        detail: if present {
+            format!("{} (Tribunal oracle only; never executed by the product)", root.display())
+        } else {
+            format!("{} not found; pin-dependent Tribunal rigs will skip", root.display())
+        },
+    }
+}
+
+fn doctor_path_tool(tool: &'static str, role: &str) -> DoctorCheck {
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+    });
+    DoctorCheck {
+        name: tool,
+        required: false,
+        status: if found.is_some() { "ok" } else { "missing" },
+        detail: match found {
+            Some(path) => format!("{} ({role})", path.display()),
+            None => format!("not on PATH ({role})"),
+        },
     }
 }
 
@@ -8407,21 +8712,29 @@ fn render_capability_notice(command: &str, json: bool) -> MultiplexerOutput {
         "serve-mcp" => ("G6", "Envoy Model Context Protocol server (plan §16.3)"),
         "replay" => ("G5", "Palimpsest deterministic elaboration replay (plan §15)"),
         "cache" => ("G2", "Ledger content-addressed artifact cache (plan §13.2)"),
+        "doctor --sql" => ("G5", "SQL surface over the build database (plan §15.5)"),
         "build" | "build explain" => ("G2", "Ledger build fabric and dependency planner (plan §13)"),
         _ => ("G0", "Planned FrankenLean capability"),
     };
     if json {
-        MultiplexerOutput::success(format!(
-            "{{\"schema\":{},\"command\":{},\"status\":\"reserved\",\"gate\":{},\"description\":{}}}\n",
-            json_string(CAPABILITY_NOTICE_SCHEMA),
-            json_string(command),
-            json_string(gate),
-            json_string(description),
-        ))
+        MultiplexerOutput::failure(
+            format!(
+                "{{\"schema\":{},\"command\":{},\"status\":\"not_implemented\",\"gate\":{},\"description\":{},\"exit_code\":{}}}\n",
+                json_string(CAPABILITY_NOTICE_SCHEMA),
+                json_string(command),
+                json_string(gate),
+                json_string(description),
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            ),
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        )
     } else {
-        MultiplexerOutput::success(format!(
-            "fln {command}: reserved capability under {gate} ({description})\nSee COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md\n"
-        ))
+        MultiplexerOutput::failure(
+            format!(
+                "fln {command}: not implemented; planned under {gate} ({description})\nSee COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md\n"
+            ),
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        )
     }
 }
 
