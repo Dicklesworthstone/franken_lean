@@ -1243,7 +1243,7 @@ fn transform_with(
             replacement: replacement.map(|term| (term, term.root())),
             operation,
             root_mode,
-            compact_levels: false,
+            compact_levels: true,
         },
         budget,
         cancelled,
@@ -1287,7 +1287,7 @@ pub(crate) fn copy_subterm_with(
             replacement: None,
             operation: Operation::Raise,
             root_mode: Mode::Rewrite { scope: 0 },
-            compact_levels: false,
+            compact_levels: true,
         },
         budget,
         cancelled,
@@ -1476,4 +1476,84 @@ pub fn substitute_free_with(
         budget,
         &mut cancelled,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::LevelNode;
+
+    const CHAIN: usize = 1000;
+
+    /// `Sort (succ^999 0)` applied to `Sort 0`, over a level arena holding the
+    /// whole 1000-node chain. The `Sort 0` subterm references one level.
+    fn bloated() -> Option<(WireExpr, ExprId)> {
+        let mut levels = vec![LevelNode::Zero];
+        for index in 1..CHAIN {
+            levels.push(LevelNode::Succ(LevelId::from_index(index - 1)?));
+        }
+        let nodes = vec![
+            ExprNode::Sort {
+                level: LevelId::from_index(CHAIN - 1)?,
+            },
+            ExprNode::Sort {
+                level: LevelId::ZERO,
+            },
+            ExprNode::Apply {
+                function: ExprId::from_index(0)?,
+                argument: ExprId::from_index(1)?,
+            },
+        ];
+        Some((
+            WireExpr::from_parts(nodes, levels, ExprId::from_index(2)?),
+            ExprId::from_index(1)?,
+        ))
+    }
+
+    /// Copying a subterm carries only the levels it references. Before this,
+    /// `copy_subterm_with` copied the source's WHOLE level arena into every
+    /// output. Level arenas therefore only grew as rewrites composed, until
+    /// one Init proof (`Array.binSearchAux._unary._proof_4`) exhausted a
+    /// 20 GB cap inside the checker. With compaction it is admitted in 13 s
+    /// at about 0.6 GB.
+    #[test]
+    fn copying_a_subterm_carries_only_its_own_levels() {
+        let fixture = bloated();
+        assert!(fixture.is_some(), "fixture construction");
+        if let Some((term, small)) = fixture {
+            assert_eq!(term.levels().len(), CHAIN);
+            let copy = copy_subterm_with(&term, small, TermBudget::unlimited(), &mut || false);
+            assert!(
+                matches!(&copy, TermOutcome::Complete(copied) if copied.levels().len() == 1),
+                "{copy:?}"
+            );
+        }
+    }
+
+    /// The rewrites behind `raise_external_bounds`, `substitute_bound` and the
+    /// free-variable operations shed unreferenced levels in the same way, so
+    /// an input that arrives bloated does not pass its bloat on.
+    #[test]
+    fn rewriting_a_term_sheds_levels_it_does_not_reference() {
+        let fixture = bloated();
+        assert!(fixture.is_some(), "fixture construction");
+        if let Some((term, _)) = fixture {
+            let root = ExprId::from_index(0);
+            assert!(root.is_some());
+            if let Some(root) = root {
+                let only_zero = WireExpr::from_parts(
+                    vec![ExprNode::Sort {
+                        level: LevelId::ZERO,
+                    }],
+                    term.levels().to_vec(),
+                    root,
+                );
+                let raised = raise_external_bounds(&only_zero, 1, 0, TermBudget::unlimited());
+                assert!(
+                    matches!(&raised, TermOutcome::Complete(out) if out.levels().len() == 1),
+                    "{raised:?}"
+                );
+            }
+        }
+    }
 }
