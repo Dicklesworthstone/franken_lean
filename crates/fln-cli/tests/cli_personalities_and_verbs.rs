@@ -153,6 +153,49 @@ fn unimplemented_verbs_exit_five_with_a_typed_notice() {
 }
 
 #[test]
+fn check_olean_continue_refuses_receipts_a_single_file_and_repeats() {
+    let manifest = fln_core::checked_manifest_dir!().join("Cargo.toml");
+    let crate_dir = fln_core::checked_manifest_dir!();
+    let run = |args: &[&std::ffi::OsStr]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .arg("check-olean")
+            .args(args)
+            .output()
+            .expect("run fln check-olean");
+        (
+            output.status.code(),
+            String::from_utf8(output.stderr).expect("utf8 stderr"),
+        )
+    };
+    let (code, stderr) = run(&[
+        "--continue".as_ref(),
+        "--receipts".as_ref(),
+        "receipts.jsonl".as_ref(),
+        crate_dir.as_os_str(),
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("writes no receipt set"), "{stderr}");
+
+    let (code, stderr) = run(&["--continue".as_ref(), manifest.as_os_str()]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--continue requires a closed module-set root"),
+        "{stderr}"
+    );
+
+    let (code, stderr) = run(&[
+        "--continue".as_ref(),
+        "--continue".as_ref(),
+        crate_dir.as_os_str(),
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--continue may be supplied at most once"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn doctor_refuses_unknown_arguments() {
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["doctor", "--all-systems-go"])

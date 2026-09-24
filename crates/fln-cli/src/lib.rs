@@ -92,7 +92,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--receipts PATH] [--max-bytes BYTES] PATH\n",
+    "  fln check-olean [--json] [--receipts PATH | --continue] [--max-bytes BYTES] PATH\n",
     "  fln check-source [--json] [--max-bytes BYTES] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -164,6 +164,11 @@ const USAGE: &str = concat!(
     "carry no clock values, so an identical set and byte content reproduce the\n",
     "file byte-for-byte. Receipts attest THIS run; they are not proof\n",
     "certificates and do not widen what the check itself establishes.\n",
+    "With --continue (a directory root only), modules are checked one by one in\n",
+    "the same order and each gets a verdict row: accepted, failed, inconclusive,\n",
+    "internal-fault, or blocked by a named import that has no accepted verdict.\n",
+    "A module is never checked against a failed import. It writes no receipts,\n",
+    "and exits 0 only when every module is accepted.\n",
     "`audit --tcb` inventories the trust surface of one import-free .olean or a\n",
     "closed directory set: every axiom declaration, plus unsafe and partial\n",
     "definitions. It decodes only; it does not kernel-check or interpret\n",
@@ -313,6 +318,7 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
         receipts: Option<PathBuf>,
+        continue_on_failure: bool,
     },
     SourceRun {
         paths: Vec<PathBuf>,
@@ -775,6 +781,7 @@ fn output_paths_alias(left: &Path, right: &Path) -> bool {
 
 fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut receipts = None;
+    let mut continue_on_failure = false;
     let mut filtered = Vec::new();
     let mut options = true;
     let mut arguments = arguments.into_iter();
@@ -782,6 +789,15 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         if options && argument == "--" {
             options = false;
             filtered.push(argument);
+            continue;
+        }
+        if options && argument == "--continue" {
+            if continue_on_failure {
+                return Err(UsageError(
+                    "--continue may be supplied at most once".to_owned(),
+                ));
+            }
+            continue_on_failure = true;
             continue;
         }
         let selected = if options && argument == "--receipts" {
@@ -824,6 +840,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         max_bytes,
         json,
         receipts,
+        continue_on_failure,
     })
 }
 
@@ -8114,6 +8131,180 @@ fn render_check_olean_set_success(
     MultiplexerOutput::success(stdout)
 }
 
+const CHECK_OLEAN_FRONTIER_SCHEMA: &str = "fln.check-olean-frontier/1";
+
+/// `fln check-olean --continue DIR`: one verdict row per module instead of an
+/// all-or-nothing answer. Exit 0 only when every module is accepted; 4 on any
+/// internal fault; 1 when any module failed or was blocked; 3 when the only
+/// non-acceptances are inconclusive.
+fn check_olean_module_frontier(
+    modules: Vec<NamedOleanBytes>,
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let worker = match std::thread::Builder::new()
+        .name("fln-check-olean-frontier".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let inputs: Vec<fln::OleanModuleInput<'_>> = modules
+                .iter()
+                .map(|module| fln::OleanModuleInput {
+                    name: &module.name,
+                    artifact: &module.bytes,
+                    server_artifact: module.server_bytes.as_deref(),
+                    private_artifact: module.private_bytes.as_deref(),
+                })
+                .collect();
+            let engine = fln::Engine::from_environment(fln::Environment::new());
+            match engine.check_olean_frontier(
+                &inputs,
+                &fln::KVMap::new(),
+                fln::OleanCheckLimits::new(
+                    max_bytes,
+                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                ),
+            ) {
+                Ok(frontier) => render_check_olean_frontier(&frontier, json),
+                Err(error) => {
+                    let (class, authority, exit_code) = check_olean_error_disposition(&error);
+                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                }
+            }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return check_olean_failure(
+                "internal-fault",
+                &format!("could not start bounded kernel worker: {error}"),
+                false,
+                json,
+                4,
+            );
+        }
+    };
+    match worker.join() {
+        Ok(output) => output,
+        Err(_) => check_olean_failure(
+            "internal-fault",
+            "bounded kernel worker panicked",
+            false,
+            json,
+            4,
+        ),
+    }
+}
+
+fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> MultiplexerOutput {
+    let (mut accepted, mut failed, mut inconclusive, mut faulted, mut blocked) = (0, 0, 0, 0, 0);
+    let mut declarations = 0_usize;
+    let mut rows = Vec::with_capacity(frontier.rows.len());
+    let mut lines = Vec::new();
+    for row in &frontier.rows {
+        let module = row.name.to_display_string();
+        let elapsed_ms = row.elapsed.as_millis();
+        let (verdict, count, detail, blocked_by) = match &row.verdict {
+            fln::OleanModuleVerdict::Accepted { declarations: n } => {
+                accepted += 1;
+                declarations += n;
+                ("accepted", *n, String::new(), String::new())
+            }
+            fln::OleanModuleVerdict::Failed(error) => {
+                failed += 1;
+                ("failed", 0, error.to_string(), String::new())
+            }
+            fln::OleanModuleVerdict::Inconclusive(reason) => {
+                inconclusive += 1;
+                ("inconclusive", 0, format!("{reason:?}"), String::new())
+            }
+            fln::OleanModuleVerdict::InternalFault(fault) => {
+                faulted += 1;
+                ("internal-fault", 0, format!("{fault:?}"), String::new())
+            }
+            fln::OleanModuleVerdict::Blocked { by } => {
+                blocked += 1;
+                ("blocked", 0, String::new(), by.to_display_string())
+            }
+        };
+        let detail = BoundedText::new(detail);
+        rows.push(format!(
+            concat!(
+                "{{\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":{},",
+                "\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{}}}"
+            ),
+            json_string(&module),
+            json_string(verdict),
+            count,
+            elapsed_ms,
+            json_string(detail.text()),
+            detail.truncated(),
+            if blocked_by.is_empty() {
+                "null".to_owned()
+            } else {
+                json_string(&blocked_by)
+            },
+        ));
+        lines.push(match verdict {
+            "accepted" => {
+                format!("  accepted      {module}: {count} declarations in {elapsed_ms} ms")
+            }
+            "blocked" => {
+                format!("  blocked       {module}: import {blocked_by} has no accepted verdict")
+            }
+            other => format!("  {other:<13} {module}: {}", detail.text()),
+        });
+    }
+    let total = frontier.rows.len();
+    let exit_code = if faulted > 0 {
+        4
+    } else if failed > 0 || blocked > 0 {
+        1
+    } else if inconclusive > 0 {
+        3
+    } else {
+        0
+    };
+    let summary = format!(
+        "council modules: {accepted}/{total} accepted, {declarations} declarations; {failed} failed, {inconclusive} inconclusive, {faulted} internal-fault, {blocked} blocked"
+    );
+    let output = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":{},\"authority\":true,\"modules\":{},",
+                "\"accepted\":{},\"failed\":{},\"inconclusive\":{},\"internalFault\":{},",
+                "\"blocked\":{},\"acceptedDeclarations\":{},\"rows\":[{}]}}\n"
+            ),
+            json_string(CHECK_OLEAN_FRONTIER_SCHEMA),
+            json_string(if exit_code == 0 {
+                "complete"
+            } else {
+                "frontier"
+            }),
+            total,
+            accepted,
+            failed,
+            inconclusive,
+            faulted,
+            blocked,
+            declarations,
+            rows.join(","),
+        )
+    } else {
+        format!(
+            "fln check-olean --continue: {summary}\n{}\n",
+            lines.join("\n")
+        )
+    };
+    if exit_code == 0 {
+        MultiplexerOutput::success(output)
+    } else {
+        MultiplexerOutput {
+            stdout: output,
+            stderr: String::new(),
+            exit_code,
+        }
+    }
+}
+
 fn check_olean_module_bytes(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
@@ -8211,7 +8402,17 @@ fn check_olean(
     max_bytes: usize,
     json: bool,
     receipts: Option<&Path>,
+    continue_on_failure: bool,
 ) -> MultiplexerOutput {
+    if continue_on_failure && receipts.is_some() {
+        return check_olean_failure(
+            "input",
+            "--continue reports a per-module frontier, which is not a complete checked set, so it writes no receipt set; drop --receipts",
+            false,
+            json,
+            1,
+        );
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -8261,7 +8462,22 @@ fn check_olean(
                 );
             }
         };
+        if continue_on_failure {
+            return check_olean_module_frontier(modules, max_bytes, json);
+        }
         return check_olean_module_bytes(modules, max_bytes, json, receipts.map(Path::to_path_buf));
+    }
+    if continue_on_failure {
+        return check_olean_failure(
+            "input",
+            &format!(
+                "--continue requires a closed module-set root (a directory); {} is a single artifact",
+                path.display()
+            ),
+            false,
+            json,
+            1,
+        );
     }
     if !metadata.is_file() {
         return check_olean_failure(
@@ -11964,7 +12180,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
             receipts,
-        }) => check_olean(&path, max_bytes, json, receipts.as_deref()),
+            continue_on_failure,
+        }) => check_olean(
+            &path,
+            max_bytes,
+            json,
+            receipts.as_deref(),
+            continue_on_failure,
+        ),
         Ok(MultiplexerCommand::Identity { json }) => render_identity(json),
         Ok(MultiplexerCommand::AuditTcb {
             path,

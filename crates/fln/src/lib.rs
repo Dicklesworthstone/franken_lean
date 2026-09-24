@@ -863,6 +863,40 @@ pub struct CheckedOleanModule {
     pub declarations: Vec<OleanCheckedDeclaration>,
 }
 
+/// One module's outcome in an [`Engine::check_olean_frontier`] run.
+#[derive(Debug)]
+pub enum OleanModuleVerdict {
+    /// Every declaration was admitted by K1 and the independent checker.
+    Accepted { declarations: usize },
+    /// The module was refused: its artifact, its import set, or one of its
+    /// declarations.
+    Failed(OleanCheckError),
+    /// No verdict was reached (FL-INV-07). Counted neither as accepted nor rejected.
+    Inconclusive(Inconclusive),
+    /// An invariant failure while checking the module.
+    InternalFault(InternalFault),
+    /// Not checked, because the named import has no accepted verdict. A module is
+    /// never checked against an import that was not itself admitted.
+    Blocked { by: Name },
+}
+
+/// One row of a frontier run. `elapsed` is operational wall time, never part of any
+/// logical identity.
+#[derive(Debug)]
+pub struct OleanFrontierRow {
+    pub name: Name,
+    pub verdict: OleanModuleVerdict,
+    pub elapsed: std::time::Duration,
+}
+
+/// Per-module result of checking a closed `.olean` set without stopping at the first
+/// failure. `engine` holds exactly the accepted modules.
+#[derive(Debug)]
+pub struct OleanFrontier {
+    pub engine: Engine,
+    pub rows: Vec<OleanFrontierRow>,
+}
+
 /// Atomic result of checking a closed set of named `.olean` modules.
 #[derive(Debug)]
 pub struct CheckedOleanSet {
@@ -1584,6 +1618,89 @@ fn olean_dependencies(
         | ConstantInfo::Rec(_) => {}
     }
     Ok(names)
+}
+
+/// Whole-set bounds for a closed `.olean` module set: non-empty, within the module and
+/// byte limits, and no module named twice. Returns each module's input index by name.
+fn olean_module_owners(
+    modules: &[OleanModuleInput<'_>],
+    limits: OleanCheckLimits,
+) -> Result<BTreeMap<Name, usize>, OleanCheckError> {
+    if modules.is_empty() {
+        return Err(OleanCheckError::EmptyModuleSet);
+    }
+    if modules.len() > limits.max_modules {
+        return Err(OleanCheckError::ModuleLimit {
+            observed: modules.len(),
+            limit: limits.max_modules,
+        });
+    }
+    let mut total_bytes = 0_usize;
+    let mut owners = BTreeMap::new();
+    for (index, module) in modules.iter().enumerate() {
+        for artifact in [
+            Some(module.artifact),
+            module.server_artifact,
+            module.private_artifact,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            total_bytes = total_bytes.checked_add(artifact.len()).ok_or(
+                OleanCheckError::TotalBytesLimit {
+                    observed: usize::MAX,
+                    limit: limits.max_total_bytes,
+                },
+            )?;
+        }
+        if total_bytes > limits.max_total_bytes {
+            return Err(OleanCheckError::TotalBytesLimit {
+                observed: total_bytes,
+                limit: limits.max_total_bytes,
+            });
+        }
+        if owners.insert(module.name.clone(), index).is_some() {
+            return Err(OleanCheckError::DuplicateModule {
+                module: module.name.clone(),
+            });
+        }
+    }
+    Ok(owners)
+}
+
+/// Decode one module of a closed set, requiring the server and private parts exactly
+/// when the artifact is a module-system `.olean`.
+fn decode_olean_module_input(
+    module: &OleanModuleInput<'_>,
+    limits: OleanCheckLimits,
+) -> Result<DecodedOlean, OleanCheckError> {
+    match (module.server_artifact, module.private_artifact) {
+        (Some(server), Some(private)) => {
+            decode_olean_module_artifacts(module.artifact, server, private, limits.decode)
+        }
+        (server, private) => {
+            let decoded = decode_olean_artifact(module.artifact, limits.decode);
+            match decoded {
+                Ok(decoded) if decoded.module.is_module => {
+                    return Err(OleanCheckError::MissingCompanionParts {
+                        module: Some(module.name.clone()),
+                        missing_server: server.is_none(),
+                        missing_private: private.is_none(),
+                    });
+                }
+                Ok(_) if server.is_some() || private.is_some() => {
+                    return Err(OleanCheckError::Decode(
+                        OleanDecodeError::UnexpectedCompanionParts,
+                    ));
+                }
+                other => other,
+            }
+        }
+    }
+    .map_err(|error| OleanCheckError::ModuleDecode {
+        module: module.name.clone(),
+        error,
+    })
 }
 
 fn plan_olean_declarations(
@@ -2678,6 +2795,144 @@ impl Engine {
         }))
     }
 
+    /// Check a closed set of named `.olean` modules module by module, reporting a
+    /// verdict for every one instead of stopping at the first failure.
+    ///
+    /// Modules are visited in the same deterministic import-topological order as
+    /// [`Engine::check_olean_modules`]. A module whose artifact does not decode, whose
+    /// imports are not all in the set, or which sits on an import cycle is `Failed`;
+    /// a module any of whose imports lacks an accepted verdict is `Blocked` and is
+    /// never checked. Only whole-set problems (an empty set, the module or byte limit,
+    /// a module named twice) are returned as an error.
+    pub fn check_olean_frontier(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<OleanFrontier, OleanCheckError> {
+        let owners = olean_module_owners(modules, limits)?;
+        let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> = modules
+            .iter()
+            .map(|module| Some(decode_olean_module_input(module, limits)))
+            .collect();
+
+        let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); modules.len()];
+        for (index, entry) in decoded.iter_mut().enumerate() {
+            let Some(Ok(artifact)) = entry.as_ref() else {
+                continue;
+            };
+            let mut missing = BTreeSet::new();
+            for import in &artifact.module.imports {
+                match owners.get(&import.module).copied() {
+                    Some(owner) if owner != index => {
+                        dependencies[index].insert(owner);
+                    }
+                    Some(_) => {
+                        dependencies[index].insert(index);
+                    }
+                    None => {
+                        missing.insert(import.module.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                dependencies[index].clear();
+                *entry = Some(Err(OleanCheckError::MissingModuleImports {
+                    module: modules[index].name.clone(),
+                    imports: missing.into_iter().collect(),
+                }));
+            }
+        }
+
+        let mut remaining: Vec<usize> = dependencies.iter().map(BTreeSet::len).collect();
+        let mut dependents = vec![Vec::new(); modules.len()];
+        for (index, deps) in dependencies.iter().enumerate() {
+            for dependency in deps {
+                dependents[*dependency].push(index);
+            }
+        }
+        let mut ready: BTreeSet<Name> = modules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| remaining[*index] == 0)
+            .map(|(_, module)| module.name.clone())
+            .collect();
+        let mut order = Vec::with_capacity(modules.len());
+        while let Some(name) = ready.pop_first() {
+            let index = owners[&name];
+            order.push(index);
+            for dependent in &dependents[index] {
+                remaining[*dependent] -= 1;
+                if remaining[*dependent] == 0 {
+                    ready.insert(modules[*dependent].name.clone());
+                }
+            }
+        }
+        let cycle: Vec<Name> = modules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| remaining[*index] != 0)
+            .map(|(_, module)| module.name.clone())
+            .collect();
+        for (index, left) in remaining.iter().enumerate() {
+            if *left != 0 {
+                decoded[index] = Some(Err(OleanCheckError::ModuleImportCycle {
+                    modules: cycle.clone(),
+                }));
+                order.push(index);
+            }
+        }
+
+        let mut engine = self.clone();
+        let mut accepted = vec![false; modules.len()];
+        let mut rows = Vec::with_capacity(modules.len());
+        for index in order {
+            let started = std::time::Instant::now();
+            let name = modules[index].name.clone();
+            let verdict = match decoded[index].take() {
+                None => OleanModuleVerdict::Failed(OleanCheckError::InternalInvariant {
+                    detail: "frontier module was visited twice",
+                }),
+                Some(Err(error)) => OleanModuleVerdict::Failed(error),
+                Some(Ok(artifact)) => {
+                    let blocker = dependencies[index]
+                        .iter()
+                        .find(|dependency| !accepted[**dependency]);
+                    if let Some(blocker) = blocker {
+                        OleanModuleVerdict::Blocked {
+                            by: modules[*blocker].name.clone(),
+                        }
+                    } else {
+                        match engine.check_decoded_olean(artifact, options, limits) {
+                            Ok(Outcome::Complete(checked)) => {
+                                let declarations = checked.declarations.len();
+                                engine = checked.engine;
+                                let mut imported = (*engine.imported_modules).clone();
+                                imported.insert(name.clone());
+                                engine.imported_modules = std::sync::Arc::new(imported);
+                                accepted[index] = true;
+                                OleanModuleVerdict::Accepted { declarations }
+                            }
+                            Ok(Outcome::Inconclusive(reason)) => {
+                                OleanModuleVerdict::Inconclusive(reason)
+                            }
+                            Ok(Outcome::InternalFault(fault)) => {
+                                OleanModuleVerdict::InternalFault(fault)
+                            }
+                            Err(error) => OleanModuleVerdict::Failed(error),
+                        }
+                    }
+                }
+            };
+            rows.push(OleanFrontierRow {
+                name,
+                verdict,
+                elapsed: started.elapsed(),
+            });
+        }
+        Ok(OleanFrontier { engine, rows })
+    }
+
     /// Decode a closed set of named `.olean` modules and return them in the
     /// deterministic import-topological order both import trust levels use.
     ///
@@ -2689,45 +2944,7 @@ impl Engine {
         modules: &[OleanModuleInput<'_>],
         limits: OleanCheckLimits,
     ) -> Result<Vec<(Name, DecodedOlean)>, OleanCheckError> {
-        if modules.is_empty() {
-            return Err(OleanCheckError::EmptyModuleSet);
-        }
-        if modules.len() > limits.max_modules {
-            return Err(OleanCheckError::ModuleLimit {
-                observed: modules.len(),
-                limit: limits.max_modules,
-            });
-        }
-        let mut total_bytes = 0_usize;
-        let mut owners = BTreeMap::new();
-        for (index, module) in modules.iter().enumerate() {
-            for artifact in [
-                Some(module.artifact),
-                module.server_artifact,
-                module.private_artifact,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                total_bytes = total_bytes.checked_add(artifact.len()).ok_or(
-                    OleanCheckError::TotalBytesLimit {
-                        observed: usize::MAX,
-                        limit: limits.max_total_bytes,
-                    },
-                )?;
-            }
-            if total_bytes > limits.max_total_bytes {
-                return Err(OleanCheckError::TotalBytesLimit {
-                    observed: total_bytes,
-                    limit: limits.max_total_bytes,
-                });
-            }
-            if owners.insert(module.name.clone(), index).is_some() {
-                return Err(OleanCheckError::DuplicateModule {
-                    module: module.name.clone(),
-                });
-            }
-        }
+        let owners = olean_module_owners(modules, limits)?;
 
         let mut decoded = Vec::new();
         decoded.try_reserve_exact(modules.len()).map_err(|_| {
@@ -2737,33 +2954,7 @@ impl Engine {
             }
         })?;
         for module in modules {
-            let artifact = match (module.server_artifact, module.private_artifact) {
-                (Some(server), Some(private)) => {
-                    decode_olean_module_artifacts(module.artifact, server, private, limits.decode)
-                }
-                (server, private) => {
-                    let decoded = decode_olean_artifact(module.artifact, limits.decode);
-                    match decoded {
-                        Ok(decoded) if decoded.module.is_module => {
-                            return Err(OleanCheckError::MissingCompanionParts {
-                                module: Some(module.name.clone()),
-                                missing_server: server.is_none(),
-                                missing_private: private.is_none(),
-                            });
-                        }
-                        Ok(_) if server.is_some() || private.is_some() => {
-                            return Err(OleanCheckError::Decode(
-                                OleanDecodeError::UnexpectedCompanionParts,
-                            ));
-                        }
-                        other => other,
-                    }
-                }
-            }
-            .map_err(|error| OleanCheckError::ModuleDecode {
-                module: module.name.clone(),
-                error,
-            })?;
+            let artifact = decode_olean_module_input(module, limits)?;
             decoded.push(Some((module.name.clone(), artifact)));
         }
 
