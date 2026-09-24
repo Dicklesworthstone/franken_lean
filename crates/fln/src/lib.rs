@@ -6668,8 +6668,14 @@ impl Default for CheckerExecutionLimits {
         let inference =
             fln_checker::infer::InferenceBudget::new(100_000_000, 100_000_000, term, term)
                 .with_whnf(whnf);
+        // Every unit the decoder produces reads at least one input byte right
+        // after it is charged, so the byte bound already bounds the units. A
+        // unit bound below it would refuse inputs the byte bound admits: at
+        // 1_000_000 it stopped five whole-Init frontier modules on proofs well
+        // under 16 MiB.
+        let decode_bytes = 16 * 1024 * 1024;
         Self {
-            decode: CheckerDecodeBudget::new(16 * 1024 * 1024, 1_000_000),
+            decode: CheckerDecodeBudget::new(decode_bytes, decode_bytes),
             environment: CheckerEnvironmentBudget::new(
                 20_000_000,
                 100_000,
@@ -10236,6 +10242,40 @@ mod tests {
             super::plan_olean_declarations(engine.environment(), &[other], olean_limits),
             Err(OleanCheckError::DuplicateDeclaration { .. })
         ));
+    }
+
+    #[test]
+    fn the_default_checker_decode_budget_binds_on_bytes_not_units() {
+        use fln_hash::canon::Canonical;
+        let default = super::CheckerExecutionLimits::default().decode;
+        assert!(
+            default.max_produced_units >= default.max_input_bytes,
+            "each produced unit reads at least one byte, so a unit bound below \
+             the byte bound refuses inputs the byte bound admits"
+        );
+        // A balanced application tree of depth 19 over `Sort 0`, shared in
+        // memory: its tree encoding is a fixed header plus 3 * 2^19 - 1 node
+        // bytes, and it produces exactly as many units (an `App` tag, a `Sort`
+        // tag and a `Zero` level tag are one byte and one unit each), past the
+        // old 1_000_000-unit bound and far under the byte bound.
+        let leaf = Expr::sort(Level::zero());
+        let header = leaf.to_canonical_bytes().len() as u64 - 2;
+        let mut tree = leaf;
+        for _ in 0..19 {
+            tree = Expr::app(tree.clone(), tree);
+        }
+        let bytes = tree.to_canonical_bytes().len() as u64;
+        assert_eq!(bytes, header + 3 * (1 << 19) - 1);
+        assert!(bytes > 1_000_000 && bytes < default.max_input_bytes);
+        super::decode_checker_expr(&tree, default)
+            .expect("an expression within the byte bound decodes under the default budget");
+        // The control: the old unit bound refuses this same input on units.
+        let refusal = super::decode_checker_expr(
+            &tree,
+            super::CheckerDecodeBudget::new(default.max_input_bytes, 1_000_000),
+        )
+        .expect_err("the old unit bound stops before the tree is decoded");
+        assert!(refusal.contains("ProducedUnits"), "{refusal}");
     }
 
     #[test]
