@@ -8,11 +8,11 @@ permissions:
   contents: write
 concurrency:
   group: native-term-store
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   implement-and-validate:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_TERM_COLOR: never
@@ -28,14 +28,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/term-store"
           git rev-parse HEAD > "$RUNNER_TEMP/term-store/base.txt"
           gh api repos/Dicklesworthstone/franken_lean/git/blobs/95b5814b23a7d5eaf68f4405040c35cb72846f89 > "$RUNNER_TEMP/term-store/payload.json"
+          gh api repos/Dicklesworthstone/franken_lean/git/blobs/229d0bcc32f8791856b3a3b29e9687dbaa7b0678 > "$RUNNER_TEMP/term-store/followup.json"
           python3 -I - <<'PY'
           import base64, gzip, hashlib, json, os
           from pathlib import Path
           out = Path(os.environ['RUNNER_TEMP'])/'term-store'
-          response = json.loads((out/'payload.json').read_text())
-          raw = base64.b64decode(response['content'])
-          assert hashlib.sha256(raw).hexdigest() == '286a2f6d7ed68f09b3e6e6321d501e6c5dee6f12a2611ac53184a50f13a05e21'
-          payload = json.loads(gzip.decompress(raw))
+          def load(name, digest):
+              response = json.loads((out/name).read_text())
+              raw = base64.b64decode(response['content'])
+              assert hashlib.sha256(raw).hexdigest() == digest
+              return json.loads(gzip.decompress(raw))
+          payload = load('payload.json', '286a2f6d7ed68f09b3e6e6321d501e6c5dee6f12a2611ac53184a50f13a05e21')
+          followup = load('followup.json', '3e6fa61f853e6244739a051558409265776b639b00de6df00656518f70b6f39b')
           assert set(payload['files']) == {
               'crates/fln-core/src/term_store.rs',
               'crates/fln-core/tests/term_store.rs',
@@ -45,7 +49,8 @@ jobs:
               p = Path(path)
               assert not p.exists(), f'refuse overwrite of {path}'
               p.write_text(content)
-          exec(compile(payload['apply'], '<reviewed-term-store-integration>', 'exec'))
+          exec(compile(payload['apply'], '<reviewed-term-store-integration>', 'exec'), {})
+          exec(compile(followup['mixed'], '<reviewed-mixed-graph-sharing>', 'exec'), {})
           PY
       - name: Install pinned toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
@@ -72,7 +77,7 @@ jobs:
           set -euo pipefail
           cargo clippy --locked -p fln-core -p fln-olean --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/term-store/clippy.log"
           cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/term-store/workspace-check.log"
-      - name: Publish tested source directly to main
+      - name: Publish tested core and decoder source directly to main
         run: |
           set -euo pipefail
           base=$(cat "$RUNNER_TEMP/term-store/base.txt")
@@ -82,9 +87,42 @@ jobs:
           git config user.name 'FrankenLean automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add crates/fln-core/src/lib.rs crates/fln-core/src/name.rs crates/fln-core/src/level.rs crates/fln-core/src/term_store.rs crates/fln-core/tests/term_store.rs crates/fln-olean/src/decl.rs crates/fln-olean/tests/term_interning.rs
-          git commit -m 'feat(core): intern native names, levels and expressions during olean decoding (franken_lean-z8j.1.13)' -m 'Explicitly owned exact hash-consing with iterative postorder traversal, full payload keys, node/key-payload/work limits and sharing statistics. All decoded offsets still pass their original shape, data-word and budget checks before deduplication. Tested on the pinned nightly: core and codec packages, selected kernel authority/resource regressions, strict core/codec clippy and all-target workspace compilation. This is per-decoder structural interning, not process-wide term identity, full G1 convergence or a measured performance claim.'
+          git commit -m 'feat(core): intern native names, levels and expressions during olean decoding (franken_lean-z8j.1.13)' -m 'Explicitly owned exact hash-consing with iterative postorder traversal, call-wide mixed-DAG memoization, full payload keys, node/key-payload/work limits and sharing statistics. All decoded offsets still pass their original shape, data-word and budget checks before deduplication. Tested on the pinned nightly: core and codec packages, selected kernel authority/resource regressions, strict core/codec clippy and all-target workspace compilation. This is per-decoder structural interning, not process-wide term identity, full G1 convergence or a measured performance claim.'
           git push origin HEAD:main
           git rev-parse HEAD > "$RUNNER_TEMP/term-store/published.txt"
+      - name: Apply reviewed kernel substitution sharing
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os
+          from pathlib import Path
+          out = Path(os.environ['RUNNER_TEMP'])/'term-store'
+          response = json.loads((out/'followup.json').read_text())
+          raw = base64.b64decode(response['content'])
+          assert hashlib.sha256(raw).hexdigest() == '3e6fa61f853e6244739a051558409265776b639b00de6df00656518f70b6f39b'
+          followup = json.loads(gzip.decompress(raw))
+          exec(compile(followup['kernel_apply'], '<reviewed-kernel-substitution-sharing>', 'exec'), {'KERNEL_TESTS': followup['kernel_tests']})
+          PY
+          rustfmt --edition 2024 crates/fln-kernel/src/tc.rs
+          git diff --check
+      - name: Validate kernel substitution sharing and authority boundaries
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-kernel --lib --test k1_judgments --test large_elimination_imax --test admission_laundering --test definition_body_stripping --test budget_parity --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/term-store/kernel-sharing-tests.log"
+          cargo clippy --locked -p fln-kernel --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/term-store/kernel-sharing-clippy.log"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/term-store/kernel-sharing-workspace.log"
+          rustfmt --edition 2024 --check crates/fln-kernel/src/tc.rs
+      - name: Publish tested kernel integration directly to main
+        run: |
+          set -euo pipefail
+          base=$(cat "$RUNNER_TEMP/term-store/published.txt")
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$base" || { echo 'main advanced; refusing untested kernel integration' >&2; exit 1; }
+          git diff --check
+          git add crates/fln-kernel/src/tc.rs
+          git commit -m 'feat(kernel): share terms produced by beta and universe substitution (franken_lean-z8j.1.13)' -m 'Use the exact term store for completed single, batched and universe-substitution results. Keep all scope/safety cache validation and fuel checkpoints. A bounded sharing refusal disables this optional accelerator and retains the already-computed result; it never becomes a theorem verdict. Regressions prove cross-source/cross-context sharing, stale-local reduction refusal, honest real fuel exhaustion and bounded fallback. Pinned-nightly selected kernel suites, strict library clippy and all-target workspace compilation passed. No whole-Corpus performance or total kernel interning claim.'
+          git push origin HEAD:main
+          git rev-parse HEAD > "$RUNNER_TEMP/term-store/kernel-published.txt"
       - name: Retain exact validation evidence
         if: always()
         run: |
