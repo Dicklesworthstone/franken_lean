@@ -1,0 +1,105 @@
+name: Native multistage callbacks
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-multistage-callbacks.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate-and-export:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 814640fd3abd2465094680f05ac9396d37103aa7
+          persist-credentials: false
+      - name: Restore checksum-bound callback implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          chunks = ['2a088957e4f7db5192df697d0c5879d02ce8fd06','ac5dba8ce4c67ccf2e7bf902b4ab38a7d4b0ad6a','16c5c0691c8ce582507470a0b2bd15ca57f85e66','1f7d495a696207f80735792f88a20ca385d858ac','03bfa90f8632d31851f973490906d4e87a9426fe']
+          payload = bytearray()
+          for sha in chunks:
+              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
+              data = base64.b64decode(response['content'])
+              assert blob(data) == sha
+              payload.extend(data)
+          assert len(payload) == 10473
+          assert hashlib.sha256(payload).hexdigest() == '1228fae6632bb06549a695dada70b85b8be3c9b034b9d36028d13d2d06db283b'
+          manifest = json.loads(gzip.decompress(payload))
+          assert git('rev-parse','HEAD') == manifest['base'] == '814640fd3abd2465094680f05ac9396d37103aa7'
+          assert git('write-tree') == manifest['base_tree'] == '6f34dd0678a42e8fb9147e3b2b7098b0b75c6de2'
+          allowed = {'.github/workflows/native-multistage-callbacks.yml','crates/fln-cli/tests/source_multistage_callbacks.rs','crates/fln/src/runtime.rs','crates/fln/src/runtime/callables.rs','crates/fln/src/runtime/callables/stages.rs','crates/fln/src/runtime/callables/stages/tests.rs','crates/fln/src/runtime/specialize.rs','crates/fln/tests/runtime_staged_closures.rs','docs/NATIVE_EMPTY_ELIMINATION.md','docs/NATIVE_MULTISTAGE_CALLBACKS.md','examples/native_multistage_callbacks.lean'}
+          assert len(manifest['entries']) == len(allowed)
+          assert {e['path'] for e in manifest['entries']} == allowed
+          for e in manifest['entries']:
+              path = root/e['path']
+              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
+              if e['before'] is None:
+                  assert not path.exists() and not git('ls-files','--',e['path'])
+              else:
+                  assert blob(path.read_bytes()) == e['before'], e['path']
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'multistage-validation'
+          out.mkdir()
+          patch = out/'change.patch'
+          patch.write_text(manifest['patch'])
+          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
+          subprocess.run(['git','apply','--index',str(patch)],check=True)
+          assert git('write-tree') == manifest['tree'] == 'd6e0a2615cacf3b52c1257b58e761961409c0b62'
+          for e in manifest['entries']:
+              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
+          (out/'manifest.json').write_text(json.dumps(manifest))
+          print('VALIDATION_TREE',git('write-tree'))
+          PY
+      - name: Validate staging, strictness, ownership and independent replay
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          tests=(); for f in crates/fln/tests/runtime_*.rs; do tests+=(--test "$(basename "$f" .rs)"); done
+          cargo test --locked -p fln --lib "${tests[@]}" --test source_module_check --test source_module_session --test engine_builder_facade 2>&1 | tee "$RUNNER_TEMP/multistage-validation/engine.log"
+          cargo test --locked -p fln-cli --test source_multistage_callbacks --test source_empty_runtime --test source_mutual_function_children --test source_mutual_indexed --test source_indexed_runtime --test source_proof_runtime 2>&1 | tee "$RUNNER_TEMP/multistage-validation/cli.log"
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/multistage-validation/clippy.log"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/multistage-validation/check.log"
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/callables/stages.rs crates/fln/src/runtime/callables/stages/tests.rs crates/fln/src/runtime/specialize.rs crates/fln/tests/runtime_staged_closures.rs crates/fln-cli/tests/source_multistage_callbacks.rs
+          git diff --check --cached
+      - name: Export checked source objects without moving refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'multistage-validation'
+          manifest = json.loads((out/'manifest.json').read_text())
+          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
+          for e in manifest['entries']:
+              data = pathlib.Path(e['path']).read_bytes()
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['after']
+              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
+              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
+              assert response['sha'] == e['after']
+              print('EXPORTED',e['path'],e['after'],flush=True)
+          PY
+      - name: Retain exact validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multistage-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/multistage-validation
+          retention-days: 14
