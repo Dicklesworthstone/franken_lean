@@ -8,10 +8,10 @@
 # builds and passes.
 #
 # Anti-vacuity: a green that ran fewer tests than were measured is refused, so
-# the gate cannot be "fixed" by skipping tests. FLOOR is the passed count of a
-# CI-faithful local run (fresh clone, no census shards) at f644e6ef: 7526 passed
-# across 524 test binaries. Raise it when the measured count rises; lowering it
-# needs the reason in the commit that does it.
+# the gate cannot be "fixed" by skipping tests. FLOOR is the passed count of the
+# first green run of this gate (36070617986, at 1731a004): 7765 passed across 524
+# test binaries. Raise it when the measured count rises; lowering it needs the
+# reason in the commit that does it.
 #
 # What this does NOT run: the pinned Reference toolchain is not installed here,
 # so pin-dependent suites take their typed SKIP (contract-drift.yml is the
@@ -46,7 +46,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      FLOOR: '7526'
+      FLOOR: '7765'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
