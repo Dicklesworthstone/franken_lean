@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   implement-and-validate:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
@@ -51,6 +51,12 @@ jobs:
               p.write_text(content)
           exec(compile(payload['apply'], '<reviewed-term-store-integration>', 'exec'), {})
           exec(compile(followup['mixed'], '<reviewed-mixed-graph-sharing>', 'exec'), {})
+          for path in ('crates/fln-core/tests/term_store.rs', 'crates/fln-olean/tests/term_interning.rs'):
+              p = Path(path)
+              text = p.read_text()
+              assert '#![forbid(unsafe_code)]' not in text
+              at = text.index('\n') + 1
+              p.write_text(text[:at] + '\n#![forbid(unsafe_code)]\n\n' + text[at:])
           PY
       - name: Install pinned toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
