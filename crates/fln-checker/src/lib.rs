@@ -89,8 +89,8 @@
 //! `gii` requires this crate to bring "its OWN decoder over Grimoire canonical
 //! wire objects". The graph enforces that by prohibiting `fln-olean` — but
 //! `fln-hash` is *permitted*, and `fln-hash::canon` carries
-//! `impl Canonical for Expr` (`canon.rs:1160`) whose trait supplies
-//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:658-679`). A
+//! `impl Canonical for Expr` (`canon.rs:1210`) whose trait supplies
+//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:699-728`). A
 //! checker can therefore read canonical bytes, call `Expr::from_canonical_bytes`,
 //! and share the decode path with the rest of the workspace **while satisfying
 //! every prohibition structure-guard currently enforces**. The "own decoder"
@@ -321,8 +321,8 @@
 //! cite crates/fln-kernel/src/tc.rs:1893 :: e.loose_bvar_range() <= k
 //! cite crates/fln-kernel/src/tc.rs:5304 :: !e.has_fvar() || active == 0
 //! cite crates/fln-kernel/src/tc.rs:5499 :: if !e.has_fvar() {
-//! cite crates/fln-hash/src/canon.rs:1160 :: impl Canonical for Expr
-//! cite crates/fln-hash/src/canon.rs:658 :: pub trait Canonical: Sized
+//! cite crates/fln-hash/src/canon.rs:1210 :: impl Canonical for Expr
+//! cite crates/fln-hash/src/canon.rs:699 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:544 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1116 :: code: "FLN-STRUCT-037"

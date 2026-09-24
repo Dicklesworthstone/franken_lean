@@ -5133,7 +5133,16 @@ fn decode_checker_expr(
     expression: &Expr,
     budget: CheckerDecodeBudget,
 ) -> Result<CheckerExpr, String> {
-    match checker_decode_expr(&expression.to_canonical_bytes(), budget) {
+    // The checker would refuse anything past its input budget, so never build
+    // more encoding than it can read: canonical bytes do not preserve sharing,
+    // and one Init theorem's tree encoding is 727 MB.
+    let limit = usize::try_from(budget.max_input_bytes).unwrap_or(usize::MAX);
+    let Some(bytes) = expression.to_canonical_bytes_within(limit) else {
+        return Err(format!(
+            "canonical expression encoding exceeds the checker's {limit}-byte decode budget"
+        ));
+    };
+    match checker_decode_expr(&bytes, budget) {
         CheckerDecodeOutcome::Complete(Ok(expression)) => Ok(expression),
         CheckerDecodeOutcome::Complete(Err(malformed)) => {
             Err(format!("canonical expression decode failed: {malformed:?}"))

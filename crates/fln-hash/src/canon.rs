@@ -314,9 +314,28 @@ impl std::fmt::Display for CanonError {
 }
 
 /// Canonical byte writer.
-#[derive(Debug, Default)]
+///
+/// An unbounded writer (`new`/`default`) stores every byte. A bounded writer
+/// (`with_limit`) stops storing once the next write would pass its limit and
+/// records that it overflowed, so a caller that will refuse anything larger
+/// learns "too large" without first materialising the whole encoding: a term
+/// whose tree encoding is hundreds of megabytes costs at most `limit` bytes.
+/// The bytes written below the limit are identical to the unbounded encoding.
+#[derive(Debug)]
 pub struct CanonWriter {
     buf: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl Default for CanonWriter {
+    fn default() -> CanonWriter {
+        CanonWriter {
+            buf: Vec::new(),
+            limit: usize::MAX,
+            overflowed: false,
+        }
+    }
 }
 
 impl CanonWriter {
@@ -324,38 +343,60 @@ impl CanonWriter {
         CanonWriter::default()
     }
 
+    /// A writer that stores at most `limit` bytes; see [`CanonWriter::overflowed`].
+    pub fn with_limit(limit: usize) -> CanonWriter {
+        CanonWriter {
+            limit,
+            ..CanonWriter::default()
+        }
+    }
+
+    /// Whether a write was refused because it would have passed the limit. Once
+    /// set, the stored bytes are a truncated prefix and must not be used.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
 
+    fn put(&mut self, v: &[u8]) {
+        if self.overflowed || v.len() > self.limit - self.buf.len() {
+            self.overflowed = true;
+            return;
+        }
+        self.buf.extend_from_slice(v);
+    }
+
     pub fn u8(&mut self, v: u8) {
-        self.buf.push(v);
+        self.put(&[v]);
     }
 
     pub fn u16(&mut self, v: u16) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     pub fn u32(&mut self, v: u32) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     pub fn u64(&mut self, v: u64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     pub fn i64(&mut self, v: i64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     pub fn bool(&mut self, v: bool) {
-        self.buf.push(u8::from(v));
+        self.put(&[u8::from(v)]);
     }
 
     /// Length-prefixed bytes (u64 LE length).
     pub fn bytes(&mut self, v: &[u8]) {
         self.u64(v.len() as u64);
-        self.buf.extend_from_slice(v);
+        self.put(v);
     }
 
     pub fn str(&mut self, v: &str) {
@@ -667,6 +708,15 @@ pub trait Canonical: Sized {
         w.schema(Self::SCHEMA);
         self.write_body(&mut w);
         w.into_bytes()
+    }
+
+    /// [`Canonical::to_canonical_bytes`] when the encoding fits in `limit` bytes,
+    /// and `None` otherwise, without ever holding more than `limit` bytes.
+    fn to_canonical_bytes_within(&self, limit: usize) -> Option<Vec<u8>> {
+        let mut w = CanonWriter::with_limit(limit);
+        w.schema(Self::SCHEMA);
+        self.write_body(&mut w);
+        (!w.overflowed()).then(|| w.into_bytes())
     }
 
     /// Total inverse of [`Canonical::to_canonical_bytes`].
@@ -1169,6 +1219,11 @@ impl Canonical for Expr {
 
         let mut pending = vec![WriteTask::Expr(self)];
         while let Some(task) = pending.pop() {
+            // A bounded writer that has overflowed stores nothing more; stop
+            // walking so an oversized term costs time bounded by the limit too.
+            if w.overflowed() {
+                return;
+            }
             let WriteTask::Expr(expr) = task else {
                 match task {
                     WriteTask::BinderInfo(info) => w.u8(binder_info_tag(info)),
@@ -3850,5 +3905,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A bounded encoding is the unbounded one whenever it fits, byte for byte,
+    /// and refuses one byte short of that. The limit is exact, not approximate.
+    #[test]
+    fn bounded_encoding_is_exact_at_its_limit() {
+        let mut generator = Gen(0xb0d0_0001);
+        for _ in 0..200 {
+            let expr = generator.expr(4);
+            let full = expr.to_canonical_bytes();
+            assert_eq!(
+                expr.to_canonical_bytes_within(full.len()),
+                Some(full.clone())
+            );
+            assert_eq!(
+                expr.to_canonical_bytes_within(usize::MAX),
+                Some(full.clone())
+            );
+            assert_eq!(expr.to_canonical_bytes_within(full.len() - 1), None);
+            assert_eq!(expr.to_canonical_bytes_within(0), None);
+        }
+    }
+
+    /// Canonical bytes do not preserve sharing, so a term built by doubling has
+    /// a tree encoding exponential in its heap size. A bounded encoding of one
+    /// with 2^60 tree nodes must answer `None` promptly: the walk stops once the
+    /// writer overflows. Without that stop this test does not finish.
+    #[test]
+    fn bounded_encoding_of_an_exponentially_shared_term_stops_at_its_limit() {
+        let mut term = Expr::const_(Name::str(Name::anonymous(), "leaf"), Vec::new());
+        for _ in 0..60 {
+            term = Expr::app(term.clone(), term);
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(term.to_canonical_bytes_within(1 << 20), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a bounded encoding kept walking after it overflowed: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An overflowed writer is sticky and stores nothing more, including a write
+    /// that would itself fit into the remaining room.
+    #[test]
+    fn an_overflowed_writer_stores_nothing_further() {
+        let mut w = CanonWriter::with_limit(3);
+        w.u16(7);
+        assert!(!w.overflowed());
+        w.u16(9);
+        assert!(w.overflowed());
+        w.u8(1);
+        assert!(w.overflowed());
+        assert_eq!(w.into_bytes(), 7u16.to_le_bytes().to_vec());
+        let mut unbounded = CanonWriter::new();
+        unbounded.u64(u64::MAX);
+        assert!(!unbounded.overflowed());
     }
 }
