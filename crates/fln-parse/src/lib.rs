@@ -840,7 +840,8 @@ fn find_let_separator(
             }
         }
         if delimiters.is_empty()
-            && (term_locals::word(tokens, index, "have")
+            && (term_locals::word(tokens, index, "let")
+                || term_locals::word(tokens, index, "have")
                 || term_locals::word(tokens, index, "suffices"))
         {
             nested_lets.push(index);
@@ -1544,7 +1545,8 @@ fn bounded_term_spliced(
                 ))));
             }
             _ if grammar == DefinitionGrammar::Scalar
-                && (term_locals::word(tokens, index, "have")
+                && (term_locals::word(tokens, index, "let")
+                    || term_locals::word(tokens, index, "have")
                     || term_locals::word(tokens, index, "show")
                     || term_locals::word(tokens, index, "suffices")) =>
             {

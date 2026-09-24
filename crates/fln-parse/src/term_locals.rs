@@ -1,6 +1,6 @@
-//! Opaque local assertions and explicit result types on the ordinary heap frames.
+//! Local bindings, opaque assertions and result types on ordinary heap frames.
 //!
-//! The pin's `have`/`show` nodes retain every original token. A nested assertion
+//! The pin's `let`/`have`/`show` nodes retain every original token. A nested binding
 //! never recursively invokes the term parser: its annotation, value and body
 //! are separate phases on the same stack used for lambda telescopes.
 use super::*;
@@ -30,6 +30,7 @@ pub(super) struct Assertion {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Form {
+    Let,
     Have,
     Show,
     Suffices,
@@ -174,7 +175,9 @@ impl Prefix {
         cursor: &mut usize,
         end: usize,
     ) -> Result<Self, NatDefinitionParseError> {
-        let form = if word(tokens, keyword, "show") {
+        let form = if word(tokens, keyword, "let") {
+            Form::Let
+        } else if word(tokens, keyword, "show") {
             Form::Show
         } else if word(tokens, keyword, "suffices") {
             Form::Suffices
@@ -204,10 +207,13 @@ impl Prefix {
                 assertion.colon = Some(*cursor + 1);
                 *cursor += 2;
             }
-        } else if form == Form::Have {
+        } else if matches!(form, Form::Have | Form::Let) {
             if *cursor < end && matches!(&tokens[*cursor].kind, TokenKind::Ident(_)) {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
+            }
+            if form == Form::Let && assertion.name.is_none() {
+                return Err(refuse(view, tokens, *cursor));
             }
             if *cursor < end && word(tokens, *cursor, ":") {
                 assertion.colon = Some(*cursor);
@@ -238,7 +244,7 @@ impl Prefix {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
             Self::Assertion(p) => match p.phase {
-                Phase::Annotation if p.form != Form::Have => {
+                Phase::Annotation if !matches!(p.form, Form::Have | Form::Let) => {
                     word(tokens, at, "from") || word(tokens, at, "by")
                 }
                 Phase::Annotation => word(tokens, at, ":="),
@@ -273,7 +279,7 @@ impl Prefix {
         match p.phase {
             Phase::Annotation => {
                 p.annotation = Some(expression);
-                if p.form != Form::Have {
+                if !matches!(p.form, Form::Have | Form::Let) {
                     p.proof_intro = Some(at);
                     p.phase = if p.form == Form::Show {
                         Phase::Body
@@ -400,10 +406,11 @@ impl Prefix {
                     p.value.expect("have value"),
                 ],
             );
+            let keyword = if p.form == Form::Let { "let" } else { "have" };
             Syntax::node(
-                parser_kind(&["Term", "have"]),
+                parser_kind(&["Term", keyword]),
                 vec![
-                    atom(leaves, p.keyword, "have")?,
+                    atom(leaves, p.keyword, keyword)?,
                     Syntax::node(parser_kind(&["Term", "letConfig"]), vec![null_node(vec![])]),
                     Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
                     separator,

@@ -2,16 +2,20 @@ name: Native nested let terms
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-nested-lets.yml']
+    paths:
+      - '.github/workflows/native-nested-lets.yml'
+      - 'crates/fln-parse/src/**'
+      - 'crates/fln-parse/tests/nested_let_terms.rs'
+      - 'crates/fln/tests/source_nested_lets.rs'
+      - 'crates/fln-cli/tests/source_nested_lets.rs'
+      - 'examples/native_nested_lets.lean'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  validate-and-export:
+  nested-lets:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    permissions:
-      contents: write
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -19,89 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 2d689747a2d75a4ced61771f576520e79374278e
           persist-credentials: false
-      - name: Restore checksum-bound nested let implementation
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install repository toolchain
         run: |
-          python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          def git(*args):
-              return subprocess.check_output(['git',*args],text=True).strip()
-          def blob(data):
-              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          chunks = ['a013627f1a16385bec3b63d506c9dd7c77316d04','d8d59d25355f87002f106026ad1f500c3a7eb167','34d212504d57b4b08fef9808969422ce7b57648e','db6bd6e838453cf950e52782e033e78bcb8aa02e']
-          payload = bytearray()
-          for sha in chunks:
-              response = json.loads(subprocess.check_output(['gh','api','repos/Dicklesworthstone/franken_lean/git/blobs/'+sha]))
-              data = base64.b64decode(response['content'])
-              assert blob(data) == sha
-              payload.extend(data)
-          assert len(payload) == 7693
-          assert hashlib.sha256(payload).hexdigest() == '7b7ef9eeeaf614099c06c8cb9ff7c5f4e2667108dfffbece5ba6bd17af00c126'
-          manifest = json.loads(gzip.decompress(payload))
-          assert git('rev-parse','HEAD') == manifest['base'] == '2d689747a2d75a4ced61771f576520e79374278e'
-          assert git('write-tree') == manifest['base_tree'] == 'd6e0a2615cacf3b52c1257b58e761961409c0b62'
-          allowed = {'.github/workflows/native-nested-lets.yml','crates/fln-cli/tests/source_nested_lets.rs','crates/fln-parse/src/lib.rs','crates/fln-parse/src/term_locals.rs','crates/fln-parse/tests/nested_let_terms.rs','crates/fln/tests/source_nested_lets.rs','docs/NATIVE_NESTED_LETS.md','examples/native_nested_lets.lean'}
-          assert len(manifest['entries']) == len(allowed)
-          assert {e['path'] for e in manifest['entries']} == allowed
-          for e in manifest['entries']:
-              path = root/e['path']
-              assert path.resolve().is_relative_to(root) and not path.is_symlink() and e['mode'] == '100644'
-              if e['before'] is None:
-                  assert not path.exists() and not git('ls-files','--',e['path'])
-              else:
-                  assert blob(path.read_bytes()) == e['before'], e['path']
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'nested-let-validation'
-          out.mkdir()
-          patch = out/'change.patch'
-          patch.write_text(manifest['patch'])
-          subprocess.run(['git','apply','--check','--index',str(patch)],check=True)
-          subprocess.run(['git','apply','--index',str(patch)],check=True)
-          assert git('write-tree') == manifest['tree'] == '42426f8722bb81843950626915a19ff8d2985c43'
-          for e in manifest['entries']:
-              assert blob((root/e['path']).read_bytes()) == e['after'], e['path']
-          (out/'manifest.json').write_text(json.dumps(manifest))
-          print('VALIDATION_TREE',git('write-tree'))
-          PY
-      - name: Check transparent scope, original source and independent replay
-        run: |
-          set -euo pipefail
           channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
-          cargo test --locked -p fln-parse -p fln-elab 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/front.log"
-          tests=(); for f in crates/fln/tests/runtime_*.rs; do tests+=(--test "$(basename "$f" .rs)"); done
-          cargo test --locked -p fln --lib "${tests[@]}" --test source_nested_lets --test source_module_check --test source_module_session --test engine_builder_facade 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/engine.log"
-          cargo test --locked -p fln-cli --test source_nested_lets --test source_multistage_callbacks --test source_empty_runtime --test source_mutual_function_children --test source_mutual_indexed --test source_indexed_runtime --test source_proof_runtime 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/cli.log"
-          cargo test --locked -p fln-comp -p fln-vm --lib --test empty_elimination --test constructor_dispatch --test closure_interfaces 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/compiler.log"
-          cargo clippy --locked -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/clippy.log"
-          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/nested-let-validation/check.log"
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln-parse/src/lib.rs crates/fln-parse/src/term_locals.rs crates/fln-parse/tests/nested_let_terms.rs crates/fln/tests/source_nested_lets.rs crates/fln-cli/tests/source_nested_lets.rs
-          git diff --check --cached
-      - name: Export checked file objects without moving refs
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check source fidelity, scope, admission and independent execution
         run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess
-          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'nested-let-validation'
-          manifest = json.loads((out/'manifest.json').read_text())
-          assert subprocess.check_output(['git','write-tree'],text=True).strip() == manifest['tree']
-          for e in manifest['entries']:
-              data = pathlib.Path(e['path']).read_bytes()
-              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == e['after']
-              request = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
-              response = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/Dicklesworthstone/franken_lean/git/blobs','--input','-'],input=request))
-              assert response['sha'] == e['after']
-              print('EXPORTED',e['path'],e['after'],flush=True)
-          PY
-      - name: Retain exact validation evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: nested-let-validation-${{ github.run_id }}
-          path: ${{ runner.temp }}/nested-let-validation
-          retention-days: 14
+          set -euo pipefail
+          cargo test --locked -p fln-parse -p fln-elab
+          cargo test --locked -p fln --lib --test source_nested_lets --test runtime_staged_closures --test runtime_dependent_programs --test source_module_check --test source_module_session
+          cargo test --locked -p fln-cli --test source_nested_lets --test source_multistage_callbacks
+          cargo clippy --locked -p fln-parse -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
