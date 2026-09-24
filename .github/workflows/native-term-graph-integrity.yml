@@ -1,0 +1,229 @@
+name: Native term graph integrity
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-term-graph-integrity.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: native-term-graph-integrity
+  cancel-in-progress: false
+jobs:
+  dag-equality:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Apply reviewed DAG equality correction
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+          def replace_once(text, old, new):
+              assert text.count(old) == 1, f'expected exactly one reviewed match: {old[:100]!r}'
+              return text.replace(old, new, 1)
+          for kind, filename in [('Expr', 'expr.rs'), ('Level', 'level.rs')]:
+              path = Path('crates/fln-core/src') / filename
+              text = path.read_text()
+              text = replace_once(text, 'use std::collections::HashMap;', 'use std::collections::{HashMap, HashSet};')
+              start = text.index(f'impl PartialEq for {kind} {{')
+              end = text.index(f'impl Eq for {kind} {{}}', start)
+              body = text[start:end]
+              body = replace_once(body, f'    fn eq(&self, other: &{kind}) -> bool {{\n', f'''    fn eq(&self, other: &{kind}) -> bool {{
+                  if self.data != other.data {{
+                      return false;
+                  }}
+                  if Arc::ptr_eq(self.node_arc(), other.node_arc()) {{
+                      return true;
+                  }}
+          ''')
+              body = replace_once(body, f'        let mut pending: Vec<(&{kind}, &{kind})> = vec![(self, other)];', f'''        // A worklist alone is stack-safe but still expands a shared DAG as a
+                  // tree. Visit each allocation PAIR once, never just a node or a hash.
+                  // Both immutable roots stay borrowed for this walk, so identities cannot
+                  // be reused. Set iteration never determines the result, and the table
+                  // does not escape this call (franken_lean-z8j.1.13).
+                  let mut visited = HashSet::new();
+                  let mut pending: Vec<(&{kind}, &{kind})> = vec![(self, other)];''')
+              needle = '''            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                          continue;
+                      }
+          '''
+              body = replace_once(body, needle, needle + '''            let pair = (
+                          Arc::as_ptr(left.node_arc()),
+                          Arc::as_ptr(right.node_arc()),
+                      );
+                      if !visited.insert(pair) {
+                          continue;
+                      }
+          ''')
+              text = text[:start] + body + text[end:]
+              path.write_text(text)
+          path = Path('crates/fln-core/tests/dag_equality.rs')
+          assert not path.exists(), 'refuse to overwrite an existing regression suite'
+          path.write_text(r'''//! Regressions for the term-store prerequisite in franken_lean-z8j.1.13.
+          //! These exercise the actual core equality implementations, not a model or timer.
+          use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
+          use fln_core::level::Level;
+          use fln_core::name::Name;
+          use fln_core::options::{DataValue, KVMap};
+
+          fn name(s: &str) -> Name { Name::str(Name::anonymous(), s) }
+          fn diamond(mut leaf: Expr, depth: usize) -> Expr {
+              for _ in 0..depth { leaf = Expr::app(leaf.clone(), leaf); }
+              leaf
+          }
+          fn level_diamond(depth: usize, imax: bool) -> Level {
+              let mut level = Level::param(name("u"));
+              for _ in 0..depth {
+                  level = if imax { Level::imax(level.clone(), level) }
+                          else { Level::max(level.clone(), level) }.expect("test depth fits");
+              }
+              level
+          }
+          fn lam(n: &str, info: BinderInfo) -> Expr {
+              Expr::lam(name(n), Expr::sort(Level::one()), Expr::bvar(0).unwrap(), info)
+          }
+          #[test]
+          fn independently_allocated_expression_diamonds_compare_without_tree_expansion() {
+              let left = diamond(Expr::const_(name("f"), vec![]), 96);
+              let right = diamond(Expr::const_(name("f"), vec![]), 96);
+              assert_ne!(left.allocation_identity(), right.allocation_identity());
+              // Only 97 nodes per input; the old tree walk visited 2^97 - 1 pairs.
+              assert!(left == right);
+              assert!(right == left);
+              assert!(left == left.clone());
+          }
+          #[test]
+          fn independently_allocated_max_and_imax_diamonds_compare_without_tree_expansion() {
+              for imax in [false, true] {
+                  let left = level_diamond(96, imax);
+                  let right = level_diamond(96, imax);
+                  assert!(left == right);
+                  assert!(right == left);
+                  assert!(left == left.clone());
+              }
+          }
+          #[test]
+          fn expression_payload_level_equality_is_also_dag_safe() {
+              let left = Expr::const_(name("c"), vec![level_diamond(96, false)]);
+              let right = Expr::const_(name("c"), vec![level_diamond(96, false)]);
+              assert!(left == right);
+              assert!(Expr::sort(level_diamond(96, true)) == Expr::sort(level_diamond(96, true)));
+          }
+          #[test]
+          fn visited_keys_include_both_allocations_not_just_the_left_node() {
+              let shared = lam("x", BinderInfo::Default);
+              let equal = lam("x", BinderInfo::Default);
+              let different = lam("y", BinderInfo::Default);
+              assert_eq!(shared.data(), different.data(), "names are not in Expr.Data");
+              let left = Expr::app(shared.clone(), shared);
+              let right = Expr::app(equal, different);
+              assert_eq!(left.data(), right.data());
+              assert!(left != right, "the second partner must be checked independently");
+              assert!(right != left);
+          }
+          #[test]
+          fn hash_collisions_never_erase_binder_names_information_or_constructor_tags() {
+              let plain = lam("x", BinderInfo::Default);
+              let renamed = lam("y", BinderInfo::Default);
+              let implicit = lam("x", BinderInfo::Implicit);
+              let forall = Expr::forall_e(name("x"), Expr::sort(Level::one()), Expr::bvar(0).unwrap(), BinderInfo::Default);
+              for other in [renamed, implicit, forall] {
+                  assert_eq!(plain.data(), other.data());
+                  assert!(plain != other);
+              }
+          }
+          #[test]
+          fn hash_collisions_never_erase_literal_high_limbs_or_let_annotations() {
+              let a = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![7, 1])));
+              let b = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![7, 2])));
+              assert_eq!(a.data(), b.data());
+              assert!(a != b);
+              let make = |n: &str, non_dep: bool| Expr::let_e(name(n), Expr::sort(Level::one()), Expr::sort(Level::zero()), Expr::bvar(0).unwrap(), non_dep);
+              let original = make("x", false);
+              for other in [make("y", false), make("x", true)] {
+                  assert_eq!(original.data(), other.data());
+                  assert!(original != other);
+              }
+          }
+          #[test]
+          fn metadata_order_duplicates_and_shadowed_values_remain_observable() {
+              let k = name("k");
+              let wrap = |entries| Expr::mdata(KVMap::from_entries(entries), lam("x", BinderInfo::Default));
+              let a = wrap(vec![(k.clone(), DataValue::OfNat(1)), (k.clone(), DataValue::OfNat(2))]);
+              let b = wrap(vec![(k.clone(), DataValue::OfNat(1)), (k.clone(), DataValue::OfNat(3))]);
+              let c = wrap(vec![(k.clone(), DataValue::OfNat(1))]);
+              let d = wrap(vec![(k.clone(), DataValue::OfNat(2)), (k, DataValue::OfNat(1))]);
+              for other in [b, c, d] {
+                  assert_eq!(a.data(), other.data());
+                  assert!(a != other);
+              }
+          }
+          #[test]
+          fn unequal_diamond_does_not_poison_a_later_equal_comparison() {
+              let a = diamond(lam("x", BinderInfo::Default), 96);
+              let bad = diamond(lam("y", BinderInfo::Default), 96);
+              let good = diamond(lam("x", BinderInfo::Default), 96);
+              assert_eq!(a.data(), bad.data());
+              assert!(a != bad);
+              assert!(a == good);
+          }
+          #[test]
+          fn equality_does_not_depend_on_sharing_topology() {
+              fn tree(depth: usize) -> Expr {
+                  if depth == 0 { lam("x", BinderInfo::Default) }
+                  else { Expr::app(tree(depth - 1), tree(depth - 1)) }
+              }
+              for depth in 0..9 {
+                  let shared = diamond(lam("x", BinderInfo::Default), depth);
+                  let unshared = tree(depth);
+                  assert!(shared == unshared);
+                  assert!(unshared == shared);
+              }
+          }
+          #[test]
+          fn equality_remains_thread_independent() {
+              for workers in [1, 8, 32] {
+                  std::thread::scope(|scope| {
+                      let jobs: Vec<_> = (0..workers).map(|_| scope.spawn(|| {
+                          diamond(lam("x", BinderInfo::Default), 96) == diamond(lam("x", BinderInfo::Default), 96)
+                              && level_diamond(96, true) == level_diamond(96, true)
+                      })).collect();
+                      for job in jobs { assert!(job.join().expect("comparison worker")); }
+                  });
+              }
+          }
+          ''')
+          PY
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Format and test real core and kernel implementations
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 crates/fln-core/src/expr.rs crates/fln-core/src/level.rs crates/fln-core/tests/dag_equality.rs
+          cargo fmt --check -p fln-core
+          cargo test --locked -p fln-core --no-fail-fast
+          cargo test --locked -p fln-kernel --lib --no-fail-fast
+          cargo clippy --locked -p fln-core --all-targets -- -D warnings
+          git diff --check
+      - name: Publish tested code directly to main without force
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD)
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$base" ]; then
+            echo 'main advanced during validation; refusing to publish untested integration' >&2
+            exit 1
+          fi
+          git config user.name 'FrankenLean automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/fln-core/src/expr.rs crates/fln-core/src/level.rs crates/fln-core/tests/dag_equality.rs
+          git commit -m 'fix(core): make expression and level equality DAG-aware (franken_lean-z8j.1.13)' -m 'Memoize allocation pairs per comparison, retaining full structural collision checks. Add independently allocated diamond, metadata, binder, literal collision, sharing-topology, recovery and 1/8/32-thread regressions. Validated with the pinned nightly: fln-core tests, fln-kernel library tests, core clippy and fmt. This does not claim total term interning or G1 closure.'
+          git push origin HEAD:main
+          git log -1 --format='%H %s'
