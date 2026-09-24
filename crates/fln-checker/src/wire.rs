@@ -53,9 +53,13 @@ pub enum NamePart {
 }
 
 /// Checker-owned name representation: root-to-leaf components, no cached hash.
+///
+/// The components are shared, so copying a term copies its names by reference
+/// count rather than by string. Rewrites copy constant nodes constantly, and deep
+/// name clones were a third of the checker's time on real Init modules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WireName {
-    parts: Vec<NamePart>,
+    parts: std::sync::Arc<[NamePart]>,
 }
 
 impl WireName {
@@ -68,7 +72,9 @@ impl WireName {
     }
 
     pub(crate) fn from_parts(parts: Vec<NamePart>) -> WireName {
-        WireName { parts }
+        WireName {
+            parts: parts.into(),
+        }
     }
 }
 
@@ -624,7 +630,9 @@ fn decode_name_value(reader: &mut Reader<'_, '_>) -> Result<WireName, StepError>
         };
         parts.push(part);
     }
-    Ok(WireName { parts })
+    Ok(WireName {
+        parts: parts.into(),
+    })
 }
 
 struct LevelBuilder {
