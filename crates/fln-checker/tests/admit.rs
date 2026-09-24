@@ -24,6 +24,8 @@ mod indexed;
 mod quotient_computation;
 #[path = "admit/recursor_conversion.rs"]
 mod recursor_conversion;
+#[path = "admit/structure_eta.rs"]
+mod structure_eta;
 #[path = "admit/unit_like.rs"]
 mod unit_like;
 

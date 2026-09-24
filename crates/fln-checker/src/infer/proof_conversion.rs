@@ -3,9 +3,10 @@
 //! worklist opens matching binders hygienically and uses checker-owned typing
 //! to compare proofs of the same proposition, (KR-315) values of the same
 //! unit-like structure type, and (KR-312) a lambda against a function that is
-//! not one, by eta-expanding the latter through its Π-type. Probes explicitly
-//! disable this lane, so nested conversion never recursively reenters typed
-//! inference.
+//! not one, by eta-expanding the latter through its Π-type, and a structure
+//! constructor application against a term that is not one, field by field.
+//! Probes explicitly disable this lane, so nested conversion never recursively
+//! reenters typed inference.
 use super::*;
 use crate::universe::{NormalNode, normalize};
 use crate::wire::WireLevel;
@@ -274,6 +275,85 @@ impl Probe<'_> {
         };
         Ok(Some((left_type, right_type)))
     }
+    /// KR-312 structure eta, the pin's `try_eta_struct_core`
+    /// (type_checker.cpp:812): when `s` is a full application of the only
+    /// constructor of a non-recursive, index-free inductive and `t`'s head is
+    /// not that constructor, `s ≟ t` holds exactly when their types do and
+    /// every field argument of `s` converts with the matching projection of
+    /// `t`. Returns those obligations as (from `s`, from `t`) pairs, types
+    /// first; `None` means the rule does not apply.
+    fn structure_eta(
+        &mut self,
+        s: &WireExpr,
+        t: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<Vec<(WireExpr, WireExpr)>>> {
+        let Some(head) = head_constant(s) else {
+            return Ok(None);
+        };
+        if head_constant(t) == Some(head) {
+            return Ok(None);
+        }
+        let constants = context.constants();
+        let Some(constructor) = constants.find(head).and_then(|d| d.constructor_metadata()) else {
+            return Ok(None);
+        };
+        let (inductive_name, parameters, fields) = (
+            constructor.inductive().clone(),
+            constructor.num_parameters() as usize,
+            constructor.num_fields() as usize,
+        );
+        let Some(inductive) = constants
+            .find(&inductive_name)
+            .and_then(|d| d.inductive_metadata())
+        else {
+            return Ok(None);
+        };
+        if inductive.constructors().len() != 1
+            || inductive.num_indices() != 0
+            || inductive.is_recursive()
+        {
+            return Ok(None);
+        }
+        let mut arguments = Vec::new();
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, argument }) = s.node(id) {
+            self.tick()?;
+            arguments.push(*argument);
+            id = *function;
+        }
+        arguments.reverse();
+        if arguments.len() != parameters + fields {
+            return Ok(None);
+        }
+        let Some(s_type) = self.infer(s, context)? else {
+            return Ok(None);
+        };
+        let Some(t_type) = self.infer(t, context)? else {
+            return Ok(None);
+        };
+        let mut obligations = vec![(s_type, t_type)];
+        for (field, argument) in arguments[parameters..].iter().enumerate() {
+            let argument = self.piece(s, *argument)?;
+            let projection = self.project(t, &inductive_name, field as u64)?;
+            obligations.push((argument, projection));
+        }
+        Ok(Some(obligations))
+    }
+    /// `term.index` of structure `name`, built by extending a copy of `term`'s
+    /// own arena, so no subterm is re-copied.
+    fn project(&mut self, term: &WireExpr, name: &WireName, index: u64) -> Result<WireExpr> {
+        self.tick()?;
+        let mut nodes = term.nodes().to_vec();
+        let root = ExprId::from_index(nodes.len())
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        nodes.push(ExprNode::Projection {
+            structure_name: name.clone(),
+            index,
+            expression: term.root(),
+        });
+        Ok(WireExpr::from_parts(nodes, term.levels().to_vec(), root))
+    }
     /// The domain of `term`'s type when that type normalizes to a Π, which is
     /// what eta expansion through the type needs. `None` means it does not.
     fn pi_domain(
@@ -347,7 +427,7 @@ impl Probe<'_> {
             }
         }
         let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
-        while let Some(task) = work.pop() {
+        'work: while let Some(task) = work.pop() {
             self.tick()?;
             let (left, right, context) = match task {
                 Work::Pair(left, right, context) => (left, right, context),
@@ -426,6 +506,21 @@ impl Probe<'_> {
             if l != left || r != right {
                 work.push(Work::Pair(l, r, context));
                 continue;
+            }
+            // KR-312 structure eta runs before congruence: after whnf the other
+            // side's head is stuck, so `mk a b ≟ f x` could only fail on heads.
+            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
+                if let Some(obligations) = self.structure_eta(s, t, &context)? {
+                    for (s_part, t_part) in obligations.into_iter().rev() {
+                        let (a, b) = if s_on_left {
+                            (s_part, t_part)
+                        } else {
+                            (t_part, s_part)
+                        };
+                        work.push(Work::Pair(a, b, context.clone()));
+                    }
+                    continue 'work;
+                }
             }
             match (l.node(l.root()), r.node(r.root())) {
                 (
