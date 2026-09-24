@@ -127,8 +127,7 @@ const USAGE: &str = concat!(
     "names the planned subsystems that are not implemented yet.\n",
     "`serve-mcp`, `replay`, and `cache` are planned capabilities that are not\n",
     "implemented; they print a typed notice and exit 5.\n",
-    "`build explain` reports which package sources changed since the last\n",
-    "successful `lake build` check, by content hash.\n",
+    "`build explain` currently refuses: recorded build provenance is unavailable.\n",
     "`verify-capsule` checks the transport completeness and content-hash integrity\n",
     "of a sealed .flnpack capsule and decodes its certificate objects; it does not\n",
     "replay certificates through a checker.\n",
@@ -12354,8 +12353,38 @@ fn run_build_explain(
                 ))
             }
         }
-        Err(err) => MultiplexerOutput::failure(format!("fln build explain: {err}\n"), 1),
+        Err(err) => lake_operation_failure(
+            "fln.build-explain/1",
+            &err.to_string(),
+            matches!(
+                err,
+                fln_lake::LakeExplainError::Unavailable
+                    | fln_lake::LakeExplainError::Discovery(
+                        fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)
+                    )
+            ),
+            json,
+        ),
     }
+}
+
+fn lake_operation_failure(
+    schema: &str,
+    detail: &str,
+    unsupported: bool,
+    json: bool,
+) -> MultiplexerOutput {
+    let stderr = if json {
+        format!(
+            "{{\"schema\":{},\"status\":{},\"detail\":{}}}\n",
+            json_string(schema),
+            json_string(if unsupported { "unsupported" } else { "error" }),
+            json_string(detail),
+        )
+    } else {
+        format!("{detail}\n")
+    };
+    MultiplexerOutput::failure(stderr, 1)
 }
 
 fn run_lean_with_optional_input(
@@ -12651,6 +12680,9 @@ const LAKE_USAGE: &str = concat!(
     "\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
+    "\nFrankenLean currently has no Lake artifact compiler or build-provenance\n",
+    "backend. `build` fails without writing artifacts; `check-build` only\n",
+    "checks default-target presence in supported TOML configuration.\n",
 );
 
 const LAKE_HELP_BUILD: &str = concat!(
@@ -12664,6 +12696,8 @@ const LAKE_HELP_BUILD: &str = concat!(
     "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
+    "\nArtifact compilation is currently unavailable in FrankenLean; this command\n",
+    "fails without creating or replacing build outputs.\n",
 );
 
 const LAKE_HELP_QUERY: &str = concat!(
@@ -12785,7 +12819,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         "serve" => serve_lsp(),
         "build" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            match fln_lake::build_package(&target_dir, &command_args, false) {
+            match fln_lake::build_package(&target_dir, &command_args) {
                 Ok(report) => {
                     if is_json {
                         let targets_json = report
@@ -12814,7 +12848,18 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                     ),
                     1,
                 ),
-                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+                Err(err) => lake_operation_failure(
+                    "fln.lake-build/1",
+                    &err.to_string(),
+                    matches!(
+                        err,
+                        fln_lake::LakeBuildError::Unavailable
+                            | fln_lake::LakeBuildError::Discovery(
+                                fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)
+                            )
+                    ),
+                    is_json,
+                ),
             }
         }
         "clean" => {
@@ -13031,34 +13076,55 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
         }
         "check-build" => {
+            if !command_args.is_empty() {
+                return lake_operation_failure(
+                    "fln.lake-check-build/1",
+                    "lake check-build accepts no target arguments",
+                    false,
+                    is_json,
+                );
+            }
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            match fln_lake::build_package(&target_dir, &command_args, true) {
-                Ok(report) => {
+            // The pinned Lake command tests only default-target presence. It is
+            // neither a dry build nor a source/type/target validity check.
+            match fln_lake::LakeConfig::discover(&target_dir) {
+                Ok(config) => {
+                    if config.default_targets.is_empty() {
+                        return lake_operation_failure(
+                            "fln.lake-check-build/1",
+                            "no default build targets are configured",
+                            false,
+                            is_json,
+                        );
+                    }
                     if is_json {
-                        let targets_json = report
-                            .targets
+                        let targets_json = config
+                            .default_targets
                             .iter()
-                            .map(|s| format!("\"{s}\""))
+                            .map(|s| json_string(s))
                             .collect::<Vec<_>>()
                             .join(",");
                         MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"package\":\"{}\",\"targets\":[{targets_json}]}}\n",
-                            report.package
+                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"check\":\"default-target-presence\",\"package\":{},\"targets\":[{targets_json}]}}\n",
+                            json_string(&config.name)
                         ))
                     } else {
-                        MultiplexerOutput::success("Build configuration validated.\n".to_owned())
+                        MultiplexerOutput::success(String::new())
                     }
                 }
-                Err(fln_lake::LakeBuildError::Discovery(
-                    fln_lake::LakeDiscoveryError::NotFound(p),
-                )) => MultiplexerOutput::failure(
+                Err(fln_lake::LakeDiscoveryError::NotFound(p)) => MultiplexerOutput::failure(
                     format!(
                         "error: no such file or directory (error code: 2)\n  file: {}\n",
                         p.join("lakefile.lean").display()
                     ),
                     1,
                 ),
-                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+                Err(err) => lake_operation_failure(
+                    "fln.lake-check-build/1",
+                    &err.to_string(),
+                    matches!(err, fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)),
+                    is_json,
+                ),
             }
         }
         "query" | "test" | "lint" | "lean" => MultiplexerOutput::failure(

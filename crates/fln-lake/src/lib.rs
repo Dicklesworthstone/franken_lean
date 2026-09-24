@@ -3,10 +3,10 @@
 //! and elan layout compatibility, and `fln build explain` diagnostics
 //! (plan §13.3).
 //!
-//! Lake is a **facade over the Ledger**: targets and facets map onto Ledger
-//! queries, `require` fetches via the D2 `git` subprocess protocol,
-//! dependency resolution produces transactional resolution receipts, and
-//! `lake build --watch` delegates to asupersync's watch infrastructure.
+//! Configuration and package operations are implemented here. Artifact
+//! compilation and provenance-backed build decisions are not yet connected;
+//! their entry points return explicit errors rather than synthetic products
+//! or cache hits. Executable Lean configuration is likewise unavailable.
 //!
 //! The Lake surface must match the Reference pin's exit codes, `--json`
 //! output, manifest format, and `lean-toolchain` layout so that `elan`
@@ -318,7 +318,8 @@ impl fmt::Display for LakeDiscoveryError {
             Self::Parse(e) => write!(f, "error parsing Lake configuration: {e}"),
             Self::LeanConfigUnsupported(p) => write!(
                 f,
-                "{} requires evaluating Lean code, which is not implemented; use lakefile.toml",
+                "executable Lake configuration is unavailable: {} requires evaluating Lean code, \
+                 which is not implemented; use the supported lakefile.toml subset",
                 p.display()
             ),
         }
@@ -415,37 +416,44 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_string_val(s: &str) -> Option<String> {
     let s = s.trim();
-    if ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-        && s.len() >= 2
-    {
-        let inner = &s[1..s.len() - 1];
-        if s.starts_with('"') {
-            let mut out = String::with_capacity(inner.len());
-            let mut chars = inner.chars();
-            while let Some(c) = chars.next() {
-                if c == '\\' {
-                    match chars.next() {
-                        Some('n') => out.push('\n'),
-                        Some('r') => out.push('\r'),
-                        Some('t') => out.push('\t'),
-                        Some('\\') => out.push('\\'),
-                        Some('"') => out.push('"'),
-                        Some(other) => {
-                            out.push('\\');
-                            out.push(other);
-                        }
-                        None => out.push('\\'),
-                    }
-                } else {
-                    out.push(c);
+    if s.len() < 2 {
+        return None;
+    }
+    let quote = s.as_bytes()[0];
+    if !matches!(quote, b'\'' | b'"') || s.as_bytes().last().copied() != Some(quote) {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == char::from(quote) || (c.is_control() && c != '\t') {
+            return None;
+        }
+        if c != '\\' || quote == b'\'' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            escape @ ('u' | 'U') => {
+                let width = if escape == 'u' { 4 } else { 8 };
+                let digits: String = chars.by_ref().take(width).collect();
+                if digits.len() != width || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
                 }
+                out.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
             }
-            return Some(out);
-        } else {
-            return Some(inner.to_owned());
+            _ => return None,
         }
     }
-    None
+    Some(out)
 }
 
 fn parse_string_array(s: &str) -> Option<Vec<String>> {
@@ -464,7 +472,7 @@ fn parse_string_array(s: &str) -> Option<Vec<String>> {
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if in_quote {
-            if ch == '\\' {
+            if ch == '\\' && quote_char == '"' {
                 current.push(ch);
                 if let Some(next) = chars.next() {
                     current.push(next);
@@ -480,18 +488,17 @@ fn parse_string_array(s: &str) -> Option<Vec<String>> {
             quote_char = ch;
             current.push(ch);
         } else if ch == ',' {
-            if let Some(val) = parse_string_val(&current) {
-                result.push(val);
-            }
+            result.push(parse_string_val(&current)?);
             current.clear();
         } else {
             current.push(ch);
         }
     }
-    if !current.trim().is_empty()
-        && let Some(val) = parse_string_val(&current)
-    {
-        result.push(val);
+    if in_quote {
+        return None;
+    }
+    if !current.trim().is_empty() {
+        result.push(parse_string_val(&current)?);
     }
     Some(result)
 }
@@ -1198,6 +1205,8 @@ pub enum LakeBuildError {
     TargetNotFound(String),
     /// I/O error occurred during build.
     Io(String),
+    /// No artifact-producing compilation path is connected to this command.
+    Unavailable,
 }
 
 impl fmt::Display for LakeBuildError {
@@ -1206,6 +1215,10 @@ impl fmt::Display for LakeBuildError {
             Self::Discovery(e) => write!(f, "{e}"),
             Self::TargetNotFound(t) => write!(f, "error: target '{t}' not found in package"),
             Self::Io(msg) => write!(f, "error during Lake build: {msg}"),
+            Self::Unavailable => write!(
+                f,
+                "native Lake artifact compilation is unavailable; no build or cache validation was performed"
+            ),
         }
     }
 }
@@ -1242,6 +1255,8 @@ pub enum LakeExplainError {
     TargetNotFound(String),
     /// I/O error occurred.
     Io(String),
+    /// No recorded, content-bound build provenance supports a decision.
+    Unavailable,
 }
 
 impl fmt::Display for LakeExplainError {
@@ -1250,243 +1265,37 @@ impl fmt::Display for LakeExplainError {
             Self::Discovery(e) => write!(f, "{e}"),
             Self::TargetNotFound(t) => write!(f, "error: target '{t}' not found in package"),
             Self::Io(msg) => write!(f, "error explaining Lake build: {msg}"),
+            Self::Unavailable => write!(
+                f,
+                "build provenance is unavailable; cannot establish changed inputs, rebuild decisions or cache outcomes"
+            ),
         }
     }
 }
 
 impl std::error::Error for LakeExplainError {}
 
-fn candidate_sources_for_target(dir: &Path, target: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let root_file = dir.join(format!("{target}.lean"));
-    if root_file.exists() {
-        candidates.push(root_file);
-    }
-    let cap_file = dir.join(format!("{}.lean", capitalize_ident(target)));
-    if cap_file.exists() && !candidates.contains(&cap_file) {
-        candidates.push(cap_file);
-    }
-    let main_file = dir.join("Main.lean");
-    if main_file.exists() && !candidates.contains(&main_file) {
-        candidates.push(main_file);
-    }
-    let src_file = dir.join("src").join(format!("{target}.lean"));
-    if src_file.exists() && !candidates.contains(&src_file) {
-        candidates.push(src_file);
-    }
-    candidates
+/// Refuse artifact builds until a real compiler and module publisher are wired.
+///
+/// Configuration presence, source timestamps and existing output files cannot
+/// authorize a successful build. In particular, do not create output directories
+/// or replace old artifacts on this unsupported path.
+pub fn build_package(dir: &Path, _targets: &[String]) -> Result<LakeBuildReport, LakeBuildError> {
+    LakeConfig::discover(dir).map_err(LakeBuildError::Discovery)?;
+    Err(LakeBuildError::Unavailable)
 }
 
-/// Build targets in `dir` according to Lake configuration.
-pub fn build_package(
-    dir: &Path,
-    targets: &[String],
-    is_dry_run: bool,
-) -> Result<LakeBuildReport, LakeBuildError> {
-    let config = LakeConfig::discover(dir).map_err(LakeBuildError::Discovery)?;
-    let targets_to_build = if targets.is_empty() {
-        if config.default_targets.is_empty() {
-            vec![config.name.clone()]
-        } else {
-            config.default_targets.clone()
-        }
-    } else {
-        targets.to_vec()
-    };
-
-    let build_dir = dir.join(".lake").join("build");
-    let lib_dir = build_dir.join("lib");
-    let bin_dir = build_dir.join("bin");
-
-    if !is_dry_run {
-        fs::create_dir_all(&lib_dir).map_err(|e| LakeBuildError::Io(e.to_string()))?;
-        fs::create_dir_all(&bin_dir).map_err(|e| LakeBuildError::Io(e.to_string()))?;
-    }
-
-    let mut targets_built = 0;
-    let mut targets_cached = 0;
-
-    for target in &targets_to_build {
-        let olean_artifact = lib_dir.join(format!("{target}.olean"));
-        let sources = candidate_sources_for_target(dir, target);
-
-        let mut needs_build = false;
-        if !olean_artifact.exists() {
-            needs_build = true;
-        } else if let Ok(art_meta) = olean_artifact.metadata() {
-            if let Ok(art_mtime) = art_meta.modified() {
-                for src in &sources {
-                    if let Ok(src_meta) = src.metadata()
-                        && let Ok(src_mtime) = src_meta.modified()
-                        && src_mtime > art_mtime
-                    {
-                        needs_build = true;
-                        break;
-                    }
-                }
-            } else {
-                needs_build = true;
-            }
-        } else {
-            needs_build = true;
-        }
-
-        if needs_build {
-            if !is_dry_run {
-                fs::write(&olean_artifact, format!("fln-olean-artifact:{}", target))
-                    .map_err(|e| LakeBuildError::Io(e.to_string()))?;
-            }
-            targets_built += 1;
-        } else {
-            targets_cached += 1;
-        }
-    }
-
-    Ok(LakeBuildReport {
-        package: config.name,
-        targets: targets_to_build,
-        targets_built,
-        targets_cached,
-    })
-}
-
-/// Explain the build decision for `target` in `dir`, contrasting Reference file-cone
-/// invalidation against native demand-node early cutoff (plan §13.3).
+/// Refuse build explanations without content-bound, recorded build provenance.
+///
+/// Neither a timestamp nor a source comment establishes semantic early cutoff.
+/// This applies equally to native and faithful-invalidation requests.
 pub fn explain_build(
     dir: &Path,
-    target: Option<&str>,
-    faithful_invalidation: bool,
+    _target: Option<&str>,
+    _faithful_invalidation: bool,
 ) -> Result<BuildExplainReport, LakeExplainError> {
-    let config = LakeConfig::discover(dir).map_err(LakeExplainError::Discovery)?;
-    let target_name = target
-        .map(str::to_string)
-        .or_else(|| config.default_targets.first().cloned())
-        .unwrap_or_else(|| config.name.clone());
-
-    let build_dir = dir.join(".lake").join("build");
-    let olean_artifact = build_dir.join("lib").join(format!("{target_name}.olean"));
-    let sources = candidate_sources_for_target(dir, &target_name);
-
-    let mut changed_inputs = Vec::new();
-    let mut opaque_barriers = Vec::new();
-
-    // Inspect sources for opaque barriers (#eval, IO.println, unsafe)
-    for src in &sources {
-        if let Ok(content) = fs::read_to_string(src) {
-            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
-            if content.contains("#eval") {
-                opaque_barriers.push(format!("{rel}: #eval command"));
-            }
-            if content.contains("IO.println") || content.contains("IO.run") {
-                opaque_barriers.push(format!("{rel}: external IO effect"));
-            }
-            if content.contains("unsafe ") {
-                opaque_barriers.push(format!("{rel}: unsafe definition"));
-            }
-        }
-    }
-
-    if !olean_artifact.exists() {
-        for src in &sources {
-            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
-            changed_inputs.push(rel);
-        }
-        return Ok(BuildExplainReport {
-            package: config.name,
-            target: target_name,
-            reference_decision: RebuildDecision::Rebuild,
-            native_decision: RebuildDecision::Rebuild,
-            delta: "initial build: no existing build artifacts in .lake/build".to_owned(),
-            changed_inputs,
-            opaque_barriers,
-            cache_outcome: "miss".to_owned(),
-        });
-    }
-
-    let art_meta = olean_artifact
-        .metadata()
-        .map_err(|e| LakeExplainError::Io(e.to_string()))?;
-    let art_mtime = art_meta
-        .modified()
-        .map_err(|e| LakeExplainError::Io(e.to_string()))?;
-
-    for src in &sources {
-        if let Ok(meta) = src.metadata()
-            && let Ok(mtime) = meta.modified()
-            && mtime > art_mtime
-        {
-            let rel = src.strip_prefix(dir).unwrap_or(src).display().to_string();
-            changed_inputs.push(rel);
-        }
-    }
-
-    if changed_inputs.is_empty() {
-        return Ok(BuildExplainReport {
-            package: config.name,
-            target: target_name,
-            reference_decision: RebuildDecision::Cached,
-            native_decision: RebuildDecision::Cached,
-            delta: "inputs unchanged; cached in both reference and native models".to_owned(),
-            changed_inputs: Vec::new(),
-            opaque_barriers,
-            cache_outcome: "hit".to_owned(),
-        });
-    }
-
-    // Input changed: Reference decision rebuilds the full file cone
-    let reference_decision = RebuildDecision::Rebuild;
-
-    if faithful_invalidation {
-        return Ok(BuildExplainReport {
-            package: config.name,
-            target: target_name,
-            reference_decision,
-            native_decision: RebuildDecision::Rebuild,
-            delta: "faithful-invalidation enabled: matching reference file-cone invalidation"
-                .to_owned(),
-            changed_inputs,
-            opaque_barriers,
-            cache_outcome: "miss".to_owned(),
-        });
-    }
-
-    // Native sound mode: analyze whether changes are interface or body/proof
-    let mut interface_changed = false;
-    for src_rel in &changed_inputs {
-        let full_path = dir.join(src_rel);
-        if let Ok(content) = fs::read_to_string(&full_path)
-            && (content.contains("-- fln-interface-change") || content.contains("axiom "))
-        {
-            interface_changed = true;
-            break;
-        }
-    }
-
-    let (native_decision, delta, cache_outcome) = if interface_changed {
-        (
-            RebuildDecision::Rebuild,
-            "interface change: demand node invalidated".to_owned(),
-            "miss".to_owned(),
-        )
-    } else {
-        (
-            RebuildDecision::Cached,
-            "early-cutoff: reference rebuilds full file cone; native demand nodes unchanged"
-                .to_owned(),
-            "hit".to_owned(),
-        )
-    };
-
-    Ok(BuildExplainReport {
-        package: config.name,
-        target: target_name,
-        reference_decision,
-        native_decision,
-        delta,
-        changed_inputs,
-        opaque_barriers,
-        cache_outcome,
-    })
+    LakeConfig::discover(dir).map_err(LakeExplainError::Discovery)?;
+    Err(LakeExplainError::Unavailable)
 }
 
 // ---------------------------------------------------------------------------

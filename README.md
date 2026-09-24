@@ -50,7 +50,7 @@
 ```bash
 # It's a drop-in: your project, your editor, your lakefile, unchanged.
 cd my-mathlib-project        # lakefile.lean, lean-toolchain, everything as-is
-lake build                   # decl-granular incremental over a content-addressed store
+lake build                   # currently refuses: no connected Lake artifact compiler
 code .                       # vscode-lean4 connects to the daemon and cannot tell
 
 # The Independent Judge: re-check every mathlib olean on a foreign-blooded kernel
@@ -210,7 +210,7 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
-> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `lake` and `leanc` toolchain personalities are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate, and `build explain` runs but derives its rebuild decisions from heuristics rather than the native decision engine (franken_lean-z8j.1.2).
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `leanc` toolchain personality are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The `lake` personality covers package `init`/`new`/`clean`, `lakefile.toml` discovery and `check-build`; `lake build` exits 1 with an "unsupported" notice and writes nothing, because no Lake artifact compiler is connected yet (`docs/NATIVE_LAKE.md`, franken_lean-z8j.1.1). `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate, and `build explain` exits 1 with an "unsupported" notice because no recorded, content-bound build provenance exists to decide from (franken_lean-z8j.1.2).
 
 ## Installation
 
