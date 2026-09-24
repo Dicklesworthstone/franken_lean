@@ -388,8 +388,10 @@ const SITES_BENCH_APPARATUS: [ClaimSite; 1] = [site(
 /// real and CI-enforced — so the matrix does not imply the whole B3 sentence is unsupported.
 ///
 /// Corrected 2026-08-02 (bead `franken_lean-4snn`): this note said TWO sub-claims were
-/// `Supported`, counting `leanchecker` as a foreign-kernel witness. The lane genuinely runs
-/// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`), but it
+/// `Supported`, counting `leanchecker` as a foreign-kernel witness. The lane
+/// (`scripts/tribunal/leanchecker_witness.sh`) exists, but no CI step executes it:
+/// `scripts/check.sh` only shellchecks and hashes it, and `leanchecker` runs only from
+/// `#[ignore]`d on-demand tests (bead `franken_lean-z8j.1.17`). Even when run it
 /// re-executes the pinned Reference kernel and is therefore `ReferenceKernelOracle`, not an
 /// independent implementation. The closed `fln-hfch` verification-manifest row records that
 /// authority boundary. Calling the lane a foreign witness hid the missing independent opinion.
@@ -556,10 +558,11 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    beyond the tree is full product coverage: other publication paths still use \
                    empty councils, general declaration/module/corpus execution is not wired, \
                    and the planned WASM and policy-driven release-closure lanes are absent. The \
-                   Reference-kernel-oracle lane genuinely runs \
-                   (scripts/tribunal/leanchecker_witness.sh, called from scripts/check.sh), \
-                   but it re-executes the Reference implementation and therefore does NOT \
-                   satisfy the foreign-independent-witness half. The authority classification \
+                   Reference-kernel-oracle lane (scripts/tribunal/leanchecker_witness.sh) \
+                   exists but no CI step executes it: scripts/check.sh only shellchecks and \
+                   hashes it (franken_lean-z8j.1.17). Even when run it re-executes the \
+                   Reference implementation and therefore does NOT satisfy the \
+                   foreign-independent-witness half. The authority classification \
                    is recorded by the fln-hfch verification-manifest row. Corrected 2026-07-25 \
                    (franken_lean-4o3n) from \
                    'a separate, Supported row', which named a row that has never existed: \
