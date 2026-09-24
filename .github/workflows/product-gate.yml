@@ -31,7 +31,11 @@ permissions:
 
 concurrency:
   group: product-gate-${{ github.ref }}
-  cancel-in-progress: true
+  # main moves many times an hour and one run takes ~20 minutes, so cancelling
+  # on every push would leave main with no finished run at all. On main the
+  # running job always completes and only the newest waiting push is kept; a
+  # pull request's superseded runs are cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate:
@@ -60,11 +64,13 @@ jobs:
       - name: clippy (workspace, all targets, warnings denied)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test (workspace, no fail-fast)
-        # Three tests are skipped here BY NAME, and only these. They guard the
-        # shared main-tree checkout's state, not the product, and a fresh CI
-        # checkout cannot honestly supply what they measure; faking it would be
-        # the vacuous satisfaction they exist to refuse. They keep running in the
-        # main-tree lanes. Measured in a fresh clone at f644e6ef:
+        # Six tests are skipped here BY NAME, and only these; each name is unique
+        # across the workspace, so no filter can drop an unrelated test. They
+        # guard the main-tree checkout's own state, not the product, and a CI
+        # clone cannot honestly supply what they measure; faking it would be the
+        # vacuous satisfaction they exist to refuse. They keep running in the
+        # main tree.
+        # Measured in a fresh local clone at f644e6ef:
         # - the_unresolvable_citation_census_matches_the_measured_population:
         #   counts manifest citations of files that exist only untracked in the
         #   main tree, so a clean checkout measures a different population;
@@ -73,12 +79,22 @@ jobs:
         # - every_rust_side_launch_of_a_trusted_script_is_sealed: its
         #   anti-vacuity floor requires generated output on disk, which a fresh
         #   checkout never has (AGENTS.md, green-bar table).
+        # Measured on this runner (run 36068215033):
+        # - the three commit_anchor_reachability tests below classify cited
+        #   anchors against refs/original and the pre-filter-branch backup refs,
+        #   which exist only in the main repository and are never fetched. In a
+        #   clone every backup-only anchor becomes unresolvable, so the negative
+        #   control cannot be built, the floor sees 0, and the AGENTS.md row reads
+        #   as repaired. The tests say so themselves.
         run: |
           set -o pipefail
           cargo test --locked --workspace --no-fail-fast -- \
             --skip the_unresolvable_citation_census_matches_the_measured_population \
             --skip real_workspace_policy_report_is_complete_and_read_only \
             --skip every_rust_side_launch_of_a_trusted_script_is_sealed \
+            --skip the_classifier_separates_a_reachable_anchor_from_a_backup_only_one \
+            --skip the_allowance_carries_no_dead_or_zero_rows \
+            --skip a_derived_zero_is_refused_as_a_broken_scan \
             2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: executed-test floor
         if: always()

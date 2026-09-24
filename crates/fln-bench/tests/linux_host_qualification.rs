@@ -106,6 +106,23 @@ fn thermal_sensor_only_policy() -> HostQualificationPolicy {
     }
 }
 
+/// Only physical topology is required. Virtualization and translation are
+/// permitted so the live topology fact is the only thing admission can refuse
+/// on; the proxy cells below cover those two refusals on their own.
+fn topology_only_policy() -> HostQualificationPolicy {
+    HostQualificationPolicy {
+        require_physical_topology: true,
+        require_power_governor: false,
+        require_thermal_sensors: false,
+        require_exclusive_cores: false,
+        require_stable_frequency: false,
+        require_thermal_stability: false,
+        allow_virtualization: true,
+        allow_translation: true,
+        allow_profiler: false,
+    }
+}
+
 /// odwj's host policy: every environmental control the bead names must be
 /// attested.  This is the policy a real Reference-baseline workload must carry;
 /// a lane that relaxes it is measuring a different host than the one odwj
@@ -382,17 +399,7 @@ fn a_host_that_clears_topology_is_still_refused_for_the_attestations_it_cannot_s
     // above could pass because `validate_host` refuses everything, and the
     // suite would be a wall rather than a measurement.
     let profile = capture();
-    let policy = HostQualificationPolicy {
-        require_physical_topology: true,
-        require_power_governor: false,
-        require_thermal_sensors: false,
-        require_exclusive_cores: false,
-        require_stable_frequency: false,
-        require_thermal_stability: false,
-        allow_virtualization: false,
-        allow_translation: false,
-        allow_profiler: false,
-    };
+    let policy = topology_only_policy();
     let workload = workload_with(policy);
     let host_root = profile.root();
     let workload_root = workload.root();
@@ -506,20 +513,7 @@ fn blocked_host_qualification_agrees_with_bundle_admission() {
     // cannot pass by both sides always refusing.
     for (label, policy) in [
         ("strict", strict_baseline_policy()),
-        (
-            "topology-only",
-            HostQualificationPolicy {
-                require_physical_topology: true,
-                require_power_governor: false,
-                require_thermal_sensors: false,
-                require_exclusive_cores: false,
-                require_stable_frequency: false,
-                require_thermal_stability: false,
-                allow_virtualization: false,
-                allow_translation: false,
-                allow_profiler: false,
-            },
-        ),
+        ("topology-only", topology_only_policy()),
     ] {
         let profile = capture();
         let report = qualify_host(&profile, policy);
@@ -691,14 +685,30 @@ fn a_positive_thermal_sensor_count_passes_without_parsing_display_text() {
     );
 }
 
-fn profile_with_virtualization(value: &str) -> HostProfile {
+/// The live profile with the two proxy facts set to what `capture_local`
+/// records on a native bare-metal host. The proxy cells substitute from this
+/// rather than from the live capture, because the live capture is itself a proxy
+/// on a hosted CI runner (`hypervisor-detected` there), and a substitution that
+/// leaves the fact unchanged proves nothing.
+fn native_profile() -> HostProfile {
     let mut profile = capture();
+    profile.virtualization =
+        Captured::observed("no-hypervisor-flag".to_string(), CaptureSource::Procfs);
+    profile.translation = Captured::observed(
+        "native-target-architecture".to_string(),
+        CaptureSource::BuildMetadata,
+    );
+    profile
+}
+
+fn profile_with_virtualization(value: &str) -> HostProfile {
+    let mut profile = native_profile();
     profile.virtualization = Captured::observed(value.to_string(), CaptureSource::Procfs);
     profile
 }
 
 fn profile_with_translation(value: &str) -> HostProfile {
-    let mut profile = capture();
+    let mut profile = native_profile();
     profile.translation = Captured::observed(value.to_string(), CaptureSource::BuildMetadata);
     profile
 }
@@ -765,16 +775,18 @@ fn a_translated_host_is_refused_as_a_proxy_and_the_check_is_named() {
 }
 
 #[test]
-fn the_real_bare_metal_host_is_not_refused_as_a_proxy() {
+fn a_native_profile_is_not_refused_as_a_proxy() {
     // THE POSITIVE CONTROL, and it is the whole reason the two cells above mean
-    // anything. Under the same proxy-only policy, THIS host — genuinely bare
-    // metal and native — must NOT be refused. Without this, a qualify_host that
-    // rejected every profile would satisfy both cells above while making every
-    // legitimate host unqualifiable, which is a wall rather than a guard.
-    let report = qualify_host(&capture(), proxy_only_policy());
+    // anything. Under the same proxy-only policy, a bare-metal native profile
+    // must NOT be refused. Without this, a qualify_host that rejected every
+    // profile would satisfy both cells above while making every legitimate host
+    // unqualifiable, which is a wall rather than a guard. The profile is the
+    // live capture with the two proxy facts set to native, so the cell holds on
+    // a hosted runner too, where the live capture is itself a proxy.
+    let report = qualify_host(&native_profile(), proxy_only_policy());
     assert!(
         report.is_ok(),
-        "this host is bare metal and native, so the proxy-only policy must admit it; \
+        "a bare-metal native profile must be admitted by the proxy-only policy; \
          blocked on {:?}",
         report.err().map(|b| b.failing_checks)
     );
@@ -783,38 +795,40 @@ fn the_real_bare_metal_host_is_not_refused_as_a_proxy() {
 #[test]
 fn the_substitution_is_the_only_thing_that_changed() {
     // Anti-vacuity for the two mutation cells: prove the constructed profiles
-    // differ from the live one in EXACTLY the substituted fact. If a helper
-    // accidentally perturbed something else, the refusals above could be
+    // differ from the native baseline in EXACTLY the substituted fact. If a
+    // helper accidentally perturbed something else, the refusals above could be
     // attributable to that instead, and the cells would be measuring the wrong
     // thing while looking correct.
-    let live = capture();
+    let base = native_profile();
     let virt = profile_with_virtualization("hypervisor-detected");
     let trans = profile_with_translation("translated-x86-on-arm");
 
-    assert_eq!(live.cpu_sku, virt.cpu_sku);
+    assert_eq!(base.cpu_sku, virt.cpu_sku);
     assert_eq!(
-        live.translation, virt.translation,
+        base.translation, virt.translation,
         "the virt cell must not touch translation"
     );
     assert_ne!(
-        live.virtualization, virt.virtualization,
+        base.virtualization, virt.virtualization,
         "the virt cell must change virtualization"
     );
 
-    assert_eq!(live.cpu_sku, trans.cpu_sku);
+    assert_eq!(base.cpu_sku, trans.cpu_sku);
     assert_eq!(
-        live.virtualization, trans.virtualization,
+        base.virtualization, trans.virtualization,
         "the translation cell must not touch virtualization"
     );
     assert_ne!(
-        live.translation, trans.translation,
+        base.translation, trans.translation,
         "the translation cell must change translation"
     );
 }
 
 // WHAT THIS DOES NOT EARN: it establishes that a profile DECLARING a hypervisor
-// or a translated target is refused. It does not establish that a real VM would
-// be detected — that depends on `capture_local`'s hypervisor-flag probe, which
-// this host cannot exercise because it has no hypervisor. Detection and refusal
-// are separate properties, and only refusal is covered here. Say so in the
-// commit message rather than letting "proxy host acceptance: killed" imply both.
+// or a translated target is refused. Detection is a separate property and no test
+// here holds it. It has been observed once: on the product gate's hosted
+// ubuntu-24.04 runner, `capture_local`'s hypervisor-flag probe reported
+// `hypervisor-detected` (run 36068215033, which failed the old live-host
+// positive controls for exactly that reason). One runner, one run, class
+// `bounded_model`. Say so in the commit message rather than letting "proxy host
+// acceptance: killed" imply both.
