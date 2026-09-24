@@ -1,0 +1,96 @@
+# The product gate (bead franken_lean-z8j.1.21).
+#
+# ci.yml has never had a green run: its evidence and governance lanes fail
+# before the product is tested, so a red there carries no information about the
+# code. This gate runs only the three checks AGENTS.md makes mandatory for every
+# change: rustfmt, workspace clippy with warnings denied, and the whole workspace
+# test suite. It must stay green, and it is the check that says whether main
+# builds and passes.
+#
+# Anti-vacuity: a green that ran fewer tests than were measured is refused, so
+# the gate cannot be "fixed" by skipping tests. FLOOR is the passed count of a
+# CI-faithful local run (fresh clone, no census shards) at f644e6ef: 7526 passed
+# across 524 test binaries. Raise it when the measured count rises; lowering it
+# needs the reason in the commit that does it.
+#
+# What this does NOT run: the pinned Reference toolchain is not installed here,
+# so pin-dependent suites take their typed SKIP (contract-drift.yml is the
+# weekly lane that installs the pin and holds those to account).
+
+name: product gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      FLOOR: '7526'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # History-reading guards (commit anchors, first-parent walks) need it.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (workspace, all targets, warnings denied)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: test (workspace, no fail-fast)
+        # Three tests are skipped here BY NAME, and only these. They guard the
+        # shared main-tree checkout's state, not the product, and a fresh CI
+        # checkout cannot honestly supply what they measure; faking it would be
+        # the vacuous satisfaction they exist to refuse. They keep running in the
+        # main-tree lanes. Measured in a fresh clone at f644e6ef:
+        # - the_unresolvable_citation_census_matches_the_measured_population:
+        #   counts manifest citations of files that exist only untracked in the
+        #   main tree, so a clean checkout measures a different population;
+        # - real_workspace_policy_report_is_complete_and_read_only: runs the
+        #   operator's `br` binary against the live tracker; CI has no `br`;
+        # - every_rust_side_launch_of_a_trusted_script_is_sealed: its
+        #   anti-vacuity floor requires generated output on disk, which a fresh
+        #   checkout never has (AGENTS.md, green-bar table).
+        run: |
+          set -o pipefail
+          cargo test --locked --workspace --no-fail-fast -- \
+            --skip the_unresolvable_citation_census_matches_the_measured_population \
+            --skip real_workspace_policy_report_is_complete_and_read_only \
+            --skip every_rust_side_launch_of_a_trusted_script_is_sealed \
+            2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: executed-test floor
+        if: always()
+        run: |
+          python3 -I - "$RUNNER_TEMP/test.log" "$FLOOR" <<'PY'
+          import re, sys
+          log, floor = open(sys.argv[1], encoding="utf-8", errors="replace").read(), int(sys.argv[2])
+          results = re.findall(r"^test result: \w+\. (\d+) passed; (\d+) failed", log, re.M)
+          passed = sum(int(p) for p, _ in results)
+          failed = sum(int(f) for _, f in results)
+          print(f"product-gate: {len(results)} test binaries, {passed} passed, {failed} failed, floor {floor}")
+          if failed or passed < floor:
+              sys.exit(f"product-gate: REFUSED (failed={failed}, passed={passed} < floor {floor})"
+                       if passed < floor else f"product-gate: REFUSED ({failed} failed)")
+          PY
