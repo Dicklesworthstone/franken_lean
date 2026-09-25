@@ -347,3 +347,71 @@ fn unsafe_proof_sources_do_not_gain_admission_from_irrelevance() {
     );
     assert!(matches!(outcome, Verdict::Rejected(_)), "{outcome:?}");
 }
+
+/// Both callers reach the typed lane only after untyped conversion has deferred
+/// the root pair, so the lane must not ask untyped conversion that question
+/// again. Measured in polls of the one cancellation hook: the declared type
+/// `T (slow p)` and the body type `T (slow q)` differ only in a proof under
+/// `slow`, which unfolds to a `WRAPS`-deep tower, so every untyped walk of the
+/// pair costs about the same. Admission makes one before the lane, and the lane
+/// needs one more, for `slow q ≟ slow p`, before proof irrelevance closes it.
+/// Asking the root again would add a third.
+#[test]
+fn the_typed_lane_does_not_repeat_the_deferred_root_query() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq_with};
+    use fln_checker::whnf::WhnfContext;
+    const WRAPS: usize = 200;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound, |inner, _| app(c("wrapP"), [inner]));
+    let slow = |proof: &str| app(c("slow"), [c(proof)]);
+    let env = environment_of(vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("wrapP", pi(c("P"), c("P"))),
+        entry("T", pi(c("P"), Expr::sort(Level::one()))),
+        definition(
+            "slow",
+            decoded(&pi(c("P"), c("P"))),
+            decoded(&lam(c("P"), tower)),
+        ),
+        entry("w", app(c("T"), [slow("q")])),
+    ]);
+    let declared = app(c("T"), [slow("p")]);
+    let body_type = app(c("T"), [slow("q")]);
+
+    let walk_polls = Cell::new(0_u64);
+    let walk = def_eq_with(
+        &decoded(&body_type),
+        &decoded(&declared),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            walk_polls.set(walk_polls.get() + 1);
+            false
+        },
+    );
+    assert!(
+        matches!(walk, DefEqOutcome::Deferred { .. }),
+        "untyped conversion must defer the pair for this test to mean anything: {walk:?}"
+    );
+    let walk = walk_polls.get();
+    assert!(
+        walk > u64::try_from(WRAPS).expect("small"),
+        "one walk: {walk} polls"
+    );
+
+    let candidate = definition("d", decoded(&declared), decoded(&c("w")));
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || {
+        polls.set(polls.get() + 1);
+        false
+    });
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    assert!(
+        2 * admission < 5 * walk,
+        "admission polled {admission} times, at least two and a half untyped walks of the \
+         deferred pair ({walk} each): the typed lane asked the root again"
+    );
+}

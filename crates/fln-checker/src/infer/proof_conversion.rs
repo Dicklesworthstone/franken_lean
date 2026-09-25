@@ -554,11 +554,15 @@ impl Probe<'_> {
         });
         Ok(WireExpr::from_parts(nodes, term.levels().to_vec(), root))
     }
+    /// `root_deferred`: untyped conversion has just deferred this exact root
+    /// pair, so asking it again would repeat that whole search for the same
+    /// answer. Only the root is skipped; every derived pair is asked as usual.
     fn run(
         &mut self,
         left: &WireExpr,
         right: &WireExpr,
         context: &InferenceContext,
+        root_deferred: bool,
     ) -> Result<bool> {
         enum Work {
             Pair(WireExpr, WireExpr, InferenceContext),
@@ -592,6 +596,7 @@ impl Probe<'_> {
             }
         }
         let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
+        let mut skip_untyped = root_deferred;
         'work: while let Some(task) = work.pop() {
             self.tick()?;
             let (left, right, context) = match task {
@@ -643,10 +648,12 @@ impl Probe<'_> {
                     continue;
                 }
             };
-            match self.equal(&left, &right, &context)? {
-                Some(true) => continue,
-                Some(false) => return Ok(false),
-                None => {}
+            if !std::mem::take(&mut skip_untyped) {
+                match self.equal(&left, &right, &context)? {
+                    Some(true) => continue,
+                    Some(false) => return Ok(false),
+                    None => {}
+                }
             }
             // Both witnesses must independently type-check as proofs. The two
             // proposition types become a further conversion obligation; merely
@@ -693,7 +700,7 @@ impl Probe<'_> {
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
                 if let Some(((major_type, constructor_type), reduced)) =
                     self.k_reduction(s, &context)?
-                    && self.run(&major_type, &constructor_type, &context)?
+                    && self.run(&major_type, &constructor_type, &context, false)?
                 {
                     let (a, b) = if s_on_left {
                         (reduced, t.clone())
@@ -938,6 +945,9 @@ fn head_constant(term: &WireExpr) -> Option<&WireName> {
     }
 }
 
+/// The typed lane for a pair untyped conversion has just DEFERRED, under an
+/// equivalent context: both callers reach it only on that outcome, so the root's
+/// untyped query is not repeated.
 pub(crate) fn proof_conversion_with(
     left: &WireExpr,
     right: &WireExpr,
@@ -955,7 +965,7 @@ pub(crate) fn proof_conversion_with(
         reserved: BTreeSet::new(),
         next: 0,
     };
-    match probe.run(left, right, context) {
+    match probe.run(left, right, context, true) {
         Ok(equal) => ProofConversionOutcome::Complete {
             equal,
             polls: probe.steps,
