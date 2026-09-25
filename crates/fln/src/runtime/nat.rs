@@ -124,35 +124,44 @@ impl Preparation<'_> {
         })
     }
 
-    /// Apply only explicit beta redexes before branch preparation. In
-    /// particular, an unused induction hypothesis disappears rather than
-    /// eagerly evaluating every predecessor of a plain, nonrecursive match.
+    /// Apply generated branch arguments without evaluating or substituting a
+    /// strict local initializer. Beta still removes an unused symbolic IH, but
+    /// a let before that lambda remains a real, once-only runtime computation.
+    /// The same operation is used by data, indexed and mutual eliminators.
     pub(super) fn minor_apply(
         &mut self,
         mut function: Expr,
-        argument: Expr,
+        mut argument: Expr,
     ) -> Result<Expr, IngressError> {
-        loop {
+        let mut bindings = Vec::new();
+        let mut result = loop {
             self.tick()?;
             match function.node() {
                 ExprNode::MData { expr, .. } => function = expr.clone(),
-                ExprNode::LetE { value, body, .. } => {
-                    // Source recursion retains the current constructor in a
-                    // checked local let around generalized arguments. Open it
-                    // before applying those arguments; admission already
-                    // checked even an unused local type and value.
-                    function = body
-                        .subst_loose(0, std::slice::from_ref(value))
-                        .map_err(|_| unsupported("Nat minor let scope"))?;
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => {
+                    // (let x := v; f) a = let x := v; f (lift a).
+                    // Substituting v instead can discard an initializer, run it
+                    // repeatedly, or move it after the application argument.
+                    reserve(&mut bindings, self.limits.max_context_depth)?;
+                    bindings.push((decl_name.clone(), type_.clone(), value.clone(), *non_dep));
+                    argument = self.lift(&argument, 1)?;
+                    function = body.clone();
                 }
-                ExprNode::Lam { body, .. } => {
-                    return body
-                        .subst_loose(0, &[argument])
-                        .map_err(|_| unsupported("Nat minor substitution scope"));
-                }
-                _ => return Ok(Expr::app(function, argument)),
+                ExprNode::Lam { body, .. } => break self.substitution(body, &argument)?,
+                _ => break Expr::app(function, argument),
             }
+        };
+        for (name, type_, value, nondep) in bindings.into_iter().rev() {
+            self.tick()?;
+            result = Expr::let_e(name, type_, value, result, nondep);
         }
+        Ok(result)
     }
 
     pub(super) fn nat_recursion(&mut self, args: &[Expr]) -> Result<Recursion, IngressError> {
@@ -383,3 +392,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod strict;
