@@ -48,6 +48,17 @@ fn node(syntax: Syntax, kind: &str, count: usize) -> Result<Vec<Syntax>, NatDefi
 fn children(syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError> {
     take(syntax, Name::from_components(["null"]), None)
 }
+fn sequence_items(sequence: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    if sequence.kind() == Some(&parser_kind(&["Term", "doSeqBracketed"])) {
+        let mut parts = node(sequence, "doSeqBracketed", 3)?;
+        expect_atom(&parts[0], "{", "do opening brace")?;
+        expect_atom(&parts[2], "}", "do closing brace")?;
+        children(parts.remove(1))
+    } else {
+        let mut parts = node(sequence, "doSeqIndent", 1)?;
+        children(parts.pop().expect("sequence items"))
+    }
+}
 fn call(bind: bool, arguments: Vec<Syntax>) -> Syntax {
     // These internal nodes preserve the expected monad before type conversion
     // unfolds aliases such as Id. They do not name user-overridable globals.
@@ -190,8 +201,7 @@ impl Context {
         let mut parts = node(syntax, "do", 2)?;
         let sequence = parts.pop().expect("do sequence");
         expect_atom(&parts[0], "do", "do keyword")?;
-        let mut sequence = node(sequence, "doSeqIndent", 1)?;
-        let statements = children(sequence.pop().expect("sequence items"))?;
+        let statements = sequence_items(sequence)?;
         let mut result = None;
         for statement in statements.into_iter().rev() {
             self.tick()?;

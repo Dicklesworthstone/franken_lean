@@ -1,14 +1,15 @@
 //! Sequential do notation on the ordinary, nonrecursive term-frame stack.
 //!
-//! Every statement owns its original leaves. This bounded parser handles
-//! immutable named lets, named monadic binds, actions and terminal returns;
-//! control-flow/mutable/pattern do elements are refused rather than reinterpreted.
+//! Every statement owns its original leaves. Immutable named lets, named
+//! monadic binds, actions and terminal returns support both indentation and
+//! explicit braces. Control-flow/mutable/pattern elements remain typed refusals.
 use super::*;
 use term_locals::word;
 
 pub(super) struct Prefix {
     keyword: usize,
     baseline: usize,
+    braces: Option<(usize, Option<usize>)>,
     items: Vec<Syntax>,
     statement: Statement,
     annotation: Option<Syntax>,
@@ -71,12 +72,20 @@ impl Prefix {
         cursor: &mut usize,
         end: usize,
     ) -> Result<Self, NatDefinitionParseError> {
+        let braces = if word(tokens, *cursor, "{") {
+            let open = *cursor;
+            *cursor += 1;
+            Some((open, None))
+        } else {
+            None
+        };
         if *cursor >= end {
             return Err(refuse(view, tokens, *cursor));
         }
         let mut p = Self {
             keyword,
             baseline: column(view, tokens, *cursor),
+            braces,
             items: Vec::new(),
             statement: Statement::Action,
             annotation: None,
@@ -275,7 +284,19 @@ impl Prefix {
         let terminal = matches!(self.statement, Statement::Return(_));
         let binding = matches!(self.statement, Statement::Binding { .. });
         self.item(leaves, expression, semi)?;
-        if next >= end
+        if let Some((_, close)) = &mut self.braces {
+            if next < end && word(tokens, next, "}") {
+                if binding {
+                    return Err(refuse(view, tokens, next));
+                }
+                *close = Some(next);
+                self.phase = Phase::Done;
+                return Ok((self, next + 1));
+            }
+            if next >= end || closing(tokens, next) {
+                return Err(refuse(view, tokens, next));
+            }
+        } else if next >= end
             || closing(tokens, next)
             || (newline(view, tokens, next) && column(view, tokens, next) < self.baseline)
         {
@@ -283,12 +304,12 @@ impl Prefix {
                 return Err(refuse(view, tokens, next));
             }
             self.phase = Phase::Done;
-        } else {
-            if terminal {
-                return Err(refuse(view, tokens, next));
-            }
-            self.begin(view, tokens, &mut next, end)?;
+            return Ok((self, next));
         }
+        if terminal {
+            return Err(refuse(view, tokens, next));
+        }
+        self.begin(view, tokens, &mut next, end)?;
         Ok((self, next))
     }
     pub(super) fn finish(
@@ -296,6 +317,12 @@ impl Prefix {
         leaves: &Leaves,
         value: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+        if self.braces.is_some_and(|(_, close)| close.is_none()) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(0),
+                expected: NatDefinitionExpectation::ClosingParenthesis,
+            });
+        }
         if self.phase != Phase::Done {
             if self.phase != Phase::Value || matches!(self.statement, Statement::Binding { .. }) {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -305,16 +332,21 @@ impl Prefix {
             }
             self.item(leaves, value, None)?;
         }
+        let sequence = if let Some((open, Some(close))) = self.braces {
+            Syntax::node(
+                parser_kind(&["Term", "doSeqBracketed"]),
+                vec![leaves.leaf(open)?, null_node(self.items), leaves.leaf(close)?],
+            )
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "doSeqIndent"]),
+                vec![null_node(self.items)],
+            )
+        };
         Ok((
             Syntax::node(
                 parser_kind(&["Term", "do"]),
-                vec![
-                    atom(leaves, self.keyword, "do")?,
-                    Syntax::node(
-                        parser_kind(&["Term", "doSeqIndent"]),
-                        vec![null_node(self.items)],
-                    ),
-                ],
+                vec![atom(leaves, self.keyword, "do")?, sequence],
             ),
             self.keyword,
         ))
@@ -322,21 +354,23 @@ impl Prefix {
 }
 
 /// Only body prefixes may close before the next do statement. Parentheses,
-/// annotations and records retain their own layout and delimiters.
+/// annotations and records retain their own layout and delimiters. Explicit
+/// braces, unlike indentation, cannot be closed by an offside token.
 pub(super) fn layout(
     view: &SourceView,
     tokens: &[LexedToken],
     frames: &[BoundedTermFrame],
     at: usize,
 ) -> Option<bool> {
-    if !newline(view, tokens, at) || word(tokens, at, ";") || closing(tokens, at) {
-        return None;
-    }
-    if frames.last().is_none_or(|f| {
-        f.application.is_empty()
-            && f.operands.is_empty()
-            && !matches!(&f.prefix, Some(term_locals::Prefix::Do(p)) if p.done())
+    if frames.last().is_some_and(|f| {
+        matches!(&f.prefix, Some(term_locals::Prefix::Do(p)) if p.done())
     }) {
+        return Some(true);
+    }
+    if frames
+        .last()
+        .is_none_or(|f| f.application.is_empty() && f.operands.is_empty())
+    {
         return None;
     }
     for frame in frames.iter().rev() {
@@ -345,8 +379,14 @@ pub(super) fn layout(
         }
         match frame.prefix.as_ref()? {
             term_locals::Prefix::Do(p) if p.phase != Phase::Annotation => {
+                if p.braces.is_some() && word(tokens, at, "}") {
+                    return Some(false);
+                }
+                if !newline(view, tokens, at) || word(tokens, at, ";") || closing(tokens, at) {
+                    return None;
+                }
                 let col = column(view, tokens, at);
-                return (col <= p.baseline).then_some(col < p.baseline);
+                return (col <= p.baseline).then_some(p.braces.is_none() && col < p.baseline);
             }
             p if p.body() => {}
             _ => return None,
