@@ -23,7 +23,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::fmt;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 struct Entry {
@@ -33,15 +33,44 @@ struct Entry {
     result: WhnfResult,
 }
 
+impl Entry {
+    fn matches(
+        &self,
+        input: &WireExpr,
+        delta_mode: DeltaMode,
+        materialization: TermBudget,
+    ) -> bool {
+        self.delta_mode == delta_mode
+            && self.materialization == materialization
+            && *self.input == *input
+    }
+}
+
+/// Whether a bucket takes a new entry: it is not full, and holds no equal one.
+fn admits(
+    bucket: &[Entry],
+    input: &WireExpr,
+    delta_mode: DeltaMode,
+    materialization: TermBudget,
+) -> bool {
+    bucket.len() < MAX_BUCKET_ENTRIES
+        && !bucket
+            .iter()
+            .any(|entry| entry.matches(input, delta_mode, materialization))
+}
+
 /// Past either bound the memo stops growing; lookups continue. A memo lives as
 /// long as its context, one declaration's check, so both bound its memory.
 const MAX_ENTRIES: usize = 1 << 16;
 const MAX_STORED_NODES: usize = 1 << 20;
+/// A full bucket takes no more entries, so no input, however it collides, makes
+/// a lookup compare more than this many terms.
+const MAX_BUCKET_ENTRIES: usize = 8;
 
 #[derive(Default)]
 struct Table {
-    /// Keyed by a fixed-key fingerprint, so the order of results never depends on
-    /// the process; entries in a bucket are compared exactly.
+    /// Keyed by a fixed fingerprint, so the order of results never depends on the
+    /// process; entries in a bucket are compared exactly.
     buckets: HashMap<u64, Vec<Entry>>,
     entries: usize,
     stored_nodes: usize,
@@ -67,8 +96,58 @@ impl fmt::Debug for WhnfMemo {
     }
 }
 
+/// A fixed multiplicative hash. A fingerprint only picks a bucket, whose entries
+/// are compared exactly, so it needs speed and a fixed key, not resistance to
+/// chosen inputs; `MAX_BUCKET_ENTRIES` bounds what a collision can cost. Every
+/// lookup hashes its whole input, which `std`'s SipHash made 6 % of a heavy
+/// declaration's check.
+#[derive(Default)]
+struct Fingerprinter(u64);
+
+impl Fingerprinter {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for Fingerprinter {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
+        }
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            for (slot, byte) in word.iter_mut().zip(rest) {
+                *slot = *byte;
+            }
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(u64::try_from(value).unwrap_or(u64::MAX));
+    }
+}
+
 fn fingerprint(input: &WireExpr, delta_mode: DeltaMode, materialization: TermBudget) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fingerprinter::default();
     input.hash(&mut hasher);
     delta_mode.hash(&mut hasher);
     materialization.hash(&mut hasher);
@@ -99,11 +178,7 @@ impl WhnfMemo {
             .buckets
             .get(&fingerprint(input, delta_mode, budget.materialization))?
             .iter()
-            .find(|entry| {
-                entry.delta_mode == delta_mode
-                    && entry.materialization == budget.materialization
-                    && *entry.input == *input
-            })
+            .find(|entry| entry.matches(input, delta_mode, budget.materialization))
             .filter(|entry| covers(budget, &entry.result))
             .map(|entry| entry.result.clone())
     }
@@ -136,11 +211,7 @@ impl WhnfMemo {
             .buckets
             .entry(fingerprint(&input, delta_mode, materialization))
             .or_default();
-        if bucket.iter().any(|entry| {
-            entry.delta_mode == delta_mode
-                && entry.materialization == materialization
-                && *entry.input == *input
-        }) {
+        if !admits(bucket, &input, delta_mode, materialization) {
             return;
         }
         bucket.push(Entry {
@@ -265,6 +336,47 @@ mod tests {
             panic!("core reduction must complete: {core:?}");
         };
         assert_eq!(core.term, link);
+    }
+
+    #[test]
+    fn a_full_bucket_takes_no_more_entries() {
+        let entry = |index: usize| Entry {
+            input: Arc::new(constant(&format!("c{index}"))),
+            delta_mode: DeltaMode::Eager,
+            materialization: TermBudget::unlimited(),
+            result: WhnfResult {
+                term: constant("done"),
+                steps: 1,
+                reductions: 1,
+                delta_reductions: 0,
+                has_auxiliary_work: false,
+                string_progress: StringExpansionProgress::default(),
+            },
+        };
+        let admits_fresh = |bucket: &[Entry]| {
+            admits(
+                bucket,
+                &constant("fresh"),
+                DeltaMode::Eager,
+                TermBudget::unlimited(),
+            )
+        };
+        let mut bucket: Vec<Entry> = (1..MAX_BUCKET_ENTRIES).map(entry).collect();
+        assert!(
+            admits_fresh(&bucket),
+            "a bucket with room takes a new input"
+        );
+        assert!(
+            !admits(
+                &bucket,
+                &constant("c1"),
+                DeltaMode::Eager,
+                TermBudget::unlimited()
+            ),
+            "an input already present is not added twice"
+        );
+        bucket.push(entry(MAX_BUCKET_ENTRIES));
+        assert!(!admits_fresh(&bucket), "a full bucket takes nothing more");
     }
 
     #[test]
