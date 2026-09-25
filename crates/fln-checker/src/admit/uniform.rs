@@ -708,12 +708,15 @@ impl Shape<'_> {
 
 /// A sound sufficient universe inequality, not a full solver. Both normalized
 /// DAGs are independent checker values. imax a b is bounded above by max a b
-/// and below by b; using either bound cannot admit an oversized field.
+/// and below by b; it is also monotone in both arguments. Keep these as
+/// alternative sufficient proofs, rather than losing the zero case by always
+/// replacing a left-hand imax with its max upper bound.
 fn universe_within(
     required: &WireLevel,
     allowed: &WireLevel,
     audit: &mut Audit<'_>,
 ) -> Result<bool, InductiveVerdict> {
+    audit.tick()?;
     let left = normalize(required).map_err(|_| overflow())?;
     let right = normalize(allowed).map_err(|_| overflow())?;
     if left.structurally_equals(&right) {
@@ -730,27 +733,51 @@ fn universe_within(
         if done.len().saturating_add(pending.len()) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
             return Err(arena_limit(done.len().saturating_add(pending.len())));
         }
-        let mut dependencies = Vec::new();
-        let mut all = true;
+        // Disjunction of conjunctions: every premise of ONE alternative must
+        // hold. In particular, imax monotonicity needs BOTH argument bounds.
+        let mut alternatives = Vec::new();
         let fixed = match (&left.nodes()[l], &right.nodes()[r]) {
             (NormalNode::Zero, _) => Some(true),
             (NormalNode::Parameter(a), NormalNode::Parameter(b)) if a == b => Some(true),
             (NormalNode::Meta(a), NormalNode::Meta(b)) if a == b => Some(true),
             (NormalNode::Succ(a), NormalNode::Succ(b)) => {
-                dependencies.push((a.index(), b.index()));
+                alternatives.push(vec![(a.index(), b.index())]);
                 None
             }
-            (NormalNode::Max(a, b) | NormalNode::IMax(a, b), _) => {
-                dependencies.extend([(a.index(), r), (b.index(), r)]);
+            (NormalNode::IMax(a, b), other) => {
+                // Original sufficient upper bound remains available.
+                alternatives.push(vec![(a.index(), r), (b.index(), r)]);
+                match other {
+                    NormalNode::IMax(c, d) => {
+                        // If b = 0 the left is zero. Otherwise b <= d makes
+                        // d positive, so both sides are ordinary maxima.
+                        alternatives.push(vec![(a.index(), c.index()), (b.index(), d.index())]);
+                        alternatives.push(vec![(l, d.index())]);
+                    }
+                    NormalNode::Max(c, d) => {
+                        alternatives.push(vec![(l, c.index())]);
+                        alternatives.push(vec![(l, d.index())]);
+                    }
+                    NormalNode::Succ(c) => {
+                        // Only weaken the RIGHT side. Never strip a successor
+                        // from the left: succ(imax a b) <= imax a b is false.
+                        alternatives.push(vec![(l, c.index())]);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            (NormalNode::Max(a, b), _) => {
+                alternatives.push(vec![(a.index(), r), (b.index(), r)]);
                 None
             }
             (_, NormalNode::Max(a, b)) => {
-                dependencies.extend([(l, a.index()), (l, b.index())]);
-                all = false;
+                alternatives.push(vec![(l, a.index())]);
+                alternatives.push(vec![(l, b.index())]);
                 None
             }
             (_, NormalNode::Succ(b) | NormalNode::IMax(_, b)) => {
-                dependencies.push((l, b.index()));
+                alternatives.push(vec![(l, b.index())]);
                 None
             }
             _ => Some(false),
@@ -758,19 +785,23 @@ fn universe_within(
         if let Some(value) = fixed {
             done.insert((l, r), value);
         } else if exit {
-            let value = if all {
-                dependencies
+            let value = alternatives.iter().any(|premises| {
+                premises
                     .iter()
                     .all(|pair| done.get(pair) == Some(&true))
-            } else {
-                dependencies
-                    .iter()
-                    .any(|pair| done.get(pair) == Some(&true))
-            };
+            });
             done.insert((l, r), value);
         } else {
+            // Every edge decreases at least one of the two DAG indices. The
+            // existing heap worklist, memo table and audit bound all branches.
             pending.push(((l, r), true));
-            pending.extend(dependencies.into_iter().rev().map(|pair| (pair, false)));
+            pending.extend(
+                alternatives
+                    .into_iter()
+                    .rev()
+                    .flat_map(|premises| premises.into_iter().rev())
+                    .map(|pair| (pair, false)),
+            );
         }
     }
     Ok(done.get(&root) == Some(&true))
@@ -1145,6 +1176,194 @@ fn check(
 #[cfg(test)]
 mod annotation_tests {
     use super::*;
+
+    fn universe_id(index: usize) -> LevelId {
+        LevelId::from_index(index).expect("small universe fixture")
+    }
+
+    fn compare_universes(
+        nodes: &[LevelNode],
+        left: usize,
+        right: usize,
+        comparisons: u64,
+        cancelled: bool,
+    ) -> Result<bool, InductiveVerdict> {
+        let mut budget = AdmissionBudget::unlimited();
+        budget.conversion.quick.max_comparisons = comparisons;
+        let mut control = StructuralComparisonControl::new(budget.conversion.quick);
+        let mut poll = || cancelled;
+        let mut audit = Audit {
+            budget,
+            comparison: &mut control,
+            cancelled: &mut poll,
+        };
+        let left = WireLevel::from_parts(nodes.to_vec(), universe_id(left));
+        let right = WireLevel::from_parts(nodes.to_vec(), universe_id(right));
+        universe_within(&left, &right, &mut audit)
+    }
+
+    fn imax_universes() -> Vec<LevelNode> {
+        vec![
+            LevelNode::Zero,                                // 0
+            LevelNode::Parameter(checker_atom("u")),        // 1
+            LevelNode::Parameter(checker_atom("v")),        // 2
+            LevelNode::Parameter(checker_atom("w")),        // 3
+            LevelNode::IMax(universe_id(1), universe_id(2)), // 4: imax u v
+            LevelNode::Succ(universe_id(4)),                // 5
+            LevelNode::Max(universe_id(4), universe_id(3)),  // 6
+            LevelNode::Succ(universe_id(1)),                // 7
+            LevelNode::IMax(universe_id(7), universe_id(2)), // 8
+            LevelNode::Max(universe_id(1), universe_id(2)),  // 9
+            LevelNode::Succ(universe_id(8)),                // 10
+            LevelNode::Meta(checker_atom("u")),             // 11
+            LevelNode::IMax(universe_id(11), universe_id(2)), // 12
+            LevelNode::IMax(universe_id(1), universe_id(3)), // 13
+            LevelNode::IMax(universe_id(1), universe_id(0)), // 14
+            LevelNode::Succ(universe_id(14)),               // 15
+        ]
+    }
+
+    #[test]
+    fn imax_universe_bounds_keep_correlated_arguments_and_nested_reflexivity() {
+        let nodes = imax_universes();
+        for (left, right) in [
+            (4, 5),  // imax u v <= succ (imax u v)
+            (4, 6),  // imax u v <= max (imax u v) w
+            (4, 8),  // imax u v <= imax (succ u) v
+            (4, 10), // imax u v <= succ (imax (succ u) v)
+            (2, 4),  // v <= imax u v: retain the original lower bound
+            (4, 9),  // imax u v <= max u v: retain the original upper bound
+            (14, 0), // imax u 0 = 0
+            (0, 14),
+        ] {
+            assert!(
+                compare_universes(&nodes, left, right, 100_000, false).unwrap(),
+                "valid universe bound {left} <= {right} was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn imax_universe_bounds_refuse_successor_erasure_and_unrelated_variables() {
+        let nodes = imax_universes();
+        for (left, right) in [
+            (5, 4),  // succ (imax u v) is not <= imax u v
+            (5, 8),  // at u = v = 0 these sides are 1 and 0
+            (9, 4),  // max u v is not <= imax u v when v = 0
+            (1, 4),  // u is not an unconditional lower bound for imax u v
+            (8, 4),  // monotonicity cannot be reversed
+            (4, 13), // its second premise cannot be omitted
+            (1, 11), // a parameter and a metavariable are distinct
+            (4, 12), // its first premise cannot be omitted
+            (15, 14),
+        ] {
+            assert!(
+                !compare_universes(&nodes, left, right, 100_000, false).unwrap(),
+                "invalid universe bound {left} <= {right} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn universe_bounds_keep_budget_and_cancellation_as_nonanswers() {
+        let nodes = imax_universes();
+        for (left, right) in [(4, 4), (4, 8), (5, 4)] {
+            assert!(matches!(
+                compare_universes(&nodes, left, right, 0, false),
+                Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+                    QuickDefEqStop::Resource { .. }
+                )))
+            ));
+            assert!(matches!(
+                compare_universes(&nodes, left, right, 100_000, true),
+                Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+                    QuickDefEqStop::Cancelled { .. }
+                )))
+            ));
+        }
+        assert!(matches!(
+            compare_universes(&nodes, 4, 8, 2, false),
+            Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+                QuickDefEqStop::Resource { .. }
+            )))
+        ));
+        // An interrupted run leaves no persistent memoized answer.
+        assert!(compare_universes(&nodes, 4, 8, 100_000, false).unwrap());
+    }
+
+    fn evaluate_universes(nodes: &[LevelNode], u: u64, v: u64) -> Vec<u64> {
+        let mut values: Vec<u64> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let value = match node {
+                LevelNode::Zero => 0,
+                LevelNode::Parameter(name) if name == &checker_atom("u") => u,
+                LevelNode::Parameter(name) => {
+                    assert_eq!(name, &checker_atom("v"));
+                    v
+                }
+                LevelNode::Succ(child) => values[child.index()] + 1,
+                LevelNode::Max(left, right) => {
+                    std::cmp::max(values[left.index()], values[right.index()])
+                }
+                LevelNode::IMax(left, right) => {
+                    if values[right.index()] == 0 {
+                        0
+                    } else {
+                        std::cmp::max(values[left.index()], values[right.index()])
+                    }
+                }
+                LevelNode::Meta(_) => unreachable!("closed two-parameter fixture"),
+            };
+            values.push(value);
+        }
+        values
+    }
+
+    #[test]
+    fn accepted_universe_bounds_hold_in_a_bounded_numeric_model() {
+        // This checks a finite model, not completeness of the inequality solver.
+        // The numeric evaluator above is independent of the proof-search rules.
+        let mut nodes = vec![
+            LevelNode::Zero,
+            LevelNode::Parameter(checker_atom("u")),
+            LevelNode::Parameter(checker_atom("v")),
+        ];
+        for index in 0..3 {
+            nodes.push(LevelNode::Succ(universe_id(index)));
+        }
+        for left in 0..3 {
+            for right in 0..3 {
+                nodes.push(LevelNode::Max(universe_id(left), universe_id(right)));
+                nodes.push(LevelNode::IMax(universe_id(left), universe_id(right)));
+            }
+        }
+        let first_layer = nodes.len();
+        for index in 0..first_layer {
+            nodes.push(LevelNode::Succ(universe_id(index)));
+            nodes.push(LevelNode::Max(universe_id(index), universe_id(1)));
+            nodes.push(LevelNode::IMax(universe_id(index), universe_id(2)));
+        }
+        let mut valuations = Vec::new();
+        for u in 0..=3 {
+            for v in 0..=3 {
+                valuations.push(evaluate_universes(&nodes, u, v));
+            }
+        }
+        for left in 0..nodes.len() {
+            for right in 0..nodes.len() {
+                if compare_universes(&nodes, left, right, 100_000, false).unwrap() {
+                    for values in &valuations {
+                        assert!(
+                            values[left] <= values[right],
+                            "universe bound {left} <= {right} fails numerically: {} > {}",
+                            values[left],
+                            values[right]
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn normalize(
         term: WireExpr,
