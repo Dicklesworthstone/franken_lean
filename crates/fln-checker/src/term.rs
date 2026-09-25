@@ -559,6 +559,58 @@ impl std::hash::Hasher for KeyHasher {
 type VisitMemo =
     std::collections::HashMap<VisitKey, ExprId, std::hash::BuildHasherDefault<KeyHasher>>;
 
+/// Past this many subject nodes a pure copy keys its visits in the map, so its
+/// table never costs more than the arena it indexes could.
+const DENSE_COPY_MAX_NODES: usize = 1 << 22;
+
+/// The visits already rewritten, keyed by what their output depends on.
+enum Visited {
+    /// A pure copy rewrites nothing, so a node's output is the same in every
+    /// binder context. One slot per subject node (its output index plus one; 0 is
+    /// unvisited) keeps all of the input's sharing and costs no hashing.
+    Copy(Vec<u32>),
+    Keyed(VisitMemo),
+}
+
+impl Visited {
+    fn for_plan(plan: &TransformPlan<'_>, subject_root: ExprId) -> Visited {
+        let pure_copy = plan.replacement.is_none()
+            && matches!(plan.operation, Operation::Raise)
+            && matches!(plan.root_mode, Mode::Rewrite { .. });
+        let slots = subject_root.index().saturating_add(1);
+        if pure_copy && slots <= DENSE_COPY_MAX_NODES {
+            Visited::Copy(vec![0; slots])
+        } else {
+            Visited::Keyed(VisitMemo::default())
+        }
+    }
+
+    fn get(&self, key: &VisitKey) -> Option<ExprId> {
+        match self {
+            Visited::Copy(slots) => slots
+                .get(key.1.index())
+                .and_then(|slot| slot.checked_sub(1))
+                .and_then(|index| ExprId::from_index(index as usize)),
+            Visited::Keyed(memo) => memo.get(key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: VisitKey, done: ExprId) {
+        match self {
+            Visited::Copy(slots) => {
+                if let (Some(slot), Ok(index)) =
+                    (slots.get_mut(key.1.index()), u32::try_from(done.index()))
+                {
+                    *slot = index.saturating_add(1);
+                }
+            }
+            Visited::Keyed(memo) => {
+                memo.insert(key, done);
+            }
+        }
+    }
+}
+
 struct Transformer<'a, 'c> {
     subject: &'a WireExpr,
     subject_root: ExprId,
@@ -575,7 +627,7 @@ struct Transformer<'a, 'c> {
     /// Each (arena, node, binder context) is rewritten once: a node shared in
     /// the input is shared in the output, so a DAG costs its size, not the
     /// size of its tree.
-    memo: VisitMemo,
+    memo: Visited,
 }
 
 impl<'a, 'c> Transformer<'a, 'c> {
@@ -1287,7 +1339,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
             match task {
                 Task::Visit { input, id, mode } => {
                     if let Some(done) = self.memo.get(&(input, id, mode)) {
-                        self.values.push(*done);
+                        self.values.push(done);
                         continue;
                     }
                     self.tasks.push(Task::Record((input, id, mode)));
@@ -1380,7 +1432,7 @@ fn transform_subterms_with(
         compact_levels: plan.compact_levels,
         values: Vec::new(),
         tasks: Vec::new(),
-        memo: VisitMemo::default(),
+        memo: Visited::for_plan(&plan, subject_root),
     };
     outcome(transformer.run(plan.root_mode))
 }
@@ -1637,6 +1689,105 @@ mod tests {
             assert!(
                 matches!(&copy, TermOutcome::Complete(copied) if copied.levels().len() == 1),
                 "{copy:?}"
+            );
+        }
+    }
+
+    fn name(text: &str) -> WireName {
+        WireName::from_parts(vec![crate::wire::NamePart::Text(text.to_owned())])
+    }
+
+    fn lambda(binder_type: ExprId, body: ExprId) -> ExprNode {
+        ExprNode::Lambda {
+            binder_name: name("b"),
+            binder_type,
+            body,
+            style: crate::wire::BinderStyle::Default,
+        }
+    }
+
+    /// `fun (x : T) => fun (y : T) => T`, where `T` is one node met at binder
+    /// depths 0, 1 and 2.
+    fn shared_across_depths() -> Option<WireExpr> {
+        let nodes = vec![
+            ExprNode::Sort {
+                level: LevelId::ZERO,
+            },
+            lambda(ExprId::from_index(0)?, ExprId::from_index(0)?),
+            lambda(ExprId::from_index(0)?, ExprId::from_index(1)?),
+        ];
+        Some(WireExpr::from_parts(
+            nodes,
+            vec![LevelNode::Zero],
+            ExprId::from_index(2)?,
+        ))
+    }
+
+    /// The tree a term denotes, as text, for comparing shapes.
+    fn render(term: &WireExpr, id: ExprId) -> String {
+        match term.node(id) {
+            Some(ExprNode::Bound { index }) => format!("#{index}"),
+            Some(ExprNode::Free { .. }) => "x".to_owned(),
+            Some(ExprNode::Sort { .. }) => "Sort".to_owned(),
+            Some(ExprNode::Lambda {
+                binder_type, body, ..
+            }) => format!(
+                "(fun {} {})",
+                render(term, *binder_type),
+                render(term, *body)
+            ),
+            Some(ExprNode::Apply { function, argument }) => {
+                format!("({} {})", render(term, *function), render(term, *argument))
+            }
+            _ => "?".to_owned(),
+        }
+    }
+
+    /// A pure copy changes nothing, so a node shared across binder depths is
+    /// copied once. Keyed by depth, as the other rewrites must be, `T` came out
+    /// three times.
+    #[test]
+    fn a_pure_copy_keeps_sharing_across_binder_depths() {
+        let term = shared_across_depths();
+        assert!(term.is_some(), "fixture construction");
+        if let Some(term) = term {
+            let copy =
+                copy_subterm_with(&term, term.root(), TermBudget::unlimited(), &mut || false);
+            assert!(
+                matches!(&copy, TermOutcome::Complete(copied) if copied.nodes().len() == 3),
+                "{copy:?}"
+            );
+        }
+    }
+
+    /// `x (fun (y : Sort 0) => x)`, with `x` free and one node. Closing over
+    /// `x` depends on binder depth: the outer `x` becomes index 0 and the inner
+    /// one index 1, so this rewrite must still key its visits by depth.
+    #[test]
+    fn closing_over_a_shared_free_name_respects_binder_depth() {
+        let term = (|| {
+            Some(WireExpr::from_parts(
+                vec![
+                    ExprNode::Free { name: name("x") },
+                    ExprNode::Sort {
+                        level: LevelId::ZERO,
+                    },
+                    lambda(ExprId::from_index(1)?, ExprId::from_index(0)?),
+                    ExprNode::Apply {
+                        function: ExprId::from_index(0)?,
+                        argument: ExprId::from_index(2)?,
+                    },
+                ],
+                vec![LevelNode::Zero],
+                ExprId::from_index(3)?,
+            ))
+        })();
+        assert!(term.is_some(), "fixture construction");
+        if let Some(term) = term {
+            let closed = abstract_free(&term, &name("x"), TermBudget::unlimited());
+            assert!(
+                matches!(&closed, TermOutcome::Complete(out) if render(out, out.root()) == "(#0 (fun Sort #1))"),
+                "{closed:?}"
             );
         }
     }
