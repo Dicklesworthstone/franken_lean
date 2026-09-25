@@ -771,7 +771,7 @@ pub(crate) fn is_potential_nat_reduction(term: &WireExpr, root: ExprId) -> bool 
 /// Whether the KR-313 reducer must refuse a free-variable pair before trying
 /// operand WHNF. The pin permits the open form only inside the domain
 /// comparison selected by an exact `eagerReduce _ _` argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NatReductionScope {
     ClosedPair,
     EagerOpenPair,

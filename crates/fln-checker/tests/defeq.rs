@@ -702,6 +702,86 @@ fn lazy_delta_finds_safe_definition_heads_under_application_spines() {
     );
 }
 
+/// Lazy delta tries the same-head shortcut at every unfolding step. When a
+/// chain of regular definitions keeps the same arguments from step to step, as
+/// `List.merge` -> `List.merge._unary` -> `WellFounded.fix` does, one conversion
+/// puts the same argument pair to the shortcut again and again. It must answer
+/// that pair once: the Init frontier's `mergeSort_zipIdx.go._unary` spent its
+/// whole 200-million-unit budget re-asking one failing pair.
+#[test]
+fn a_chain_of_same_head_steps_compares_its_arguments_once() {
+    const STEPS: usize = 8;
+    const WRAPS: usize = 200;
+    let bound = || Expr::bvar(0).expect("bound variable");
+    let lambda = |body: Expr| Expr::lam(name("x"), constant("carrier"), body, BinderInfo::Default);
+    let step = |index: usize| {
+        if index > STEPS {
+            constant("base")
+        } else {
+            constant(format!("step_{index}"))
+        }
+    };
+    // `slow y` unfolds to a `wrap` tower `WRAPS` deep, so comparing `slow a`
+    // with `slow b` walks the whole tower before the leaves disagree.
+    let tower = (0..WRAPS).fold(bound(), |inner, _| Expr::app(constant("wrap"), inner));
+    let mut entries = vec![
+        definition_entry(
+            "slow",
+            decoded(&lambda(tower)),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "base",
+            decoded(&lambda(bound())),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+    ];
+    for index in 1..=STEPS {
+        entries.push(definition_entry(
+            format!("step_{index}"),
+            decoded(&lambda(Expr::app(step(index + 1), bound()))),
+            ReducibilityHint::Regular(u32::try_from(STEPS + 2 - index).expect("small height")),
+            DefinitionSafety::Safe,
+        ));
+    }
+    let context = definition_context(entries);
+    let a = Expr::app(constant("slow"), constant("a"));
+    let b = Expr::app(constant("slow"), constant("b"));
+    let cost = |left: &Expr, right: &Expr| -> u64 {
+        match def_eq(
+            &decoded(left),
+            &decoded(right),
+            &context,
+            DefEqBudget::unlimited(),
+        ) {
+            DefEqOutcome::NotEqual { progress, .. } | DefEqOutcome::Deferred { progress, .. } => {
+                progress.slow_comparisons
+            }
+            other => panic!("`slow a` and `slow b` must not convert: {other:?}"),
+        }
+    };
+
+    let one_pair = cost(&a, &b);
+    let from = |index: usize| {
+        cost(
+            &Expr::app(step(index), a.clone()),
+            &Expr::app(step(index), b.clone()),
+        )
+    };
+    let four_more_steps = from(1).saturating_sub(from(1 + STEPS / 2));
+    assert!(
+        one_pair > 2 * u64::try_from(WRAPS).expect("small"),
+        "the pair must be expensive for this test to mean anything: {one_pair}"
+    );
+    assert!(
+        four_more_steps < one_pair,
+        "four more same-head steps cost {four_more_steps} slow comparisons, more than one \
+         comparison of their shared arguments ({one_pair}): the pair was compared again"
+    );
+}
+
 #[test]
 fn lazy_delta_resources_cancellation_and_recursion_are_typed_and_recoverable() {
     let context = definition_context(vec![

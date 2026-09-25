@@ -16,9 +16,12 @@
 //! a typed deferral. A deferral is not a rejection and this module is not a
 //! declaration-admission authority.
 
+mod memo;
 mod spine;
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use memo::{ArgumentMemo, Remembered};
 
 use crate::environment::ReducibilityHint;
 use crate::term::{TermBudget, TermOutcome, TermStop, copy_compact_subterm_with};
@@ -3209,6 +3212,7 @@ fn regular_same_head_apps_def_eq(
     context: &WhnfContext,
     nat_scope: NatReductionScope,
     control: &mut SlowControl,
+    memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
     let sources = TermSources::new(left, right, generated);
@@ -3284,6 +3288,13 @@ fn regular_same_head_apps_def_eq(
         let sources = TermSources::new(left, right, generated);
         let right_wire = materialize_subterm_wire(right_arg, sources, control, cancelled)?;
 
+        // This conversion may have put exactly this pair to the shortcut
+        // before, at an earlier unfolding step or deeper in a nested comparison.
+        match memo.recall(&left_wire, &right_wire, nat_scope) {
+            Some(Remembered::Equal) => continue,
+            Some(Remembered::NotProven) => return Ok(false),
+            None => {}
+        }
         let sub_budget = control.remaining_defeq_budget();
         let outcome = def_eq_scoped_with(
             &left_wire,
@@ -3291,14 +3302,17 @@ fn regular_same_head_apps_def_eq(
             context,
             sub_budget,
             nat_scope,
+            memo,
             cancelled,
         );
         match outcome {
             DefEqOutcome::Equal(progress) => {
                 control.absorb_defeq_progress(&progress);
+                memo.remember(left_wire, right_wire, nat_scope, Remembered::Equal);
             }
             DefEqOutcome::NotEqual { progress, .. } | DefEqOutcome::Deferred { progress, .. } => {
                 control.absorb_defeq_progress(&progress);
+                memo.remember(left_wire, right_wire, nat_scope, Remembered::NotProven);
                 return Ok(false);
             }
             DefEqOutcome::Inconclusive(stop) => {
@@ -3324,6 +3338,7 @@ fn regular_same_head_apps_def_eq(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_slow(
     left: &WireExpr,
     right: &WireExpr,
@@ -3331,6 +3346,7 @@ fn run_slow(
     budget: DefEqBudget,
     quick_comparisons: u64,
     nat_scope: NatReductionScope,
+    memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqOutcome, SlowHalt> {
     let mut control = SlowControl::new(budget, quick_comparisons);
@@ -3694,6 +3710,7 @@ fn run_slow(
                                 context,
                                 nat_scope,
                                 &mut control,
+                                memo,
                                 cancelled,
                             )?
                         {
@@ -3841,6 +3858,7 @@ pub fn def_eq_with(
         context,
         budget,
         NatReductionScope::ClosedPair,
+        &mut ArgumentMemo::default(),
         &mut cancelled,
     )
 }
@@ -3861,6 +3879,7 @@ pub(crate) fn def_eq_eager_with(
         context,
         budget,
         NatReductionScope::EagerOpenPair,
+        &mut ArgumentMemo::default(),
         &mut cancelled,
     )
 }
@@ -3871,6 +3890,7 @@ fn def_eq_scoped_with(
     context: &WhnfContext,
     budget: DefEqBudget,
     nat_scope: NatReductionScope,
+    memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> DefEqOutcome {
     match quick_def_eq_with(left, right, budget.quick, &mut *cancelled) {
@@ -3912,6 +3932,7 @@ fn def_eq_scoped_with(
                     budget,
                     completed_comparisons,
                     nat_scope,
+                    memo,
                     cancelled,
                 ))
             }
@@ -3926,6 +3947,7 @@ fn def_eq_scoped_with(
             budget,
             completed_comparisons,
             nat_scope,
+            memo,
             cancelled,
         )),
         QuickDefEqOutcome::Inconclusive(stop) => DefEqOutcome::Inconclusive(DefEqStop::Quick(stop)),

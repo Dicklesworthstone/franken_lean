@@ -49,7 +49,7 @@ const DATA_INT: u8 = 4;
 const DATA_SYNTAX: u8 = 5;
 
 /// One component of a hierarchical Lean name.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NamePart {
     Numeric { value: u64, overflowed: bool },
     Text(String),
@@ -60,7 +60,7 @@ pub enum NamePart {
 /// The components are shared, so copying a term copies its names by reference
 /// count rather than by string. Rewrites copy constant nodes constantly, and deep
 /// name clones were a third of the checker's time on real Init modules.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct WireName {
     parts: std::sync::Arc<[NamePart]>,
 }
@@ -135,7 +135,7 @@ impl LevelId {
 }
 
 /// Checker-owned universe node. Child references always point backward in the arena.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LevelNode {
     Zero,
     Succ(LevelId),
@@ -186,7 +186,7 @@ impl ExprId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinderStyle {
     Default,
     Implicit,
@@ -194,7 +194,7 @@ pub enum BinderStyle {
     InstanceImplicit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetadataValue {
     Text(String),
     Bool(bool),
@@ -205,7 +205,7 @@ pub enum MetadataValue {
 }
 
 /// Checker-owned expression node. Recursive shape is represented by arena indexes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExprNode {
     Bound {
         index: u32,
@@ -320,7 +320,7 @@ pub(crate) fn expression_owned_units(node: &ExprNode) -> u64 {
 }
 
 /// One independently decoded expression and all levels embedded in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WireExpr {
     nodes: Vec<ExprNode>,
     levels: Vec<LevelNode>,
