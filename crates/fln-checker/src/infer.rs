@@ -1702,6 +1702,13 @@ enum Continuation {
     },
 }
 
+/// What one worklist step leaves for the next: a finished type, or a subterm
+/// to infer first.
+enum Advance {
+    Inferred(WireExpr),
+    Query(TermReference),
+}
+
 struct FunctionState {
     term: WireExpr,
     root: ExprId,
@@ -3992,187 +3999,190 @@ impl<'a> InferenceEngine<'a> {
     }
 
     fn run(&mut self) -> Result<WireExpr, LeafHalt> {
-        let mut current = Some(TermReference {
+        let mut advance = Advance::Query(TermReference {
             source: ArenaSource::Input,
             root: self.input.root(),
         });
-        let mut inferred = None;
-
+        // Each step runs out of line, so the frame live beneath a rule
+        // (`complete_forall`, `ensure_sort`, ...) is that step's alone. As one
+        // loop the worklist held about 19 KiB unoptimized, and the 64 KiB stack
+        // tests reach whnf and materialization through it.
         loop {
-            if let Some(reference) = current.take() {
-                if let Some(type_) = self.inferred_types.get(&reference) {
-                    inferred = Some(type_.clone());
-                    continue;
+            advance = match advance {
+                Advance::Query(reference) => self.begin(reference)?,
+                Advance::Inferred(value) => {
+                    let Some(continuation) = self.continuations.pop() else {
+                        return Ok(value);
+                    };
+                    self.resume(continuation, value)?
                 }
-                self.continuations.push(Continuation::Record { reference });
-                let facts = self.facts_of(reference.source)?;
-                match dispatch_reference(
-                    self.input,
-                    &self.generated,
-                    reference,
-                    &facts,
-                    DispatchScope {
-                        context: self.context,
-                        scoped_locals: &self.scoped_locals,
-                        mode: self.mode,
-                    },
-                    self.control,
-                    self.cancelled,
-                )? {
-                    Dispatch::Type(type_) => inferred = Some(type_),
-                    Dispatch::Application { head, arguments } => {
-                        self.continuations
-                            .push(Continuation::ApplicationHead { arguments });
-                        current = Some(head);
-                    }
-                    Dispatch::Lambda { binders, body } => {
-                        let state = Box::new(TelescopeState {
-                            kind: TelescopeKind::Lambda,
-                            sources: binders,
-                            body,
-                            binders: Vec::new(),
-                            domain_sorts: Vec::new(),
-                            next: 0,
-                        });
-                        let TelescopeSchedule::Query {
-                            continuation,
-                            reference,
-                        } = self.schedule_telescope(state)?;
-                        self.continuations.push(continuation);
-                        current = Some(reference);
-                    }
-                    Dispatch::Forall { binders, body } => {
-                        let state = Box::new(TelescopeState {
-                            kind: TelescopeKind::Forall,
-                            sources: binders,
-                            body,
-                            binders: Vec::new(),
-                            domain_sorts: Vec::new(),
-                            next: 0,
-                        });
-                        let TelescopeSchedule::Query {
-                            continuation,
-                            reference,
-                        } = self.schedule_telescope(state)?;
-                        self.continuations.push(continuation);
-                        current = Some(reference);
-                    }
-                    Dispatch::Let { binders, body } => {
-                        current = Some(self.begin_let(binders, body)?);
-                    }
-                    Dispatch::Projection { state } => {
-                        let scrutinee = state.scrutinee;
-                        self.continuations
-                            .push(Continuation::ProjectionScrutinee { state });
-                        current = Some(scrutinee);
-                    }
-                }
-                continue;
-            }
-
-            let value = inferred
-                .take()
-                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
-            let Some(continuation) = self.continuations.pop() else {
-                return Ok(value);
             };
-            match continuation {
-                Continuation::Record { reference } => {
-                    self.inferred_types.insert(reference, value.clone());
-                    inferred = Some(value);
+        }
+    }
+
+    /// Infer `reference` directly, or schedule the subterm it needs first.
+    #[inline(never)]
+    fn begin(&mut self, reference: TermReference) -> Result<Advance, LeafHalt> {
+        if let Some(type_) = self.inferred_types.get(&reference) {
+            return Ok(Advance::Inferred(type_.clone()));
+        }
+        self.continuations.push(Continuation::Record { reference });
+        let facts = self.facts_of(reference.source)?;
+        Ok(
+            match dispatch_reference(
+                self.input,
+                &self.generated,
+                reference,
+                &facts,
+                DispatchScope {
+                    context: self.context,
+                    scoped_locals: &self.scoped_locals,
+                    mode: self.mode,
+                },
+                self.control,
+                self.cancelled,
+            )? {
+                Dispatch::Type(type_) => Advance::Inferred(type_),
+                Dispatch::Application { head, arguments } => {
+                    self.continuations
+                        .push(Continuation::ApplicationHead { arguments });
+                    Advance::Query(head)
                 }
-                Continuation::ApplicationHead { arguments } => {
-                    if self.mode == InferenceMode::InferOnly {
-                        inferred = Some(self.infer_only_application(value, &arguments)?);
-                    } else {
-                        let (continuation, argument) = self.schedule_checking_argument(
-                            FunctionState::new(value),
-                            arguments,
-                            0,
-                        )?;
-                        self.continuations.push(continuation);
-                        current = Some(argument);
-                    }
-                }
-                Continuation::ApplicationArgument {
-                    arguments,
-                    index,
-                    mut function,
-                    domain,
-                    argument,
-                    conversion,
-                } => {
-                    self.compare_domain(index, conversion, &value, &domain)?;
-                    let (_, body) = Self::pi_parts(&function)?;
-                    function.root = body;
-                    function.instantiations.push(argument);
-                    let next = index.saturating_add(1);
-                    if next == arguments.len() {
-                        inferred = Some(self.materialize_function_subterm(
-                            &function,
-                            function.root,
-                            InferencePhase::Codomain,
-                        )?);
-                    } else {
-                        let (continuation, argument) =
-                            self.schedule_checking_argument(function, arguments, next)?;
-                        self.continuations.push(continuation);
-                        current = Some(argument);
-                    }
-                }
-                Continuation::TelescopeDomain {
-                    mut state,
-                    domain,
-                    local_name,
-                    local_reference,
-                } => {
-                    match state.kind {
-                        TelescopeKind::Lambda => {
-                            self.ensure_sort(
-                                InferenceSortSite::LambdaBinder { binder: state.next },
-                                &value,
-                                false,
-                            )?;
-                        }
-                        TelescopeKind::Forall => {
-                            let sort = self
-                                .ensure_sort(
-                                    InferenceSortSite::ForallBinder { binder: state.next },
-                                    &value,
-                                    true,
-                                )?
-                                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
-                            state.domain_sorts.push(sort);
-                        }
-                    }
-                    self.install_telescope_binder(&mut state, domain, local_name, local_reference)?;
+                Dispatch::Lambda { binders, body } => {
+                    let state = Box::new(TelescopeState {
+                        kind: TelescopeKind::Lambda,
+                        sources: binders,
+                        body,
+                        binders: Vec::new(),
+                        domain_sorts: Vec::new(),
+                        next: 0,
+                    });
                     let TelescopeSchedule::Query {
                         continuation,
                         reference,
                     } = self.schedule_telescope(state)?;
                     self.continuations.push(continuation);
-                    current = Some(reference);
+                    Advance::Query(reference)
                 }
-                Continuation::TelescopeBody { state } => {
-                    inferred = Some(match state.kind {
-                        TelescopeKind::Lambda => self.complete_lambda(*state, value)?,
-                        TelescopeKind::Forall => self.complete_forall(*state, &value)?,
+                Dispatch::Forall { binders, body } => {
+                    let state = Box::new(TelescopeState {
+                        kind: TelescopeKind::Forall,
+                        sources: binders,
+                        body,
+                        binders: Vec::new(),
+                        domain_sorts: Vec::new(),
+                        next: 0,
                     });
+                    let TelescopeSchedule::Query {
+                        continuation,
+                        reference,
+                    } = self.schedule_telescope(state)?;
+                    self.continuations.push(continuation);
+                    Advance::Query(reference)
                 }
-                Continuation::LetDeclaredType { state } => {
-                    current = Some(self.after_let_declared_type(state, &value)?);
+                Dispatch::Let { binders, body } => Advance::Query(self.begin_let(binders, body)?),
+                Dispatch::Projection { state } => {
+                    let scrutinee = state.scrutinee;
+                    self.continuations
+                        .push(Continuation::ProjectionScrutinee { state });
+                    Advance::Query(scrutinee)
                 }
-                Continuation::LetValue { state } => {
-                    current = Some(self.after_let_value(state, &value)?);
-                }
-                Continuation::LetBody { state } => {
-                    inferred = Some(self.complete_let(*state, value)?);
-                }
-                Continuation::ProjectionScrutinee { state } => {
-                    inferred = Some(self.complete_projection(*state, &value)?);
+            },
+        )
+    }
+
+    /// Hand `value`, the type just inferred, to the continuation waiting on it.
+    #[inline(never)]
+    fn resume(&mut self, continuation: Continuation, value: WireExpr) -> Result<Advance, LeafHalt> {
+        Ok(match continuation {
+            Continuation::Record { reference } => {
+                self.inferred_types.insert(reference, value.clone());
+                Advance::Inferred(value)
+            }
+            Continuation::ApplicationHead { arguments } => {
+                if self.mode == InferenceMode::InferOnly {
+                    Advance::Inferred(self.infer_only_application(value, &arguments)?)
+                } else {
+                    let (continuation, argument) =
+                        self.schedule_checking_argument(FunctionState::new(value), arguments, 0)?;
+                    self.continuations.push(continuation);
+                    Advance::Query(argument)
                 }
             }
-        }
+            Continuation::ApplicationArgument {
+                arguments,
+                index,
+                mut function,
+                domain,
+                argument,
+                conversion,
+            } => {
+                self.compare_domain(index, conversion, &value, &domain)?;
+                let (_, body) = Self::pi_parts(&function)?;
+                function.root = body;
+                function.instantiations.push(argument);
+                let next = index.saturating_add(1);
+                if next == arguments.len() {
+                    Advance::Inferred(self.materialize_function_subterm(
+                        &function,
+                        function.root,
+                        InferencePhase::Codomain,
+                    )?)
+                } else {
+                    let (continuation, argument) =
+                        self.schedule_checking_argument(function, arguments, next)?;
+                    self.continuations.push(continuation);
+                    Advance::Query(argument)
+                }
+            }
+            Continuation::TelescopeDomain {
+                mut state,
+                domain,
+                local_name,
+                local_reference,
+            } => {
+                match state.kind {
+                    TelescopeKind::Lambda => {
+                        self.ensure_sort(
+                            InferenceSortSite::LambdaBinder { binder: state.next },
+                            &value,
+                            false,
+                        )?;
+                    }
+                    TelescopeKind::Forall => {
+                        let sort = self
+                            .ensure_sort(
+                                InferenceSortSite::ForallBinder { binder: state.next },
+                                &value,
+                                true,
+                            )?
+                            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+                        state.domain_sorts.push(sort);
+                    }
+                }
+                self.install_telescope_binder(&mut state, domain, local_name, local_reference)?;
+                let TelescopeSchedule::Query {
+                    continuation,
+                    reference,
+                } = self.schedule_telescope(state)?;
+                self.continuations.push(continuation);
+                Advance::Query(reference)
+            }
+            Continuation::TelescopeBody { state } => Advance::Inferred(match state.kind {
+                TelescopeKind::Lambda => self.complete_lambda(*state, value)?,
+                TelescopeKind::Forall => self.complete_forall(*state, &value)?,
+            }),
+            Continuation::LetDeclaredType { state } => {
+                Advance::Query(self.after_let_declared_type(state, &value)?)
+            }
+            Continuation::LetValue { state } => {
+                Advance::Query(self.after_let_value(state, &value)?)
+            }
+            Continuation::LetBody { state } => Advance::Inferred(self.complete_let(*state, value)?),
+            Continuation::ProjectionScrutinee { state } => {
+                Advance::Inferred(self.complete_projection(*state, &value)?)
+            }
+        })
     }
 }
 

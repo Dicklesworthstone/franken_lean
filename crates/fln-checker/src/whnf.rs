@@ -2349,7 +2349,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
     }
 
     fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
-        let mut current = self.materialize_term(input, root, WhnfPhase::Initial)?;
+        let current = self.materialize_term(input, root, WhnfPhase::Initial)?;
+        self.normalize(current)
+    }
+
+    /// The reduction loop. Out of line so the initial materialization in `run`
+    /// executes on a small frame: unoptimized, this loop's frame is about 11 KiB,
+    /// and the 64 KiB stack tests reach materialization from inside inference.
+    #[inline(never)]
+    fn normalize(mut self, mut current: Cursor) -> Result<WhnfResult, Halt> {
         let mut pending_arguments = VecDeque::<Cursor>::new();
         let mut frames = Vec::new();
 
