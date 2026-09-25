@@ -17,6 +17,7 @@ pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
 mod refine;
+mod relations;
 mod rewrite;
 mod search;
 pub(in crate::source) use refine::RefinementFrame;
@@ -710,6 +711,13 @@ impl Context {
                     equality,
                     expression,
                 });
+            } else if kind == &parser_kind(&["Tactic", "symm"]) {
+                let [keyword, location] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "symm", "symmetry tactic")?;
+                expect_empty_null(location, "goal-only symmetry location")?;
+                self.symmetrize_proof_goal(proof, goal)?;
             } else if kind == &parser_kind(&["Tactic", "rfl"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

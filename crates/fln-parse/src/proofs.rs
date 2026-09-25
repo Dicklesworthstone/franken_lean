@@ -133,6 +133,7 @@ fn tactic(
             "left",
             "right",
             "rfl",
+            "symm",
             "rw",
             "rewrite",
             "simp",
@@ -184,6 +185,9 @@ fn local_tactic(
     let start = range.start;
     let mut args = vec![atom];
     match keyword {
+        "symm" if range.end == start + 1 => {
+            args.push(null_node(Vec::new()));
+        }
         "revert" if range.end > start + 1 => {
             let mut names = Vec::new();
             for index in start + 1..range.end {
