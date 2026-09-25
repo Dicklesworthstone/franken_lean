@@ -175,7 +175,11 @@ fn fixture() -> Environment {
     for (name, value) in [("dictZero", 0), ("dictOne", 1)] {
         env = publish(
             &env,
-            definition(name, app("Dict", [c("Nat")]), app("Dict.mk", [c("Nat"), number(value)])),
+            definition(
+                name,
+                app("Dict", [c("Nat")]),
+                app("Dict.mk", [c("Nat"), number(value)]),
+            ),
         );
     }
     for (name, dictionary, priority) in [
@@ -197,7 +201,10 @@ fn fixture() -> Environment {
         definition(
             "further",
             app("Further", [c("Nat"), c("dictZero"), c("familyHigh")]),
-            app("Further.mk", [c("Nat"), c("dictZero"), c("familyHigh"), number(9)]),
+            app(
+                "Further.mk",
+                [c("Nat"), c("dictZero"), c("familyHigh"), number(9)],
+            ),
         ),
     );
     env = register_instance(&env, &n("further"), 1000).unwrap();
@@ -235,11 +242,14 @@ fn known_dependent_outputs_do_not_filter_out_the_highest_priority_instance() {
     accepted("def selected : @Family Nat dictZero := inferInstance", &env);
     // Selection must still choose familyHigh, then refuse the incompatible
     // dictOne output. Selecting familyLow instead would violate outParam order.
-    assert!(check_definition_source(
-        b"def wrong : @Family Nat dictOne := inferInstance",
-        &env,
-        budget(),
-    ).is_err());
+    assert!(
+        check_definition_source(
+            b"def wrong : @Family Nat dictOne := inferInstance",
+            &env,
+            budget(),
+        )
+        .is_err()
+    );
     assert!(env.find(&n("wrong")).is_none());
     accepted("def recovered := useFamily 0", &env);
 }
@@ -247,7 +257,7 @@ fn known_dependent_outputs_do_not_filter_out_the_highest_priority_instance() {
 #[test]
 fn local_instances_keep_precedence_over_global_dependent_output_candidates() {
     let value = accepted(
-        "def selected [local : @Family Nat dictOne] : @Family Nat dictOne := inferInstance",
+        "def selected [localFamily : @Family Nat dictOne] : @Family Nat dictOne := inferInstance",
         &fixture(),
     );
     assert!(!has_constant(&value.value, "familyHigh"));
@@ -259,7 +269,7 @@ fn local_instances_keep_precedence_over_global_dependent_output_candidates() {
 }
 
 #[test]
-fn_ordinary_inputs_remain_blocked_and_failed_search_does_not_poison_recovery() {
+fn ordinary_inputs_remain_blocked_and_failed_search_does_not_poison_recovery() {
     let env = fixture();
     assert!(check_definition_source(b"def blocked := useDict 0", &env, budget()).is_err());
     assert!(env.find(&n("blocked")).is_none());

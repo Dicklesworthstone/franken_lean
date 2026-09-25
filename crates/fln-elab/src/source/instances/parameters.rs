@@ -4,6 +4,8 @@
 //! the selected result must still unify with the original goal before publication.
 use super::*;
 
+mod universes;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParameterMode {
     Input,
@@ -14,8 +16,8 @@ enum ParameterMode {
 pub(super) struct PreparedTarget {
     pub target: Expr,
     pub expected: Expr,
-    /// Outputs are erased; bare unknown semi-outputs are alpha-canonicalized.
-    /// This expression is never used as a term or submitted to a checker.
+    /// Outputs and their exclusive universes are erased; bare unknown
+    /// semi-outputs are alpha-canonicalized. Never submitted to a checker.
     pub key: Expr,
 }
 
@@ -129,10 +131,6 @@ impl Context {
         let ExprNode::Const { name, levels } = head.node() else {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         };
-        // Universe metavariables are equations for candidate matching, not
-        // unknown expression inputs. In particular an output parameter may
-        // determine its own universe. Final publication still requires every
-        // universe in the selected term and goal to be resolved.
         let info = self
             .txn
             .env
@@ -144,9 +142,14 @@ impl Context {
         if arguments.len() != modes.len() {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         }
-        let mut telescope = self.instantiate_params(&base.type_, &base.level_params, levels)?;
-        let mut prepared = head.clone();
-        let mut key = head;
+        // Output-only universes must not filter candidate selection, even when
+        // the caller already knows them. Reconcile with the original target
+        // only after selecting the first successful candidate.
+        let (levels, key_levels) =
+            self.instance_search_levels(&base.type_, &modes, &base.level_params, levels)?;
+        let mut telescope = self.instantiate_params(&base.type_, &base.level_params, &levels)?;
+        let mut prepared = Expr::const_(name.clone(), levels);
+        let mut key = Expr::const_(name.clone(), key_levels);
         let mut semi_holes = Vec::new();
         for (argument, mode) in arguments.into_iter().rev().zip(modes) {
             self.tick()?;
