@@ -24,9 +24,9 @@ use crate::instantiate::{
     instantiate_term_parameters_from_level_roots_with,
 };
 use crate::term::{
-    TermBudget, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
-    abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_with,
-    substitute_bound_subterms_with, substitute_free_with,
+    TermBudget, TermFacts, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
+    abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_nodes_with,
+    inspect_with, substitute_bound_subterms_with, substitute_free_with,
 };
 use crate::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
@@ -1516,13 +1516,13 @@ impl<'a> ArenaAssembler<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ArenaSource {
     Input,
     Generated(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TermReference {
     source: ArenaSource,
     root: ExprId,
@@ -1654,6 +1654,11 @@ enum Dispatch {
 }
 
 enum Continuation {
+    /// The reference beneath has just been inferred: remember its type, so
+    /// another occurrence of the same subterm is not inferred again.
+    Record {
+        reference: TermReference,
+    },
     ApplicationHead {
         arguments: Vec<TermReference>,
     },
@@ -2017,6 +2022,7 @@ fn dispatch_reference(
     input: &WireExpr,
     generated: &[Arc<WireExpr>],
     reference: TermReference,
+    facts: &[TermFacts],
     scope: DispatchScope<'_>,
     control: &mut Control,
     cancelled: &mut dyn FnMut() -> bool,
@@ -2033,18 +2039,17 @@ fn dispatch_reference(
         )
         .map_err(LeafHalt::stop)?;
 
-    let facts = match inspect_with(term, control.budget.inspection, &mut *cancelled) {
-        TermOutcome::Complete(facts) => facts,
-        TermOutcome::Inconclusive(stop) => {
-            return Err(LeafHalt::stop(InferenceStop::Inspection {
-                stop,
-                progress: control.progress,
-            }));
-        }
-        TermOutcome::InternalFault(fault) => {
-            return Err(LeafHalt::Fault(InferenceFault::Inspection(fault)));
-        }
-    };
+    // The facts of the referenced node itself: a subterm is dispatched in place,
+    // so the arena's root says nothing about it.
+    let facts = facts
+        .get(reference.root.index())
+        .copied()
+        .ok_or(LeafHalt::Fault(InferenceFault::Inspection(
+            TermFault::MissingExpression {
+                input: TermInput::Subject,
+                index: reference.root.index(),
+            },
+        )))?;
     if facts.external_bound_span != 0 {
         return Err(LeafHalt::Fault(InferenceFault::LooseBoundVariables {
             external_bound_span: facts.external_bound_span,
@@ -2271,6 +2276,14 @@ struct InferenceEngine<'a> {
     reserved_names: Option<BTreeSet<WireName>>,
     next_local_identity: u64,
     continuations: Vec<Continuation>,
+    /// Per-node facts of each arena, derived once per arena rather than once
+    /// per subterm dispatched from it.
+    arena_facts: std::collections::HashMap<ArenaSource, Arc<Vec<TermFacts>>>,
+    /// The type of every reference already inferred in this run. Arenas are
+    /// immutable and append-only, so a reference denotes one term for the whole
+    /// run, and it is dispatched only inside the scope of the locals it names:
+    /// a subterm shared in the input is inferred once, not once per occurrence.
+    inferred_types: std::collections::HashMap<TermReference, WireExpr>,
 }
 
 enum TelescopeSchedule {
@@ -3956,6 +3969,28 @@ impl<'a> InferenceEngine<'a> {
         }
     }
 
+    fn facts_of(&mut self, source: ArenaSource) -> Result<Arc<Vec<TermFacts>>, LeafHalt> {
+        if let Some(facts) = self.arena_facts.get(&source) {
+            return Ok(Arc::clone(facts));
+        }
+        let arena = inference_arena(self.input, &self.generated, source)?;
+        let facts =
+            match inspect_nodes_with(arena, self.control.budget.inspection, &mut *self.cancelled) {
+                TermOutcome::Complete(facts) => Arc::new(facts),
+                TermOutcome::Inconclusive(stop) => {
+                    return Err(LeafHalt::stop(InferenceStop::Inspection {
+                        stop,
+                        progress: self.control.progress,
+                    }));
+                }
+                TermOutcome::InternalFault(fault) => {
+                    return Err(LeafHalt::Fault(InferenceFault::Inspection(fault)));
+                }
+            };
+        self.arena_facts.insert(source, Arc::clone(&facts));
+        Ok(facts)
+    }
+
     fn run(&mut self) -> Result<WireExpr, LeafHalt> {
         let mut current = Some(TermReference {
             source: ArenaSource::Input,
@@ -3965,11 +4000,17 @@ impl<'a> InferenceEngine<'a> {
 
         loop {
             if let Some(reference) = current.take() {
-                let reference = self.materialize_reference(reference)?;
+                if let Some(type_) = self.inferred_types.get(&reference) {
+                    inferred = Some(type_.clone());
+                    continue;
+                }
+                self.continuations.push(Continuation::Record { reference });
+                let facts = self.facts_of(reference.source)?;
                 match dispatch_reference(
                     self.input,
                     &self.generated,
                     reference,
+                    &facts,
                     DispatchScope {
                         context: self.context,
                         scoped_locals: &self.scoped_locals,
@@ -4036,6 +4077,10 @@ impl<'a> InferenceEngine<'a> {
                 return Ok(value);
             };
             match continuation {
+                Continuation::Record { reference } => {
+                    self.inferred_types.insert(reference, value.clone());
+                    inferred = Some(value);
+                }
                 Continuation::ApplicationHead { arguments } => {
                     if self.mode == InferenceMode::InferOnly {
                         inferred = Some(self.infer_only_application(value, &arguments)?);
@@ -4182,6 +4227,8 @@ fn infer_policy(
         reserved_names: None,
         next_local_identity: 0,
         continuations: Vec::new(),
+        arena_facts: std::collections::HashMap::new(),
+        inferred_types: std::collections::HashMap::new(),
     }
     .run();
     finish(result, control.progress)

@@ -17,8 +17,8 @@ use fln_checker::infer::{
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
 use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfContext, WhnfStop};
 use fln_checker::wire::{
-    DecodeBudget, DecodeOutcome, ExprId, ExprNode, LevelId, LevelNode, WireExpr, WireName,
-    decode_expr, decode_name,
+    DecodeBudget, DecodeOutcome, EXPR_APP, EXPR_FVAR, ExprId, ExprNode, LevelId, LevelNode,
+    SCHEMA_EXPR_DAG, WireExpr, WireName, decode_expr, decode_expr_dag, decode_name,
 };
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
@@ -2604,6 +2604,8 @@ fn application_nested_resources_and_cancellation_are_typed_and_recover_cleanly()
         InferenceBudget::unlimited(),
     ));
 
+    // Subterms are inferred in place, so the first materialization is the copy
+    // of the head local's type.
     assert!(matches!(
         infer(
             &application,
@@ -2617,7 +2619,7 @@ fn application_nested_resources_and_cancellation_are_typed_and_recover_cleanly()
             ),
         ),
         InferenceOutcome::Inconclusive(InferenceStop::Materialization {
-            phase: InferencePhase::ApplicationTerm,
+            phase: InferencePhase::LocalType,
             stop: TermStop::Resource { .. },
             ..
         })
@@ -4695,4 +4697,75 @@ fn scoped_reduction_overlay_is_discarded_on_cancellation_and_resource_stop() {
         InferenceMode::InferOnly,
         InferenceBudget::unlimited(),
     ));
+}
+
+/// `t_0 = x`, `t_(k+1) = g t_k t_k`, written in the shared transport so each
+/// `t_k` is one record: `levels` levels are 2^levels occurrences of `x`.
+fn doubling_tree(levels: u32) -> WireExpr {
+    let mut w = CanonWriter::new();
+    w.schema(SCHEMA_EXPR_DAG);
+    w.u64(2 + 2 * u64::from(levels));
+    for label in ["x", "g"] {
+        w.u8(EXPR_FVAR);
+        primary_name(label).write_body(&mut w);
+    }
+    let mut previous = 0u32;
+    for level in 0..levels {
+        let partial = 2 + 2 * level;
+        w.u8(EXPR_APP);
+        w.u32(1);
+        w.u32(previous);
+        w.u8(EXPR_APP);
+        w.u32(partial);
+        w.u32(previous);
+        previous = partial + 1;
+    }
+    match decode_expr_dag(&w.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        other => panic!("hand-written shared records did not decode: {other:?}"),
+    }
+}
+
+#[test]
+fn a_shared_subterm_is_inferred_once() {
+    // Forty levels are 2^40 occurrences over 82 records. Checking each
+    // occurrence could not finish inside this step budget; checking each
+    // subterm once, with its argument comparisons, takes a few thousand steps.
+    let carrier = Expr::fvar(FVarId(primary_name("A")));
+    let binary = Expr::forall_e(
+        Name::anonymous(),
+        carrier.clone(),
+        Expr::forall_e(
+            Name::anonymous(),
+            carrier.clone(),
+            carrier.clone(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&Expr::sort(Level::one()))),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&carrier)),
+            LocalDeclaration::assumption(checker_name("g"), decoded(&binary)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let term = doubling_tree(40);
+    assert_eq!(term.nodes().len(), 82);
+    let result = complete(infer(
+        &term,
+        &context,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::new(
+            100_000,
+            u64::MAX,
+            TermBudget::unlimited(),
+            TermBudget::unlimited(),
+        ),
+    ));
+    assert_eq!(result.type_, decoded(&carrier));
 }

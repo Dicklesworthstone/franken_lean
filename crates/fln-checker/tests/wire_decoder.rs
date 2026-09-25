@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use fln_checker::wire::{
-    BinderStyle, DecodeBudget, DecodeLimit, DecodeOutcome, DecodeStop, ExprNode, LevelNode,
-    MalformedKind, MetadataValue, NamePart, decode_expr, decode_expr_with, decode_level,
-    decode_name,
+    BinderStyle, DecodeBudget, DecodeLimit, DecodeOutcome, DecodeStop, EXPR_APP, EXPR_FVAR,
+    ExprNode, LevelNode, MalformedKind, MetadataValue, NamePart, SCHEMA_EXPR_DAG, decode_expr,
+    decode_expr_dag, decode_expr_with, decode_level, decode_name,
 };
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::Level;
@@ -497,4 +497,75 @@ fn production_decoder_uses_only_shared_schema_constants_from_the_primary_codec()
     assert!(source.contains("SCHEMA_NAME"));
     assert!(source.contains("SCHEMA_LEVEL"));
     assert!(source.contains("SCHEMA_EXPR"));
+}
+
+/// Shared-transport bytes over free locals and applications; `App(f, a)`
+/// names two earlier records.
+fn shared_bytes(records: &[Result<&str, (u32, u32)>]) -> Vec<u8> {
+    let mut w = CanonWriter::new();
+    w.schema(SCHEMA_EXPR_DAG);
+    w.u64(records.len() as u64);
+    for record in records {
+        match record {
+            Ok(label) => {
+                w.u8(EXPR_FVAR);
+                Name::str(Name::anonymous(), *label).write_body(&mut w);
+            }
+            Err((function, argument)) => {
+                w.u8(EXPR_APP);
+                w.u32(*function);
+                w.u32(*argument);
+            }
+        }
+    }
+    w.into_bytes()
+}
+
+#[test]
+fn the_shared_transport_keeps_a_record_referenced_twice_as_one_node() {
+    // `g x x`, then `g (g x x) (g x x)` naming that record twice.
+    let term = complete(decode_expr_dag(
+        &shared_bytes(&[
+            Ok("x"),
+            Ok("g"),
+            Err((1, 0)),
+            Err((2, 0)),
+            Err((1, 3)),
+            Err((4, 3)),
+        ]),
+        DecodeBudget::unlimited(),
+    ))
+    .expect("shared records");
+    assert_eq!(term.nodes().len(), 6);
+    let Some(ExprNode::Apply { function, argument }) = term.node(term.root()) else {
+        panic!("the root is the last record");
+    };
+    assert!(matches!(
+        term.node(*function),
+        Some(ExprNode::Apply { argument: inner, .. }) if inner == argument
+    ));
+}
+
+#[test]
+fn the_shared_transport_refuses_forward_unreferenced_and_empty_tables() {
+    let decode = |records: &[Result<&str, (u32, u32)>]| {
+        decode_expr_dag(&shared_bytes(records), DecodeBudget::unlimited())
+    };
+    assert!(complete(decode(&[Ok("x"), Ok("g"), Err((1, 0))])).is_ok());
+    assert_eq!(
+        malformed(decode(&[Ok("x"), Err((0, 1))])),
+        Some(MalformedKind::ForwardReference),
+        "a record naming itself"
+    );
+    assert_eq!(
+        malformed(decode(&[Ok("x"), Err((0, 2))])),
+        Some(MalformedKind::ForwardReference),
+        "a record naming a later one"
+    );
+    assert_eq!(
+        malformed(decode(&[Ok("x"), Ok("g"), Err((1, 1))])),
+        Some(MalformedKind::UnreferencedRecord),
+        "`x` feeds nothing"
+    );
+    assert_eq!(malformed(decode(&[])), Some(MalformedKind::EmptyTable));
 }

@@ -2,9 +2,10 @@
 //!
 //! This module deliberately derives scope and traversal facts from the wire nodes
 //! themselves. It never consumes the primary expression data word. Rewrites are
-//! occurrence walks rather than node-id memoized walks: a future wire schema may
-//! share one node beneath different binder depths, and scope is a property of the
-//! occurrence, not merely of the arena slot.
+//! memoized per (node, binder context), never per node alone: the shared wire
+//! schema meets one node beneath different binder depths, and scope is a property
+//! of the occurrence's context, not merely of the arena slot. A node shared in the
+//! input is rewritten once per context it is met in, so a DAG costs its size.
 
 use std::collections::BTreeMap;
 
@@ -80,7 +81,7 @@ pub enum TermStop {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TermInput {
     Subject,
     Replacement,
@@ -309,6 +310,17 @@ fn prior_expr(facts: &[TermFacts], id: ExprId, parent: usize) -> Result<TermFact
 }
 
 fn inspect_inner(term: &WireExpr, control: &mut Control<'_>) -> Result<TermFacts, Halt> {
+    let facts = inspect_nodes_inner(term, control)?;
+    facts
+        .get(term.root().index())
+        .copied()
+        .ok_or(Halt::Fault(TermFault::MissingExpression {
+            input: TermInput::Subject,
+            index: term.root().index(),
+        }))
+}
+
+fn inspect_nodes_inner(term: &WireExpr, control: &mut Control<'_>) -> Result<Vec<TermFacts>, Halt> {
     let mut universe_marks = Vec::new();
     for (index, node) in term.levels().iter().enumerate() {
         control.step(index)?;
@@ -394,14 +406,7 @@ fn inspect_inner(term: &WireExpr, control: &mut Control<'_>) -> Result<TermFacts
         };
         facts.push(value);
     }
-
-    facts
-        .get(term.root().index())
-        .copied()
-        .ok_or(Halt::Fault(TermFault::MissingExpression {
-            input: TermInput::Subject,
-            index: term.root().index(),
-        }))
+    Ok(facts)
 }
 
 pub fn inspect(term: &WireExpr, budget: TermBudget) -> TermOutcome<TermFacts> {
@@ -417,7 +422,18 @@ pub fn inspect_with(
     outcome(inspect_inner(term, &mut control))
 }
 
-#[derive(Debug, Clone, Copy)]
+/// [`inspect`]'s facts for every node of `term`, indexed by [`ExprId`], so a
+/// caller asking about many subterms of one arena validates and walks it once.
+pub(crate) fn inspect_nodes_with(
+    term: &WireExpr,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<Vec<TermFacts>> {
+    let mut control = Control::new(budget, cancelled);
+    outcome(inspect_nodes_inner(term, &mut control))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Mode {
     Rewrite { scope: u64 },
     Raise { amount: u64, cutoff: u64 },
@@ -488,7 +504,60 @@ enum Task {
         mode: Mode,
     },
     Build(Frame),
+    /// The visit keyed here has just left its one result on the value stack.
+    Record(VisitKey),
 }
+
+/// What a visit's output depends on besides the fixed operation and
+/// replacement: which arena, which node, and the binder context it is met in.
+type VisitKey = (TermInput, ExprId, Mode);
+
+/// A deterministic multiplicative hasher for the transform memo, which is only
+/// ever looked up, never iterated. `std`'s keyed default costs more than the
+/// rewrite it saves on the small keys here.
+#[derive(Default, Clone, Copy)]
+struct KeyHasher(u64);
+
+impl KeyHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.add(u64::from(*byte));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.add(value as u64);
+    }
+}
+
+type VisitMemo =
+    std::collections::HashMap<VisitKey, ExprId, std::hash::BuildHasherDefault<KeyHasher>>;
 
 struct Transformer<'a, 'c> {
     subject: &'a WireExpr,
@@ -503,6 +572,10 @@ struct Transformer<'a, 'c> {
     compact_levels: bool,
     values: Vec<ExprId>,
     tasks: Vec<Task>,
+    /// Each (arena, node, binder context) is rewritten once: a node shared in
+    /// the input is shared in the output, so a DAG costs its size, not the
+    /// size of its tree.
+    memo: VisitMemo,
 }
 
 impl<'a, 'c> Transformer<'a, 'c> {
@@ -1212,8 +1285,22 @@ impl<'a, 'c> Transformer<'a, 'c> {
         });
         while let Some(task) = self.tasks.pop() {
             match task {
-                Task::Visit { input, id, mode } => self.visit(input, id, mode)?,
+                Task::Visit { input, id, mode } => {
+                    if let Some(done) = self.memo.get(&(input, id, mode)) {
+                        self.values.push(*done);
+                        continue;
+                    }
+                    self.tasks.push(Task::Record((input, id, mode)));
+                    self.visit(input, id, mode)?;
+                }
                 Task::Build(frame) => self.build(frame)?,
+                Task::Record(key) => {
+                    let done = *self
+                        .values
+                        .last()
+                        .ok_or(Halt::Fault(TermFault::ValueStack { entries: 0 }))?;
+                    self.memo.insert(key, done);
+                }
             }
         }
         if self.values.len() != 1 {
@@ -1293,6 +1380,7 @@ fn transform_subterms_with(
         compact_levels: plan.compact_levels,
         values: Vec::new(),
         tasks: Vec::new(),
+        memo: VisitMemo::default(),
     };
     outcome(transformer.run(plan.root_mode))
 }

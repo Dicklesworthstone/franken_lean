@@ -8,8 +8,9 @@ use fln_checker::term::{
     substitute_free_with,
 };
 use fln_checker::wire::{
-    DecodeBudget, DecodeOutcome, ExprId, ExprNode, LevelNode, NamePart, WireExpr, WireName,
-    decode_expr, decode_name,
+    DecodeBudget, DecodeOutcome, EXPR_APP, EXPR_BVAR, EXPR_FVAR, EXPR_LAM, ExprId, ExprNode,
+    LevelNode, NamePart, SCHEMA_EXPR_DAG, WireExpr, WireName, decode_expr, decode_expr_dag,
+    decode_name,
 };
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
@@ -999,4 +1000,116 @@ fn term_production_code_has_no_primary_semantic_path() {
             "checker term source shares forbidden semantic path `{forbidden}`"
         );
     }
+}
+
+/// One hand-written record of the shared transport, so a test states exactly
+/// which nodes are shared rather than depending on the primary's allocations.
+enum Record {
+    Bound(u32),
+    Free(&'static str),
+    App(u32, u32),
+    Lambda(u32, u32),
+}
+
+fn shared(records: &[Record]) -> WireExpr {
+    let mut w = CanonWriter::new();
+    w.schema(SCHEMA_EXPR_DAG);
+    w.u64(records.len() as u64);
+    for record in records {
+        match record {
+            Record::Bound(index) => {
+                w.u8(EXPR_BVAR);
+                w.u32(*index);
+            }
+            Record::Free(label) => {
+                w.u8(EXPR_FVAR);
+                Name::str(Name::anonymous(), *label).write_body(&mut w);
+            }
+            Record::App(function, argument) => {
+                w.u8(EXPR_APP);
+                w.u32(*function);
+                w.u32(*argument);
+            }
+            Record::Lambda(binder_type, body) => {
+                w.u8(EXPR_LAM);
+                Name::str(Name::anonymous(), "y").write_body(&mut w);
+                w.u32(*binder_type);
+                w.u32(*body);
+                w.u8(0);
+            }
+        }
+    }
+    match decode_expr_dag(&w.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        other => panic!("hand-written shared records did not decode: {other:?}"),
+    }
+}
+
+#[test]
+fn a_shared_node_is_rewritten_per_binder_context() {
+    // `s = #0 c` is ONE record, met both outside and under a lambda, where its
+    // `#0` is the lambda's own binder. Every rewrite must treat the two
+    // occurrences differently: a memo keyed by the node alone would reuse the
+    // outer result inside the binder.
+    let term = shared(&[
+        Record::Bound(0),
+        Record::Free("c"),
+        Record::App(0, 1),
+        Record::Free("T"),
+        Record::Lambda(3, 2),
+        Record::App(2, 4),
+    ]);
+    let model = wire_model(&term, term.root());
+    let replacement = Model::Free("r".to_owned());
+    let replacement_wire = decoded(&model_expr(&replacement));
+
+    let opened = complete(substitute_bound(
+        &term,
+        0,
+        &replacement_wire,
+        TermBudget::unlimited(),
+    ));
+    assert_eq!(
+        wire_model(&opened, opened.root()),
+        model_substitute_bound(&model, 0, &replacement, 0)
+    );
+    let raised = complete(raise_external_bounds(&term, 2, 0, TermBudget::unlimited()));
+    assert_eq!(
+        wire_model(&raised, raised.root()),
+        model_raise(&model, 2, 0, 0)
+    );
+    let closed = complete(abstract_free(
+        &term,
+        &checker_name("c"),
+        TermBudget::unlimited(),
+    ));
+    assert_eq!(
+        wire_model(&closed, closed.root()),
+        model_abstract_free(&model, "c", 0)
+    );
+}
+
+#[test]
+fn a_shared_node_is_rewritten_once_per_binder_context() {
+    // `t_0 = #0`, `t_(k+1) = g t_k t_k`: forty levels are 2^40 occurrences of
+    // `#0` over 82 records. Rewriting occurrence by occurrence could not finish
+    // inside this budget; rewriting each node once takes a few hundred steps.
+    let mut records = vec![Record::Bound(0), Record::Free("g")];
+    let mut previous = 0;
+    for _ in 0..40 {
+        let partial = records.len() as u32;
+        records.push(Record::App(1, previous));
+        records.push(Record::App(partial, previous));
+        previous = partial + 1;
+    }
+    let term = shared(&records);
+    assert_eq!(term.nodes().len(), 82);
+    let replacement = decoded(&model_expr(&Model::Free("r".to_owned())));
+    let opened = complete(substitute_bound(
+        &term,
+        0,
+        &replacement,
+        TermBudget::new(10_000, 10_000),
+    ));
+    assert_eq!(opened.nodes().len(), 82, "sharing survives the rewrite");
 }

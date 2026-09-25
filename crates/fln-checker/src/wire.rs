@@ -24,19 +24,22 @@ const LEVEL_IMAX: u8 = 3;
 const LEVEL_PARAM: u8 = 4;
 const LEVEL_MVAR: u8 = 5;
 
-const EXPR_BVAR: u8 = 0;
-const EXPR_FVAR: u8 = 1;
-const EXPR_MVAR: u8 = 2;
-const EXPR_SORT: u8 = 3;
-const EXPR_CONST: u8 = 4;
-const EXPR_APP: u8 = 5;
-const EXPR_LAM: u8 = 6;
-const EXPR_FORALL: u8 = 7;
-const EXPR_LET: u8 = 8;
-const EXPR_LIT_NAT: u8 = 9;
-const EXPR_LIT_STR: u8 = 10;
-const EXPR_MDATA: u8 = 11;
-const EXPR_PROJ: u8 = 12;
+// Expression record tags. Public because the shared transport
+// ([`SCHEMA_EXPR_DAG`]) is written outside this crate; they are the same
+// numbers as [`SCHEMA_EXPR`]'s.
+pub const EXPR_BVAR: u8 = 0;
+pub const EXPR_FVAR: u8 = 1;
+pub const EXPR_MVAR: u8 = 2;
+pub const EXPR_SORT: u8 = 3;
+pub const EXPR_CONST: u8 = 4;
+pub const EXPR_APP: u8 = 5;
+pub const EXPR_LAM: u8 = 6;
+pub const EXPR_FORALL: u8 = 7;
+pub const EXPR_LET: u8 = 8;
+pub const EXPR_LIT_NAT: u8 = 9;
+pub const EXPR_LIT_STR: u8 = 10;
+pub const EXPR_MDATA: u8 = 11;
+pub const EXPR_PROJ: u8 = 12;
 
 const DATA_STRING: u8 = 0;
 const DATA_BOOL: u8 = 1;
@@ -422,6 +425,12 @@ pub enum MalformedKind {
     NonCanonicalNat,
     ArenaOverflow,
     ValueStack,
+    /// A shared-transport record names a record at or after itself.
+    ForwardReference,
+    /// A shared-transport record other than the root is never referenced.
+    UnreferencedRecord,
+    /// A shared-transport table has no records, so it has no root.
+    EmptyTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,6 +1064,170 @@ fn decode_expr_value(
     }
 }
 
+/// The sharing-preserving expression transport. Node payloads are exactly those
+/// of [`SCHEMA_EXPR`] (names, levels and metadata stay inline), but the term is
+/// a post-order table of records whose expression children are `u32` indices of
+/// earlier records, and the last record is the root. A subterm shared in memory
+/// is therefore sent, decoded and stored once: Init has proofs whose tree
+/// encoding is 64 million nodes over 7,419 distinct ones.
+pub const SCHEMA_EXPR_DAG: SchemaId = SchemaId {
+    name: "fln.checker.expr-dag",
+    version: 1,
+};
+
+fn dag_child(reader: &mut Reader<'_, '_>, referenced: &mut [bool]) -> Result<ExprId, StepError> {
+    let index = reader.u32()? as usize;
+    // Every record before the current one has a slot, so this bound is exactly
+    // "an earlier record".
+    let Some(slot) = referenced.get_mut(index) else {
+        return Err(reader.malformed(MalformedKind::ForwardReference));
+    };
+    *slot = true;
+    Ok(ExprId(index as u32))
+}
+
+fn decode_expr_dag_value(
+    reader: &mut Reader<'_, '_>,
+    levels: &mut LevelBuilder,
+) -> Result<(Vec<ExprNode>, ExprId), StepError> {
+    let count = reader.u64()?;
+    let mut nodes = Vec::new();
+    let mut referenced: Vec<bool> = Vec::new();
+    for _ in 0..count {
+        reader.charge_unit()?;
+        let node = match reader.u8()? {
+            EXPR_BVAR => {
+                let index = reader.u32()?;
+                if index > MAX_BVAR_INDEX {
+                    return Err(reader.malformed(MalformedKind::BoundIndex));
+                }
+                ExprNode::Bound { index }
+            }
+            EXPR_FVAR => ExprNode::Free {
+                name: decode_name_value(reader)?,
+            },
+            EXPR_MVAR => ExprNode::Meta {
+                name: decode_name_value(reader)?,
+            },
+            EXPR_SORT => ExprNode::Sort {
+                level: decode_level_value(reader, levels)?,
+            },
+            EXPR_CONST => {
+                let name = decode_name_value(reader)?;
+                let level_count = reader.u64()?;
+                let mut arguments = Vec::new();
+                for _ in 0..level_count {
+                    arguments.push(decode_level_value(reader, levels)?);
+                }
+                ExprNode::Constant {
+                    name,
+                    levels: arguments,
+                }
+            }
+            EXPR_APP => {
+                let function = dag_child(reader, &mut referenced)?;
+                let argument = dag_child(reader, &mut referenced)?;
+                ExprNode::Apply { function, argument }
+            }
+            tag @ (EXPR_LAM | EXPR_FORALL) => {
+                let binder_name = decode_name_value(reader)?;
+                let binder_type = dag_child(reader, &mut referenced)?;
+                let body = dag_child(reader, &mut referenced)?;
+                let style = binder_style(reader)?;
+                if tag == EXPR_LAM {
+                    ExprNode::Lambda {
+                        binder_name,
+                        binder_type,
+                        body,
+                        style,
+                    }
+                } else {
+                    ExprNode::Forall {
+                        binder_name,
+                        binder_type,
+                        body,
+                        style,
+                    }
+                }
+            }
+            EXPR_LET => {
+                let declaration_name = decode_name_value(reader)?;
+                let type_ = dag_child(reader, &mut referenced)?;
+                let value = dag_child(reader, &mut referenced)?;
+                let body = dag_child(reader, &mut referenced)?;
+                let non_dependent = reader.bool()?;
+                ExprNode::Let {
+                    declaration_name,
+                    type_,
+                    value,
+                    body,
+                    non_dependent,
+                }
+            }
+            EXPR_LIT_NAT => {
+                let limb_count = reader.u64()?;
+                let mut limbs = Vec::new();
+                for _ in 0..limb_count {
+                    reader.charge_unit()?;
+                    limbs.push(reader.u64()?);
+                }
+                if limbs.last() == Some(&0) {
+                    return Err(reader.malformed(MalformedKind::NonCanonicalNat));
+                }
+                ExprNode::NatLiteral { limbs_le: limbs }
+            }
+            EXPR_LIT_STR => ExprNode::StringLiteral(reader.text()?.to_owned()),
+            EXPR_MDATA => {
+                let entries = metadata_entries(reader)?;
+                let expression = dag_child(reader, &mut referenced)?;
+                ExprNode::Metadata {
+                    entries,
+                    expression,
+                }
+            }
+            EXPR_PROJ => {
+                let structure_name = decode_name_value(reader)?;
+                let index = reader.u64()?;
+                let expression = dag_child(reader, &mut referenced)?;
+                ExprNode::Projection {
+                    structure_name,
+                    index,
+                    expression,
+                }
+            }
+            tag => return Err(reader.malformed(MalformedKind::UnknownExprTag(tag))),
+        };
+        push_expr(&mut nodes, node, reader.at)?;
+        referenced.push(false);
+    }
+    let Some(root) = nodes.len().checked_sub(1) else {
+        return Err(reader.malformed(MalformedKind::EmptyTable));
+    };
+    // A table is one term: every record but the root feeds a later one.
+    if referenced[..root].contains(&false) {
+        return Err(reader.malformed(MalformedKind::UnreferencedRecord));
+    }
+    Ok((nodes, ExprId(root as u32)))
+}
+
+fn run_expr_dag(
+    bytes: &[u8],
+    budget: DecodeBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<WireExpr, StepError> {
+    let mut reader = Reader::new(bytes, budget, cancelled);
+    reader.admit_input()?;
+    reader.schema(SCHEMA_EXPR_DAG)?;
+    let mut levels = LevelBuilder::new();
+    let (nodes, root) = decode_expr_dag_value(&mut reader, &mut levels)?;
+    reader.finish()?;
+    Ok(WireExpr {
+        nodes,
+        levels: levels.nodes,
+        root,
+    })
+}
+
 fn run_name(
     bytes: &[u8],
     budget: DecodeBudget,
@@ -1137,4 +1310,18 @@ pub fn decode_expr_with(
     mut cancelled: impl FnMut() -> bool,
 ) -> DecodeOutcome<WireExpr> {
     outcome(run_expr(bytes, budget, &mut cancelled))
+}
+
+/// Decode the [`SCHEMA_EXPR_DAG`] transport into an arena that keeps its
+/// sharing: a record referenced twice is one arena node.
+pub fn decode_expr_dag(bytes: &[u8], budget: DecodeBudget) -> DecodeOutcome<WireExpr> {
+    decode_expr_dag_with(bytes, budget, || false)
+}
+
+pub fn decode_expr_dag_with(
+    bytes: &[u8],
+    budget: DecodeBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> DecodeOutcome<WireExpr> {
+    outcome(run_expr_dag(bytes, budget, &mut cancelled))
 }

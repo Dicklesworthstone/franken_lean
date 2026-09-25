@@ -54,7 +54,7 @@ use fln_checker::environment::{
 pub use fln_checker::wire::DecodeBudget as CheckerDecodeBudget;
 use fln_checker::wire::{
     DecodeOutcome as CheckerDecodeOutcome, WireExpr as CheckerExpr, WireName as CheckerName,
-    decode_expr as checker_decode_expr, decode_name as checker_decode_name,
+    decode_expr_dag as checker_decode_expr_dag, decode_name as checker_decode_name,
 };
 pub use fln_comp::fir::LoweringError;
 use fln_comp::fir::ValueType;
@@ -5171,27 +5171,192 @@ fn decode_checker_name(name: &Name, budget: CheckerDecodeBudget) -> Result<Check
     }
 }
 
+/// Write `expression` in the checker's sharing-preserving transport
+/// ([`fln_checker::wire::SCHEMA_EXPR_DAG`]): one record per distinct node
+/// allocation, children before parents, so a term shared in memory crosses as
+/// its DAG rather than its tree. `None` once the encoding would pass `limit`
+/// bytes, without ever holding more than that.
+fn encode_checker_expr_dag(expression: &Expr, limit: usize) -> Option<Vec<u8>> {
+    use fln_checker::wire as tag;
+    use fln_core::expr::ExprNode;
+
+    fn children(node: &ExprNode) -> [Option<&Expr>; 3] {
+        match node {
+            ExprNode::App { f, a } => [Some(f), Some(a), None],
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => [Some(binder_type), Some(body), None],
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => [Some(type_), Some(value), Some(body)],
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Lit { .. } => [None, None, None],
+        }
+    }
+    // A node's identity is the address of its shared allocation, stable while
+    // `expression` is borrowed; structurally equal but separately allocated
+    // nodes stay separate records, which costs bytes and never meaning.
+    let identity = |term: &Expr| std::ptr::from_ref(term.node()).addr();
+
+    let mut index: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut order: Vec<&Expr> = Vec::new();
+    let mut pending: Vec<(&Expr, bool)> = vec![(expression, false)];
+    while let Some((term, children_done)) = pending.pop() {
+        let id = identity(term);
+        if index.contains_key(&id) {
+            continue;
+        }
+        if children_done {
+            index.insert(id, u32::try_from(order.len()).ok()?);
+            order.push(term);
+            continue;
+        }
+        pending.push((term, true));
+        for child in children(term.node()).into_iter().rev().flatten() {
+            if !index.contains_key(&identity(child)) {
+                pending.push((child, false));
+            }
+        }
+    }
+
+    let reference = |term: &Expr| index[&identity(term)];
+    let mut w = CanonWriter::with_limit(limit);
+    w.schema(tag::SCHEMA_EXPR_DAG);
+    w.u64(order.len() as u64);
+    for term in order {
+        if w.overflowed() {
+            return None;
+        }
+        match term.node() {
+            ExprNode::BVar { idx } => {
+                w.u8(tag::EXPR_BVAR);
+                w.u32(*idx);
+            }
+            ExprNode::FVar { id } => {
+                w.u8(tag::EXPR_FVAR);
+                id.0.write_body(&mut w);
+            }
+            ExprNode::MVar { id } => {
+                w.u8(tag::EXPR_MVAR);
+                id.0.write_body(&mut w);
+            }
+            ExprNode::Sort { level } => {
+                w.u8(tag::EXPR_SORT);
+                level.write_body(&mut w);
+            }
+            ExprNode::Const { name, levels } => {
+                w.u8(tag::EXPR_CONST);
+                name.write_body(&mut w);
+                w.u64(levels.len() as u64);
+                for level in levels {
+                    level.write_body(&mut w);
+                }
+            }
+            ExprNode::App { f, a } => {
+                w.u8(tag::EXPR_APP);
+                w.u32(reference(f));
+                w.u32(reference(a));
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            }
+            | ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                w.u8(if matches!(term.node(), ExprNode::Lam { .. }) {
+                    tag::EXPR_LAM
+                } else {
+                    tag::EXPR_FORALL
+                });
+                binder_name.write_body(&mut w);
+                w.u32(reference(binder_type));
+                w.u32(reference(body));
+                // The upstream `BinderInfo.toUInt64` numbering, as in `SCHEMA_EXPR`.
+                w.u8(binder_info.to_u64() as u8);
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                w.u8(tag::EXPR_LET);
+                decl_name.write_body(&mut w);
+                w.u32(reference(type_));
+                w.u32(reference(value));
+                w.u32(reference(body));
+                w.bool(*non_dep);
+            }
+            ExprNode::Lit { literal } => match literal {
+                Literal::Nat(n) => {
+                    w.u8(tag::EXPR_LIT_NAT);
+                    w.u64(n.limbs_le().len() as u64);
+                    for limb in n.limbs_le() {
+                        w.u64(*limb);
+                    }
+                }
+                Literal::Str(s) => {
+                    w.u8(tag::EXPR_LIT_STR);
+                    w.str(s);
+                }
+            },
+            ExprNode::MData { data, expr } => {
+                w.u8(tag::EXPR_MDATA);
+                data.write_body(&mut w);
+                w.u32(reference(expr));
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                w.u8(tag::EXPR_PROJ);
+                struct_name.write_body(&mut w);
+                w.u64(*idx);
+                w.u32(reference(expr));
+            }
+        }
+    }
+    (!w.overflowed()).then(|| w.into_bytes())
+}
+
 fn decode_checker_expr(
     expression: &Expr,
     budget: CheckerDecodeBudget,
 ) -> Result<CheckerExpr, String> {
+    // Terms cross as their DAG: canonical tree bytes do not preserve sharing,
+    // and one Init theorem's tree encoding is 727 MB over 7,419 distinct nodes.
     // The checker would refuse anything past its input budget, so never build
-    // more encoding than it can read: canonical bytes do not preserve sharing,
-    // and one Init theorem's tree encoding is 727 MB.
+    // more encoding than it can read.
     let limit = usize::try_from(budget.max_input_bytes).unwrap_or(usize::MAX);
-    let Some(bytes) = expression.to_canonical_bytes_within(limit) else {
+    let Some(bytes) = encode_checker_expr_dag(expression, limit) else {
         return Err(format!(
-            "canonical expression encoding exceeds the checker's {limit}-byte decode budget"
+            "shared expression encoding exceeds the checker's {limit}-byte decode budget"
         ));
     };
-    match checker_decode_expr(&bytes, budget) {
+    match checker_decode_expr_dag(&bytes, budget) {
         CheckerDecodeOutcome::Complete(Ok(expression)) => Ok(expression),
         CheckerDecodeOutcome::Complete(Err(malformed)) => {
-            Err(format!("canonical expression decode failed: {malformed:?}"))
+            Err(format!("shared expression decode failed: {malformed:?}"))
         }
-        CheckerDecodeOutcome::Inconclusive(stop) => Err(format!(
-            "canonical expression decode did not finish: {stop:?}"
-        )),
+        CheckerDecodeOutcome::Inconclusive(stop) => {
+            Err(format!("shared expression decode did not finish: {stop:?}"))
+        }
     }
 }
 
@@ -10246,36 +10411,54 @@ mod tests {
 
     #[test]
     fn the_default_checker_decode_budget_binds_on_bytes_not_units() {
-        use fln_hash::canon::Canonical;
         let default = super::CheckerExecutionLimits::default().decode;
         assert!(
             default.max_produced_units >= default.max_input_bytes,
             "each produced unit reads at least one byte, so a unit bound below \
              the byte bound refuses inputs the byte bound admits"
         );
-        // A balanced application tree of depth 19 over `Sort 0`, shared in
-        // memory: its tree encoding is a fixed header plus 3 * 2^19 - 1 node
-        // bytes, and it produces exactly as many units (an `App` tag, a `Sort`
-        // tag and a `Zero` level tag are one byte and one unit each), past the
-        // old 1_000_000-unit bound and far under the byte bound.
-        let leaf = Expr::sort(Level::zero());
-        let header = leaf.to_canonical_bytes().len() as u64 - 2;
-        let mut tree = leaf;
-        for _ in 0..19 {
-            tree = Expr::app(tree.clone(), tree);
+        // A left-nested application spine with a fresh leaf per argument: every
+        // node is its own allocation, so the shared transport carries all
+        // 1,200,001 of them as records (an application is 9 bytes, a bound
+        // variable 5), past the old 1_000_000-unit bound and under the byte
+        // bound.
+        let mut spine = Expr::bvar(0).expect("small index");
+        for index in 0..600_000u32 {
+            spine = Expr::app(spine, Expr::bvar(index % 1000).expect("small index"));
         }
-        let bytes = tree.to_canonical_bytes().len() as u64;
-        assert_eq!(bytes, header + 3 * (1 << 19) - 1);
-        assert!(bytes > 1_000_000 && bytes < default.max_input_bytes);
-        super::decode_checker_expr(&tree, default)
+        let bytes = super::encode_checker_expr_dag(&spine, usize::MAX)
+            .expect("unbounded")
+            .len() as u64;
+        assert!(
+            bytes > 1_200_001 && bytes < default.max_input_bytes,
+            "{bytes}"
+        );
+        super::decode_checker_expr(&spine, default)
             .expect("an expression within the byte bound decodes under the default budget");
         // The control: the old unit bound refuses this same input on units.
         let refusal = super::decode_checker_expr(
-            &tree,
+            &spine,
             super::CheckerDecodeBudget::new(default.max_input_bytes, 1_000_000),
         )
-        .expect_err("the old unit bound stops before the tree is decoded");
+        .expect_err("the old unit bound stops before the spine is decoded");
         assert!(refusal.contains("ProducedUnits"), "{refusal}");
+    }
+
+    #[test]
+    fn terms_cross_to_the_checker_as_their_dag() {
+        use fln_hash::canon::Canonical;
+        // A balanced application tree of depth 40 over `Sort 0`, shared in
+        // memory: 2^41 - 1 tree nodes over 41 distinct ones. Its tree encoding
+        // could never be built; its shared encoding is 41 records.
+        let mut tree = Expr::sort(Level::zero());
+        for _ in 0..40 {
+            tree = Expr::app(tree.clone(), tree);
+        }
+        assert!(tree.to_canonical_bytes_within(1 << 20).is_none());
+        let decoded =
+            super::decode_checker_expr(&tree, super::CheckerExecutionLimits::default().decode)
+                .expect("the shared encoding fits");
+        assert_eq!(decoded.nodes().len(), 41);
     }
 
     #[test]
