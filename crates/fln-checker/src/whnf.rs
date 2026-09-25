@@ -9,10 +9,14 @@
 //! stuck. Nat literal majors are exposed one constructor layer at a time;
 //! string literal majors and native extensions remain outside this layer.
 
+mod memo;
 mod quotient;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
+
+use memo::WhnfMemo;
 
 use crate::environment::{ConstantEnvironment, RecursorDeclaration};
 use crate::instantiate::{
@@ -99,11 +103,24 @@ impl ProjectionRule {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct WhnfContext {
     free_bindings: Vec<FreeBinding>,
     projection_rules: Vec<ProjectionRule>,
     constants: ConstantEnvironment,
+    /// Results already computed under this context; see `memo`.
+    memo: WhnfMemo,
+}
+
+impl fmt::Debug for WhnfContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WhnfContext")
+            .field("free_bindings", &self.free_bindings)
+            .field("projection_rules", &self.projection_rules)
+            .field("constants", &self.constants)
+            .finish()
+    }
 }
 
 impl WhnfContext {
@@ -116,6 +133,7 @@ impl WhnfContext {
             free_bindings,
             projection_rules,
             constants,
+            memo: WhnfMemo::default(),
         }
     }
 
@@ -150,6 +168,12 @@ impl WhnfContext {
 
     pub fn constants(&self) -> &ConstantEnvironment {
         &self.constants
+    }
+
+    /// The memo, while no let-bound local is in scope: only then does reduction
+    /// read nothing a context can change.
+    fn memo(&self) -> Option<&WhnfMemo> {
+        self.free_bindings.is_empty().then_some(&self.memo)
     }
 }
 
@@ -518,7 +542,7 @@ struct ProjectionFrame {
     outer_arguments: VecDeque<Cursor>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DeltaMode {
     Eager,
     Disabled,
@@ -2350,7 +2374,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
 
     fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
         let current = self.materialize_term(input, root, WhnfPhase::Initial)?;
-        self.normalize(current)
+        let Some(memo) = self.context.source.memo() else {
+            return self.normalize(current);
+        };
+        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
+        if let Some(result) = memo.recall(&current.arena, delta_mode, &budget) {
+            return Ok(result);
+        }
+        let input = Arc::clone(&current.arena);
+        let result = self.normalize(current)?;
+        memo.remember(input, delta_mode, budget.materialization, &result);
+        Ok(result)
     }
 
     /// The reduction loop. Out of line so the initial materialization in `run`

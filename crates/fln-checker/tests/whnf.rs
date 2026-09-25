@@ -2751,3 +2751,136 @@ fn nat_reduction_in_eager_whnf_reduces_ble_and_arithmetic_without_unfolding() {
         add_result.steps
     );
 }
+
+/// `link_0 := link_1`, ..., `link_{n-1} := chain_end`: n delta steps to a stuck
+/// constant.
+fn delta_chain_context(length: usize) -> WhnfContext {
+    definition_context(
+        (0..length)
+            .map(|index| {
+                let next = if index + 1 == length {
+                    "chain_end".to_owned()
+                } else {
+                    format!("link_{}", index + 1)
+                };
+                definition_entry(
+                    format!("link_{index}"),
+                    Vec::new(),
+                    decoded(&constant(next)),
+                    ReducibilityHint::Regular(1),
+                    DefinitionSafety::Safe,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn polled_whnf(term: &WireExpr, context: &WhnfContext, budget: WhnfBudget) -> (WhnfOutcome, u64) {
+    let mut polls = 0_u64;
+    let outcome = whnf_with(term, context, budget, || {
+        polls += 1;
+        false
+    });
+    (outcome, polls)
+}
+
+#[test]
+fn a_repeated_reduction_is_answered_from_the_context_memo_with_its_charges() {
+    let term = decoded(&constant("link_0"));
+    let context = delta_chain_context(40);
+    let (first, first_polls) = polled_whnf(&term, &context, WhnfBudget::unlimited());
+    let first = complete(first);
+    assert_eq!(
+        output_model(&first),
+        Frozen::Constant("chain_end".to_owned())
+    );
+    assert_eq!(first.delta_reductions, 40);
+
+    // The same answer, charges included, so no caller can tell the difference...
+    let (second, second_polls) = polled_whnf(&term, &context, WhnfBudget::unlimited());
+    assert_eq!(complete(second), first);
+    // ...but without repeating the forty unfoldings.
+    assert!(
+        second_polls * 10 < first_polls,
+        "a repeat polled {second_polls} times against {first_polls} the first time"
+    );
+
+    // The memo belongs to the context: a fresh one recomputes.
+    let (fresh, fresh_polls) =
+        polled_whnf(&term, &delta_chain_context(40), WhnfBudget::unlimited());
+    assert_eq!(complete(fresh), first);
+    assert_eq!(fresh_polls, first_polls);
+}
+
+#[test]
+fn a_remembered_reduction_is_replayed_only_under_a_budget_that_completes_it() {
+    let term = decoded(&constant("link_0"));
+    let context = delta_chain_context(40);
+    let full = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    let with_steps = |steps| WhnfBudget {
+        max_steps: steps,
+        ..WhnfBudget::unlimited()
+    };
+    let with_reductions = |reductions| WhnfBudget {
+        max_reductions: reductions,
+        ..WhnfBudget::unlimited()
+    };
+    for (label, budget, completes) in [
+        ("exact steps", with_steps(full.steps), true),
+        ("one step short", with_steps(full.steps - 1), false),
+        ("exact reductions", with_reductions(full.reductions), true),
+        (
+            "one reduction short",
+            with_reductions(full.reductions - 1),
+            false,
+        ),
+    ] {
+        // The context that remembers the result answers exactly as a context that
+        // must recompute it: complete where that completes, the same typed stop
+        // where it stops.
+        let remembered = whnf(&term, &context, budget);
+        let recomputed = whnf(&term, &delta_chain_context(40), budget);
+        assert_eq!(remembered, recomputed, "{label}");
+        assert_eq!(
+            matches!(recomputed, WhnfOutcome::Complete(_)),
+            completes,
+            "{label}: {recomputed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_remembered_reduction_is_not_replayed_under_another_materialization_budget() {
+    // `wide := f a b c`: the input is one node, the unfolded value seven.
+    let value = Expr::app(
+        Expr::app(Expr::app(constant("f"), constant("a")), constant("b")),
+        constant("c"),
+    );
+    let wide_context = || {
+        definition_context(vec![definition_entry(
+            "wide",
+            Vec::new(),
+            decoded(&value),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        )])
+    };
+    let term = decoded(&constant("wide"));
+    let context = wide_context();
+    complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    // Room to copy the input, not the unfolded value.
+    let narrow = WhnfBudget {
+        materialization: TermBudget {
+            max_arena_nodes: 3,
+            ..TermBudget::unlimited()
+        },
+        ..WhnfBudget::unlimited()
+    };
+    let remembered = whnf(&term, &context, narrow);
+    let recomputed = whnf(&term, &wide_context(), narrow);
+    assert!(
+        matches!(recomputed, WhnfOutcome::Inconclusive(_)),
+        "the narrow budget must stop a recomputation: {recomputed:?}"
+    );
+    assert_eq!(remembered, recomputed);
+}

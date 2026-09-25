@@ -553,3 +553,42 @@ fn production_expansion_has_no_primary_semantic_path() {
     assert!(!tree.lines().any(|line| line.trim() == "fln-kernel"));
     assert!(!tree.lines().any(|line| line.trim() == "fln-bignum"));
 }
+
+#[test]
+fn a_remembered_projection_is_replayed_only_within_its_string_budget() {
+    let projection = decoded(&Expr::proj(top("String"), 0, string_literal("aλ")));
+    let context = string_context();
+    let full = match whnf(&projection, &context, WhnfBudget::unlimited()) {
+        WhnfOutcome::Complete(result) => result,
+        other => panic!("String projection did not normalize: {other:?}"),
+    };
+    let used = full.string_progress;
+    let unlimited = [u64::MAX; 4];
+    for (dimension, spent) in [
+        used.steps,
+        used.code_points,
+        used.arena_nodes,
+        used.owned_units,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (allowed, completes) in [(spent, true), (spent - 1, false)] {
+            let mut limits = unlimited;
+            limits[dimension] = allowed;
+            let budget = WhnfBudget::unlimited().with_string(StringExpansionBudget::new(
+                limits[0], limits[1], limits[2], limits[3],
+            ));
+            // The context that remembers the result answers exactly as a fresh
+            // context that must expand the literal again.
+            let remembered = whnf(&projection, &context, budget);
+            let recomputed = whnf(&projection, &string_context(), budget);
+            assert_eq!(remembered, recomputed, "dimension {dimension}, {allowed}");
+            assert_eq!(
+                matches!(recomputed, WhnfOutcome::Complete(_)),
+                completes,
+                "dimension {dimension}, {allowed}: {recomputed:?}"
+            );
+        }
+    }
+}

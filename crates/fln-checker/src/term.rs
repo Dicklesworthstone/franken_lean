@@ -39,7 +39,7 @@ pub enum TermLimit {
 ///
 /// Output units count expression and universe nodes, name parts, metadata
 /// entries, level references, natural limbs, and owned UTF-8 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TermBudget {
     pub max_steps: u64,
     pub max_output_units: u64,
