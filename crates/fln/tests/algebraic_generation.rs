@@ -191,3 +191,102 @@ fn invalid_constructor_telescope_and_budget_refusals_are_explicit() {
         .is_err()
     );
 }
+
+/// The payload's type is A -> B, hence its universe is imax u v. Do not
+/// pre-normalize that type or replace the field with a synthetic sort witness:
+/// the council must independently infer the actual function-field universe.
+fn function_box(result_level: Level) -> InductiveSpec {
+    let a = field("A", Expr::sort(Level::param(name("u"))));
+    let b = field("B", Expr::sort(Level::param(name("v"))));
+    let function = Expr::forall_e(
+        name("x"),
+        Expr::fvar(a.id.clone()),
+        Expr::fvar(b.id.clone()),
+        BinderInfo::Default,
+    );
+    let mut data = spec(
+        "FunctionBox",
+        vec![ctor("mk", vec![field("f", function)])],
+    );
+    data.level_params = vec![name("u"), name("v")];
+    data.parameters = vec![a, b];
+    data.result_level = result_level;
+    data
+}
+
+#[test]
+fn correlated_function_universes_reach_both_checkers_and_source_reduction() {
+    let u = Level::param(name("u"));
+    let v = Level::param(name("v"));
+    let correlated = Level::imax(u.clone(), v.clone()).unwrap();
+    let bounds = [
+        correlated.clone().succ().unwrap(),
+        Level::max(correlated, Level::one()).unwrap(),
+        Level::imax(u.succ().unwrap(), v).unwrap().succ().unwrap(),
+    ];
+    for bound in bounds {
+        let e = admit(&function_box(bound));
+        assert!(e.environment().find(&name("FunctionBox.mk")).is_some());
+        let info = e.environment().find(&name("FunctionBox.rec")).unwrap();
+        let fln_env::constants::ConstantInfo::Rec(rec) = info else {
+            panic!("independently admitted recursor metadata");
+        };
+        assert_eq!(rec.rules.len(), 1);
+        assert_eq!(rec.rules[0].nfields, 1);
+        proof(
+            &e,
+            "def boxedIdentity : FunctionBox Nat Nat := @FunctionBox.mk Nat Nat (fun x => x)",
+        );
+        proof(
+            &e,
+            "theorem read_box : @FunctionBox.rec Nat Nat (fun _ => Nat) (fun f => f 7) (@FunctionBox.mk Nat Nat (fun x => x)) = 7 := by rfl",
+        );
+    }
+}
+
+#[test]
+fn correlated_function_universes_keep_the_zero_codomain_case() {
+    let correlated = Level::imax(Level::param(name("u")), Level::param(name("v"))).unwrap();
+    let e = admit(&function_box(correlated.succ().unwrap()));
+    // True : Sort 0, so Nat -> True is a proof even though Nat : Sort 1.
+    // The surrounding FunctionBox remains data and may eliminate into Nat.
+    proof(
+        &e,
+        "theorem read_proof_box : @FunctionBox.rec Nat True (fun _ => Nat) (fun _ => 7) (@FunctionBox.mk Nat True (fun _ => True.intro)) = 7 := by rfl",
+    );
+}
+
+#[test]
+fn oversized_function_universes_cannot_publish_and_valid_retry_is_deterministic() {
+    let e = engine();
+    let before = e.logical_root(&KVMap::new());
+    // For u = v = 2 the function field lives in Sort 2, not Sort 1.
+    // Generation is not authority; the complete proposed block must be refused.
+    let oversized = inductive_declaration(&function_box(Level::one()), RecordBudget::default())
+        .unwrap();
+    let refused = e.admit_declarations(&[oversized], &KVMap::new(), limits());
+    assert!(
+        !matches!(refused, Ok(Outcome::Complete(_))),
+        "oversized polymorphic payload was admitted: {refused:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), before);
+    for member in ["FunctionBox", "FunctionBox.mk", "FunctionBox.rec"] {
+        assert!(e.environment().find(&name(member)).is_none());
+    }
+
+    let correlated = Level::imax(Level::param(name("u")), Level::param(name("v"))).unwrap();
+    let valid = function_box(correlated.succ().unwrap());
+    let declaration = inductive_declaration(&valid, RecordBudget::default()).unwrap();
+    let retried = e
+        .admit_declarations(&[declaration], &KVMap::new(), limits())
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let fresh = admit(&valid);
+    assert_eq!(
+        retried.logical_root(&KVMap::new()),
+        fresh.logical_root(&KVMap::new())
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), before);
+}
