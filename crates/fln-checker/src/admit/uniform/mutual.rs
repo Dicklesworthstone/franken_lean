@@ -6,6 +6,7 @@
 //! source of their expected types. No primary-kernel implementation is used.
 //! Nested recursion and proposition-valued mutual families remain nonanswers.
 use super::*;
+use crate::whnf::{WhnfContext, WhnfOutcome, whnf_core_at_with};
 
 struct Family<'a> {
     entry: &'a ConstantEntry,
@@ -97,6 +98,12 @@ impl Block<'_> {
             }
         }
         if mentions_any(audit, term, term.root(), &self.names)? {
+            // The pin tests a field after whnf (`is_rec_argument`). A head redex
+            // is recursive there: a nested family's `RBNode` field becomes
+            // `(fun _ => Json) k` once its lambda parameter is instantiated.
+            if let Some(reduced) = reduced_codomain(audit, term)? {
+                return self.child(audit, &reduced, field);
+            }
             return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Recursive));
         }
         Ok(None)
@@ -315,6 +322,58 @@ impl Block<'_> {
         }
         audit.finish(builder, body)
     }
+}
+
+/// `term`'s telescope with its codomain in weak head normal form (no delta), or
+/// `None` when nothing reduces or the reduction does not complete. The binders
+/// are kept as written, as the pin keeps a recursive field's own type and reads
+/// only the reduced form.
+fn reduced_codomain(
+    audit: &mut Audit<'_>,
+    term: &WireExpr,
+) -> Result<Option<WireExpr>, InductiveVerdict> {
+    let mut binders = Vec::new();
+    let mut tail = term.root();
+    loop {
+        audit.tick()?;
+        match term.node(tail) {
+            Some(ExprNode::Metadata { expression, .. }) => tail = *expression,
+            Some(ExprNode::Forall {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            }) => {
+                binders.push(Binder {
+                    name: binder_name.clone(),
+                    style: *style,
+                    domain: audit.piece(term, *binder_type)?,
+                });
+                tail = *body;
+            }
+            _ => break,
+        }
+    }
+    let budget = audit.budget.inference.whnf;
+    let WhnfOutcome::Complete(result) = whnf_core_at_with(
+        term,
+        tail,
+        &WhnfContext::default(),
+        budget,
+        &mut *audit.cancelled,
+    ) else {
+        return Ok(None);
+    };
+    if result.reductions == 0 {
+        return Ok(None);
+    }
+    let mut builder = StructuralTermBuilder::new();
+    let mut root = audit.import(&mut builder, &result.term)?;
+    for binder in binders.iter().rev() {
+        let domain = audit.import(&mut builder, &binder.domain)?;
+        root = builder.forall_name(&binder.name, binder.style, domain, root);
+    }
+    audit.finish(builder, root).map(Some)
 }
 
 pub(in crate::admit) fn admit(

@@ -573,9 +573,6 @@ fn f3() -> (ConstantEnvironment, Vec<ConstantEntry>) {
             prefix.iter().map(|l| l.e()),
         )
     };
-    fn joined<'a>(prefix: &[&'a Local], extra: &[&'a Local]) -> Vec<&'a Local> {
-        prefix.iter().chain(extra).copied().collect()
-    }
     let major_r = local("major_r", r.clone());
     let major_j = local("major_j", j_r.clone());
     let rows = vec![
@@ -640,6 +637,139 @@ fn f3() -> (ConstantEnvironment, Vec<ConstantEntry>) {
     (env, rows)
 }
 
+/// F4: `K | node (f : Fam K (fun _ => K))`, where `Fam.{u} (α : Type u)
+/// (β : α → Type u)` has `Fam.mk : (a : α) → β a → Fam α β`. The auxiliary
+/// constructor's second field is `(fun _ => K) a`, a head redex that the pin
+/// recognizes as recursive only after whnf. Its binder keeps the written type;
+/// its induction hypothesis reads the reduced one.
+fn f4() -> (ConstantEnvironment, Vec<ConstantEntry>) {
+    let zero = || Level::zero();
+    let alpha = local("fam.alpha", ty(param("u")));
+    let beta = local(
+        "fam.beta",
+        pi(&[&local("fam.x", alpha.e())], ty(param("u"))),
+    );
+    let fa = local("fam.a", alpha.e());
+    let fb = local("fam.b", app(beta.e(), [fa.e()]));
+    let env = environment(vec![
+        inductive(
+            "Fam",
+            &["u"],
+            pi(&[&alpha, &beta], ty(param("u"))),
+            2,
+            &["Fam"],
+            &["Fam.mk"],
+            0,
+            false,
+        ),
+        constructor(
+            "Fam.mk",
+            &["u"],
+            pi(
+                &[&alpha, &beta, &fa, &fb],
+                app(c("Fam", vec![param("u")]), [alpha.e(), beta.e()]),
+            ),
+            "Fam",
+            0,
+            2,
+            2,
+        ),
+    ]);
+    let k = c("K", vec![]);
+    let family = Expr::lam(name("x"), k.clone(), k.clone(), BinderInfo::Default);
+    let fam_k = app(c("Fam", vec![zero()]), [k.clone(), family.clone()]);
+    let w = param("w");
+    let m1 = local("m1", pi(&[&local("t1", k.clone())], Expr::sort(w.clone())));
+    let m2 = local(
+        "m2",
+        pi(&[&local("t2", fam_k.clone())], Expr::sort(w.clone())),
+    );
+    let child = local("child", fam_k.clone());
+    let a = local("a", k.clone());
+    let b = local("b", app(family.clone(), [a.e()]));
+    let ih_child = local("ih_child", app(m2.e(), [child.e()]));
+    let ih_a = local("ih_a", app(m1.e(), [a.e()]));
+    let ih_b = local("ih_b", app(m1.e(), [b.e()]));
+    let node = local(
+        "node",
+        pi(
+            &[&child, &ih_child],
+            app(m1.e(), [app(c("K.node", vec![]), [child.e()])]),
+        ),
+    );
+    let mk = local(
+        "mk",
+        pi(
+            &[&a, &b, &ih_a, &ih_b],
+            app(
+                m2.e(),
+                [app(
+                    c("Fam.mk", vec![zero()]),
+                    [k.clone(), family.clone(), a.e(), b.e()],
+                )],
+            ),
+        ),
+    );
+    let prefix = [&m1, &m2, &node, &mk];
+    let head = |n: &str| app(c(n, vec![w.clone()]), prefix.iter().map(|l| l.e()));
+    let major_k = local("major_k", k.clone());
+    let major_fam = local("major_fam", fam_k.clone());
+    let rows = vec![
+        inductive("K", &[], ty(zero()), 0, &["K"], &["K.node"], 1, true),
+        constructor("K.node", &[], pi(&[&child], k.clone()), "K", 0, 0, 1),
+        recursor(
+            "K.rec",
+            &["w"],
+            pi(&joined(&prefix, &[&major_k]), app(m1.e(), [major_k.e()])),
+            &["K"],
+            0,
+            2,
+            2,
+            vec![(
+                "K.node",
+                1,
+                lam(
+                    &joined(&prefix, &[&child]),
+                    app(node.e(), [child.e(), app(head("K.rec_1"), [child.e()])]),
+                ),
+            )],
+        ),
+        recursor(
+            "K.rec_1",
+            &["w"],
+            pi(
+                &joined(&prefix, &[&major_fam]),
+                app(m2.e(), [major_fam.e()]),
+            ),
+            &["K"],
+            0,
+            2,
+            2,
+            vec![(
+                "Fam.mk",
+                2,
+                lam(
+                    &joined(&prefix, &[&a, &b]),
+                    app(
+                        mk.e(),
+                        [
+                            a.e(),
+                            b.e(),
+                            app(head("K.rec"), [a.e()]),
+                            app(head("K.rec"), [b.e()]),
+                        ],
+                    ),
+                ),
+            )],
+        ),
+    ];
+    (env, rows)
+}
+
+fn joined<'a>(prefix: &[&'a Local], extra: &[&'a Local]) -> Vec<&'a Local> {
+    prefix.iter().chain(extra).copied().collect()
+}
+
 fn admitted(verdict: &InductiveVerdict) -> bool {
     matches!(verdict, InductiveVerdict::Admitted(_))
 }
@@ -702,4 +832,11 @@ fn a_declared_nested_count_must_match_the_translation() {
         ),
         "{verdict:?}"
     );
+}
+
+#[test]
+fn a_field_whose_type_reduces_to_the_family_is_recursive() {
+    let (env, rows) = f4();
+    let verdict = verdict(&env, &rows);
+    assert!(admitted(&verdict), "{verdict:?}");
 }
