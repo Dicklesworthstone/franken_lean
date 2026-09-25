@@ -2,20 +2,24 @@
 //! types. Source-local ids are resolved only after every lambda (including
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
+mod recursors;
 mod stages;
 
 use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
 impl Preparation<'_> {
-    /// Keep an application of a data eliminator's returned closure distinct
-    /// from the eliminator's own arguments. The let evaluates the selected
-    /// function once, before its arguments, without evaluating either branch.
+    /// Adapt underapplication before separating an eliminator's returned
+    /// closure from overapplication. Both forms keep the original recursor on
+    /// the ordinary family-specific lowering path.
     pub(super) fn overapplied_data_recursor(
         &mut self,
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(partial) = self.partially_applied_recursor(head, args)? {
+            return Ok(Some(partial));
+        }
         let ExprNode::Const { name, .. } = head.node() else {
             return Ok(None);
         };

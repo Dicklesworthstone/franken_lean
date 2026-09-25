@@ -37,6 +37,11 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv > target/constructor-runtime/compiler.txt
+      - name: Test first-class recursors and higher-order execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test runtime_partial_recursors --test runtime_higher_order --no-fail-fast 2>&1 | tee target/constructor-runtime/partial-recursors.log
       - name: Test compiler and VM
         shell: bash
         run: |
@@ -58,7 +63,7 @@ jobs:
           set -euo pipefail
           cargo clippy --locked -p fln-comp -p fln-vm -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/constructor-runtime/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/constructor-runtime/workspace.log
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/variants.rs crates/fln/src/runtime/data_recursion.rs crates/fln/tests/runtime_recursive_data.rs crates/fln/tests/runtime_variants.rs crates/fln-cli/tests/source_variant_runtime.rs crates/fln-vm/tests/constructor_dispatch.rs crates/fln-comp/src/ingress/constructor_case.rs
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/variants.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/callables/recursors.rs crates/fln/tests/runtime_partial_recursors.rs crates/fln/tests/runtime_recursive_data.rs crates/fln/tests/runtime_variants.rs crates/fln-cli/tests/source_variant_runtime.rs crates/fln-vm/tests/constructor_dispatch.rs crates/fln-comp/src/ingress/constructor_case.rs
       - name: Retain exact verification results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
