@@ -93,6 +93,12 @@ const SELF_CLEANING: &[(&str, &str)] = &[
     ),
     // The lake integrity controls: every package root is a `Package` removed on drop.
     ("crates/fln-cli/tests/lake_integrity.rs", "remove_dir_all"),
+    // The relation-tactic regressions: each input file is created with `create_new`
+    // and removed when its `Input` guard drops.
+    (
+        "crates/fln-cli/tests/native_relation_tactics.rs",
+        "remove_file",
+    ),
 ];
 
 /// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits, and

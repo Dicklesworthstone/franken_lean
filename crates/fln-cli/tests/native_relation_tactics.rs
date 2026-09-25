@@ -1,4 +1,5 @@
 //! Installed-command regressions: parsing alone is not evidence of a proof.
+#![forbid(unsafe_code)]
 
 use std::fs::OpenOptions;
 use std::io::Write;

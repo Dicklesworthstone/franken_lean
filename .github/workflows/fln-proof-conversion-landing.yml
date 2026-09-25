@@ -146,11 +146,11 @@ jobs:
       - name: Validate and export native symm
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 "$RUNNER_TEMP/relation-evidence/verify.py" 1
+        run: python3 -I "$RUNNER_TEMP/relation-evidence/verify.py" 1
       - name: Validate and export native change
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 "$RUNNER_TEMP/relation-evidence/verify.py" 2
+        run: python3 -I "$RUNNER_TEMP/relation-evidence/verify.py" 2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
