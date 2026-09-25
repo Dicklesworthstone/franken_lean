@@ -351,7 +351,7 @@ fn field_limit(observed: usize) -> InductiveVerdict {
 }
 
 #[allow(clippy::too_many_lines)]
-fn check(
+pub(super) fn check(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
     first: &ConstantEntry,

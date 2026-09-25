@@ -7905,7 +7905,16 @@ pub fn admit_inductive_with(
                 observed: extra_types.saturating_add(1),
             });
         }
-        return uniform::admit_mutual(
+        let nested = inductive
+            .declaration()
+            .inductive_metadata()
+            .is_some_and(|metadata| metadata.num_nested() != 0);
+        let admit = if nested {
+            uniform::admit_nested
+        } else {
+            uniform::admit_mutual
+        };
+        return admit(
             environment,
             declarations,
             inductive,
@@ -8180,6 +8189,18 @@ pub fn admit_inductive_with(
     }
     if name == &checker_child(&checker_atom("Lean"), "Syntax") {
         return admit_lean_syntax(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    // Any other nested family is judged as the mutual block the pin elaborates.
+    if metadata.num_nested() != 0 {
+        return uniform::admit_nested(
             environment,
             declarations,
             inductive,

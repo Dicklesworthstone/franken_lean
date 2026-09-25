@@ -7,7 +7,9 @@
 //! call. Strictly positive function-valued children retain their argument telescopes.
 //! Nested occurrences under unrelated type constructors remain unsupported.
 mod mutual;
+mod nested;
 pub(super) use mutual::admit as admit_mutual;
+pub(super) use nested::admit as admit_nested;
 
 use super::*;
 use crate::infer::LocalDeclaration;
