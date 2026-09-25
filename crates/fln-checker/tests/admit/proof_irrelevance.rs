@@ -415,3 +415,73 @@ fn the_typed_lane_does_not_repeat_the_deferred_root_query() {
          deferred pair ({walk} each): the typed lane asked the root again"
     );
 }
+
+/// `T3 (slow a) (slow b) (slow c)`.
+fn t3_of_slow(proofs: [&str; 3]) -> Expr {
+    app(c("T3"), proofs.map(|proof| app(c("slow"), [c(proof)])))
+}
+
+/// `T3 : P → P → P → Type`, and `slow : P → P`, a regular definition unfolding
+/// to a `WRAPS`-deep tower, so each argument pair `slow a ≟ slow b` costs the
+/// typed lane one untyped walk before proof irrelevance closes it. `w` has type
+/// `T3` over `witness`.
+fn three_slow_proofs(witness: [&str; 3]) -> ConstantEnvironment {
+    const WRAPS: usize = 200;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound, |inner, _| app(c("wrapP"), [inner]));
+    environment_of(vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("wrapP", pi(c("P"), c("P"))),
+        entry(
+            "T3",
+            pi(c("P"), pi(c("P"), pi(c("P"), Expr::sort(Level::one())))),
+        ),
+        definition(
+            "slow",
+            decoded(&pi(c("P"), c("P"))),
+            decoded(&lam(c("P"), tower)),
+        ),
+        entry("w", t3_of_slow(witness)),
+    ])
+}
+
+/// A task the typed lane has already taken on is not taken on again: the run
+/// succeeds only if every task holds, so a repeat adds nothing. Here the one
+/// argument obligation `slow q ≟ slow p` arises three times, once per
+/// application layer, and is walked once.
+#[test]
+fn the_typed_lane_takes_on_each_obligation_once() {
+    let env = three_slow_proofs(["q", "q", "q"]);
+    let candidate = definition("d", decoded(&t3_of_slow(["p", "p", "p"])), decoded(&c("w")));
+    let slow_polls = |left: &str, right: &str| {
+        use fln_checker::defeq::def_eq_with;
+        use fln_checker::whnf::WhnfContext;
+        let polls = Cell::new(0_u64);
+        let _ = def_eq_with(
+            &decoded(&app(c("slow"), [c(left)])),
+            &decoded(&app(c("slow"), [c(right)])),
+            &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+            DefEqBudget::unlimited(),
+            || {
+                polls.set(polls.get() + 1);
+                false
+            },
+        );
+        polls.get()
+    };
+    let walk = slow_polls("q", "p");
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || {
+        polls.set(polls.get() + 1);
+        false
+    });
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    assert!(
+        2 * admission < 11 * walk,
+        "admission polled {admission} times, at least five and a half walks of the \
+         repeated argument pair ({walk} each): an obligation was taken on again"
+    );
+}

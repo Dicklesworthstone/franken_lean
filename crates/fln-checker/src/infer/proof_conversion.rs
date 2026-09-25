@@ -13,6 +13,14 @@ use super::*;
 use crate::universe::{NormalNode, normalize};
 use crate::wire::WireLevel;
 
+/// The kind of task a pair of terms was taken on as, in the lane's worklist.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Taken {
+    Pair,
+    Binders,
+    Eta(bool),
+}
+
 pub(crate) enum ProofConversionOutcome {
     Complete { equal: bool, polls: u64 },
     Halted(Box<InferenceOutcome>),
@@ -597,8 +605,32 @@ impl Probe<'_> {
         }
         let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
         let mut skip_untyped = root_deferred;
+        // Every task is an obligation of one conjunction: the run succeeds only
+        // if each holds, and returns false at the first that does not. A task
+        // already taken on therefore never needs taking on again, and the same
+        // obligations recur heavily, reached from different decompositions. On
+        // `Rat.ceil_add_intCast_le_ceil_add`, 1,242 distinct pairs were asked
+        // 11,186 times. Local names are fresh and bound once, so a pair of
+        // terms means the same thing in every context of one run. Binder and
+        // eta tasks are keyed before they open a fresh local, since the pairs
+        // they produce then differ in that local's name.
+        let mut taken: std::collections::HashSet<(Taken, WireExpr, WireExpr)> =
+            std::collections::HashSet::new();
         'work: while let Some(task) = work.pop() {
             self.tick()?;
+            let (kind, a, b) = match &task {
+                Work::Pair(left, right, _) => (Taken::Pair, left, right),
+                Work::Binders(left, right, ..) => (Taken::Binders, left, right),
+                Work::Eta {
+                    lambda,
+                    other,
+                    lambda_on_left,
+                    ..
+                } => (Taken::Eta(*lambda_on_left), lambda, other),
+            };
+            if !taken.insert((kind, a.clone(), b.clone())) {
+                continue;
+            }
             let (left, right, context) = match task {
                 Work::Pair(left, right, context) => (left, right, context),
                 Work::Binders(left, right, lb, rb, domain, context) => {
