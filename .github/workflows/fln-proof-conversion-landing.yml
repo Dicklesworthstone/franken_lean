@@ -1,10 +1,14 @@
 name: Native quotient integration
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-proof-conversion-landing.yml']
 permissions:
   contents: read
 jobs:
   verify:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -23,3 +27,134 @@ jobs:
           cargo test --locked -p fln-cli --test source_quotients --no-fail-fast
           cargo clippy --locked -p fln-checker -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
+  relation-transfer:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event_name == 'push' && github.event.head_commit.message == 'build(source): validate symm and change for direct main publication'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare identity-bound patch validation
+        shell: python
+        run: |
+          import os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'relation-evidence'
+          root.mkdir()
+          (root / 'verify.py').write_text(r'''
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'relation-evidence'
+          stage = int(sys.argv[1])
+          patches = {
+              1: ('7d49030837ae1c5ee53975ce715651f397417e7c', 'f9a54373e9e7b59365670997f2b95645c9e0cf223957fa0e79d8f0c7ee21abae', [
+                  'crates/fln-parse/src/proofs.rs',
+                  'crates/fln-elab/src/source/tactics.rs',
+                  'crates/fln-elab/src/source/tactics/relations.rs',
+                  'crates/fln-cli/tests/native_relation_tactics.rs']),
+              2: ('3e7c7720cf953140f602003f10590c5ef014e103', 'b222973a8040deb0b54d9a95e3a6feccf044aa9f2a7d5158e964ef251dfe169b', [
+                  'crates/fln-parse/src/proofs.rs',
+                  'crates/fln-elab/src/source/tactics.rs',
+                  'crates/fln-elab/src/source.rs',
+                  'crates/fln-elab/src/source/tactics/change.rs',
+                  'crates/fln-cli/tests/native_relation_tactics.rs']),
+          }
+          def api(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean' + path,
+                  data=body, headers={'Accept': 'application/vnd.github+json',
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          def identity(path):
+              file = pathlib.Path(path)
+              assert not file.is_symlink(), path
+              return blob(file.read_bytes()) if file.exists() else None
+          sha, digest, paths = patches[stage]
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          before = {path: identity(path) for path in paths}
+          data = api('/git/blobs/' + sha)
+          assert data['encoding'] == 'base64'
+          compressed = base64.b64decode(data['content'])
+          assert blob(compressed) == sha
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == digest
+          actual = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(actual) == sorted(paths) and len(actual) == len(set(actual)), actual
+          assert '\ndeleted file mode ' not in patch.decode()
+          patch_file = root / f'stage-{stage}.patch'
+          patch_file.write_bytes(patch)
+          commands = []
+          with (root / f'stage-{stage}.log').open('w') as log:
+              def run(args):
+                  print('+ ' + ' '.join(args), flush=True)
+                  log.write('+ ' + ' '.join(args) + '\n')
+                  log.flush()
+                  result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+                  commands.append({'argv': args, 'exit_code': result.returncode})
+                  if result.returncode:
+                      print((root / f'stage-{stage}.log').read_text()[-50000:], flush=True)
+                      raise subprocess.CalledProcessError(result.returncode, args)
+              run(['git', 'apply', '--check', str(patch_file)])
+              run(['git', 'apply', str(patch_file)])
+              run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths])
+              run(['rustfmt', '--check', '--edition', '2024', '--config', 'skip_children=true', *paths])
+              run(['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'native_relation_tactics', '--no-fail-fast'])
+              run(['cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--no-fail-fast'])
+              run(['cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings'])
+              run(['cargo', 'check', '--locked', '--workspace', '--all-targets'])
+              run(['git', 'diff', '--check'])
+          allowed = set(paths)
+          if stage == 2:
+              allowed.update(patches[1][2])
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines()
+          assert set(changed + untracked) == allowed, (changed, untracked)
+          after = {}
+          for path in paths:
+              content = pathlib.Path(path).read_bytes()
+              sha = blob(content)
+              result = api('/git/blobs', {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})
+              assert result['sha'] == sha, path
+              after[path] = sha
+          # Immutable objects only: branch publication is a separate connected
+          # GitHub fast-forward after the caller checks current main identities.
+          receipt = {'base': base, 'stage': stage, 'before': before, 'after': after,
+              'commands': commands, 'patch_sha256': digest, 'published_branch': False}
+          (root / f'stage-{stage}.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
+          print((root / f'stage-{stage}.log').read_text()[-12000:], flush=True)
+          '''.lstrip())
+      - name: Install repository-pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Validate and export native symm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/relation-evidence/verify.py" 1
+      - name: Validate and export native change
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/relation-evidence/verify.py" 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: relation-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/relation-evidence
+          retention-days: 7
+          if-no-files-found: error
