@@ -88,8 +88,8 @@ pub use fln_env::constants::{
     InductiveVal, OpaqueVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
     TheoremVal,
 };
-use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
+use fln_env::environment::{DeclarationCommitted, EnvironmentEntry};
 pub use fln_env::module_apply::{
     AppliedExtensionRangeWitness, AppliedModulePayload, ExtensionPayload, ModuleApplyCheckpoint,
     ModuleApplyPrepareError, ModuleApplyState, ModuleApplyStateError, ModuleApplyTransactionId,
@@ -912,6 +912,85 @@ pub enum OleanFrontierEvent<'a> {
 pub struct OleanFrontier {
     pub engine: Engine,
     pub rows: Vec<OleanFrontierRow>,
+}
+
+/// How a frontier run spreads its modules over threads. Neither field changes a
+/// row or the returned engine; see [`Engine::check_olean_frontier_scheduled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OleanFrontierJobs {
+    /// Modules checked at once. One checks every module on the calling thread.
+    pub threads: std::num::NonZeroUsize,
+    /// Stack for each worker thread when `threads` is above one. The kernel budget
+    /// in the run's limits must be calibrated for it, as for the calling thread.
+    pub worker_stack_bytes: usize,
+}
+
+impl OleanFrontierJobs {
+    /// One module at a time, on the calling thread.
+    pub const SERIAL: OleanFrontierJobs = OleanFrontierJobs {
+        threads: std::num::NonZeroUsize::MIN,
+        worker_stack_bytes: 0,
+    };
+}
+
+/// A module whose council check passed, as its importers need it.
+struct FrontierAccepted {
+    index: usize,
+    position: usize,
+    name: Name,
+    /// The engine after checking the module: its closure's environment plus
+    /// what it admitted.
+    engine: Engine,
+    /// Every constant the module added, with the digest its engine computed.
+    admitted: Vec<EnvironmentEntry>,
+    /// The module's transitive import closure, itself included.
+    closure: std::sync::Arc<BTreeSet<usize>>,
+}
+
+/// One module handed to the council, with the accepted modules of its closure.
+struct FrontierJob {
+    index: usize,
+    position: usize,
+    name: Name,
+    closure_members: std::sync::Arc<BTreeSet<usize>>,
+    artifact: DecodedOlean,
+    imports: Vec<std::sync::Arc<FrontierAccepted>>,
+    closure: Vec<std::sync::Arc<FrontierAccepted>>,
+}
+
+struct FrontierDone {
+    index: usize,
+    verdict: OleanModuleVerdict,
+    accepted: Option<FrontierAccepted>,
+    elapsed: std::time::Duration,
+}
+
+/// Add one admitted constant to an import closure under the serial planner's
+/// rule for a repeated name: an identical copy is already there, a copy that
+/// subsumes or is subsumed by the present one keeps the present one, and any
+/// other pair cannot be imported together.
+fn merge_frontier_entry(
+    environment: Environment,
+    entry: &EnvironmentEntry,
+) -> Result<Environment, OleanCheckError> {
+    let name = entry.declaration().name();
+    let Some(present) = environment.entry(name) else {
+        return environment.with_entry(entry.clone()).map_err(|_| {
+            OleanCheckError::InternalInvariant {
+                detail: "an absent frontier constant could not be added",
+            }
+        });
+    };
+    if present.digest() == entry.digest() {
+        return Ok(environment);
+    }
+    let lookup = |name: &Name| environment.find(name);
+    if olean_imports::subsumes_info(&lookup, present.declaration(), entry.declaration())
+        || olean_imports::subsumes_info(&lookup, entry.declaration(), present.declaration())
+    {
+        return Ok(environment);
+    }
+    Err(OleanCheckError::DuplicateDeclaration { name: name.clone() })
 }
 
 /// Atomic result of checking a closed set of named `.olean` modules.
@@ -2841,6 +2920,35 @@ impl Engine {
         limits: OleanCheckLimits,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
     ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_scheduled(
+            modules,
+            options,
+            limits,
+            OleanFrontierJobs::SERIAL,
+            on_event,
+        )
+    }
+
+    /// [`Engine::check_olean_frontier_observed`] over `jobs.threads` modules at once.
+    ///
+    /// Each module is checked against the environment of exactly its own import
+    /// closure: this engine's environment plus what every module of the closure
+    /// admitted, merged in frontier order under the rule the serial planner applies
+    /// to a repeated name. An identical copy is one constant; a copy that subsumes
+    /// or is subsumed by the first keeps the first; any other pair is a
+    /// `DuplicateDeclaration` for the importing module. So a verdict depends only on
+    /// the module and its closure, never on what ran beside it or finished first,
+    /// and the rows and the returned engine are the same at every thread count.
+    /// `Decided` events arrive in row order; `Started` events arrive as modules are
+    /// dispatched, which above one thread is not row order.
+    pub fn check_olean_frontier_scheduled(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
         let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> = modules
             .iter()
@@ -2914,65 +3022,334 @@ impl Engine {
             }
         }
 
-        let mut engine = self.clone();
-        let mut accepted = vec![false; modules.len()];
-        let mut rows = Vec::with_capacity(modules.len());
-        for index in order {
-            let started = std::time::Instant::now();
-            let name = modules[index].name.clone();
-            let verdict = match decoded[index].take() {
-                None => OleanModuleVerdict::Failed(OleanCheckError::InternalInvariant {
-                    detail: "frontier module was visited twice",
-                }),
-                Some(Err(error)) => OleanModuleVerdict::Failed(error),
-                Some(Ok(artifact)) => {
-                    let blocker = dependencies[index]
-                        .iter()
-                        .find(|dependency| !accepted[**dependency]);
-                    if let Some(blocker) = blocker {
-                        OleanModuleVerdict::Blocked {
-                            by: modules[*blocker].name.clone(),
+        let count = modules.len();
+        let mut position = vec![0_usize; count];
+        for (at, index) in order.iter().enumerate() {
+            position[*index] = at;
+        }
+        // Each module's transitive import closure, itself included. Frontier order
+        // is topological, so every import's closure exists before its importer's.
+        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> =
+            vec![std::sync::Arc::default(); count];
+        for index in &order {
+            let mut closure = BTreeSet::new();
+            for dependency in &dependencies[*index] {
+                if dependency != index {
+                    closure.extend(closures[*dependency].iter().copied());
+                }
+            }
+            closure.insert(*index);
+            closures[*index] = std::sync::Arc::new(closure);
+        }
+
+        // A row waits here from its decision until every earlier row has left.
+        let mut pending_rows: Vec<Option<OleanFrontierRow>> = (0..count).map(|_| None).collect();
+        let mut decided = vec![false; count];
+        let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
+        let mut rows = Vec::with_capacity(count);
+        let threads = jobs.threads.get();
+
+        let base = self;
+        let check = |job: FrontierJob| base.frontier_check_module(job, options, limits);
+        std::thread::scope(|scope| -> Result<(), OleanCheckError> {
+            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierJob>();
+            let (done_sender, done_receiver) = std::sync::mpsc::channel::<FrontierDone>();
+            let job_receiver = std::sync::Arc::new(std::sync::Mutex::new(job_receiver));
+            if threads > 1 {
+                for worker in 0..threads {
+                    let job_receiver = std::sync::Arc::clone(&job_receiver);
+                    let done_sender = done_sender.clone();
+                    let check = &check;
+                    std::thread::Builder::new()
+                        .name(format!("fln-frontier-{worker}"))
+                        .stack_size(jobs.worker_stack_bytes)
+                        .spawn_scoped(scope, move || {
+                            loop {
+                                let next = match job_receiver.lock() {
+                                    Ok(receiver) => receiver.recv(),
+                                    Err(_) => return,
+                                };
+                                let Ok(job) = next else { return };
+                                if done_sender.send(check(job)).is_err() {
+                                    return;
+                                }
+                            }
+                        })
+                        .map_err(|_| OleanCheckError::InternalInvariant {
+                            detail: "could not start a frontier worker thread",
+                        })?;
+                }
+            }
+            drop(done_sender);
+
+            let mut running = vec![false; count];
+            let mut in_flight = 0_usize;
+            let record =
+                |done: FrontierDone,
+                 running: &mut Vec<bool>,
+                 decided: &mut Vec<bool>,
+                 accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                 pending_rows: &mut Vec<Option<OleanFrontierRow>>| {
+                    running[done.index] = false;
+                    decided[done.index] = true;
+                    accepted[done.index] = done.accepted.map(std::sync::Arc::new);
+                    pending_rows[done.index] = Some(OleanFrontierRow {
+                        name: modules[done.index].name.clone(),
+                        verdict: done.verdict,
+                        elapsed: done.elapsed,
+                    });
+                };
+            loop {
+                // Decide every module that needs no council, and collect the ready.
+                let mut ready = Vec::new();
+                for index in &order {
+                    let index = *index;
+                    if decided[index] || running[index] {
+                        continue;
+                    }
+                    let verdict = match &decoded[index] {
+                        Some(Ok(_)) => {
+                            if !dependencies[index]
+                                .iter()
+                                .all(|dependency| decided[*dependency])
+                            {
+                                continue;
+                            }
+                            match dependencies[index]
+                                .iter()
+                                .find(|dependency| accepted[**dependency].is_none())
+                            {
+                                Some(blocker) => OleanModuleVerdict::Blocked {
+                                    by: modules[*blocker].name.clone(),
+                                },
+                                None => {
+                                    ready.push(index);
+                                    continue;
+                                }
+                            }
                         }
-                    } else {
-                        on_event(OleanFrontierEvent::Started {
-                            position: rows.len() + 1,
-                            total: modules.len(),
-                            module: &name,
+                        Some(Err(_)) => match decoded[index].take() {
+                            Some(Err(error)) => OleanModuleVerdict::Failed(error),
+                            _ => continue,
+                        },
+                        None => OleanModuleVerdict::Failed(OleanCheckError::InternalInvariant {
+                            detail: "frontier module was visited twice",
+                        }),
+                    };
+                    decided[index] = true;
+                    pending_rows[index] = Some(OleanFrontierRow {
+                        name: modules[index].name.clone(),
+                        verdict,
+                        elapsed: std::time::Duration::ZERO,
+                    });
+                }
+
+                // Rows leave in frontier order, as soon as every earlier row exists.
+                while let Some(row) = order
+                    .get(rows.len())
+                    .and_then(|index| pending_rows[*index].take())
+                {
+                    on_event(OleanFrontierEvent::Decided {
+                        position: rows.len() + 1,
+                        total: count,
+                        row: &row,
+                    });
+                    rows.push(row);
+                }
+                if rows.len() == count {
+                    break;
+                }
+
+                let mut dispatched = 0_usize;
+                for index in ready {
+                    if in_flight >= threads {
+                        break;
+                    }
+                    let Some(Ok(artifact)) = decoded[index].take() else {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "a ready frontier module has no decoded artifact",
                         });
-                        match engine.check_decoded_olean(artifact, options, limits) {
-                            Ok(Outcome::Complete(checked)) => {
-                                let declarations = checked.declarations.len();
-                                engine = checked.engine;
-                                let mut imported = (*engine.imported_modules).clone();
-                                imported.insert(name.clone());
-                                engine.imported_modules = std::sync::Arc::new(imported);
-                                accepted[index] = true;
-                                OleanModuleVerdict::Accepted { declarations }
-                            }
-                            Ok(Outcome::Inconclusive(reason)) => {
-                                OleanModuleVerdict::Inconclusive(reason)
-                            }
-                            Ok(Outcome::InternalFault(fault)) => {
-                                OleanModuleVerdict::InternalFault(fault)
-                            }
-                            Err(error) => OleanModuleVerdict::Failed(error),
-                        }
+                    };
+                    let imports: Vec<_> = dependencies[index]
+                        .iter()
+                        .filter_map(|dependency| accepted[*dependency].clone())
+                        .collect();
+                    let mut closure: Vec<_> = closures[index]
+                        .iter()
+                        .filter(|member| **member != index)
+                        .filter_map(|member| accepted[*member].clone())
+                        .collect();
+                    closure.sort_by_key(|module| module.position);
+                    on_event(OleanFrontierEvent::Started {
+                        position: position[index] + 1,
+                        total: count,
+                        module: modules[index].name,
+                    });
+                    running[index] = true;
+                    in_flight += 1;
+                    dispatched += 1;
+                    let job = FrontierJob {
+                        index,
+                        position: position[index],
+                        name: modules[index].name.clone(),
+                        closure_members: std::sync::Arc::clone(&closures[index]),
+                        artifact,
+                        imports,
+                        closure,
+                    };
+                    if threads == 1 {
+                        // Serial: finish this module before deciding anything else,
+                        // so the events keep the one-at-a-time order.
+                        let done = check(job);
+                        in_flight -= 1;
+                        record(
+                            done,
+                            &mut running,
+                            &mut decided,
+                            &mut accepted,
+                            &mut pending_rows,
+                        );
+                        break;
+                    }
+                    if job_sender.send(job).is_err() {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "every frontier worker thread has stopped",
+                        });
                     }
                 }
-            };
-            let row = OleanFrontierRow {
-                name,
-                verdict,
-                elapsed: started.elapsed(),
-            };
-            on_event(OleanFrontierEvent::Decided {
-                position: rows.len() + 1,
-                total: modules.len(),
-                row: &row,
-            });
-            rows.push(row);
+                if threads == 1 {
+                    if dispatched == 0 {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "the frontier stalled with modules undecided",
+                        });
+                    }
+                    continue;
+                }
+                if in_flight == 0 {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "the frontier stalled with modules undecided",
+                    });
+                }
+                let done =
+                    done_receiver
+                        .recv()
+                        .map_err(|_| OleanCheckError::InternalInvariant {
+                            detail: "every frontier worker thread has stopped",
+                        })?;
+                in_flight -= 1;
+                record(
+                    done,
+                    &mut running,
+                    &mut decided,
+                    &mut accepted,
+                    &mut pending_rows,
+                );
+            }
+            drop(job_sender);
+            Ok(())
+        })?;
+
+        // The returned engine holds exactly the accepted modules, merged by the
+        // same rule as every closure.
+        let mut engine = self.clone();
+        let mut environment = self.environment.clone();
+        let mut imported = (*self.imported_modules).clone();
+        for index in &order {
+            if let Some(module) = &accepted[*index] {
+                for entry in &module.admitted {
+                    environment = merge_frontier_entry(environment, entry)?;
+                }
+                imported.insert(module.name.clone());
+            }
         }
+        engine.environment = environment;
+        engine.checker_environment = None;
+        engine.imported_modules = std::sync::Arc::new(imported);
         Ok(OleanFrontier { engine, rows })
+    }
+
+    /// Check one frontier module against its import closure's environment.
+    fn frontier_check_module(
+        &self,
+        job: FrontierJob,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> FrontierDone {
+        let started = std::time::Instant::now();
+        let index = job.index;
+        let finish = |verdict, accepted| FrontierDone {
+            index,
+            verdict,
+            accepted,
+            elapsed: started.elapsed(),
+        };
+        let engine = match self.frontier_closure_engine(&job) {
+            Ok(engine) => engine,
+            Err(error) => return finish(OleanModuleVerdict::Failed(error), None),
+        };
+        let start = engine.environment.clone();
+        match engine.check_decoded_olean(job.artifact, options, limits) {
+            Ok(Outcome::Complete(checked)) => {
+                let declarations = checked.declarations.len();
+                let admitted = checked
+                    .decoded
+                    .constants
+                    .iter()
+                    .filter(|info| !start.contains(info.name()))
+                    .filter_map(|info| checked.engine.environment.entry(info.name()))
+                    .collect();
+                let mut engine = checked.engine;
+                let mut imported = (*engine.imported_modules).clone();
+                imported.insert(job.name.clone());
+                engine.imported_modules = std::sync::Arc::new(imported);
+                finish(
+                    OleanModuleVerdict::Accepted { declarations },
+                    Some(FrontierAccepted {
+                        index,
+                        position: job.position,
+                        name: job.name,
+                        engine,
+                        admitted,
+                        closure: job.closure_members,
+                    }),
+                )
+            }
+            Ok(Outcome::Inconclusive(reason)) => {
+                finish(OleanModuleVerdict::Inconclusive(reason), None)
+            }
+            Ok(Outcome::InternalFault(fault)) => {
+                finish(OleanModuleVerdict::InternalFault(fault), None)
+            }
+            Err(error) => finish(OleanModuleVerdict::Failed(error), None),
+        }
+    }
+
+    /// The engine a frontier module is checked with: its import with the largest
+    /// closure (the earlier on a tie), plus what the rest of its closure admitted.
+    fn frontier_closure_engine(&self, job: &FrontierJob) -> Result<Engine, OleanCheckError> {
+        let Some(base) = job.imports.iter().max_by(|left, right| {
+            left.closure
+                .len()
+                .cmp(&right.closure.len())
+                .then(right.position.cmp(&left.position))
+        }) else {
+            return Ok(self.clone());
+        };
+        let mut engine = base.engine.clone();
+        let mut environment = engine.environment.clone();
+        let mut imported = (*engine.imported_modules).clone();
+        for module in &job.closure {
+            if base.closure.contains(&module.index) {
+                continue;
+            }
+            for entry in &module.admitted {
+                environment = merge_frontier_entry(environment, entry)?;
+            }
+            imported.insert(module.name.clone());
+        }
+        engine.environment = environment;
+        engine.imported_modules = std::sync::Arc::new(imported);
+        Ok(engine)
     }
 
     /// Decode a closed set of named `.olean` modules and return them in the
@@ -10442,6 +10819,77 @@ mod tests {
         )
         .expect_err("the old unit bound stops before the spine is decoded");
         assert!(refusal.contains("ProducedUnits"), "{refusal}");
+    }
+
+    #[test]
+    fn frontier_closures_merge_a_repeated_name_by_the_import_rule() {
+        use super::{ConstantInfo, merge_frontier_entry};
+        let name = || Name::from_components(["t"]);
+        let constant = |label: &str| Expr::const_(Name::from_components([label]), Vec::new());
+        let theorem = |type_: Expr, value: Expr| {
+            ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: name(),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                value,
+                all: vec![name()],
+            })
+        };
+        let axiom = |label: &str, type_: Expr| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components([label]),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            })
+        };
+        let mut base = Environment::new();
+        for (label, type_) in [
+            ("P", Expr::sort(Level::zero())),
+            ("Q", Expr::sort(Level::zero())),
+            ("h1", constant("P")),
+            ("h2", constant("P")),
+        ] {
+            base = base.add_decl(axiom(label, type_)).expect("unique");
+        }
+        let entry = |info: ConstantInfo| {
+            base.add_decl(info)
+                .expect("unique")
+                .entry(&name())
+                .expect("present")
+        };
+        let first = base
+            .add_decl(theorem(constant("P"), constant("h1")))
+            .expect("unique");
+
+        // An absent name is added, digest and all.
+        let added =
+            merge_frontier_entry(base.clone(), &entry(theorem(constant("P"), constant("h1"))))
+                .expect("absent");
+        assert_eq!(added, first);
+        // An identical copy is already there.
+        let identical = merge_frontier_entry(
+            first.clone(),
+            &entry(theorem(constant("P"), constant("h1"))),
+        )
+        .expect("identical");
+        assert_eq!(identical, first);
+        // The same statement with another proof subsumes: the present copy stays.
+        let subsumed = merge_frontier_entry(
+            first.clone(),
+            &entry(theorem(constant("P"), constant("h2"))),
+        )
+        .expect("subsumed");
+        assert_eq!(subsumed, first);
+        // Another statement cannot be imported beside it.
+        assert!(matches!(
+            merge_frontier_entry(first, &entry(theorem(constant("Q"), constant("h1")))),
+            Err(OleanCheckError::DuplicateDeclaration { name: refused }) if refused == name()
+        ));
     }
 
     #[test]

@@ -885,6 +885,26 @@ impl DeclAdmission {
     }
 }
 
+/// One constant as an environment holds it: the declaration with the content
+/// digest computed when it was inserted. Only an [`Environment`] produces one,
+/// so a digest can never be paired with a constant it was not computed from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvironmentEntry {
+    info: Arc<ConstantInfo>,
+    digest: Digest,
+}
+
+impl EnvironmentEntry {
+    pub fn declaration(&self) -> &ConstantInfo {
+        &self.info
+    }
+
+    /// `decl_content_digest` of the declaration: equal digests are equal content.
+    pub fn digest(&self) -> Digest {
+        self.digest
+    }
+}
+
 /// The environment. `Clone` IS `snapshot`: O(1), fully isolated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -916,6 +936,32 @@ impl Environment {
 
     pub fn contains(&self, name: &Name) -> bool {
         self.constants.contains_key(name)
+    }
+
+    /// The constant named `name` with the digest this environment computed for
+    /// it, to carry into another environment without re-hashing.
+    pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {
+        Some(EnvironmentEntry {
+            info: Arc::clone(self.constants.get(name)?),
+            digest: *self.digests.get(name)?,
+        })
+    }
+
+    /// [`Environment::add_decl`] for an entry taken from another environment:
+    /// the same duplicate law, but the stored digest is reused. Assembling an
+    /// import closure from environments that already hold each constant would
+    /// otherwise re-hash every proof once per importing module, and one Init
+    /// proof's canonical tree is 64 million nodes.
+    pub fn with_entry(&self, entry: EnvironmentEntry) -> Result<Environment, EnvError> {
+        let name = entry.info.name().clone();
+        if self.constants.contains_key(&name) {
+            return Err(EnvError::DuplicateDeclaration { name });
+        }
+        Ok(Environment {
+            digests: self.digests.insert(name.clone(), entry.digest),
+            constants: self.constants.insert(name, entry.info),
+            extensions: self.extensions.clone(),
+        })
     }
 
     /// Borrow every constant in deterministic persistent-map order.
@@ -1450,6 +1496,39 @@ mod tests {
             },
             is_unsafe: false,
         })
+    }
+
+    #[test]
+    fn an_entry_carries_its_digest_into_another_environment() {
+        let source = Environment::new()
+            .add_decl(axiom("alpha"))
+            .expect("unique")
+            .add_decl(axiom("beta"))
+            .expect("unique");
+        let alpha = source.entry(&n("alpha")).expect("present");
+        assert_eq!(alpha.declaration(), &axiom("alpha"));
+        assert_eq!(
+            alpha.digest(),
+            Environment::decl_content_digest(&axiom("alpha"))
+        );
+        assert!(source.entry(&n("gamma")).is_none());
+
+        // Carried entries build the same environment, root included, as
+        // re-adding the declarations would.
+        let carried = Environment::new()
+            .with_entry(alpha.clone())
+            .expect("unique")
+            .with_entry(source.entry(&n("beta")).expect("present"))
+            .expect("unique");
+        assert_eq!(carried, source);
+        assert_eq!(
+            carried.logical_root(&KVMap::new()),
+            source.logical_root(&KVMap::new())
+        );
+        assert!(matches!(
+            carried.with_entry(alpha),
+            Err(EnvError::DuplicateDeclaration { name }) if name == n("alpha")
+        ));
     }
 
     #[test]

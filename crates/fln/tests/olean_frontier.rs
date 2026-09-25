@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use fln::{
-    Budget, Engine, Environment, KVMap, Name, OleanCheckError, OleanCheckLimits,
-    OleanFrontierEvent, OleanModuleInput, OleanModuleVerdict,
+    Budget, Engine, Environment, KVMap, Name, OleanCheckError, OleanCheckLimits, OleanFrontier,
+    OleanFrontierEvent, OleanFrontierJobs, OleanModuleInput, OleanModuleVerdict,
 };
 
 const STACK: usize = 256 * 1024 * 1024;
@@ -157,6 +157,40 @@ fn a_failing_module_blocks_only_its_dependents() {
                 admitted,
                 [&name("Init.MethodSpecsSimp"), &name("Init.Prelude")],
                 "the engine holds exactly the accepted modules"
+            );
+
+            // The same set over four threads. Each module is checked against its
+            // own import closure, so the rows and the engine cannot depend on
+            // what ran beside it: Init.Coe and Init.MethodSpecsSimp are both
+            // ready once the Prelude is decided, and here they run at once.
+            let parallel = Engine::from_environment(Environment::new())
+                .check_olean_frontier_scheduled(
+                    &inputs,
+                    &KVMap::new(),
+                    limits,
+                    OleanFrontierJobs {
+                        threads: std::num::NonZeroUsize::new(4).expect("nonzero"),
+                        worker_stack_bytes: STACK,
+                    },
+                    &mut |_| {},
+                )
+                .expect("the set itself is well formed");
+            let summary = |frontier: &OleanFrontier| -> Vec<(Name, String)> {
+                frontier
+                    .rows
+                    .iter()
+                    .map(|row| (row.name.clone(), format!("{:?}", row.verdict)))
+                    .collect()
+            };
+            assert_eq!(summary(&parallel), summary(&frontier));
+            assert_eq!(
+                parallel.engine.imported_modules(),
+                frontier.engine.imported_modules()
+            );
+            assert_eq!(
+                parallel.engine.logical_root(&KVMap::new()),
+                frontier.engine.logical_root(&KVMap::new()),
+                "the same accepted constants, whatever the thread count"
             );
         })
         .expect("spawn the checking thread")

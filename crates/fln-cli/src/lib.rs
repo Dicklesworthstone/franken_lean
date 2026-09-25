@@ -92,7 +92,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--receipts PATH | --continue [--progress]] [--max-bytes BYTES] PATH\n",
+    "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH\n",
     "  fln check-source [--json] [--max-bytes BYTES] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -170,7 +170,9 @@ const USAGE: &str = concat!(
     "A module is never checked against a failed import. It writes no receipts,\n",
     "and exits 0 only when every module is accepted. --progress also streams\n",
     "JSON lines to stderr: \"started\" as a module goes to the council, and\n",
-    "\"decided\" with its row the moment its verdict exists.\n",
+    "\"decided\" with its row once every earlier row exists. --jobs N checks up to\n",
+    "N modules at once; each module is checked against its own import closure, so\n",
+    "the rows do not depend on N, only their wall time does.\n",
     "`audit --tcb` inventories the trust surface of one import-free .olean or a\n",
     "closed directory set: every axiom declaration, plus unsafe and partial\n",
     "definitions. It decodes only; it does not kernel-check or interpret\n",
@@ -322,6 +324,7 @@ enum MultiplexerCommand {
         receipts: Option<PathBuf>,
         continue_on_failure: bool,
         progress: bool,
+        jobs: std::num::NonZeroUsize,
     },
     SourceRun {
         paths: Vec<PathBuf>,
@@ -786,6 +789,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
     let mut receipts = None;
     let mut continue_on_failure = false;
     let mut progress = false;
+    let mut jobs: Option<std::num::NonZeroUsize> = None;
     let mut filtered = Vec::new();
     let mut options = true;
     let mut arguments = arguments.into_iter();
@@ -811,6 +815,31 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
                 ));
             }
             progress = true;
+            continue;
+        }
+        let jobs_value =
+            if options && argument == "--jobs" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--jobs requires a following thread count".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--jobs="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        if let Some(value) = jobs_value {
+            if jobs.is_some() {
+                return Err(UsageError("--jobs may be supplied at most once".to_owned()));
+            }
+            jobs = Some(
+                value
+                    .to_str()
+                    .and_then(|text| text.parse::<std::num::NonZeroUsize>().ok())
+                    .ok_or_else(|| UsageError("--jobs takes a positive thread count".to_owned()))?,
+            );
             continue;
         }
         let selected = if options && argument == "--receipts" {
@@ -853,6 +882,11 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             "--progress streams per-module rows, so it requires --continue".to_owned(),
         ));
     }
+    if jobs.is_some() && !continue_on_failure {
+        return Err(UsageError(
+            "--jobs schedules per-module checks, so it requires --continue".to_owned(),
+        ));
+    }
     Ok(MultiplexerCommand::CheckOlean {
         path: path.clone(),
         max_bytes,
@@ -860,6 +894,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         receipts,
         continue_on_failure,
         progress,
+        jobs: jobs.unwrap_or(std::num::NonZeroUsize::MIN),
     })
 }
 
@@ -8161,6 +8196,7 @@ fn check_olean_module_frontier(
     max_bytes: usize,
     json: bool,
     progress: bool,
+    jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean-frontier".to_owned())
@@ -8204,13 +8240,17 @@ fn check_olean_module_frontier(
                     let _ = stderr.flush();
                 }
             };
-            match engine.check_olean_frontier_observed(
+            match engine.check_olean_frontier_scheduled(
                 &inputs,
                 &fln::KVMap::new(),
                 fln::OleanCheckLimits::new(
                     max_bytes,
                     fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
                 ),
+                fln::OleanFrontierJobs {
+                    threads: jobs,
+                    worker_stack_bytes: SOURCE_RUN_KERNEL_STACK_BYTES,
+                },
                 &mut stream,
             ) {
                 Ok(frontier) => render_check_olean_frontier(&frontier, json),
@@ -8489,6 +8529,7 @@ fn check_olean(
     receipts: Option<&Path>,
     continue_on_failure: bool,
     progress: bool,
+    jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
     if continue_on_failure && receipts.is_some() {
         return check_olean_failure(
@@ -8549,7 +8590,7 @@ fn check_olean(
             }
         };
         if continue_on_failure {
-            return check_olean_module_frontier(modules, max_bytes, json, progress);
+            return check_olean_module_frontier(modules, max_bytes, json, progress, jobs);
         }
         return check_olean_module_bytes(modules, max_bytes, json, receipts.map(Path::to_path_buf));
     }
@@ -12286,6 +12327,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             receipts,
             continue_on_failure,
             progress,
+            jobs,
         }) => check_olean(
             &path,
             max_bytes,
@@ -12293,6 +12335,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             receipts.as_deref(),
             continue_on_failure,
             progress,
+            jobs,
         ),
         Ok(MultiplexerCommand::Identity { json }) => render_identity(json),
         Ok(MultiplexerCommand::AuditTcb {

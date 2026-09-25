@@ -217,6 +217,46 @@ fn check_olean_continue_refuses_receipts_a_single_file_and_repeats() {
         stderr.contains("--progress may be supplied at most once"),
         "{stderr}"
     );
+
+    // --jobs schedules frontier modules, so it too needs --continue, and it takes
+    // one positive count.
+    let (code, stderr) = run(&["--jobs".as_ref(), "2".as_ref(), crate_dir.as_os_str()]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("it requires --continue"), "{stderr}");
+    for bad in ["0", "two", "-1"] {
+        let (code, stderr) = run(&[
+            "--continue".as_ref(),
+            "--jobs".as_ref(),
+            bad.as_ref(),
+            crate_dir.as_os_str(),
+        ]);
+        assert_eq!(code, Some(2), "{bad}: {stderr}");
+        assert!(
+            stderr.contains("--jobs takes a positive thread count"),
+            "{stderr}"
+        );
+    }
+    let (code, stderr) = run(&[
+        "--continue".as_ref(),
+        "--jobs=2".as_ref(),
+        "--jobs".as_ref(),
+        "3".as_ref(),
+        crate_dir.as_os_str(),
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--jobs may be supplied at most once"),
+        "{stderr}"
+    );
+    // A thread count changes no answer: the same set, the same result.
+    let serial = run(&["--continue".as_ref(), crate_dir.as_os_str()]);
+    let parallel = run(&[
+        "--continue".as_ref(),
+        "--jobs".as_ref(),
+        "2".as_ref(),
+        crate_dir.as_os_str(),
+    ]);
+    assert_eq!(parallel, serial);
 }
 
 /// A3 criterion 2: the K2 line is tied to the engines the kernel crate exports, in
