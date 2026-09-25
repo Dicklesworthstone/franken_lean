@@ -1037,8 +1037,15 @@ impl SlowControl {
             .delta_unfolds
             .saturating_add(result.delta_reductions);
         self.poll(cancelled)?;
-        let produced = usize_units(result.term.nodes().len())
-            .saturating_add(usize_units(result.term.levels().len()));
+        self.charge_materialized(&result.term)
+    }
+
+    /// Charge a term this conversion materialized, in arena nodes and in owned
+    /// units, each against its budget. Every materialization is charged: a copy
+    /// that is not charged is work the budget cannot bound.
+    fn charge_materialized(&mut self, term: &WireExpr) -> Result<(), SlowHalt> {
+        let produced =
+            usize_units(term.nodes().len()).saturating_add(usize_units(term.levels().len()));
         let observed = self
             .progress
             .materialized_arena_nodes
@@ -1052,14 +1059,13 @@ impl SlowControl {
             })));
         }
         self.progress.materialized_arena_nodes = observed;
-        let produced_units = result
-            .term
+        let produced_units = term
             .nodes()
             .iter()
             .fold(0_u64, |units, node| {
                 units.saturating_add(expression_owned_units(node))
             })
-            .saturating_add(result.term.levels().iter().fold(0_u64, |units, node| {
+            .saturating_add(term.levels().iter().fold(0_u64, |units, node| {
                 units.saturating_add(level_owned_units(node))
             }));
         let observed = self
@@ -3175,7 +3181,10 @@ fn materialize_subterm_wire(
     let visible = eta_visible(term, sources, control, cancelled)?;
     let arena = sources.source(visible)?;
     match copy_compact_subterm_with(arena, visible.root, TermBudget::unlimited(), cancelled) {
-        TermOutcome::Complete(wire) => Ok(wire),
+        TermOutcome::Complete(wire) => {
+            control.charge_materialized(&wire)?;
+            Ok(wire)
+        }
         TermOutcome::Inconclusive(stop) => Err(SlowHalt::Stop(Box::new(match stop {
             TermStop::Cancelled { polls, .. } => DefEqStop::Cancelled {
                 polls: control.polls.saturating_add(polls),
@@ -3995,6 +4004,82 @@ mod tests {
                     child: 0,
                 }
             ))
+        );
+    }
+
+    /// The same-head shortcut copies each argument out of its arena before
+    /// comparing it, and the copy is charged like every other materialization.
+    /// Once the argument memo answers a repeated pair, the nested comparison that
+    /// used to account for this work is skipped, so an uncharged copy would be
+    /// work no budget bounds.
+    #[test]
+    fn a_shortcut_argument_copy_is_charged_to_the_conversion() {
+        let id = |index: usize| ExprId::from_index(index).expect("small expression index");
+        let name = |text: &str| WireName::from_parts(vec![NamePart::Text(text.into())]);
+        // `f an_argument`, with the argument at index 1.
+        let term = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("f"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("an_argument_with_a_long_name"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: id(0),
+                    argument: id(1),
+                },
+            ],
+            Vec::new(),
+            id(2),
+        );
+        let generated = Vec::new();
+        let argument = DefEqTerm::original(DefEqSide::Left, id(1));
+        let copy_under = |budget: DefEqBudget| {
+            let mut control = SlowControl::new(budget, 0);
+            let copy = materialize_subterm_wire(
+                argument,
+                TermSources::new(&term, &term, &generated),
+                &mut control,
+                &mut || false,
+            );
+            (copy, control.progress)
+        };
+
+        let (copy, progress) = copy_under(DefEqBudget::unlimited());
+        assert!(
+            copy.is_ok(),
+            "the argument copies under an unlimited budget"
+        );
+        let Ok(copy) = copy else { return };
+        let units = copy
+            .nodes()
+            .iter()
+            .map(expression_owned_units)
+            .chain(copy.levels().iter().map(level_owned_units))
+            .sum::<u64>();
+        assert!(units > 0);
+        assert_eq!(progress.materialized_owned_units, units);
+        assert_eq!(
+            progress.materialized_arena_nodes,
+            usize_units(copy.nodes().len() + copy.levels().len())
+        );
+
+        let (short, _) = copy_under(DefEqBudget {
+            max_materialized_owned_units: units - 1,
+            ..DefEqBudget::unlimited()
+        });
+        assert!(
+            matches!(
+                &short,
+                Err(SlowHalt::Stop(stop)) if matches!(
+                    **stop,
+                    DefEqStop::Resource { limit: DefEqLimit::MaterializedOwnedUnits, .. }
+                )
+            ),
+            "a budget one unit short of the copy must stop the conversion, typed"
         );
     }
 
