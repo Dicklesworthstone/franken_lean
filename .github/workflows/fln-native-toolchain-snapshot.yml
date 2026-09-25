@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   source:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -31,7 +31,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   compiler:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -55,4 +55,125 @@ jobs:
           name: native-pinned-compiler-${{ github.sha }}
           path: target/pinned-compiler
           retention-days: 1
+          if-no-files-found: error
+  indexed-dictionary-transfer:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'build(numeric): validate indexed dictionaries and pinned numeral semantics'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Apply the exact locally validated implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-dictionary-evidence'
+          root.mkdir()
+          patch_sha = '66ca4cbadd8d70180227c861984470d24b41647d'
+          path = 'crates/fln/src/runtime/specialize.rs'
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + patch_sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          assert data['encoding'] == 'base64'
+          packed = base64.b64decode(data['content'])
+          assert blob(packed) == patch_sha
+          patch = gzip.decompress(packed)
+          assert hashlib.sha256(patch).hexdigest() == 'bf6270f7c06d1f162b7902fd1767fbba5b284647fbad0d3c4dc2f01b957aa484'
+          assert [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')] == [path]
+          assert blob(pathlib.Path(path).read_bytes()) == '1255c6b5d381dc357dc5f80ca23ed4d1c0e544d1'
+          file = root / 'implementation.patch'
+          file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(file)], check=True)
+          subprocess.run(['git', 'apply', str(file)], check=True)
+          assert blob(pathlib.Path(path).read_bytes()) == '6380271d1ddf0d0002ff159ebb43841328ea46cf'
+      - name: Validate pinned compilation and strict dictionary behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/indexed-dictionary-evidence"
+          exec > >(tee "$evidence/validation.log") 2>&1
+          channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustfmt --check --edition 2024 --config skip_children=true crates/fln/src/runtime/specialize.rs
+          cargo test --locked -p fln --lib --test runtime_specialization --test runtime_staged_closures --no-fail-fast
+          cargo clippy --locked -p fln --all-targets -- -D warnings
+          git diff --check
+      - name: Export the validated immutable source object without moving a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          path = 'crates/fln/src/runtime/specialize.rs'
+          content = pathlib.Path(path).read_bytes()
+          sha = hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest()
+          assert sha == '6380271d1ddf0d0002ff159ebb43841328ea46cf'
+          assert subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines() == [path]
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              assert json.load(response)['sha'] == sha
+          receipt = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'before': {path: '1255c6b5d381dc357dc5f80ca23ed4d1c0e544d1'}, 'after': {path: sha}, 'published_branch': False}
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-dictionary-evidence' / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: indexed-dictionary-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/indexed-dictionary-evidence
+          retention-days: 7
+          if-no-files-found: error
+  numeral-oracle:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'build(numeric): validate indexed dictionaries and pinned numeral semantics'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Identify the pinned Reference outside the product
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/lean.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $archive" | sha256sum --check --strict
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+      - name: Measure numeral inference and alias boundaries
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'numeral-oracle'
+          root.mkdir()
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          probes = {
+              'named_alias': 'def Carrier : Type := Nat\ndef value : Carrier := 23\n',
+              'computed_alias': 'def Carrier : Type := ite True Nat Bool\ndef value : Carrier := 23\n',
+              'raw_computed_alias': 'def Carrier : Type := ite True Nat Bool\ndef value : Carrier := nat_lit 23\ntheorem ok : value = nat_lit 23 := by rfl\n',
+              'custom_numeral': 'structure Count where\n  value : Nat\ninstance countNumeral (n : Nat) : OfNat Count n := OfNat.mk (Count.mk n)\ndef answer : Count := 42\n#eval answer.value\n',
+              'delayed_numeral': 'structure Count where\n  value : Nat\ninstance countNumeral (n : Nat) : OfNat Count n := OfNat.mk (Count.mk n)\ndef first {A : Type} (x y : A) : A := x\ndef answer := first 7 (Count.mk 19)\n#eval answer.value\n',
+              'local_numeric_index': 'def localNumber {A : Type u} [OfNat A 7] [OfNat A 7] : A := 7\n',
+              'nested_tactics': 'theorem t : 0 = 0 := by\n first\n | have h : 0 = 0 := by\n     first | fail | rfl\n   exact h\n | fail\n',
+          }
+          report = {'pin': subprocess.check_output([str(lean), '--githash'], text=True).strip(), 'probes': {}}
+          for name, source in probes.items():
+              file = root / (name + '.lean')
+              file.write_text(source)
+              result = subprocess.run([str(lean), str(file)], capture_output=True, text=True, timeout=60)
+              report['probes'][name] = {'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+          (root / 'report.json').write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: numeral-oracle-${{ github.sha }}
+          path: ${{ runner.temp }}/numeral-oracle
+          retention-days: 7
           if-no-files-found: error
