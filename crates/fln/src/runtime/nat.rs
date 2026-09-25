@@ -79,22 +79,19 @@ impl Preparation<'_> {
         Ok(())
     }
 
-    /// A motive can return data or a first-order data function. Flatten
-    /// the latter into extra closure arguments so changing accumulators use
-    /// the compiler's existing partial-application and ownership machinery.
+    /// A motive can return data or a first-order data function. Normalize the
+    /// static motive through the same uniform-layout erasure as other indexed
+    /// eliminators. Only an absent runtime index binder may be removed: using
+    /// its raw body would leave that index referring to a new closure binder.
+    /// The resulting function telescope becomes extra recursive arguments.
     fn nat_motive(&mut self, motive: &Expr) -> Result<Motive, IngressError> {
-        let ExprNode::Lam {
-            binder_type, body, ..
-        } = motive.node()
-        else {
-            return Err(unsupported("Nat recursor motive"));
-        };
-        if scalar_type(binder_type) != Some(ValueType::Nat) {
-            return Err(unsupported("Nat recursor motive domain"));
-        }
-        let mut body = body;
+        let family = scalar(ValueType::Nat)?;
+        let normalized = self
+            .indexed_motive(motive, &[], &family)?
+            .ok_or_else(|| unsupported("dependent Nat recursor motive"))?;
+        let mut body = &normalized;
         let mut parameters = vec![ValueType::Nat];
-        let mut domains = vec![scalar(ValueType::Nat)?];
+        let mut domains = vec![family];
         loop {
             self.tick()?;
             match body.node() {
@@ -347,5 +344,42 @@ mod tests {
             Preparation::new(&environment, limits).nat_motive(&motive),
             Err(IngressError::ResourceLimit { .. })
         ));
+    }
+
+    #[test]
+    fn static_beta_and_let_motives_use_the_same_erased_telescope() {
+        let environment = Environment::new();
+        let family = scalar(ValueType::Nat).unwrap();
+        let type_ = Expr::forall_e(
+            Name::anonymous(),
+            family.clone(),
+            Expr::sort(Level::one()),
+            BinderInfo::Default,
+        );
+        let literal = Expr::lam(
+            Name::anonymous(),
+            family.clone(),
+            family.clone(),
+            BinderInfo::Default,
+        );
+        let identity = Expr::lam(
+            Name::anonymous(),
+            type_.clone(),
+            variable(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let motives = [
+            literal.clone(),
+            Expr::app(identity, literal.clone()),
+            Expr::let_e(Name::anonymous(), type_, literal, variable(0).unwrap(), false),
+        ];
+        for expression in motives {
+            let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            let motive = preparation.nat_motive(&expression).unwrap();
+            assert_eq!(motive.parameters, vec![ValueType::Nat]);
+            assert_eq!(motive.domains, vec![family.clone()]);
+            assert_eq!(motive.result, ValueType::Nat);
+            assert_eq!(motive.result_type, family);
+        }
     }
 }

@@ -61,11 +61,7 @@ impl Preparation<'_> {
                 observed: arity,
             });
         }
-        let mut type_ = self.universe_instance(
-            &rec.base.type_,
-            &rec.base.level_params,
-            levels,
-        )?;
+        let mut type_ = self.universe_instance(&rec.base.type_, &rec.base.level_params, levels)?;
         let mut arguments = Vec::new();
         let mut captures = Vec::new();
         for (index, argument) in args.iter().enumerate() {
@@ -102,11 +98,24 @@ impl Preparation<'_> {
             // dummy scalar may determine a dependent layout or callback type.
             type_ = self.substitution(body, argument)?;
         }
+        let missing = arity - args.len();
+        let depth = captures
+            .len()
+            .checked_add(missing)
+            .ok_or_else(|| unsupported("partial recursor depth"))?;
+        // Charge the combined generated context before discovering its callable
+        // graph or allocating its missing-binder telescope, not each half alone.
+        if depth > self.limits.max_context_depth {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ContextDepth,
+                limit: self.limits.max_context_depth,
+                observed: depth,
+            });
+        }
         let callback_type = self.erase_runtime_type(&type_)?;
         if !matches!(self.value_type(&callback_type)?, Some(ValueType::Closure(_))) {
             return Ok(None);
         }
-        let missing = arity - args.len();
         let mut binders = Vec::new();
         let mut remaining = callback_type.clone();
         for _ in 0..missing {
@@ -132,17 +141,6 @@ impl Preparation<'_> {
             reserve(&mut binders, self.limits.max_context_depth)?;
             binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
             remaining = body.clone();
-        }
-        let depth = captures
-            .len()
-            .checked_add(missing)
-            .ok_or_else(|| unsupported("partial recursor depth"))?;
-        if depth > self.limits.max_context_depth {
-            return Err(IngressError::ResourceLimit {
-                resource: IngressResource::ContextDepth,
-                limit: self.limits.max_context_depth,
-                observed: depth,
-            });
         }
         let lift = u32::try_from(depth).map_err(|_| unsupported("partial recursor depth"))?;
         let mut value = head.clone();
@@ -189,3 +187,6 @@ impl Preparation<'_> {
         Ok(Some(result))
     }
 }
+
+#[cfg(test)]
+mod tests;
