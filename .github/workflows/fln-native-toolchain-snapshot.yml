@@ -7,6 +7,29 @@ on:
 permissions:
   contents: read
 jobs:
+  source:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retain the exact source, plan, and work graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-source/source-commit.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-source/source.tar.gz"
+          sha256sum "$RUNNER_TEMP/native-source/source.tar.gz" > "$RUNNER_TEMP/native-source/SHA256SUMS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-source-checkout-${{ github.sha }}
+          path: ${{ runner.temp }}/native-source
+          retention-days: 1
+          if-no-files-found: error
   compiler:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
