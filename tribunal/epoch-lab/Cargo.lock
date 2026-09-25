@@ -31,7 +31,6 @@ dependencies = [
 name = "fln-checker"
 version = "0.0.0"
 dependencies = [
- "fln-core",
  "fln-hash",
 ]
 
@@ -42,6 +41,7 @@ dependencies = [
  "fln",
  "fln-core",
  "fln-hash",
+ "fln-lake",
  "fln-server",
 ]
 
@@ -121,6 +121,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fln-lake"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
+
+[[package]]
 name = "fln-libm"
 version = "0.0.0"
 
@@ -172,16 +179,12 @@ name = "fln-unsafe-abi"
 version = "0.0.0"
 dependencies = [
  "fln-bignum",
- "fln-core",
  "fln-libm",
 ]
 
 [[package]]
 name = "fln-unsafe-region"
 version = "0.0.0"
-dependencies = [
- "fln-core",
-]
 
 [[package]]
 name = "fln-verdict"
