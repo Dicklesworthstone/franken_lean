@@ -787,11 +787,9 @@ fn universe_within(
         if let Some(value) = fixed {
             done.insert((l, r), value);
         } else if exit {
-            let value = alternatives.iter().any(|premises| {
-                premises
-                    .iter()
-                    .all(|pair| done.get(pair) == Some(&true))
-            });
+            let value = alternatives
+                .iter()
+                .any(|premises| premises.iter().all(|pair| done.get(pair) == Some(&true)));
             done.insert((l, r), value);
         } else {
             // Every edge decreases at least one of the two DAG indices. The
@@ -1206,22 +1204,22 @@ mod annotation_tests {
 
     fn imax_universes() -> Vec<LevelNode> {
         vec![
-            LevelNode::Zero,                                // 0
-            LevelNode::Parameter(checker_atom("u")),        // 1
-            LevelNode::Parameter(checker_atom("v")),        // 2
-            LevelNode::Parameter(checker_atom("w")),        // 3
-            LevelNode::IMax(universe_id(1), universe_id(2)), // 4: imax u v
-            LevelNode::Succ(universe_id(4)),                // 5
-            LevelNode::Max(universe_id(4), universe_id(3)),  // 6
-            LevelNode::Succ(universe_id(1)),                // 7
-            LevelNode::IMax(universe_id(7), universe_id(2)), // 8
-            LevelNode::Max(universe_id(1), universe_id(2)),  // 9
-            LevelNode::Succ(universe_id(8)),                // 10
-            LevelNode::Meta(checker_atom("u")),             // 11
+            LevelNode::Zero,                                  // 0
+            LevelNode::Parameter(checker_atom("u")),          // 1
+            LevelNode::Parameter(checker_atom("v")),          // 2
+            LevelNode::Parameter(checker_atom("w")),          // 3
+            LevelNode::IMax(universe_id(1), universe_id(2)),  // 4: imax u v
+            LevelNode::Succ(universe_id(4)),                  // 5
+            LevelNode::Max(universe_id(4), universe_id(3)),   // 6
+            LevelNode::Succ(universe_id(1)),                  // 7
+            LevelNode::IMax(universe_id(7), universe_id(2)),  // 8
+            LevelNode::Max(universe_id(1), universe_id(2)),   // 9
+            LevelNode::Succ(universe_id(8)),                  // 10
+            LevelNode::Meta(checker_atom("u")),               // 11
             LevelNode::IMax(universe_id(11), universe_id(2)), // 12
-            LevelNode::IMax(universe_id(1), universe_id(3)), // 13
-            LevelNode::IMax(universe_id(1), universe_id(0)), // 14
-            LevelNode::Succ(universe_id(14)),               // 15
+            LevelNode::IMax(universe_id(1), universe_id(3)),  // 13
+            LevelNode::IMax(universe_id(1), universe_id(0)),  // 14
+            LevelNode::Succ(universe_id(14)),                 // 15
         ]
     }
 

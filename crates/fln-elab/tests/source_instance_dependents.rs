@@ -148,7 +148,12 @@ fn add_class(env: &Environment, name: &str, depth: usize) -> Environment {
         }
     }
     let field = locals
-        .add_param(FVarId(n("value")), n("value"), c("Nat"), BinderInfo::Default)
+        .add_param(
+            FVarId(n("value")),
+            n("value"),
+            c("Nat"),
+            BinderInfo::Default,
+        )
         .clone();
     let spec = RecordSpec {
         name: n(name),

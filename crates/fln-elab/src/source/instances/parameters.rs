@@ -92,7 +92,9 @@ impl Context {
                             // domain; a nested binder is not a class parameter.
                             if binder_type.has_loose_bvar(index) {
                                 if *binder_info != BinderInfo::InstImplicit {
-                                    return Err(failure(SourceInferenceError::InvalidInstanceBinder));
+                                    return Err(failure(
+                                        SourceInferenceError::InvalidInstanceBinder,
+                                    ));
                                 }
                                 mode = ParameterMode::Output;
                                 break;
@@ -286,8 +288,14 @@ mod tests {
                 annotation("outParam", Expr::sort(Level::one())),
                 BinderInfo::Default,
             ),
-            (annotation("D", Expr::bvar(0).unwrap()), BinderInfo::InstImplicit),
-            (annotation("E", Expr::bvar(0).unwrap()), BinderInfo::InstImplicit),
+            (
+                annotation("D", Expr::bvar(0).unwrap()),
+                BinderInfo::InstImplicit,
+            ),
+            (
+                annotation("E", Expr::bvar(0).unwrap()),
+                BinderInfo::InstImplicit,
+            ),
         ]);
         assert_eq!(
             context().instance_parameter_modes(&type_).unwrap(),
@@ -311,7 +319,11 @@ mod tests {
         ]);
         assert_eq!(
             context().instance_parameter_modes(&type_).unwrap(),
-            vec![ParameterMode::Output, ParameterMode::Input, ParameterMode::Output]
+            vec![
+                ParameterMode::Output,
+                ParameterMode::Input,
+                ParameterMode::Output
+            ]
         );
     }
 
@@ -348,7 +360,9 @@ mod tests {
             ]);
             assert!(matches!(
                 context().instance_parameter_modes(&invalid),
-                Err(NatDefinitionElabError::Inference(SourceInferenceError::InvalidInstanceBinder))
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::InvalidInstanceBinder
+                ))
             ));
             let valid = telescope(vec![
                 (output, BinderInfo::Default),
@@ -368,7 +382,10 @@ mod tests {
                 annotation("semiOutParam", Expr::sort(Level::one())),
                 BinderInfo::Default,
             ),
-            (annotation("D", Expr::bvar(0).unwrap()), BinderInfo::InstImplicit),
+            (
+                annotation("D", Expr::bvar(0).unwrap()),
+                BinderInfo::InstImplicit,
+            ),
         ]);
         assert_eq!(
             context().instance_parameter_modes(&type_).unwrap(),
@@ -382,7 +399,9 @@ mod tests {
         context.txn.budget.heartbeats_consumed = context.txn.budget.max_heartbeats;
         assert!(matches!(
             context.instance_parameter_modes(&Expr::sort(Level::one())),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
     }
 }

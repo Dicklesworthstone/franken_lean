@@ -36,7 +36,9 @@ impl Preparation<'_> {
             || rec.num_motives == 0
             || rec.all.is_empty()
             || levels.len() != rec.base.level_params.len()
-            || levels.iter().any(|level| level.has_mvar() || level.has_param())
+            || levels
+                .iter()
+                .any(|level| level.has_mvar() || level.has_param())
         {
             return Ok(None);
         }
@@ -113,7 +115,10 @@ impl Preparation<'_> {
             });
         }
         let callback_type = self.erase_runtime_type(&type_)?;
-        if !matches!(self.value_type(&callback_type)?, Some(ValueType::Closure(_))) {
+        if !matches!(
+            self.value_type(&callback_type)?,
+            Some(ValueType::Closure(_))
+        ) {
             return Ok(None);
         }
         let mut binders = Vec::new();
@@ -174,8 +179,8 @@ impl Preparation<'_> {
         );
         for (index, (name, domain, argument)) in captures.into_iter().enumerate().rev() {
             self.tick()?;
-            let offset = u32::try_from(index)
-                .map_err(|_| unsupported("partial recursor capture depth"))?;
+            let offset =
+                u32::try_from(index).map_err(|_| unsupported("partial recursor capture depth"))?;
             result = Expr::let_e(
                 name,
                 self.lift(&domain, offset)?,

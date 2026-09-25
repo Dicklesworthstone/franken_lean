@@ -380,7 +380,13 @@ mod tests {
         let motives = [
             literal.clone(),
             Expr::app(identity, literal.clone()),
-            Expr::let_e(Name::anonymous(), type_, literal, variable(0).unwrap(), false),
+            Expr::let_e(
+                Name::anonymous(),
+                type_,
+                literal,
+                variable(0).unwrap(),
+                false,
+            ),
         ];
         for expression in motives {
             let mut preparation = Preparation::new(&environment, IngressLimits::default());

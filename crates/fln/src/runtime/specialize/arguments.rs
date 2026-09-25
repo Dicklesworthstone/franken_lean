@@ -124,7 +124,10 @@ impl Preparation<'_> {
         let mut selected = static_arguments.iter().peekable();
         for (index, argument) in args.iter().enumerate() {
             self.tick()?;
-            if selected.peek().is_some_and(|(position, _)| *position == index) {
+            if selected
+                .peek()
+                .is_some_and(|(position, _)| *position == index)
+            {
                 selected.next();
             } else {
                 reserve(&mut runtime_arguments, self.limits.max_application_args)?;

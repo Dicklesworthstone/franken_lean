@@ -26,7 +26,10 @@ fn generic() -> (Expr, Expr) {
         (Expr::sort(Level::one()), BinderInfo::Implicit),
         (b(0), BinderInfo::Default),
     ];
-    (telescope(&binders, b(1), false), telescope(&binders, b(0), true))
+    (
+        telescope(&binders, b(1), false),
+        telescope(&binders, b(0), true),
+    )
 }
 
 #[test]
@@ -36,7 +39,11 @@ fn type_arguments_after_runtime_parameters_are_erased_without_substituting_value
     let (type_, value) = generic();
     let runtime = b(0);
     let result = preparation
-        .specialize_arguments(type_, value, &[runtime.clone(), ty("Nat"), nat::literal(42)])
+        .specialize_arguments(
+            type_,
+            value,
+            &[runtime.clone(), ty("Nat"), nat::literal(42)],
+        )
         .unwrap();
     let retained = [
         (ty("Nat"), BinderInfo::Default),
@@ -64,7 +71,13 @@ fn multiple_interleaved_types_rebase_later_domains_and_earlier_runtime_reference
         .specialize_arguments(
             telescope(&binders, b(3), false),
             telescope(&binders, b(2), true),
-            &[nat::literal(7), ty("Nat"), b(0), ty("String"), ty("runtimeText")],
+            &[
+                nat::literal(7),
+                ty("Nat"),
+                b(0),
+                ty("String"),
+                ty("runtimeText"),
+            ],
         )
         .unwrap();
     let retained = [
@@ -74,8 +87,14 @@ fn multiple_interleaved_types_rebase_later_domains_and_earlier_runtime_reference
     ];
     assert_eq!(result.type_, telescope(&retained, ty("Nat"), false));
     assert_eq!(result.value, telescope(&retained, b(1), true));
-    assert_eq!(result.static_arguments, vec![(1, ty("Nat")), (3, ty("String"))]);
-    assert_eq!(result.runtime_arguments, vec![nat::literal(7), b(0), ty("runtimeText")]);
+    assert_eq!(
+        result.static_arguments,
+        vec![(1, ty("Nat")), (3, ty("String"))]
+    );
+    assert_eq!(
+        result.runtime_arguments,
+        vec![nat::literal(7), b(0), ty("runtimeText")]
+    );
 }
 
 #[test]
@@ -113,7 +132,10 @@ fn value_dependent_and_computed_dictionaries_are_not_erased() {
     let dictionary = telescope(&[(ty("Nat"), BinderInfo::Default)], b(0), true);
     let dependent = [
         (ty("Nat"), BinderInfo::Default),
-        (Expr::app(ty("IndexedClass"), b(0)), BinderInfo::InstImplicit),
+        (
+            Expr::app(ty("IndexedClass"), b(0)),
+            BinderInfo::InstImplicit,
+        ),
     ];
     let environment = Environment::new();
     let type_ = telescope(&dependent, ty("Nat"), false);
@@ -209,20 +231,37 @@ fn partial_and_saturated_calls_share_keys_but_distinct_static_types_do_not() {
         .unwrap();
     assert_ne!(preparation.spine(&other).unwrap().0, full_head);
     assert_eq!(preparation.specializations.definitions.len(), 2);
-    let ExprNode::Const { name: generated, .. } = full_head.node() else {
+    let ExprNode::Const {
+        name: generated, ..
+    } = full_head.node()
+    else {
         panic!("private specialization head");
     };
     assert!(!environment.contains(generated));
-    assert!(preparation.specialize_call(&full_head, &full_args).unwrap().is_none());
+    assert!(
+        preparation
+            .specialize_call(&full_head, &full_args)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
 fn resource_refusals_do_not_publish_partial_specializations() {
     let environment = environment();
     for limits in [
-        IngressLimits { max_nodes: 1, ..IngressLimits::default() },
-        IngressLimits { max_application_args: 1, ..IngressLimits::default() },
-        IngressLimits { max_context_depth: 0, ..IngressLimits::default() },
+        IngressLimits {
+            max_nodes: 1,
+            ..IngressLimits::default()
+        },
+        IngressLimits {
+            max_application_args: 1,
+            ..IngressLimits::default()
+        },
+        IngressLimits {
+            max_context_depth: 0,
+            ..IngressLimits::default()
+        },
         IngressLimits {
             fir: fln_comp::fir::ValidationLimits {
                 max_functions: 0,
@@ -233,7 +272,10 @@ fn resource_refusals_do_not_publish_partial_specializations() {
     ] {
         let mut preparation = Preparation::new(&environment, limits);
         assert!(matches!(
-            preparation.specialize_call(&ty("generic"), &[nat::literal(1), ty("Nat"), nat::literal(42)]),
+            preparation.specialize_call(
+                &ty("generic"),
+                &[nat::literal(1), ty("Nat"), nat::literal(42)]
+            ),
             Err(IngressError::ResourceLimit { .. })
         ));
         assert!(preparation.specializations.definitions.is_empty());

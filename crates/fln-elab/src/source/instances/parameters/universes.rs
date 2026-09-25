@@ -179,7 +179,10 @@ mod tests {
             type_at("u"),
             pi(
                 annotated("semiOutParam", type_at("v")),
-                pi(annotated("outParam", Expr::sort(shared)), Expr::sort(Level::one())),
+                pi(
+                    annotated("outParam", Expr::sort(shared)),
+                    Expr::sort(Level::one()),
+                ),
             ),
         );
         let mut context = context();
@@ -217,7 +220,11 @@ mod tests {
                 &[Level::one(), Level::one()],
             )
             .unwrap();
-        assert!(prepared.iter().all(|level| matches!(level.view(), LevelView::MVar(_))));
+        assert!(
+            prepared
+                .iter()
+                .all(|level| matches!(level.view(), LevelView::MVar(_)))
+        );
         assert_ne!(prepared[0], prepared[1]);
     }
 
@@ -225,7 +232,10 @@ mod tests {
     fn output_aliases_to_input_universes_are_separated_during_selection() {
         let class = pi(
             type_at("u"),
-            pi(annotated("outParam", type_at("v")), Expr::sort(Level::one())),
+            pi(
+                annotated("outParam", type_at("v")),
+                Expr::sort(Level::one()),
+            ),
         );
         let mut context = context();
         let modes = context.instance_parameter_modes(&class).unwrap();
@@ -275,12 +285,16 @@ mod tests {
         let before = context.txn.universes.clone();
         assert!(matches!(
             context.instance_search_levels(&type_at("u"), &[], &[n("u")], &[]),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::Scope))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::Scope
+            ))
         ));
         context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed;
         assert!(matches!(
             context.instance_search_levels(&type_at("u"), &[], &[n("u")], &[Level::one()]),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
         assert_eq!(context.txn.universes, before);
     }

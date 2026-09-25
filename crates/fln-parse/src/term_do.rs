@@ -335,7 +335,11 @@ impl Prefix {
         let sequence = if let Some((open, Some(close))) = self.braces {
             Syntax::node(
                 parser_kind(&["Term", "doSeqBracketed"]),
-                vec![leaves.leaf(open)?, null_node(self.items), leaves.leaf(close)?],
+                vec![
+                    leaves.leaf(open)?,
+                    null_node(self.items),
+                    leaves.leaf(close)?,
+                ],
             )
         } else {
             Syntax::node(
@@ -362,9 +366,10 @@ pub(super) fn layout(
     frames: &[BoundedTermFrame],
     at: usize,
 ) -> Option<bool> {
-    if frames.last().is_some_and(|f| {
-        matches!(&f.prefix, Some(term_locals::Prefix::Do(p)) if p.done())
-    }) {
+    if frames
+        .last()
+        .is_some_and(|f| matches!(&f.prefix, Some(term_locals::Prefix::Do(p)) if p.done()))
+    {
         return Some(true);
     }
     if frames

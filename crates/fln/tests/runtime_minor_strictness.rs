@@ -27,12 +27,15 @@ fn execute(source: &str, expected: &str) {
     );
 }
 
-const SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
+const SPEND: &str =
+    "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
 fn strict_function_valued_minors_keep_captured_results_and_accumulators() {
     execute(
-        &format!("{SPEND}#eval @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend 8; fun (x : Nat) => paid + x) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih (x + 1)) 3 31"),
+        &format!(
+            "{SPEND}#eval @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend 8; fun (x : Nat) => paid + x) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih (x + 1)) 3 31"
+        ),
         "42",
     );
 }
@@ -50,9 +53,11 @@ fn an_unused_initializer_still_runs_and_exhaustion_is_not_success() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let program = |cost| format!(
-        "{SPEND}def run (cost : Nat) : Nat := @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend cost; fun (x : Nat) => x) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih x) 0 42\n#eval run {cost}"
-    );
+    let program = |cost| {
+        format!(
+            "{SPEND}def run (cost : Nat) : Nat := @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend cost; fun (x : Nat) => x) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih x) 0 42\n#eval run {cost}"
+        )
+    };
     let mut bounded = limits();
     bounded.vm.max_steps = 2000;
     bounded.vm.max_stack_depth = 256;

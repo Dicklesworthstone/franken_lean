@@ -204,10 +204,7 @@ fn function_box(result_level: Level) -> InductiveSpec {
         Expr::fvar(b.id.clone()),
         BinderInfo::Default,
     );
-    let mut data = spec(
-        "FunctionBox",
-        vec![ctor("mk", vec![field("f", function)])],
-    );
+    let mut data = spec("FunctionBox", vec![ctor("mk", vec![field("f", function)])]);
     data.level_params = vec![name("u"), name("v")];
     data.parameters = vec![a, b];
     data.result_level = result_level;
@@ -262,8 +259,8 @@ fn oversized_function_universes_cannot_publish_and_valid_retry_is_deterministic(
     let before = e.logical_root(&KVMap::new());
     // For u = v = 2 the function field lives in Sort 2, not Sort 1.
     // Generation is not authority; the complete proposed block must be refused.
-    let oversized = inductive_declaration(&function_box(Level::one()), RecordBudget::default())
-        .unwrap();
+    let oversized =
+        inductive_declaration(&function_box(Level::one()), RecordBudget::default()).unwrap();
     let refused = e.admit_declarations(&[oversized], &KVMap::new(), limits());
     assert!(
         !matches!(refused, Ok(Outcome::Complete(_))),

@@ -25,10 +25,18 @@ fn template(type_: Expr) -> bool {
 fn later_type_and_dictionary_binders_are_templates() {
     let type_parameter = pi(
         Expr::sort(Level::one()),
-        pi(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap(), BinderInfo::Default),
+        pi(
+            Expr::bvar(0).unwrap(),
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
         BinderInfo::Implicit,
     );
-    let dictionary = pi(scalar("Dictionary"), scalar("Nat"), BinderInfo::InstImplicit);
+    let dictionary = pi(
+        scalar("Dictionary"),
+        scalar("Nat"),
+        BinderInfo::InstImplicit,
+    );
     for suffix in [type_parameter, dictionary] {
         assert!(template(pi(scalar("Nat"), suffix, BinderInfo::Default)));
     }

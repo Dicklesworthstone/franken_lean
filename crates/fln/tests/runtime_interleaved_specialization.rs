@@ -94,7 +94,10 @@ const MONAD: &str = "class Pure (f : Type -> Type) where\n  pure : {A : Type} ->
 
 #[test]
 fn monadic_operations_with_late_type_and_instance_arguments_run_on_golem() {
-    execute(&format!("{MONAD}#eval (step 9 (M := Id) 41 : Id Nat)"), "42");
+    execute(
+        &format!("{MONAD}#eval (step 9 (M := Id) 41 : Id Nat)"),
+        "42",
+    );
 }
 
 #[test]

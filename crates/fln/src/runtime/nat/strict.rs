@@ -47,11 +47,7 @@ fn nested_initializers_keep_order_dependencies_and_outer_argument_scope() {
     let input = local(
         "first",
         first.clone(),
-        local(
-            "second",
-            second.clone(),
-            lam(call("Nat.add", [b(2), b(0)])),
-        ),
+        local("second", second.clone(), lam(call("Nat.add", [b(2), b(0)]))),
     );
     assert_eq!(
         prepare(input, b(0)),
@@ -68,11 +64,7 @@ fn dynamic_branch_callees_stay_inside_their_strict_bindings() {
     let input = local("callee", call("makeCallback", []), b(0));
     assert_eq!(
         prepare(input, b(0)),
-        local(
-            "callee",
-            call("makeCallback", []),
-            Expr::app(b(0), b(1))
-        )
+        local("callee", call("makeCallback", []), Expr::app(b(0), b(1)))
     );
 }
 
@@ -107,8 +99,7 @@ fn deep_let_spines_are_heap_backed_and_refuse_exhausted_budgets() {
                 ..IngressLimits::default()
             };
             assert!(matches!(
-                Preparation::new(&environment, no_work)
-                    .minor_apply(function.clone(), literal(42)),
+                Preparation::new(&environment, no_work).minor_apply(function.clone(), literal(42)),
                 Err(IngressError::ResourceLimit { .. })
             ));
             let mut result = prepare(function, literal(42));
