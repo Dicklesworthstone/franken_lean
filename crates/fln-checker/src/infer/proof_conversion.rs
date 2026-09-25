@@ -4,7 +4,9 @@
 //! to compare proofs of the same proposition, (KR-315) values of the same
 //! unit-like structure type, and (KR-312) a lambda against a function that is
 //! not one, by eta-expanding the latter through its Π-type, and a structure
-//! constructor application against a term that is not one, field by field.
+//! constructor application against a term that is not one, field by field, and
+//! (KR-317) a K recursor stuck on a major premise that is not a constructor
+//! application, by reducing it as if the major were the nullary constructor.
 //! Probes explicitly disable this lane, so nested conversion never recursively
 //! reenters typed inference.
 use super::*;
@@ -340,6 +342,169 @@ impl Probe<'_> {
         }
         Ok(Some(obligations))
     }
+    /// KR-317 in the typed lane, the pin's `to_cnstr_when_K` (inductive.h:31):
+    /// a K recursor application `s` stuck on a major premise that is not a
+    /// constructor application reduces as if that major were the inductive's
+    /// nullary constructor, applied to the parameters of the major's type,
+    /// whenever the major's type is definitionally equal to that constructor's.
+    /// whnf applies the rule too, but gates it on a structural comparison with
+    /// no typing, so it misses a type pair that only eta or proof irrelevance
+    /// closes (`Fin.addCases_left`: `castLT (castAdd n i) h ≟ i`). Returns the
+    /// (major type, constructor type) pair, which the caller must prove before
+    /// using the rule, and `s` with the major replaced, which whnf's iota then
+    /// reduces; `None` means the rule does not apply.
+    fn k_reduction(
+        &mut self,
+        s: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<((WireExpr, WireExpr), WireExpr)>> {
+        let Some(head) = head_constant(s) else {
+            return Ok(None);
+        };
+        let constants = context.constants();
+        let Some(recursor) = constants.find(head).and_then(|d| d.recursor_metadata()) else {
+            return Ok(None);
+        };
+        if !recursor.k() {
+            return Ok(None);
+        }
+        let major_index = [
+            recursor.num_parameters(),
+            recursor.num_motives(),
+            recursor.num_minors(),
+            recursor.num_indices(),
+        ]
+        .into_iter()
+        .map(|count| count as usize)
+        .sum::<usize>();
+        // The spine as (application node, argument), innermost first.
+        let mut spine = Vec::new();
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, argument }) = s.node(id) {
+            self.tick()?;
+            spine.push((id, *argument));
+            id = *function;
+        }
+        spine.reverse();
+        let Some(&(major_application, major_id)) = spine.get(major_index) else {
+            return Ok(None);
+        };
+        let Some(ExprNode::Apply {
+            function: before_major,
+            ..
+        }) = s.node(major_application)
+        else {
+            return Ok(None);
+        };
+        let before_major = *before_major;
+        let major = self.piece(s, major_id)?;
+        let Some(reduced_major) = self.whnf(&major, context)? else {
+            return Ok(None);
+        };
+        if head_constant(&reduced_major)
+            .and_then(|name| constants.find(name))
+            .is_some_and(|declaration| declaration.constructor_metadata().is_some())
+        {
+            return Ok(None);
+        }
+        let Some(major_type) = self.infer(&major, context)? else {
+            return Ok(None);
+        };
+        let Some(major_type) = self.whnf(&major_type, context)? else {
+            return Ok(None);
+        };
+        // The major's type must be an application of the recursor's inductive.
+        let mut type_arguments = Vec::new();
+        let mut type_head = major_type.root();
+        while let Some(ExprNode::Apply { function, argument }) = major_type.node(type_head) {
+            self.tick()?;
+            type_arguments.push(*argument);
+            type_head = *function;
+        }
+        type_arguments.reverse();
+        let Some(ExprNode::Constant {
+            name: inductive_name,
+            levels: inductive_levels,
+        }) = major_type.node(type_head)
+        else {
+            return Ok(None);
+        };
+        if !recursor.mutual().contains(inductive_name) {
+            return Ok(None);
+        }
+        let Some(inductive) = constants
+            .find(inductive_name)
+            .and_then(|d| d.inductive_metadata())
+        else {
+            return Ok(None);
+        };
+        let [constructor_name] = inductive.constructors() else {
+            return Ok(None);
+        };
+        let parameters = inductive.num_parameters() as usize;
+        if type_arguments.len() < parameters
+            || constants
+                .find(constructor_name)
+                .and_then(|d| d.constructor_metadata())
+                .is_none_or(|c| c.num_fields() != 0)
+        {
+            return Ok(None);
+        }
+        // The constructor applied to the major type's parameters, built by
+        // extending a copy of the type's own arena.
+        let mut nodes = major_type.nodes().to_vec();
+        let mut constructor = push_node(
+            &mut nodes,
+            ExprNode::Constant {
+                name: constructor_name.clone(),
+                levels: inductive_levels.clone(),
+            },
+        )
+        .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        for argument in &type_arguments[..parameters] {
+            self.tick()?;
+            constructor = push_node(
+                &mut nodes,
+                ExprNode::Apply {
+                    function: constructor,
+                    argument: *argument,
+                },
+            )
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        }
+        let constructor = WireExpr::from_parts(nodes, major_type.levels().to_vec(), constructor);
+        let Some(constructor_type) = self.infer(&constructor, context)? else {
+            return Ok(None);
+        };
+        // `s` with the major replaced, built by extending a copy of `s`'s arena.
+        let mut nodes = s.nodes().to_vec();
+        let mut levels = s.levels().to_vec();
+        let replacement = append_arena(&mut nodes, &mut levels, &constructor)
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        let mut root = push_node(
+            &mut nodes,
+            ExprNode::Apply {
+                function: before_major,
+                argument: replacement,
+            },
+        )
+        .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        for &(_, argument) in &spine[major_index + 1..] {
+            self.tick()?;
+            root = push_node(
+                &mut nodes,
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+            )
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        }
+        Ok(Some((
+            (major_type, constructor_type),
+            WireExpr::from_parts(nodes, levels, root),
+        )))
+    }
     /// `term.index` of structure `name`, built by extending a copy of `term`'s
     /// own arena, so no subterm is re-copied.
     fn project(&mut self, term: &WireExpr, name: &WireName, index: u64) -> Result<WireExpr> {
@@ -522,6 +687,23 @@ impl Probe<'_> {
                     continue 'work;
                 }
             }
+            // KR-317: a K recursor stuck on a non-constructor major. Like the pin,
+            // reduce only once the gate is established, so an unmet gate leaves
+            // the pair to congruence and the other rules instead of failing it.
+            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
+                if let Some(((major_type, constructor_type), reduced)) =
+                    self.k_reduction(s, &context)?
+                    && self.run(&major_type, &constructor_type, &context)?
+                {
+                    let (a, b) = if s_on_left {
+                        (reduced, t.clone())
+                    } else {
+                        (t.clone(), reduced)
+                    };
+                    work.push(Work::Pair(a, b, context.clone()));
+                    continue 'work;
+                }
+            }
             match (l.node(l.root()), r.node(r.root())) {
                 (
                     Some(ExprNode::Apply {
@@ -645,6 +827,103 @@ impl Probe<'_> {
         }
         Ok(true)
     }
+}
+
+/// Push `node` onto an arena under construction and return its id.
+fn push_node(nodes: &mut Vec<ExprNode>, node: ExprNode) -> Option<ExprId> {
+    let id = ExprId::from_index(nodes.len())?;
+    nodes.push(node);
+    Some(id)
+}
+
+/// Append `other`'s whole arena to one under construction, shifting every
+/// reference, and return the id `other`'s root now has.
+fn append_arena(
+    nodes: &mut Vec<ExprNode>,
+    levels: &mut Vec<LevelNode>,
+    other: &WireExpr,
+) -> Option<ExprId> {
+    let (node_offset, level_offset) = (nodes.len(), levels.len());
+    let e = |id: &ExprId| ExprId::from_index(id.index() + node_offset);
+    let l = |id: &LevelId| LevelId::from_index(id.index() + level_offset);
+    for level in other.levels() {
+        levels.push(match level {
+            LevelNode::Succ(a) => LevelNode::Succ(l(a)?),
+            LevelNode::Max(a, b) => LevelNode::Max(l(a)?, l(b)?),
+            LevelNode::IMax(a, b) => LevelNode::IMax(l(a)?, l(b)?),
+            LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => level.clone(),
+        });
+    }
+    for node in other.nodes() {
+        nodes.push(match node {
+            ExprNode::Sort { level } => ExprNode::Sort { level: l(level)? },
+            ExprNode::Constant { name, levels } => ExprNode::Constant {
+                name: name.clone(),
+                levels: levels.iter().map(l).collect::<Option<_>>()?,
+            },
+            ExprNode::Apply { function, argument } => ExprNode::Apply {
+                function: e(function)?,
+                argument: e(argument)?,
+            },
+            ExprNode::Lambda {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            } => ExprNode::Lambda {
+                binder_name: binder_name.clone(),
+                binder_type: e(binder_type)?,
+                body: e(body)?,
+                style: *style,
+            },
+            ExprNode::Forall {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            } => ExprNode::Forall {
+                binder_name: binder_name.clone(),
+                binder_type: e(binder_type)?,
+                body: e(body)?,
+                style: *style,
+            },
+            ExprNode::Let {
+                declaration_name,
+                type_,
+                value,
+                body,
+                non_dependent,
+            } => ExprNode::Let {
+                declaration_name: declaration_name.clone(),
+                type_: e(type_)?,
+                value: e(value)?,
+                body: e(body)?,
+                non_dependent: *non_dependent,
+            },
+            ExprNode::Metadata {
+                entries,
+                expression,
+            } => ExprNode::Metadata {
+                entries: entries.clone(),
+                expression: e(expression)?,
+            },
+            ExprNode::Projection {
+                structure_name,
+                index,
+                expression,
+            } => ExprNode::Projection {
+                structure_name: structure_name.clone(),
+                index: *index,
+                expression: e(expression)?,
+            },
+            ExprNode::Bound { .. }
+            | ExprNode::Free { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_) => node.clone(),
+        });
+    }
+    e(&other.root())
 }
 
 /// The constant at the head of `term`'s application spine, if there is one.

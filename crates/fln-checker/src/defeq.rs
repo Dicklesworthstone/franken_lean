@@ -1379,6 +1379,8 @@ fn child(parent: DefEqTerm, child: ExprId) -> Result<DefEqTerm, SlowHalt> {
 
 enum PairAction {
     Done,
+    /// The same comparison with metadata stripped: not a decomposition.
+    Strip((DefEqTerm, DefEqTerm)),
     Push1((DefEqTerm, DefEqTerm)),
     Push2((DefEqTerm, DefEqTerm), (DefEqTerm, DefEqTerm)),
     NotEqual(DefEqMismatch),
@@ -1468,7 +1470,7 @@ fn compare_pair(
                 ..
             },
         ) => {
-            return Ok(PairAction::Push1((
+            return Ok(PairAction::Strip((
                 child(left_reference, *left_expression)?,
                 child(right_reference, *right_expression)?,
             )));
@@ -1480,7 +1482,7 @@ fn compare_pair(
             },
             _,
         ) => {
-            return Ok(PairAction::Push1((
+            return Ok(PairAction::Strip((
                 child(left_reference, *left_expression)?,
                 right_reference,
             )));
@@ -1492,7 +1494,7 @@ fn compare_pair(
                 ..
             },
         ) => {
-            return Ok(PairAction::Push1((
+            return Ok(PairAction::Strip((
                 left_reference,
                 child(right_reference, *right_expression)?,
             )));
@@ -3124,6 +3126,43 @@ fn unresolved_pair(
     }
 }
 
+/// What a mismatch means where it was found: final at an undecomposed pair
+/// or under a matched string expansion, a deferral below the root otherwise
+/// (see `run_slow`). Out of line so `run_slow`'s frame does not grow: deep
+/// conversion tests run it on a 64 KiB stack.
+#[inline(never)]
+fn mismatch_outcome(
+    mismatch: DefEqMismatch,
+    (left, right): (DefEqTerm, DefEqTerm),
+    (decomposed, string_context): (bool, StringComparisonContext),
+    sources: TermSources<'_>,
+    progress: DefEqProgress,
+) -> Result<DefEqOutcome, SlowHalt> {
+    if decomposed && string_context == StringComparisonContext::Ordinary {
+        return Ok(DefEqOutcome::Deferred {
+            need: nested_mismatch(left, right, sources)?,
+            progress,
+        });
+    }
+    Ok(DefEqOutcome::NotEqual { mismatch, progress })
+}
+
+/// The deferral a mismatch below the root pair becomes (see `run_slow`).
+fn nested_mismatch(
+    left: DefEqTerm,
+    right: DefEqTerm,
+    sources: TermSources<'_>,
+) -> Result<DefEqDeferred, SlowHalt> {
+    let (_, left_node) = slow_node(left, sources.left, sources.right, sources.generated)?;
+    let (_, right_node) = slow_node(right, sources.left, sources.right, sources.generated)?;
+    Ok(DefEqDeferred {
+        left: left.location(),
+        right: right.location(),
+        left_class: expression_class(left_node),
+        right_class: expression_class(right_node),
+    })
+}
+
 fn materialize_subterm_wire(
     term: DefEqTerm,
     sources: TermSources<'_>,
@@ -3301,10 +3340,20 @@ fn run_slow(
         DefEqTerm::original(DefEqSide::Right, right.root()),
         NatOffsetContext::Fresh,
         StringComparisonContext::Ordinary,
+        false,
     )];
     let mut seen = BTreeSet::new();
 
-    while let Some((left_reference, right_reference, offset_context, string_context)) =
+    // `decomposed` marks a pair reached by splitting an enclosing comparison
+    // (congruence, binders, projections, structure-eta fields) rather than by
+    // rewriting it. Without types, two different literals or sorts found there
+    // prove nothing about the enclosing terms: those may be proofs, equal by
+    // proof irrelevance, or may reduce away the differing part. So, as in quick
+    // conversion, only a mismatch on an undecomposed pair is a final negative
+    // verdict, and below the root it defers to conversion that has types. A
+    // matched string expansion is the exception: its pairs are `String`,
+    // `List Char`, `Char` and `Nat` data, never proofs, and stay decisive.
+    while let Some((left_reference, right_reference, offset_context, string_context, decomposed)) =
         pending.pop()
     {
         if !seen.insert((
@@ -3312,6 +3361,7 @@ fn run_slow(
             right_reference,
             offset_context,
             string_context,
+            decomposed,
         )) {
             continue;
         }
@@ -3326,18 +3376,30 @@ fn run_slow(
             cancelled,
         )? {
             PairAction::Done => {}
+            PairAction::Strip((next_left, next_right)) => {
+                pending.push((
+                    next_left,
+                    next_right,
+                    offset_context,
+                    string_context,
+                    decomposed,
+                ));
+            }
             PairAction::Push1((next_left, next_right)) => {
-                pending.push((next_left, next_right, offset_context, string_context));
+                pending.push((next_left, next_right, offset_context, string_context, true));
             }
             PairAction::Push2(first, second) => {
-                pending.push((second.0, second.1, offset_context, string_context));
-                pending.push((first.0, first.1, offset_context, string_context));
+                pending.push((second.0, second.1, offset_context, string_context, true));
+                pending.push((first.0, first.1, offset_context, string_context, true));
             }
             PairAction::NotEqual(mismatch) => {
-                return Ok(DefEqOutcome::NotEqual {
+                return mismatch_outcome(
                     mismatch,
-                    progress: control.progress,
-                });
+                    (left_reference, right_reference),
+                    (decomposed, string_context),
+                    TermSources::new(left, right, &generated),
+                    control.progress,
+                );
             }
             PairAction::Normalize(need) => {
                 match nat_offset_action(
@@ -3352,10 +3414,13 @@ fn run_slow(
                     NatOffsetAction::NoMatch => {}
                     NatOffsetAction::Equal => continue,
                     NatOffsetAction::NotEqual(mismatch) => {
-                        return Ok(DefEqOutcome::NotEqual {
+                        return mismatch_outcome(
                             mismatch,
-                            progress: control.progress,
-                        });
+                            (left_reference, right_reference),
+                            (decomposed, string_context),
+                            TermSources::new(left, right, &generated),
+                            control.progress,
+                        );
                     }
                     NatOffsetAction::Peel(next_left, next_right) => {
                         pending.push((
@@ -3363,6 +3428,7 @@ fn run_slow(
                             next_right,
                             NatOffsetContext::PairedPeel,
                             string_context,
+                            decomposed,
                         ));
                         continue;
                     }
@@ -3422,7 +3488,13 @@ fn run_slow(
                     }
                 }
                 if next_left != left_reference || next_right != right_reference {
-                    pending.push((next_left, next_right, offset_context, string_context));
+                    pending.push((
+                        next_left,
+                        next_right,
+                        offset_context,
+                        string_context,
+                        decomposed,
+                    ));
                     continue;
                 }
 
@@ -3439,8 +3511,8 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )? {
-                    pending.push((second.0, second.1, offset_context, string_context));
-                    pending.push((first.0, first.1, offset_context, string_context));
+                    pending.push((second.0, second.1, offset_context, string_context, true));
+                    pending.push((first.0, first.1, offset_context, string_context, true));
                     continue;
                 }
 
@@ -3459,6 +3531,7 @@ fn run_slow(
                                 right_reference,
                                 offset_context,
                                 StringComparisonContext::MatchedExpansion,
+                                decomposed,
                             ));
                         }
                         DefEqSide::Right => {
@@ -3469,6 +3542,7 @@ fn run_slow(
                                 next_right,
                                 offset_context,
                                 StringComparisonContext::MatchedExpansion,
+                                decomposed,
                             ));
                         }
                     }
@@ -3502,7 +3576,13 @@ fn run_slow(
                     )?
                 {
                     let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
-                    pending.push((next_left, right_reference, offset_context, string_context));
+                    pending.push((
+                        next_left,
+                        right_reference,
+                        offset_context,
+                        string_context,
+                        decomposed,
+                    ));
                     continue;
                 }
                 if right_is_nat
@@ -3517,7 +3597,13 @@ fn run_slow(
                     )?
                 {
                     let next_right = retain_generated(&mut generated, DefEqSide::Right, term);
-                    pending.push((left_reference, next_right, offset_context, string_context));
+                    pending.push((
+                        left_reference,
+                        next_right,
+                        offset_context,
+                        string_context,
+                        decomposed,
+                    ));
                     continue;
                 }
 
@@ -3574,6 +3660,7 @@ fn run_slow(
                                     next_right,
                                     offset_context,
                                     string_context,
+                                    true,
                                 ));
                             }
                             continue;
@@ -3674,7 +3761,13 @@ fn run_slow(
                     }
                     next_right = retain_generated(&mut generated, DefEqSide::Right, result.term);
                 }
-                pending.push((next_left, next_right, offset_context, string_context));
+                pending.push((
+                    next_left,
+                    next_right,
+                    offset_context,
+                    string_context,
+                    decomposed,
+                ));
             }
         }
     }

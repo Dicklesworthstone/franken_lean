@@ -159,6 +159,38 @@ fn equality_of_proofs_requires_conversion_of_their_propositions() {
     );
 }
 #[test]
+fn proofs_that_differ_only_in_a_literal_are_still_one_proof() {
+    // `mk 0` and `mk 1` are both proofs of `P`, so `T (f (mk 0))` and
+    // `T (f (mk 1))` are one type. Untyped congruence reaches `0 ≟ 1` below
+    // them and used to call the whole conversion unequal, rejecting a
+    // declaration the Reference accepts (`Fin.zero_eq_one_iff`'s
+    // `Nat.mod_lt 0 _` against `Nat.mod_lt 1 _`).
+    let nat = |value: u64| {
+        Expr::lit(fln_core::expr::Literal::Nat(
+            fln_core::expr::NatLit::from_u64(value),
+        ))
+    };
+    let mut rows = environment()
+        .constants()
+        .map(|(name, decl)| ConstantEntry::new(name.clone(), decl.clone()))
+        .collect::<Vec<_>>();
+    rows.push(entry("Nat", Expr::sort(Level::one())));
+    rows.push(entry("mk", pi(c("Nat"), c("P"))));
+    rows.push(entry("w0", target(app(c("mk"), [nat(0)]))));
+    rows.push(entry("S", pi(c("Nat"), Expr::sort(Level::one()))));
+    rows.push(entry("v", app(c("S"), [nat(0)])));
+    let env = environment_of(rows);
+    accepted(
+        &env,
+        &candidate("literal_proofs", target(app(c("mk"), [nat(1)])), c("w0")),
+    );
+    // The same literals as data stay distinct.
+    refused(
+        &env,
+        &candidate("literal_data", app(c("S"), [nat(1)]), c("v")),
+    );
+}
+#[test]
 fn proof_arguments_cannot_hide_invalid_unused_annotations() {
     let env = environment();
     let bad = Expr::let_e(primary_name("ignored"), c("Q"), c("p"), c("w"), false);

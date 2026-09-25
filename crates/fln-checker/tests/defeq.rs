@@ -268,6 +268,32 @@ fn rigid_sort_and_literal_mismatches_are_exact_non_equal_answers() {
 }
 
 #[test]
+fn a_mismatch_below_the_root_defers_instead_of_rejecting() {
+    // Untyped conversion cannot see types, so a literal mismatch it reaches by
+    // congruence says nothing about the terms enclosing it: `g 0` and `g 1`
+    // are one proof whenever `g` returns proofs. Only the root pair, two
+    // literals compared directly, is decisive.
+    let context = WhnfContext::default();
+    let applied = |value| decoded(&Expr::app(constant("g"), nat_literal(value)));
+    assert!(matches!(
+        def_eq(&applied(0), &applied(1), &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Deferred { .. }
+    ));
+    assert!(matches!(
+        def_eq(
+            &decoded(&nat_literal(0)),
+            &decoded(&nat_literal(1)),
+            &context,
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::NotEqual {
+            mismatch: DefEqMismatch::NatLiterals { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
 fn slow_or_environment_sensitive_cases_defer_instead_of_rejecting() {
     let left = decoded(&Expr::const_(name("C"), vec![Level::zero()]));
     let right = decoded(&Expr::const_(name("C"), vec![Level::one()]));
