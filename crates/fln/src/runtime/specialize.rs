@@ -4,6 +4,7 @@
 //! permitted only for closed constructor values with inert fields, and runtime
 //! beta reduction introduces strict lets: it never duplicates or drops an
 //! action. Both the original theorem checking and FIR validation remain intact.
+mod arguments;
 mod scope;
 
 use super::*;
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub(super) struct Store {
     definitions: BTreeMap<Name, DefinitionVal>,
-    instances: HashMap<(Name, Vec<Level>, Vec<Expr>), Name>,
+    instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,
     constructor_types: HashMap<Name, Expr>,
 }
@@ -385,119 +386,6 @@ impl Preparation<'_> {
             }
         }
         Ok(value)
-    }
-    /// Consume a prefix of erased type arguments and inert instance arguments.
-    /// Remaining arguments stay in the runtime call. A cache permits ordinary
-    /// recursion and shares each concrete body across all its call sites.
-    pub(super) fn specialize_call(
-        &mut self,
-        head: &Expr,
-        args: &[Expr],
-    ) -> Result<Option<Expr>, IngressError> {
-        let ExprNode::Const {
-            name: original,
-            levels,
-        } = head.node()
-        else {
-            return Ok(None);
-        };
-        if self.specializations.definitions.contains_key(original) {
-            return Ok(None);
-        }
-        let Some(mut definition) = self.definition(original) else {
-            return Ok(None);
-        };
-        if definition.base.level_params.len() != levels.len()
-            || levels.iter().any(|l| l.has_mvar() || l.has_param())
-        {
-            return Ok(None);
-        }
-        let mut type_ = self.universe_instance(
-            &definition.base.type_,
-            &definition.base.level_params,
-            levels,
-        )?;
-        let mut value =
-            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
-        let mut consumed = 0;
-        for argument in args {
-            self.tick()?;
-            let domain = self.type_head(&type_)?;
-            let ExprNode::ForallE {
-                binder_type,
-                body,
-                binder_info,
-                ..
-            } = domain.node()
-            else {
-                break;
-            };
-            if !closed(argument) {
-                break;
-            }
-            if !self.type_parameter(binder_type)?
-                && (*binder_info != BinderInfo::InstImplicit || !self.static_value(argument)?)
-            {
-                break;
-            }
-            // The source's lambda telescope must actually bind this argument.
-            // No eta or callback invocation is used to invent an erased body.
-            value = self.static_head(&value)?;
-            let ExprNode::Lam {
-                body: body_value, ..
-            } = value.node()
-            else {
-                break;
-            };
-            value = self.substitution(body_value, argument)?;
-            type_ = self.substitution(body, argument)?;
-            consumed += 1;
-        }
-        if consumed == 0 && levels.is_empty() {
-            return Ok(None);
-        }
-        let key = (original.clone(), levels.clone(), args[..consumed].to_vec());
-        let name = if let Some(name) = self.specializations.instances.get(&key) {
-            name.clone()
-        } else {
-            let count = self.specializations.definitions.len();
-            if count >= self.limits.fir.max_functions {
-                return Err(IngressError::ResourceLimit {
-                    resource: IngressResource::ProgramTables,
-                    limit: self.limits.fir.max_functions,
-                    observed: count.saturating_add(1),
-                });
-            }
-            let serial =
-                u64::try_from(count).map_err(|_| unsupported("specialization identity"))?;
-            let name = Name::num(
-                Name::from_components(["_fln_runtime_specialization"]),
-                serial,
-            );
-            if self.environment.contains(&name) {
-                return Err(unsupported("runtime specialization name collision"));
-            }
-            definition.base.name = name.clone();
-            definition.base.level_params.clear();
-            definition.base.type_ = type_;
-            definition.value = value;
-            definition.all.clear();
-            self.specializations.instances.try_reserve(1).map_err(|_| {
-                IngressError::AllocationFailure {
-                    resource: IngressResource::ProgramTables,
-                    requested: count.saturating_add(1),
-                }
-            })?;
-            self.specializations.instances.insert(key, name.clone());
-            self.specializations
-                .definitions
-                .insert(name.clone(), definition);
-            name
-        };
-        Ok(Some(application(
-            Expr::const_(name, vec![]),
-            args[consumed..].iter().cloned(),
-        )))
     }
     /// Expose a concrete dictionary field and eliminate its type lambdas. For
     /// runtime lambdas, retain strict evaluation and sharing with a let binder.

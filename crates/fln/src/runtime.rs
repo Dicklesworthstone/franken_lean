@@ -866,33 +866,47 @@ fn result_ownership(result: ValueType) -> CallableResultOwnership {
     }
 }
 
-/// Purely syntactic template classification. Actual uses still require complete
-/// type/instance arguments, ordinary admission, and compiler validation.
+/// Purely syntactic template classification. Inspect the whole parameter
+/// telescope: a static type/dictionary argument need not be its first binder.
+/// This does not turn a compilation refusal into success. Every template is
+/// still admitted, and each concrete evaluation must compile and execute.
 pub(super) fn is_template(definition: &DefinitionVal) -> bool {
     if !definition.base.level_params.is_empty() {
         return true;
     }
-    match definition.base.type_.node() {
-        ExprNode::Sort { .. } => true,
-        ExprNode::ForallE {
-            binder_type,
-            binder_info,
-            ..
-        } => {
-            *binder_info == BinderInfo::InstImplicit
-                || matches!(binder_type.node(), ExprNode::Sort { .. })
-                || matches!(binder_type.node(), ExprNode::ForallE { .. })
-                    && type_constructor_kind(binder_type)
+    let mut type_ = &definition.base.type_;
+    loop {
+        match type_.node() {
+            ExprNode::MData { expr, .. } => type_ = expr,
+            ExprNode::Sort { .. } => return true,
+            ExprNode::ForallE {
+                binder_type,
+                binder_info,
+                body,
+                ..
+            } => {
+                if *binder_info == BinderInfo::InstImplicit || type_constructor_kind(binder_type) {
+                    return true;
+                }
+                type_ = body;
+            }
+            _ => return false,
         }
-        _ => false,
     }
 }
 fn type_constructor_kind(mut type_: &Expr) -> bool {
-    while let ExprNode::ForallE { body, .. } = type_.node() {
-        type_ = body;
+    loop {
+        match type_.node() {
+            ExprNode::MData { expr, .. } => type_ = expr,
+            ExprNode::ForallE { body, .. } => type_ = body,
+            ExprNode::Sort { .. } => return true,
+            _ => return false,
+        }
     }
-    matches!(type_.node(), ExprNode::Sort { .. })
 }
+
+#[cfg(test)]
+mod templates;
 
 #[cfg(test)]
 mod tests {
