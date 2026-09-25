@@ -7,6 +7,7 @@
 
 use super::*;
 pub(in crate::source) mod backtrack;
+mod change;
 mod construct;
 mod constructor_transport;
 mod constructors;
@@ -36,6 +37,7 @@ pub enum TacticError {
     NoConstructor,
     ExpectedTwoConstructors,
     ApplyMismatch,
+    ChangeMismatch,
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
@@ -72,6 +74,9 @@ impl std::fmt::Display for TacticError {
             ),
             Self::NoMatchingAssumption => write!(f, "no local assumption matches the goal"),
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
+            Self::ChangeMismatch => {
+                write!(f, "change target is not definitionally equal to the goal")
+            }
             Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
             Self::RewriteLocation => write!(
                 f,
@@ -150,6 +155,10 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Change {
+        goal: ProofGoal,
+        target: &'a Syntax,
+    },
     Simpa {
         goal: ProofGoal,
         args: &'a [Syntax],
@@ -711,6 +720,13 @@ impl Context {
                     equality,
                     expression,
                 });
+            } else if kind == &parser_kind(&["Tactic", "change"]) {
+                let [keyword, target, location] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "change", "target replacement tactic")?;
+                expect_empty_null(location, "goal-only change location")?;
+                return Ok(ProofAction::Change { goal, target });
             } else if kind == &parser_kind(&["Tactic", "symm"]) {
                 let [keyword, location] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

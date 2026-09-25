@@ -841,6 +841,7 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            ChangeTarget(tactics::ProofState<'a>, tactics::ProofGoal),
             SimpaTerm(tactics::ProofState<'a>, tactics::ProofGoal, &'a [Syntax]),
             ProofEliminate(
                 tactics::ProofState<'a>,
@@ -1380,7 +1381,17 @@ impl Context {
                             self.accept_record_field(&mut state, &codomain, value)?;
                             tasks.push(Task::RecordNext(state));
                         }
+                        Task::ChangeTarget(mut proof, goal) => {
+                            let annotation = values.pop().expect("change target visit");
+                            self.change_proof_goal(&mut proof, goal, annotation)?;
+                            tasks.push(Task::Proof(proof));
+                        }
                         Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                            tactics::ProofAction::Change { goal, target } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::ChangeTarget(proof, goal));
+                                tasks.push(Task::Visit(target, Some(self.type_expected()?), true));
+                            }
                             tactics::ProofAction::Simpa { goal, args, using } => {
                                 self.txn.lctx = goal.lctx.clone();
                                 tasks.push(Task::SimpaTerm(proof, goal, args));

@@ -134,6 +134,7 @@ fn tactic(
             "right",
             "rfl",
             "symm",
+            "change",
             "rw",
             "rewrite",
             "simp",
@@ -166,6 +167,7 @@ fn tactic(
         "rw" | "rewrite" => rewrite(leaves, view, tokens, range, atom, keyword == "rw"),
         "generalize" => generalize(leaves, view, tokens, range, atom),
         "by_cases" => by_cases(leaves, view, tokens, range, atom),
+        "change" => change(leaves, view, tokens, range, atom),
         "exact" | "apply" | "refine" => term_tactic(leaves, view, tokens, range, keyword, atom),
         _ => local_tactic(leaves, view, tokens, range, keyword, atom),
     }
@@ -284,6 +286,30 @@ fn term_tactic(
     Ok(Syntax::node(
         parser_kind(&["Tactic", keyword]),
         vec![atom, term],
+    ))
+}
+
+#[inline(never)]
+fn change(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if range.len() < 2 {
+        return Err(refusal(view, tokens, range.start));
+    }
+    let target = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "change"]),
+        vec![atom, target, null_node(Vec::new())],
     ))
 }
 

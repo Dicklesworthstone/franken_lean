@@ -90,3 +90,62 @@ fn symm_refuses_unsupported_goals_and_locations() {
 fn symm_remains_a_contextual_keyword() {
     accepted("def symm (a : Nat) : Nat := a\ntheorem useName (a : Nat) : symm a = a := by rfl\n");
 }
+
+#[test]
+fn change_preserves_written_goal_and_unfolds_safe_definitions() {
+    accepted(
+        "def alias (a : Nat) : Nat := a\ntheorem changed (a b : Nat) (h : b = a) : alias a = b := by\n  change a = b\n  symm\n  exact h\n",
+    );
+    accepted(
+        "def alias (a : Nat) : Nat := a\ntheorem folded (a b : Nat) (h : a = b) : a = b := by\n  change alias a = b\n  exact h\n",
+    );
+}
+
+#[test]
+fn change_handles_dependent_targets_and_introduced_locals() {
+    accepted(
+        "def identity (A : Type) (a : A) : A := a\ntheorem dependent (A : Type) (P : A -> Prop) (a : A) : P a -> P (identity A a) := by\n  intro h\n  change P a\n  exact h\n",
+    );
+    accepted("theorem arithmetic : 2 + 3 = 5 := by\n  change 5 = 5\n  rfl\n");
+}
+
+#[test]
+fn change_infers_ordinary_placeholders_from_the_old_target() {
+    accepted(
+        "theorem placeholders (a b : Nat) (h : a = b) : a = b := by\n  change _ = b\n  exact h\n",
+    );
+}
+
+#[test]
+fn change_does_not_prove_an_unrelated_or_unfinished_target() {
+    refused("theorem unsound : False := by\n  change True\n  constructor\n");
+    refused("theorem badSelection : True := by\n  change False\n  exact True.intro\n");
+    refused("theorem unfinished : True := by\n  change True\n");
+    refused("theorem notAType : True := by\n  change 0\n  constructor\n");
+}
+
+#[test]
+fn change_keeps_invalid_discarded_arguments_in_kernel_input() {
+    refused(
+        "def relationIgnoreNat (x : Nat) : Prop := True\ntheorem discarded : True := by\n  change relationIgnoreNat True.intro\n  constructor\n",
+    );
+    refused(
+        "def relationIgnoreNat (x : Nat) : Prop := True\ntheorem discardedAnnotation : True := by\n  change relationIgnoreNat (True.intro : Nat)\n  constructor\n",
+    );
+}
+
+#[test]
+fn change_failure_rolls_back_before_trying_another_branch() {
+    accepted("theorem recovered (P : Prop) (h : P) : P := by\n  first | change False | exact h\n");
+    accepted(
+        "theorem recoveredHole (a b : Nat) (h : a = b) : a = b := by\n  first | change (_ : Nat) = True.intro | exact h\n",
+    );
+}
+
+#[test]
+fn change_remains_contextual_and_refuses_unsupported_locations() {
+    accepted(
+        "def change (a : Nat) : Nat := a\ntheorem useChange (a : Nat) : change a = a := by rfl\n",
+    );
+    refused("theorem unsupportedChange (P : Prop) (h : P) : P := by\n  change P at h\n  exact h\n");
+}
