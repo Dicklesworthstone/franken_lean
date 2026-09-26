@@ -79,6 +79,7 @@ impl Preparation<'_> {
         enum Work {
             Enter(Expr),
             Finish(Expr, Expr),
+            Alias(Expr, Expr),
         }
         let mut work = vec![Work::Enter(input.clone())];
         let mut done = HashMap::<Expr, Expr>::new();
@@ -91,6 +92,16 @@ impl Preparation<'_> {
                     }
                     let mut normal = self.type_head(&source)?;
                     let (head, args) = self.spine(&normal)?;
+                    if let Some(carrier) = self.quotient_carrier(&head, &args)? {
+                        // A quotient has its carrier's representation. Reenter
+                        // the same worklist so nested quotients/data/functions
+                        // do not create recursive host calls or visit relations.
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Work::Alias(source, carrier.clone()));
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Work::Enter(carrier));
+                        continue;
+                    }
                     if let ExprNode::Const { name, levels } = head.node()
                         && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
                         && family.num_indices != 0
@@ -129,6 +140,18 @@ impl Preparation<'_> {
                         }
                         _ => {}
                     }
+                }
+                Work::Alias(source, carrier) => {
+                    let value = done
+                        .get(&carrier)
+                        .cloned()
+                        .ok_or_else(|| unsupported("quotient type postorder"))?;
+                    done.try_reserve(1)
+                        .map_err(|_| IngressError::AllocationFailure {
+                            resource: IngressResource::Nodes,
+                            requested: done.len().saturating_add(1),
+                        })?;
+                    done.insert(source, value);
                 }
                 Work::Finish(source, normal) => {
                     let child = |e: &Expr| {

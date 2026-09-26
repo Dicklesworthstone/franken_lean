@@ -1,6 +1,8 @@
 //! Equality transport after admission. A cast may disappear only when both
 //! logical endpoints erase to the same executable type. No proof is executed,
 //! and ordinary endpoint/payload evaluation is retained in source order.
+mod quotient;
+
 use super::*;
 
 fn application(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
@@ -48,6 +50,11 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        // Quotient construction/elimination is another post-admission
+        // representation transport. Keep it before ordinary callable ingress.
+        if let Some(value) = self.quotient_operation(head, args)? {
+            return Ok(Some(value));
+        }
         let ExprNode::Const {
             name: callee,
             levels,
