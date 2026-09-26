@@ -5,6 +5,8 @@
 //! The generated declarations are private compiler inputs, not logical facts.
 use super::*;
 
+mod factories;
+
 pub(super) type InstanceKey = (Name, Vec<Level>, Vec<(usize, Expr)>);
 
 struct RetainedBinder {
@@ -70,14 +72,21 @@ impl Preparation<'_> {
             // global specialization, even when this caller supplies a literal.
             // Closed static arguments with independent domains need no lift
             // when substituted under the retained runtime binders.
-            let is_static = !binder_type.has_loose_bvars()
-                && closed(argument)
-                && (self.type_parameter(binder_type)?
-                    || *binder_info == BinderInfo::InstImplicit && self.static_value(argument)?);
-            if is_static {
-                let next_type = self.substitution(body, argument)?;
-                let next_value = self.substitution(value_body, argument)?;
+            let selected = if binder_type.has_loose_bvars() || !closed(argument) {
+                None
+            } else if self.type_parameter(binder_type)? {
+                Some(argument.clone())
+            } else if *binder_info == BinderInfo::InstImplicit {
+                self.instance_factory_value(argument)?
+            } else {
+                None
+            };
+            if let Some(selected) = selected {
+                let next_type = self.substitution(body, &selected)?;
+                let next_value = self.substitution(value_body, &selected)?;
                 reserve(&mut static_arguments, self.limits.max_application_args)?;
+                // Keep the exact source argument in the key; only the private
+                // compiler body receives the proven-inert factory result.
                 static_arguments.push((index, argument.clone()));
                 type_ = next_type;
                 value = next_value;
