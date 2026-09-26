@@ -5,6 +5,7 @@
 //! search. Continuations are real lambdas, so actions are never duplicated or
 //! eagerly evaluated by the frontend. Final declarations still face both judges.
 use super::*;
+mod conditional;
 mod control;
 mod for_loop;
 
@@ -243,7 +244,9 @@ impl Context {
                 expect_atom(separator, ";", "do separator")?;
             }
             let element = item.pop().expect("do element");
-            if control::is_jump(&element) {
+            if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+                result = Some(self.expand_do_conditional(element, result, loop_targets.as_ref())?);
+            } else if control::is_jump(&element) {
                 // Never discard an unreachable source suffix: it may contain
                 // invalid declarations or effects that still need checking.
                 if offset != 0 {

@@ -26,16 +26,32 @@ impl LoopTargets {
         }
         Ok(Self { accumulator: accumulator.clone() })
     }
-    fn exit(&self, stop: bool) -> Syntax {
+    fn value(&self, stop: bool) -> Syntax {
         let constructor = ident(Name::from_components([
             "_root_", "ForInStep", if stop { "done" } else { "yield" },
         ]));
-        let step = Syntax::node(
+        Syntax::node(
             parser_kind(&["Term", "app"]),
             vec![constructor, null(vec![self.accumulator.clone()])],
-        );
-        call(false, vec![step])
+        )
     }
+    fn exit(&self, stop: bool) -> Syntax {
+        call(false, vec![self.value(stop)])
+    }
+
+    /// A conditional needs three exits: normal, break and continue. Reuse the
+    /// checked ForInStep family twice, instead of cloning its source suffix.
+    /// Outer done forwards an inner loop exit; outer yield resumes the suffix.
+    pub(super) fn signal(&self, stop: Option<bool>) -> Syntax {
+        let constructor = ident(Name::from_components([
+            "_root_", "ForInStep", if stop.is_some() { "done" } else { "yield" },
+        ]));
+        call(false, vec![Syntax::node(
+            parser_kind(&["Term", "app"]),
+            vec![constructor, null(vec![self.value(stop.unwrap_or(false))])],
+        )])
+    }
+
 }
 
 pub(super) fn is_jump(element: &Syntax) -> bool {
@@ -48,10 +64,15 @@ pub(super) fn jump(
     element: Syntax,
     targets: Option<&LoopTargets>,
 ) -> Result<Syntax, NatDefinitionElabError> {
+    let stop = jump_kind(element)?;
+    Ok(targets.ok_or_else(invalid)?.exit(stop))
+}
+
+pub(super) fn jump_kind(element: Syntax) -> Result<bool, NatDefinitionElabError> {
     let stop = element.kind() == Some(&parser_kind(&["Term", "doBreak"]));
     let parts = node(element, if stop { "doBreak" } else { "doContinue" }, 1)?;
     expect_atom(&parts[0], if stop { "break" } else { "continue" }, "loop control keyword")?;
-    Ok(targets.ok_or_else(invalid)?.exit(stop))
+    Ok(stop)
 }
 
 #[cfg(test)]

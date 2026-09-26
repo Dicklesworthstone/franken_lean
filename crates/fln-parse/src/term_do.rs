@@ -7,6 +7,7 @@
 //! iteration and nonlocal returns from loops remain separate elaboration work.
 use super::*;
 use term_locals::word;
+mod conditional;
 
 pub(super) struct Prefix {
     keyword: usize,
@@ -21,6 +22,7 @@ pub(super) struct Prefix {
 #[derive(Clone, Copy)]
 enum Statement {
     Action,
+    Conditional { position: BytePos },
     Return(usize),
     Jump {
         keyword: usize,
@@ -173,6 +175,12 @@ impl Prefix {
             };
             self.phase = Phase::Collection;
             *cursor = in_at + 1;
+        } else if word(tokens, at, "if") {
+            // The compound planner owns the explicit-else conditional. Its
+            // branches are reclassified as do elements after that single parse.
+            self.statement = Statement::Conditional {
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "break") || word(tokens, at, "continue") {
             // Leave the keyword on the ordinary term frame. `item` requires
             // that frame to contain exactly this original leaf, so a jump
@@ -186,10 +194,10 @@ impl Prefix {
             self.statement = Statement::Return(at);
             *cursor += 1;
         } else {
-            // These belong to doElem, not ordinary term application. In
-            // particular, parsing an if as a term would lose early-return scope.
+            // These belong to doElem, not ordinary term application. Unsupported
+            // control forms must not be laundered into calls to user declarations.
             for unsupported in [
-                "if", "match", "while", "repeat", "unless", "try", "have",
+                "match", "while", "repeat", "unless", "try", "have",
                 "let_expr",
             ] {
                 if word(tokens, at, unsupported) {
@@ -224,6 +232,7 @@ impl Prefix {
     ) -> Result<(), NatDefinitionParseError> {
         let element = match self.statement {
             Statement::Action => Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
+            Statement::Conditional { position } => conditional::element(value, position)?,
             Statement::Return(at) => Syntax::node(
                 parser_kind(&["Term", "doReturn"]),
                 vec![atom(leaves, at, "return")?, null_node(vec![value])],
