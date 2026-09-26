@@ -174,8 +174,8 @@ impl Prefix {
             // These belong to doElem, not ordinary term application. In
             // particular, parsing an if as a term would lose early-return scope.
             for unsupported in [
-                "if", "match", "while", "repeat", "unless", "try", "break", "continue",
-                "have", "let_expr",
+                "if", "match", "while", "repeat", "unless", "try", "break", "continue", "have",
+                "let_expr",
             ] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
@@ -236,12 +236,13 @@ impl Prefix {
                 }
                 let sequence = args.pop().expect("checked do sequence");
                 let do_keyword = args.pop().expect("checked do keyword");
-                let collection = self.collection.take().ok_or_else(|| {
-                    NatDefinitionParseError::OutsideSeedGrammar {
-                        at: position,
-                        expected: NatDefinitionExpectation::ScalarValue,
-                    }
-                })?;
+                let collection =
+                    self.collection
+                        .take()
+                        .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                            at: position,
+                            expected: NatDefinitionExpectation::ScalarValue,
+                        })?;
                 let declaration = Syntax::node(
                     parser_kind(&["Term", "doForDecl"]),
                     vec![
@@ -547,7 +548,8 @@ mod for_tests {
 
     #[test]
     fn collection_parentheses_protect_a_nested_do_from_the_header_delimiter() {
-        let source = "def walk : Nat := do { for x in (do { return xs }) do { visit x }; return 7 }";
+        let source =
+            "def walk : Nat := do { for x in (do { return xs }) do { visit x }; return 7 }";
         let parsed = parse_definition(source.as_ref()).expect("parenthesized collection");
         assert_eq!(kinds(&parsed.syntax, "do"), 2);
         assert_eq!(kinds(&parsed.syntax, "doFor"), 1);
