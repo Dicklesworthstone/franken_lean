@@ -776,13 +776,17 @@ pub(crate) enum NatReductionScope {
     ClosedPair,
     EagerOpenPair,
     /// A recursor is computing its discriminant, not comparing a pair, so
-    /// there is no companion to check. The discriminant itself must be
-    /// closed, as the pin's `reduce_nat` requires of every input
-    /// (`has_fvar`): an open one such as `Nat.succ (… c …)` for a local `c` is
-    /// already a constructor application or unfolds to the recursor it is
-    /// stuck on, and normalizing its operands in the hope of a literal cost
-    /// `assemble₃_eq_some_iff_utf8EncodeChar_eq` minutes of nested attempts
-    /// that all failed.
+    /// there is no companion to check. The discriminant itself must be closed,
+    /// and here the checker departs from the pin. The pin's `whnf` offers every
+    /// form to `reduce_nat` whether it is open or not (`type_checker.cpp`
+    /// `whnf` and `reduce_nat`). Its `has_fvar` guard sits only in
+    /// `lazy_delta_reduction`, which is `ClosedPair`'s. The checker declines an
+    /// open discriminant because normalizing its operands in the hope of a
+    /// literal measured as pure cost: on
+    /// `assemble₃_eq_some_iff_utf8EncodeChar_eq`, 673 of 673 attempts ended
+    /// `NotReduced`, and their nesting took minutes. Declining only ever
+    /// yields `NotReduced`, and a `Nat.succ _` discriminant still reduces by
+    /// iota.
     DemandedMajor,
 }
 

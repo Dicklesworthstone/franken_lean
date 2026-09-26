@@ -2644,9 +2644,10 @@ fn open_arithmetic_demands_do_not_turn_spent_work_into_false_progress() {
         "{outcome:?}"
     );
 }
-/// An open discriminant is not evaluated as a literal: the pin's `reduce_nat`
-/// refuses any input with a free variable, and so does the demanded lane. The
-/// major `wrap (tower x)` normalizes to `Nat.succ (tower x)`, a constructor
+/// An open discriminant is not evaluated as a literal. The pin's `reduce_nat`
+/// would try it, so this is a deliberate departure (see
+/// `NatReductionScope::DemandedMajor`). The major `wrap (tower x)` normalizes
+/// to `Nat.succ (tower x)`, a constructor
 /// application iota fires on, so the predecessor is `tower x` either way.
 /// Normalizing `tower x` first, in the hope of a literal, walks all of `tower`
 /// for nothing, and the open discriminants of
