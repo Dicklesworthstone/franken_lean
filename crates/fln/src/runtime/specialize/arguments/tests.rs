@@ -164,7 +164,7 @@ fn value_dependent_and_computed_dictionaries_are_not_erased() {
 }
 
 #[test]
-fn specialization_does_not_cross_a_strict_function_return_stage() {
+fn specialization_preserves_a_strict_function_return_stage() {
     let (type_, value) = generic();
     let ExprNode::Lam { body, .. } = value.node() else {
         panic!("runtime prefix");
@@ -184,9 +184,33 @@ fn specialization_does_not_cross_a_strict_function_return_stage() {
     let result = Preparation::new(&environment, IngressLimits::default())
         .specialize_arguments(type_.clone(), value.clone(), &[nat::literal(1), ty("Nat")])
         .unwrap();
-    assert!(result.static_arguments.is_empty());
-    assert_eq!(result.type_, type_);
-    assert_eq!(result.value, value);
+    assert_eq!(result.static_arguments, vec![(1, ty("Nat"))]);
+    assert_eq!(result.runtime_arguments, vec![nat::literal(1)]);
+    assert_eq!(
+        result.type_,
+        telescope(
+            &[
+                (ty("Nat"), BinderInfo::Default),
+                (ty("Nat"), BinderInfo::Default),
+            ],
+            ty("Nat"),
+            false,
+        )
+    );
+    assert_eq!(
+        result.value,
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::let_e(
+                name("paid"),
+                ty("Nat"),
+                Expr::app(ty("observableInitializer"), b(0)),
+                telescope(&[(ty("Nat"), BinderInfo::Default)], b(0), true),
+                false,
+            ),
+            true,
+        )
+    );
 }
 
 fn environment() -> Environment {
@@ -309,3 +333,5 @@ fn late_static_arguments_use_a_bounded_heap_telescope() {
         .join()
         .unwrap();
 }
+
+mod stages;

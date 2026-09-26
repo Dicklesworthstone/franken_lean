@@ -1,7 +1,8 @@
 //! Specialize static arguments at their actual positions in a lambda telescope.
 //!
 //! Retained values are parameters, not constants to substitute or cache. Static
-//! selection never crosses a strict let or a computed function-return stage.
+//! selection preserves strict let stages and never evaluates an initializer or
+//! a call that computes a function.
 //! The generated declarations are private compiler inputs, not logical facts.
 use super::*;
 
@@ -16,6 +17,19 @@ struct RetainedBinder {
     value_name: Name,
     value_domain: Expr,
     value_info: BinderInfo,
+}
+
+/// Type and value telescopes differ once a strict initializer occurs between
+/// application stages. Keep the value-only binders in source order; the type
+/// telescope must never gain a runtime let or have its de Bruijn indices lifted.
+enum Retained {
+    Parameter(RetainedBinder),
+    StrictLet {
+        name: Name,
+        type_: Expr,
+        value: Expr,
+        non_dep: bool,
+    },
 }
 
 struct PreparedArguments {
@@ -56,9 +70,35 @@ impl Preparation<'_> {
             else {
                 break;
             };
-            // This exposes only already inert aliases, never an initializer or
-            // a call which computes a callback. The actual lambda must exist.
-            value = self.static_head(&value)?;
+            // Recover literal callback stages without executing, substituting,
+            // duplicating, or dropping their strict initializers. Closed static
+            // arguments can be substituted under these value-only binders;
+            // ordinary runtime arguments stay outside the specialization key.
+            loop {
+                value = self.static_head(&value)?;
+                let ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value: initializer,
+                    body,
+                    non_dep,
+                } = value.node()
+                else {
+                    break;
+                };
+                self.tick()?;
+                reserve(&mut retained, self.limits.max_context_depth)?;
+                retained.push(Retained::StrictLet {
+                    name: decl_name.clone(),
+                    type_: type_.clone(),
+                    value: initializer.clone(),
+                    non_dep: *non_dep,
+                });
+                value = body.clone();
+            }
+            // A computed function result still is not a syntactic telescope.
+            // Speculatively collected lets are discarded unless a later static
+            // argument is selected, leaving the original body unchanged.
             let ExprNode::Lam {
                 binder_name: value_name,
                 binder_type: value_domain,
@@ -96,14 +136,14 @@ impl Preparation<'_> {
                 last_static = Some((type_.clone(), value.clone(), retained.len()));
             } else {
                 reserve(&mut retained, self.limits.max_context_depth)?;
-                retained.push(RetainedBinder {
+                retained.push(Retained::Parameter(RetainedBinder {
                     type_name: binder_name.clone(),
                     type_domain: binder_type.clone(),
                     type_info: *binder_info,
                     value_name: value_name.clone(),
                     value_domain: value_domain.clone(),
                     value_info: *value_info,
-                });
+                }));
                 type_ = body.clone();
                 value = value_body.clone();
             }
@@ -112,18 +152,30 @@ impl Preparation<'_> {
             retained.truncate(count);
             for binder in retained.into_iter().rev() {
                 self.tick()?;
-                type_ = Expr::forall_e(
-                    binder.type_name,
-                    binder.type_domain,
-                    type_,
-                    binder.type_info,
-                );
-                value = Expr::lam(
-                    binder.value_name,
-                    binder.value_domain,
-                    value,
-                    binder.value_info,
-                );
+                match binder {
+                    Retained::Parameter(binder) => {
+                        type_ = Expr::forall_e(
+                            binder.type_name,
+                            binder.type_domain,
+                            type_,
+                            binder.type_info,
+                        );
+                        value = Expr::lam(
+                            binder.value_name,
+                            binder.value_domain,
+                            value,
+                            binder.value_info,
+                        );
+                    }
+                    Retained::StrictLet {
+                        name,
+                        type_,
+                        value: initializer,
+                        non_dep,
+                    } => {
+                        value = Expr::let_e(name, type_, initializer, value, non_dep);
+                    }
+                }
             }
             (type_, value)
         } else {
