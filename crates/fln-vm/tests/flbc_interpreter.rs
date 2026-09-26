@@ -2546,7 +2546,7 @@ fn core_linear_ownership_drops_dead_heap_values_at_their_final_use() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/14\n",
+            "flbc-ownership/15\n",
             "function f0 mode=inserted-linear result=owned source=3 emitted=4 drops=1 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2662,7 +2662,7 @@ fn straight_line_register_reuse_releases_each_value_epoch_without_leaking() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/14\n",
+            "flbc-ownership/15\n",
             "function f0 mode=inserted-linear-reuse result=owned source=7 emitted=9 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2795,7 +2795,7 @@ fn acyclic_cfg_register_reuse_executes_both_value_epochs_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=owned source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -2893,7 +2893,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=owned source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3059,7 +3059,7 @@ fn preowned_flbc_is_checked_before_golem_and_preserves_transfer_events() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/14\n",
+            "flbc-ownership/15\n",
             "function f0 mode=validated-existing-ownership result=owned source=7 emitted=7 drops=0 moves=0 existing_drops=2 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -3256,7 +3256,7 @@ fn fir_acyclic_cfg_ownership_executes_both_edges_with_balanced_marrow() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg result=owned source=9 emitted=18 drops=5 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3397,7 +3397,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg result=owned source=8 emitted=15 drops=3 moves=0 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8868,7 +8868,7 @@ fn generated_array_ownership_transfers_exactly_and_refuses_drift_before_executio
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/14\n",
+            "flbc-ownership/15\n",
             "function f0 mode=inserted-linear result=owned source=6 emitted=8 drops=2 moves=0 redefs=0 edges=0 extern_consumes=2 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=2 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );

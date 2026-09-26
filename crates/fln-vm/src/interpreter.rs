@@ -58,6 +58,7 @@ use fln_rt::obj::Obj;
 use std::fmt;
 
 mod floats;
+mod tail_calls;
 
 /// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
 /// instruction allowance, not the Reference's allocation-linked heartbeat
@@ -1642,6 +1643,10 @@ struct Frame {
     pc: usize,
     registers: Vec<Option<Obj>>,
     return_to: Option<ReturnTo>,
+    // A non-exact tail Apply still has real result/overapplication work.
+    // Its old registers have been released; this slot receives that result
+    // and uses the ordinary checked Return path, including all continuations.
+    pending_tail_return: Option<Register>,
 }
 
 enum ReturnTo {
@@ -1949,6 +1954,7 @@ fn run(
         pc: 0,
         registers: empty_registers(entry.register_count),
         return_to: None,
+        pending_tail_return: None,
     }];
     let mut steps = 0u64;
     let mut peak_stack_depth = 1u64;
@@ -1979,6 +1985,10 @@ fn run(
                 ),
             ))
         })?;
+        let instruction = match frame.pending_tail_return {
+            Some(src) => Instruction::Return { src },
+            None => instruction,
+        };
         let cache_site = CacheSite {
             function: frame.function,
             pc: frame.pc,
@@ -2030,6 +2040,9 @@ fn run(
         }
         steps = observed_steps;
 
+        // Share all argument/closure checks with ordinary calls. Only the
+        // final dispatch differs; no tail form may bypass a checked contract.
+        let (instruction, tail) = tail_calls::ordinary_call(instruction);
         match instruction {
             Instruction::Nat { dst, value } => {
                 let value = usize::try_from(value).map_err(|_| {
@@ -2473,6 +2486,10 @@ fn run(
                     &args,
                     &argument_ownership,
                 )?;
+                if tail {
+                    tail_calls::replace_frame(program, &mut stack, function, values)?;
+                    continue;
+                }
                 advance(current_frame_mut(&mut stack)?)?;
                 let next_depth = push_call(
                     program,
@@ -2560,6 +2577,11 @@ fn run(
                 match finish_apply(plan, args, Some(argument_ownership)) {
                     PreparedApply::Partial { function, captures } => {
                         let value = make_golem_closure(program, function, captures)?;
+                        if tail {
+                            tail_calls::prepare_return(current_frame_mut(&mut stack)?, dst);
+                            set_register(current_frame_mut(&mut stack)?, dst, value)?;
+                            continue;
+                        }
                         set_register(current_frame_mut(&mut stack)?, dst, value)?;
                         advance(current_frame_mut(&mut stack)?)?;
                     }
@@ -2569,6 +2591,10 @@ fn run(
                         remainder,
                         remainder_ownership,
                     } => {
+                        if tail && remainder.is_empty() {
+                            tail_calls::replace_frame(program, &mut stack, function, args)?;
+                            continue;
+                        }
                         let return_to = if remainder.is_empty() {
                             ReturnTo::Store(dst)
                         } else {
@@ -2579,7 +2605,11 @@ fn run(
                                 result_ownership,
                             }
                         };
-                        advance(current_frame_mut(&mut stack)?)?;
+                        if tail {
+                            tail_calls::prepare_return(current_frame_mut(&mut stack)?, dst);
+                        } else {
+                            advance(current_frame_mut(&mut stack)?)?;
+                        }
                         let next_depth = push_call(
                             program,
                             &mut stack,
@@ -2592,6 +2622,12 @@ fn run(
                         peak_stack_depth = peak_stack_depth.max(next_depth);
                     }
                 }
+            }
+            Instruction::TailCall { .. } | Instruction::TailApply { .. } => {
+                return Err(Stop::InternalFault(InternalFault::new(
+                    "FLBC-TAIL-DISPATCH",
+                    "tail instruction was not normalized for checked dispatch",
+                )));
             }
             Instruction::Jump { target } => {
                 current_frame_mut(&mut stack)?.pc =
@@ -3170,6 +3206,7 @@ fn push_call(
         pc: 0,
         registers,
         return_to: Some(return_to),
+        pending_tail_return: None,
     });
     Ok(next_depth)
 }

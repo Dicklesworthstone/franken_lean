@@ -28,15 +28,16 @@ use std::fmt;
 /// version 12 adds the ABI-exact callable result class used by `Nat`, whose
 /// runtime representation may be either a tagged scalar or an owned mpz;
 /// version 13 carries canonical arbitrary-precision Nat literal limbs;
-/// version 14 adds borrowed, shape-checked constructor discrimination.
-pub const FLBC_SCHEMA_VERSION: u16 = 14;
+/// version 14 adds borrowed, shape-checked constructor discrimination;
+/// version 15 adds terminal direct and closure calls with frame ownership transfer.
+pub const FLBC_SCHEMA_VERSION: u16 = 15;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 9;
+pub const FLBC_WIRE_VERSION: u16 = 10;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -52,8 +53,9 @@ pub const FLBC_WIRE_VERSION: u16 = 9;
 /// consumes; version 12 binds borrowed-result promotions and raw-object
 /// intrinsic results; version 13 binds function, direct-call, and dynamic-Apply
 /// result ownership plus exact owned/scalar invocation counts; version 14
-/// admits cyclic CFG register reuse and binds its redefinition count.
-pub const OWNERSHIP_WITNESS_VERSION: u16 = 14;
+/// admits cyclic CFG register reuse and binds its redefinition count; version
+/// 15 recognizes terminal calls as releasing the caller's remaining handles.
+pub const OWNERSHIP_WITNESS_VERSION: u16 = 15;
 
 const FLBC_MAGIC: [u8; 8] = *b"FLNFLBC\0";
 
@@ -77,6 +79,8 @@ const OP_CHECK_SYSTEM: u8 = 16;
 const OP_CHECK_SYSTEM_VALUE: u8 = 17;
 const OP_NAT_BIG: u8 = 18;
 const OP_CTOR_TEST: u8 = 19;
+const OP_TAIL_CALL: u8 = 20;
+const OP_TAIL_APPLY: u8 = 21;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -507,6 +511,15 @@ pub enum Instruction {
         argument_ownership: Vec<ArgumentOwnership>,
         result_ownership: CallableResultOwnership,
     },
+    /// Transfer operands to a direct callee, release all remaining caller
+    /// handles, and inherit its return continuation without adding a frame.
+    /// The callee and this function must have the same result contract.
+    TailCall {
+        function: FunctionId,
+        args: Vec<Register>,
+        argument_ownership: Vec<ArgumentOwnership>,
+        result_ownership: CallableResultOwnership,
+    },
     /// Build a closure over the leading parameters of `function`. At least
     /// one parameter must remain open for later application.
     Closure {
@@ -520,6 +533,17 @@ pub enum Instruction {
     /// applies the remainder to the value returned by that call.
     Apply {
         dst: Register,
+        closure: Register,
+        args: Vec<Register>,
+        argument_ownership: Vec<ArgumentOwnership>,
+        result_ownership: CallableResultOwnership,
+    },
+    /// Return a closure application. Exact applications replace the caller's
+    /// frame. Underapplication returns a closure; overapplication retains only
+    /// the bounded continuation needed to apply the remaining operands.
+    /// All old register handles are released after argument transfer. The final
+    /// result contract must equal this function's contract.
+    TailApply {
         closure: Register,
         args: Vec<Register>,
         argument_ownership: Vec<ArgumentOwnership>,
@@ -570,9 +594,11 @@ impl Instruction {
             }
             Self::Ctor { fields, .. } => fields.clone(),
             Self::Array { items, .. } => items.clone(),
-            Self::Intrinsic { args, .. } | Self::Call { args, .. } => args.clone(),
+            Self::Intrinsic { args, .. }
+            | Self::Call { args, .. }
+            | Self::TailCall { args, .. } => args.clone(),
             Self::Closure { captures, .. } => captures.clone(),
-            Self::Apply { closure, args, .. } => {
+            Self::Apply { closure, args, .. } | Self::TailApply { closure, args, .. } => {
                 let mut reads = Vec::with_capacity(args.len() + 1);
                 reads.push(*closure);
                 reads.extend_from_slice(args);
@@ -600,6 +626,8 @@ impl Instruction {
             | Self::Closure { dst, .. }
             | Self::Apply { dst, .. } => Some(*dst),
             Self::Drop { .. }
+            | Self::TailCall { .. }
+            | Self::TailApply { .. }
             | Self::Jump { .. }
             | Self::JumpIfZero { .. }
             | Self::CheckSystem { .. }
@@ -607,6 +635,12 @@ impl Instruction {
             | Self::Return { .. }
             | Self::Panic { .. } => None,
         }
+    }
+
+    /// Unlike a normal call, this instruction owns and exits the current
+    /// register frame. Argument dispositions still govern transfer to the callee.
+    const fn exits_frame(&self) -> bool {
+        matches!(self, Self::TailCall { .. } | Self::TailApply { .. })
     }
 }
 
@@ -1310,6 +1344,12 @@ pub enum ValidationError {
         expected: CallableResultOwnership,
         actual: CallableResultOwnership,
     },
+    TailResultOwnershipContract {
+        function: FunctionId,
+        pc: Pc,
+        expected: CallableResultOwnership,
+        actual: CallableResultOwnership,
+    },
     CallConsumeAlias {
         function: FunctionId,
         pc: Pc,
@@ -1627,6 +1667,19 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 pc.get(),
                 target.get(),
+                actual.token(),
+                expected.token()
+            ),
+            Self::TailResultOwnershipContract {
+                function,
+                pc,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "function {} pc {} tail result declares {}, expected {}",
+                function.get(),
+                pc.get(),
                 actual.token(),
                 expected.token()
             ),
@@ -2232,6 +2285,30 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.registers(captures)?;
             encoder.argument_ownership(capture_ownership)
         }
+        Instruction::TailCall {
+            function,
+            args,
+            argument_ownership,
+            result_ownership,
+        } => {
+            encoder.u8(OP_TAIL_CALL)?;
+            encoder.u32(function.get())?;
+            encoder.registers(args)?;
+            encoder.argument_ownership(argument_ownership)?;
+            encoder.callable_result_ownership(*result_ownership)
+        }
+        Instruction::TailApply {
+            closure,
+            args,
+            argument_ownership,
+            result_ownership,
+        } => {
+            encoder.u8(OP_TAIL_APPLY)?;
+            encoder.register(*closure)?;
+            encoder.registers(args)?;
+            encoder.argument_ownership(argument_ownership)?;
+            encoder.callable_result_ownership(*result_ownership)
+        }
         Instruction::Apply {
             dst,
             closure,
@@ -2369,6 +2446,18 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
         }),
         OP_CHECK_SYSTEM_VALUE => Ok(Instruction::CheckSystemValue {
             module_name: decoder.register()?,
+        }),
+        OP_TAIL_CALL => Ok(Instruction::TailCall {
+            function: FunctionId::new(decoder.u32()?),
+            args: decoder.registers()?,
+            argument_ownership: decoder.argument_ownership()?,
+            result_ownership: decoder.callable_result_ownership()?,
+        }),
+        OP_TAIL_APPLY => Ok(Instruction::TailApply {
+            closure: decoder.register()?,
+            args: decoder.registers()?,
+            argument_ownership: decoder.argument_ownership()?,
+            result_ownership: decoder.callable_result_ownership()?,
         }),
         OP_RETURN => Ok(Instruction::Return {
             src: decoder.register()?,
@@ -2815,6 +2904,21 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
         if let Some(register) = instruction.written_register() {
             check_register(function, pc, register)?;
         }
+        if let Instruction::TailCall {
+            result_ownership, ..
+        }
+        | Instruction::TailApply {
+            result_ownership, ..
+        } = instruction
+            && *result_ownership != function.result_ownership
+        {
+            return Err(ValidationError::TailResultOwnershipContract {
+                function: function.id,
+                pc,
+                expected: function.result_ownership,
+                actual: *result_ownership,
+            });
+        }
         match instruction {
             Instruction::Jump { target } => check_target(function, pc, *target)?,
             Instruction::JumpIfZero { zero, nonzero, .. } => {
@@ -2827,6 +2931,12 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                 argument_ownership,
                 result_ownership,
                 ..
+            }
+            | Instruction::TailCall {
+                function: target,
+                args,
+                argument_ownership,
+                result_ownership,
             } => {
                 let Some(callee) = target.index().and_then(|i| program.functions.get(i)) else {
                     return Err(ValidationError::MissingCallTarget {
@@ -2902,6 +3012,12 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                 }
             }
             Instruction::Apply {
+                closure,
+                args,
+                argument_ownership,
+                ..
+            }
+            | Instruction::TailApply {
                 closure,
                 args,
                 argument_ownership,
@@ -3444,7 +3560,10 @@ fn validate_definite_initialization(function: &Function) -> Result<(), Validatio
                 successors[0] = zero.index();
                 successors[1] = nonzero.index();
             }
-            Instruction::Return { .. } | Instruction::Panic { .. } => {}
+            Instruction::Return { .. }
+            | Instruction::Panic { .. }
+            | Instruction::TailCall { .. }
+            | Instruction::TailApply { .. } => {}
             _ => {
                 let next = offset + 1;
                 if next == function.code.len() {
@@ -3518,7 +3637,9 @@ fn ownership_reads<E>(
                 visit(*register)?;
             }
         }
-        Instruction::Intrinsic { args, .. } | Instruction::Call { args, .. } => {
+        Instruction::Intrinsic { args, .. }
+        | Instruction::Call { args, .. }
+        | Instruction::TailCall { args, .. } => {
             for register in args {
                 visit(*register)?;
             }
@@ -3528,7 +3649,7 @@ fn ownership_reads<E>(
                 visit(*register)?;
             }
         }
-        Instruction::Apply { closure, args, .. } => {
+        Instruction::Apply { closure, args, .. } | Instruction::TailApply { closure, args, .. } => {
             visit(*closure)?;
             for register in args {
                 visit(*register)?;
@@ -3556,7 +3677,17 @@ fn ownership_consumes<E>(
             argument_ownership,
             ..
         }
+        | Instruction::TailCall {
+            args,
+            argument_ownership,
+            ..
+        }
         | Instruction::Apply {
+            args,
+            argument_ownership,
+            ..
+        }
+        | Instruction::TailApply {
             args,
             argument_ownership,
             ..
@@ -3608,6 +3739,9 @@ fn consumed_call_argument_count(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::Call {
             argument_ownership, ..
+        }
+        | Instruction::TailCall {
+            argument_ownership, ..
         } => argument_ownership
             .iter()
             .filter(|disposition| disposition.consumes())
@@ -3631,6 +3765,9 @@ fn consumed_closure_capture_count(instruction: &Instruction) -> usize {
 fn consumed_apply_argument_count(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::Apply {
+            argument_ownership, ..
+        }
+        | Instruction::TailApply {
             argument_ownership, ..
         } => argument_ownership
             .iter()
@@ -3671,6 +3808,14 @@ fn owned_callable_result_count(instruction: &Instruction) -> usize {
             result_ownership: CallableResultOwnership::Owned
                 | CallableResultOwnership::OwnedOrScalar,
             ..
+        } | Instruction::TailCall {
+            result_ownership: CallableResultOwnership::Owned
+                | CallableResultOwnership::OwnedOrScalar,
+            ..
+        } | Instruction::TailApply {
+            result_ownership: CallableResultOwnership::Owned
+                | CallableResultOwnership::OwnedOrScalar,
+            ..
         }
     ))
 }
@@ -3682,6 +3827,12 @@ fn scalar_callable_result_count(instruction: &Instruction) -> usize {
             result_ownership: CallableResultOwnership::Scalar,
             ..
         } | Instruction::Apply {
+            result_ownership: CallableResultOwnership::Scalar,
+            ..
+        } | Instruction::TailCall {
+            result_ownership: CallableResultOwnership::Scalar,
+            ..
+        } | Instruction::TailApply {
             result_ownership: CallableResultOwnership::Scalar,
             ..
         }
@@ -3718,6 +3869,11 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
             args,
             argument_ownership,
             ..
+        }
+        | Instruction::TailCall {
+            args,
+            argument_ownership,
+            ..
         } => args
             .len()
             .saturating_add(argument_ownership.len())
@@ -3728,6 +3884,11 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
             ..
         } => captures.len().saturating_add(capture_ownership.len()),
         Instruction::Apply {
+            args,
+            argument_ownership,
+            ..
+        }
+        | Instruction::TailApply {
             args,
             argument_ownership,
             ..
@@ -3747,7 +3908,10 @@ fn ownership_operand_total(function: &Function) -> usize {
 
 fn ownership_cfg_edge_count(instruction: &Instruction) -> usize {
     match instruction {
-        Instruction::Return { .. } | Instruction::Panic { .. } => 0,
+        Instruction::Return { .. }
+        | Instruction::Panic { .. }
+        | Instruction::TailCall { .. }
+        | Instruction::TailApply { .. } => 0,
         Instruction::JumpIfZero { .. } => 2,
         _ => 1,
     }
@@ -3768,8 +3932,10 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::CtorTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
+        | Instruction::TailCall { .. }
         | Instruction::Closure { .. }
         | Instruction::Apply { .. }
+        | Instruction::TailApply { .. }
         | Instruction::Jump { .. }
         | Instruction::JumpIfZero { .. }
         | Instruction::CheckSystemValue { .. }
@@ -4039,6 +4205,34 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             )?,
             result_ownership: *result_ownership,
         },
+        Instruction::TailCall {
+            function,
+            args,
+            argument_ownership,
+            result_ownership,
+        } => Instruction::TailCall {
+            function: *function,
+            args: ownership_clone_copy(args, OwnershipResource::Operands)?,
+            argument_ownership: ownership_clone_copy(
+                argument_ownership,
+                OwnershipResource::Operands,
+            )?,
+            result_ownership: *result_ownership,
+        },
+        Instruction::TailApply {
+            closure,
+            args,
+            argument_ownership,
+            result_ownership,
+        } => Instruction::TailApply {
+            closure: *closure,
+            args: ownership_clone_copy(args, OwnershipResource::Operands)?,
+            argument_ownership: ownership_clone_copy(
+                argument_ownership,
+                OwnershipResource::Operands,
+            )?,
+            result_ownership: *result_ownership,
+        },
         Instruction::Jump { target } => Instruction::Jump { target: *target },
         Instruction::JumpIfZero {
             cond,
@@ -4071,7 +4265,10 @@ fn ownership_successors(function: &Function, offset: usize) -> [Option<usize>; 2
     match &function.code[offset] {
         Instruction::Jump { target } => [target.index(), None],
         Instruction::JumpIfZero { zero, nonzero, .. } => [zero.index(), nonzero.index()],
-        Instruction::Return { .. } | Instruction::Panic { .. } => [None, None],
+        Instruction::Return { .. }
+        | Instruction::Panic { .. }
+        | Instruction::TailCall { .. }
+        | Instruction::TailApply { .. } => [None, None],
         _ => [offset.checked_add(1), None],
     }
 }
@@ -4589,6 +4786,12 @@ fn insert_linear_function(
             }
             live[dst.index()] = true;
             inferred_moves = inferred_moves.saturating_add(1);
+        } else if instruction.exits_frame() {
+            // Terminal calls transfer their operands before releasing the
+            // entire old frame. No post-call drop can be emitted on this edge.
+            live.fill(false);
+            current_epoch.fill(None);
+            continue;
         } else if let Some(terminal) = ownership_terminal(instruction) {
             if !live[terminal.index()] {
                 return Err(OwnershipError::OwnershipState {
@@ -5482,7 +5685,9 @@ fn validate_linear_candidate(
     source
         .code
         .last()
-        .and_then(ownership_terminal)
+        .filter(|instruction| {
+            instruction.exits_frame() || ownership_terminal(instruction).is_some()
+        })
         .ok_or(OwnershipError::SkeletonMismatch {
             function: source.id,
             source_instruction: source.code.len().saturating_sub(1),
@@ -5586,6 +5791,9 @@ fn validate_linear_candidate(
             }
             live[dst.index()] = true;
             inferred_moves = inferred_moves.saturating_add(1);
+        } else if source_instruction.exits_frame() {
+            live.fill(false);
+            current_epochs.fill(None);
         } else if let Some(transferred) = ownership_terminal(source_instruction) {
             live[transferred.index()] = false;
         } else if let Some(dst) = source_instruction.written_register() {
@@ -5603,7 +5811,7 @@ fn validate_linear_candidate(
             next_epoch = next_epoch.saturating_add(1);
         }
         candidate_cursor = candidate_cursor.saturating_add(1);
-        if ownership_terminal(source_instruction).is_none() {
+        if ownership_terminal(source_instruction).is_none() && !source_instruction.exits_frame() {
             drops = drops.saturating_add(schedule.validate_stage(
                 source_offset.saturating_add(1),
                 &current_epochs,
@@ -6251,6 +6459,12 @@ fn validate_ownership_state(
             Instruction::Drop { src } => state[src.index()] = false,
             Instruction::Return { src } => state[src.index()] = false,
             Instruction::Panic { message } => state[message.index()] = false,
+            Instruction::TailCall { .. } | Instruction::TailApply { .. } => {
+                // The VM transfers checked arguments and destroys the old
+                // register frame. This is the terminal instruction's contract,
+                // not permission for an ordinary call/return to leak handles.
+                state.fill(false);
+            }
             _ => {
                 if let Some(dst) = instruction.written_register() {
                     if state[dst.index()] {
@@ -7070,7 +7284,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=8 emitted=16 drops=4 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7270,7 +7484,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=5 emitted=8 drops=1 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7332,7 +7546,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=6 emitted=12 drops=4 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7476,7 +7690,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=13 drops=3 moves=0 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-cyclic-cfg result=scalar source=1 emitted=2 drops=0 moves=0 redefs=0 edges=1 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -7609,7 +7823,7 @@ mod codec_tests {
         assert_eq!(
             backedge_inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=14 drops=4 moves=1 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7942,7 +8156,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-linear result=scalar source=5 emitted=7 drops=2 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear result=scalar source=2 emitted=3 drops=1 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=inserted-acyclic-cfg result=scalar source=3 emitted=5 drops=0 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -8097,7 +8311,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear-reuse result=scalar source=6 emitted=8 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8264,7 +8478,7 @@ mod codec_tests {
         assert_eq!(
             preserved.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=preserved-non-ssa result=scalar source=3 emitted=3 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8330,7 +8544,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=scalar source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8533,7 +8747,7 @@ mod codec_tests {
         assert_eq!(
             entry_owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-acyclic-cfg-reuse result=scalar source=6 emitted=12 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8599,7 +8813,7 @@ mod codec_tests {
         assert_eq!(
             inserted_cycle.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=5 emitted=9 drops=1 moves=0 redefs=1 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8650,7 +8864,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8944,7 +9158,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=validated-existing-ownership result=scalar source=4 emitted=4 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -9466,7 +9680,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/14\n",
+                "flbc-ownership/15\n",
                 "function f0 mode=inserted-linear result=scalar source=4 emitted=5 drops=1 moves=0 redefs=0 edges=0 extern_consumes=1 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -11306,8 +11520,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                9, 0, // wire version
-                14, 0, // schema version
+                10, 0, // wire version: terminal call opcodes 20 and 21
+                15, 0, // schema version: terminal frame ownership transfer
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
