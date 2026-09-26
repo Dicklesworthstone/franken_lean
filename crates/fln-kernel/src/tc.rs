@@ -1697,6 +1697,10 @@ pub(crate) struct TypeChecker<'a> {
     instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
     recursor_major_cache: RecursorMajorCache,
+    /// Set by `whnf_recursor_chain` around its own whnf: the local depth at
+    /// which a recursor it meets is handed back as `Stop::DeferredRecursor`,
+    /// so its major is normalized on the chain's explicit stack. `is_def_eq`
+    /// clears it for the comparison it runs.
     defer_recursor_major: Option<usize>,
     /// Query-local counterpart of the pin's `m_eager_reduce`. Only the
     /// domain comparison for an `eagerReduce _ _` argument may reduce open
@@ -3697,7 +3701,18 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn is_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        // A comparison is a judgment of its own, not a step of the reduction
+        // that started it, so a recursor chain's deferral does not reach into
+        // it. The chain replays its whnf once a deferred major is normalized
+        // and relies on the whnf caches to answer that recursor the second
+        // time; lazy delta's cheap `whnf_core` consults no cache, so a
+        // recursor met inside a comparison deferred again on every replay.
+        // `Raw₀.Const.get_eq_getValue` retried one stuck `List.rec` until the
+        // budget ran out. A recursor met here starts its own chain instead,
+        // as it does outside any chain.
+        let deferral = self.defer_recursor_major.take();
         let result = self.is_def_eq_core(t, s, depth);
+        self.defer_recursor_major = deferral;
         if matches!(result, Ok(true)) {
             self.positive_def_eq_cache.insert(
                 t.clone(),

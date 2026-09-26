@@ -8546,6 +8546,220 @@ fn kr316_a_recursor_under_a_binder_is_not_deferred_to_an_enclosing_chain() {
     );
 }
 
+/// A comparison that a recursor chain's whnf starts is its own judgment, and
+/// the chain's deferral stops at it even at the chain's own depth.
+/// `outer := E.rec M E.a E.b wrapQ` starts a chain on `wrapQ`, whose whnf
+/// unfolds to `Q.rec M' E.b g h` for a K-like `Q : E → Prop` with
+/// `Q.mk : Q (S.mk E.a).1`, and `h : Q g` for `g := (E.rec M'' (S.mk E.a)
+/// (S.mk E.b) z).1`, stuck. K conversion compares `Q g` with `Q (S.mk E.a).1`,
+/// so two projections at one index, which defeq reduces with its cheap whnf;
+/// that whnf consults no cache, and it meets the recursor in `g`'s scrutinee.
+/// With the deferral reaching into the comparison, the chain normalized that
+/// major, found the recursor stuck, cached it, replayed its whnf, and met the
+/// same deferral again: the retry never ended. `Raw₀.Const.get_eq_getValue`
+/// and `Vector.swap_swap` exhausted their budgets this way. Here `z` is
+/// opaque, so K conversion fails, both recursors stay stuck, and the
+/// comparison must end in `NotDefEq` well inside a small budget.
+#[test]
+fn kr316_a_recursor_met_by_a_comparison_is_not_deferred_to_an_enclosing_chain() {
+    let env = add_enum_e(&Environment::new());
+    let e = || Expr::const_(n("E"), vec![]);
+    let e_a = || Expr::const_(nn("E", "a"), vec![]);
+    let e_b = || Expr::const_(nn("E", "b"), vec![]);
+    let bv = |i| Expr::bvar(i).expect("packs");
+    let env = add_structure(&env, "S", "S.mk", sort1(), &[e()]);
+    let s_ty = || Expr::const_(n("S"), vec![]);
+    let s_mk = |field: Expr| Expr::app(Expr::const_(n("S.mk"), vec![]), field);
+    let e_rec = |motive_result: Expr, a: Expr, b: Expr, major: Expr| {
+        let mut app = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+        for arg in [
+            Expr::lam(n("_"), e(), motive_result, BinderInfo::Default),
+            a,
+            b,
+            major,
+        ] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let q = || Expr::const_(n("Q"), vec![]);
+    let q_index = Expr::proj(n("S"), 0, s_mk(e_a()));
+    let env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: n("Q"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("x"), e(), prop(), BinderInfo::Default),
+            },
+            num_params: 0,
+            num_indices: 1,
+            all: vec![n("Q")],
+            ctors: vec![nn("Q", "mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("Q", "mk"),
+                level_params: vec![],
+                type_: Expr::app(q(), q_index.clone()),
+            },
+            induct: n("Q"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        }),
+    );
+    // ∀ (motive : ∀ x, Q x → Sort u) (c : motive (S.mk E.a).1 Q.mk) (x) (h : Q x), motive x h
+    let u = n("u");
+    let motive_ty = Expr::forall_e(
+        n("x"),
+        e(),
+        Expr::forall_e(
+            n("h"),
+            Expr::app(q(), bv(0)),
+            Expr::sort(Level::param(u.clone())),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let minor_ty = || {
+        Expr::app(
+            Expr::app(bv(0), q_index.clone()),
+            Expr::const_(nn("Q", "mk"), vec![]),
+        )
+    };
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("c"),
+            minor_ty(),
+            Expr::forall_e(
+                n("x"),
+                e(),
+                Expr::forall_e(
+                    n("h"),
+                    Expr::app(q(), bv(0)),
+                    Expr::app(Expr::app(bv(3), bv(1)), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(n("c"), minor_ty(), bv(0), BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("Q", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![n("Q")],
+            num_params: 0,
+            num_indices: 1,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("Q", "mk"),
+                nfields: 0,
+                rhs,
+            }],
+            k: true,
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("z"),
+                level_params: vec![],
+                type_: e(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let g = Expr::proj(
+        n("S"),
+        0,
+        e_rec(
+            s_ty(),
+            s_mk(e_a()),
+            s_mk(e_b()),
+            Expr::const_(n("z"), vec![]),
+        ),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("h"),
+                level_params: vec![],
+                type_: Expr::app(q(), g.clone()),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut q_rec = Expr::const_(nn("Q", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::lam(
+            n("x"),
+            e(),
+            Expr::lam(n("h"), Expr::app(q(), bv(0)), e(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        e_b(),
+        g,
+        Expr::const_(n("h"), vec![]),
+    ] {
+        q_rec = Expr::app(q_rec, arg);
+    }
+    let env = add_info(
+        &env,
+        ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("wrapQ"),
+                level_params: vec![],
+                type_: e(),
+            },
+            value: q_rec,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![n("wrapQ")],
+        }),
+    );
+    let outer = e_rec(e(), e_a(), e_b(), Expr::const_(n("wrapQ"), vec![]));
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &outer,
+        &e_a(),
+        Budget::DEFAULT.narrowed(100_000, 64),
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "a recursor met by the K check's comparison must start its own chain: {verdict:?}"
+    );
+}
+
 /// KR-307 under KR-973: an unsafe declaration unfolds the unsafe definitions
 /// it may reference, as the pin's `is_delta` does for any definition.
 /// `mkBox : Box := n₀` for an unsafe `Box : Type := N` needs `Box` unfolded to
