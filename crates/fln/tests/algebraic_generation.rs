@@ -216,27 +216,39 @@ fn correlated_function_universes_reach_both_checkers_and_source_reduction() {
     let u = Level::param(name("u"));
     let v = Level::param(name("v"));
     let correlated = Level::imax(u.clone(), v.clone()).unwrap();
-    let bounds = [
-        correlated.clone().succ().unwrap(),
-        Level::max(correlated, Level::one()).unwrap(),
+    let e = admit(&function_box(
+        Level::max(correlated.clone(), Level::one()).unwrap(),
+    ));
+    assert!(e.environment().find(&name("FunctionBox.mk")).is_some());
+    let info = e.environment().find(&name("FunctionBox.rec")).unwrap();
+    let fln_env::constants::ConstantInfo::Rec(rec) = info else {
+        panic!("independently admitted recursor metadata");
+    };
+    assert_eq!(rec.rules.len(), 1);
+    assert_eq!(rec.rules[0].nfields, 1);
+    proof(
+        &e,
+        "def boxedIdentity : FunctionBox Nat Nat := @FunctionBox.mk Nat Nat (fun x => x)",
+    );
+    proof(
+        &e,
+        "theorem read_box : @FunctionBox.rec Nat Nat (fun _ => Nat) (fun f => f 7) (@FunctionBox.mk Nat Nat (fun x => x)) = 7 := by rfl",
+    );
+    // Both bounds are at least `imax u v` for every `u` and `v`, but the pin's
+    // KR-604 check is its syntactic `is_geq`, which proves neither: the pinned
+    // kernel's `addDeclCore` refuses both with "universe level of
+    // type_of(arg #3) of 'FunctionBox.mk' is too big". K1 answers as the pin
+    // does, so the council must refuse them too.
+    for bound in [
+        correlated.succ().unwrap(),
         Level::imax(u.succ().unwrap(), v).unwrap().succ().unwrap(),
-    ];
-    for bound in bounds {
-        let e = admit(&function_box(bound));
-        assert!(e.environment().find(&name("FunctionBox.mk")).is_some());
-        let info = e.environment().find(&name("FunctionBox.rec")).unwrap();
-        let fln_env::constants::ConstantInfo::Rec(rec) = info else {
-            panic!("independently admitted recursor metadata");
-        };
-        assert_eq!(rec.rules.len(), 1);
-        assert_eq!(rec.rules[0].nfields, 1);
-        proof(
-            &e,
-            "def boxedIdentity : FunctionBox Nat Nat := @FunctionBox.mk Nat Nat (fun x => x)",
-        );
-        proof(
-            &e,
-            "theorem read_box : @FunctionBox.rec Nat Nat (fun _ => Nat) (fun f => f 7) (@FunctionBox.mk Nat Nat (fun x => x)) = 7 := by rfl",
+    ] {
+        let declaration =
+            inductive_declaration(&function_box(bound), RecordBudget::default()).unwrap();
+        let refused = engine().admit_declarations(&[declaration], &KVMap::new(), limits());
+        assert!(
+            !matches!(refused, Ok(Outcome::Complete(_))),
+            "a bound the pin refuses was admitted: {refused:?}"
         );
     }
 }
@@ -244,7 +256,7 @@ fn correlated_function_universes_reach_both_checkers_and_source_reduction() {
 #[test]
 fn correlated_function_universes_keep_the_zero_codomain_case() {
     let correlated = Level::imax(Level::param(name("u")), Level::param(name("v"))).unwrap();
-    let e = admit(&function_box(correlated.succ().unwrap()));
+    let e = admit(&function_box(Level::max(correlated, Level::one()).unwrap()));
     // True : Sort 0, so Nat -> True is a proof even though Nat : Sort 1.
     // The surrounding FunctionBox remains data and may eliminate into Nat.
     proof(
@@ -272,7 +284,7 @@ fn oversized_function_universes_cannot_publish_and_valid_retry_is_deterministic(
     }
 
     let correlated = Level::imax(Level::param(name("u")), Level::param(name("v"))).unwrap();
-    let valid = function_box(correlated.succ().unwrap());
+    let valid = function_box(Level::max(correlated, Level::one()).unwrap());
     let declaration = inductive_declaration(&valid, RecordBudget::default()).unwrap();
     let retried = e
         .admit_declarations(&[declaration], &KVMap::new(), limits())
