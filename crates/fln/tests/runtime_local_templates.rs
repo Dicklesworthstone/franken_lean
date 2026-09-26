@@ -81,13 +81,32 @@ fn generic_local_helpers_capture_runtime_values_and_owned_strings() {
     );
 }
 
+#[test]
+fn consuming_string_arguments_preserve_the_original_and_its_aliases() {
+    execute(
+        "def run (suffix : String) : Nat := let doubled : String := suffix ++ suffix; String.length (suffix ++ doubled)\n#eval run \"abc\"",
+        "9",
+    );
+    execute(
+        "def run (suffix : String) : Nat := let alias : String := suffix; let appended : String := suffix ++ \"d\"; String.length alias + String.length appended\n#eval run \"abc\"",
+        "7",
+    );
+    execute(
+        "#eval let suffix : String := \"abc\"; String.length ((suffix ++ suffix) ++ (suffix ++ suffix))",
+        "12",
+    );
+}
+
 const APPLY: &str = "def applyBoth (f : Nat -> Nat -> Nat) (a b : Nat) : Nat := f a b\n";
-const SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
+const SPEND: &str =
+    "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
 fn named_staged_helpers_and_aliases_reach_known_callback_specialization() {
     execute(
-        &format!("{APPLY}def run (delta : Nat) : Nat := let stage (x : Nat) : Nat -> Nat := let saved : Nat := delta + x; fun (y : Nat) => saved + y; let alias : Nat -> Nat -> Nat := stage; applyBoth alias 20 16\n#eval run 6"),
+        &format!(
+            "{APPLY}def run (delta : Nat) : Nat := let stage (x : Nat) : Nat -> Nat := let saved : Nat := delta + x; fun (y : Nat) => saved + y; let alias : Nat -> Nat -> Nat := stage; applyBoth alias 20 16\n#eval run 6"
+        ),
         "42",
     );
     execute(
@@ -98,8 +117,14 @@ fn named_staged_helpers_and_aliases_reach_known_callback_specialization() {
 
 #[test]
 fn unused_callback_results_still_run_their_required_first_stage() {
-    let definitions = format!("{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n");
-    let program = |cost| format!("{definitions}#eval let stage (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (y : Nat) => y; ignorePartial stage {cost}");
+    let definitions = format!(
+        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n"
+    );
+    let program = |cost| {
+        format!(
+            "{definitions}#eval let stage (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (y : Nat) => y; ignorePartial stage {cost}"
+        )
+    };
     let idle = execute(&program(0), "42");
     let busy = execute(&program(30), "42");
     assert!(

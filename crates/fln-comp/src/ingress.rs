@@ -1513,6 +1513,39 @@ fn coerce_abi_boundary(
     emit_binding(bindings, parameter_count, expected, operation, limits).map(Some)
 }
 
+/// A source local denotes a reusable value, even when its current ABI use
+/// transfers ownership. Give an owned call operand a separate reference when
+/// the original register still belongs to the lexical context. FLBC's ordinary
+/// Copy semantics retain that reference; its initialization/ownership validators
+/// remain unchanged. Unique arguments require their own exclusivity proof and
+/// are deliberately not made shared here.
+fn retain_source_arguments(
+    arguments: &mut [CompiledValue],
+    ownership: &[crate::flbc::ArgumentOwnership],
+    context: &CompiledContext,
+    bindings: &mut Vec<fir::Binding>,
+    parameter_count: usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    for (argument, disposition) in arguments.iter_mut().zip(ownership) {
+        if *disposition == crate::flbc::ArgumentOwnership::Owned
+            && context
+                .iter()
+                .flatten()
+                .any(|local| local.id == argument.id)
+        {
+            *argument = emit_binding(
+                bindings,
+                parameter_count,
+                argument.ty,
+                fir::Operation::Alias(argument.id),
+                limits,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn emit_literal(
     literal: &Literal,
     bindings: &mut Vec<fir::Binding>,
@@ -4152,6 +4185,24 @@ fn lower_body<'a>(
                     };
                     arguments[argument] = coerced;
                 }
+                let ownership = match target {
+                    CallTarget::Intrinsic(index) => catalog.entries[index]
+                        .declaration
+                        .argument_ownership
+                        .as_slice(),
+                    CallTarget::Function(index) => {
+                        catalog.functions[index].parameter_ownership.as_slice()
+                    }
+                    _ => &[],
+                };
+                retain_source_arguments(
+                    &mut arguments,
+                    ownership,
+                    &context,
+                    &mut bindings,
+                    parameter_count,
+                    limits,
+                )?;
                 let mut argument_ids = Vec::new();
                 argument_ids
                     .try_reserve_exact(argument_count)
@@ -4343,6 +4394,14 @@ fn lower_body<'a>(
                         });
                     }
                 };
+                retain_source_arguments(
+                    &mut arguments,
+                    &argument_ownership,
+                    &context,
+                    &mut bindings,
+                    parameter_count,
+                    limits,
+                )?;
                 let mut argument_ids = Vec::new();
                 argument_ids
                     .try_reserve_exact(argument_count)
@@ -5651,6 +5710,87 @@ mod tests {
     }
 
     #[test]
+    fn consuming_intrinsics_retain_source_values_used_by_later_calls() {
+        let suffix = Expr::bvar(0).unwrap();
+        let append = || direct_call(&["String", "append"], [suffix.clone(), suffix.clone()]);
+        let source = Expr::let_e(
+            Name::from_components(["suffix"]),
+            Expr::const_(Name::from_components(["String"]), Vec::new()),
+            string("abc"),
+            direct_call(&["String", "append"], [append(), append()]),
+            false,
+        );
+        let ingress =
+            lower_closed_expr_with_intrinsics(&source, &pure_catalog(), IngressLimits::default())
+                .expect("ordinary shared source value is valid FIR");
+        let lowered = fir::lower_to_flbc(ingress.fir())
+            .expect("an owned intrinsic argument must not consume the retained source binding");
+        let encoded = encode_canonical(&lowered, CodecLimits::default()).unwrap();
+        crate::flbc::decode_canonical(&encoded, CodecLimits::default())
+            .expect("persisted bytecode preserves independent initialization validation");
+    }
+
+    #[test]
+    fn repeated_owned_arguments_to_functions_and_closures_have_distinct_references() {
+        let body = direct_call(
+            &["String", "append"],
+            [Expr::bvar(1).unwrap(), Expr::bvar(0).unwrap()],
+        );
+        let mut join = function_binding(
+            &["User", "join"],
+            vec![fir::ValueType::String; 2],
+            fir::ValueType::String,
+            body.clone(),
+        );
+        join.parameter_ownership = vec![crate::flbc::ArgumentOwnership::Owned; 2];
+        let closure = named_lambda("first", named_lambda("second", body));
+        let mut annotation = lambda_binding(
+            &closure,
+            vec![fir::ValueType::String; 2],
+            fir::ValueType::String,
+        );
+        annotation.parameter_ownership = join.parameter_ownership.clone();
+        let shared = Expr::bvar(0).unwrap();
+        let direct = direct_call(&["User", "join"], [shared.clone(), shared.clone()]);
+        let applied = Expr::app(Expr::app(closure, shared.clone()), shared);
+
+        for (call, annotations) in [(direct, Vec::new()), (applied, vec![annotation])] {
+            let source = Expr::let_e(
+                Name::from_components(["shared"]),
+                ignored_type(),
+                string("abc"),
+                call,
+                false,
+            );
+            let ingress = lower_closed_expr_with_lambdas(
+                &source,
+                &[string_append_binding()],
+                &[],
+                std::slice::from_ref(&join),
+                &annotations,
+                IngressLimits::default(),
+            )
+            .expect("both owned arguments retain the same source binding independently");
+            let lowered = fir::lower_to_flbc(ingress.fir())
+                .expect("call operands no longer alias the same consumed register");
+            assert_eq!(
+                lowered.functions()[0]
+                    .code
+                    .iter()
+                    .filter(|instruction| {
+                        matches!(instruction, crate::flbc::Instruction::Copy { .. })
+                    })
+                    .count(),
+                2,
+                "the call receives one retained reference for each owned argument",
+            );
+            let encoded = encode_canonical(&lowered, CodecLimits::default()).unwrap();
+            crate::flbc::decode_canonical(&encoded, CodecLimits::default())
+                .expect("independent ownership validation survives canonical replay");
+        }
+    }
+
+    #[test]
     fn constructor_catalog_is_typed_canonical_and_lowers_to_abi_shape() {
         let source = direct_call(&["User", "Pair", "mk"], [nat(42), string("answer")]);
         let unused = constructor_binding(&["User", "Empty", "mk"], 3, Vec::new(), Vec::new());
@@ -6622,7 +6762,7 @@ mod tests {
         assert!(text.contains(
             "function f1 params=[string,string] ownership=[owned,borrowed] result=string"
         ));
-        assert!(text.contains("v2:string = intrinsic i0 [v0,v1]"));
+        assert!(text.contains("v2:string = alias v0\n  v3:string = intrinsic i0 [v2,v1]"));
         assert!(text.contains("v2:string = call f1 [v0,v1]"));
         let lowered = fir::lower_to_flbc(ingress.fir()).expect("owned direct call lowers");
         assert_eq!(
@@ -6933,7 +7073,7 @@ mod tests {
                 generated_closure_types: 1,
                 generated_functions: 2,
                 function_parameters: 2,
-                generated_values: 5,
+                generated_values: 6,
                 literal_bytes: 6,
                 maximum_context_depth: 2,
             }
@@ -6953,8 +7093,9 @@ mod tests {
                 "  return v3\n",
                 "function f1 params=[string,string] ownership=[borrowed,borrowed] result=string result_ownership=owned\n",
                 " block b0\n",
-                "  v2:string = intrinsic i0 [v1,v0]\n",
-                "  return v2\n",
+                "  v2:string = alias v1\n",
+                "  v3:string = intrinsic i0 [v2,v0]\n",
+                "  return v3\n",
             )
         );
         let lowered = fir::lower_to_flbc(ingress.fir()).expect("checked closure lowering");
@@ -7021,7 +7162,7 @@ mod tests {
         assert_eq!(ingress.work().elided_capture_slots, 1);
         assert_eq!(ingress.work().function_parameters, 2);
         assert_eq!(ingress.work().maximum_context_depth, 4);
-        assert_eq!(ingress.work().generated_values, 7);
+        assert_eq!(ingress.work().generated_values, 8);
         assert!(ingress.fir().canonical_text().contains(
             "function f1 params=[string,string] ownership=[borrowed,borrowed] result=string",
         ));
@@ -7029,7 +7170,7 @@ mod tests {
             ingress
                 .fir()
                 .canonical_text()
-                .contains("v3:string = intrinsic i0 [v1,v0]")
+                .contains("v3:string = alias v1\n  v4:string = intrinsic i0 [v3,v0]")
         );
 
         let lowered = fir::lower_to_flbc(ingress.fir()).expect("checked minimal-capture lowering");
@@ -7090,7 +7231,7 @@ mod tests {
         assert_eq!(ingress.work().generated_closure_types, 2);
         assert_eq!(ingress.work().generated_functions, 3);
         assert_eq!(ingress.work().function_parameters, 4);
-        assert_eq!(ingress.work().generated_values, 8);
+        assert_eq!(ingress.work().generated_values, 9);
         assert_eq!(ingress.work().maximum_context_depth, 3);
 
         let lowered = fir::lower_to_flbc(ingress.fir()).expect("checked nested-closure lowering");

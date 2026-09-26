@@ -2215,6 +2215,89 @@ fn core_expr_ingress_reaches_canonical_flbc_and_golem_without_host_evaluation() 
 }
 
 #[test]
+fn core_expr_shared_owned_string_operands_survive_canonical_vm_replay() {
+    let _guard = lock();
+    let append_name = Name::from_components(["String", "append"]);
+    let append = |left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(append_name.clone(), Vec::new()), left),
+            right,
+        )
+    };
+    let string_type = || Expr::const_(Name::from_components(["String"]), Vec::new());
+    let bound = |index| Expr::bvar(index).expect("small de Bruijn index");
+    let source_shared = Expr::let_e(
+        Name::from_components(["s"]),
+        string_type(),
+        Expr::lit(Literal::Str("abc".to_string())),
+        append(append(bound(0), bound(0)), append(bound(0), bound(0))),
+        false,
+    );
+    let source_cow = Expr::let_e(
+        Name::from_components(["s"]),
+        string_type(),
+        Expr::lit(Literal::Str("abc".to_string())),
+        Expr::let_e(
+            Name::from_components(["extended"]),
+            string_type(),
+            append(bound(0), Expr::lit(Literal::Str("!".to_string()))),
+            // The original s is still "abc" after extending its owned alias.
+            append(bound(1), bound(0)),
+            false,
+        ),
+        false,
+    );
+    let binding = ingress::IntrinsicBinding {
+        name: append_name,
+        universe_arity: 0,
+        row: "extern:String.append".to_string(),
+        argument_ownership: contract_argument_ownership("extern:String.append", 2),
+        result_ownership: contract_result_ownership("extern:String.append"),
+        arguments: vec![fir::ValueType::String, fir::ValueType::String],
+        result: fir::ValueType::String,
+        effect: fir::EffectClass::Pure,
+    };
+
+    shadow::enable();
+    for (source, expected) in [(source_shared, "abcabcabcabc"), (source_cow, "abcabc!")] {
+        let ingress = ingress::lower_closed_expr_with_intrinsics(
+            &source,
+            std::slice::from_ref(&binding),
+            ingress::IngressLimits::default(),
+        )
+        .expect("source aliases across owned String.append operands enter valid FIR");
+        let lowered = fir::lower_to_flbc(ingress.fir())
+            .expect("shared source values lower through ordinary FIR");
+        let owned = fir::lower_to_flbc_with_ownership(ingress.fir(), OwnershipLimits::default())
+            .expect("ownership insertion retains live aliases before consuming operands");
+        for program in [&lowered, owned.program()] {
+            let bytes = encode_canonical(program, CodecLimits::default())
+                .expect("shared string operands serialize to canonical FLBC");
+            let decoded = decode_canonical(&bytes, CodecLimits::default())
+                .expect("replayed ownership graph passes independent FLBC validation");
+            assert_eq!(
+                encode_canonical(&decoded, CodecLimits::default()).unwrap(),
+                bytes
+            );
+            let completed = returned(execute(program, ExecutionLimits::default(), None));
+            let replayed = returned(execute(&decoded, ExecutionLimits::default(), None));
+            assert_eq!(string_contents(&completed.value), expected);
+            assert_eq!(string_contents(&replayed.value), expected);
+            assert_eq!(replayed.usage, completed.usage);
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "shared owned string operands and canonical replays retain no ABI object"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
 fn core_check_system_expr_reaches_static_and_computed_golem_checkpoints() {
     let _guard = lock();
     let source = Expr::app(
