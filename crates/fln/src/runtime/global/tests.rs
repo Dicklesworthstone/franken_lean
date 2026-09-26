@@ -95,7 +95,7 @@ fn trailing_arguments_follow_the_producer_and_cross_all_new_binders() {
                 Name::anonymous(),
                 ty(),
                 app("after", [b(3)]),
-                Expr::app(b(1), b(0)),
+                annotation(ty(), Expr::app(b(1), b(0))),
                 false,
             ),
             false,

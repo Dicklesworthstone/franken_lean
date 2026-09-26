@@ -1,6 +1,8 @@
 //! Lower global function producers through the existing typed local-closure
 //! path. Ordinary globals retain their flat ABI. A shorter executable lambda
 //! spine is not eta-expanded across its strict, closure-producing body.
+mod applications;
+
 use super::*;
 
 struct Binder {
@@ -159,50 +161,12 @@ impl Preparation<'_> {
                 .ok_or_else(|| unsupported("global producer result representation"))?;
             value = self.typed_callable_result(value, type_, callback)?;
         } else {
-            let mut trailing = Vec::new();
-            let mut result_type = type_.clone();
-            for argument in &args[prefix..] {
-                self.tick()?;
-                let normal = self.type_head(&result_type)?;
-                let ExprNode::ForallE {
-                    binder_name,
-                    binder_type,
-                    body,
-                    ..
-                } = normal.node()
-                else {
-                    return Ok(None);
-                };
-                if binder_type.has_loose_bvars() || body.has_loose_bvars() {
-                    return Ok(None);
-                }
-                let offset = self.producer_depth(
-                    bindings.len().saturating_add(1).saturating_add(trailing.len()),
-                )?;
-                reserve(&mut trailing, self.limits.max_application_args)?;
-                trailing.push(Binder {
-                    name: binder_name.clone(),
-                    domain: binder_type.clone(),
-                    value: self.lift(argument, offset)?,
-                });
-                result_type = body.clone();
-            }
-            self.producer_depth(
-                bindings.len().saturating_add(1).saturating_add(trailing.len()),
-            )?;
-            let mut applied = variable(trailing.len())?;
-            for index in (0..trailing.len()).rev() {
-                self.tick()?;
-                applied = Expr::app(applied, variable(index)?);
-            }
-            for binding in trailing.into_iter().rev() {
-                self.tick()?;
-                applied = Expr::let_e(binding.name, binding.domain, binding.value, applied, false);
-            }
-            // The producer finishes before any trailing argument. Retaining
-            // argument annotations lets literal callbacks use normal conversion.
-            value = self.annotate_execution_value(value, type_.clone())?;
-            value = Expr::let_e(Name::anonymous(), type_, value, applied, false);
+            let Some(applied) =
+                self.apply_producer(value, type_, &args[prefix..], bindings.len())?
+            else {
+                return Ok(None);
+            };
+            value = applied;
         }
         for binding in bindings.into_iter().rev() {
             self.tick()?;
