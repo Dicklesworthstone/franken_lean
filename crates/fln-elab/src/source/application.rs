@@ -72,9 +72,14 @@ impl Context {
                     name.clone(),
                 )));
             }
+            let value =
+                match self.do_for_monad_argument(&function, name, &parts[3], expected.as_ref())? {
+                    Some(value) => ApplicationValue::Elaborated(value),
+                    None => ApplicationValue::Syntax(&parts[3]),
+                };
             named.push(Named {
                 name: name.clone(),
-                value: ApplicationValue::Syntax(&parts[3]),
+                value,
             });
         }
         Ok(NamedApplication {

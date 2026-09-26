@@ -18,7 +18,72 @@ fn application(function: Syntax, arguments: Vec<Syntax>) -> Syntax {
     )
 }
 
+// A private named-argument marker reaches the ordinary application worklist.
+// It carries no guessed source expression and cannot be spelled by the parser.
+fn monad_argument() -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "namedArgument"]),
+        vec![
+            atom("("),
+            ident(Name::from_components(["m"])),
+            atom(":="),
+            Syntax::node(parser_kind(&["Term", "nativeDoForMonad"]), vec![]),
+            atom(")"),
+        ],
+    )
+}
+
 impl Context {
+    /// Preserve the expected monad before alias reduction (notably Id/State)
+    /// can erase its application head. Return a typed named argument so the
+    /// ordinary application worklist checks and supplies it; this does not infer
+    /// injectivity of a higher-kinded metavariable application.
+    pub(in crate::source) fn do_for_monad_argument(
+        &mut self,
+        function: &Typed,
+        name: &Name,
+        syntax: &Syntax,
+        expected: Option<&Expr>,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let marker = parser_kind(&["Term", "nativeDoForMonad"]);
+        if syntax.kind() != Some(&marker) {
+            return Ok(None);
+        }
+        expect_node(syntax, &marker, 0, "internal loop monad hint")?;
+        if name != &Name::from_components(["m"])
+            || !matches!(function.value.node(), ExprNode::Const { name, .. }
+                if name == &Name::from_components(["ForIn", "forIn"]))
+        {
+            return Err(invalid());
+        }
+        let type_ = self.whnf(&function.type_)?;
+        let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            ..
+        } = type_.node()
+        else {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        };
+        if binder_name != name {
+            return Err(invalid());
+        }
+        let monad = match expected {
+            Some(type_) => self.do_monad(type_)?,
+            None => None,
+        };
+        let (value, type_) = match monad {
+            Some(monad) => {
+                let actual = self
+                    .known_type(&monad)?
+                    .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                (monad, actual)
+            }
+            None => (self.hole(binder_type.clone())?, binder_type.clone()),
+        };
+        Ok(Some(Typed { value, type_ }))
+    }
+
     pub(super) fn expand_for_loop(
         &mut self,
         syntax: Syntax,
@@ -59,7 +124,7 @@ impl Context {
         )?;
         let action = application(
             root(&["ForIn", "forIn"]),
-            vec![collection, root(&["PUnit", "unit"]), callback],
+            vec![monad_argument(), collection, root(&["PUnit", "unit"]), callback],
         );
         // Retain a doElem, not a bare term: the enclosing sequence determines
         // whether to return this action or bind it to the remaining statements.
@@ -128,6 +193,43 @@ mod tests {
     }
 
     #[test]
+    fn monad_hint_is_restricted_to_the_canonical_operation_and_parameter() {
+        let mut context = context();
+        let marker = term("nativeDoForMonad", vec![]);
+        for (function_name, argument_name) in [
+            (Name::from_components(["unrelated"]), Name::from_components(["m"])),
+            (Name::from_components(["ForIn", "forIn"]), Name::from_components(["wrong"])),
+        ] {
+            let function = Typed {
+                value: Expr::const_(function_name, vec![]),
+                type_: Expr::sort(Level::one()),
+            };
+            assert!(context
+                .do_for_monad_argument(&function, &argument_name, &marker, None)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_named_arguments_keep_their_original_inference_path() {
+        let mut context = context();
+        let function = Typed {
+            value: Expr::const_(Name::from_components(["ForIn", "forIn"]), vec![]),
+            type_: Expr::sort(Level::one()),
+        };
+        assert!(context
+            .do_for_monad_argument(
+                &function,
+                &Name::from_components(["m"]),
+                &term("hole", vec![atom("_")]),
+                None,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(context.next, 0);
+    }
+
+    #[test]
     fn loop_keeps_collection_once_and_body_inside_a_hygienic_callback() {
         for bracketed in [false, true] {
             let body = sequence(vec![term("doExpr", vec![named("action")])], bracketed);
@@ -153,6 +255,7 @@ mod tests {
                 vec![application(
                     root(&["ForIn", "forIn"]),
                     vec![
+                        monad_argument(),
                         named("collection"),
                         root(&["PUnit", "unit"]),
                         lambda(

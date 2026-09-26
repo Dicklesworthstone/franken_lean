@@ -1,5 +1,7 @@
 //! Native source do -> typeclass elaboration -> both ordinary checkers.
 #![forbid(unsafe_code)]
+#[path = "source_do/for_loops.rs"]
+mod for_loops;
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 fn limits() -> SourceCheckLimits {
     SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
