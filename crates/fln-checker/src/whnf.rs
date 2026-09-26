@@ -557,6 +557,7 @@ struct RecursorFrame {
     delta_mode: DeltaMode,
     unfolded_bindings: BTreeSet<usize>,
     force_string_delta: bool,
+    progress: ProgressMark,
 }
 
 enum RecursorStep {
@@ -596,9 +597,25 @@ struct Reducer<'a, 'c> {
     unfolded_bindings: BTreeSet<usize>,
     delta_mode: DeltaMode,
     delta_reductions: u64,
+    /// Reductions spent normalizing the major of a recursor that then stayed
+    /// stuck. Its application is returned with the major it had, so this work
+    /// changed nothing in the result and is not reported as progress. The
+    /// budget still counts it.
+    discarded_reductions: u64,
+    discarded_delta_reductions: u64,
     has_auxiliary_work: bool,
     string_progress: StringExpansionProgress,
     force_string_delta: bool,
+}
+
+/// The reported-progress counters when a recursor frame starts normalizing
+/// its major.
+#[derive(Clone, Copy)]
+struct ProgressMark {
+    reductions: u64,
+    delta_reductions: u64,
+    discarded_reductions: u64,
+    discarded_delta_reductions: u64,
 }
 
 impl<'a, 'c> Reducer<'a, 'c> {
@@ -2269,6 +2286,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
             delta_mode: self.delta_mode,
             unfolded_bindings: self.unfolded_bindings.clone(),
             force_string_delta: self.force_string_delta,
+            progress: ProgressMark {
+                reductions: self.control.reductions,
+                delta_reductions: self.delta_reductions,
+                discarded_reductions: self.discarded_reductions,
+                discarded_delta_reductions: self.discarded_delta_reductions,
+            },
         });
         Ok(Some(RecursorStep::NormalizeMajor { frame, major }))
     }
@@ -2655,7 +2678,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         self.force_string_delta = frame.force_string_delta;
 
                         let reduced_major = self.reduce_demanded_nat_cursor(&current)?;
-                        frame.arguments[frame.major_index] = reduced_major.clone();
+                        let original_major = std::mem::replace(
+                            &mut frame.arguments[frame.major_index],
+                            reduced_major.clone(),
+                        );
 
                         if let Some(reduced) = self.apply_recursor_rule(
                             &frame.metadata,
@@ -2713,7 +2739,28 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             continue 'normalize;
                         }
 
-                        // Preserve progress within a blocked major:
+                        // No rule fires: the application is stuck, and it is
+                        // returned with the major it had, as the pin's
+                        // `whnf_core` returns `e` when `reduce_recursor`
+                        // fails. The normalized major is not kept in the
+                        // result: it can be far larger than the major it came
+                        // from (`Int32.toBitVec_div` grew 179 nodes into
+                        // 74,901 in one whnf), and every later comparison paid
+                        // for it. Work that needs the major normalizes it
+                        // again, as at the pin. The reductions spent on the
+                        // major changed nothing in the result, so they are not
+                        // reported as progress (the budget still counts them):
+                        // callers read a nonzero count as change, and would
+                        // resubmit the same term forever.
+                        frame.arguments[frame.major_index] = original_major;
+                        let mark = frame.progress;
+                        self.discarded_reductions = mark.discarded_reductions.saturating_add(
+                            self.control.reductions.saturating_sub(mark.reductions),
+                        );
+                        self.discarded_delta_reductions =
+                            mark.discarded_delta_reductions.saturating_add(
+                                self.delta_reductions.saturating_sub(mark.delta_reductions),
+                            );
                         current = self.compose_application(&frame.head, &frame.arguments)?;
                         continue;
                     }
@@ -2737,8 +2784,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(WhnfResult {
                 term,
                 steps: self.control.steps,
-                reductions: self.control.reductions,
-                delta_reductions: self.delta_reductions,
+                reductions: self
+                    .control
+                    .reductions
+                    .saturating_sub(self.discarded_reductions),
+                delta_reductions: self
+                    .delta_reductions
+                    .saturating_sub(self.discarded_delta_reductions),
                 has_auxiliary_work: self.has_auxiliary_work,
                 string_progress: self.string_progress,
             });
@@ -3408,6 +3460,8 @@ fn whnf_at_mode_with(
         unfolded_bindings: BTreeSet::new(),
         delta_mode,
         delta_reductions: 0,
+        discarded_reductions: 0,
+        discarded_delta_reductions: 0,
         has_auxiliary_work: false,
         string_progress: StringExpansionProgress::default(),
         force_string_delta: false,

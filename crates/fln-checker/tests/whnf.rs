@@ -2160,8 +2160,15 @@ fn defeq_normalizes_saturated_recursor_spines_before_application_congruence() {
     ));
 }
 
+/// A stuck recursor application is returned with the major it had, as the
+/// pin's `whnf_core` returns `e` when `reduce_recursor` fails, and the work
+/// spent normalizing that major is not reported as progress. `alias` unfolds
+/// to `opaque_major`, on which no rule fires. Keeping the normalized major
+/// instead grew `Int32.toBitVec_div`'s terms from 179 nodes to 74,901 in one
+/// whnf; reporting the discarded work as progress would make a caller resubmit
+/// the unchanged term forever.
 #[test]
-fn stuck_recursor_majors_retain_their_reduction_progress() {
+fn a_stuck_recursor_keeps_its_major_and_reports_no_progress() {
     let mut entries = two_family_entries();
     entries.push(definition_entry(
         "alias",
@@ -2177,20 +2184,16 @@ fn stuck_recursor_majors_retain_their_reduction_progress() {
         constant("no"),
     ));
     let first = complete(whnf(&input, &context, WhnfBudget::unlimited()));
-    let expected = decoded(&two_eliminate(
-        constant("opaque_major"),
-        constant("yes"),
-        constant("no"),
-    ));
-    assert!(matches!(
-        fln_checker::defeq::quick_def_eq(
-            &first.term,
-            &expected,
-            fln_checker::defeq::QuickDefEqBudget::unlimited()
-        ),
-        fln_checker::defeq::QuickDefEqOutcome::Equal(_)
-    ));
-    assert_eq!(first.delta_reductions, 1);
+    assert_eq!(
+        output_model(&first),
+        frozen(&input, input.root()),
+        "the stuck application keeps `alias` as its major"
+    );
+    assert_eq!(
+        (first.reductions, first.delta_reductions),
+        (0, 0),
+        "a major normalized and discarded is not progress"
+    );
     let second = complete(whnf(&first.term, &context, WhnfBudget::unlimited()));
     assert_eq!(
         second.reductions, 0,
