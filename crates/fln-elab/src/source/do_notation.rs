@@ -5,6 +5,7 @@
 //! search. Continuations are real lambdas, so actions are never duplicated or
 //! eagerly evaluated by the frontend. Final declarations still face both judges.
 use super::*;
+mod for_loop;
 
 fn null(args: Vec<Syntax>) -> Syntax {
     Syntax::node(Name::from_components(["null"]), args)
@@ -66,6 +67,13 @@ fn call(bind: bool, arguments: Vec<Syntax>) -> Syntax {
         parser_kind(&["Term", if bind { "nativeDoBind" } else { "nativeDoPure" }]),
         arguments,
     )
+}
+
+fn unit_annotation() -> Syntax {
+    null(vec![Syntax::node(
+        parser_kind(&["Term", "typeSpec"]),
+        vec![atom(":"), ident(Name::from_components(["_root_", "PUnit"]))],
+    )])
 }
 
 fn lambda(
@@ -192,6 +200,12 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "doFor"])) {
+            if pattern {
+                return Err(invalid());
+            }
+            return self.expand_for_loop(syntax);
+        }
         if syntax.kind() != Some(&parser_kind(&["Term", "do"])) {
             return Ok(syntax);
         }
@@ -201,8 +215,21 @@ impl Context {
         let mut parts = node(syntax, "do", 2)?;
         let sequence = parts.pop().expect("do sequence");
         expect_atom(&parts[0], "do", "do keyword")?;
+        self.expand_do_sequence(sequence, None)
+    }
+
+    // A supplied continuation belongs to the current return scope. In
+    // particular, a loop callback must not turn a nonlocal return into pure.
+    fn expand_do_sequence(
+        &mut self,
+        sequence: Syntax,
+        mut result: Option<Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let require_unit = result.is_some();
         let statements = sequence_items(sequence)?;
-        let mut result = None;
+        if statements.is_empty() {
+            return Err(invalid());
+        }
         for statement in statements.into_iter().rev() {
             self.tick()?;
             let mut item = node(statement, "doSeqItem", 2)?;
@@ -235,7 +262,12 @@ impl Context {
                     let _ = self.fresh_name()?;
                     // Numeric names below anonymous cannot be spelled in source.
                     let name = ident(Name::num(Name::anonymous(), serial));
-                    call(true, vec![action, lambda(name, null(vec![]), body)?])
+                    let annotation = if require_unit {
+                        unit_annotation()
+                    } else {
+                        null(vec![])
+                    };
+                    call(true, vec![action, lambda(name, annotation, body)?])
                 } else {
                     action
                 });
