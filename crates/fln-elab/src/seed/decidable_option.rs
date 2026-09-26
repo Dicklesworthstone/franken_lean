@@ -166,7 +166,7 @@ impl Terms {
 /// Decidable, Not, True, False and DecidableEq; register only after admission.
 pub fn option_equality_decision_seed_declaration() -> Declaration {
     let universe = Level::param(name("u"));
-    let sort = universe.succ().expect("fixed Option universe");
+    let sort = universe.clone().succ().expect("fixed Option universe");
     let mut terms = Terms { next: 0, universe, sort: sort.clone(), alpha: Expr::sort(Level::zero()) };
     let alpha = terms.local("alpha", Expr::sort(sort.clone()), BinderInfo::Implicit);
     terms.alpha = fv(&alpha);
@@ -287,5 +287,38 @@ mod tests {
         }
         let env = environment();
         assert!(env.contains(&name("instDecidableEqOption")));
+    }
+    #[test]
+    fn a_dictionary_for_the_wrong_carrier_cannot_forge_an_option_decision() {
+        let env = environment();
+        let nat = constant("Nat", vec![]);
+        let type_ = Expr::app(constant("DecidableEq", vec![Level::one()]), option(nat.clone()));
+        let value = dictionary(nat, constant("Bool.decEq", vec![]));
+        let candidate = definition("wrong_carrier", vec![], &[], type_, value);
+        let result = fln_kernel::check(&env, &candidate, budget());
+        assert!(matches!(result, Outcome::Complete(Verdict::Rejected { .. })), "{result:?}");
+    }
+    #[test]
+    fn native_search_builds_nested_and_higher_universe_option_dictionaries() {
+        use crate::instances::{register_class, register_instance};
+        let mut env = register_class(&environment(), &name("Decidable")).unwrap();
+        for label in ["instDecidableEqNat", "instDecidableEqBool", "instDecidableEqOption", "instDecidableNot"] {
+            env = register_instance(&env, &name(label), 1000).unwrap();
+        }
+        for source in [
+            "theorem same : (Option.some 0 : Option Nat) = Option.some 0 := by decide",
+            "theorem different : Not ((Option.some 0 : Option Nat) = Option.some 1) := by decide",
+            "theorem empty : Not ((Option.none : Option Nat) = Option.some 0) := by decide",
+            "theorem nested : Option.some (Option.none : Option Bool) = Option.some (Option.none : Option Bool) := by decide",
+            "def lifted {A : Type 1} [DecidableEq A] (x y : Option A) : Decidable (x = y) := decEq x y",
+        ] {
+            let checked = crate::check_definition_source(source.as_bytes(), &env, budget())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert!(matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}\n{:?}", checked.outcome);
+        }
+        let source = b"theorem false_claim : (Option.some 0 : Option Nat) = Option.some 1 := by decide";
+        if let Ok(checked) = crate::check_definition_source(source, &env, budget()) {
+            assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })));
+        }
     }
 }
