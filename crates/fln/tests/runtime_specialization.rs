@@ -156,7 +156,7 @@ def useBump [chosen : Bump Nat] (n : Nat) : Nat := Bump.bump n
 }
 
 #[test]
-fn nested_closure_returning_monads_remain_explicit_refusals() {
+fn nested_closure_returning_monads_specialize_known_continuations() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
@@ -174,11 +174,19 @@ def work : Reader Nat := do
   return (n + 2)
 #eval work 40
 "#;
-    // This requires a closure-returning callback ABI, not merely erasure of
-    // the Reader alias. Do not relabel an unsupported lambda as a value.
-    assert!(
-        base.execute_source_definitions(&[source.as_bytes()], &options, limits())
-            .is_err()
+    // The continuation is a known lambda. Specialize it into the consumer;
+    // do not relabel its staged interface as the consumer's flat callback ABI.
+    let run = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &run.executions.last().unwrap().exit else {
+        panic!("Reader computation did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
     );
     assert_eq!(base.logical_root(&options), root);
 }

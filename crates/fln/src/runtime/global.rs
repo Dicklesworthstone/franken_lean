@@ -2,6 +2,7 @@
 //! path. Ordinary globals retain their flat ABI. A shorter executable lambda
 //! spine is not eta-expanded across its strict, closure-producing body.
 mod applications;
+mod callbacks;
 
 use super::*;
 
@@ -46,14 +47,18 @@ impl Preparation<'_> {
         self.typed_callable_result(value, type_, result)
     }
 
-    /// Only safe, ground definitions with a represented callback result enter
-    /// this path. No body is executed to find its type or its stage boundary.
-    /// The copied body is post-admission compiler input, never a declaration.
+    /// Specialize known staged callbacks before considering a global producer.
+    /// Only safe, ground definitions enter either path. No body is executed to
+    /// find its type or its stage boundary. Copied bodies remain compiler input,
+    /// never logical declarations or alternate admission authority.
     pub(super) fn global_producer(
         &mut self,
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(specialized) = self.specialize_staged_callback(head, args)? {
+            return Ok(Some(specialized));
+        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
