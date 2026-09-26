@@ -1697,7 +1697,7 @@ pub(crate) struct TypeChecker<'a> {
     instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
     recursor_major_cache: RecursorMajorCache,
-    defer_recursor_major: bool,
+    defer_recursor_major: Option<usize>,
     /// Query-local counterpart of the pin's `m_eager_reduce`. Only the
     /// domain comparison for an `eagerReduce _ _` argument may reduce open
     /// Nat applications; the previous value is restored after that query.
@@ -1743,7 +1743,7 @@ impl<'a> TypeChecker<'a> {
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
-            defer_recursor_major: false,
+            defer_recursor_major: None,
             eager_reduction: false,
         }
     }
@@ -3213,7 +3213,7 @@ impl<'a> TypeChecker<'a> {
         let Some((frame, major)) = self.prepare_inductive_reduction(e, depth)? else {
             return Ok(None);
         };
-        if self.defer_recursor_major {
+        if self.defer_recursor_major == Some(self.locals.len()) {
             return Err(Stop::DeferredRecursor {
                 frame: Box::new(frame),
                 major,
@@ -3280,7 +3280,7 @@ impl<'a> TypeChecker<'a> {
                 continue;
             } else {
                 let previous = self.defer_recursor_major;
-                self.defer_recursor_major = true;
+                self.defer_recursor_major = Some(self.locals.len());
                 let result = self.whnf(&current, depth);
                 self.defer_recursor_major = previous;
                 match result {
