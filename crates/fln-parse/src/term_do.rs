@@ -3,7 +3,8 @@
 //! Every statement owns its original leaves. Immutable named lets, named
 //! monadic binds, actions and terminal returns support both indentation and
 //! explicit braces. Single-collection, immutable for loops reuse the same
-//! frame stack; mutable, pattern and nonlocal control-flow forms still refuse.
+//! frame stack, including terminal break/continue. Mutable bindings, pattern
+//! iteration and nonlocal returns from loops remain separate elaboration work.
 use super::*;
 use term_locals::word;
 
@@ -21,6 +22,11 @@ pub(super) struct Prefix {
 enum Statement {
     Action,
     Return(usize),
+    Jump {
+        keyword: usize,
+        is_break: bool,
+        position: BytePos,
+    },
     For {
         keyword: usize,
         name: usize,
@@ -167,6 +173,15 @@ impl Prefix {
             };
             self.phase = Phase::Collection;
             *cursor = in_at + 1;
+        } else if word(tokens, at, "break") || word(tokens, at, "continue") {
+            // Leave the keyword on the ordinary term frame. `item` requires
+            // that frame to contain exactly this original leaf, so a jump
+            // cannot swallow an argument, ascription or trailing expression.
+            self.statement = Statement::Jump {
+                keyword: at,
+                is_break: word(tokens, at, "break"),
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "return") {
             self.statement = Statement::Return(at);
             *cursor += 1;
@@ -174,7 +189,7 @@ impl Prefix {
             // These belong to doElem, not ordinary term application. In
             // particular, parsing an if as a term would lose early-return scope.
             for unsupported in [
-                "if", "match", "while", "repeat", "unless", "try", "break", "continue", "have",
+                "if", "match", "while", "repeat", "unless", "try", "have",
                 "let_expr",
             ] {
                 if word(tokens, at, unsupported) {
@@ -213,6 +228,22 @@ impl Prefix {
                 parser_kind(&["Term", "doReturn"]),
                 vec![atom(leaves, at, "return")?, null_node(vec![value])],
             ),
+            Statement::Jump {
+                keyword,
+                is_break,
+                position,
+            } => {
+                if value != leaves.leaf(keyword)? {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::EndOfCommand,
+                    });
+                }
+                Syntax::node(
+                    parser_kind(&["Term", if is_break { "doBreak" } else { "doContinue" }]),
+                    vec![atom(leaves, keyword, if is_break { "break" } else { "continue" })?],
+                )
+            }
             Statement::For {
                 keyword,
                 name,
@@ -379,7 +410,7 @@ impl Prefix {
         }
         let semi = word(tokens, at, ";").then_some(at);
         let mut next = at + usize::from(semi.is_some());
-        let terminal = matches!(self.statement, Statement::Return(_));
+        let terminal = matches!(self.statement, Statement::Return(_) | Statement::Jump { .. });
         let binding = matches!(self.statement, Statement::Binding { .. });
         self.item(leaves, expression, semi)?;
         if let Some((_, close)) = &mut self.braces {
@@ -572,8 +603,8 @@ mod for_tests {
             "def walk : Nat := do { for (x, y) in xs do { visit x }; return 7 }",
             "def walk : Nat := do { for h : x in xs do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs, y in ys do { visit x }; return 7 }",
-            "def walk : Nat := do { for x in xs do { break }; return 7 }",
-            "def walk : Nat := do { for x in xs do { continue }; return 7 }",
+            "def walk : Nat := do { for x in xs do { break 1 }; return 7 }",
+            "def walk : Nat := do { for x in xs do { continue action }; return 7 }",
             "def walk : Nat := do { for x in xs do { let mut y := x; visit y }; return 7 }",
         ] {
             assert!(parse_definition(source.as_ref()).is_err(), "{source}");
@@ -588,5 +619,57 @@ mod for_tests {
             error.primary_offset(),
             Some(BytePos(source.find("return").unwrap()))
         );
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    fn count(syntax: &Syntax, label: &str) -> usize {
+        let kind = parser_kind(&["Term", label]);
+        let mut pending = vec![syntax];
+        let mut result = 0;
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind: found, args, .. } = syntax {
+                result += usize::from(found == &kind);
+                pending.extend(args);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn control_keywords_retain_original_leaves_and_enclosing_continuations() {
+        for (keyword, kind) in [("break", "doBreak"), ("continue", "doContinue")] {
+            for source in [
+                format!("def run : Nat := do {{ for x in xs do {{ visit x; {keyword} }}; return 7 }}"),
+                format!("def run : Nat := do\r\n  for «𝒙» in xs do\r\n    visit «𝒙»\r\n    {keyword} -- control\r\n  return 7"),
+            ] {
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(count(parsed.syntax(), kind), 1);
+                assert_eq!(count(parsed.syntax(), "doReturn"), 1);
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                assert_eq!(parsed.reconstruct_normalized().unwrap(),
+                    parsed.source_view().normalized().as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_control_names_are_ordinary_actions_not_jumps() {
+        let source = "def run : Nat := do { «break»; «continue»; return 7 }";
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(count(parsed.syntax(), "doExpr"), 2);
+        assert_eq!(count(parsed.syntax(), "doBreak"), 0);
+        assert_eq!(count(parsed.syntax(), "doContinue"), 0);
+    }
+
+    #[test]
+    fn terminal_controls_cannot_hide_unreachable_or_malformed_source() {
+        for body in ["break; missing", "continue; missing", "break 1", "continue true", "break : Nat"] {
+            let source = format!("def run : Nat := do {{ for x in xs do {{ {body} }}; return 7 }}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
     }
 }

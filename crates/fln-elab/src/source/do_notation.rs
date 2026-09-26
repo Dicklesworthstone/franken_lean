@@ -5,6 +5,7 @@
 //! search. Continuations are real lambdas, so actions are never duplicated or
 //! eagerly evaluated by the frontend. Final declarations still face both judges.
 use super::*;
+mod control;
 mod for_loop;
 
 fn null(args: Vec<Syntax>) -> Syntax {
@@ -226,11 +227,12 @@ impl Context {
         mut result: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
         let require_unit = result.is_some();
+        let loop_targets = result.as_ref().map(control::LoopTargets::new).transpose()?;
         let statements = sequence_items(sequence)?;
         if statements.is_empty() {
             return Err(invalid());
         }
-        for statement in statements.into_iter().rev() {
+        for (offset, statement) in statements.into_iter().rev().enumerate() {
             self.tick()?;
             let mut item = node(statement, "doSeqItem", 2)?;
             let separators = children(item.pop().expect("optional semicolon"))?;
@@ -241,7 +243,14 @@ impl Context {
                 expect_atom(separator, ";", "do separator")?;
             }
             let element = item.pop().expect("do element");
-            if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
+            if control::is_jump(&element) {
+                // Never discard an unreachable source suffix: it may contain
+                // invalid declarations or effects that still need checking.
+                if offset != 0 {
+                    return Err(invalid());
+                }
+                result = Some(control::jump(element, loop_targets.as_ref())?);
+            } else if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
                 // This slice has terminal return only. Rejecting a continuation
                 // is essential: treating early return as pure would run it.
                 if result.is_some() {
