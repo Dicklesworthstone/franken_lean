@@ -144,6 +144,14 @@ impl Preparation<'_> {
         value: &Expr,
         type_: &Expr,
     ) -> Result<Expr, IngressError> {
+        if matches!(value.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+            && let Some(result @ ValueType::Closure(_)) = self.value_type(type_)?
+        {
+            // A computed local initializer may finish with a literal lambda.
+            // Its outer let type must reach that tail without moving any of
+            // the initializer's strict work under the returned function.
+            return self.typed_callable_result(value.clone(), type_.clone(), result);
+        }
         if !matches!(value.node(), ExprNode::Lam { .. }) {
             return Ok(value.clone());
         }

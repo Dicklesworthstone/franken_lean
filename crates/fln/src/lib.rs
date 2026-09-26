@@ -5474,10 +5474,9 @@ impl Engine {
             &mut preparation,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        let local_lambda = executable_lambda(&admission.declaration, &mut preparation)
+        let local_lambda = executable_lambda(&admission.declaration, &expression, &mut preparation)
             .map_err(EngineExecutionError::Ingress)?;
-        if let Some(mut lambda) = local_lambda {
-            lambda.lambda = expression.clone();
+        if let Some(lambda) = local_lambda {
             preparation.lambdas.push(lambda);
         }
         let interfaces = preparation
@@ -6881,12 +6880,13 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
 /// execute the function value itself and expose the checked successor snapshot.
 fn executable_lambda(
     declaration: &Declaration,
+    prepared: &Expr,
     preparation: &mut runtime::Preparation<'_>,
 ) -> Result<Option<LambdaBinding>, IngressError> {
     let Declaration::Defn(definition) = declaration else {
         return Ok(None);
     };
-    let Some(signature) = preparation.signature(definition, false)? else {
+    let Some(mut signature) = preparation.signature(definition, false)? else {
         return Ok(None);
     };
     if signature.parameters.is_empty() {
@@ -6901,9 +6901,10 @@ fn executable_lambda(
     ) {
         return Ok(None);
     }
+    preparation.refine_local_result(&mut signature, prepared)?;
     let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
     Ok(Some(LambdaBinding {
-        lambda: definition.value.clone(),
+        lambda: prepared.clone(),
         parameters: signature.parameters,
         parameter_ownership,
         result: signature.result,

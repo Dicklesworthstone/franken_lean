@@ -2259,14 +2259,11 @@ mod tests {
             panic!("the alias command must elaborate to a definition");
         };
         assert_eq!(alias.base.type_, copy_ty);
-        let ExprNode::Lam {
-            binder_type, body, ..
-        } = alias.value.node()
-        else {
-            panic!("a function alias must eta-expand to a lambda");
-        };
-        assert_eq!(binder_type, &string_ty);
-        assert!(matches!(body.node(), ExprNode::App { .. }));
+        assert_eq!(
+            alias.value,
+            Expr::const_(Name::from_components(["copy"]), Vec::new()),
+            "source aliases retain their original expression and evaluation stage"
+        );
 
         let parsed = parse_definition(b"def message := let x := copy \"hi\"; x")
             .expect("an un-ascribed let of an application is in the scalar grammar");
@@ -2323,6 +2320,23 @@ mod tests {
         assert_eq!(evaluation.base.type_, nat);
         assert_eq!(evaluation.all, vec![evaluation.base.name.clone()]);
         assert!(matches!(evaluation.value.node(), ExprNode::LetE { .. }));
+
+        let computed = fln_parse::parse_source_command(
+            b"#eval let paid : Nat := Nat.add 40 2; fun (x : Nat) => x",
+        )
+        .expect("a function-valued evaluation retains its strict initializer");
+        let Declaration::Defn(computed) = elaborate_evaluation_in(
+            computed.syntax(),
+            Name::num(Name::anonymous(), 9),
+            &environment,
+        )
+        .expect("a function-valued evaluation elaborates without eta expansion") else {
+            panic!("evaluation must produce a checked definition candidate");
+        };
+        let ExprNode::LetE { body, .. } = computed.value.node() else {
+            panic!("evaluation must execute the initializer before returning a function");
+        };
+        assert!(matches!(body.node(), ExprNode::Lam { .. }));
 
         let source_name = Name::from_components(["pretendEval"]);
         assert_eq!(

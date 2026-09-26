@@ -212,6 +212,50 @@ impl<'a> Preparation<'a> {
     /// This runs after admission, and the ordinary FIR ingress still validates
     /// captures, calls and ownership. Unsupported erasures remain refusals.
     fn local_function(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
+        if !matches!(value.node(), ExprNode::LetE { .. }) {
+            return self.local_lambda(value, type_);
+        }
+        if !matches!(self.value_type(type_)?, Some(ValueType::Closure(_))) {
+            return Ok(value.clone());
+        }
+        // Reducing a literal application may expose a function-producing let
+        // after its outer annotation was visited. Keep every strict binding
+        // and register the resulting lambda in its actual lexical scope.
+        let mut tail = value.clone();
+        let mut bindings = Vec::new();
+        while let ExprNode::LetE {
+            decl_name,
+            type_,
+            value: initializer,
+            body,
+            non_dep,
+        } = tail.node()
+        {
+            self.tick()?;
+            reserve(&mut bindings, self.limits.max_context_depth)?;
+            bindings.push((
+                decl_name.clone(),
+                type_.clone(),
+                initializer.clone(),
+                *non_dep,
+            ));
+            tail = body.clone();
+        }
+        if !matches!(tail.node(), ExprNode::Lam { .. }) {
+            return Ok(value.clone());
+        }
+        let depth =
+            u32::try_from(bindings.len()).map_err(|_| unsupported("local initializer scope"))?;
+        let type_ = self.lift(type_, depth)?;
+        tail = self.local_lambda(&tail, &type_)?;
+        for (name, type_, value, non_dep) in bindings.into_iter().rev() {
+            self.tick()?;
+            tail = Expr::let_e(name, type_, value, tail, non_dep);
+        }
+        Ok(tail)
+    }
+
+    fn local_lambda(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
         let ExprNode::Lam {
             binder_type,
             body,
@@ -238,7 +282,7 @@ impl<'a> Preparation<'a> {
         if signature.parameters.is_empty() {
             return Ok(value.clone());
         }
-        self.refine_local_result(&mut signature)?;
+        self.refine_local_result(&mut signature, value)?;
         reserve(&mut self.lambdas, self.limits.max_lambda_bindings)?;
         let id = self.next_local;
         self.next_local = id

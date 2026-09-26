@@ -2558,7 +2558,10 @@ fn definition_in_context_named(
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
     context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
-    term.value = eta_expand_nondependent(term.value, &term.type_)?;
+    // Preserve the source's actual lambda stages. Eta-expanding a computed
+    // function moves its strict initializer under a new binder and delays it
+    // until an argument arrives. Native runtime preparation owns function
+    // aliases and computed closures without changing the admitted term.
     for local in parameters.into_iter().rev() {
         let LocalDecl {
             id,
@@ -2641,10 +2644,7 @@ pub(super) fn query(
     )?;
     let mut context = Context::new(environment, kernel);
     let term = context.term(&parts[1], None)?;
-    let mut term = context.finish(term)?;
-    if evaluate {
-        term.value = eta_expand_nondependent(term.value, &term.type_)?;
-    }
+    let term = context.finish(term)?;
     Ok(Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),

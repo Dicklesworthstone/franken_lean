@@ -26,14 +26,11 @@ fn execute(source: &str, expected: &str) -> u64 {
         Some(expected),
         "{source}"
     );
-    let replay = fln::execute_flbc_artifact(
-        &execution.flbc_artifact,
-        &KVMap::new(),
-        Default::default(),
-    )
-    .unwrap()
-    .into_complete()
-    .unwrap();
+    let replay =
+        fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), Default::default())
+            .unwrap()
+            .into_complete()
+            .unwrap();
     let VmExit::Returned(replayed) = replay else {
         panic!("replay did not return");
     };
@@ -90,6 +87,34 @@ fn zero_argument_globals_can_compute_functions_instead_of_fabricating_lambdas() 
 }
 
 #[test]
+fn primitive_aliases_and_partial_applications_remain_callable() {
+    execute(
+        "def addTwo : Nat -> Nat := Nat.add 2\n#eval addTwo 40",
+        "42",
+    );
+    execute(
+        "def plus : Nat -> Nat -> Nat := Nat.add\n#eval plus 20 22",
+        "42",
+    );
+    execute(
+        "def plus := Nat.add\ndef addTwo := plus 2\n#eval let f : Nat -> Nat := addTwo; f 40",
+        "42",
+    );
+}
+
+#[test]
+fn successive_global_return_stages_keep_their_strict_let_boundaries() {
+    execute(
+        "def build (n : Nat) : Nat -> Nat -> Nat := let base : Nat := n + 1; fun (x : Nat) => let middle : Nat := base + x; fun (y : Nat) => middle + y\n#eval build 20 10 11",
+        "42",
+    );
+    execute(
+        "def build (n : Nat) : Nat -> Nat -> Nat := let base : Nat := n + 1; fun (x : Nat) => let middle : Nat := base + x; fun (y : Nat) => middle + y\n#eval let first : Nat -> Nat -> Nat := build 20; let second : Nat -> Nat := first 10; second 5 + second 6",
+        "73",
+    );
+}
+
+#[test]
 fn interleaved_specialization_preserves_the_concrete_function_return_stage() {
     execute(
         "def make (ignored : Nat) {A : Type} (value : A) : Nat -> A := let saved : A := value; fun (n : Nat) => saved\n#eval make 1 42 9",
@@ -102,6 +127,75 @@ fn interleaved_specialization_preserves_the_concrete_function_return_stage() {
 }
 
 const SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\ndef make (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (x : Nat) => x\n";
+
+#[test]
+fn admitted_producers_and_aliases_retain_the_source_expression_stages() {
+    use fln::{ConstantInfo, Expr, ExprNode, Name, SourceCheckLimits};
+
+    let source = format!("{SPEND}def alias := make\ndef ready : Nat -> Nat := make 3");
+    let checked = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let definition = |name| {
+        let Some(ConstantInfo::Defn(definition)) = checked
+            .engine
+            .environment()
+            .find(&Name::from_components([name]))
+        else {
+            panic!("missing checked definition {name}");
+        };
+        definition
+    };
+    let ExprNode::Lam { body, .. } = definition("make").value.node() else {
+        panic!("make must bind its source parameter");
+    };
+    let ExprNode::LetE { value, body, .. } = body.node() else {
+        panic!("make must compute its initializer before returning the next lambda");
+    };
+    assert_eq!(
+        value,
+        &Expr::app(
+            Expr::const_(Name::from_components(["spend"]), Vec::new()),
+            Expr::bvar(0).unwrap(),
+        )
+    );
+    assert!(matches!(body.node(), ExprNode::Lam { .. }));
+    assert_eq!(
+        definition("alias").value,
+        Expr::const_(Name::from_components(["make"]), Vec::new()),
+        "a source alias must not invent argument stages"
+    );
+    let ExprNode::App { f, .. } = definition("ready").value.node() else {
+        panic!("a computed global must retain its initializer application");
+    };
+    assert_eq!(
+        f,
+        &Expr::const_(Name::from_components(["make"]), Vec::new())
+    );
+}
+
+#[test]
+fn unused_function_aliases_preserve_strict_initializers() {
+    for (declarations, initializer) in [
+        ("def alias := make\n", "alias {n}"),
+        ("def ready : Nat -> Nat := make {n}\n", "ready"),
+    ] {
+        let program = |n: u32| {
+            let source =
+                format!("{SPEND}{declarations}#eval let ignored : Nat -> Nat := {initializer}; 42");
+            source.replace("{n}", &n.to_string())
+        };
+        let idle = execute(&program(0), "42");
+        let busy = execute(&program(30), "42");
+        assert!(busy > idle + 30, "{initializer}: {idle} vs {busy}");
+    }
+}
 
 #[test]
 fn ignoring_a_returned_closure_does_not_skip_its_strict_producer() {

@@ -210,15 +210,28 @@ impl Preparation<'_> {
         Ok(expand(self, a)? == expand(self, b)?)
     }
 
-    pub(in crate::runtime) fn refine_local_result(
+    pub(crate) fn refine_local_result(
         &mut self,
         signature: &mut ExecutableSignature,
+        prepared: &Expr,
     ) -> Result<(), IngressError> {
         if !matches!(signature.result, ValueType::Closure(_)) {
             return Ok(());
         }
+        // Signature derivation normalizes types and may substitute local
+        // templates in its copy of the expression. Closure annotations belong
+        // to the exact, already prepared lambdas, so recover the return stage
+        // from the body the compiler will actually receive.
+        let mut body = prepared;
+        for _ in &signature.parameters {
+            self.tick()?;
+            let ExprNode::Lam { body: inner, .. } = body.node() else {
+                return Err(unsupported("prepared callback lambda spine"));
+            };
+            body = inner;
+        }
         if let Some(actual @ ValueType::Closure(_)) =
-            self.staged_result(&signature.body, &signature.parameters)?
+            self.staged_result(body, &signature.parameters)?
             && actual != signature.result
             && self.same_stage_telescope(actual, signature.result)?
         {

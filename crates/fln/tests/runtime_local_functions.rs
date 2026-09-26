@@ -78,6 +78,22 @@ fn local_partial_applications_and_function_aliases_execute() {
 }
 
 #[test]
+fn local_higher_order_calls_type_literal_callbacks_in_their_original_context() {
+    execute(
+        "#eval let apply := fun (f : Nat -> Nat) => f 10; apply (fun x => x + 32)",
+        "42",
+    );
+    execute(
+        "def run (offset : Nat) : Nat := let apply (f : Nat -> Nat) (n : Nat) : Nat := f n; let alias := apply; alias (fun x => x + offset) 10\n#eval run 32",
+        "42",
+    );
+    execute(
+        "def run (prefix : String) (h : 0 = 0) : Nat := let apply (f : String -> String) (s : String) : String := f s; String.length (apply (fun s => prefix ++ s) \"answer\")\n#eval run \"ok\" (by rfl)",
+        "8",
+    );
+}
+
+#[test]
 fn deterministic_lowering_does_not_modify_the_checked_snapshot() {
     let base = engine();
     let options = KVMap::new();

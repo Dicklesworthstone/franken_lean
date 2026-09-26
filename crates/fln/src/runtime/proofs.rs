@@ -19,7 +19,7 @@ fn erased_value() -> Expr {
 enum Frame {
     Visit(Expr, Option<Expr>),
     Keep(Expr),
-    Apply(usize),
+    Apply(usize, Vec<Option<Expr>>),
     Lambda(Name, Expr, BinderInfo),
     LetValue(Name, Expr, Expr, Expr, bool),
     LetBody(Name, Expr, Expr, bool),
@@ -208,6 +208,11 @@ impl Preparation<'_> {
                             let (head, args) = self.spine(&expr)?;
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
+                            let local_callbacks = matches!(head.node(), ExprNode::BVar { .. })
+                                && args
+                                    .iter()
+                                    .any(|arg| matches!(arg.node(), ExprNode::Lam { .. }));
+                            let mut callback_types = Vec::new();
                             for arg in &args {
                                 self.tick()?;
                                 let domain = if let Some(current) = type_ {
@@ -232,6 +237,24 @@ impl Preparation<'_> {
                                     Some(domain) => self.type_parameter(domain)?,
                                     None => false,
                                 };
+                                if local_callbacks {
+                                    // The checked local telescope is available here,
+                                    // before proof erasure removes its dependent domains.
+                                    // Keep the runtime type of literal callback operands:
+                                    // later global-call annotation cannot recover a BVar's
+                                    // type without this original local context.
+                                    let callback_type = match &domain {
+                                        Some(domain)
+                                            if !static_type
+                                                && matches!(arg.node(), ExprNode::Lam { .. }) =>
+                                        {
+                                            Some(self.erase_type_in(domain, &context)?)
+                                        }
+                                        _ => None,
+                                    };
+                                    reserve(&mut callback_types, self.limits.max_application_args)?;
+                                    callback_types.push(callback_type);
+                                }
                                 reserve(&mut arguments, self.limits.max_application_args)?;
                                 arguments.push(if static_type {
                                     Frame::Keep(arg.clone())
@@ -240,7 +263,7 @@ impl Preparation<'_> {
                                 });
                             }
                             reserve(&mut work, self.limits.max_nodes)?;
-                            work.push(Frame::Apply(args.len()));
+                            work.push(Frame::Apply(args.len(), callback_types));
                             for task in arguments.into_iter().rev() {
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(task);
@@ -324,7 +347,7 @@ impl Preparation<'_> {
                     reserve(&mut values, self.limits.max_nodes)?;
                     values.push(expr);
                 }
-                Frame::Apply(count) => {
+                Frame::Apply(count, callback_types) => {
                     let start = values
                         .len()
                         .checked_sub(count + 1)
@@ -333,7 +356,16 @@ impl Preparation<'_> {
                     let mut expr = args
                         .next()
                         .ok_or_else(|| unsupported("proof application head"))?;
-                    for arg in args {
+                    for (index, mut arg) in args.enumerate() {
+                        if matches!(arg.node(), ExprNode::Lam { .. })
+                            && let Some(Some(type_)) = callback_types.get(index)
+                            && let Some(result @ ValueType::Closure(_)) = self.value_type(type_)?
+                        {
+                            // Proof operands have already become inert scalars. Only
+                            // executable lambdas receive ordinary typed let bindings,
+                            // preserving captures and left-to-right argument evaluation.
+                            arg = self.typed_callable_result(arg, type_.clone(), result)?;
+                        }
                         expr = Expr::app(expr, arg);
                     }
                     values.push(expr);
