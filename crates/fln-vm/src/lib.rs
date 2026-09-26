@@ -18,3 +18,4 @@ pub mod extern_table_generated;
 pub mod interpreter;
 pub mod load;
 pub mod parity;
+pub mod scientific;
