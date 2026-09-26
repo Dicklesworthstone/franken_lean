@@ -1,23 +1,23 @@
 //! Deterministic dataflow scheduler (Bet B4, Plan §10.6, FL-INV-01).
 //!
-//! Declarations execute speculatively in parallel against immutable snapshots.
-//! Commits merge in **canonical source order** with commit-time read-set
-//! validation and rebase/retry on conflict.
+//! Ready commands execute against a committed immutable snapshot in bounded
+//! source-order batches. Dependencies and non-replayable effects split batches.
+//! Products merge canonically, with observed-footprint validation against every
+//! intervening commit. Stops and faults are never turned into successful retries.
 //!
-//! Schedule independence: the final environment, diagnostic message stream,
-//! InfoTrees, and decision ledgers are bit-for-bit identical at any thread count (1, 8, 32).
+//! Successful products have the same environment, messages, InfoTrees and
+//! decisions as sequential execution under the command effect contract.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use fln_core::outcome::Outcome;
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_env::environment::{DeclAdmission, Environment};
 use fln_env::pmap::CollisionBudget;
 
-use crate::dataflow::{CommandId, DataflowGraph, ElabUnitProduct};
+use crate::dataflow::{CommandId, DataflowGraph, DataflowNode, ElabUnitProduct};
 use crate::decision::DecisionRecord;
-use crate::effects::EffectSummary;
+use crate::effects::{CommandEffect, EffectSummary};
 use crate::info::InfoTree;
 use crate::messages::Message;
 use crate::txn::ElabBudget;
@@ -62,73 +62,155 @@ pub struct SchedulerOutput {
     pub retry_count: usize,
 }
 
+impl SchedulerOutput {
+    fn empty(base_env: &Environment) -> Self {
+        Self {
+            final_environment: base_env.clone(),
+            messages: Vec::new(),
+            info_trees: Vec::new(),
+            decisions: Vec::new(),
+            effects: BTreeMap::new(),
+            committed_order: Vec::new(),
+            retry_count: 0,
+        }
+    }
+
+    /// No output escapes unless the entire run completes. Declaration admission
+    /// still uses the ordinary environment door, including on cache replay.
+    fn commit(
+        &mut self,
+        id: CommandId,
+        product: ElabUnitProduct,
+    ) -> Outcome<Result<(), String>> {
+        for decl in &product.admitted_decls {
+            match self.final_environment.try_add_decl_with_budget(
+                decl.clone(),
+                1,
+                CollisionBudget::UNBOUNDED,
+            ) {
+                Outcome::Complete(DeclAdmission::Admitted(environment)) => {
+                    self.final_environment = environment;
+                }
+                Outcome::Complete(DeclAdmission::Rejected(error)) => {
+                    return Outcome::complete(Err(format!(
+                        "Failed to admit declaration {:?}: {error:?}",
+                        decl.name()
+                    )));
+                }
+                Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            }
+        }
+        self.messages.extend(product.messages);
+        if let Some(tree) = product.info_tree {
+            self.info_trees.push(tree);
+        }
+        self.decisions.extend(product.decisions);
+        self.effects.insert(id, product.effects);
+        self.committed_order.push(id);
+        Outcome::complete(Ok(()))
+    }
+}
+
+type CommandOutcome = Outcome<Result<ElabUnitProduct, String>>;
+
+/// Include actual publications even when a producer omitted WritesDecl from
+/// its dynamic effect log. Static pre-scans are conservative and never removed.
+fn product_footprint(node: &DataflowNode, product: &ElabUnitProduct) -> EffectSummary {
+    let mut effects = node.dependency_effects();
+    effects.extend(&product.effects);
+    for declaration in &product.admitted_decls {
+        effects.record(CommandEffect::WritesDecl {
+            name: declaration.name().clone(),
+        });
+    }
+    effects
+}
+
+/// A callback panic is an invariant failure, not a rejected source program.
+fn invoke(node: &DataflowNode, environment: &Environment, budget: &ElabBudget) -> CommandOutcome {
+    match catch_unwind(AssertUnwindSafe(|| (node.elab_fn)(environment, budget))) {
+        Ok(outcome) => outcome,
+        Err(_) => Outcome::InternalFault(InternalFault::new(
+            "FL-INV-01",
+            format!("elaboration callback for command {} panicked", node.id),
+        )),
+    }
+}
+
+fn run_batch(
+    nodes: &[DataflowNode],
+    environment: &Environment,
+    budget: &ElabBudget,
+) -> Outcome<Vec<CommandOutcome>> {
+    if let [node] = nodes {
+        return Outcome::complete(vec![invoke(node, environment, budget)]);
+    }
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let worker = std::thread::Builder::new()
+                .spawn_scoped(scope, move || invoke(node, environment, budget));
+            match worker {
+                Ok(handle) => handles.push((node.id, handle)),
+                Err(error) => {
+                    // Scoped workers already started are joined before returning.
+                    // No staged success is published from an incomplete batch.
+                    return Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                        "elaboration worker for command {}: {error}",
+                        node.id
+                    )));
+                }
+            }
+        }
+        Outcome::complete(
+            handles
+                .into_iter()
+                .map(|(id, handle)| match handle.join() {
+                    Ok(outcome) => outcome,
+                    Err(_) => Outcome::InternalFault(InternalFault::new(
+                        "FL-INV-01",
+                        format!("elaboration worker for command {id} panicked"),
+                    )),
+                })
+                .collect(),
+        )
+    })
+}
+
 /// Deterministic scheduler executing dataflow graphs under `FL-INV-01`.
 pub struct DeterministicScheduler;
 
 impl DeterministicScheduler {
-    /// Execute a dataflow graph sequentially.
+    /// Execute a dataflow graph sequentially, validating IDs before any callbacks.
     pub fn execute_sequential(
         graph: &DataflowGraph,
         base_env: &Environment,
         budget: &ElabBudget,
     ) -> Outcome<Result<SchedulerOutput, String>> {
-        let mut current_env = base_env.clone();
-        let mut all_messages = Vec::new();
-        let mut all_info_trees = Vec::new();
-        let mut all_decisions = Vec::new();
-        let mut all_effects = BTreeMap::new();
-        let mut committed_order = Vec::new();
-
+        if let Err(error) = graph.validate() {
+            return Outcome::complete(Err(error));
+        }
+        let mut output = SchedulerOutput::empty(base_env);
         for node in graph.nodes() {
-            let outcome = (node.elab_fn)(&current_env, budget);
-            let product = match outcome {
-                Outcome::Complete(Ok(p)) => p,
-                Outcome::Complete(Err(e)) => return Outcome::complete(Err(e)),
-                Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
+            let product = match invoke(node, &output.final_environment, budget) {
+                Outcome::Complete(Ok(product)) => product,
+                Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
                 Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
             };
-
-            for decl in &product.admitted_decls {
-                match current_env.try_add_decl_with_budget(
-                    decl.clone(),
-                    1,
-                    CollisionBudget::UNBOUNDED,
-                ) {
-                    Outcome::Complete(DeclAdmission::Admitted(new_env)) => {
-                        current_env = new_env;
-                    }
-                    Outcome::Complete(DeclAdmission::Rejected(err)) => {
-                        return Outcome::complete(Err(format!(
-                            "Failed to admit declaration {:?}: {err:?}",
-                            decl.name()
-                        )));
-                    }
-                    Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
-                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-                }
+            match output.commit(node.id, product) {
+                Outcome::Complete(Ok(())) => {}
+                Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
             }
-
-            all_messages.extend(product.messages);
-            if let Some(tree) = product.info_tree {
-                all_info_trees.push(tree);
-            }
-            all_decisions.extend(product.decisions);
-            all_effects.insert(node.id, product.effects);
-            committed_order.push(node.id);
         }
-
-        Outcome::complete(Ok(SchedulerOutput {
-            final_environment: current_env,
-            messages: all_messages,
-            info_trees: all_info_trees,
-            decisions: all_decisions,
-            effects: all_effects,
-            committed_order,
-            retry_count: 0,
-        }))
+        Outcome::complete(Ok(output))
     }
 
-    /// Execute a dataflow graph in parallel with canonical merge and optimistic concurrency.
+    /// Execute bounded ready prefixes, never speculating across a barrier or
+    /// ahead of a declared dependency. Batch width is capped by worker_threads.
     pub fn execute_parallel(
         graph: &DataflowGraph,
         base_env: &Environment,
@@ -137,128 +219,96 @@ impl DeterministicScheduler {
         if config.worker_threads <= 1 || !config.enable_speculation || graph.len() <= 1 {
             return Self::execute_sequential(graph, base_env, &config.budget);
         }
-
-        let num_nodes = graph.len();
-        let retry_count = Arc::new(AtomicUsize::new(0));
-
-        // Shared speculative results pool: CommandId -> Staged Product
-        let staged_results = Arc::new(Mutex::new(HashMap::<CommandId, ElabUnitProduct>::new()));
-
-        // Snapshot of base environment for initial speculative passes
-        let base_snapshot = Arc::new(base_env.clone());
-
-        // Launch worker threads to speculatively execute independent/ready nodes
-        std::thread::scope(|s| {
-            let chunk_size = num_nodes.div_ceil(config.worker_threads);
-            for worker_id in 0..config.worker_threads {
-                let start_idx = worker_id * chunk_size;
-                let end_idx = (start_idx + chunk_size).min(num_nodes);
-                if start_idx >= end_idx {
-                    continue;
-                }
-
-                let nodes_slice: Vec<_> = graph.nodes()[start_idx..end_idx].to_vec();
-                let staged_ref = Arc::clone(&staged_results);
-                let base_snap = Arc::clone(&base_snapshot);
-                let budget = config.budget.clone();
-
-                s.spawn(move || {
-                    for node in nodes_slice {
-                        // Speculative execution against base snapshot
-                        let outcome = (node.elab_fn)(&base_snap, &budget);
-                        if let Outcome::Complete(Ok(product)) = outcome {
-                            let mut lock = staged_ref.lock().unwrap();
-                            lock.insert(node.id, product);
-                        }
-                    }
-                });
-            }
-        });
-
-        // Canonical Merge Loop (runs in strict source order 0..num_nodes)
-        let mut current_env = base_env.clone();
-        let mut all_messages = Vec::new();
-        let mut all_info_trees = Vec::new();
-        let mut all_decisions = Vec::new();
-        let mut all_effects = BTreeMap::new();
-        let mut committed_order = Vec::new();
-
-        let mut staged_map = match Arc::try_unwrap(staged_results) {
-            Ok(mutex) => mutex.into_inner().unwrap(),
-            Err(arc) => arc.lock().unwrap().clone(),
-        };
-
-        for node in graph.nodes() {
-            let mut product_opt = staged_map.remove(&node.id);
-
-            // Read-set validation: check if speculative product is valid over current_env
-            let needs_rebase = match &product_opt {
-                Some(product) => {
-                    let mut invalid = false;
-                    for read_decl in product.effects.read_decls() {
-                        if !base_snapshot.contains(read_decl) || !current_env.contains(read_decl) {
-                            invalid = true;
-                            break;
-                        }
-                    }
-                    invalid
-                }
-                None => true,
-            };
-
-            let product = if needs_rebase {
-                // Rebase / re-elaborate directly against current committed environment
-                retry_count.fetch_add(1, Ordering::Relaxed);
-                let outcome = (node.elab_fn)(&current_env, &config.budget);
-                match outcome {
-                    Outcome::Complete(Ok(p)) => p,
-                    Outcome::Complete(Err(e)) => return Outcome::complete(Err(e)),
-                    Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
-                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-                }
-            } else {
-                product_opt.take().unwrap()
-            };
-
-            // Commit declarations into current_env
-            for decl in &product.admitted_decls {
-                match current_env.try_add_decl_with_budget(
-                    decl.clone(),
-                    1,
-                    CollisionBudget::UNBOUNDED,
-                ) {
-                    Outcome::Complete(DeclAdmission::Admitted(new_env)) => {
-                        current_env = new_env;
-                    }
-                    Outcome::Complete(DeclAdmission::Rejected(err)) => {
-                        return Outcome::complete(Err(format!(
-                            "Failed to admit declaration {:?}: {err:?}",
-                            decl.name()
-                        )));
-                    }
-                    Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
-                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-                }
-            }
-
-            all_messages.extend(product.messages);
-            if let Some(tree) = product.info_tree {
-                all_info_trees.push(tree);
-            }
-            all_decisions.extend(product.decisions);
-            all_effects.insert(node.id, product.effects);
-            committed_order.push(node.id);
+        if let Err(error) = graph.validate() {
+            return Outcome::complete(Err(error));
         }
-
-        Outcome::complete(Ok(SchedulerOutput {
-            final_environment: current_env,
-            messages: all_messages,
-            info_trees: all_info_trees,
-            decisions: all_decisions,
-            effects: all_effects,
-            committed_order,
-            retry_count: retry_count.load(Ordering::Relaxed),
-        }))
+        let mut output = SchedulerOutput::empty(base_env);
+        let mut committed = HashSet::new();
+        let nodes = graph.nodes();
+        let mut next = 0;
+        while next < nodes.len() {
+            let limit = next.saturating_add(config.worker_threads).min(nodes.len());
+            let mut end = next;
+            while end < limit {
+                let candidate = &nodes[end];
+                if !candidate.dependency_effects().is_replay_safe()
+                    || !graph.dependencies_of(candidate.id).is_some_and(|dependencies| {
+                        dependencies.iter().all(|id| committed.contains(id))
+                    })
+                {
+                    break;
+                }
+                end += 1;
+            }
+            if end == next {
+                // A non-replayable command runs exactly once at its canonical
+                // position, after all earlier commands and before any later ones.
+                end += 1;
+            }
+            let batch = &nodes[next..end];
+            let concurrent = batch.len() > 1;
+            let outcomes = match run_batch(batch, &output.final_environment, &config.budget) {
+                Outcome::Complete(outcomes) => outcomes,
+                Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            };
+            let mut intervening = EffectSummary::new();
+            let mut environment_changed = false;
+            for (index, (node, outcome)) in batch.iter().zip(outcomes).enumerate() {
+                let mut product = match outcome {
+                    Outcome::Complete(Ok(product)) => Some(product),
+                    // A semantic error may depend on a declaration published
+                    // since the snapshot. Resource/cancellation/fault outcomes
+                    // are not semantic errors and must NEVER take this retry.
+                    Outcome::Complete(Err(_)) if environment_changed => None,
+                    Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                    Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                };
+                if concurrent
+                    && product.as_ref().is_some_and(|product| {
+                        !product_footprint(node, product).is_replay_safe()
+                    })
+                {
+                    return undeclared_replay_effect(node.id);
+                }
+                let needs_rebase = match &product {
+                    Some(product) => index > 0
+                        && !product_footprint(node, product).commutes_with(&intervening),
+                    None => true,
+                };
+                if needs_rebase {
+                    output.retry_count += 1;
+                    product = match invoke(node, &output.final_environment, &config.budget) {
+                        Outcome::Complete(Ok(product)) => Some(product),
+                        Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                        Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    };
+                }
+                let Some(product) = product else {
+                    return Outcome::InternalFault(InternalFault::new(
+                        "FL-INV-01",
+                        "successful rebase produced no command product",
+                    ));
+                };
+                let footprint = product_footprint(node, &product);
+                if concurrent && !footprint.is_replay_safe() {
+                    return undeclared_replay_effect(node.id);
+                }
+                environment_changed |= !product.admitted_decls.is_empty();
+                intervening.extend(&footprint);
+                match output.commit(node.id, product) {
+                    Outcome::Complete(Ok(())) => {}
+                    Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                    Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                }
+                committed.insert(node.id);
+            }
+            next = end;
+        }
+        Outcome::complete(Ok(output))
     }
 
     /// Execute a dataflow graph using the provided configuration.
@@ -273,4 +323,12 @@ impl DeterministicScheduler {
             Self::execute_sequential(graph, base_env, &config.budget)
         }
     }
+}
+
+fn undeclared_replay_effect(id: CommandId) -> Outcome<Result<SchedulerOutput, String>> {
+    Outcome::InternalFault(InternalFault::new(
+        "FL-INV-01",
+        format!("command {id} reported a non-replayable effect after parallel execution; \
+                 declare it before scheduling"),
+    ))
 }
