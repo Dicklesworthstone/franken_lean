@@ -2,10 +2,12 @@
 //!
 //! Lambda bodies remain code until applied. Every supplied argument, local
 //! initializer and constructor operand must independently be inert, even when
-//! the result would discard it. Intrinsics, recursors, axioms, unsafe bodies
-//! and open values never become compile-time dictionary evidence.
+//! the result would discard it. Intrinsics, recursors, executable axioms, unsafe
+//! bodies and open values never become compile-time dictionary evidence.
 use super::*;
 use std::collections::VecDeque;
+
+mod projections;
 
 enum Task {
     Value(Expr),
@@ -13,6 +15,7 @@ enum Task {
     Application(usize),
     Continue(VecDeque<Expr>),
     Let(Expr),
+    Projection(Name, u64),
 }
 
 fn push(tasks: &mut Vec<Task>, task: Task, limit: usize) -> Result<(), IngressError> {
@@ -33,12 +36,6 @@ impl Preparation<'_> {
         if !closed(input) {
             return Ok(None);
         }
-        // Preserve the existing accepted profile, including opaque type-only
-        // constructor parameters. Factory evaluation only extends that profile;
-        // it must not make an already supported dictionary require more erasure.
-        if self.static_value(input)? {
-            return Ok(Some(input.clone()));
-        }
         let mut tasks = vec![Task::Value(input.clone())];
         let mut values = Vec::new();
         let limit = self.limits.max_nodes;
@@ -50,6 +47,23 @@ impl Preparation<'_> {
                     let (head, arguments) = self.spine(&expression)?;
                     if let ExprNode::Const { name, levels } = head.node() {
                         match self.environment.find(name) {
+                            Some(ConstantInfo::Axiom(axiom))
+                                if !axiom.is_unsafe
+                                    && levels.len() == axiom.base.level_params.len() =>
+                            {
+                                let type_ = self.universe_instance(
+                                    &axiom.base.type_,
+                                    &axiom.base.level_params,
+                                    levels,
+                                )?;
+                                // Opaque types such as String are inert type
+                                // metadata, not executable axioms. A constant
+                                // producing a runtime value or proof is refused.
+                                if self.type_parameter(&type_)? {
+                                    values.push(expression);
+                                    continue;
+                                }
+                            }
                             Some(ConstantInfo::Induct(family))
                                 if !family.is_unsafe
                                     && levels.len() == family.base.level_params.len() =>
@@ -73,7 +87,11 @@ impl Preparation<'_> {
                                 // functions too. Projection still requires full
                                 // saturation. Check parameters as well as fields:
                                 // a value parameter is not an erased type argument.
-                                push(&mut tasks, Task::Constructor(head, arguments.len()), limit)?;
+                                push(
+                                    &mut tasks,
+                                    Task::Constructor(head, arguments.len()),
+                                    limit,
+                                )?;
                                 for argument in arguments.into_iter().rev() {
                                     self.tick()?;
                                     push(&mut tasks, Task::Value(argument), limit)?;
@@ -114,6 +132,18 @@ impl Preparation<'_> {
                                 levels,
                             )?;
                             push(&mut tasks, Task::Value(body), limit)?;
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            push(
+                                &mut tasks,
+                                Task::Projection(struct_name.clone(), *idx),
+                                limit,
+                            )?;
+                            push(&mut tasks, Task::Value(expr.clone()), limit)?;
                         }
                         ExprNode::LetE { value, body, .. } => {
                             push(&mut tasks, Task::Let(body.clone()), limit)?;
@@ -185,6 +215,15 @@ impl Preparation<'_> {
                         // indirectly obtained constructor or type constructor.
                         push(&mut tasks, Task::Value(value), limit)?;
                     }
+                }
+                Task::Projection(family, index) => {
+                    let value = values
+                        .pop()
+                        .ok_or_else(|| unsupported("instance factory projection receiver"))?;
+                    let Some(field) = self.instance_factory_field(&family, index, &value)? else {
+                        return Ok(None);
+                    };
+                    values.push(field);
                 }
                 Task::Let(body) => {
                     let value = values
