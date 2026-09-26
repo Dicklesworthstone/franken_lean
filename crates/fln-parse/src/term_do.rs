@@ -2,7 +2,8 @@
 //!
 //! Every statement owns its original leaves. Immutable named lets, named
 //! monadic binds, actions and terminal returns support both indentation and
-//! explicit braces. Control-flow/mutable/pattern elements remain typed refusals.
+//! explicit braces. Single-collection, immutable for loops reuse the same
+//! frame stack; mutable, pattern and nonlocal control-flow forms still refuse.
 use super::*;
 use term_locals::word;
 
@@ -13,12 +14,19 @@ pub(super) struct Prefix {
     items: Vec<Syntax>,
     statement: Statement,
     annotation: Option<Syntax>,
+    collection: Option<Syntax>,
     phase: Phase,
 }
 #[derive(Clone, Copy)]
 enum Statement {
     Action,
     Return(usize),
+    For {
+        keyword: usize,
+        name: usize,
+        in_at: usize,
+        position: BytePos,
+    },
     Binding {
         keyword: usize,
         name: usize,
@@ -29,6 +37,7 @@ enum Statement {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Annotation,
+    Collection,
     Value,
     Done,
 }
@@ -89,6 +98,7 @@ impl Prefix {
             items: Vec::new(),
             statement: Statement::Action,
             annotation: None,
+            collection: None,
             phase: Phase::Value,
         };
         p.begin(view, tokens, cursor, end)?;
@@ -105,6 +115,7 @@ impl Prefix {
             return Err(refuse(view, tokens, *cursor));
         }
         self.annotation = None;
+        self.collection = None;
         self.phase = Phase::Value;
         let at = *cursor;
         if word(tokens, at, "let") {
@@ -138,6 +149,24 @@ impl Prefix {
                 assignment,
             };
             *cursor = marker + 1;
+        } else if word(tokens, at, "for") {
+            let name = at + 1;
+            let in_at = at + 2;
+            if in_at >= end
+                || !matches!(&tokens[name].kind, TokenKind::Ident(name)
+                    if !name.is_anonymous() && name.parent().is_anonymous())
+                || !word(tokens, in_at, "in")
+            {
+                return Err(refuse(view, tokens, name));
+            }
+            self.statement = Statement::For {
+                keyword: at,
+                name,
+                in_at,
+                position: original_position(view, tokens, at),
+            };
+            self.phase = Phase::Collection;
+            *cursor = in_at + 1;
         } else if word(tokens, at, "return") {
             self.statement = Statement::Return(at);
             *cursor += 1;
@@ -145,7 +174,7 @@ impl Prefix {
             // These belong to doElem, not ordinary term application. In
             // particular, parsing an if as a term would lose early-return scope.
             for unsupported in [
-                "if", "match", "for", "while", "repeat", "unless", "try", "break", "continue",
+                "if", "match", "while", "repeat", "unless", "try", "break", "continue",
                 "have", "let_expr",
             ] {
                 if word(tokens, at, unsupported) {
@@ -168,6 +197,7 @@ impl Prefix {
                 word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-")
             }
             Phase::Value => word(tokens, at, ";"),
+            Phase::Collection => word(tokens, at, "do"),
             Phase::Done => false,
         }
     }
@@ -183,6 +213,54 @@ impl Prefix {
                 parser_kind(&["Term", "doReturn"]),
                 vec![atom(leaves, at, "return")?, null_node(vec![value])],
             ),
+            Statement::For {
+                keyword,
+                name,
+                in_at,
+                position,
+            } => {
+                // The loop's `do` introduces a doSeq, not a new return scope.
+                // Reuse the nested parser frame, then remove only its wrapper.
+                let mut value = value;
+                let Syntax::Node { kind, args, .. } = &mut value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                let sequence = args.pop().expect("checked do sequence");
+                let do_keyword = args.pop().expect("checked do keyword");
+                let collection = self.collection.take().ok_or_else(|| {
+                    NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    }
+                })?;
+                let declaration = Syntax::node(
+                    parser_kind(&["Term", "doForDecl"]),
+                    vec![
+                        null_node(vec![]),
+                        leaves.leaf(name)?,
+                        atom(leaves, in_at, "in")?,
+                        collection,
+                    ],
+                );
+                Syntax::node(
+                    parser_kind(&["Term", "doFor"]),
+                    vec![
+                        atom(leaves, keyword, "for")?,
+                        null_node(vec![declaration]),
+                        do_keyword,
+                        sequence,
+                    ],
+                )
+            }
             Statement::Binding {
                 keyword,
                 name,
@@ -267,6 +345,25 @@ impl Prefix {
         expression: Syntax,
         end: usize,
     ) -> Result<(Self, usize), NatDefinitionParseError> {
+        if self.phase == Phase::Collection {
+            if !word(tokens, at, "do") || at + 1 >= end {
+                return Err(refuse(view, tokens, at));
+            }
+            let Statement::For { keyword, .. } = self.statement else {
+                return Err(refuse(view, tokens, at));
+            };
+            if !word(tokens, at + 1, "{")
+                && newline(view, tokens, at + 1)
+                && column(view, tokens, at + 1) <= column(view, tokens, keyword)
+            {
+                return Err(refuse(view, tokens, at + 1));
+            }
+            self.collection = Some(expression);
+            self.phase = Phase::Value;
+            // Let the ordinary parser consume this original `do` token and
+            // its entire sequence on a child heap frame.
+            return Ok((self, at));
+        }
         if self.phase == Phase::Annotation {
             self.annotation = Some(expression);
             let Statement::Binding { assignment, .. } = &mut self.statement else {
@@ -383,7 +480,9 @@ pub(super) fn layout(
             continue;
         }
         match frame.prefix.as_ref()? {
-            term_locals::Prefix::Do(p) if p.phase != Phase::Annotation => {
+            term_locals::Prefix::Do(p)
+                if !matches!(p.phase, Phase::Annotation | Phase::Collection) =>
+            {
                 if p.braces.is_some() && word(tokens, at, "}") {
                     return Some(false);
                 }
@@ -398,4 +497,94 @@ pub(super) fn layout(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod for_tests {
+    use super::*;
+
+    fn kinds(syntax: &Syntax, leaf: &str) -> usize {
+        let expected = parser_kind(&["Term", leaf]);
+        let mut work = vec![syntax];
+        let mut count = 0;
+        while let Some(syntax) = work.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                count += usize::from(kind == &expected);
+                work.extend(args);
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn for_body_is_a_sequence_not_a_nested_return_scope() {
+        let source = "def walk : Nat := do\n  for x in xs do\n    visit x\n  return 7";
+        let parsed = parse_definition(source.as_ref()).expect("immutable loop syntax");
+        assert_eq!(kinds(&parsed.syntax, "do"), 1);
+        assert_eq!(kinds(&parsed.syntax, "doFor"), 1);
+        assert_eq!(kinds(&parsed.syntax, "doForDecl"), 1);
+        assert_eq!(kinds(&parsed.syntax, "doReturn"), 1);
+    }
+
+    #[test]
+    fn nested_loops_and_explicit_do_keep_distinct_scopes() {
+        let source = "def walk : Nat := do\n  for x in xs do\n    for y in ys do\n      visit (do { return x }) y\n  return 7";
+        let parsed = parse_definition(source.as_ref()).expect("nested loops");
+        assert_eq!(kinds(&parsed.syntax, "doFor"), 2);
+        assert_eq!(kinds(&parsed.syntax, "do"), 2);
+        assert_eq!(kinds(&parsed.syntax, "doReturn"), 2);
+    }
+
+    #[test]
+    fn braced_loops_retain_the_outer_continuation() {
+        let source = "def walk : Nat := do { for x in xs do { visit x }; after; return 7 }";
+        let parsed = parse_definition(source.as_ref()).expect("braced loop");
+        assert_eq!(kinds(&parsed.syntax, "doFor"), 1);
+        assert_eq!(kinds(&parsed.syntax, "doSeqBracketed"), 2);
+        assert_eq!(kinds(&parsed.syntax, "doExpr"), 2);
+        assert_eq!(kinds(&parsed.syntax, "doReturn"), 1);
+    }
+
+    #[test]
+    fn collection_parentheses_protect_a_nested_do_from_the_header_delimiter() {
+        let source = "def walk : Nat := do { for x in (do { return xs }) do { visit x }; return 7 }";
+        let parsed = parse_definition(source.as_ref()).expect("parenthesized collection");
+        assert_eq!(kinds(&parsed.syntax, "do"), 2);
+        assert_eq!(kinds(&parsed.syntax, "doFor"), 1);
+    }
+
+    #[test]
+    fn crlf_comments_and_a_non_bmp_binder_do_not_change_loop_structure() {
+        let source = "def walk : Nat := do\r\n  for «𝒙» in xs /- collection -/ do\r\n    visit «𝒙» -- one action\r\n  return 7";
+        let parsed = parse_definition(source.as_ref()).expect("original source coordinates");
+        assert_eq!(kinds(&parsed.syntax, "doFor"), 1);
+        assert_eq!(kinds(&parsed.syntax, "do"), 1);
+    }
+
+    #[test]
+    fn malformed_or_unsupported_loop_headers_never_become_actions() {
+        for source in [
+            "def walk : Nat := do { for x xs do { visit x }; return 7 }",
+            "def walk : Nat := do { for x in xs; return 7 }",
+            "def walk : Nat := do { for x in xs do {}; return 7 }",
+            "def walk : Nat := do { for (x, y) in xs do { visit x }; return 7 }",
+            "def walk : Nat := do { for h : x in xs do { visit x }; return 7 }",
+            "def walk : Nat := do { for x in xs, y in ys do { visit x }; return 7 }",
+            "def walk : Nat := do { for x in xs do { break }; return 7 }",
+            "def walk : Nat := do { for x in xs do { continue }; return 7 }",
+            "def walk : Nat := do { for x in xs do { let mut y := x; visit y }; return 7 }",
+        ] {
+            assert!(parse_definition(source.as_ref()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn missing_indented_body_does_not_consume_the_enclosing_continuation() {
+        let source = "def walk : Nat := do\r\n  for x in xs do\r\n  return 7";
+        let error = parse_definition(source.as_ref()).expect_err("missing loop body");
+        assert_eq!(
+            error.primary_offset(),
+            Some(BytePos(source.find("return").unwrap()))
+        );
+    }
 }
