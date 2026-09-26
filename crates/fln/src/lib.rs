@@ -5479,6 +5479,9 @@ impl Engine {
         if let Some(lambda) = local_lambda {
             preparation.lambdas.push(lambda);
         }
+        preparation
+            .refine_expression_captures(&expression)
+            .map_err(EngineExecutionError::Ingress)?;
         let interfaces = preparation
             .finalize_callables(&mut catalog.functions)
             .map_err(EngineExecutionError::Ingress)?;

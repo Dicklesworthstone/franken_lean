@@ -306,6 +306,9 @@ impl Preparation<'_> {
                                 // literal helper from later call-site specialization.
                                 // Only lambda syntax moves; computed initializers
                                 // retain the ordinary strict binding below.
+                                // Retain checked types at its function-return stages
+                                // before substitution exposes their literal lambdas.
+                                let lambda = self.annotate_callable_tail(&lambda, type_)?;
                                 let body = self.substitution(body, &lambda)?;
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(Frame::Visit(body, expected));

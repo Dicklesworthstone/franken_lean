@@ -40,6 +40,16 @@ enum Work {
 }
 
 impl Preparation<'_> {
+    /// The entry expression has its own lexical scopes and is not a catalog
+    /// function. Its prepared local closures need the same capture discovery.
+    pub(crate) fn refine_expression_captures(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<(), IngressError> {
+        self.captured_result(expression, &[])?;
+        Ok(())
+    }
+
     /// Only local lambdas acquire more precise results. A catalog function's
     /// fixed parameter/result ABI, branch ABI, and recursive ABI remain exact.
     pub(in crate::runtime) fn refine_function_captures(
