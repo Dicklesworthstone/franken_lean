@@ -98,8 +98,9 @@
 mod uniform;
 
 // Motives and all constructor minors are shared by each mutual recursor.
-// Keep their quadratic reconstruction independently bounded.
-const MAX_MUTUAL_TYPES: usize = 8;
+// Keep their quadratic reconstruction independently bounded. The pinned
+// stdlib's widest block is 21 families with its nested auxiliaries.
+const MAX_MUTUAL_TYPES: usize = 32;
 
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
@@ -2026,13 +2027,18 @@ fn structural_expression_equal(
 
 /// Maximum number of constructors reconstructed by the bounded independent
 /// inductive judgment. Expected recursor rules are quadratic in this count;
-/// larger but otherwise valid blocks remain typed deferrals.
-pub const MAX_NONRECURSIVE_CONSTRUCTORS: usize = 32;
+/// larger but otherwise valid blocks remain typed deferrals. The pinned
+/// stdlib's widest block has 70 (`Lean.Meta.Grind.Arith.Cutsat.EqCnstr`, with
+/// its nested auxiliaries); `Std.Http.Status` has 64. Each is admitted in
+/// seconds, so the bound is a ceiling on work, not a guess at the stdlib.
+pub const MAX_NONRECURSIVE_CONSTRUCTORS: usize = 128;
 
 /// Maximum aggregate constructor fields in one independently reconstructed
 /// block. This is deliberately a block limit: recursor reconstruction touches
-/// every field type in every minor premise and computation rule.
-pub const MAX_NONRECURSIVE_FIELDS: usize = 64;
+/// every field type in every minor premise and computation rule. The pinned
+/// stdlib's widest block has 157 fields (`Lean.Meta.Grind.Arith.Cutsat.EqCnstr`);
+/// `Std.DHashMap.Raw.WF.below` has 144.
+pub const MAX_NONRECURSIVE_FIELDS: usize = 256;
 
 /// Maximum conservative node-and-level upper bound for one reconstructed
 /// recursor expression. The builder imports the prefix containing each field

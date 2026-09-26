@@ -237,11 +237,39 @@ fn all_block_members_and_recursor_rules_are_required() {
     extra_rule.recs[1].rules.push(copied_rule);
     assert!(!verdict(&rows(&extra_rule)).is_admitted());
 }
+/// The stdlib's widest block, `Lean.Meta.Grind.Arith.Cutsat.EqCnstr`, is 21
+/// families with its auxiliaries; `Lean.Doc.Block` is 9.
+#[test]
+fn wide_mutual_blocks_are_admitted_up_to_the_limit() {
+    accepts(&fixture(false, false, false, 9, Mutation::None));
+    accepts(&fixture(false, false, false, 21, Mutation::None));
+}
+
 #[test]
 fn wider_mutual_blocks_remain_explicit_support_nonanswers() {
     assert!(matches!(
-        verdict(&rows(&fixture(false, false, false, 9, Mutation::None))),
-        InductiveVerdict::Deferred(InductiveSupportLimit::MultipleTypes { observed: 9 })
+        verdict(&rows(&fixture(false, false, false, 33, Mutation::None))),
+        InductiveVerdict::Deferred(InductiveSupportLimit::MultipleTypes { observed: 33 })
+    ));
+}
+
+/// `Std.Http.Status` has 64 constructors and `Std.Http.Method` 40.
+#[test]
+fn enumerations_are_admitted_up_to_the_constructor_limit() {
+    accepts(&fixtures::enumeration(64));
+    assert!(matches!(
+        verdict(&rows(&fixtures::enumeration(129))),
+        InductiveVerdict::Deferred(_)
+    ));
+}
+
+/// `Std.DHashMap.Raw.WF.below` has 144 fields over 15 constructors.
+#[test]
+fn wide_blocks_are_admitted_up_to_the_field_limit() {
+    accepts(&fixtures::wide_structure(144));
+    assert!(matches!(
+        verdict(&rows(&fixtures::wide_structure(257))),
+        InductiveVerdict::Deferred(_)
     ));
 }
 #[test]

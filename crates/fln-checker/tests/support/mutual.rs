@@ -23,6 +23,8 @@ struct B {
     id: FVarId,
     user_name: Name,
     ty: Expr,
+    /// The binder's info in a Π telescope; λ binders are always default.
+    info: BinderInfo,
 }
 impl B {
     fn new(label: &str, ty: Expr) -> Self {
@@ -30,7 +32,12 @@ impl B {
             id: FVarId(name(label)),
             user_name: name(label),
             ty,
+            info: BinderInfo::Default,
         }
+    }
+    fn implicit(mut self) -> Self {
+        self.info = BinderInfo::Implicit;
+        self
     }
     fn named(mut self, user_name: Name) -> Self {
         self.user_name = user_name;
@@ -46,7 +53,7 @@ fn close(bs: &[B], mut body: Expr, lambda: bool) -> Expr {
         body = if lambda {
             Expr::lam(b.user_name.clone(), b.ty.clone(), body, BinderInfo::Default)
         } else {
-            Expr::forall_e(b.user_name.clone(), b.ty.clone(), body, BinderInfo::Default)
+            Expr::forall_e(b.user_name.clone(), b.ty.clone(), body, b.info)
         };
     }
     body
@@ -443,5 +450,137 @@ pub fn fixture(
         recs,
         recursive: !matches!(mutation, Mutation::FalseRecursive),
         reflexive: higher && !matches!(mutation, Mutation::FalseReflexive),
+    }
+}
+
+/// `Enum` with `n` constructors and its recursor, in the pin's form:
+/// `Enum.rec.{u} : (motive : Enum → Sort u) → motive c0 → … → (t : Enum) → motive t`.
+pub fn enumeration(n: usize) -> Fixture {
+    let family = name("Enum");
+    let universe = name("u");
+    let enum_type = constant(&family, &[]);
+    let ctor = |i: usize| name(&format!("Enum.c{i}"));
+    let motive = B::new(
+        "motive",
+        close(
+            &[B::new("t", enum_type.clone())],
+            Expr::sort(Level::param(universe.clone())),
+            false,
+        ),
+    )
+    .named(name("motive"))
+    .implicit();
+    let minors: Vec<B> = (0..n)
+        .map(|i| {
+            B::new(
+                &format!("minor{i}"),
+                Expr::app(motive.e(), constant(&ctor(i), &[])),
+            )
+        })
+        .collect();
+    let major = B::new("major", enum_type.clone()).named(name("t"));
+    let mut prefix = vec![motive.clone()];
+    prefix.extend(minors.iter().cloned());
+    let mut binders = prefix.clone();
+    binders.push(major.clone());
+    Fixture {
+        names: vec![family.clone()],
+        levels: vec![],
+        rec_levels: vec![universe],
+        parameters: 0,
+        types: vec![Type {
+            name: family.clone(),
+            ty: Expr::sort(Level::one()),
+            indices: 0,
+            ctors: (0..n).map(ctor).collect(),
+        }],
+        ctors: (0..n)
+            .map(|i| Ctor {
+                name: ctor(i),
+                ty: enum_type.clone(),
+                family: 0,
+                index: i,
+                fields: 0,
+            })
+            .collect(),
+        recs: vec![Rec {
+            name: name("Enum.rec"),
+            ty: close(&binders, Expr::app(motive.e(), major.e()), false),
+            indices: 0,
+            rules: (0..n)
+                .map(|i| Rule {
+                    ctor: ctor(i),
+                    fields: 0,
+                    rhs: close(&prefix, minors[i].e(), true),
+                })
+                .collect(),
+        }],
+        recursive: false,
+        reflexive: false,
+    }
+}
+
+/// `Wide : Type` with one constructor of `n` propositional fields and its
+/// recursor, in the pin's form.
+pub fn wide_structure(n: usize) -> Fixture {
+    let family = name("Wide");
+    let universe = name("u");
+    let wide_type = constant(&family, &[]);
+    let mk = name("Wide.mk");
+    let fields: Vec<B> = (0..n)
+        .map(|i| B::new(&format!("field{i}"), Expr::sort(Level::zero())))
+        .collect();
+    let motive = B::new(
+        "motive",
+        close(
+            &[B::new("t", wide_type.clone())],
+            Expr::sort(Level::param(universe.clone())),
+            false,
+        ),
+    )
+    .named(name("motive"))
+    .implicit();
+    let constructed = app(constant(&mk, &[]), fields.iter().map(B::e));
+    let minor = B::new(
+        "minor",
+        close(&fields, Expr::app(motive.e(), constructed), false),
+    )
+    .named(name("mk"));
+    let major = B::new("major", wide_type.clone()).named(name("t"));
+    let prefix = vec![motive.clone(), minor.clone()];
+    let mut binders = prefix.clone();
+    binders.push(major.clone());
+    let mut rule_binders = prefix.clone();
+    rule_binders.extend(fields.iter().cloned());
+    Fixture {
+        names: vec![family.clone()],
+        levels: vec![],
+        rec_levels: vec![universe],
+        parameters: 0,
+        types: vec![Type {
+            name: family.clone(),
+            ty: Expr::sort(Level::one()),
+            indices: 0,
+            ctors: vec![mk.clone()],
+        }],
+        ctors: vec![Ctor {
+            name: mk.clone(),
+            ty: close(&fields, wide_type.clone(), false),
+            family: 0,
+            index: 0,
+            fields: n,
+        }],
+        recs: vec![Rec {
+            name: name("Wide.rec"),
+            ty: close(&binders, Expr::app(motive.e(), major.e()), false),
+            indices: 0,
+            rules: vec![Rule {
+                ctor: mk,
+                fields: n,
+                rhs: close(&rule_binders, app(minor.e(), fields.iter().map(B::e)), true),
+            }],
+        }],
+        recursive: false,
+        reflexive: false,
     }
 }

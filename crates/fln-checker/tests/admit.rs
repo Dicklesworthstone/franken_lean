@@ -11691,7 +11691,8 @@ fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
 #[test]
 fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
     let entries = enumeration_entries(BinderInfo::Implicit);
-    let oversized = vec![entries[0].clone(); 35];
+    let limit = fln_checker::admit::MAX_NONRECURSIVE_CONSTRUCTORS + 2;
+    let oversized = vec![entries[0].clone(); limit + 1];
     assert!(matches!(
         admit_inductive(
             &ConstantEnvironment::empty(),
@@ -11700,11 +11701,8 @@ fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
             EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Deferred(
-            fln_checker::admit::InductiveSupportLimit::DeclarationRows {
-                observed: 35,
-                limit: 34,
-            }
-        )
+            fln_checker::admit::InductiveSupportLimit::DeclarationRows { observed, limit: bound }
+        ) if observed == limit + 1 && bound == limit
     ));
     let budget = AdmissionBudget::new(
         InferenceBudget::unlimited(),
