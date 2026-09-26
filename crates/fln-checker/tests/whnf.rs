@@ -2884,3 +2884,184 @@ fn a_remembered_reduction_is_not_replayed_under_another_materialization_budget()
     );
     assert_eq!(remembered, recomputed);
 }
+
+/// `Box1 (α : Type) | mk (a : α)` with its recursor in the pin's form, the
+/// structure `Box1` registered for projections, and the axioms the terms use.
+fn box1_context() -> WhnfContext {
+    let alpha = FVarId(primary_name("box1_alpha"));
+    let motive = FVarId(primary_name("box1_motive"));
+    let minor = FVarId(primary_name("box1_minor"));
+    let a = FVarId(primary_name("box1_a"));
+    let major = FVarId(primary_name("box1_major"));
+    let close = |ids: &[(&FVarId, Expr)], mut body: Expr, lambda: bool| {
+        for (id, ty) in ids.iter().rev() {
+            body = body.abstract_fvar(id, 0).expect("abstract");
+            body = if lambda {
+                Expr::lam(primary_name("x"), ty.clone(), body, BinderInfo::Default)
+            } else {
+                Expr::forall_e(primary_name("x"), ty.clone(), body, BinderInfo::Default)
+            };
+        }
+        body
+    };
+    let ty0 = Expr::sort(Level::one());
+    let box1 = |arg: Expr| Expr::app(constant("Box1"), arg);
+    let mk = |alpha: Expr, a: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Box1", "mk"]), vec![]),
+                alpha,
+            ),
+            a,
+        )
+    };
+    let u = Level::param(primary_name("u"));
+    let motive_type = close(
+        &[(&major, box1(Expr::fvar(alpha.clone())))],
+        Expr::sort(u),
+        false,
+    );
+    let minor_type = close(
+        &[(&a, Expr::fvar(alpha.clone()))],
+        Expr::app(
+            Expr::fvar(motive.clone()),
+            mk(Expr::fvar(alpha.clone()), Expr::fvar(a.clone())),
+        ),
+        false,
+    );
+    let rec_type = close(
+        &[
+            (&alpha, ty0.clone()),
+            (&motive, motive_type.clone()),
+            (&minor, minor_type.clone()),
+            (&major, box1(Expr::fvar(alpha.clone()))),
+        ],
+        Expr::app(Expr::fvar(motive.clone()), Expr::fvar(major.clone())),
+        false,
+    );
+    let rule = close(
+        &[
+            (&alpha, ty0.clone()),
+            (&motive, motive_type),
+            (&minor, minor_type),
+            (&a, Expr::fvar(alpha.clone())),
+        ],
+        Expr::app(Expr::fvar(minor.clone()), Expr::fvar(a.clone())),
+        true,
+    );
+    let entries = vec![
+        header_entry("A", ConstantKind::Axiom, ConstantSafety::Safe),
+        header_entry("f", ConstantKind::Axiom, ConstantSafety::Safe),
+        header_entry("M", ConstantKind::Axiom, ConstantSafety::Safe),
+        ConstantEntry::new(
+            checker_name("Box1"),
+            ConstantDeclaration::inductive(
+                vec![],
+                decoded(&close(&[(&alpha, ty0.clone())], ty0.clone(), false)),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![checker_name("Box1")],
+                    vec![checker_qualified(&["Box1", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Box1", "mk"]),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&close(
+                    &[(&alpha, ty0.clone()), (&a, Expr::fvar(alpha.clone()))],
+                    box1(Expr::fvar(alpha.clone())),
+                    false,
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Box1"), 0, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Box1", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![checker_name("Box1")],
+                    1,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(
+                        checker_qualified(&["Box1", "mk"]),
+                        1,
+                        decoded(&rule),
+                    )],
+                    false,
+                ),
+            ),
+        ),
+    ];
+    WhnfContext::new(
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name("Box1"),
+            checker_qualified(&["Box1", "mk"]),
+            1,
+        )],
+        constant_environment(entries),
+    )
+}
+
+/// `fun (a : A) => f (f (… (f a)))`, `depth` applications deep.
+fn wide_minor(depth: usize) -> Expr {
+    let mut body = Expr::bvar(0).expect("packs");
+    for _ in 0..depth {
+        body = Expr::app(constant("f"), body);
+    }
+    Expr::lam(primary_name("a"), constant("A"), body, BinderInfo::Default)
+}
+
+fn polls(term: &Expr, context: &WhnfContext) -> u64 {
+    let mut polls = 0_u64;
+    let outcome = whnf_with(&decoded(term), context, WhnfBudget::unlimited(), || {
+        polls += 1;
+        false
+    });
+    complete(outcome);
+    polls
+}
+
+/// A structure recursor with a stuck major rebuilds the major from projections,
+/// and needs the major's type, which mentions only the parameters. The motive
+/// and minor premise are substituted into that type only to renumber it. A
+/// large minor is copied once as part of the input and once by its own beta
+/// step, so it must cost less than twice that step. Measured: 1.75 times with
+/// the premises it does not mention left uncopied, 2.25 times without.
+#[test]
+fn a_structure_major_does_not_copy_the_premises_its_type_does_not_mention() {
+    let context = box1_context();
+    let major = Expr::fvar(FVarId(primary_name("stuck_major")));
+    let recursor = |minor: Expr| {
+        let head = Expr::const_(Name::from_components(["Box1", "rec"]), vec![Level::one()]);
+        [constant("A"), constant("M"), minor, major.clone()]
+            .into_iter()
+            .fold(head, Expr::app)
+    };
+    let beta = |minor: Expr| Expr::app(minor, Expr::proj(primary_name("Box1"), 0, major.clone()));
+    let (small, large) = (wide_minor(1), wide_minor(4000));
+    let recursor_extra =
+        polls(&recursor(large.clone()), &context) - polls(&recursor(small.clone()), &context);
+    let beta_extra = polls(&beta(large), &context) - polls(&beta(small), &context);
+    assert!(
+        beta_extra > 1000,
+        "the large minor must be large enough to measure ({beta_extra} polls)"
+    );
+    assert!(
+        recursor_extra < beta_extra * 2,
+        "the recursor spent {recursor_extra} polls on a large minor, its beta step {beta_extra}"
+    );
+}

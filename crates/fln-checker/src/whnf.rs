@@ -1467,6 +1467,25 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
         for (position, replacement) in arguments.range(end - needed..end).rev().enumerate() {
             self.control.step(term.root().index(), self.cancelled)?;
+            // Substituting an index that does not occur only renumbers the others,
+            // so any closed value gives the same term. The motive and minor
+            // premises before a structure's major are often large, and the
+            // major's type rarely mentions them.
+            if !loose_bound_occurs(&term, 0) {
+                term = self.control.term_halt(
+                    WhnfPhase::Iota,
+                    substitute_bound_subterms_with(
+                        &term,
+                        term.root(),
+                        0,
+                        &absent_value(),
+                        ExprId::ZERO,
+                        self.control.budget.materialization,
+                        &mut *self.cancelled,
+                    ),
+                )?;
+                continue;
+            }
             let replacement =
                 self.materialize_wire(&replacement.arena, replacement.root, WhnfPhase::Iota)?;
             // `needed` originated in a u32, and position is strictly below it.
@@ -3271,6 +3290,70 @@ pub(crate) fn whnf_delta_step_at_with(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
     whnf_at_mode_with(term, root, context, budget, DeltaMode::Once, cancelled)
+}
+
+/// Whether the loose index `target` occurs in `term`, counting it at every
+/// binder depth.
+fn loose_bound_occurs(term: &WireExpr, target: u32) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![(term.root(), 0u32)];
+    while let Some((id, depth)) = stack.pop() {
+        if !seen.insert((id, depth)) {
+            continue;
+        }
+        let Some(node) = term.node(id) else {
+            // A malformed arena is refused where it is read; say it may occur.
+            return true;
+        };
+        match node {
+            ExprNode::Bound { index } => {
+                if index.checked_sub(depth) == Some(target) {
+                    return true;
+                }
+            }
+            ExprNode::Apply { function, argument } => {
+                stack.push((*function, depth));
+                stack.push((*argument, depth));
+            }
+            ExprNode::Lambda {
+                binder_type, body, ..
+            }
+            | ExprNode::Forall {
+                binder_type, body, ..
+            } => {
+                stack.push((*binder_type, depth));
+                stack.push((*body, depth.saturating_add(1)));
+            }
+            ExprNode::Let {
+                type_, value, body, ..
+            } => {
+                stack.push((*type_, depth));
+                stack.push((*value, depth));
+                stack.push((*body, depth.saturating_add(1)));
+            }
+            ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+                stack.push((*expression, depth));
+            }
+            ExprNode::Free { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Constant { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_) => {}
+        }
+    }
+    false
+}
+
+/// A closed value for an index that does not occur.
+fn absent_value() -> WireExpr {
+    WireExpr::from_parts(
+        vec![ExprNode::Sort {
+            level: LevelId::ZERO,
+        }],
+        vec![LevelNode::Zero],
+        ExprId::ZERO,
+    )
 }
 
 fn whnf_at_mode_with(
