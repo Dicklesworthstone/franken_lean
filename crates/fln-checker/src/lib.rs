@@ -61,8 +61,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:3670` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3610`/`4218`/`5771` decide
+//!   directly as its verdict — `tc.rs:3685` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3625`/`4233`/`5786` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -74,7 +74,7 @@
 //!   kernel *skips work* on: `instantiate` returns early when
 //!   `loose_bvar_range() <= k` (`tc.rs:1893`), and the iterative
 //!   `abstract_fvar_set` and `replace_fvar` paths return early when
-//!   `!has_fvar()` (`tc.rs:5304`/`5499`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:5319`/`5514`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -314,13 +314,13 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:3670 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:3610 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:4218 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:5771 :: ExprNode::Sort { level } @@ fn finish_infer_proj
+//! cite crates/fln-kernel/src/tc.rs:3685 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:3625 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:4233 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:5786 :: ExprNode::Sort { level } @@ fn finish_infer_proj
 //! cite crates/fln-kernel/src/tc.rs:1893 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:5304 :: !e.has_fvar() || active == 0
-//! cite crates/fln-kernel/src/tc.rs:5499 :: if !e.has_fvar() {
+//! cite crates/fln-kernel/src/tc.rs:5319 :: !e.has_fvar() || active == 0
+//! cite crates/fln-kernel/src/tc.rs:5514 :: if !e.has_fvar() {
 //! cite crates/fln-hash/src/canon.rs:1210 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:699 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr

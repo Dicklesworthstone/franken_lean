@@ -188,6 +188,17 @@ impl InferenceContext {
         }
     }
 
+    /// This context for checking a declaration of safety `scope`; see
+    /// [`WhnfContext::admitting`].
+    pub fn admitting(mut self, scope: DefinitionSafety) -> InferenceContext {
+        self.reduction = Arc::new(self.reduction.admitting(scope));
+        self
+    }
+
+    pub fn scope(&self) -> DefinitionSafety {
+        self.reduction.scope()
+    }
+
     pub fn locals(&self) -> &[LocalDeclaration] {
         &self.locals
     }
@@ -3886,7 +3897,8 @@ impl<'a> InferenceEngine<'a> {
             self.reduction.projection_rules().to_vec(),
             self.context.constants().clone(),
         )
-        .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?
+        .admitting(self.context.scope());
         let mut budget = self.control.budget;
         budget.max_steps = budget.max_steps.saturating_sub(self.control.progress.steps);
         match proof_conversion_with(

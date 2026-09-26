@@ -78,7 +78,7 @@ impl SlowControl {
                     if found { Demand::Always } else { Demand::Never }
                 }
                 ExprNode::Constant { name, .. } => match context.constants().find(name) {
-                    Some(entry) if entry.delta_body().is_some() => Demand::Always,
+                    Some(entry) if context.delta_body(entry).is_some() => Demand::Always,
                     Some(entry)
                         if entry.kind() == crate::environment::ConstantKind::Constructor =>
                     {

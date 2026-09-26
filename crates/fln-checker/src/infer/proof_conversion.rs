@@ -794,7 +794,8 @@ impl Probe<'_> {
                         context.projection_rules().to_vec(),
                         context.constants().clone(),
                     )
-                    .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name }))?;
+                    .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name }))?
+                    .admitting(context.scope());
                     let left = self.open(&left, lb, &local)?;
                     let right = self.open(&right, rb, &local)?;
                     work.push(Work::Pair(left, right, context));
@@ -819,7 +820,8 @@ impl Probe<'_> {
                     )
                     .map_err(|_| {
                         self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() })
-                    })?;
+                    })?
+                    .admitting(context.scope());
                     let opened = self.open(&lambda, body, &local)?;
                     let applied = self.apply_to_free(&other, name)?;
                     let (left, right) = if lambda_on_left {

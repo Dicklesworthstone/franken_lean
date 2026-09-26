@@ -15135,3 +15135,59 @@ fn uniform_rule_table_cardinality_is_checked_before_untrusted_rule_traversal() {
         "{result:?}"
     );
 }
+
+/// An unsafe declaration may unfold the unsafe definitions it may reference,
+/// as the pin's `is_delta` does for any definition: `mkBox : Box := n₀` for an
+/// unsafe `Box : Type := N` needs `Box` unfolded to see that `n₀ : N` fits
+/// (the shape of `Lean.mkPtrMap : PtrMap α β`). A safe declaration still
+/// cannot reference `Box` at all.
+#[test]
+fn an_unsafe_declaration_unfolds_the_unsafe_definitions_it_references() {
+    let n = || decoded(&Expr::const_(primary_name("N"), Vec::new()));
+    let unsafe_definition = |name: &str, declared: WireExpr, body: WireExpr| {
+        ConstantEntry::new(
+            checker_name(name),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                declared,
+                ConstantSafety::Unsafe,
+                DefinitionBody::new(
+                    body,
+                    ReducibilityHint::Regular(1),
+                    DefinitionSafety::Unsafe,
+                    Vec::new(),
+                ),
+            ),
+        )
+    };
+    let environment = environment_of(vec![
+        ConstantEntry::new(
+            checker_name("N"),
+            header(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_name("n0"),
+            header(Vec::new(), n(), ConstantKind::Axiom, ConstantSafety::Safe),
+        ),
+        unsafe_definition("Box", decoded(&Expr::sort(Level::one())), n()),
+    ]);
+    let boxed = decoded(&Expr::const_(primary_name("Box"), Vec::new()));
+    let n0 = decoded(&Expr::const_(primary_name("n0"), Vec::new()));
+    let verdict = admit(
+        &environment,
+        &unsafe_definition("mkBox", boxed.clone(), n0.clone()),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let verdict = admit(
+        &environment,
+        &definition("safeBox", boxed, n0),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(matches!(verdict, Verdict::Rejected(_)), "{verdict:?}");
+}

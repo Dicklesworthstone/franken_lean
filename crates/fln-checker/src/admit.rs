@@ -614,6 +614,18 @@ fn first_repeated_level_parameter(
 /// is a term like `Sort 1` only after weak-head reduction, so a type whose
 /// well-formedness is hidden behind an unreduced application is judged on what it
 /// reduces to rather than on how it was written.
+/// The safety a declaration is checked at, which decides the definitions its
+/// checking may unfold, as the pin's `m_definition_safety` does.
+fn checking_scope(declaration: &ConstantDeclaration) -> DefinitionSafety {
+    if declaration.safety() == ConstantSafety::Unsafe {
+        DefinitionSafety::Unsafe
+    } else {
+        declaration
+            .definition_body()
+            .map_or(DefinitionSafety::Safe, DefinitionBody::safety)
+    }
+}
+
 fn declared_type_is_a_type(
     environment: &ConstantEnvironment,
     name: &WireName,
@@ -629,7 +641,7 @@ fn declared_type_is_a_type(
         declaration.level_parameters().to_vec(),
         environment.clone(),
     ) {
-        Ok(context) => context,
+        Ok(context) => context.admitting(checking_scope(declaration)),
         Err(refusal) => {
             return Err(Verdict::InternalFault(AdmissionFault::ContextUnbuildable {
                 name: name.clone(),
@@ -949,7 +961,7 @@ fn body_matches_declared_type(
         declaration.level_parameters().to_vec(),
         body_environment,
     ) {
-        Ok(context) => context,
+        Ok(context) => context.admitting(checking_scope(declaration)),
         Err(refusal) => {
             return Err(Verdict::InternalFault(AdmissionFault::ContextUnbuildable {
                 name: name.clone(),

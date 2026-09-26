@@ -58,12 +58,14 @@ pub enum ConstantSafety {
     Unsafe,
 }
 
-/// Definition safety is schema, not an admission decision. Delta reduction may
-/// unfold only `Safe` bodies belonging to a safe constant; retaining all three
-/// forms prevents the environment boundary from erasing that distinction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Definition safety is schema, not an admission decision. Delta reduction
+/// unfolds a body only where the declaration being checked may reference it
+/// (see [`ConstantDeclaration::delta_body_in`]); retaining all three forms
+/// prevents the environment boundary from erasing that distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DefinitionSafety {
     Unsafe,
+    #[default]
     Safe,
     Partial,
 }
@@ -518,19 +520,31 @@ impl ConstantDeclaration {
     }
 
     /// Return the body only when every schema dimension permits delta
-    /// reduction. This keeps callers from forgetting the common unsafe flag.
+    /// reduction in a safe declaration. This keeps callers from forgetting the
+    /// common unsafe flag.
     pub fn delta_body(&self) -> Option<&DefinitionBody> {
-        if self.kind == ConstantKind::Definition
-            && self.safety == ConstantSafety::Safe
-            && matches!(
-                self.definition_body().map(DefinitionBody::safety),
-                Some(DefinitionSafety::Safe)
-            )
-        {
-            self.definition_body()
-        } else {
-            None
+        self.delta_body_in(DefinitionSafety::Safe)
+    }
+
+    /// The body delta reduction may unfold while checking a declaration of
+    /// safety `scope`: exactly the definitions such a declaration may reference
+    /// (KR-973). A safe declaration unfolds safe definitions, a partial one
+    /// partial definitions as well, and an unsafe one any definition. The pin's
+    /// `is_delta` has no safety gate at all; its reference rule is what keeps a
+    /// non-safe body out of a safe declaration. Refusing delta everywhere only
+    /// deferred unsafe declarations whose types need an unsafe definition
+    /// unfolded, such as `Lean.mkPtrMap : PtrMap α β`.
+    pub fn delta_body_in(&self, scope: DefinitionSafety) -> Option<&DefinitionBody> {
+        if self.kind != ConstantKind::Definition {
+            return None;
         }
+        let body = self.definition_body()?;
+        let referable = match (self.safety, body.safety()) {
+            (ConstantSafety::Safe, DefinitionSafety::Safe) => true,
+            (ConstantSafety::Safe, DefinitionSafety::Partial) => scope != DefinitionSafety::Safe,
+            _ => scope == DefinitionSafety::Unsafe,
+        };
+        referable.then_some(body)
     }
 
     pub fn is_delta_unfoldable(&self) -> bool {

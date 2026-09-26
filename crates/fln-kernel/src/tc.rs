@@ -2931,7 +2931,7 @@ impl<'a> TypeChecker<'a> {
                 // A theorem carries no `DefinitionSafety`, and the pin reports
                 // `is_unsafe() == false` for every theorem, so the KR-973
                 // refusal stays on this arm rather than becoming a shared gate.
-                if defn.safety != DefinitionSafety::Safe {
+                if !self.may_unfold(defn.safety) {
                     return Ok(None);
                 }
                 (defn.value.clone(), defn.base.level_params.clone())
@@ -2964,6 +2964,21 @@ impl<'a> TypeChecker<'a> {
         Ok(Some(unfolded))
     }
 
+    /// KR-307 under KR-973: a definition unfolds in exactly the contexts that
+    /// may reference it. The pin's `is_delta` has no safety gate at all
+    /// (`type_checker.cpp`, `is_delta`); the reference rule, checked on every
+    /// constant in `Check` mode, is what keeps a non-safe body out of a safe
+    /// context. Refusing delta as well only rejected unsafe declarations whose
+    /// types need an unsafe definition unfolded, such as
+    /// `Lean.mkPtrMap : PtrMap α β := Std.HashMap.emptyWithCapacity capacity`.
+    fn may_unfold(&self, definition: DefinitionSafety) -> bool {
+        match definition {
+            DefinitionSafety::Safe => true,
+            DefinitionSafety::Partial => self.safety != DefinitionSafety::Safe,
+            DefinitionSafety::Unsafe => self.safety == DefinitionSafety::Unsafe,
+        }
+    }
+
     fn definition_height(&self, e: &Expr) -> Option<u32> {
         let mut head = e;
         while let ExprNode::App { f, .. } = head.node() {
@@ -2973,7 +2988,7 @@ impl<'a> TypeChecker<'a> {
             return None;
         };
         match self.env.find(name)? {
-            ConstantInfo::Defn(d) if d.safety == DefinitionSafety::Safe => {
+            ConstantInfo::Defn(d) if self.may_unfold(d.safety) => {
                 Some(match d.hints {
                     ReducibilityHints::Regular(h) => h,
                     // Abbrev unfolds eagerly (treated as tall); Opaque as height 0.

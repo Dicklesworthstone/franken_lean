@@ -2005,7 +2005,7 @@ fn definition_height(
                 return Ok(context
                     .constants()
                     .find(name)
-                    .and_then(|constant| constant.delta_body())
+                    .and_then(|constant| context.delta_body(constant))
                     .map(|definition| definition.hint().delta_height()));
             }
             ExprNode::Bound { .. }
@@ -3318,7 +3318,7 @@ fn regular_same_head_apps_def_eq(
     let is_regular = context
         .constants()
         .find(left_name)
-        .and_then(|constant| constant.delta_body())
+        .and_then(|constant| context.delta_body(constant))
         .map(|definition| matches!(definition.hint(), ReducibilityHint::Regular(_)))
         .unwrap_or(false);
 

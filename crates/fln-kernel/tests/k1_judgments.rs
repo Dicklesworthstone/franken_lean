@@ -8545,3 +8545,44 @@ fn kr316_a_recursor_under_a_binder_is_not_deferred_to_an_enclosing_chain() {
         "a recursor under the K check's binder must be reduced in its own scope: {verdict:?}"
     );
 }
+
+/// KR-307 under KR-973: an unsafe declaration unfolds the unsafe definitions
+/// it may reference, as the pin's `is_delta` does for any definition.
+/// `mkBox : Box := n₀` for an unsafe `Box : Type := N` needs `Box` unfolded to
+/// see that `n₀ : N` fits; this is the shape of `Lean.mkPtrMap : PtrMap α β`,
+/// which K1 rejected. A safe declaration still may not reference `Box`.
+#[test]
+fn kr973_an_unsafe_declaration_unfolds_the_unsafe_definitions_it_references() {
+    let unsafe_defn = |name: &str, type_: Expr, value: Expr| {
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Unsafe,
+            all: vec![n(name)],
+        })
+    };
+    let env = admit(&Environment::new(), &axiom("N", sort1()));
+    let env = admit(&env, &axiom("n0", Expr::const_(n("N"), vec![])));
+    let env = admit(
+        &env,
+        &unsafe_defn("Box", sort1(), Expr::const_(n("N"), vec![])),
+    );
+    let boxed = Expr::const_(n("Box"), vec![]);
+    let n0 = Expr::const_(n("n0"), vec![]);
+    let verdict = check(
+        &env,
+        &unsafe_defn("mkBox", boxed.clone(), n0.clone()),
+        Budget::DEFAULT,
+    );
+    assert!(verdict.is_accepted(), "{verdict:?}");
+    assert_eq!(
+        reject_class(&check(&env, &defn("safeBox", boxed, n0), Budget::DEFAULT)),
+        Some(RejectClass::SafetyViolation),
+        "a safe declaration still may not reference an unsafe definition"
+    );
+}

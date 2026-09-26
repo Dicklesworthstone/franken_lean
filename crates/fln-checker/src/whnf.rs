@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use memo::WhnfMemo;
 
-use crate::environment::{ConstantEnvironment, RecursorDeclaration};
+use crate::environment::{
+    ConstantDeclaration, ConstantEnvironment, DefinitionBody, DefinitionSafety, RecursorDeclaration,
+};
 use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
@@ -108,6 +110,9 @@ pub struct WhnfContext {
     free_bindings: Vec<FreeBinding>,
     projection_rules: Vec<ProjectionRule>,
     constants: ConstantEnvironment,
+    /// The safety of the declaration being checked, which decides which
+    /// definitions delta may unfold (`ConstantDeclaration::delta_body_in`).
+    scope: DefinitionSafety,
     /// Results already computed under this context; see `memo`.
     memo: WhnfMemo,
 }
@@ -119,6 +124,7 @@ impl fmt::Debug for WhnfContext {
             .field("free_bindings", &self.free_bindings)
             .field("projection_rules", &self.projection_rules)
             .field("constants", &self.constants)
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -133,8 +139,32 @@ impl WhnfContext {
             free_bindings,
             projection_rules,
             constants,
+            scope: DefinitionSafety::Safe,
             memo: WhnfMemo::default(),
         }
+    }
+
+    /// This context for checking a declaration of safety `scope`. A different
+    /// scope unfolds different definitions, so it starts its own memo.
+    pub fn admitting(&self, scope: DefinitionSafety) -> WhnfContext {
+        let mut context = self.clone();
+        if scope != self.scope {
+            context.scope = scope;
+            context.memo = WhnfMemo::default();
+        }
+        context
+    }
+
+    pub fn scope(&self) -> DefinitionSafety {
+        self.scope
+    }
+
+    /// The body delta may unfold for `constant` in this context.
+    pub(crate) fn delta_body<'a>(
+        &self,
+        constant: &'a ConstantDeclaration,
+    ) -> Option<&'a DefinitionBody> {
+        constant.delta_body_in(self.scope)
     }
 
     pub fn free_bindings(&self) -> &[FreeBinding] {
@@ -923,7 +953,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let Some(constant) = self.context.source.constants().find(name) else {
             return Ok(None);
         };
-        let Some(definition) = constant.delta_body() else {
+        let Some(definition) = self.context.source.delta_body(constant) else {
             return Ok(None);
         };
         if constant.level_parameters().len() != levels.len() {
