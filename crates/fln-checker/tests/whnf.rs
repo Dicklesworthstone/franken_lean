@@ -2644,6 +2644,60 @@ fn open_arithmetic_demands_do_not_turn_spent_work_into_false_progress() {
         "{outcome:?}"
     );
 }
+/// An open discriminant is not evaluated as a literal: the pin's `reduce_nat`
+/// refuses any input with a free variable, and so does the demanded lane. The
+/// major `wrap (tower x)` normalizes to `Nat.succ (tower x)`, a constructor
+/// application iota fires on, so the predecessor is `tower x` either way.
+/// Normalizing `tower x` first, in the hope of a literal, walks all of `tower`
+/// for nothing, and the open discriminants of
+/// `assemble₃_eq_some_iff_utf8EncodeChar_eq` nest that walk until it takes
+/// minutes.
+#[test]
+fn an_open_demanded_major_is_not_normalized_for_a_literal() {
+    const DEPTH: usize = 200;
+    let succ = |value| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            value,
+        )
+    };
+    let lambda = |body| {
+        Expr::lam(
+            primary_name("n"),
+            constant("Nat"),
+            body,
+            BinderInfo::Default,
+        )
+    };
+    let tower = (0..DEPTH).fold(Expr::bvar(0).unwrap(), |inner, _| succ(inner));
+    let mut entries = nat_literal_family_entries();
+    for (name, body) in [("tower", tower), ("wrap", succ(Expr::bvar(0).unwrap()))] {
+        entries.push(definition_entry(
+            name,
+            vec![],
+            decoded(&lambda(body)),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ));
+    }
+    let context = definition_context(entries);
+    let tower_x = Expr::app(constant("tower"), Expr::fvar(FVarId(primary_name("x"))));
+    let alone = complete(whnf(&decoded(&tower_x), &context, WhnfBudget::unlimited()));
+    let major = Expr::app(constant("wrap"), tower_x);
+    let term = decoded(&nat_predecessor_application(major));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        frozen(&result.term, result.term.root()),
+        frozen(&alone.term, alone.term.root())
+    );
+    assert!(
+        result.steps < alone.steps + 64,
+        "the predecessor of `wrap (tower x)` took {} steps against {} for `tower x` \
+         alone: the open discriminant was normalized for a literal",
+        result.steps,
+        alone.steps
+    );
+}
 #[test]
 fn demanded_arithmetic_does_not_bypass_a_foreign_recursor_family() {
     let major = natural_operation("beq", [numeric_literal(7), numeric_literal(7)]);

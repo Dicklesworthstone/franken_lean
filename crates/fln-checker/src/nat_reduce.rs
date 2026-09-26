@@ -775,8 +775,14 @@ pub(crate) fn is_potential_nat_reduction(term: &WireExpr, root: ExprId) -> bool 
 pub(crate) enum NatReductionScope {
     ClosedPair,
     EagerOpenPair,
-    /// A recursor is computing its discriminant, not comparing an arbitrary
-    /// open term pair. Operand normalization is demanded by iota reduction.
+    /// A recursor is computing its discriminant, not comparing a pair, so
+    /// there is no companion to check. The discriminant itself must be
+    /// closed, as the pin's `reduce_nat` requires of every input
+    /// (`has_fvar`): an open one such as `Nat.succ (… c …)` for a local `c` is
+    /// already a constructor application or unfolds to the recursor it is
+    /// stuck on, and normalizing its operands in the hope of a literal cost
+    /// `assemble₃_eq_some_iff_utf8EncodeChar_eq` minutes of nested attempts
+    /// that all failed.
     DemandedMajor,
 }
 
@@ -1372,33 +1378,35 @@ fn reduce_inner(
         }
     };
 
-    if scope == NatReductionScope::ClosedPair {
-        if !is_closed(
+    if scope != NatReductionScope::EagerOpenPair
+        && !is_closed(
             candidate,
             NatReductionInput::Candidate,
             candidate_root,
             &mut control,
-        )? {
-            return Ok(NatReductionOutcome::NotReduced {
-                reason: NatNotReduced::OpenPair {
-                    input: NatReductionInput::Candidate,
-                },
-                progress: control.progress,
-            });
-        }
-        if !is_closed(
+        )?
+    {
+        return Ok(NatReductionOutcome::NotReduced {
+            reason: NatNotReduced::OpenPair {
+                input: NatReductionInput::Candidate,
+            },
+            progress: control.progress,
+        });
+    }
+    if scope == NatReductionScope::ClosedPair
+        && !is_closed(
             companion,
             NatReductionInput::Companion,
             companion_root,
             &mut control,
-        )? {
-            return Ok(NatReductionOutcome::NotReduced {
-                reason: NatNotReduced::OpenPair {
-                    input: NatReductionInput::Companion,
-                },
-                progress: control.progress,
-            });
-        }
+        )?
+    {
+        return Ok(NatReductionOutcome::NotReduced {
+            reason: NatNotReduced::OpenPair {
+                input: NatReductionInput::Companion,
+            },
+            progress: control.progress,
+        });
     }
 
     let top_cursor = Cursor {
