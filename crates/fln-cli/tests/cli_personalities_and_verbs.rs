@@ -259,6 +259,130 @@ fn check_olean_continue_refuses_receipts_a_single_file_and_repeats() {
     assert_eq!(parallel, serial);
 }
 
+/// Run `fln check-olean` with `args`, returning exit code, stdout and stderr.
+fn check_olean_run(args: &[&std::ffi::OsStr]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .arg("check-olean")
+        .args(args)
+        .output()
+        .expect("run fln check-olean");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+    )
+}
+
+/// `check-olean --continue ROOT...`: further roots join the module set, so a
+/// library is checked together with the libraries it imports. Two paths are a
+/// usage error without --continue; a module found under two roots, or a root
+/// that is not a directory, is refused before anything is checked; and the
+/// modules of every root reach the frontier.
+#[test]
+fn check_olean_continue_joins_module_set_roots() {
+    let first = TempDir::new("roots-first");
+    let second = TempDir::new("roots-second");
+    for root in [&first.0, &second.0] {
+        std::fs::create_dir_all(root.join("Shared")).unwrap();
+        std::fs::write(root.join("Shared").join("Twice.olean"), b"not decoded").unwrap();
+    }
+    let (code, _, stderr) = check_olean_run(&[first.0.as_os_str(), second.0.as_os_str()]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("several module-set roots with --continue"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = check_olean_run(&[
+        "--continue".as_ref(),
+        first.0.as_os_str(),
+        second.0.as_os_str(),
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("module Shared.Twice is found under more than one root"),
+        "{stderr}"
+    );
+    let file = first.0.join("Shared").join("Twice.olean");
+    let (code, _, stderr) = check_olean_run(&[
+        "--continue".as_ref(),
+        second.0.as_os_str(),
+        file.as_os_str(),
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("must be a real directory"), "{stderr}");
+
+    // Distinct modules under two roots both reach the frontier. These bytes do
+    // not decode, so each fails; what is checked is that the second root's
+    // module is in the set at all.
+    let other = TempDir::new("roots-other");
+    std::fs::create_dir_all(other.0.join("Other")).unwrap();
+    std::fs::write(other.0.join("Other").join("Once.olean"), b"not decoded").unwrap();
+    let (code, stdout, stderr) = check_olean_run(&[
+        "--continue".as_ref(),
+        "--json".as_ref(),
+        first.0.as_os_str(),
+        other.0.as_os_str(),
+    ]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stdout.contains("\"modules\":2"), "{stdout}");
+    assert!(stdout.contains("\"module\":\"Shared.Twice\""), "{stdout}");
+    assert!(stdout.contains("\"module\":\"Other.Once\""), "{stdout}");
+}
+
+/// The joined roots resolve imports across roots. `Init.Coe` imports
+/// `Init.Prelude`: alone, its root fails with that import named; with
+/// Prelude's root joined, both are checked and accepted. It needs the pinned
+/// toolchain, and checking `Init.Prelude` in a debug build took 108 s, so it
+/// runs on demand:
+///
+/// `cargo test -p fln-cli --test cli_personalities_and_verbs \
+///   check_olean_continue_resolves_imports_across_roots -- --ignored --exact`
+#[test]
+#[ignore = "cost: checks Init.Prelude through the council; needs the pinned toolchain"]
+fn check_olean_continue_resolves_imports_across_roots() {
+    let library = std::env::var_os("ELAN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".elan"))
+        })
+        .map(|elan| {
+            elan.join("toolchains")
+                .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                .join("lib")
+                .join("lean")
+        })
+        .filter(|library| library.join("Init").join("Coe.olean").is_file())
+        .expect("the pinned toolchain library, with Init.Coe");
+    let prelude = TempDir::new("roots-prelude");
+    let coe = TempDir::new("roots-coe");
+    // Each module is copied with its `.olean.server` and `.olean.private` parts.
+    for (root, module) in [(&prelude.0, "Prelude"), (&coe.0, "Coe")] {
+        std::fs::create_dir_all(root.join("Init")).unwrap();
+        for part in ["olean", "olean.server", "olean.private"] {
+            let file = format!("{module}.{part}");
+            std::fs::copy(
+                library.join("Init").join(&file),
+                root.join("Init").join(&file),
+            )
+            .unwrap();
+        }
+    }
+    let (code, stdout, stderr) =
+        check_olean_run(&["--continue".as_ref(), "--json".as_ref(), coe.0.as_os_str()]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stdout.contains("\"failed\":1"), "{stdout}");
+    assert!(stdout.contains("Init.Prelude"), "{stdout}");
+    let (code, stdout, stderr) = check_olean_run(&[
+        "--continue".as_ref(),
+        "--json".as_ref(),
+        coe.0.as_os_str(),
+        prelude.0.as_os_str(),
+    ]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("\"accepted\":2"), "{stdout}");
+    assert!(stdout.contains("\"blocked\":0"), "{stdout}");
+}
+
 /// A3 criterion 2: the K2 line is tied to the engines the kernel crate exports, in
 /// both directions, so doctor cannot claim or deny a second engine the code lacks.
 #[test]

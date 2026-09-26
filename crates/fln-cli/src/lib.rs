@@ -92,7 +92,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH\n",
+    "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
     "  fln check-source [--json] [--max-bytes BYTES] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -172,7 +172,10 @@ const USAGE: &str = concat!(
     "JSON lines to stderr: \"started\" as a module goes to the council, and\n",
     "\"decided\" with its row once every earlier row exists. --jobs N checks up to\n",
     "N modules at once; each module is checked against its own import closure, so\n",
-    "the rows do not depend on N, only their wall time does.\n",
+    "the rows do not depend on N, only their wall time does. With --continue,\n",
+    "further ROOT directories join the module set, so a library checks together\n",
+    "with the libraries it imports (a toolchain's lib/lean, a package's build);\n",
+    "a module found under two roots is refused, and --max-bytes bounds the set.\n",
     "`audit --tcb` inventories the trust surface of one import-free .olean or a\n",
     "closed directory set: every axiom declaration, plus unsafe and partial\n",
     "definitions. It decodes only; it does not kernel-check or interpret\n",
@@ -318,7 +321,9 @@ enum MultiplexerCommand {
     Help,
     Version,
     CheckOlean {
-        path: PathBuf,
+        /// The input path, then any further module-set roots (`--continue`
+        /// only). Never empty.
+        roots: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
         receipts: Option<PathBuf>,
@@ -872,11 +877,15 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
     else {
         return Ok(MultiplexerCommand::Help);
     };
-    let [path] = paths.as_slice() else {
-        return Err(UsageError(
-            "check-olean accepts exactly one input path".to_owned(),
-        ));
-    };
+    match paths.as_slice() {
+        [_] => {}
+        [_, _, ..] if continue_on_failure => {}
+        _ => {
+            return Err(UsageError(
+                "check-olean accepts exactly one input path, or several module-set roots with --continue".to_owned(),
+            ));
+        }
+    }
     if progress && !continue_on_failure {
         return Err(UsageError(
             "--progress streams per-module rows, so it requires --continue".to_owned(),
@@ -888,7 +897,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         ));
     }
     Ok(MultiplexerCommand::CheckOlean {
-        path: path.clone(),
+        roots: paths,
         max_bytes,
         json,
         receipts,
@@ -8187,6 +8196,79 @@ fn render_check_olean_set_success(
 
 const CHECK_OLEAN_FRONTIER_SCHEMA: &str = "fln.check-olean-frontier/1";
 
+/// Join the modules under each further root to `modules`, in root order, for a
+/// frontier over a library together with the libraries it imports. A root must
+/// be a real directory, a module name found under two roots is refused (the
+/// set would not say which artifact it checked), and `max_bytes` bounds the
+/// whole set, not each root.
+fn add_module_set_roots(
+    mut modules: Vec<NamedOleanBytes>,
+    roots: &[PathBuf],
+    max_bytes: usize,
+) -> Result<Vec<NamedOleanBytes>, (&'static str, String)> {
+    let module_bytes = |module: &NamedOleanBytes| {
+        module.bytes.len()
+            + module.server_bytes.as_ref().map_or(0, Vec::len)
+            + module.private_bytes.as_ref().map_or(0, Vec::len)
+    };
+    let mut used = modules.iter().map(module_bytes).sum::<usize>();
+    let mut names = modules
+        .iter()
+        .map(|module| module.name.clone())
+        .collect::<BTreeSet<_>>();
+    for root in roots {
+        match std::fs::symlink_metadata(root) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            Ok(_) => {
+                return Err((
+                    "input",
+                    format!(
+                        "module-set root {} must be a real directory, not a symlink or a file",
+                        root.display()
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err((
+                    "input",
+                    format!("cannot inspect {}: {error}", root.display()),
+                ));
+            }
+        }
+        let added = collect_olean_directory(root, max_bytes.saturating_sub(used))
+            .map_err(|error| (error.class(), error.to_string()))?;
+        for module in added {
+            if !names.insert(module.name.clone()) {
+                return Err((
+                    "input",
+                    format!(
+                        "module {} is found under more than one root; the last was {}",
+                        module.name.to_display_string(),
+                        root.display()
+                    ),
+                ));
+            }
+            used = used.saturating_add(module_bytes(&module));
+            modules.push(module);
+        }
+    }
+    let limit = fln::OleanCheckLimits::new(
+        max_bytes,
+        fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+    )
+    .max_modules;
+    if modules.len() > limit {
+        return Err((
+            "resource",
+            format!(
+                ".olean module count {} exceeds the limit {limit}",
+                modules.len()
+            ),
+        ));
+    }
+    Ok(modules)
+}
+
 /// `fln check-olean --continue DIR`: one verdict row per module instead of an
 /// all-or-nothing answer. Exit 0 only when every module is accepted; 4 on any
 /// internal fault; 1 when any module failed or was blocked; 3 when the only
@@ -8523,7 +8605,7 @@ fn check_olean_module_bytes(
 }
 
 fn check_olean(
-    path: &Path,
+    roots: &[PathBuf],
     max_bytes: usize,
     json: bool,
     receipts: Option<&Path>,
@@ -8531,6 +8613,9 @@ fn check_olean(
     progress: bool,
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
+    let Some((path, extra_roots)) = roots.split_first() else {
+        return check_olean_failure("input", "no input path", false, json, 1);
+    };
     if continue_on_failure && receipts.is_some() {
         return check_olean_failure(
             "input",
@@ -8590,6 +8675,18 @@ fn check_olean(
             }
         };
         if continue_on_failure {
+            let modules = match add_module_set_roots(modules, extra_roots, max_bytes) {
+                Ok(modules) => modules,
+                Err((class, detail)) => {
+                    return check_olean_failure(
+                        class,
+                        &detail,
+                        false,
+                        json,
+                        if class == "resource" { 3 } else { 1 },
+                    );
+                }
+            };
             return check_olean_module_frontier(modules, max_bytes, json, progress, jobs);
         }
         return check_olean_module_bytes(modules, max_bytes, json, receipts.map(Path::to_path_buf));
@@ -12321,7 +12418,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             MultiplexerOutput::success(format!("fln {}\n", env!("CARGO_PKG_VERSION")))
         }
         Ok(MultiplexerCommand::CheckOlean {
-            path,
+            roots,
             max_bytes,
             json,
             receipts,
@@ -12329,7 +12426,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             progress,
             jobs,
         }) => check_olean(
-            &path,
+            &roots,
             max_bytes,
             json,
             receipts.as_deref(),
