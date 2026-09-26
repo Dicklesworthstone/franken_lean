@@ -109,12 +109,58 @@ impl std::fmt::Debug for DataflowNode {
     }
 }
 
+/// Only domains with precise read AND write effects need an access index.
+/// Simp/option reads conflict with generic extension writers, handled as global
+/// barriers below. Names in different typed domains must not alias.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DependencyKey {
+    Declaration(Name),
+    Instances(Name),
+    Grammar(Name),
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeyAccesses {
+    readers: HashSet<CommandId>,
+    writers: HashSet<CommandId>,
+}
+
+fn keyed_access(effect: &CommandEffect) -> Option<(DependencyKey, bool)> {
+    match effect {
+        CommandEffect::ReadsDecl { name, .. } => {
+            Some((DependencyKey::Declaration(name.clone()), false))
+        }
+        CommandEffect::WritesDecl { name } => {
+            Some((DependencyKey::Declaration(name.clone()), true))
+        }
+        CommandEffect::ReadsInstances { class_head } => {
+            Some((DependencyKey::Instances(class_head.clone()), false))
+        }
+        CommandEffect::WritesInstance { class_head, .. } => {
+            Some((DependencyKey::Instances(class_head.clone()), true))
+        }
+        CommandEffect::ReadsGrammar { category } => {
+            Some((DependencyKey::Grammar(category.clone()), false))
+        }
+        CommandEffect::WritesGrammar { category } => {
+            Some((DependencyKey::Grammar(category.clone()), true))
+        }
+        CommandEffect::ReadsSimpSet { .. }
+        | CommandEffect::ReadsOption { .. }
+        | CommandEffect::WritesEnvExtension { .. }
+        | CommandEffect::UsesCapability { .. }
+        | CommandEffect::Opaque { .. } => None,
+    }
+}
+
 /// A directed acyclic dataflow graph of commands within a module.
 #[derive(Debug, Clone, Default)]
 pub struct DataflowGraph {
     nodes: Vec<DataflowNode>,
-    /// Conservative footprints, in the same source order as `nodes`.
-    footprints: Vec<EffectSummary>,
+    /// Per-key access history: constructing disjoint nodes does not scan the
+    /// entire prefix. Work is proportional to effects and conflicting edges.
+    accesses: HashMap<DependencyKey, KeyAccesses>,
+    barriers: HashSet<CommandId>,
     /// Predecessors of each node (nodes that must execute/commit before this node).
     dependencies: HashMap<CommandId, HashSet<CommandId>>,
     /// Successors of each node (nodes that depend on this node).
@@ -133,15 +179,37 @@ impl DataflowGraph {
         let mut deps = HashSet::new();
 
         let footprint = node.dependency_effects();
-        // All edges point backwards in insertion/source order. This includes
-        // RAW, WAR, WAW, typed registry conflicts, and BOTH sides of a barrier.
-        // A barrier only waiting for predecessors is not enough: successors
-        // must also wait for it before taking their environment snapshots.
-        for (previous, effects) in self.nodes.iter().zip(&self.footprints) {
-            if previous.id != node_id && !effects.commutes_with(&footprint) {
-                deps.insert(previous.id);
+        // All edges point backwards in insertion/source order. Both sides of
+        // a barrier matter, including successors with completely empty effects.
+        if footprint.is_barrier() {
+            deps.extend(self.nodes.iter().map(|previous| previous.id));
+        } else {
+            deps.extend(self.barriers.iter().copied());
+        }
+        let accesses: Vec<_> = footprint.effects().iter().filter_map(keyed_access).collect();
+        for (key, write) in &accesses {
+            if let Some(previous) = self.accesses.get(key) {
+                deps.extend(previous.writers.iter().copied());
+                if *write {
+                    deps.extend(previous.readers.iter().copied());
+                }
             }
         }
+        // Record only AFTER querying all keys, so a command reading and writing
+        // the same declaration cannot accidentally depend on itself.
+        for (key, write) in accesses {
+            let history = self.accesses.entry(key).or_default();
+            if write {
+                history.writers.insert(node_id);
+            } else {
+                history.readers.insert(node_id);
+            }
+        }
+        if footprint.is_barrier() {
+            self.barriers.insert(node_id);
+        }
+        // Duplicate identities remain an explicit validate() refusal.
+        deps.remove(&node_id);
 
         // Update dependents
         for &dep in &deps {
@@ -149,7 +217,6 @@ impl DataflowGraph {
         }
 
         self.dependencies.insert(node_id, deps);
-        self.footprints.push(footprint);
         self.nodes.push(node);
     }
 

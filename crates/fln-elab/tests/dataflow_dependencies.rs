@@ -221,3 +221,87 @@ fn commutativity_is_symmetric_for_the_effect_vocabulary() {
         }
     }
 }
+
+#[test]
+fn indexed_dependencies_match_pairwise_effect_conflicts() {
+    // Reproducible generated graphs, without a random-number dependency. This
+    // tests the live Rust index against the public commutativity specification.
+    let variants = [
+        read("a"), write("a"), read("b"), write("b"),
+        CommandEffect::ReadsInstances { class_head: name("a") },
+        CommandEffect::WritesInstance { class_head: name("a"), instance_name: name("i") },
+        CommandEffect::WritesInstance { class_head: name("b"), instance_name: name("i") },
+        CommandEffect::ReadsGrammar { category: name("a") },
+        CommandEffect::WritesGrammar { category: name("a") },
+        CommandEffect::WritesGrammar { category: name("b") },
+        CommandEffect::ReadsSimpSet { simp_name: name("a") },
+        CommandEffect::ReadsOption { key: "a".into() },
+        CommandEffect::WritesEnvExtension { extension_name: name("a") },
+        CommandEffect::UsesCapability { capability_id: "io".into() },
+        CommandEffect::Opaque { reason: "opaque".into() },
+    ];
+    let mut seed = 0x5eed_u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 32) as usize
+    };
+    for _ in 0..256 {
+        let mut graph = DataflowGraph::new();
+        for index in 0..24 {
+            let mut summary = EffectSummary::new();
+            for _ in 0..next() % 5 {
+                summary.record(variants[next() % variants.len()].clone());
+            }
+            if next() % 23 == 0 {
+                summary.demote_to_opaque("perturbation".into());
+            }
+            let mut current = node(1000 - index * 7, summary);
+            if next() % 3 == 0 {
+                current.name = Some(name("a"));
+            }
+            if next() % 3 == 0 {
+                current.declared_names.push(name("b"));
+            }
+            if next() % 3 == 0 {
+                current.referenced_names.push(name("b"));
+            }
+            let current_effects = current.dependency_effects();
+            let expected: HashSet<_> = graph.nodes().iter()
+                .filter(|previous| {
+                    !previous.dependency_effects().commutes_with(&current_effects)
+                })
+                .map(|previous| previous.id)
+                .collect();
+            let id = current.id;
+            graph.add_node(current);
+            assert_eq!(graph.dependencies_of(id).unwrap(), &expected);
+        }
+        graph.validate().unwrap();
+        let mut expected = HashSet::from([graph.nodes()[0].id]);
+        for current in graph.nodes() {
+            if graph.dependencies_of(current.id).unwrap().iter()
+                .any(|dependency| expected.contains(dependency))
+            {
+                expected.insert(current.id);
+            }
+        }
+        let expected: Vec<_> = graph.nodes().iter()
+            .filter(|current| expected.contains(&current.id))
+            .map(|current| current.id)
+            .collect();
+        assert_eq!(graph.affected_commands(&[graph.nodes()[0].id]).unwrap(), expected);
+    }
+}
+
+#[test]
+fn large_disjoint_graph_has_no_accidental_edges_or_invalidation() {
+    let mut graph = DataflowGraph::new();
+    for id in 0..4096 {
+        graph.add_node(node(id, effects([write(&format!("independent_{id}"))])));
+    }
+    graph.validate().unwrap();
+    for current in graph.nodes() {
+        assert!(graph.dependencies_of(current.id).unwrap().is_empty());
+    }
+    assert_eq!(graph.affected_commands(&[CommandId(2048)]).unwrap(), vec![CommandId(2048)]);
+}

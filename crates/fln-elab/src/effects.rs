@@ -200,8 +200,8 @@ impl EffectSummary {
             return false;
         }
 
-        // Compare typed keys directly: graph construction calls this for each
-        // candidate predecessor, so avoid allocating four temporary sets.
+        // Compare typed keys directly during staged-product validation; avoid
+        // allocating four temporary declaration sets for each comparison.
         for eff1 in &self.effects {
             for eff2 in &other.effects {
                 match (eff1, eff2) {

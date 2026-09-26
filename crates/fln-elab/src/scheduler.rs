@@ -8,6 +8,9 @@
 //! Successful products have the same environment, messages, InfoTrees and
 //! decisions as sequential execution under the command effect contract.
 
+mod incremental;
+pub use incremental::{IncrementalOutput, IncrementalScheduler};
+
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
