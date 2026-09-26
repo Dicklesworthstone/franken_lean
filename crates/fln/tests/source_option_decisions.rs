@@ -1,16 +1,14 @@
-//! Native Option decisions must survive both checker seats at the public facade.
+//! Native Option proofs use the real attribute/source-batch/dual-checker path.
 #![forbid(unsafe_code)]
 
-use fln::{Budget, Engine, EngineAdmissionLimits, Name, Outcome};
-use fln_elab::check_definition_source;
-use fln_kernel::verdict::Verdict;
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
 
-fn budget() -> Budget {
-    Budget::for_stack_bytes(2 * 1024 * 1024)
+fn limits() -> EngineAdmissionLimits {
+    EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
 
 fn engine() -> Engine {
-    let result = Engine::with_source_seed(EngineAdmissionLimits::new(budget()))
+    let result = Engine::with_source_seed(limits())
         .expect("source seed must pass both checker seats");
     let Outcome::Complete(engine) = result else {
         panic!("source seed did not complete: {result:?}");
@@ -22,51 +20,62 @@ fn engine() -> Engine {
 }
 
 #[test]
-fn option_decisions_are_available_without_manual_instance_registration() {
+fn option_instance_attribute_and_proofs_survive_both_checker_seats() {
     let engine = engine();
-    for source in [
-        "theorem same : (Option.some 0 : Option Nat) = Option.some 0 := by decide",
-        "theorem different : Not ((Option.some 0 : Option Nat) = Option.some 1) := by decide",
-        "theorem empty_left : Not ((Option.none : Option Nat) = Option.some 0) := by decide",
-        "theorem empty_right : Not ((Option.some 0 : Option Nat) = Option.none) := by decide",
-        "theorem empty_same : (Option.none : Option Nat) = Option.none := by decide",
-        "theorem nested : Option.some (Option.none : Option Bool) = Option.some (Option.none : Option Bool) := by decide",
-        "theorem nested_different : Not (Option.some (Option.none : Option Bool) = Option.some (Option.some Bool.false)) := by decide",
-        "def lifted {A : Type 1} [DecidableEq A] (x y : Option A) : Decidable (x = y) := decEq x y",
+    let source = include_bytes!("../../../examples/native_option_decide.lean");
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    let result = engine
+        .check_source_files(&[source.as_slice()], &options, SourceCheckLimits::new(limits()))
+        .expect("native Option example must elaborate and pass both checker seats");
+    let Outcome::Complete(checked) = result else {
+        panic!("source batch did not complete: {result:?}");
+    };
+    assert_eq!(checked.theorems, 7);
+    for label in [
+        "option_same",
+        "option_different",
+        "option_empty_left",
+        "option_empty_right",
+        "option_empty_same",
+        "option_nested_same",
+        "option_nested_different",
+        "option_lifted",
     ] {
-        let checked = check_definition_source(source.as_bytes(), engine.environment(), budget())
-            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
-        assert!(
-            matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
-            "{source}\n{:?}",
-            checked.outcome
-        );
-        let admitted = engine
-            .admit_decl(checked.declaration, EngineAdmissionLimits::new(budget()))
-            .unwrap_or_else(|error| panic!("{source}\nindependent admission: {error:?}"));
-        assert!(
-            matches!(admitted, Outcome::Complete(_)),
-            "{source}\nindependent admission: {admitted:?}"
-        );
+        assert!(checked.engine.environment().contains(&Name::from_components([label])));
+        assert!(!engine.environment().contains(&Name::from_components([label])));
     }
+    assert_eq!(engine.logical_root(&options), before);
 }
 
 #[test]
-fn false_option_claims_never_reach_a_successful_source_verdict() {
+fn false_option_claims_refuse_without_publishing_the_batch_prefix() {
     let engine = engine();
-    for source in [
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    for claim in [
         "theorem false_element : (Option.some 0 : Option Nat) = Option.some 1 := by decide",
         "theorem false_constructor : (Option.none : Option Nat) = Option.some 0 := by decide",
         "theorem false_negation : Not ((Option.some 0 : Option Nat) = Option.some 0) := by decide",
         "theorem false_nested : Option.some (Option.none : Option Bool) = Option.some (Option.some Bool.false) := by decide",
     ] {
-        if let Ok(checked) =
-            check_definition_source(source.as_bytes(), engine.environment(), budget())
-        {
-            assert!(
-                !matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
-                "{source}"
-            );
-        }
+        let source = format!(
+            "attribute [instance] instDecidableEqOption\ndef unpublished_prefix : Nat := 0\n{claim}\n"
+        );
+        let result = engine.check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits()),
+        );
+        let error = result.expect_err("a false Option proof must refuse, not succeed or time out");
+        let (kind, _, _) = error.disposition();
+        assert!(
+            matches!(kind, "elaboration" | "kernel-rejection"),
+            "{claim}\nunexpected refusal: {error} ({kind})"
+        );
+        assert!(!engine.environment().contains(&Name::from_components([
+            "unpublished_prefix",
+        ])));
+        assert_eq!(engine.logical_root(&options), before);
     }
 }
