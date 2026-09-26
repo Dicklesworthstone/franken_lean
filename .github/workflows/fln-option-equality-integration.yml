@@ -1,0 +1,106 @@
+name: Integrate constructive Option equality
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fln-option-equality-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-option-equality-integration
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Inspect current work graph and registration seam
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, pathlib
+          for line in pathlib.Path('.beads/issues.jsonl').read_text().splitlines():
+              item = json.loads(line)
+              title = item.get('title', '')
+              if item.get('status') not in ('closed', 'tombstone') and any(word in title.lower() for word in ('decid', 'synod', 'instance', 'prelude')):
+                  print(item.get('id'), item.get('status'), item.get('priority'), title)
+          source = pathlib.Path('crates/fln/src/lib.rs').read_text().splitlines()
+          for index, line in enumerate(source):
+              if 'instDecidableEqNat' in line:
+                  print('\n'.join(f'{i+1}: {source[i]}' for i in range(max(0,index-12), min(len(source),index+14))))
+          PY
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Integrate candidate without changing admission policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/option-equality
+          python3 -I - <<'PY'
+          from pathlib import Path
+          path = Path('crates/fln-elab/src/seed.rs')
+          source = path.read_text()
+          if 'mod decidable_option;' not in source:
+              edits = [
+                  ('mod decidable_generic;\n', 'mod decidable_generic;\nmod decidable_option;\n'),
+                  ('pub fn source_seed_declarations() -> [Declaration; 91]', 'pub fn source_seed_declarations() -> [Declaration; 92]'),
+                  ('        list_tail,\n    ]\n}', '        list_tail,\n        decidable_option::option_equality_decision_seed_declaration(),\n    ]\n}'),
+              ]
+              for old, new in edits:
+                  assert source.count(old) == 1, f'seed anchor drift: {old!r}'
+                  source = source.replace(old, new, 1)
+              path.write_text(source)
+          path = Path('crates/fln-elab/src/seed/decidable_option.rs')
+          source = path.read_text().replace('let sort = universe.succ()', 'let sort = universe.clone().succ()')
+          path.write_text(source)
+          PY
+          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/decidable_option.rs
+          git diff --check
+          git diff > target/option-equality/implementation.patch
+      - name: Check and exercise constructive decisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p fln-elab --all-targets 2>&1 | tee target/option-equality/check.log
+          cargo test --locked -p fln-elab seed::decidable_option -- --nocapture 2>&1 | tee target/option-equality/option-tests.log
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/option-equality/elab-tests.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/option-equality/facade-tests.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/option-equality/workspace-check.log
+      - name: Commit tested source integration directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-elab/src/seed.rs|crates/fln-elab/src/seed/decidable_option.rs) ;;
+              *) printf 'Unexpected changed path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git add -- crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/decidable_option.rs
+          if ! git diff --cached --quiet; then
+            git config user.name 'FrankenLean source integration'
+            git config user.email 'noreply@github.com'
+            git commit -m 'feat(elab): admit generic Option equality in the native source seed'
+            git push origin HEAD:main
+          fi
+          git rev-parse HEAD | tee target/option-equality/published-commit.txt
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: option-equality-${{ github.sha }}
+          path: target/option-equality
+          retention-days: 7
+          if-no-files-found: warn
