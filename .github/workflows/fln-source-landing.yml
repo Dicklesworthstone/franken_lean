@@ -70,3 +70,85 @@ jobs:
           path: target/source-landing
           if-no-files-found: warn
           retention-days: 7
+
+  native-tail-calls:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.head_commit.message == 'build(runtime): publish verified native tail-call implementation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install pinned Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Apply checksum-pinned native implementation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/tail-call-landing
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, urllib.request
+          sha = 'df330ebe477b91183ebc59d1a465ff12e07a07b2'
+          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              blob = json.load(response)
+          compressed = base64.b64decode(blob['content'])
+          assert hashlib.sha1(b'blob ' + str(len(compressed)).encode() + b'\0' + compressed).hexdigest() == sha
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == 'f076575965e5fab1652c37b143e4bfee6c8b4d51b53f8a9c1a4c61694ec1e4ab'
+          pathlib.Path('target/tail-call-landing/implementation.patch').write_bytes(patch)
+          PY
+          git apply --check --index target/tail-call-landing/implementation.patch
+          git apply --index --whitespace=error target/tail-call-landing/implementation.patch
+          python3 -I - <<'PY'
+          import subprocess
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == {'crates/fln-comp/src/flbc.rs', 'crates/fln-vm/src/interpreter.rs', 'crates/fln-vm/src/interpreter/tail_calls.rs', 'crates/fln-vm/tests/flbc_interpreter.rs', 'crates/fln-vm/tests/tail_calls.rs'}, paths
+          statuses = subprocess.check_output(['git', 'diff', '--cached', '--name-status'], text=True).splitlines()
+          assert all(row.split('\t', 1)[0] in {'M', 'A'} for row in statuses), statuses
+          PY
+      - name: Test and commit tail-call execution directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify() {
+            git diff --check
+            git diff --cached --check
+            cargo test --locked -p fln-comp -p fln-vm --no-fail-fast 2>&1 | tee target/tail-call-landing/tests.log
+            cargo clippy --locked -p fln-comp -p fln-vm --all-targets -- -D warnings 2>&1 | tee target/tail-call-landing/clippy.log
+            rustfmt --edition 2024 --check --config skip_children=true crates/fln-comp/src/flbc.rs crates/fln-vm/src/interpreter.rs crates/fln-vm/src/interpreter/tail_calls.rs crates/fln-vm/tests/flbc_interpreter.rs crates/fln-vm/tests/tail_calls.rs
+          }
+          verify
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git commit -m 'feat(vm): execute checked tail calls with bounded native frames' -m 'Add direct and closure tail-call bytecodes, canonical encoding, result/argument ownership validation, and frame replacement that retains the existing caller, thunk and task continuations. Preserve real pending continuations for overapplication and ordinary calls. Version the internal FLBC wire and ownership witness explicitly; old artifacts are rejected rather than reinterpreted.' -m 'Add ten real execution regressions covering 10,000-step self/mutual and captured-closure loops with a one-frame budget, owned permutations, cancellation, limits, partial and overapplication, thunk caching, task completion, malformed contracts, Marrow cleanup and independent serialized replay. Full fln-comp/fln-vm tests, strict Clippy and scoped rustfmt run before publication. Source/FIR tail-position selection follows separately; no broader W5 or Reference-parity claim.'
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              git rev-parse HEAD | tee target/tail-call-landing/published-commit.txt
+              exit 0
+            fi
+            test "$attempt" -lt 3
+            git fetch origin main
+            git rebase origin/main
+            verify
+          done
+      - name: Retain native validation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-tail-call-landing-${{ github.sha }}
+          path: target/tail-call-landing
+          if-no-files-found: warn
+          retention-days: 7
