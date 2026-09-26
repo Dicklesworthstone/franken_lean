@@ -485,3 +485,154 @@ fn the_typed_lane_takes_on_each_obligation_once() {
          repeated argument pair ({walk} each): an obligation was taken on again"
     );
 }
+
+/// Two applications of one head whose arguments differ only in a proof are
+/// equal by congruence, which the typed lane now tries first, as the pin tries
+/// it before unfolding a regular definition. `U q (slow q)` against
+/// `U p (slow p)`: untyped conversion defers at `q ≟ p` before it reaches the
+/// `slow` pair, and the lane then closes `slow q ≟ slow p` by proof
+/// irrelevance on `q ≟ p` without unfolding `slow`. Without the attempt, the
+/// lane walks `slow q ≟ slow p` untyped first. Measured on
+/// `utf8DecodeChar?_eq_assemble₄`, whose `b[0]` differ only in their bound
+/// proofs: 941 s to an exhausted budget, then 5.6 s.
+#[test]
+fn a_proof_argument_under_one_head_closes_by_congruence() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq_with};
+    use fln_checker::whnf::WhnfContext;
+    const WRAPS: usize = 200;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound, |inner, _| app(c("wrapP"), [inner]));
+    let slow = |proof: &str| app(c("slow"), [c(proof)]);
+    let u = |proof: &str| app(c("U"), [c(proof), slow(proof)]);
+    let env = environment_of(vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("wrapP", pi(c("P"), c("P"))),
+        entry("U", pi(c("P"), pi(c("P"), Expr::sort(Level::one())))),
+        definition(
+            "slow",
+            decoded(&pi(c("P"), c("P"))),
+            decoded(&lam(c("P"), tower)),
+        ),
+        entry("w", u("q")),
+    ]);
+    let walk_polls = Cell::new(0_u64);
+    let walk = def_eq_with(
+        &decoded(&slow("q")),
+        &decoded(&slow("p")),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            walk_polls.set(walk_polls.get() + 1);
+            false
+        },
+    );
+    assert!(
+        matches!(walk, DefEqOutcome::Deferred { .. }),
+        "untyped conversion must defer the pair for this test to mean anything: {walk:?}"
+    );
+    let walk = walk_polls.get();
+    assert!(
+        walk > u64::try_from(WRAPS).expect("small"),
+        "one walk: {walk} polls"
+    );
+    let candidate = definition("d", decoded(&u("p")), decoded(&c("w")));
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || {
+        polls.set(polls.get() + 1);
+        false
+    });
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    assert!(
+        2 * admission < walk,
+        "admission polled {admission} times, half an untyped walk of \
+         `slow q ≟ slow p` ({walk}): the lane unfolded `slow` instead of trying \
+         congruence"
+    );
+}
+
+/// Congruence is only sufficient. `T2 (k b) q` against `T2 (k a) p` reaches the
+/// typed lane, since untyped conversion defers the proofs `q ≟ p`. There the
+/// attempt on `k b ≟ k a` fails, `b` and `a` being distinct data, although `k`
+/// ignores its argument; the pair goes on to the rules that unfold `k`, and the
+/// whole is admitted. Distinct data under a head that keeps it stays refused.
+#[test]
+fn a_pair_congruence_cannot_establish_takes_the_other_rules() {
+    let t2 = |data: Expr, proof: &str| app(c("T2"), [data, c(proof)]);
+    let env = environment_of(vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("a", c("A")),
+        entry("b", c("A")),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("T2", pi(c("A"), pi(c("P"), Expr::sort(Level::one())))),
+        definition(
+            "k",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), c("a"))),
+        ),
+        definition(
+            "keep",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), Expr::bvar(0).expect("bound variable"))),
+        ),
+        entry("wk", t2(app(c("k"), [c("b")]), "q")),
+        entry("wkeep", t2(app(c("keep"), [c("b")]), "q")),
+    ]);
+    accepted(
+        &env,
+        &candidate("ignored", t2(app(c("k"), [c("a")]), "p"), c("wk")),
+    );
+    refused(
+        &env,
+        &candidate("kept", t2(app(c("keep"), [c("a")]), "p"), c("wkeep")),
+    );
+}
+
+/// A failed congruence attempt is not made again. `F` is an opaque constant, so
+/// `S (Fⁿ b) ≟ S (Fⁿ a)` fails congruence at every depth, and each failure hands
+/// its pair to the other rules, whose decomposition reaches the pair below
+/// again. Remembering the failed attempts keeps the work polynomial in the
+/// depth: doubling the depth multiplies it by far less than eight. Repeating
+/// them would double it with every level, which the poll cap turns into an
+/// inconclusive verdict instead of a hang.
+#[test]
+fn a_failed_congruence_attempt_is_not_made_again() {
+    let chain =
+        |depth: usize, base: &str| (0..depth).fold(c(base), |inner, _| app(c("F"), [inner]));
+    let run = |depth: usize, cap: u64| {
+        let env = environment_of(vec![
+            entry("A", Expr::sort(Level::one())),
+            entry("a", c("A")),
+            entry("b", c("A")),
+            entry("F", pi(c("A"), c("A"))),
+            entry("S", pi(c("A"), Expr::sort(Level::one()))),
+            entry("w", app(c("S"), [chain(depth, "b")])),
+        ]);
+        let candidate = definition(
+            "d",
+            decoded(&app(c("S"), [chain(depth, "a")])),
+            decoded(&c("w")),
+        );
+        let polls = Cell::new(0_u64);
+        let verdict = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || {
+            polls.set(polls.get() + 1);
+            polls.get() > cap
+        });
+        (verdict, polls.get())
+    };
+    let (shallow, shallow_polls) = run(10, u64::MAX);
+    assert!(
+        matches!(shallow, Verdict::Rejected(_) | Verdict::Deferred(_)),
+        "{shallow:?}"
+    );
+    let (deep, deep_polls) = run(20, 8 * shallow_polls);
+    assert!(
+        matches!(deep, Verdict::Rejected(_) | Verdict::Deferred(_)),
+        "depth 20 did not finish within eight times depth 10's {shallow_polls} polls \
+         ({deep_polls} polled): {deep:?}"
+    );
+}

@@ -10,7 +10,7 @@
 //! Probes explicitly disable this lane, so nested conversion never recursively
 //! reenters typed inference.
 use super::*;
-use crate::universe::{NormalNode, normalize};
+use crate::universe::{NormalNode, level_roots_equal, normalize};
 use crate::wire::WireLevel;
 
 /// The kind of task a pair of terms was taken on as, in the lane's worklist.
@@ -33,6 +33,39 @@ struct Probe<'a> {
     stop: Option<InferenceStop>,
     reserved: BTreeSet<WireName>,
     next: u64,
+    /// Pairs whose congruence attempt failed. Like the pin's `failed_before`,
+    /// it only stops the attempt being repeated; the pair itself takes the
+    /// other rules.
+    incongruent: PairSet,
+}
+/// A set of term pairs, looked up without copying the terms.
+#[derive(Default)]
+struct PairSet {
+    buckets: std::collections::HashMap<u64, Vec<(WireExpr, WireExpr)>>,
+}
+impl PairSet {
+    fn fingerprint(left: &WireExpr, right: &WireExpr) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        left.hash(&mut hasher);
+        right.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn contains(&self, left: &WireExpr, right: &WireExpr) -> bool {
+        !self.buckets.is_empty()
+            && self
+                .buckets
+                .get(&Self::fingerprint(left, right))
+                .is_some_and(|pairs| pairs.iter().any(|(l, r)| l == left && r == right))
+    }
+    fn insert(&mut self, left: WireExpr, right: WireExpr) {
+        if !self.contains(&left, &right) {
+            self.buckets
+                .entry(Self::fingerprint(&left, &right))
+                .or_default()
+                .push((left, right));
+        }
+    }
 }
 type Result<T> = std::result::Result<T, Box<InferenceOutcome>>;
 impl Probe<'_> {
@@ -207,6 +240,52 @@ impl Probe<'_> {
                 Err(self.fault(InferenceFault::DefEq { argument: 0, fault }))
             }
         }
+    }
+    /// The argument pairs of two applications of one head: the same local, or
+    /// the same constant at equal universe levels, applied to equally many
+    /// arguments.
+    fn same_head_arguments(
+        &mut self,
+        left: &WireExpr,
+        right: &WireExpr,
+    ) -> Result<Option<Vec<(ExprId, ExprId)>>> {
+        let spine = |term: &WireExpr| {
+            let mut arguments = Vec::new();
+            let mut id = term.root();
+            while let Some(ExprNode::Apply { function, argument }) = term.node(id) {
+                arguments.push(*argument);
+                id = *function;
+            }
+            arguments.reverse();
+            (id, arguments)
+        };
+        let (left_head, left_arguments) = spine(left);
+        let (right_head, right_arguments) = spine(right);
+        if left_arguments.is_empty() || left_arguments.len() != right_arguments.len() {
+            return Ok(None);
+        }
+        self.tick()?;
+        let same_head = match (left.node(left_head), right.node(right_head)) {
+            (
+                Some(ExprNode::Constant {
+                    name: left_name,
+                    levels: left_levels,
+                }),
+                Some(ExprNode::Constant {
+                    name: right_name,
+                    levels: right_levels,
+                }),
+            ) => {
+                left_name == right_name
+                    && left_levels.len() == right_levels.len()
+                    && left_levels.iter().zip(right_levels).all(|(l, r)| {
+                        level_roots_equal(left.levels(), *l, right.levels(), *r).unwrap_or(false)
+                    })
+            }
+            (Some(ExprNode::Free { name: l }), Some(ExprNode::Free { name: r })) => l == r,
+            _ => false,
+        };
+        Ok(same_head.then(|| left_arguments.into_iter().zip(right_arguments).collect()))
     }
     fn proof_type(
         &mut self,
@@ -574,6 +653,19 @@ impl Probe<'_> {
     ) -> Result<bool> {
         enum Work {
             Pair(WireExpr, WireExpr, InferenceContext),
+            /// A pair whose congruence attempt failed, taking the other rules;
+            /// the flag is the root's `root_deferred`.
+            Rules(WireExpr, WireExpr, InferenceContext, bool),
+            /// Every task above this one is an argument obligation of a
+            /// congruence attempt on the pair, so reaching it means they all
+            /// held. `trail` is the length of the taken-trail at the attempt.
+            Attempt {
+                left: WireExpr,
+                right: WireExpr,
+                context: InferenceContext,
+                skip_untyped: bool,
+                trail: usize,
+            },
             Binders(
                 WireExpr,
                 WireExpr,
@@ -616,23 +708,81 @@ impl Probe<'_> {
         // they produce then differ in that local's name.
         let mut taken: std::collections::HashSet<(Taken, WireExpr, WireExpr)> =
             std::collections::HashSet::new();
+        // A congruence attempt only proposes obligations: when one fails, the
+        // attempt is abandoned and the tasks it took on are not established.
+        // `trail` records what was taken while an attempt is open, so that
+        // abandoning it can give those tasks back.
+        let mut trail: Vec<(Taken, WireExpr, WireExpr)> = Vec::new();
+        let mut attempts = 0_usize;
         'work: while let Some(task) = work.pop() {
+            // A task that does not hold fails the innermost open congruence
+            // attempt, whose pair then takes the other rules; outside every
+            // attempt it fails the run.
+            macro_rules! fail {
+                () => {{
+                    let Some(marker) = work
+                        .iter()
+                        .rposition(|task| matches!(task, Work::Attempt { .. }))
+                    else {
+                        return Ok(false);
+                    };
+                    work.truncate(marker + 1);
+                    if let Some(Work::Attempt {
+                        left,
+                        right,
+                        context,
+                        skip_untyped,
+                        trail: mark,
+                    }) = work.pop()
+                    {
+                        attempts -= 1;
+                        for entry in trail.drain(mark..) {
+                            taken.remove(&entry);
+                        }
+                        self.incongruent.insert(left.clone(), right.clone());
+                        work.push(Work::Rules(left, right, context, skip_untyped));
+                    }
+                    continue 'work;
+                }};
+            }
             self.tick()?;
-            let (kind, a, b) = match &task {
-                Work::Pair(left, right, _) => (Taken::Pair, left, right),
-                Work::Binders(left, right, ..) => (Taken::Binders, left, right),
+            let key = match &task {
+                Work::Pair(left, right, _) => Some((Taken::Pair, left, right)),
+                Work::Binders(left, right, ..) => Some((Taken::Binders, left, right)),
                 Work::Eta {
                     lambda,
                     other,
                     lambda_on_left,
                     ..
-                } => (Taken::Eta(*lambda_on_left), lambda, other),
+                } => Some((Taken::Eta(*lambda_on_left), lambda, other)),
+                Work::Rules(..) | Work::Attempt { .. } => None,
             };
-            if !taken.insert((kind, a.clone(), b.clone())) {
-                continue;
+            if let Some((kind, a, b)) = key {
+                let entry = (kind, a.clone(), b.clone());
+                if taken.contains(&entry) {
+                    continue;
+                }
+                if attempts > 0 {
+                    trail.push(entry.clone());
+                }
+                taken.insert(entry);
             }
-            let (left, right, context) = match task {
-                Work::Pair(left, right, context) => (left, right, context),
+            let (left, right, context, try_congruence, skip) = match task {
+                Work::Pair(left, right, context) => (
+                    left,
+                    right,
+                    context,
+                    true,
+                    std::mem::take(&mut skip_untyped),
+                ),
+                Work::Rules(left, right, context, skip) => (left, right, context, false, skip),
+                Work::Attempt { .. } => {
+                    attempts -= 1;
+                    if attempts == 0 {
+                        trail.clear();
+                    }
+                    continue;
+                }
                 Work::Binders(left, right, lb, rb, domain, context) => {
                     let (name, local) = self.local()?;
                     let mut locals = context.locals().to_vec();
@@ -680,10 +830,47 @@ impl Probe<'_> {
                     continue;
                 }
             };
-            if !std::mem::take(&mut skip_untyped) {
+            if left == right {
+                continue;
+            }
+            // Congruence first, with each argument pair decided by this lane.
+            // The pin tries congruence before unfolding two applications of one
+            // regular definition (`lazy_delta_reduction_step`), comparing the
+            // arguments with the full conversion. The untyped converter makes
+            // that attempt without types, so it cannot equate proofs: a pair
+            // differing only in a proof argument, such as
+            // `parseFirstByte (b[0]'h₁)` against `parseFirstByte (b[0]'h₂)`,
+            // unfolds on both sides until it defers, and cost
+            // `utf8DecodeChar?_eq_assemble₄` its whole budget. Congruence is
+            // sufficient, so a pair it cannot establish goes on to the rules
+            // below unchanged.
+            if try_congruence
+                && let Some(arguments) = self.same_head_arguments(&left, &right)?
+                && !self.incongruent.contains(&left, &right)
+            {
+                let mut obligations = Vec::with_capacity(arguments.len());
+                for (left_argument, right_argument) in arguments {
+                    obligations.push(Work::Pair(
+                        self.piece(&left, left_argument)?,
+                        self.piece(&right, right_argument)?,
+                        context.clone(),
+                    ));
+                }
+                work.push(Work::Attempt {
+                    left,
+                    right,
+                    context,
+                    skip_untyped: skip,
+                    trail: trail.len(),
+                });
+                attempts += 1;
+                work.extend(obligations.into_iter().rev());
+                continue;
+            }
+            if !skip {
                 match self.equal(&left, &right, &context)? {
                     Some(true) => continue,
-                    Some(false) => return Ok(false),
+                    Some(false) => fail!(),
                     None => {}
                 }
             }
@@ -701,10 +888,10 @@ impl Probe<'_> {
                 continue;
             }
             let Some(l) = self.whnf(&left, &context)? else {
-                return Ok(false);
+                fail!()
             };
             let Some(r) = self.whnf(&right, &context)? else {
-                return Ok(false);
+                fail!()
             };
             // A changed head may expose ordinary conversion or proof evidence.
             if l != left || r != right {
@@ -827,7 +1014,7 @@ impl Probe<'_> {
                 ) => {
                     let (binder_type, body) = (*binder_type, *body);
                     let Some(other_domain) = self.pi_domain(&r, &context)? else {
-                        return Ok(false);
+                        fail!()
                     };
                     let domain = self.piece(&l, binder_type)?;
                     work.push(Work::Eta {
@@ -848,7 +1035,7 @@ impl Probe<'_> {
                 ) => {
                     let (binder_type, body) = (*binder_type, *body);
                     let Some(other_domain) = self.pi_domain(&l, &context)? else {
-                        return Ok(false);
+                        fail!()
                     };
                     let domain = self.piece(&r, binder_type)?;
                     work.push(Work::Eta {
@@ -861,7 +1048,7 @@ impl Probe<'_> {
                     });
                     work.push(Work::Pair(other_domain, domain, context));
                 }
-                _ => return Ok(false),
+                _ => fail!(),
             }
         }
         Ok(true)
@@ -996,6 +1183,7 @@ pub(crate) fn proof_conversion_with(
         stop: None,
         reserved: BTreeSet::new(),
         next: 0,
+        incongruent: PairSet::default(),
     };
     match probe.run(left, right, context, true) {
         Ok(equal) => ProofConversionOutcome::Complete {
