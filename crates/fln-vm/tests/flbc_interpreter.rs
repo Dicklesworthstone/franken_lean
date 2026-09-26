@@ -10932,3 +10932,156 @@ fn float_intrinsics_stop_on_budget_or_cancellation_without_publishing_or_leaking
             && event.kind != shadow::EventKind::ForeignPointer
     }));
 }
+
+#[test]
+fn float_to_string_intrinsics_match_pinned_fixed_decimal_format() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let row = format!("extern:{family}.toString");
+        for (input, expected) in [
+            (0.0, "0.000000"),
+            (-0.0, "-0.000000"),
+            (1.5, "1.500000"),
+            (-2.25, "-2.250000"),
+            (2.1, "2.100000"),
+            (1.0 / 3.0, "0.333333"),
+            (1.0e-7, "0.000000"),
+            (-1.0e-7, "-0.000000"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "NaN"),
+            // These exact binary fractions put the sixth decimal digit at
+            // a tie: decimal rendering rounds to even, unlike Float.round.
+            (1.0 / 128.0, "0.007812"),
+            (3.0 / 128.0, "0.023438"),
+            (-1.0 / 128.0, "-0.007812"),
+            (-3.0 / 128.0, "-0.023438"),
+        ] {
+            let value = run_float(&row, vec![float_operand(r(0), binary32, input)], true);
+            assert_eq!(value_kind(&value), ValueKind::String);
+            assert_eq!(
+                string_contents(&value),
+                expected,
+                "{family}.toString({input})"
+            );
+        }
+        let smallest = if binary32 {
+            f64::from(f32::from_bits(1))
+        } else {
+            f64::from_bits(1)
+        };
+        for (input, expected) in [(smallest, "0.000000"), (-smallest, "-0.000000")] {
+            let value = run_float(&row, vec![float_operand(r(0), binary32, input)], true);
+            assert_eq!(string_contents(&value), expected);
+        }
+        let payload = if binary32 {
+            0xff80_1234_u32.to_ne_bytes().to_vec()
+        } else {
+            0xfff0_0000_0000_1234_u64.to_ne_bytes().to_vec()
+        };
+        let value = run_float(&row, vec![boxed_scalar(r(0), payload)], true);
+        assert_eq!(
+            string_contents(&value),
+            "NaN",
+            "signed signaling NaN payload is hidden"
+        );
+    }
+    for (binary32, input, expected) in [
+        (false, 1.0e20, "100000000000000000000.000000"),
+        (true, 1.0e20, "100000002004087734272.000000"),
+        (
+            true,
+            f64::from(f32::MAX),
+            "340282346638528859811704183484516925440.000000",
+        ),
+    ] {
+        let row = if binary32 {
+            "extern:Float32.toString"
+        } else {
+            "extern:Float.toString"
+        };
+        let value = run_float(row, vec![float_operand(r(0), binary32, input)], true);
+        assert_eq!(string_contents(&value), expected);
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "numeric String results own and release their ABI allocation"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_to_string_results_compose_with_owned_strings_and_reclaim_stopped_results() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let row = format!("extern:{family}.toString");
+        let program = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            4,
+            vec![
+                float_operand(r(0), binary32, -0.0),
+                intrinsic(r(1), &row, vec![r(0)]),
+                Instruction::String {
+                    dst: r(2),
+                    value: " units".to_string(),
+                },
+                intrinsic(r(3), "extern:String.append", vec![r(1), r(2)]),
+                Instruction::Return { src: r(3) },
+            ],
+        )]);
+        let bytes = encode_canonical(&program, CodecLimits::default()).unwrap();
+        let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        let value = returned(execute(&decoded, ExecutionLimits::default(), None));
+        assert_eq!(string_contents(&value.value), "-0.000000 units");
+        drop(value);
+
+        let single = float_program(&row, vec![float_operand(r(0), binary32, 1.5)], true);
+        let exhausted = execute(
+            &single,
+            ExecutionLimits {
+                max_steps: 2,
+                ..ExecutionLimits::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            exhausted,
+            Outcome::Inconclusive(ref inconclusive)
+                if matches!(inconclusive.cause,
+                    InconclusiveCause::ResourceExhausted { ref usage }
+                        if usage.reason == ResourceReason::ExecutionSteps)
+        ));
+        let wrong = float_program(
+            &row,
+            vec![Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            }],
+            true,
+        );
+        assert!(matches!(
+            execute(&wrong, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { argument: 0, .. },
+                ..
+            })
+        ));
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "owned String composition and stopped formatting release every object"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}

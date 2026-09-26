@@ -5,7 +5,8 @@
 //! 64-bit integer carriers use the pin's zero-field constructor boxes;
 //! narrow integer and Boolean results use tagged immediates. This is a
 //! per-row adapter, not permission for any scalar intrinsic to return a heap
-//! object. Transcendentals and ambient-library formatting remain unsupported.
+//! object. The pin's fixed-decimal formatter returns a normal owned String;
+//! transcendentals remain unsupported.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, type_mismatch};
 
@@ -72,6 +73,7 @@ enum Operation {
     IsInf,
     OfBits,
     ToBits,
+    ToString,
     ConvertWidth,
     ToInteger(Integer),
     FromInteger(Integer),
@@ -150,6 +152,7 @@ macro_rules! evaluate {
                 };
                 $bits_result(bits)
             }
+            Operation::ToString => string_result(value),
             Operation::ConvertWidth => $converted(value),
             Operation::ToInteger(integer) => match integer {
                 // Rust float-to-int casts match lean.h's NaN-to-zero,
@@ -208,6 +211,7 @@ impl Intrinsic {
             "isInf" => Operation::IsInf,
             "ofBits" => Operation::OfBits,
             "toBits" => Operation::ToBits,
+            "toString" => Operation::ToString,
             "toFloat32" if width == Width::Binary64 => Operation::ConvertWidth,
             "toFloat" if width == Width::Binary32 => Operation::ConvertWidth,
             _ => Operation::ToInteger(Integer::from_name(method.strip_prefix("to")?)?),
@@ -266,6 +270,9 @@ impl Intrinsic {
     }
 
     pub(super) fn result_kind_matches(self, value: &Obj) -> bool {
+        if self.operation == Operation::ToString {
+            return super::value_kind(value) == super::ValueKind::String;
+        }
         let boxed = match self.operation {
             Operation::Eq
             | Operation::Le
@@ -397,4 +404,17 @@ fn widen(value: f32) -> IntrinsicResult {
 
 fn boolean_result(value: bool) -> IntrinsicResult {
     IntrinsicResult::scalar(Obj::mk_nat(usize::from(value)))
+}
+
+fn string_result(value: impl Into<f64>) -> IntrinsicResult {
+    // object.cpp uses std::to_string: fixed notation with six fractional
+    // digits. Float32 is promoted to double before formatting. Every NaN
+    // prints identically, while -0.0 retains its sign as "-0.000000".
+    let value = value.into();
+    let text = if value.is_nan() {
+        "NaN".to_string()
+    } else {
+        format!("{value:.6}")
+    };
+    IntrinsicResult::owned(Obj::mk_string(&text))
 }
