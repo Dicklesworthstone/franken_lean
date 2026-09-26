@@ -86,6 +86,54 @@ fn explicit_local_functions_and_strict_implicits_remain_typed() {
 }
 
 #[test]
+fn ordinary_applications_synthesize_trailing_instances_without_a_result_hint() {
+    let checked = check(
+        &engine(),
+        concat!(
+            "def read (n : Nat) [Inhabited Nat] : Nat := n + default\n",
+            "def ordinary := read 7\n",
+            "def named := read (n := 7)\n",
+            "def decided := decide (7 = 7)\n",
+            "def explicit := @read 7\n",
+            "def delayed (n : Nat) ⦃A : Type⦄ (x : A) : A := x\n",
+            "def pending := delayed 7\n",
+            "theorem ordinary_ok : ordinary = 7 := by rfl\n",
+            "theorem named_ok : named = 7 := by rfl\n",
+            "theorem decided_ok : decided = true := by rfl\n",
+        ),
+    );
+    for (name, expected) in [("ordinary", "Nat"), ("named", "Nat"), ("decided", "Bool")] {
+        let Some(ConstantInfo::Defn(definition)) = checked
+            .engine
+            .environment()
+            .find(&Name::from_components([name]))
+        else {
+            panic!("checked definition {name}");
+        };
+        assert!(
+            matches!(definition.base.type_.node(), ExprNode::Const { name, .. }
+            if name == &Name::from_components([expected]))
+        );
+    }
+    for (name, expected) in [
+        ("explicit", BinderInfo::InstImplicit),
+        ("pending", BinderInfo::StrictImplicit),
+    ] {
+        let Some(ConstantInfo::Defn(definition)) = checked
+            .engine
+            .environment()
+            .find(&Name::from_components([name]))
+        else {
+            panic!("checked definition {name}");
+        };
+        assert!(
+            matches!(definition.base.type_.node(), ExprNode::ForallE { binder_info, .. }
+            if *binder_info == expected)
+        );
+    }
+}
+
+#[test]
 fn malformed_or_missing_explicit_arguments_cannot_publish() {
     let base = check(&engine(), ID).engine;
     let root = base.logical_root(&KVMap::new());

@@ -81,6 +81,7 @@ pub enum NatDefinitionElabError {
     CannotInferCheckType,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
+    InvalidScientificLiteral,
     InvalidStringLiteral,
     TooManyParameters,
     Inference(source::SourceInferenceError),
@@ -106,6 +107,7 @@ impl std::fmt::Display for NatDefinitionElabError {
             }
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
+            Self::InvalidScientificLiteral => write!(formatter, "scientific literal is invalid"),
             Self::InvalidStringLiteral => write!(formatter, "string literal is invalid"),
             Self::TooManyParameters => write!(formatter, "definition has too many parameters"),
             Self::Inference(error) => write!(formatter, "{error}"),

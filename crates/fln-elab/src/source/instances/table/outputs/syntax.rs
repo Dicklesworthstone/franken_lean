@@ -260,6 +260,7 @@ mod tests {
             binders: Vec::new(),
             base,
             candidates: Vec::new(),
+            default_application: false,
             cursor: 0,
             chosen: None,
             children: Vec::new(),

@@ -212,6 +212,13 @@ fln identity --json                # implementation commit, epoch, profile, TCB 
 
 > **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor`, `fln diff`, and the `leanc` toolchain personality are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. It rechecks every build and reports zero cache hits. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md) (franken_lean-z8j.1.1 remains open). `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate, and `build explain` exits 5 with an "unsupported" notice because no recorded, content-bound build provenance exists to decide from (franken_lean-z8j.1.2).
 
+Native source execution also supports bounded `Float` and `Float32` programs:
+decimal and scientific literals, arithmetic, typed function arguments, branches,
+captured closures, bit and precision conversions, and native string output. Run
+[`examples/native_floats.lean`](examples/native_floats.lean) with `lean` or
+`fln run`; [the numeric source guide](docs/NATIVE_FLOATS.md) explains dictionary
+selection, exact literal rounding, and the remaining runtime boundaries.
+
 ## Installation
 
 **1. Install script — *not yet available*.** The planned script detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain. It is deliberately not shown as a runnable command here: `scripts/install.sh` does not exist yet, and there are no release binaries for it to install. This section becomes a command again when distribution ships one (bead `franken_lean-readme-install-oneliner-wao6`).

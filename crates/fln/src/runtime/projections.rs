@@ -27,6 +27,83 @@ enum ProjectionFrame {
 }
 
 impl Preparation<'_> {
+    /// Unfold an admitted record projection without creating a callable
+    /// wrapper around its selected field. Type/index arguments occur only in
+    /// metadata; the receiver occurs exactly once and retains its evaluation.
+    pub(super) fn projection_call(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        let definition = definition.clone();
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        let mut body = &definition.value;
+        let mut arity = 0usize;
+        while let ExprNode::Lam { body: inner, .. } = body.node() {
+            self.tick()?;
+            arity += 1;
+            body = inner;
+        }
+        if arity == 0 || arguments.len() < arity {
+            return Ok(None);
+        }
+        if !matches!(body.node(), ExprNode::Proj { expr, .. }
+            if matches!(expr.node(), ExprNode::BVar { idx: 0 }))
+        {
+            return Ok(None);
+        }
+        let mut value =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for (index, argument) in arguments[..arity].iter().enumerate() {
+            self.tick()?;
+            let ExprNode::Lam {
+                binder_type, body, ..
+            } = value.node()
+            else {
+                return Ok(None);
+            };
+            if index + 1 != arity
+                && !self.type_parameter(binder_type)?
+                && !matches!(
+                    argument.node(),
+                    ExprNode::Lit {
+                        literal: Literal::Nat(_)
+                    }
+                )
+            {
+                return Ok(None);
+            }
+            value = self.substitution(body, argument)?;
+        }
+        let ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } = value.node()
+        else {
+            return Ok(None);
+        };
+        // Only expose a field when this administrative projection is fully
+        // resolved. A dynamic receiver still needs the existing lexical,
+        // signature-aware projection layout pass after specialization.
+        let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            arguments[arity..].iter().cloned().fold(field, Expr::app),
+        ))
+    }
+
     /// Reconstruct a source type using explicit continuations. In particular,
     /// applications and nested projections do not recurse on the host stack.
     /// Unknown or genuinely dependent representations are left unsupported.

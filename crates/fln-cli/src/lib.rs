@@ -1976,6 +1976,9 @@ fn closed_source_cli_value(
     runtime_type: &fln::Expr,
     exit: &fln::VmExit,
 ) -> Result<Option<SourceFinalValue>, SourceValueProjectionError> {
+    if let Some(value) = fln::closed_float_value(runtime_type, exit)? {
+        return Ok(Some(SourceFinalValue::Float(value)));
+    }
     let Some(declared) = source_result_kind(runtime_type) else {
         return Ok(None);
     };
@@ -10034,6 +10037,7 @@ struct SourceSuccess<'a> {
 
 #[derive(Debug)]
 enum SourceFinalValue {
+    Float(fln::ClosedFloatValue),
     Nat(String),
     String(String),
     Bool(bool),
@@ -10048,6 +10052,8 @@ struct SourceEvaluationResult {
 impl SourceFinalValue {
     const fn kind(&self) -> &'static str {
         match self {
+            Self::Float(fln::ClosedFloatValue::Float(_)) => "float",
+            Self::Float(fln::ClosedFloatValue::Float32(_)) => "float32",
             Self::Nat(_) => "nat",
             Self::String(_) => "string",
             Self::Bool(_) => "bool",
@@ -10056,6 +10062,14 @@ impl SourceFinalValue {
 
     fn json(&self) -> String {
         match self {
+            Self::Float(value) => {
+                let decimal = value.to_string();
+                if matches!(decimal.as_str(), "NaN" | "inf" | "-inf") {
+                    json_string(&decimal)
+                } else {
+                    decimal
+                }
+            }
             Self::Nat(value) => value.clone(),
             Self::String(value) => json_string(value),
             Self::Bool(value) => value.to_string(),
@@ -10066,6 +10080,7 @@ impl SourceFinalValue {
 impl std::fmt::Display for SourceFinalValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Float(value) => write!(formatter, "{value}"),
             Self::Nat(value) => write!(formatter, "{value}"),
             Self::String(value) => write!(formatter, "{value:?}"),
             Self::Bool(value) => write!(formatter, "{value}"),

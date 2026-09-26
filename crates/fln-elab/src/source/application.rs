@@ -223,7 +223,7 @@ impl Context {
             let mut term = if state.explicit {
                 self.finish_explicit_term(state.function, state.result_expected.as_ref())?
             } else {
-                self.finish_term(state.function, state.result_expected.as_ref())?
+                self.finish_application(state.function, state.result_expected.as_ref())?
             };
             term.value = self.instantiate(&term.value)?;
             term.type_ = self.instantiate(&term.type_)?;

@@ -29,8 +29,9 @@ use std::fmt;
 /// each `Lean.Core.checkSystem` call as an explicit effect checkpoint; version
 /// 14 carries computed module-name values into that checkpoint; version 15
 /// carries canonical arbitrary-precision Nat literal limbs through lowering;
-/// version 16 adds exact constructor-shape tests for native case dispatch.
-pub const FIR_SCHEMA_VERSION: u16 = 16;
+/// version 16 adds exact constructor-shape tests for native case dispatch;
+/// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types.
+pub const FIR_SCHEMA_VERSION: u16 = 17;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +218,10 @@ pub enum ValueType {
     Bool,
     Nat,
     String,
+    Float,
+    Float32,
+    UInt32,
+    UInt64,
     Constructor,
     Array,
     Ref,
@@ -233,6 +238,10 @@ impl ValueType {
             Self::Bool => "bool",
             Self::Nat => "nat",
             Self::String => "string",
+            Self::Float => "float",
+            Self::Float32 => "float32",
+            Self::UInt32 => "uint32",
+            Self::UInt64 => "uint64",
             Self::Constructor => "ctor",
             Self::Array => "array",
             Self::Ref => "ref",
@@ -245,7 +254,7 @@ impl ValueType {
 
     const fn admits_callable_result(self, ownership: flbc::CallableResultOwnership) -> bool {
         match self {
-            Self::Unit | Self::Bool => {
+            Self::Unit | Self::Bool | Self::UInt32 => {
                 matches!(ownership, flbc::CallableResultOwnership::Scalar)
             }
             Self::Nat => matches!(
@@ -255,6 +264,9 @@ impl ValueType {
             ),
             Self::Abi => true,
             Self::String
+            | Self::Float
+            | Self::Float32
+            | Self::UInt64
             | Self::Constructor
             | Self::Array
             | Self::Ref
@@ -4807,7 +4819,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/16 entry=f0\n",
+                "fir/17 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",

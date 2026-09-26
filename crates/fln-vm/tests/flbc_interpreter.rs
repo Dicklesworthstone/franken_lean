@@ -67,9 +67,14 @@ const fn cache_context(
 
 const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnership {
     match ty {
-        fir::ValueType::Unit | fir::ValueType::Bool => CallableResultOwnership::Scalar,
+        fir::ValueType::Unit | fir::ValueType::Bool | fir::ValueType::UInt32 => {
+            CallableResultOwnership::Scalar
+        }
         fir::ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         fir::ValueType::String
+        | fir::ValueType::Float
+        | fir::ValueType::Float32
+        | fir::ValueType::UInt64
         | fir::ValueType::Constructor
         | fir::ValueType::Array
         | fir::ValueType::Ref

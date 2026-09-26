@@ -255,6 +255,18 @@ impl Context {
                 head = f;
             }
             let base = match head.node() {
+                ExprNode::MVar { .. } => {
+                    // The pin defaults unresolved receiver types here (for
+                    // example `(2).succ` and `(1.5).abs`) without demanding
+                    // that unrelated synthetic goals are already solvable.
+                    self.resolve_instances_with_defaults()?;
+                    let instantiated = self.instantiate(&receiver.type_)?;
+                    if instantiated == receiver.type_ {
+                        return Err(error(RecordTermError::ExpectedRecordType));
+                    }
+                    receiver.type_ = instantiated;
+                    continue;
+                }
                 ExprNode::Const { name, .. } => name.clone(),
                 ExprNode::ForallE { .. } => Name::from_components(["Function"]),
                 ExprNode::Proj {

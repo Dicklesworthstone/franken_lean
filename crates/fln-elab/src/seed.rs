@@ -29,11 +29,13 @@
 
 mod collections;
 mod decidable;
+mod float;
 mod logic;
 mod logic_support;
 pub use decidable::false_declaration as false_seed_declaration;
 pub use decidable_eq::equality_decision_seed_declarations;
 pub use decidable_generic::generic_equality_decision_seed_declarations;
+pub use float::{float_intrinsic_seed_declaration, float_numeric_seed, float_seed_declarations};
 pub use logic::propext_seed_declaration;
 mod decidable_eq;
 mod decidable_generic;

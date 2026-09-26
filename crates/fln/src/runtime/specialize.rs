@@ -284,12 +284,22 @@ impl Preparation<'_> {
                             && args.len()
                                 == ctor.num_params as usize + ctor.num_fields as usize =>
                     {
+                        // A value parameter can execute work even when it is
+                        // absent from the runtime field layout. Erasing a
+                        // dictionary must not discard that computation.
+                        for parameter in &args[..ctor.num_params as usize] {
+                            if self.instance_factory_value(parameter)?.is_none() {
+                                return Ok(false);
+                            }
+                        }
                         for field in args.into_iter().skip(ctor.num_params as usize) {
                             reserve(&mut work, self.limits.max_nodes)?;
                             work.push(field);
                         }
                     }
                     Some(ConstantInfo::Induct(_)) => {} // checked type value
+                    Some(ConstantInfo::Axiom(_))
+                        if args.is_empty() && self.inert_native_function(&head) => {}
                     Some(ConstantInfo::Defn(definition))
                         if args.is_empty()
                             && definition.safety == DefinitionSafety::Safe
@@ -317,7 +327,7 @@ impl Preparation<'_> {
         value: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
         if !self.static_value(value)? {
-            return Ok(None);
+            return self.single_field_projection(family, index, value);
         }
         let mut value = value.clone();
         loop {
@@ -353,6 +363,67 @@ impl Preparation<'_> {
             }
         }
     }
+    /// A single-field constructor projection retains its only executable
+    /// field. Unlike a multi-field projection, the field need not be inert.
+    /// Only inert factory arguments and constructor parameters may disappear;
+    /// computed arguments and strict lets keep the ordinary runtime path.
+    fn single_field_projection(
+        &mut self,
+        family: &Name,
+        index: u64,
+        input: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if index != 0 || !closed(input) {
+            return Ok(None);
+        }
+        let mut value = input.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = self.spine(&value)?;
+            match head.node() {
+                ExprNode::Const { name, levels } => match self.environment.find(name) {
+                    Some(ConstantInfo::Ctor(ctor))
+                        if !ctor.is_unsafe
+                            && ctor.induct == *family
+                            && ctor.num_fields == 1
+                            && args.len() == ctor.num_params as usize + 1 =>
+                    {
+                        for parameter in &args[..ctor.num_params as usize] {
+                            if self.instance_factory_value(parameter)?.is_none() {
+                                return Ok(None);
+                            }
+                        }
+                        return Ok(args.last().cloned());
+                    }
+                    Some(ConstantInfo::Defn(definition))
+                        if definition.safety == DefinitionSafety::Safe
+                            && definition.base.level_params.len() == levels.len() =>
+                    {
+                        value = application(
+                            self.universe_instance(
+                                &definition.value,
+                                &definition.base.level_params,
+                                levels,
+                            )?,
+                            args,
+                        );
+                    }
+                    _ => return Ok(None),
+                },
+                ExprNode::Lam { body, .. } if !args.is_empty() => {
+                    let Some(argument) = self.instance_factory_value(&args[0])? else {
+                        return Ok(None);
+                    };
+                    value = application(
+                        self.substitution(body, &argument)?,
+                        args[1..].iter().cloned(),
+                    );
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
     fn static_head(&mut self, input: &Expr) -> Result<Expr, IngressError> {
         let mut value = input.clone();
         loop {

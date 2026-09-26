@@ -27,6 +27,10 @@ fn scalar(value: ValueType) -> Result<Expr, IngressError> {
         ValueType::Nat => "Nat",
         ValueType::Bool => "Bool",
         ValueType::String => "String",
+        ValueType::Float => "Float",
+        ValueType::Float32 => "Float32",
+        ValueType::UInt32 => "UInt32",
+        ValueType::UInt64 => "UInt64",
         _ => return Err(unsupported("Nat recursor result representation")),
     };
     Ok(Expr::const_(name(spelling), vec![]))

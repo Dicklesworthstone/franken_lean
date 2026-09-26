@@ -5,7 +5,9 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
 mod data_recursion;
+mod decisions;
 mod empty;
+mod floats;
 mod global;
 mod indexed;
 mod mutual;
@@ -168,6 +170,10 @@ impl<'a> Preparation<'a> {
             ValueType::String => 1,
             ValueType::Bool => 2,
             ValueType::Constructor => 3,
+            ValueType::Float => u64::MAX,
+            ValueType::Float32 => u64::MAX - 1,
+            ValueType::UInt32 => u64::MAX - 2,
+            ValueType::UInt64 => u64::MAX - 3,
             ValueType::Closure(id) => 4 + u64::from(id.get()),
             _ => return Err(unsupported("conditional result representation")),
         };
@@ -363,6 +369,18 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(decision) = self.nat_equality_decision(&head, &args)? {
+                            tasks.push(Task::Visit(decision));
+                            continue;
+                        }
+                        if let Some(projected) = self.projection_call(&head, &args)? {
+                            tasks.push(Task::Visit(projected));
+                            continue;
+                        }
+                        if let Some(literal) = self.float_literal(&head, &args)? {
+                            tasks.push(Task::Visit(literal));
+                            continue;
+                        }
                         if let Some(empty) = self.empty_recursor(&head, &args)? {
                             tasks.push(Task::Visit(empty));
                             continue;
@@ -911,6 +929,14 @@ fn scalar_type(expr: &Expr) -> Option<ValueType> {
                 Some(ValueType::Nat)
             } else if n == &name("String") {
                 Some(ValueType::String)
+            } else if n == &name("Float") {
+                Some(ValueType::Float)
+            } else if n == &name("Float32") {
+                Some(ValueType::Float32)
+            } else if n == &name("UInt32") {
+                Some(ValueType::UInt32)
+            } else if n == &name("UInt64") {
+                Some(ValueType::UInt64)
             } else if n == &name("Bool") {
                 Some(ValueType::Bool)
             } else {
@@ -922,7 +948,7 @@ fn scalar_type(expr: &Expr) -> Option<ValueType> {
 }
 fn result_ownership(result: ValueType) -> CallableResultOwnership {
     match result {
-        ValueType::Bool => CallableResultOwnership::Scalar,
+        ValueType::Bool | ValueType::UInt32 => CallableResultOwnership::Scalar,
         ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         _ => CallableResultOwnership::Owned,
     }

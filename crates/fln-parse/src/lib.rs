@@ -739,8 +739,12 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
         kind,
         Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
     ) || (grammar == DefinitionGrammar::Scalar
-        && (matches!(kind, Some(TokenKind::Literal(LiteralKind::Str)))
-            || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_"))))
+        && (matches!(
+            kind,
+            Some(TokenKind::Literal(
+                LiteralKind::Str | LiteralKind::Scientific
+            ))
+        ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_"))))
 }
 
 fn bounded_term_leaf(
@@ -759,6 +763,14 @@ fn bounded_term_leaf(
         Some(TokenKind::Literal(LiteralKind::Str)) if grammar == DefinitionGrammar::Scalar => Ok(
             Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf]),
         ),
+        Some(TokenKind::Literal(LiteralKind::Scientific))
+            if grammar == DefinitionGrammar::Scalar =>
+        {
+            Ok(Syntax::node(
+                Name::str(Name::anonymous(), "scientific"),
+                vec![leaf],
+            ))
+        }
         Some(TokenKind::Ident(_)) => Ok(leaf),
         Some(TokenKind::Symbol(symbol)) if grammar == DefinitionGrammar::Scalar => {
             match symbol.as_str() {
@@ -1334,8 +1346,8 @@ fn hygienic_lparen(lparen: Syntax) -> Syntax {
     )
 }
 
-/// A prefix has its own application frame: `f ¬p` applies f to Not p,
-/// rather than negating f p. Its operand accepts precedence 40 and above.
+/// Prefix operands have their own application frame. Propositional negation
+/// accepts precedence 40 and above; arithmetic negation uses the pin's 75.
 fn finish_negation_frame(
     leaves: &Leaves,
     view: &SourceView,
@@ -1347,8 +1359,13 @@ fn finish_negation_frame(
     let mut frame = frames.pop().expect("guarded negation frame");
     let prefix = frame.negation.take().expect("negation prefix");
     let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
+    let kind = if matches!(&tokens[prefix].kind, TokenKind::Symbol(symbol) if symbol == "-") {
+        "term-_"
+    } else {
+        "term¬_"
+    };
     let syntax = Syntax::node(
-        Name::str(Name::anonymous(), "term¬_"),
+        Name::str(Name::anonymous(), kind),
         vec![leaves.leaf(prefix)?, body],
     );
     frames
@@ -1654,7 +1671,12 @@ fn bounded_term_spliced(
                 cursor = end;
             }
             Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "¬" =>
+                if grammar == DefinitionGrammar::Scalar
+                    && (symbol == "¬"
+                        || (symbol == "-"
+                            && frames
+                                .last()
+                                .is_some_and(|frame| frame.application.is_empty()))) =>
             {
                 frames.push(BoundedTermFrame {
                     record: None,
@@ -1889,10 +1911,11 @@ fn bounded_term_spliced(
             kind if bounded_infix(kind, grammar).is_some() => {
                 let operator = bounded_infix(kind, grammar)
                     .expect("the guarded bounded infix remains recognized");
-                if operator.precedence() < 40 {
-                    while frames.last().is_some_and(|frame| frame.negation.is_some()) {
-                        finish_negation_frame(leaves, view, tokens, &mut frames, grammar, index)?;
-                    }
+                while frames.last().and_then(|frame| frame.negation).is_some_and(|prefix| {
+                    let precedence = if matches!(&tokens[prefix].kind, TokenKind::Symbol(symbol) if symbol == "-") { 75 } else { 40 };
+                    operator.precedence() < precedence
+                }) {
+                    finish_negation_frame(leaves, view, tokens, &mut frames, grammar, index)?;
                 }
                 let syntax = leaves.leaf(index)?;
                 let frame = frames.last_mut().expect("the root term frame remains live");
@@ -3168,6 +3191,45 @@ mod nat_definition_tests {
             Syntax::Node { kind, args, .. }
                 if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1
         )));
+    }
+
+    #[test]
+    fn scientific_literals_and_arithmetic_negation_preserve_pin_syntax_and_precedence() {
+        for spelling in ["1.25", "1.", "1e20", "1.25E-2", "1_2.3_4e+5_6"] {
+            let source = format!("def value : Float := {spelling}");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(
+                parsed.reconstruct_normalized().as_deref(),
+                Some(source.as_bytes())
+            );
+            assert!(
+                matches!(definition_value(&parsed), Syntax::Node { kind, args, .. }
+                if kind == &Name::from_components(["scientific"])
+                    && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == spelling))
+            );
+        }
+        let parsed = parse_definition(b"def value := -1.5 ^ 2 * 3.0 + 4.0").unwrap();
+        let add = operator_args(definition_value(&parsed), "term_+_");
+        let multiply = operator_args(&add[0], "term_*_");
+        let Syntax::Node { kind, args, .. } = &multiply[0] else {
+            panic!("arithmetic negation is a syntax node");
+        };
+        assert_eq!(kind, &Name::from_components(["term-_"]));
+        operator_args(&args[1], "term_^_");
+
+        let parsed = parse_definition(b"def value := 1.0 - -2.0").unwrap();
+        let subtraction = operator_args(definition_value(&parsed), "term_-_");
+        assert!(matches!(&subtraction[2], Syntax::Node { kind, .. }
+            if kind == &Name::from_components(["term-_"])));
+        for source in [
+            "def x := 1e",
+            "def x := 1e-",
+            "def x := .5",
+            "def x := 1.foo",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        assert!(parse_nat_definition(b"def x : Nat := 1.5").is_err());
     }
 
     #[test]

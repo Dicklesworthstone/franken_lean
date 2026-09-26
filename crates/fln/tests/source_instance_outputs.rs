@@ -92,6 +92,33 @@ fn source_output_parameters_infer_types_and_execute_selected_dictionary_fields()
 }
 
 #[test]
+fn completed_instance_outputs_convert_regular_aliases_without_changing_inputs() {
+    let engine = checked(
+        &fixture("outParam"),
+        concat!(
+            "def Id (A : Type) : Type := A\n",
+            "def wrapped : Id (Id Nat) := transfer 4\n",
+            "theorem wrapped_ok : wrapped = 5 := by rfl\n",
+            "def NatAlias : Type := Nat\n",
+            "instance distinct : Transfer NatAlias Bool := { convert := fun x => true }\n",
+            "def aliasInput (x : NatAlias) : Bool := Transfer.convert x\n",
+        ),
+    );
+    assert!(contains(
+        &definition(&engine, "wrapped").value,
+        &n("natural")
+    ));
+    assert!(contains(
+        &definition(&engine, "aliasInput").value,
+        &n("distinct")
+    ));
+    assert!(!contains(
+        &definition(&engine, "aliasInput").value,
+        &n("natural")
+    ));
+}
+
+#[test]
 fn source_semi_outputs_use_known_types_but_can_also_infer_unknown_types() {
     let engine = checked(
         &fixture("semiOutParam"),

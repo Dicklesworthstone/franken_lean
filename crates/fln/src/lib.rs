@@ -254,6 +254,7 @@ pub enum ClosedVmValueError {
     StringMissingTrailingNul,
     StringSizeExceedsBuffer { size: usize, buffer: usize },
     StringPayloadIsNotUtf8,
+    InvalidFloatRepresentation { source_type: &'static str },
 }
 
 impl fmt::Display for ClosedVmValueError {
@@ -275,11 +276,77 @@ impl fmt::Display for ClosedVmValueError {
             Self::StringPayloadIsNotUtf8 => {
                 formatter.write_str("returned String payload was not UTF-8")
             }
+            Self::InvalidFloatRepresentation { source_type } => write!(
+                formatter,
+                "returned {source_type} did not use its boxed scalar representation"
+            ),
         }
     }
 }
 
 impl std::error::Error for ClosedVmValueError {}
+
+/// The exact bits of a typed source floating-point result. Keeping the bits
+/// preserves signed zero and allows stable equality even for NaN results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedFloatValue {
+    Float(u64),
+    Float32(u32),
+}
+
+impl fmt::Display for ClosedFloatValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match *self {
+            Self::Float(bits) => f64::from_bits(bits),
+            Self::Float32(bits) => f64::from(f32::from_bits(bits)),
+        };
+        if value.is_nan() {
+            formatter.write_str("NaN")
+        } else {
+            write!(formatter, "{value:.6}")
+        }
+    }
+}
+
+/// Project a floating-point result using its checked source runtime type.
+///
+/// Float boxes share their physical layout with other scalar boxes; the
+/// untyped [`closed_vm_value`] therefore deliberately does not guess their
+/// type. Pass the `runtime_type` carried by a source execution here. Unknown
+/// types return `Ok(None)` and malformed boxes return a typed error.
+pub fn closed_float_value(
+    runtime_type: &Expr,
+    exit: &VmExit,
+) -> Result<Option<ClosedFloatValue>, ClosedVmValueError> {
+    let ExprNode::Const { name, levels } = runtime_type.node() else {
+        return Ok(None);
+    };
+    if !levels.is_empty() {
+        return Ok(None);
+    }
+    let source_type = if name == &Name::from_components(["Float"]) {
+        "Float"
+    } else if name == &Name::from_components(["Float32"]) {
+        "Float32"
+    } else {
+        return Ok(None);
+    };
+    let VmExit::Returned(returned) = exit else {
+        return Err(ClosedVmValueError::NonReturningExit);
+    };
+    let value = &returned.value;
+    let error = ClosedVmValueError::InvalidFloatRepresentation { source_type };
+    if value.is_scalar() || value.header().tag != 0 || value.header().other != 0 {
+        return Err(error);
+    }
+    if source_type == "Float" {
+        value.try_ctor_scalar_u64(0).map(ClosedFloatValue::Float)
+    } else {
+        value.try_ctor_scalar_u32(0).map(ClosedFloatValue::Float32)
+    }
+    .map(Some)
+    .ok_or(error)
+}
 
 /// Copy one returned scalar, nonnegative mpz, or String out of Marrow's runtime
 /// representation.
@@ -2335,6 +2402,41 @@ impl EngineBuilder {
             .map_err(|_| EngineAdmissionError::UnexpectedPublication {
                 detail: "source instance registration failed",
             })?;
+        }
+        let numeric = fln_elab::seed::float_numeric_seed().map_err(|_| {
+            EngineAdmissionError::UnexpectedPublication {
+                detail: "numeric source seed construction failed",
+            }
+        })?;
+        engine = match engine.admit_declarations(&numeric.declarations, &self.options, limits)? {
+            Outcome::Complete(batch) => batch.engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        for name in numeric.classes {
+            engine.environment = fln_elab::instances::register_class(&engine.environment, &name)
+                .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                    detail: "numeric source class registration failed",
+                })?;
+        }
+        for name in numeric.instances {
+            let priority = numeric
+                .priorities
+                .iter()
+                .find_map(|(candidate, priority)| (candidate == &name).then_some(*priority))
+                .unwrap_or(1000);
+            engine.environment =
+                fln_elab::instances::register_instance(&engine.environment, &name, priority)
+                    .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                        detail: "numeric source instance registration failed",
+                    })?;
+        }
+        for (name, priority) in numeric.defaults {
+            engine.environment =
+                fln_elab::instances::defaults::register(&engine.environment, &name, priority)
+                    .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                        detail: "numeric source default registration failed",
+                    })?;
         }
         Ok(Outcome::Complete(engine))
     }
@@ -6663,6 +6765,10 @@ struct ExecutableValueTypes {
     nat: Expr,
     string: Expr,
     bool_: Expr,
+    float: Expr,
+    float32: Expr,
+    uint32: Expr,
+    uint64: Expr,
     records: std::collections::HashSet<Expr>,
     closures: std::collections::HashMap<Expr, ValueType>,
 }
@@ -6673,6 +6779,10 @@ impl ExecutableValueTypes {
             nat: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
             string: Expr::const_(Name::from_components(["String"]), Vec::new()),
             bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
+            float: Expr::const_(Name::from_components(["Float"]), Vec::new()),
+            float32: Expr::const_(Name::from_components(["Float32"]), Vec::new()),
+            uint32: Expr::const_(Name::from_components(["UInt32"]), Vec::new()),
+            uint64: Expr::const_(Name::from_components(["UInt64"]), Vec::new()),
             records: std::collections::HashSet::new(),
             closures: std::collections::HashMap::new(),
         }
@@ -6827,7 +6937,8 @@ fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<In
     let ConstantInfo::Axiom(actual) = info else {
         return None;
     };
-    let Declaration::Axiom(expected) = fln_elab::seed::source_intrinsic_seed_declaration(name)?
+    let Declaration::Axiom(expected) = fln_elab::seed::source_intrinsic_seed_declaration(name)
+        .or_else(|| fln_elab::seed::float_intrinsic_seed_declaration(name))?
     else {
         return None;
     };
@@ -6873,7 +6984,51 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             ValueType::Bool,
             None,
         ),
-        _ => return None,
+        _ => {
+            let (family, operation) = row_name.split_once('.')?;
+            let scalar = match family {
+                "Float" => ValueType::Float,
+                "Float32" => ValueType::Float32,
+                "UInt32" => ValueType::UInt32,
+                "UInt64" => ValueType::UInt64,
+                _ => return None,
+            };
+            let floating = matches!(scalar, ValueType::Float | ValueType::Float32);
+            match operation {
+                "add" | "sub" | "mul" | "div" if floating => (vec![scalar, scalar], scalar, None),
+                "neg" | "abs" if floating => (vec![scalar], scalar, None),
+                "beq" | "decLt" | "decLe" if floating => {
+                    (vec![scalar, scalar], ValueType::Bool, None)
+                }
+                "isNaN" | "isFinite" | "isInf" if floating => (vec![scalar], ValueType::Bool, None),
+                "toString" if floating => (vec![scalar], ValueType::String, None),
+                "toBits" if floating => (
+                    vec![scalar],
+                    if scalar == ValueType::Float {
+                        ValueType::UInt64
+                    } else {
+                        ValueType::UInt32
+                    },
+                    None,
+                ),
+                "ofBits" if floating => (
+                    vec![if scalar == ValueType::Float {
+                        ValueType::UInt64
+                    } else {
+                        ValueType::UInt32
+                    }],
+                    scalar,
+                    None,
+                ),
+                "toUInt64" if floating => (vec![scalar], ValueType::UInt64, None),
+                "toUInt32" if floating => (vec![scalar], ValueType::UInt32, None),
+                "toFloat" => (vec![scalar], ValueType::Float, None),
+                "toFloat32" => (vec![scalar], ValueType::Float32, None),
+                "ofNat" if !floating => (vec![ValueType::Nat], scalar, None),
+                "toNat" if !floating => (vec![scalar], ValueType::Nat, None),
+                _ => return None,
+            }
+        }
     };
     let arity = u32::try_from(argument_types.len()).ok()?;
     let row = fln_vm::extern_table_generated::EXTERN_ROWS
@@ -7188,6 +7343,14 @@ fn executable_value_type(
         Some((ValueType::String, CallableResultOwnership::Owned))
     } else if source == &value_types.bool_ {
         Some((ValueType::Bool, CallableResultOwnership::Scalar))
+    } else if source == &value_types.float {
+        Some((ValueType::Float, CallableResultOwnership::Owned))
+    } else if source == &value_types.float32 {
+        Some((ValueType::Float32, CallableResultOwnership::Owned))
+    } else if source == &value_types.uint32 {
+        Some((ValueType::UInt32, CallableResultOwnership::Scalar))
+    } else if source == &value_types.uint64 {
+        Some((ValueType::UInt64, CallableResultOwnership::Owned))
     } else if let Some(value) = value_types.closures.get(source) {
         Some((*value, CallableResultOwnership::Owned))
     } else if value_types.records.contains(source) {
@@ -11750,7 +11913,12 @@ mod tests {
             .into_complete()
             .expect("the bounded source seed answers completely");
         let expected_constants: usize = fln_elab::seed::source_seed_declarations()
-            .iter()
+            .into_iter()
+            .chain(
+                fln_elab::seed::float_numeric_seed()
+                    .expect("the numeric candidate inventory is valid")
+                    .declarations,
+            )
             .map(|declaration| match declaration {
                 Declaration::Inductive(block) => {
                     block.types.len() + block.ctors.len() + block.recursors.len()

@@ -359,6 +359,7 @@ mod tests {
             binders: vec![],
             base: context(),
             candidates: vec![],
+            default_application: false,
             cursor: 0,
             chosen: None,
             children: vec![],

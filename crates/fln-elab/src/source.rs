@@ -24,6 +24,7 @@ mod local_functions;
 pub use level_syntax::LevelSyntaxError;
 pub mod inspect;
 mod matching;
+mod numeric;
 mod patterns;
 mod record;
 mod record_terms;
@@ -144,6 +145,7 @@ struct Typed {
 #[derive(Clone, Copy)]
 enum ImplicitInsertion<'a> {
     ExplicitArgument,
+    ApplicationEnd,
     Expected(Option<&'a Expr>),
     FieldReceiver,
 }
@@ -155,6 +157,8 @@ enum ImplicitInsertion<'a> {
 enum EquationPolicy {
     FinalAdmission,
     BeforeSelection,
+    AfterSelection,
+    DefaultInstance,
 }
 
 #[derive(Clone)]
@@ -174,6 +178,18 @@ impl SourceEquation {
         Self {
             sides: (left, right),
             policy: EquationPolicy::BeforeSelection,
+        }
+    }
+    fn instance_result(left: Expr, right: Expr) -> Self {
+        Self {
+            sides: (left, right),
+            policy: EquationPolicy::AfterSelection,
+        }
+    }
+    fn default_instance(left: Expr, right: Expr) -> Self {
+        Self {
+            sides: (left, right),
+            policy: EquationPolicy::DefaultInstance,
         }
     }
 }
@@ -313,6 +329,9 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(literal) = self.numeric_literal(syntax, expected)? {
+            return Ok(literal);
+        }
         if let Syntax::Node { kind, args, .. } = syntax {
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {
@@ -607,7 +626,7 @@ impl Context {
             let allow_delta = self
                 .equations
                 .iter()
-                .all(|equation| equation.policy == EquationPolicy::FinalAdmission);
+                .all(|equation| equation.policy != EquationPolicy::BeforeSelection);
             let deferred = match self.unify_source_batch(&pairs, allow_delta) {
                 Ok(()) => {
                     self.equations.clear();
@@ -659,7 +678,7 @@ impl Context {
                 }
                 match self.unify_source_batch(
                     &[(left.clone(), right.clone())],
-                    equation.policy == EquationPolicy::FinalAdmission,
+                    equation.policy != EquationPolicy::BeforeSelection,
                 ) {
                     Ok(()) => {}
                     Err(UnificationError::Deferred(_)) => {
@@ -742,6 +761,21 @@ impl Context {
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
+        self.finish_explicit_term(term, expected)
+    }
+
+    fn finish_application(
+        &mut self,
+        term: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        // App.processImplicitArg/processInstImplicitArg continue after the
+        // last written argument even without an expected result. Strict
+        // implicits still require another argument; explicit `@` bypasses us.
+        let insertion = expected.map_or(ImplicitInsertion::ApplicationEnd, |expected| {
+            ImplicitInsertion::Expected(Some(expected))
+        });
+        let term = self.insert_implicits(term, insertion)?;
         self.finish_explicit_term(term, expected)
     }
 
@@ -1231,6 +1265,15 @@ impl Context {
                                     expect_atom(&parts[0], "¬", "negation prefix")?;
                                     let function =
                                         self.constant(&Name::from_components(["Not"]))?;
+                                    tasks.push(Task::Apply(function, &parts[1..], expected, false));
+                                    continue;
+                                }
+                                if kind == &Name::str(Name::anonymous(), "term-_") {
+                                    let parts =
+                                        expect_node(syntax, kind, 2, "arithmetic negation")?;
+                                    expect_atom(&parts[0], "-", "negation prefix")?;
+                                    let function =
+                                        self.constant(&Name::from_components(["Neg", "neg"]))?;
                                     tasks.push(Task::Apply(function, &parts[1..], expected, false));
                                     continue;
                                 }
@@ -1748,7 +1791,7 @@ impl Context {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?
                                 } else {
-                                    self.finish_term(function, expected.as_ref())?
+                                    self.finish_application(function, expected.as_ref())?
                                 });
                             }
                         }
@@ -1769,15 +1812,26 @@ impl Context {
                             let right = values.pop().expect("infix right visit");
                             let left = values.pop().expect("infix left visit");
                             self.flush(false)?;
-                            let name = match intrinsic {
-                                BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
-                                BoundedInfixIntrinsic::ScalarBeq => {
-                                    if self.instantiate(&left.type_)? == string_const()
-                                        && self.instantiate(&right.type_)? == string_const()
-                                    {
-                                        Name::from_components(["String", "decEq"])
-                                    } else {
-                                        Name::from_components(["Nat", "beq"])
+                            let notation =
+                                match crate::instances::numeric::notation(intrinsic.spelling()) {
+                                    Some((class, method)) if self.has_numeric_class(class)? => {
+                                        Some(Name::from_components([class, method]))
+                                    }
+                                    _ => None,
+                                };
+                            let name = if let Some(name) = notation {
+                                name
+                            } else {
+                                match intrinsic {
+                                    BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                                    BoundedInfixIntrinsic::ScalarBeq => {
+                                        if self.instantiate(&left.type_)? == string_const()
+                                            && self.instantiate(&right.type_)? == string_const()
+                                        {
+                                            Name::from_components(["String", "decEq"])
+                                        } else {
+                                            Name::from_components(["Nat", "beq"])
+                                        }
                                     }
                                 }
                             };

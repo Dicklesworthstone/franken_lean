@@ -28,7 +28,7 @@ impl Preparation<'_> {
     /// Return an inert value, not a kernel normal form. This private result is
     /// substituted only for a static instance argument after source admission;
     /// the specialization key retains the caller's exact original argument.
-    pub(super) fn instance_factory_value(
+    pub(in crate::runtime::specialize) fn instance_factory_value(
         &mut self,
         input: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
@@ -59,7 +59,9 @@ impl Preparation<'_> {
                                 // Opaque types such as String are inert type
                                 // metadata, not executable axioms. A constant
                                 // producing a runtime value or proof is refused.
-                                if self.type_parameter(&type_)? {
+                                if self.type_parameter(&type_)?
+                                    || arguments.is_empty() && self.inert_native_function(&head)
+                                {
                                     values.push(expression);
                                     continue;
                                 }
@@ -87,11 +89,7 @@ impl Preparation<'_> {
                                 // functions too. Projection still requires full
                                 // saturation. Check parameters as well as fields:
                                 // a value parameter is not an erased type argument.
-                                push(
-                                    &mut tasks,
-                                    Task::Constructor(head, arguments.len()),
-                                    limit,
-                                )?;
+                                push(&mut tasks, Task::Constructor(head, arguments.len()), limit)?;
                                 for argument in arguments.into_iter().rev() {
                                     self.tick()?;
                                     push(&mut tasks, Task::Value(argument), limit)?;

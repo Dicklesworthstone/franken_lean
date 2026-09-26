@@ -38,6 +38,7 @@ struct Frame {
     // the original depth-first order. No foreign metavariable IDs are replayed.
     replay_first: bool,
     returned: bool,
+    default_application: bool,
 }
 
 pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabError {
@@ -193,6 +194,18 @@ impl Context {
         Ok(())
     }
 
+    /// Field notation needs a concrete receiver type before method lookup.
+    /// Match `synthesizeSyntheticMVarsUsingDefault` in the pin: use defaults
+    /// after ordinary synthesis, while postponing unrelated instance goals.
+    pub(super) fn resolve_instances_with_defaults(&mut self) -> Result<(), NatDefinitionElabError> {
+        self.resolve_instances(false)?;
+        let registry = InstanceRegistry::read(&self.txn.env).map_err(registry_error)?;
+        while self.resolve_default_instance(&registry)? {
+            self.resolve_instances(false)?;
+        }
+        Ok(())
+    }
+
     /// Defaults are tried only after ordinary synthesis reaches a fixed point.
     /// Higher priorities run across all pending goals before any lower priority.
     /// Commit just one complete result, then rerun ordinary synthesis first.
@@ -341,6 +354,7 @@ impl Context {
         }
         let resumable = prepared.expected.has_expr_mvar();
         Ok(Some(Frame {
+            default_application: default.is_some(),
             resumable,
             replay_first: false,
             returned: false,
@@ -361,6 +375,7 @@ impl Context {
         &mut self,
         candidate: &Candidate,
         target: &Expr,
+        default_application: bool,
     ) -> Result<Option<Expansion>, NatDefinitionElabError> {
         let mut term = match candidate {
             Candidate::Local(id) => {
@@ -404,8 +419,16 @@ impl Context {
             term.value = Expr::app(term.value, arg);
         }
         self.constrain(&term.type_, target)?;
-        self.equations
-            .push(SourceEquation::selection(term.type_, target.clone()));
+        // The pin applies an explicitly registered default with ordinary
+        // isDefEqGuarded transparency (SyntheticMVars.synthesizeUsingDefaultInstance),
+        // then synthesizes its prerequisites using ordinary instance search.
+        // Preserve alias inputs during normal selection; only this selected
+        // default application may use safe-definition conversion.
+        self.equations.push(if default_application {
+            SourceEquation::default_instance(term.type_, target.clone())
+        } else {
+            SourceEquation::selection(term.type_, target.clone())
+        });
         self.flush(true)?;
         Ok(Some(Expansion {
             value: term.value,
@@ -585,8 +608,12 @@ impl Context {
                 // here would silently turn outParam into semiOutParam.
                 self.txn.lctx = frames[index].base.txn.lctx.clone();
                 let expected = self.instantiate(&frames[index].expected)?;
+                // SynthInstance.assignOutParams uses default transparency
+                // after selection (including ordinary aliases such as Id or
+                // OrderDual). Keep this equation mandatory even when ground;
+                // candidate matching above remains abbreviation-only.
                 self.equations
-                    .push(SourceEquation::selection(actual, expected));
+                    .push(SourceEquation::instance_result(actual, expected));
                 match self.flush(true) {
                     Ok(()) => {}
                     Err(error) if nonmatch(&error) => {
@@ -651,7 +678,7 @@ impl Context {
             let spent = self.txn.budget.heartbeats_consumed;
             *self = frame.base.clone();
             self.txn.budget.heartbeats_consumed = spent;
-            match self.expand_instance(&candidate, &frame.target) {
+            match self.expand_instance(&candidate, &frame.target, frame.default_application) {
                 Ok(expansion) => frame.chosen = expansion,
                 Err(error) if nonmatch(&error) => {}
                 Err(error) => return Err(error),
