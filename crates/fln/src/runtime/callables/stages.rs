@@ -3,6 +3,8 @@
 //! adapts a staged function to the flat interface of an external consumer.
 use super::*;
 
+mod captures;
+
 impl Preparation<'_> {
     fn stage_interface(&mut self, signature: ClosureSignature) -> Result<ValueType, IngressError> {
         for index in 0..self.interfaces.len() {

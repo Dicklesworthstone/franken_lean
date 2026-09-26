@@ -227,6 +227,10 @@ impl Preparation<'_> {
         if self.interfaces.is_empty() {
             return Ok(Vec::new());
         }
+        // Local capture types become known only after preparation has rebuilt
+        // the enclosing function. Recover their real return stages before any
+        // source-local interface id is replaced by a canonical FIR rank.
+        self.refine_function_captures(functions)?;
         let mut signatures = Vec::new();
         for (index, signature) in self.interfaces.iter().enumerate() {
             add_suffixes(
