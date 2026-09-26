@@ -2,7 +2,12 @@ name: Source frontier reproduction snapshot
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-source-frontier-snapshot.yml']
+    paths:
+      - '.github/workflows/fln-source-frontier-snapshot.yml'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln-comp/src/fir.rs'
+      - 'crates/fln-comp/src/fir/**'
   workflow_dispatch:
 permissions:
   contents: read
