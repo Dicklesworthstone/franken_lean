@@ -67,6 +67,8 @@ impl PairSet {
         }
     }
 }
+/// How many stuck recursor majors `nested_k_reduction` follows down.
+const MAX_NESTED_K_DEPTH: usize = 8;
 type Result<T> = std::result::Result<T, Box<InferenceOutcome>>;
 impl Probe<'_> {
     fn progress(&self) -> InferenceProgress {
@@ -593,6 +595,122 @@ impl Probe<'_> {
             WireExpr::from_parts(nodes, levels, root),
         )))
     }
+    /// KR-317 below the head. The pin's `whnf` normalizes a recursor's major with
+    /// K conversion available (`inductive_reduce_rec` whnfs the major, and the
+    /// recursor steps inside that whnf call `to_cnstr_when_K`), so a K recursor
+    /// stuck inside another recursor's major still reduces. Untyped reduction
+    /// has no types for the K gate, and `k_reduction` examines only the head:
+    /// `decide` on a `Rat` equality stuck as `Decidable.rec … (Eq.rec … h)`
+    /// was deferred. Follow the chain of stuck majors down to the first K
+    /// recursor `k_reduction` accepts, and rebuild the chain around it. The gate
+    /// is the caller's, exactly as for `k_reduction`.
+    fn nested_k_reduction(
+        &mut self,
+        s: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<((WireExpr, WireExpr), WireExpr)>> {
+        let mut chain: Vec<(WireExpr, usize)> = Vec::new();
+        let mut current = s.clone();
+        for _ in 0..MAX_NESTED_K_DEPTH {
+            let Some((index, major)) = self.recursor_major(&current, context)? else {
+                return Ok(None);
+            };
+            let major = self.piece(&current, major)?;
+            let Some(major) = self.whnf(&major, context)? else {
+                return Ok(None);
+            };
+            chain.push((current, index));
+            if let Some((gate, reduced)) = self.k_reduction(&major, context)? {
+                let mut rebuilt = reduced;
+                for (term, index) in chain.into_iter().rev() {
+                    rebuilt = self.with_argument(&term, index, &rebuilt)?;
+                }
+                return Ok(Some((gate, rebuilt)));
+            }
+            current = major;
+        }
+        Ok(None)
+    }
+    /// The position and node of `s`'s major premise, when `s`'s head is a
+    /// recursor applied far enough to have one.
+    fn recursor_major(
+        &mut self,
+        s: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<(usize, ExprId)>> {
+        let Some(head) = head_constant(s) else {
+            return Ok(None);
+        };
+        let Some(recursor) = context
+            .constants()
+            .find(head)
+            .and_then(|d| d.recursor_metadata())
+        else {
+            return Ok(None);
+        };
+        let index = [
+            recursor.num_parameters(),
+            recursor.num_motives(),
+            recursor.num_minors(),
+            recursor.num_indices(),
+        ]
+        .into_iter()
+        .map(|count| count as usize)
+        .sum::<usize>();
+        let mut arguments = Vec::new();
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, argument }) = s.node(id) {
+            self.tick()?;
+            arguments.push(*argument);
+            id = *function;
+        }
+        arguments.reverse();
+        Ok(arguments.get(index).map(|&major| (index, major)))
+    }
+    /// `s` with its argument at `index` replaced, built by extending a copy of
+    /// `s`'s arena.
+    fn with_argument(
+        &mut self,
+        s: &WireExpr,
+        index: usize,
+        replacement: &WireExpr,
+    ) -> Result<WireExpr> {
+        let mut spine = Vec::new();
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, argument }) = s.node(id) {
+            self.tick()?;
+            spine.push((*function, *argument));
+            id = *function;
+        }
+        spine.reverse();
+        let Some(&(before, _)) = spine.get(index) else {
+            return Err(self.fault(InferenceFault::LiteralTypeAllocation));
+        };
+        let mut nodes = s.nodes().to_vec();
+        let mut levels = s.levels().to_vec();
+        let replacement = append_arena(&mut nodes, &mut levels, replacement)
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        let mut root = push_node(
+            &mut nodes,
+            ExprNode::Apply {
+                function: before,
+                argument: replacement,
+            },
+        )
+        .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        for &(_, argument) in &spine[index + 1..] {
+            self.tick()?;
+            root = push_node(
+                &mut nodes,
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+            )
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        }
+        Ok(WireExpr::from_parts(nodes, levels, root))
+    }
     /// `term.index` of structure `name`, built by extending a copy of `term`'s
     /// own arena, so no subterm is re-copied.
     fn project(&mut self, term: &WireExpr, name: &WireName, index: u64) -> Result<WireExpr> {
@@ -922,6 +1040,22 @@ impl Probe<'_> {
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
                 if let Some(((major_type, constructor_type), reduced)) =
                     self.k_reduction(s, &context)?
+                    && self.run(&major_type, &constructor_type, &context, false)?
+                {
+                    let (a, b) = if s_on_left {
+                        (reduced, t.clone())
+                    } else {
+                        (t.clone(), reduced)
+                    };
+                    work.push(Work::Pair(a, b, context.clone()));
+                    continue 'work;
+                }
+            }
+            // KR-317 below the head, under the same gate: see
+            // `nested_k_reduction`.
+            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
+                if let Some(((major_type, constructor_type), reduced)) =
+                    self.nested_k_reduction(s, &context)?
                     && self.run(&major_type, &constructor_type, &context, false)?
                 {
                     let (a, b) = if s_on_left {

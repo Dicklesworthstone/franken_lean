@@ -269,3 +269,150 @@ fn an_unmet_k_gate_leaves_the_pair_to_congruence() {
     let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
     assert!(matches!(outcome, Verdict::Admitted(_)), "{outcome:?}");
 }
+
+/// `E2 : Type` with two nullary constructors, so `E2.rec` is not K-like.
+fn e2_entries() -> Vec<ConstantEntry> {
+    let v = Level::param(primary_name("v"));
+    let e2 = || c("E2");
+    let e1 = || qualified("E2", "e1");
+    let e2c = || qualified("E2", "e2");
+    // scope [motive]: `motive E2.e1`, then [motive, m1]: `motive E2.e2`, then
+    // [motive, m1, m2]: `(t : E2) → motive t`
+    let recursor_type = pi(
+        pi(e2(), Expr::sort(v.clone())),
+        pi(
+            app(bv(0), [e1()]),
+            pi(app(bv(1), [e2c()]), pi(e2(), app(bv(3), [bv(0)]))),
+        ),
+    );
+    let motive_type = || pi(e2(), Expr::sort(v.clone()));
+    let rule = |index: u32| {
+        lam(
+            motive_type(),
+            lam(app(bv(0), [e1()]), lam(app(bv(1), [e2c()]), bv(index))),
+        )
+    };
+    let mut rows = vec![ConstantEntry::new(
+        checker_name("E2"),
+        ConstantDeclaration::inductive(
+            vec![],
+            decoded(&ty()),
+            ConstantSafety::Safe,
+            InductiveDeclaration::new(
+                0,
+                0,
+                vec![checker_name("E2")],
+                vec![
+                    checker_qualified(&["E2", "e1"]),
+                    checker_qualified(&["E2", "e2"]),
+                ],
+                0,
+                false,
+                false,
+            ),
+        ),
+    )];
+    for (index, leaf) in [(0_u32, "e1"), (1, "e2")] {
+        rows.push(ConstantEntry::new(
+            checker_qualified(&["E2", leaf]),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&e2()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("E2"), index, 0, 0),
+            ),
+        ));
+    }
+    rows.push(ConstantEntry::new(
+        checker_qualified(&["E2", "rec"]),
+        ConstantDeclaration::recursor(
+            vec![checker_name("v")],
+            decoded(&recursor_type),
+            ConstantSafety::Safe,
+            RecursorDeclaration::new(
+                vec![checker_name("E2")],
+                0,
+                0,
+                1,
+                2,
+                vec![
+                    RecursorRule::new(checker_qualified(&["E2", "e1"]), 0, decoded(&rule(1))),
+                    RecursorRule::new(checker_qualified(&["E2", "e2"]), 0, decoded(&rule(0))),
+                ],
+                false,
+            ),
+        ),
+    ));
+    rows
+}
+
+/// `F2 (E2.rec (fun _ => D) d1 d2 (KEq.rec … E2.e1 x major))` for
+/// `a := S.mk first p`, in an environment with `wd : F2 d1`.
+fn nested_cast(first: Expr, major: &str) -> (ConstantEnvironment, Expr) {
+    let mut rows = vec![
+        axiom("A", ty()),
+        axiom("Pp", prop()),
+        axiom("p", c("Pp")),
+        axiom("a0", c("A")),
+        axiom("D", ty()),
+        axiom("d1", c("D")),
+        axiom("d2", c("D")),
+        axiom("F2", pi(c("D"), ty())),
+        axiom("wd", app(c("F2"), [c("d1")])),
+    ];
+    rows.extend(keq_entries());
+    rows.extend(structure_entries());
+    rows.extend(e2_entries());
+    rows.extend([
+        axiom("x", c("S")),
+        axiom("h", keq(c("S"), rebuilt(first_of_x()), c("x"))),
+        axiom("h_other", keq(c("S"), rebuilt(c("a0")), c("x"))),
+    ]);
+    let a = rebuilt(first);
+    let inner = app(
+        Expr::const_(Name::from_components(["KEq", "rec"]), vec![Level::one()]),
+        [
+            c("S"),
+            a.clone(),
+            lam(c("S"), lam(keq(c("S"), a, bv(0)), c("E2"))),
+            qualified("E2", "e1"),
+            c("x"),
+            c(major),
+        ],
+    );
+    let outer = app(
+        Expr::const_(Name::from_components(["E2", "rec"]), vec![Level::one()]),
+        [lam(c("E2"), c("D")), c("d1"), c("d2"), inner],
+    );
+    (environment_of(rows), app(c("F2"), [outer]))
+}
+
+/// A K recursor stuck inside another recursor's major reduces there too, as
+/// the pin's `whnf` normalizes a major with K conversion available. The cast
+/// `KEq.rec (motive := fun _ _ => E2) E2.e1 x h` reduces to `E2.e1` only by
+/// K, and it is the major of the non-K `E2.rec (fun _ => D) d1 d2`, which then
+/// reduces to `d1`. So `wd : F2 d1` has type `F2 (E2.rec … (cast))`. The lane
+/// used to try K only at the head, which is `E2.rec`, and deferred; the
+/// whole-stdlib frontier hit this as `decide` on a `Rat` equality in
+/// `Std.Time.Time.Unit.Basic`, stuck as `Decidable.rec … (Eq.rec … h)`.
+#[test]
+fn a_k_recursor_stuck_in_another_recursors_major_reduces() {
+    let (env, declared) = nested_cast(first_of_x(), "h");
+    let candidate = definition("nested_k", decoded(&declared), decoded(&c("wd")));
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(outcome, Verdict::Admitted(_)), "{outcome:?}");
+}
+
+/// The nested reduction keeps the head reduction's gate: with `a := S.mk a0 p`
+/// the major's type does not convert with the constructor's, so K must not
+/// fire below the head either.
+#[test]
+fn a_nested_k_recursor_stays_stuck_when_the_major_type_differs() {
+    let (env, declared) = nested_cast(c("a0"), "h_other");
+    let candidate = definition("nested_k_other", decoded(&declared), decoded(&c("wd")));
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(
+        !matches!(outcome, Verdict::Admitted(_)),
+        "a nested cast whose indices differ must not reduce: {outcome:?}"
+    );
+}
