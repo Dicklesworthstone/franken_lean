@@ -53,9 +53,18 @@ pub enum CommandEffect {
 }
 
 impl CommandEffect {
-    /// Whether this effect is an unanalyzable full barrier.
+    /// Whether this effect requires a full source-order barrier.
+    ///
+    /// Ambient capabilities have no rollback contract. Generic extension
+    /// writes have no typed read key, so they may affect options, simp sets,
+    /// instances, grammar, or declaration attributes.
     pub fn is_barrier(&self) -> bool {
-        matches!(self, CommandEffect::Opaque { .. })
+        matches!(
+            self,
+            CommandEffect::Opaque { .. }
+                | CommandEffect::UsesCapability { .. }
+                | CommandEffect::WritesEnvExtension { .. }
+        )
     }
 
     /// Whether this is a write effect.
@@ -102,6 +111,31 @@ impl EffectSummary {
         if !self.effects.contains(&effect) {
             self.effects.push(effect);
         }
+    }
+
+    /// Join another footprint without losing an opaque demotion.
+    pub fn extend(&mut self, other: &Self) {
+        for effect in &other.effects {
+            self.record(effect.clone());
+        }
+        if other.is_demoted_to_opaque {
+            self.is_demoted_to_opaque = true;
+            if self.demote_reason.is_none() {
+                self.demote_reason = other.demote_reason.clone();
+            }
+        }
+    }
+
+    /// Whether a product can be speculated or replayed without repeating an
+    /// ambient action or omitting a state change not represented in the product.
+    ///
+    /// ElabUnitProduct carries declarations, but not instance/grammar/extension
+    /// deltas. Those writers must execute once at their canonical position.
+    pub fn is_replay_safe(&self) -> bool {
+        !self.is_barrier()
+            && self.effects.iter().all(|effect| {
+                effect.is_read() || matches!(effect, CommandEffect::WritesDecl { .. })
+            })
     }
 
     /// Mark this summary as demoted to opaque (due to perturbation failure or unanalyzed effect).
@@ -157,7 +191,7 @@ impl EffectSummary {
     /// Check if two effect summaries commute (can safely run in parallel with no hazards).
     ///
     /// Commutativity requires:
-    /// 1. Neither is a barrier (Opaque).
+    /// 1. Neither is an opaque, ambient-capability, or generic-extension barrier.
     /// 2. No Read-After-Write (RAW) conflict: `self` writes do not intersect `other` reads.
     /// 3. No Write-After-Read (WAR) conflict: `self` reads do not intersect `other` writes.
     /// 4. No Write-After-Write (WAW) conflict: `self` writes do not intersect `other` writes.
@@ -166,26 +200,24 @@ impl EffectSummary {
             return false;
         }
 
-        // Check declaration conflicts
-        let self_w_decls = self.written_decls();
-        let other_w_decls = other.written_decls();
-        let self_r_decls = self.read_decls();
-        let other_r_decls = other.read_decls();
-
-        if !self_w_decls.is_disjoint(&other_w_decls) {
-            return false; // WAW
-        }
-        if !self_w_decls.is_disjoint(&other_r_decls) {
-            return false; // RAW/WAR
-        }
-        if !self_r_decls.is_disjoint(&other_w_decls) {
-            return false; // WAR/RAW
-        }
-
-        // Check instance conflicts
+        // Compare typed keys directly: graph construction calls this for each
+        // candidate predecessor, so avoid allocating four temporary sets.
         for eff1 in &self.effects {
             for eff2 in &other.effects {
                 match (eff1, eff2) {
+                    (
+                        CommandEffect::WritesDecl { name: n1 },
+                        CommandEffect::ReadsDecl { name: n2, .. },
+                    )
+                    | (
+                        CommandEffect::ReadsDecl { name: n1, .. },
+                        CommandEffect::WritesDecl { name: n2 },
+                    )
+                    | (
+                        CommandEffect::WritesDecl { name: n1 },
+                        CommandEffect::WritesDecl { name: n2 },
+                    ) if n1 == n2 => return false,
+
                     (
                         CommandEffect::WritesInstance { class_head: h1, .. },
                         CommandEffect::ReadsInstances { class_head: h2 },
@@ -211,11 +243,6 @@ impl EffectSummary {
                         CommandEffect::WritesGrammar { category: c1 },
                         CommandEffect::WritesGrammar { category: c2 },
                     ) if c1 == c2 => return false,
-
-                    (
-                        CommandEffect::WritesEnvExtension { extension_name: e1 },
-                        CommandEffect::WritesEnvExtension { extension_name: e2 },
-                    ) if e1 == e2 => return false,
 
                     _ => {}
                 }
