@@ -265,6 +265,62 @@ fn intrinsic(dst: Register, row: &str, args: Vec<Register>) -> Instruction {
     }
 }
 
+fn boxed_scalar(dst: Register, bytes: Vec<u8>) -> Instruction {
+    Instruction::Ctor {
+        dst,
+        tag: 0,
+        fields: Vec::new(),
+        scalar_bytes: bytes,
+    }
+}
+
+fn float_operand(dst: Register, binary32: bool, value: f64) -> Instruction {
+    boxed_scalar(
+        dst,
+        if binary32 {
+            (value as f32).to_ne_bytes().to_vec()
+        } else {
+            value.to_ne_bytes().to_vec()
+        },
+    )
+}
+
+fn float_program(row: &str, mut inputs: Vec<Instruction>, boxed_result: bool) -> ValidatedProgram {
+    let count = u16::try_from(inputs.len()).unwrap();
+    inputs.push(intrinsic(r(count), row, (0..count).map(r).collect()));
+    inputs.push(Instruction::Return { src: r(count) });
+    validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        if boxed_result {
+            CallableResultOwnership::Owned
+        } else {
+            CallableResultOwnership::Scalar
+        },
+        count + 1,
+        inputs,
+    )])
+}
+
+fn run_float(row: &str, inputs: Vec<Instruction>, boxed_result: bool) -> Obj {
+    returned(execute(
+        &float_program(row, inputs, boxed_result),
+        ExecutionLimits::default(),
+        None,
+    ))
+    .value
+}
+
+fn float_contents(value: &Obj, binary32: bool) -> f64 {
+    assert_eq!(value.header().tag, 0);
+    assert_eq!(value.header().other, 0);
+    if binary32 {
+        f64::from(f32::from_bits(value.try_ctor_scalar_u32(0).unwrap()))
+    } else {
+        f64::from_bits(value.try_ctor_scalar_u64(0).unwrap())
+    }
+}
+
 fn validated(functions: Vec<Function>) -> ValidatedProgram {
     validate(Program::new(fid(0), functions)).expect("fixture program is valid")
 }
@@ -10173,6 +10229,621 @@ fn intrinsic_plan_slot_collisions_are_never_dispatch_authority() {
     assert_eq!(caches.stats().replacements, 3);
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "plan collisions retain no Marrow value");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_intrinsics_execute_ieee_arithmetic_at_each_native_precision() {
+    let _guard = lock();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        for (operation, left, right, expected) in [
+            ("add", 1.5, 2.25, 3.75),
+            ("sub", 1.5, 2.25, -0.75),
+            ("mul", -1.5, 2.0, -3.0),
+            ("div", 7.0, 2.0, 3.5),
+            ("div", 1.0, 0.0, f64::INFINITY),
+            ("div", 1.0, -0.0, f64::NEG_INFINITY),
+            ("mul", -0.0, 2.0, -0.0),
+            ("div", 0.0, 0.0, f64::NAN),
+            ("sub", f64::INFINITY, f64::INFINITY, f64::NAN),
+            ("mul", 0.0, f64::INFINITY, f64::NAN),
+        ] {
+            let value = run_float(
+                &format!("extern:{family}.{operation}"),
+                vec![
+                    float_operand(r(0), binary32, left),
+                    float_operand(r(1), binary32, right),
+                ],
+                true,
+            );
+            let actual = float_contents(&value, binary32);
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "{family}.{operation}({left}, {right})");
+            } else {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{family}.{operation}({left}, {right})"
+                );
+            }
+        }
+        for (operation, input, expected) in [
+            ("neg", 0.0, -0.0_f64),
+            ("neg", -0.0, 0.0),
+            ("neg", 2.5, -2.5),
+            ("abs", -0.0, 0.0),
+            ("abs", -2.5, 2.5),
+        ] {
+            let value = run_float(
+                &format!("extern:{family}.{operation}"),
+                vec![float_operand(r(0), binary32, input)],
+                true,
+            );
+            assert_eq!(
+                float_contents(&value, binary32).to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
+
+    let rounded = run_float(
+        "extern:Float32.add",
+        vec![
+            float_operand(r(0), true, 16_777_216.0),
+            float_operand(r(1), true, 1.0),
+        ],
+        true,
+    );
+    assert_eq!(float_contents(&rounded, true), 16_777_216.0);
+    let exact = run_float(
+        "extern:Float.add",
+        vec![
+            float_operand(r(0), false, 16_777_216.0),
+            float_operand(r(1), false, 1.0),
+        ],
+        true,
+    );
+    assert_eq!(float_contents(&exact, false), 16_777_217.0);
+}
+
+#[test]
+fn float_intrinsics_compare_nan_and_signed_zero_without_total_ordering() {
+    let _guard = lock();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        for (left, right, equal, le, lt) in [
+            (f64::NAN, f64::NAN, false, false, false),
+            (f64::NAN, 0.0, false, false, false),
+            (0.0, f64::NAN, false, false, false),
+            (0.0, -0.0, true, true, false),
+            (-0.0, 0.0, true, true, false),
+            (-1.0, 1.0, false, true, true),
+            (1.0, -1.0, false, false, false),
+            (f64::INFINITY, f64::INFINITY, true, true, false),
+        ] {
+            for (operation, expected) in [("beq", equal), ("decLe", le), ("decLt", lt)] {
+                let result = run_float(
+                    &format!("extern:{family}.{operation}"),
+                    vec![
+                        float_operand(r(0), binary32, left),
+                        float_operand(r(1), binary32, right),
+                    ],
+                    false,
+                );
+                assert!(result.is_scalar());
+                assert_eq!(
+                    result.unbox(),
+                    usize::from(expected),
+                    "{family}.{operation}"
+                );
+            }
+        }
+        let subnormal = if binary32 {
+            f64::from(f32::from_bits(1))
+        } else {
+            f64::from_bits(1)
+        };
+        for (input, nan, finite, infinite) in [
+            (f64::NAN, true, false, false),
+            (f64::INFINITY, false, false, true),
+            (f64::NEG_INFINITY, false, false, true),
+            (-0.0, false, true, false),
+            (subnormal, false, true, false),
+        ] {
+            for (operation, expected) in [("isNaN", nan), ("isFinite", finite), ("isInf", infinite)]
+            {
+                let result = run_float(
+                    &format!("extern:{family}.{operation}"),
+                    vec![float_operand(r(0), binary32, input)],
+                    false,
+                );
+                assert_eq!(
+                    result.unbox(),
+                    usize::from(expected),
+                    "{family}.{operation}"
+                );
+            }
+        }
+    }
+}
+
+/// Expectations come from the pinned runtime's NaN normalization and
+/// `tests/elab/floatBits.lean`; the high sign bit must survive the ABI box.
+#[test]
+fn float_bits_roundtrips_preserve_non_nan_bits_and_canonicalize_every_nan() {
+    let _guard = lock();
+    for (binary32, patterns, canonical) in [
+        (
+            false,
+            vec![
+                (0_u64, 0_u64),
+                (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+                (1, 1),
+                (0x7ff0_0000_0000_0000, 0x7ff0_0000_0000_0000),
+                (0xfff0_0000_0000_0000, 0xfff0_0000_0000_0000),
+                (4_608_285_800_708_723_180, 4_608_285_800_708_723_180),
+                (0x7ff0_0000_0000_0001, 0x7ff8_0000_0000_0000),
+                (0xfff8_0000_0000_1234, 0x7ff8_0000_0000_0000),
+            ],
+            0x7ff8_0000_0000_0000_u64,
+        ),
+        (
+            true,
+            vec![
+                (0, 0),
+                (0x8000_0000, 0x8000_0000),
+                (1, 1),
+                (0x7f80_0000, 0x7f80_0000),
+                (0xff80_0000, 0xff80_0000),
+                (1_067_408_425, 1_067_408_425),
+                (0x7f80_0001, 0x7fc0_0000),
+                (0xffc0_1234, 0x7fc0_0000),
+            ],
+            0x7fc0_0000,
+        ),
+    ] {
+        let family = if binary32 { "Float32" } else { "Float" };
+        for (bits, expected) in patterns {
+            let input = if binary32 {
+                Instruction::Nat {
+                    dst: r(0),
+                    value: bits,
+                }
+            } else {
+                boxed_scalar(r(0), bits.to_ne_bytes().to_vec())
+            };
+            let program = validated(vec![function_with_callable_result(
+                0,
+                Vec::new(),
+                if binary32 {
+                    CallableResultOwnership::Scalar
+                } else {
+                    CallableResultOwnership::Owned
+                },
+                3,
+                vec![
+                    input,
+                    intrinsic(r(1), &format!("extern:{family}.ofBits"), vec![r(0)]),
+                    intrinsic(r(2), &format!("extern:{family}.toBits"), vec![r(1)]),
+                    Instruction::Return { src: r(2) },
+                ],
+            )]);
+            let result = returned(execute(&program, ExecutionLimits::default(), None));
+            let actual = if binary32 {
+                u64::try_from(result.value.unbox()).unwrap()
+            } else {
+                result.value.try_ctor_scalar_u64(0).unwrap()
+            };
+            assert_eq!(actual, expected, "{family} bit roundtrip {bits:#x}");
+        }
+        // A payload arriving through a raw ABI box must normalize too;
+        // normalization cannot live only in the ofBits producer.
+        let payload = if binary32 {
+            0xffc0_1234_u32.to_ne_bytes().to_vec()
+        } else {
+            0xfff8_0000_0000_1234_u64.to_ne_bytes().to_vec()
+        };
+        let result = run_float(
+            &format!("extern:{family}.toBits"),
+            vec![boxed_scalar(r(0), payload)],
+            !binary32,
+        );
+        let actual = if binary32 {
+            u64::try_from(result.unbox()).unwrap()
+        } else {
+            result.try_ctor_scalar_u64(0).unwrap()
+        };
+        assert_eq!(actual, canonical);
+    }
+}
+
+#[test]
+fn float_integer_conversions_saturate_at_destination_width_and_truncate() {
+    let _guard = lock();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        for (unsigned, signed, bits, boxed) in [
+            ("UInt8", "Int8", 8, false),
+            ("UInt16", "Int16", 16, false),
+            ("UInt32", "Int32", 32, false),
+            ("UInt64", "Int64", 64, true),
+            ("USize", "ISize", usize::BITS, true),
+        ] {
+            let max_unsigned = u64::MAX >> (64 - bits);
+            let signed_min_bits = 1_u64 << (bits - 1);
+            let max_signed = signed_min_bits - 1;
+            for (target, cases) in [
+                (
+                    unsigned,
+                    vec![
+                        (f64::NAN, 0),
+                        (f64::NEG_INFINITY, 0),
+                        (f64::INFINITY, max_unsigned),
+                        (-5.75, 0),
+                        (-0.0, 0),
+                        (5.75, 5),
+                        (2.0_f64.powi(i32::try_from(bits).unwrap()), max_unsigned),
+                    ],
+                ),
+                (
+                    signed,
+                    vec![
+                        (f64::NAN, 0),
+                        (f64::NEG_INFINITY, signed_min_bits),
+                        (f64::INFINITY, max_signed),
+                        (-5.75, max_unsigned - 4),
+                        (-0.75, 0),
+                        (5.75, 5),
+                        (2.0_f64.powi(i32::try_from(bits - 1).unwrap()), max_signed),
+                    ],
+                ),
+            ] {
+                for (input, expected) in cases {
+                    let result = run_float(
+                        &format!("extern:{family}.to{target}"),
+                        vec![float_operand(r(0), binary32, input)],
+                        boxed,
+                    );
+                    let actual = if boxed {
+                        result.try_ctor_scalar_u64(0).unwrap()
+                    } else {
+                        u64::try_from(result.unbox()).unwrap()
+                    };
+                    assert_eq!(actual, expected, "{family}.to{target}({input})");
+                }
+            }
+        }
+        for (input, expected) in [(-129.0, 128), (-128.75, 128), (-127.75, 129), (127.75, 127)] {
+            let result = run_float(
+                &format!("extern:{family}.toInt8"),
+                vec![float_operand(r(0), binary32, input)],
+                false,
+            );
+            assert_eq!(result.unbox(), expected);
+        }
+    }
+
+    let rounded = run_float(
+        "extern:Float32.toUInt64",
+        vec![float_operand(r(0), true, 10_000_000_000_000_000_000.0)],
+        true,
+    );
+    assert_eq!(
+        rounded.try_ctor_scalar_u64(0),
+        Some(9_999_999_980_506_447_872),
+        "pinned float_conversions.lean vector preserves Float32 input rounding"
+    );
+}
+
+#[test]
+fn integer_to_float_uses_signed_carriers_and_avoids_double_rounding() {
+    let _guard = lock();
+    for (method, binary32) in [("toFloat", false), ("toFloat32", true)] {
+        for (unsigned, signed, bits, boxed) in [
+            ("UInt8", "Int8", 8, false),
+            ("UInt16", "Int16", 16, false),
+            ("UInt32", "Int32", 32, false),
+            ("UInt64", "Int64", 64, true),
+            ("USize", "ISize", usize::BITS, true),
+        ] {
+            let signed_carrier = u64::MAX >> (64 - bits);
+            for (source, carrier, expected) in
+                [(unsigned, 42, 42.0), (signed, signed_carrier, -1.0)]
+            {
+                let input = if boxed {
+                    boxed_scalar(r(0), carrier.to_ne_bytes().to_vec())
+                } else {
+                    Instruction::Nat {
+                        dst: r(0),
+                        value: carrier,
+                    }
+                };
+                let result = run_float(&format!("extern:{source}.{method}"), vec![input], true);
+                assert_eq!(
+                    float_contents(&result, binary32),
+                    expected,
+                    "{source}.{method}"
+                );
+            }
+        }
+    }
+
+    let midpoint_plus_one = (1_u64 << 63) + (1_u64 << 39) + 1;
+    let rounded = run_float(
+        "extern:UInt64.toFloat32",
+        vec![boxed_scalar(r(0), midpoint_plus_one.to_ne_bytes().to_vec())],
+        true,
+    );
+    assert_eq!(
+        rounded.try_ctor_scalar_u32(0),
+        Some(0x5f00_0001),
+        "an intermediate f64 loses the +1 and rounds to 0x5f000000"
+    );
+
+    for (input, expected) in [(1.5, 1.5_f64), (-0.0, -0.0), (16_777_217.0, 16_777_216.0)] {
+        let program = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            3,
+            vec![
+                float_operand(r(0), false, input),
+                intrinsic(r(1), "extern:Float.toFloat32", vec![r(0)]),
+                intrinsic(r(2), "extern:Float32.toFloat", vec![r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        let result = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(
+            float_contents(&result.value, false).to_bits(),
+            expected.to_bits()
+        );
+    }
+}
+
+#[test]
+fn float_bits_compose_with_uint64_arithmetic_and_cached_execution() {
+    let _guard = lock();
+    let program = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Owned,
+        6,
+        vec![
+            float_operand(r(0), false, -0.0),
+            intrinsic(r(1), "extern:Float.toBits", vec![r(0)]),
+            boxed_scalar(r(2), 1_u64.to_ne_bytes().to_vec()),
+            intrinsic(r(3), "extern:UInt64.add", vec![r(1), r(2)]),
+            intrinsic(r(4), "extern:Float.ofBits", vec![r(3)]),
+            intrinsic(r(5), "extern:Float.toBits", vec![r(4)]),
+            Instruction::Return { src: r(5) },
+        ],
+    )]);
+    shadow::enable();
+    let uncached = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(
+        uncached.value.try_ctor_scalar_u64(0),
+        Some(0x8000_0000_0000_0001)
+    );
+    let mut caches = InlineCaches::try_new(16).unwrap();
+    for _ in 0..2 {
+        let cached = returned(execute_cached(
+            &program,
+            ExecutionLimits::default(),
+            None,
+            cache_context(8, 18, Mode::Sound),
+            &mut caches,
+        ));
+        assert_eq!(
+            cached.value.try_ctor_scalar_u64(0),
+            Some(0x8000_0000_0000_0001)
+        );
+        assert_eq!(cached.usage, uncached.usage);
+    }
+    assert!(caches.stats().hits > 0);
+    drop(uncached);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "boxed float/integer pipelines release every intermediate"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_intrinsics_refuse_malformed_objects_and_arity() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32, width) in [("Float", false, 8), ("Float32", true, 4)] {
+        for malformed in [
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            Instruction::String {
+                dst: r(0),
+                value: "not a float".to_string(),
+            },
+            Instruction::Ctor {
+                dst: r(0),
+                tag: 1,
+                fields: Vec::new(),
+                scalar_bytes: vec![0; width],
+            },
+            // The ABI records aligned, initialized scalar storage. Payloads
+            // of 1..8 bytes share an eight-byte area, so only an empty area
+            // lacks enough storage for a floating value on this target.
+            boxed_scalar(r(0), Vec::new()),
+            Instruction::Array {
+                dst: r(0),
+                items: Vec::new(),
+            },
+        ] {
+            let program = float_program(
+                &format!("extern:{family}.add"),
+                vec![malformed, float_operand(r(1), binary32, 1.0)],
+                true,
+            );
+            let result = execute(&program, ExecutionLimits::default(), None);
+            assert!(
+                matches!(
+                    result,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::TypeMismatch { argument: 0, .. },
+                        ..
+                    })
+                ),
+                "{family} accepted or misclassified a malformed operand: {result:?}"
+            );
+        }
+        let bad_second = float_program(
+            &format!("extern:{family}.mul"),
+            vec![
+                float_operand(r(0), binary32, 1.0),
+                Instruction::Nat {
+                    dst: r(1),
+                    value: 1,
+                },
+            ],
+            true,
+        );
+        assert!(matches!(
+            execute(&bad_second, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { argument: 1, .. },
+                ..
+            })
+        ));
+        let child_bearing = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            3,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "owned child".to_string(),
+                },
+                Instruction::Ctor {
+                    dst: r(1),
+                    tag: 0,
+                    fields: vec![r(0)],
+                    scalar_bytes: vec![0; width],
+                },
+                intrinsic(r(2), &format!("extern:{family}.neg"), vec![r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        assert!(matches!(
+            execute(&child_bearing, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { argument: 0, .. },
+                ..
+            })
+        ));
+        let row = format!("extern:{family}.add");
+        let wrong_arity = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            1,
+            vec![
+                Instruction::Intrinsic {
+                    dst: r(0),
+                    row: row.clone(),
+                    args: Vec::new(),
+                    argument_ownership: Vec::new(),
+                    result_ownership: contract_result_ownership(&row),
+                },
+                Instruction::Return { src: r(0) },
+            ],
+        )]);
+        let result = execute(&wrong_arity, ExecutionLimits::default(), None);
+        // The extracted C scalar signature binds arity before the numeric
+        // implementation is entered, so this is an ownership-contract refusal.
+        assert!(
+            matches!(
+                result,
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::IntrinsicOwnershipContract {
+                        row: ref actual,
+                        ref reason,
+                    },
+                    ..
+                }) if actual == &row
+                    && reason == "ownership signature carries 2 executable arguments, FLBC carries 0"
+            ),
+            "{family} arity refusal: {result:?}"
+        );
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "malformed float objects release all children and operands"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_intrinsics_stop_on_budget_or_cancellation_without_publishing_or_leaking() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let program = float_program(
+            &format!("extern:{family}.add"),
+            vec![
+                float_operand(r(0), binary32, 20.0),
+                float_operand(r(1), binary32, 22.0),
+            ],
+            true,
+        );
+        // Stop immediately before dispatch, then after result allocation but
+        // before Return can publish it. Both sides must reclaim the graph.
+        for completed_steps in [2, 3] {
+            let exhausted = execute(
+                &program,
+                ExecutionLimits {
+                    max_steps: completed_steps,
+                    ..ExecutionLimits::default()
+                },
+                None,
+            );
+            assert_eq!(exhausted.authority(), Authority::NonAuthoritative);
+            assert!(matches!(
+                exhausted,
+                Outcome::Inconclusive(ref inconclusive)
+                    if matches!(inconclusive.cause,
+                        InconclusiveCause::ResourceExhausted { ref usage }
+                            if usage.reason == ResourceReason::ExecutionSteps)
+            ));
+            let polls = Cell::new(0);
+            let cancel = || {
+                polls.set(polls.get() + 1);
+                polls.get() == completed_steps + 1
+            };
+            let cancelled = execute(&program, ExecutionLimits::default(), Some(&cancel));
+            assert_eq!(cancelled.authority(), Authority::NonAuthoritative);
+            assert!(matches!(
+                cancelled,
+                Outcome::Inconclusive(ref inconclusive)
+                    if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
+            ));
+        }
+        let recovered = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(float_contents(&recovered.value, binary32), 42.0);
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "float cancellation and exhaustion leave no unpublished box"
+    );
     assert!(events.iter().all(|event| {
         event.kind != shadow::EventKind::DoubleRelease
             && event.kind != shadow::EventKind::ForeignPointer

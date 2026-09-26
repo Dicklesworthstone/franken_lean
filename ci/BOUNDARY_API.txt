@@ -67,6 +67,8 @@ row FLN-BX-0085 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_child | (&se
 row FLN-BX-0038 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_retag | (&self, u8) | ctor_retag_and_scalar_write | ctor-range asserted
 row FLN-BX-0039 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_set_u64 | (&self, usize, u64) | ctor_retag_and_scalar_write | scalar-area write, offset law asserted
 row FLN-BX-0040 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_u64 | (&self, usize) -> u64 | ctor scalar suites; C4 scalar facts | value copy
+row FLN-BX-0091 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_scalar_u32 | (&self, usize) -> Option<u32> | fallible_constructor_scalar_reads_check_width_and_offset; float_intrinsics_refuse_malformed_objects_and_arity | bounded scalar value copy or None; no raw pointer or kernel type escapes
+row FLN-BX-0092 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_scalar_u64 | (&self, usize) -> Option<u64> | fallible_constructor_scalar_reads_check_width_and_offset; float_intrinsics_refuse_malformed_objects_and_arity | bounded scalar value copy or None; no raw pointer or kernel type escapes
 row FLN-BX-0041 | crates/fln-unsafe-abi/src/handle.rs | fn string_view | (&self) -> (usize, usize, usize, Vec<u8>) | string_facts_utf8 | data copies
 row FLN-BX-0083 | crates/fln-unsafe-abi/src/handle.rs | fn try_string_view | (&self) -> Option<(usize, usize, usize, Vec<u8>)> | try_string_view_refuses_hostile_headers | owned byte copies, or None; no raw pointer, owned authority, or kernel type escapes
 row FLN-BX-0042 | crates/fln-unsafe-abi/src/handle.rs | fn array_view | (&self) -> (usize, usize) | array suites | value copies

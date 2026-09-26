@@ -457,6 +457,44 @@ impl Obj {
         unsafe { object::ctor_get_scalar::<u64>(self.0, byte_off) }
     }
 
+    /// Copy a 32-bit constructor scalar, refusing non-constructors and offsets
+    /// outside their scalar storage. The width matters for boxed `Float32`:
+    /// its four payload bytes must not depend on the allocation's padding.
+    pub fn try_ctor_scalar_u32(&self, byte_off: usize) -> Option<u32> {
+        if !self.has_scalar_storage(byte_off, size_of::<u32>()) {
+            return None;
+        }
+        // SAFETY: has_scalar_storage checked the tag, object-field boundary,
+        // and complete scalar extent before the existing membrane read.
+        Some(unsafe { object::ctor_get_scalar::<u32>(self.0, byte_off) })
+    }
+
+    /// Copy a 64-bit constructor scalar with the same fallible bounds contract
+    /// as [`Self::try_ctor_scalar_u32`]. No pointer or borrowed storage escapes.
+    pub fn try_ctor_scalar_u64(&self, byte_off: usize) -> Option<u64> {
+        if !self.has_scalar_storage(byte_off, size_of::<u64>()) {
+            return None;
+        }
+        // SAFETY: the complete scalar read is inside a live constructor's
+        // scalar storage; the returned integer is a plain value copy.
+        Some(unsafe { object::ctor_get_scalar::<u64>(self.0, byte_off) })
+    }
+
+    fn has_scalar_storage(&self, byte_off: usize, width: usize) -> bool {
+        if self.is_scalar() {
+            return false;
+        }
+        let header = self.header();
+        let floor = usize::from(header.other) * size_of::<*mut LeanObject>();
+        // The constructor allocator initializes its final padded word, so the
+        // aligned header extent contains initialized bytes after mk_ctor's
+        // explicit payload too. Foreign-memory validation is a separate door.
+        let extent = usize::from(header.cs_sz).saturating_sub(size_of::<LeanObject>());
+        header.tag <= TAG_MAX_CTOR_TAG
+            && byte_off >= floor
+            && byte_off.checked_add(width).is_some_and(|end| end <= extent)
+    }
+
     /// Fallible string view `(size, capacity, length, bytes-with-NUL)`.
     ///
     /// Returns `None` when the handle is not a string or the header is

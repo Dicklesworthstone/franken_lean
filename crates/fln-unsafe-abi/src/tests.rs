@@ -18,6 +18,49 @@ use std::sync::{Mutex, MutexGuard};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn fallible_constructor_scalar_reads_check_width_and_offset() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let bits = 0x8000_0000_0000_0001_u64;
+        let value = Obj::mk_ctor(0, Vec::new(), &bits.to_ne_bytes());
+        assert_eq!(value.try_ctor_scalar_u64(0), Some(bits));
+        assert_eq!(value.try_ctor_scalar_u32(0), Some(1));
+        assert_eq!(value.try_ctor_scalar_u32(4), Some(0x8000_0000));
+        assert_eq!(value.try_ctor_scalar_u64(1), None);
+        assert_eq!(value.try_ctor_scalar_u32(5), None);
+        assert_eq!(value.try_ctor_scalar_u32(usize::MAX), None);
+        assert_eq!(value.try_ctor_scalar_u64(usize::MAX), None);
+
+        let payload = [3_u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        let with_field = Obj::mk_ctor(0, vec![Obj::mk_nat(1)], &payload);
+        let start = size_of::<*const ()>();
+        assert_eq!(with_field.try_ctor_scalar_u32(0), None);
+        assert_eq!(with_field.try_ctor_scalar_u64(0), None);
+        assert_eq!(with_field.try_ctor_scalar_u32(start + 1), Some(0x0706_0504));
+        assert_eq!(
+            with_field.try_ctor_scalar_u64(start + 1),
+            Some(0x0b0a_0908_0706_0504)
+        );
+        for invalid in [
+            Obj::mk_nat(0),
+            Obj::mk_string("not a constructor"),
+            Obj::mk_ctor(0, Vec::new(), &[]),
+            Obj::mk_array(Vec::new()),
+        ] {
+            assert_eq!(invalid.try_ctor_scalar_u32(0), None);
+            assert_eq!(invalid.try_ctor_scalar_u64(0), None);
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
 fn lock() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

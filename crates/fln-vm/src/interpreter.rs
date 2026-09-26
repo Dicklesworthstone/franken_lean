@@ -57,6 +57,8 @@ use fln_rt::abi;
 use fln_rt::obj::Obj;
 use std::fmt;
 
+mod floats;
+
 /// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
 /// instruction allowance, not the Reference's allocation-linked heartbeat
 /// option. A value of zero permits no work in that dimension; the first
@@ -523,6 +525,7 @@ struct IntrinsicPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
+    Float(floats::Intrinsic),
     BaseIoAsTask,
     BaseIoBindTask,
     BaseIoMapTask,
@@ -1186,7 +1189,7 @@ impl IntrinsicImplementation {
             "extern:Task.spawn" => Self::TaskSpawn,
             "extern:Task.map" => Self::TaskMap,
             "extern:Task.bind" => Self::TaskBind,
-            _ => Self::Unsupported,
+            _ => floats::Intrinsic::for_row(row).map_or(Self::Unsupported, Self::Float),
         }
     }
 
@@ -3377,10 +3380,23 @@ fn finish_intrinsic_result(
         });
     }
     let value = result.into_object();
-    if expected == ResultOwnership::Scalar && !value.is_scalar() {
+    let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
+        intrinsic.result_kind_matches(&value)
+    } else if floats::boxed_integer_result(row) {
+        floats::wide_argument(&value, "wide scalar result", 0).is_ok()
+    } else {
+        value.is_scalar()
+    };
+    if expected == ResultOwnership::Scalar && !scalar_kind_matches {
         return Err(VmRefusal::IntrinsicResultKind {
             row: row.to_string(),
-            expected: "tagged scalar",
+            expected: if floats::Intrinsic::for_row(row).is_some()
+                || floats::boxed_integer_result(row)
+            {
+                "the row's boxed or immediate scalar representation"
+            } else {
+                "tagged scalar"
+            },
             actual: value_kind(&value),
         });
     }
@@ -3581,6 +3597,7 @@ fn invoke_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
+        IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
             let sum = with_nat_views(
@@ -4173,7 +4190,12 @@ fn invoke_intrinsic(
                 _ => "UInt8.toUSize",
             };
             let value = byte_argument(&args[0], operation, 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(value))))
+            Ok(match implementation {
+                IntrinsicImplementation::UInt8ToUInt16 => uint16_result(u16::from(value)),
+                IntrinsicImplementation::UInt8ToUInt32 => uint32_result(u32::from(value)),
+                IntrinsicImplementation::UInt8ToUInt64 => uint64_result(u64::from(value)),
+                _ => usize_result(usize::from(value)),
+            })
         }
         IntrinsicImplementation::UInt16Add
         | IntrinsicImplementation::UInt16Sub
@@ -4876,11 +4898,8 @@ fn invoke_intrinsic(
             })?;
             Ok(int8_result(low as i8))
         }
-        // Every widening target shares one scalar encoding at this VM layer:
-        // the sign-extended value re-boxed through mk_int, which reproduces
-        // the pin's per-width scalar payloads bit for bit. toInt's census
-        // contract is owned_res (a fresh object); the fixed-width targets
-        // are scalar-class rows.
+        // `toInt` produces the arbitrary-precision signed representation;
+        // fixed-width conversions use each destination's unsigned carrier.
         IntrinsicImplementation::Int8ToInt => {
             expect_arity(row, args, 1)?;
             let value = int8_argument(&args[0], "Int8.toInt", 0)?;
@@ -4889,7 +4908,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::Int8ToWidth => {
             expect_arity(row, args, 1)?;
             let value = int8_argument(&args[0], "Int8.toInt16", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+            signed_width_result(row, i64::from(value)).map_err(Into::into)
         }
         IntrinsicImplementation::Int16Add
         | IntrinsicImplementation::Int16Sub
@@ -5020,7 +5039,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::Int16ToWidth => {
             expect_arity(row, args, 1)?;
             let value = int16_argument(&args[0], "Int16.toInt32", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+            signed_width_result(row, i64::from(value)).map_err(Into::into)
         }
         IntrinsicImplementation::Int32Add
         | IntrinsicImplementation::Int32Sub
@@ -5151,7 +5170,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::Int32ToWidth => {
             expect_arity(row, args, 1)?;
             let value = int32_argument(&args[0], "Int32.toInt64", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+            signed_width_result(row, i64::from(value)).map_err(Into::into)
         }
         IntrinsicImplementation::Int64Add
         | IntrinsicImplementation::Int64Sub
@@ -5282,7 +5301,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::Int64ToWidth => {
             expect_arity(row, args, 1)?;
             let value = int64_argument(&args[0], "Int64.toISize", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_int(value)))
+            signed_width_result(row, value).map_err(Into::into)
         }
         IntrinsicImplementation::ISizeAdd
         | IntrinsicImplementation::ISizeSub
@@ -5414,7 +5433,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::ISizeToWidth => {
             expect_arity(row, args, 1)?;
             let value = isize_argument(&args[0], "ISize.toInt64", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_int(value as i64)))
+            signed_width_result(row, value as i64).map_err(Into::into)
         }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
@@ -6459,6 +6478,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ThunkGet
         | IntrinsicImplementation::TaskPure
         | IntrinsicImplementation::TaskGet
+        | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
@@ -7053,6 +7073,9 @@ fn uint64_argument(
     operation: &'static str,
     argument: usize,
 ) -> Result<u64, VmRefusal> {
+    if matches!(value_kind(value), ValueKind::Ctor(_)) {
+        return floats::wide_argument(value, operation, argument);
+    }
     if value.is_scalar() {
         return Ok(value.unbox() as u64);
     }
@@ -7061,20 +7084,15 @@ fn uint64_argument(
 }
 
 fn int64_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<i64, VmRefusal> {
-    if value.is_scalar() {
-        return Ok(value.unbox() as u64 as i64);
-    }
-    with_nat_view(value, operation, argument, |view| view.to_u64())?
-        .map(|u| u as i64)
-        .ok_or(VmRefusal::NatOverflow { operation })
+    uint64_argument(value, operation, argument).map(|value| value as i64)
 }
 
 fn uint64_result(value: u64) -> IntrinsicResult {
-    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
+    floats::wide_result(value)
 }
 
 fn int64_result(value: i64) -> IntrinsicResult {
-    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
+    uint64_result(value as u64)
 }
 
 fn usize_argument(
@@ -7082,10 +7100,7 @@ fn usize_argument(
     operation: &'static str,
     argument: usize,
 ) -> Result<usize, VmRefusal> {
-    if value.is_scalar() {
-        return Ok(value.unbox());
-    }
-    nat_as_usize(value, operation, argument)?.ok_or(VmRefusal::NatOverflow { operation })
+    uint64_argument(value, operation, argument).map(|value| value as usize)
 }
 
 fn isize_argument(
@@ -7097,11 +7112,24 @@ fn isize_argument(
 }
 
 fn usize_result(value: usize) -> IntrinsicResult {
-    IntrinsicResult::scalar(Obj::mk_nat(value & (usize::MAX >> 1)))
+    uint64_result(value as u64)
 }
 
 fn isize_result(value: isize) -> IntrinsicResult {
-    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
+    int64_result(value as i64)
+}
+
+fn signed_width_result(row: &str, value: i64) -> Result<IntrinsicResult, VmRefusal> {
+    match row.rsplit('.').next() {
+        Some("toInt8") => Ok(int8_result(value as i8)),
+        Some("toInt16") => Ok(int16_result(value as i16)),
+        Some("toInt32") => Ok(int32_result(value as i32)),
+        Some("toInt64") => Ok(int64_result(value)),
+        Some("toISize") => Ok(isize_result(value as isize)),
+        _ => Err(VmRefusal::UnsupportedIntrinsic {
+            row: row.to_string(),
+        }),
+    }
 }
 /// Exact port of the pin's `lean_byte_array_copy_slice` value semantics:
 /// a source offset past the source returns the destination unchanged; the
@@ -7232,7 +7260,7 @@ mod tests {
     #[test]
     fn intrinsic_result_adapter_refuses_class_and_scalar_kind_drift() {
         let scalar_kind = finish_intrinsic_result(
-            "extern:Float.abs",
+            "extern:UInt8.add",
             ResultOwnership::Scalar,
             IntrinsicResult {
                 ownership: ResultOwnership::Scalar,
@@ -7245,7 +7273,7 @@ mod tests {
                 ref row,
                 expected: "tagged scalar",
                 actual: ValueKind::String,
-            }) if row == "extern:Float.abs"
+            }) if row == "extern:UInt8.add"
         ));
 
         let class = finish_intrinsic_result(
@@ -8064,7 +8092,7 @@ mod tests {
             "extern:UInt8.toUInt64",
             "extern:UInt8.toUSize",
         ] {
-            assert_eq!(owned_usize(invoke(row, &[b(250)])), 250, "{row}");
+            assert_eq!(u64_val(invoke(row, &[b(250)])), 250, "{row}");
         }
         assert_eq!(owned_usize(invoke("extern:UInt8.decEq", &[b(5), b(5)])), 1);
         assert_eq!(owned_usize(invoke("extern:UInt8.decLt", &[b(6), b(5)])), 0);
@@ -8142,15 +8170,11 @@ mod tests {
 
     #[test]
     fn int8_widening_sign_extends_into_the_int_plane() {
-        for row in [
-            "extern:Int8.toInt",
-            "extern:Int8.toInt16",
-            "extern:Int8.toInt32",
-            "extern:Int8.toInt64",
-            "extern:Int8.toISize",
-        ] {
-            assert_eq!(int_i64(invoke(row, &[b(254)])), -2, "{row}");
-        }
+        assert_eq!(int_i64(invoke("extern:Int8.toInt", &[b(254)])), -2);
+        assert_eq!(i16_val(invoke("extern:Int8.toInt16", &[b(254)])), -2);
+        assert_eq!(i32_val(invoke("extern:Int8.toInt32", &[b(254)])), -2);
+        assert_eq!(i64_val(invoke("extern:Int8.toInt64", &[b(254)])), -2);
+        assert_eq!(isize_val(invoke("extern:Int8.toISize", &[b(254)])), -2);
     }
 
     #[test]
@@ -8249,6 +8273,8 @@ mod tests {
         let obj = result.expect("intrinsic result");
         if obj.is_scalar() {
             obj.unbox() as u64
+        } else if matches!(value_kind(&obj), ValueKind::Ctor(0)) {
+            obj.try_ctor_scalar_u64(0).expect("boxed 64-bit scalar")
         } else {
             with_nat_view(&obj, "test", 0, |view| view.to_u64())
                 .unwrap()
@@ -8584,7 +8610,7 @@ mod tests {
         );
         assert_eq!(
             i64_val(invoke("extern:Int64.ofInt", &[i(-999999)])),
-            (-999999i64 as usize & (usize::MAX >> 1)) as i64
+            -999999
         );
         assert_eq!(int_i64(invoke("extern:Int64.toInt", &[n(42)])), 42);
     }
@@ -8600,10 +8626,7 @@ mod tests {
         assert_eq!(isize_val(invoke("extern:ISize.sub", &[n(50), n(20)])), 30);
         assert_eq!(isize_val(invoke("extern:ISize.div", &[n(100), n(0)])), 0);
         assert_eq!(isize_val(invoke("extern:ISize.mod", &[n(100), n(0)])), 100);
-        assert_eq!(
-            isize_val(invoke("extern:ISize.ofInt", &[i(-42)])),
-            (-42isize as usize & (usize::MAX >> 1)) as isize
-        );
+        assert_eq!(isize_val(invoke("extern:ISize.ofInt", &[i(-42)])), -42);
         assert_eq!(int_i64(invoke("extern:ISize.toInt", &[n(42)])), 42);
     }
 

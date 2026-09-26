@@ -348,8 +348,10 @@ impl ArgumentOwnership {
 ///
 /// Every class still produces one register-owned [`fln_rt::obj::Obj`] inside
 /// Golem. `Borrowed` requires the row implementation to promote a reviewed
-/// borrowed source before that source can die. `Scalar` requires a tagged
-/// immediate. `RawObject` records that the generated C signature does not
+/// borrowed source before that source can die. `Scalar` describes a C scalar
+/// return: Golem uses tagged immediates for narrow integers, and a checked
+/// constructor box for an explicitly implemented floating-point or wide
+/// integer conversion row. `RawObject` records that the generated C signature does not
 /// itself state ownership; it is executable only through a row-specific native
 /// implementation that returns an internally owned object.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
