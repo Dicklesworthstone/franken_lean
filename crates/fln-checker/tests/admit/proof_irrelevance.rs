@@ -636,3 +636,63 @@ fn a_failed_congruence_attempt_is_not_made_again() {
          ({deep_polls} polled): {deep:?}"
     );
 }
+
+/// Where a deferred pair goes on to typed conversion, untyped conversion defers
+/// two applications of one regular definition whose arguments it cannot
+/// decide, instead of unfolding both. `T (slow q)` against `T (slow p)`: the
+/// arguments `q` and `p` are two proofs that only typed conversion identifies,
+/// so admission defers at once and the typed lane closes the pair by
+/// congruence, with no walk of `slow` anywhere. Unfolding first walks the whole
+/// tower, and on `assemble₃_eq_some_iff_utf8EncodeChar_eq` the corresponding
+/// walk through `String.utf8EncodeChar c` materialized past its budget.
+#[test]
+fn undecided_arguments_under_one_regular_head_defer_to_typed_conversion() {
+    use fln_checker::defeq::def_eq_with;
+    use fln_checker::whnf::WhnfContext;
+    const WRAPS: usize = 200;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound, |inner, _| app(c("wrapP"), [inner]));
+    let slow = |proof: &str| app(c("slow"), [c(proof)]);
+    let env = environment_of(vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("wrapP", pi(c("P"), c("P"))),
+        entry("T", pi(c("P"), Expr::sort(Level::one()))),
+        definition(
+            "slow",
+            decoded(&pi(c("P"), c("P"))),
+            decoded(&lam(c("P"), tower)),
+        ),
+        entry("w", app(c("T"), [slow("q")])),
+    ]);
+    let walk_polls = Cell::new(0_u64);
+    let _ = def_eq_with(
+        &decoded(&app(c("T"), [slow("q")])),
+        &decoded(&app(c("T"), [slow("p")])),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            walk_polls.set(walk_polls.get() + 1);
+            false
+        },
+    );
+    let walk = walk_polls.get();
+    assert!(
+        walk > u64::try_from(WRAPS).expect("small"),
+        "plain conversion still walks the tower: {walk} polls"
+    );
+    let candidate = definition("d", decoded(&app(c("T"), [slow("p")])), decoded(&c("w")));
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || {
+        polls.set(polls.get() + 1);
+        false
+    });
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    assert!(
+        4 * admission < walk,
+        "admission polled {admission} times, a quarter of the {walk}-poll walk of \
+         `T (slow q) ≟ T (slow p)`: conversion unfolded `slow` instead of deferring"
+    );
+}

@@ -221,9 +221,10 @@ impl Probe<'_> {
         context: &InferenceContext,
     ) -> Result<Option<bool>> {
         let budget = self.budget.defeq;
-        let result = def_eq_with(left, right, context.reduction(), budget, &mut || {
-            self.poll()
-        });
+        let result =
+            def_eq_before_typed_with(left, right, context.reduction(), budget, &mut || {
+                self.poll()
+            });
         self.check_stop()?;
         match result {
             DefEqOutcome::Equal(_) => Ok(Some(true)),

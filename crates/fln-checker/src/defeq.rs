@@ -3205,12 +3205,47 @@ fn materialize_subterm_wire(
     }
 }
 
+/// What conversion does with two applications of one regular definition whose
+/// arguments it could not decide: an argument pair that deferred, as two proofs
+/// of one proposition do when they differ, since only typed conversion knows
+/// them for proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UndecidedArguments {
+    /// Unfold both heads and go on comparing, as lazy delta does after a failed
+    /// congruence. For a caller with nothing to defer to.
+    Unfold,
+    /// Defer the pair. For a caller that decides deferred pairs with types,
+    /// where congruence with proof irrelevance settles what unfolding could only
+    /// approach through the definitions' bodies: comparing
+    /// `List.get (String.utf8EncodeChar c) ⟨0, h₁⟩` with the same term at `h₂`
+    /// that way materialized past its budget.
+    Defer,
+}
+
+/// The query-wide choices of one conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ConversionScope {
+    nat: NatReductionScope,
+    arguments: UndecidedArguments,
+}
+
+/// The same-head shortcut's answer for one pair.
+enum SameHeadArguments {
+    /// Every argument pair is equal, so the applications are.
+    Equal,
+    /// The shortcut does not apply or an argument pair differs: unfold.
+    Unfold,
+    /// An argument pair deferred.
+    Undecided,
+}
+
 /// Upstream Lean 4 / K1 equal-regular-definition shortcut:
 /// Before unfolding two applications of the SAME regular definition,
 /// check whether all arguments are definitionally equal.
 /// If all arguments are defeq, congruence proves definitional equality
-/// directly, skipping delta reduction. If argument checking fails,
-/// this returns `Ok(false)` and lazy delta continues with normal height ordering.
+/// directly, skipping delta reduction. Otherwise lazy delta continues with
+/// normal height ordering, unless an argument pair deferred and the scope
+/// defers such pairs.
 #[allow(clippy::too_many_arguments)]
 fn regular_same_head_apps_def_eq(
     left_reference: DefEqTerm,
@@ -3219,22 +3254,22 @@ fn regular_same_head_apps_def_eq(
     right: &WireExpr,
     generated: &[WireExpr],
     context: &WhnfContext,
-    nat_scope: NatReductionScope,
+    scope: ConversionScope,
     control: &mut SlowControl,
     memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<bool, SlowHalt> {
+) -> Result<SameHeadArguments, SlowHalt> {
     let sources = TermSources::new(left, right, generated);
     let (left_head, left_args) =
         collect_constructor_spine(left_reference, sources, control, cancelled)?;
     if left_args.is_empty() {
-        return Ok(false);
+        return Ok(SameHeadArguments::Unfold);
     }
     let sources = TermSources::new(left, right, generated);
     let (right_head, right_args) =
         collect_constructor_spine(right_reference, sources, control, cancelled)?;
     if left_args.len() != right_args.len() {
-        return Ok(false);
+        return Ok(SameHeadArguments::Unfold);
     }
 
     let sources = TermSources::new(left, right, generated);
@@ -3254,11 +3289,11 @@ fn regular_same_head_apps_def_eq(
         right_arena.node(right_head.root),
     )
     else {
-        return Ok(false);
+        return Ok(SameHeadArguments::Unfold);
     };
 
     if left_name != right_name || left_levels.len() != right_levels.len() {
-        return Ok(false);
+        return Ok(SameHeadArguments::Unfold);
     }
 
     for (left_level, right_level) in left_levels.iter().zip(right_levels) {
@@ -3276,7 +3311,7 @@ fn regular_same_head_apps_def_eq(
             })
         })?;
         if !equal {
-            return Ok(false);
+            return Ok(SameHeadArguments::Unfold);
         }
     }
 
@@ -3288,7 +3323,7 @@ fn regular_same_head_apps_def_eq(
         .unwrap_or(false);
 
     if !is_regular {
-        return Ok(false);
+        return Ok(SameHeadArguments::Unfold);
     }
 
     for (&left_arg, &right_arg) in left_args.iter().zip(&right_args) {
@@ -3299,9 +3334,9 @@ fn regular_same_head_apps_def_eq(
 
         // This conversion may have put exactly this pair to the shortcut
         // before, at an earlier unfolding step or deeper in a nested comparison.
-        match memo.recall(&left_wire, &right_wire, nat_scope) {
+        match memo.recall(&left_wire, &right_wire, scope.nat) {
             Some(Remembered::Equal) => continue,
-            Some(Remembered::NotProven) => return Ok(false),
+            Some(Remembered::NotProven) => return Ok(SameHeadArguments::Unfold),
             None => {}
         }
         let sub_budget = control.remaining_defeq_budget();
@@ -3310,19 +3345,26 @@ fn regular_same_head_apps_def_eq(
             &right_wire,
             context,
             sub_budget,
-            nat_scope,
+            scope,
             memo,
             cancelled,
         );
         match outcome {
             DefEqOutcome::Equal(progress) => {
                 control.absorb_defeq_progress(&progress);
-                memo.remember(left_wire, right_wire, nat_scope, Remembered::Equal);
+                memo.remember(left_wire, right_wire, scope.nat, Remembered::Equal);
             }
-            DefEqOutcome::NotEqual { progress, .. } | DefEqOutcome::Deferred { progress, .. } => {
+            DefEqOutcome::NotEqual { progress, .. } => {
                 control.absorb_defeq_progress(&progress);
-                memo.remember(left_wire, right_wire, nat_scope, Remembered::NotProven);
-                return Ok(false);
+                memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+                return Ok(SameHeadArguments::Unfold);
+            }
+            // Remembered as not proven: under `Defer` the first undecided
+            // argument ends the conversion, so only `Unfold` ever recalls it.
+            DefEqOutcome::Deferred { progress, .. } => {
+                control.absorb_defeq_progress(&progress);
+                memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+                return Ok(SameHeadArguments::Undecided);
             }
             DefEqOutcome::Inconclusive(stop) => {
                 return Err(SlowHalt::Stop(Box::new(stop)));
@@ -3344,7 +3386,7 @@ fn regular_same_head_apps_def_eq(
         }
     }
 
-    Ok(true)
+    Ok(SameHeadArguments::Equal)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3354,7 +3396,7 @@ fn run_slow(
     context: &WhnfContext,
     budget: DefEqBudget,
     quick_comparisons: u64,
-    nat_scope: NatReductionScope,
+    scope: ConversionScope,
     memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqOutcome, SlowHalt> {
@@ -3595,7 +3637,7 @@ fn run_slow(
                         right_reference,
                         TermSources::new(left, right, &generated),
                         context,
-                        nat_scope,
+                        scope.nat,
                         &mut control,
                         cancelled,
                     )?
@@ -3616,7 +3658,7 @@ fn run_slow(
                         left_reference,
                         TermSources::new(left, right, &generated),
                         context,
-                        nat_scope,
+                        scope.nat,
                         &mut control,
                         cancelled,
                     )?
@@ -3709,21 +3751,42 @@ fn run_slow(
                     (Some(_), None) => (true, false),
                     (None, Some(_)) => (false, true),
                     (Some(left_height), Some(right_height)) => {
-                        if left_height == right_height
-                            && regular_same_head_apps_def_eq(
+                        if left_height == right_height {
+                            match regular_same_head_apps_def_eq(
                                 left_reference,
                                 right_reference,
                                 left,
                                 right,
                                 &generated,
                                 context,
-                                nat_scope,
+                                scope,
                                 &mut control,
                                 memo,
                                 cancelled,
-                            )?
-                        {
-                            continue;
+                            )? {
+                                SameHeadArguments::Equal => continue,
+                                SameHeadArguments::Undecided
+                                    if scope.arguments == UndecidedArguments::Defer
+                                        && string_context == StringComparisonContext::Ordinary =>
+                                {
+                                    trace_unresolved(
+                                        &need,
+                                        left_reference,
+                                        right_reference,
+                                        left,
+                                        right,
+                                        &generated,
+                                    );
+                                    return Ok(unresolved_pair(
+                                        need,
+                                        left_reference,
+                                        right_reference,
+                                        string_context,
+                                        control.progress,
+                                    ));
+                                }
+                                SameHeadArguments::Undecided | SameHeadArguments::Unfold => {}
+                            }
                         }
                         (left_height >= right_height, right_height >= left_height)
                     }
@@ -3866,7 +3929,33 @@ pub fn def_eq_with(
         right,
         context,
         budget,
-        NatReductionScope::ClosedPair,
+        ConversionScope {
+            nat: NatReductionScope::ClosedPair,
+            arguments: UndecidedArguments::Unfold,
+        },
+        &mut ArgumentMemo::default(),
+        &mut cancelled,
+    )
+}
+
+/// Ordinary conversion for a caller that decides a deferred pair with types:
+/// see [`UndecidedArguments::Defer`].
+pub(crate) fn def_eq_before_typed_with(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> DefEqOutcome {
+    def_eq_scoped_with(
+        left,
+        right,
+        context,
+        budget,
+        ConversionScope {
+            nat: NatReductionScope::ClosedPair,
+            arguments: UndecidedArguments::Defer,
+        },
         &mut ArgumentMemo::default(),
         &mut cancelled,
     )
@@ -3887,7 +3976,10 @@ pub(crate) fn def_eq_eager_with(
         right,
         context,
         budget,
-        NatReductionScope::EagerOpenPair,
+        ConversionScope {
+            nat: NatReductionScope::EagerOpenPair,
+            arguments: UndecidedArguments::Unfold,
+        },
         &mut ArgumentMemo::default(),
         &mut cancelled,
     )
@@ -3898,7 +3990,7 @@ fn def_eq_scoped_with(
     right: &WireExpr,
     context: &WhnfContext,
     budget: DefEqBudget,
-    nat_scope: NatReductionScope,
+    scope: ConversionScope,
     memo: &mut ArgumentMemo,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> DefEqOutcome {
@@ -3940,7 +4032,7 @@ fn def_eq_scoped_with(
                     context,
                     budget,
                     completed_comparisons,
-                    nat_scope,
+                    scope,
                     memo,
                     cancelled,
                 ))
@@ -3955,7 +4047,7 @@ fn def_eq_scoped_with(
             context,
             budget,
             completed_comparisons,
-            nat_scope,
+            scope,
             memo,
             cancelled,
         )),

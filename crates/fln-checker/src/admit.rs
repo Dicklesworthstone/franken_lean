@@ -105,7 +105,7 @@ const MAX_MUTUAL_TYPES: usize = 32;
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
     QuickDefEqBudget, QuickDefEqFault, QuickDefEqLimit, QuickDefEqSide, QuickDefEqStop,
-    def_eq_with,
+    def_eq_before_typed_with,
 };
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
@@ -1002,7 +1002,7 @@ fn body_matches_declared_type(
     if cancelled() {
         return Err(stopped_err(name, AdmissionPhase::BodyConversion));
     }
-    match def_eq_with(
+    match def_eq_before_typed_with(
         &body_type,
         declaration.type_(),
         // Again the context that INFERRED, not one rebuilt from the same inputs.

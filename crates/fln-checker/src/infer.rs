@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
-    QuickDefEqBudget, def_eq_eager_with, def_eq_with,
+    QuickDefEqBudget, def_eq_before_typed_with, def_eq_eager_with,
 };
 use crate::environment::{ConstantEnvironment, ConstantKind, ConstantSafety, DefinitionSafety};
 use crate::instantiate::{
@@ -2790,7 +2790,7 @@ impl<'a> InferenceEngine<'a> {
             .step(self.cancelled, InferencePhase::LetValueComparison, binder)
             .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
-        match def_eq_with(
+        match def_eq_before_typed_with(
             actual,
             declared,
             self.reduction.as_ref(),
@@ -3921,7 +3921,7 @@ impl<'a> InferenceEngine<'a> {
             .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
         let outcome = match conversion {
-            ConversionMode::Ordinary => def_eq_with(
+            ConversionMode::Ordinary => def_eq_before_typed_with(
                 actual,
                 expected,
                 self.reduction.as_ref(),
