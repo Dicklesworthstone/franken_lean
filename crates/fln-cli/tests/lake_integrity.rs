@@ -35,7 +35,7 @@ fn package(config: &str) -> Package {
 }
 
 #[test]
-fn lake_build_never_reports_success_without_a_compiler() {
+fn unsupported_default_facets_never_report_compilation_success() {
     let dir = package("name = \"honest\"\ndefaultTargets = [\"Honest\"]\n");
     for source in [
         "def answer : Nat := 42\n",

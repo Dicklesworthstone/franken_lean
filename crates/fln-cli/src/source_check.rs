@@ -3,6 +3,14 @@ use super::*;
 mod imports;
 pub(super) mod lsp;
 
+pub(super) fn load_build_base(
+    roots: &[fln::Name],
+    source_root: &Path,
+) -> Result<fln::Engine, (&'static str, String, bool)> {
+    imports::load_build_base(roots, source_root)
+        .map_err(|error| (error.class, error.detail, error.authority))
+}
+
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.
     let mut json = false;

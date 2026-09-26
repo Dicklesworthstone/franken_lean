@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod lake_build;
 mod source_check;
 
 use fln_core::diag::{
@@ -12929,9 +12930,10 @@ const LAKE_USAGE: &str = concat!(
     "\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean currently has no Lake artifact compiler or build-provenance\n",
-    "backend. `build` fails without writing artifacts; `check-build` only\n",
-    "checks default-target presence in supported TOML configuration.\n",
+    "\nFrankenLean builds checked +Module:olean facets from declared TOML libraries.\n",
+    "Default library, executable and other facets remain unavailable.\n",
+    "Builds recheck source and imports; no persistent cache is consulted.\n",
+    "`check-build` only checks default-target presence in TOML configuration.\n",
 );
 
 const LAKE_HELP_BUILD: &str = concat!(
@@ -12945,8 +12947,14 @@ const LAKE_HELP_BUILD: &str = concat!(
     "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nArtifact compilation is currently unavailable in FrankenLean; this command\n",
-    "fails without creating or replacing build outputs.\n",
+    "\nFrankenLean supports +Module:olean for modules owned by a TOML lean_lib.\n",
+    "Local source imports are built first; external imports (including implicit\n",
+    "Init) are read from LEAN_PATH or the pinned toolchain and rechecked by K1\n",
+    "and the independent checker. Outputs are in buildDir/lib/lean.\n",
+    "All selected sources must check and encode before any output is replaced.\n",
+    "Source is bounded to 1 MiB and 256 modules; artifacts to 64 MiB.\n",
+    "Builds always recheck. Default leanArts, executable facets, custom build\n",
+    "settings and distinct external-import scopes remain unavailable.\n",
 );
 
 const LAKE_HELP_QUERY: &str = concat!(
@@ -12986,6 +12994,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
     let mut is_json = false;
+    let mut ignored_options = Vec::new();
 
     while let Some(arg) = iter.next() {
         let s = arg.to_string_lossy();
@@ -13027,6 +13036,15 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             return MultiplexerOutput::failure(format!("error: unknown option '{s}'\n"), 1);
         }
         if s.starts_with('-') {
+            if command.as_deref() == Some("build") {
+                return lake_operation_failure(
+                    "fln.lake-build/2",
+                    &format!("build option `{s}` is unavailable"),
+                    true,
+                    is_json,
+                );
+            }
+            ignored_options.push(s.into_owned());
             continue;
         }
         if command.is_none() {
@@ -13067,49 +13085,16 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     match cmd.as_str() {
         "serve" => serve_lsp(),
         "build" => {
-            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            match fln_lake::build_package(&target_dir, &command_args) {
-                Ok(report) => {
-                    if is_json {
-                        let targets_json = report
-                            .targets
-                            .iter()
-                            .map(|s| format!("\"{s}\""))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-build/1\",\"status\":\"success\",\"package\":\"{}\",\"targets\":[{targets_json}],\"targets_built\":{},\"targets_cached\":{}}}\n",
-                            report.package, report.targets_built, report.targets_cached
-                        ))
-                    } else {
-                        MultiplexerOutput::success(format!(
-                            "Built {} ({} built, {} cached)\n",
-                            report.package, report.targets_built, report.targets_cached
-                        ))
-                    }
-                }
-                Err(fln_lake::LakeBuildError::Discovery(
-                    fln_lake::LakeDiscoveryError::NotFound(p),
-                )) => MultiplexerOutput::failure(
-                    format!(
-                        "error: no such file or directory (error code: 2)\n  file: {}\n",
-                        p.join("lakefile.lean").display()
-                    ),
-                    1,
-                ),
-                Err(err) => lake_operation_failure(
-                    "fln.lake-build/1",
-                    &err.to_string(),
-                    matches!(
-                        err,
-                        fln_lake::LakeBuildError::Unavailable
-                            | fln_lake::LakeBuildError::Discovery(
-                                fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)
-                            )
-                    ),
+            if let Some(option) = ignored_options.first() {
+                return lake_operation_failure(
+                    "fln.lake-build/2",
+                    &format!("build option `{option}` is unavailable"),
+                    true,
                     is_json,
-                ),
+                );
             }
+            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            lake_build::run(target_dir, command_args, is_json)
         }
         "clean" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));

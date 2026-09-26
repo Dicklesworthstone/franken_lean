@@ -461,6 +461,19 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
     Ok(loaded)
 }
 
+/// Builds use the same bounded import loader and dual-checker admission as
+/// source checking, but never substitute a synthetic seed for missing imports.
+pub(super) fn load_build_base(roots: &[Name], source_root: &Path) -> Result<fln::Engine, Failure> {
+    let loaded = Loaded {
+        inputs: Inputs::Files(Vec::new()),
+        total_bytes: 0,
+        oleans: load_olean_closure(roots, source_root)?,
+    };
+    loaded
+        .base_engine(|| Ok(fln::Engine::from_environment(fln::Environment::new())))
+        .map(|(engine, _)| engine)
+}
+
 fn validate_component(component: &str) -> Result<(), Failure> {
     if component.is_empty()
         || matches!(component, "." | "..")

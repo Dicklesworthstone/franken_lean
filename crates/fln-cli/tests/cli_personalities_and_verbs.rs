@@ -951,7 +951,7 @@ fn lake_personality_build_and_check_build() {
     let build_json_stdout = String::from_utf8(build_json.stdout).expect("utf8 stdout");
     assert!(build_json_stdout.is_empty());
     let build_json_stderr = String::from_utf8(build_json.stderr).unwrap();
-    assert!(build_json_stderr.contains("\"schema\":\"fln.lake-build/1\""));
+    assert!(build_json_stderr.contains("\"schema\":\"fln.lake-build/2\""));
     assert!(build_json_stderr.contains("\"status\":\"unsupported\""));
     assert!(!build_json_stderr.contains("targets_cached"));
 

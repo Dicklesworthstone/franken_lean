@@ -281,6 +281,8 @@ pub enum LakeParseError {
     MissingField(&'static str),
     /// A syntax error occurred on a specific line.
     InvalidSyntax(String),
+    /// A build-affecting setting has no native implementation yet.
+    UnsupportedBuildSetting(String),
 }
 
 impl fmt::Display for LakeParseError {
@@ -290,6 +292,9 @@ impl fmt::Display for LakeParseError {
                 write!(f, "missing required field '{field}' in lakefile.toml")
             }
             Self::InvalidSyntax(msg) => write!(f, "syntax error in lakefile.toml: {msg}"),
+            Self::UnsupportedBuildSetting(setting) => {
+                write!(f, "native Lake build setting is unavailable: {setting}")
+            }
         }
     }
 }
@@ -504,6 +509,86 @@ fn parse_string_array(s: &str) -> Option<Vec<String>> {
 }
 
 impl LakeConfig {
+    /// The artifact-producing path must not silently ignore compiler options,
+    /// custom globs, dependency jobs or native facets. Other configuration-only
+    /// commands retain their existing permissive discovery surface.
+    pub fn parse_toml_for_build(content: &str) -> Result<Self, LakeParseError> {
+        let mut section = "package";
+        let mut keys = std::collections::BTreeSet::new();
+        for (index, raw) in content.lines().enumerate() {
+            let line = strip_comment(raw).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = match line {
+                    "[package]" => "package",
+                    "[[lean_lib]]" => "lean_lib",
+                    "[[lean_exe]]" => "lean_exe",
+                    _ => {
+                        return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                            "line {}: {line}",
+                            index + 1
+                        )));
+                    }
+                };
+                keys.clear();
+                continue;
+            }
+            let invalid = || LakeParseError::InvalidSyntax(format!("line {}: {line}", index + 1));
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(invalid());
+            };
+            let key = key.trim();
+            if !keys.insert(key) {
+                return Err(LakeParseError::InvalidSyntax(format!(
+                    "line {}: duplicate {key}",
+                    index + 1
+                )));
+            }
+            let array = match (section, key) {
+                ("package", "defaultTargets" | "keywords") | ("lean_lib", "roots") => true,
+                (
+                    "package",
+                    "name" | "version" | "description" | "homepage" | "license" | "srcDir"
+                    | "buildDir",
+                )
+                | ("lean_lib" | "lean_exe", "name" | "srcDir")
+                | ("lean_exe", "root") => false,
+                _ => {
+                    return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                        "line {}: {section}.{key}",
+                        index + 1
+                    )));
+                }
+            };
+            if if array {
+                parse_string_array(value).is_none()
+            } else {
+                parse_string_val(value).is_none()
+            } {
+                return Err(invalid());
+            }
+            if key == "roots" && parse_string_array(value).is_some_and(|roots| roots.is_empty()) {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "line {}: an empty library roots array",
+                    index + 1
+                )));
+            }
+        }
+        let config = Self::parse_toml(content)?;
+        let mut names = std::collections::BTreeSet::new();
+        for target in &config.targets {
+            if !names.insert(&target.name) {
+                return Err(LakeParseError::InvalidSyntax(format!(
+                    "duplicate target {}",
+                    target.name
+                )));
+            }
+        }
+        Ok(config)
+    }
+
     /// Parse a `lakefile.toml` configuration string.
     pub fn parse_toml(content: &str) -> Result<Self, LakeParseError> {
         let mut name: Option<String> = None;

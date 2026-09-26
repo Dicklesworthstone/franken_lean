@@ -2222,6 +2222,8 @@ impl EngineBuilder {
             environment: Environment::new(),
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2235,6 +2237,8 @@ impl EngineBuilder {
             environment,
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2255,6 +2259,8 @@ impl EngineBuilder {
             environment: state.environment().clone(),
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2356,6 +2362,12 @@ pub struct Engine {
     /// through [`Engine::check_olean_modules`]; source imports of them are
     /// satisfied by the base rather than by a source module.
     imported_modules: std::sync::Arc<BTreeSet<Name>>,
+    /// Exact environment produced solely by independently checked, named
+    /// imports. Later admission preserves this snapshot so artifact production
+    /// can detect any ambient declarations or extension changes.
+    imported_environment: Option<Environment>,
+    /// Direct import edges retained from each checked module's decoded header.
+    imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
     epoch: ModuleEpoch,
     mode: Mode,
     reproducibility: ReproducibilityProfile,
@@ -2562,6 +2574,8 @@ impl Engine {
             environment,
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
             epoch: Self::pinned_epoch(),
             mode: Mode::DEFAULT,
             reproducibility: ReproducibilityProfile::Standard,
@@ -2583,6 +2597,8 @@ impl Engine {
             environment: state.environment().clone(),
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2855,6 +2871,14 @@ impl Engine {
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
         let ordered = self.decode_olean_module_set(modules, limits)?;
+        let bound_base = (self.environment == Environment::new()
+            || self
+                .imported_environment
+                .as_ref()
+                .is_some_and(|snapshot| snapshot == &self.environment))
+            && modules
+                .iter()
+                .all(|module| !self.imported_modules.contains(module.name));
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
         let mut checked_modules = Vec::new();
@@ -2882,6 +2906,21 @@ impl Engine {
         let mut imported = (*engine.imported_modules).clone();
         imported.extend(checked_modules.iter().map(|module| module.name.clone()));
         engine.imported_modules = std::sync::Arc::new(imported);
+        let mut dependencies = (*self.imported_module_dependencies).clone();
+        for module in &checked_modules {
+            dependencies.insert(
+                module.name.clone(),
+                module
+                    .decoded
+                    .module
+                    .imports
+                    .iter()
+                    .map(|import| import.module.clone())
+                    .collect(),
+            );
+        }
+        engine.imported_module_dependencies = std::sync::Arc::new(dependencies);
+        engine.imported_environment = bound_base.then(|| engine.environment.clone());
         let result_logical_root = engine.logical_root(options);
         Ok(Outcome::Complete(CheckedOleanSet {
             engine,
@@ -3822,6 +3861,10 @@ impl Engine {
                 environment,
                 checker_environment: Some(checker_environment),
                 imported_modules: std::sync::Arc::clone(&self.imported_modules),
+                imported_environment: self.imported_environment.clone(),
+                imported_module_dependencies: std::sync::Arc::clone(
+                    &self.imported_module_dependencies,
+                ),
                 epoch: self.epoch.clone(),
                 mode: self.mode,
                 reproducibility: self.reproducibility,

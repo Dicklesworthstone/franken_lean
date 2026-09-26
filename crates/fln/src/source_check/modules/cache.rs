@@ -157,8 +157,13 @@ pub(super) struct CacheView<'a> {
     entries: &'a BTreeMap<Name, Arc<CachedModule>>,
     limits: SourceModuleCacheLimits,
 }
+pub(super) struct RunOptions<'a> {
+    pub(super) cache: Option<CacheView<'a>>,
+    pub(super) collect_artifacts: bool,
+}
 pub(super) struct Run {
     pub(super) result: SourceModuleSessionCheck,
+    pub(super) artifacts: Vec<artifacts::PendingArtifact>,
     entries: BTreeMap<Name, Arc<CachedModule>>,
     source_bytes: usize,
 }
@@ -174,6 +179,33 @@ pub(super) fn run(
     cancellation: Option<&dyn CancellationProbe>,
     cache: Option<CacheView<'_>>,
 ) -> Result<Outcome<Run>, SourceModuleCheckError> {
+    run_collecting(
+        base,
+        modules,
+        entry,
+        options,
+        limits,
+        cancellation,
+        RunOptions {
+            cache,
+            collect_artifacts: false,
+        },
+    )
+}
+
+pub(super) fn run_collecting(
+    base: &Engine,
+    modules: &[SourceModuleInput<'_>],
+    entry: &Name,
+    options: &KVMap,
+    limits: SourceModuleCheckLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+    run_options: RunOptions<'_>,
+) -> Result<Outcome<Run>, SourceModuleCheckError> {
+    let RunOptions {
+        cache,
+        collect_artifacts,
+    } = run_options;
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
             "source-modules/before-plan",
@@ -184,7 +216,12 @@ pub(super) fn run(
         bytes: 0,
         limits,
     };
-    let plan = graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?;
+    let plan = if collect_artifacts {
+        graph::Plan::with_implicit_init(modules, entry, base.imported_modules(), &mut meter, true)?
+    } else {
+        graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?
+    };
+    let mut artifacts = Vec::new();
     let base_logical_root = base.logical_root(options);
     let mut exports: BTreeMap<usize, Arc<replay::Export>> = BTreeMap::new();
     let mut stamps: BTreeMap<usize, Arc<()>> = BTreeMap::new();
@@ -203,6 +240,16 @@ pub(super) fn run(
             )));
         }
         let dependencies = plan.dependencies_of(index, modules, &mut meter)?;
+        if collect_artifacts {
+            artifacts::validate_import_scope(
+                base,
+                index,
+                &dependencies,
+                &plan,
+                modules,
+                &mut meter,
+            )?;
+        }
         let identities: Vec<_> = if cache.is_some() {
             dependencies
                 .iter()
@@ -310,6 +357,16 @@ pub(super) fn run(
                 declarations,
                 &mut meter,
             )?);
+            if collect_artifacts {
+                export.require_artifact_support(module.name)?;
+                artifacts.push(artifacts::PendingArtifact::capture(
+                    module.name,
+                    header,
+                    imported.environment(),
+                    checked.engine.environment(),
+                    &mut meter,
+                )?);
+            }
             if cache.is_some() {
                 let stamp = Arc::new(());
                 stamps.insert(index, Arc::clone(&stamp));
@@ -361,6 +418,7 @@ pub(super) fn run(
         )));
     }
     Ok(Outcome::Complete(Run {
+        artifacts,
         result: SourceModuleSessionCheck {
             checked: SourceModuleCheck {
                 checked: entry_result.expect("entry is last in its postorder"),

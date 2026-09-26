@@ -7,9 +7,11 @@ use super::*;
 use crate::SourceModuleInput;
 use std::collections::BTreeMap;
 
+mod artifacts;
 mod cache;
 mod graph;
 mod replay;
+pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 
@@ -54,6 +56,10 @@ pub enum SourceModuleCheckError {
         importer: Name,
         module: Name,
     },
+    AmbientImport {
+        module: Name,
+        import: Name,
+    },
     Cycle(Name),
     UnreachableModule(Name),
     Limit {
@@ -95,6 +101,12 @@ impl std::fmt::Display for SourceModuleCheckError {
                 "module `{}` requires missing module `{}`",
                 importer.to_display_string(),
                 module.to_display_string()
+            ),
+            Self::AmbientImport { module, import } => write!(
+                f,
+                "module `{}` does not import ambient module `{}`; artifact checking requires the exact declared import closure",
+                module.to_display_string(),
+                import.to_display_string()
             ),
             Self::Cycle(name) => write!(
                 f,

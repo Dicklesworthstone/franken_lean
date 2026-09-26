@@ -25,6 +25,20 @@ fn extension_error(
     }
 }
 impl Export {
+    pub(super) fn require_artifact_support(
+        &self,
+        module: &Name,
+    ) -> Result<(), SourceModuleCheckError> {
+        if let Some(suffix) = self.extensions.first() {
+            return Err(extension_error(
+                module,
+                &suffix.descriptor.name,
+                "the pinned .olean writer cannot yet serialize this module's environment extension",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn capture(
         module: &Name,
         base: &Environment,

@@ -13,6 +13,16 @@ impl Plan {
         provided: &std::collections::BTreeSet<Name>,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
+        Self::with_implicit_init(modules, entry, provided, meter, false)
+    }
+
+    pub(super) fn with_implicit_init(
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        provided: &std::collections::BTreeSet<Name>,
+        meter: &mut Meter,
+        implicit_init: bool,
+    ) -> Result<Self, SourceModuleCheckError> {
         if modules.is_empty() {
             return Err(SourceModuleCheckError::EmptyInput);
         }
@@ -51,12 +61,17 @@ impl Plan {
         let mut imports = 0usize;
         for module in modules {
             meter.work(1)?;
-            let header = parse_source_header(module.source).map_err(|error| {
+            let mut header = parse_source_header(module.source).map_err(|error| {
                 SourceModuleCheckError::Header {
                     module: module.name.clone(),
                     error,
                 }
             })?;
+            if implicit_init && !header.prelude {
+                // The two implicit Import rows have one graph dependency.
+                // Preserve the original explicit rows, including duplicates.
+                header.imports.insert(0, Name::from_components(["Init"]));
+            }
             imports = imports
                 .checked_add(header.imports.len())
                 .filter(|n| *n <= meter.limits.max_imports)
