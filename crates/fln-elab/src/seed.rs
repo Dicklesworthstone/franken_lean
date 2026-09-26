@@ -37,6 +37,7 @@ pub use decidable_generic::generic_equality_decision_seed_declarations;
 pub use logic::propext_seed_declaration;
 mod decidable_eq;
 mod decidable_generic;
+mod decidable_option;
 pub mod equality;
 mod heterogeneous;
 mod quotient;
@@ -669,7 +670,7 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// frontend. Order is part of the deterministic seed contract: scalar types
 /// precede intrinsic signatures, and collection families precede their checked
 /// operation bodies. This is not a complete Prelude ingestion path.
-pub fn source_seed_declarations() -> [Declaration; 91] {
+pub fn source_seed_declarations() -> [Declaration; 92] {
     let [false_elim, ne] = logic_support::logical_support_seed_declarations();
     let [
         and,
@@ -798,6 +799,7 @@ pub fn source_seed_declarations() -> [Declaration; 91] {
         list_reverse,
         list_head,
         list_tail,
+        decidable_option::option_equality_decision_seed_declaration(),
     ]
 }
 
@@ -906,6 +908,10 @@ mod tests {
         assert_eq!(declarations[73], quotient_seed_declaration());
         assert_eq!(declarations[74], quotient_sound_seed_declaration());
         assert_eq!(declarations[75], propext_seed_declaration());
+        assert_eq!(
+            declarations[91],
+            decidable_option::option_equality_decision_seed_declaration()
+        );
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"
