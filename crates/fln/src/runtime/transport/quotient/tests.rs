@@ -167,3 +167,90 @@ fn quotient_lowering_respects_work_and_context_budgets() {
         })
     ));
 }
+
+#[test]
+fn partial_constructors_have_a_typed_identity_body() {
+    let environment = environment(false);
+    let actual = Preparation::new(&environment, IngressLimits::default())
+        .quotient_operation(&head("Quot.mk", 1), &[ty("Nat"), ty("r")])
+        .unwrap()
+        .unwrap();
+    let ExprNode::LetE { value, body, .. } = actual.node() else {
+        panic!("typed constructor function");
+    };
+    assert_eq!(*body, b(0));
+    let ExprNode::Lam { binder_type, body, .. } = value.node() else {
+        panic!("missing representative parameter");
+    };
+    assert_eq!(*binder_type, ty("Nat"));
+    assert_eq!(*body, b(0));
+}
+
+#[test]
+fn partial_lift_captures_the_supplied_function_before_returning() {
+    let environment = environment(false);
+    let function = app(ty("makeFunction"), [b(0)]);
+    let actual = Preparation::new(&environment, IngressLimits::default())
+        .quotient_operation(
+            &head("Quot.lift", 2),
+            &[ty("Nat"), ty("r"), ty("Nat"), function.clone(), ty("proof")],
+        )
+        .unwrap()
+        .unwrap();
+    let ExprNode::LetE { value, body, .. } = actual.node() else {
+        panic!("strict function initializer");
+    };
+    assert_eq!(*value, function);
+    let ExprNode::LetE { value, .. } = body.node() else {
+        panic!("typed residual function");
+    };
+    let ExprNode::Lam { binder_type, body, .. } = value.node() else {
+        panic!("representative parameter");
+    };
+    assert_eq!(*binder_type, ty("Nat"));
+    assert_eq!(*body, Expr::app(b(1), b(0)));
+}
+
+#[test]
+fn an_overapplied_result_finishes_lifting_before_its_next_argument() {
+    let environment = environment(false);
+    let result_type = Expr::forall_e(Name::anonymous(), ty("Nat"), ty("Nat"), BinderInfo::Default);
+    let actual = Preparation::new(&environment, IngressLimits::default())
+        .quotient_operation(
+            &head("Quot.lift", 2),
+            &[
+                ty("Nat"), ty("r"), result_type, ty("f"), ty("proof"),
+                app(ty("representative"), [b(0)]), app(ty("afterLift"), [b(0)]),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+    let ExprNode::LetE { value, body, .. } = actual.node() else {
+        panic!("lifting must finish first");
+    };
+    assert!(matches!(value.node(), ExprNode::LetE { .. }));
+    let ExprNode::LetE { value, .. } = body.node() else {
+        panic!("then the trailing argument");
+    };
+    assert_eq!(*value, app(ty("afterLift"), [b(1)]));
+}
+
+#[test]
+fn scalar_overapplication_is_not_dropped_and_argument_budgets_remain_enforced() {
+    let environment = environment(false);
+    let args = [ty("Nat"), ty("r"), ty("Nat"), ty("f"), ty("proof"), b(0), b(1)];
+    assert!(
+        Preparation::new(&environment, IngressLimits::default())
+            .quotient_operation(&head("Quot.lift", 2), &args)
+            .is_err()
+    );
+    let limits = IngressLimits { max_application_args: 6, ..IngressLimits::default() };
+    assert!(matches!(
+        Preparation::new(&environment, limits).quotient_operation(&head("Quot.lift", 2), &args),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::ApplicationArguments,
+            limit: 6,
+            observed: 7,
+        })
+    ));
+}

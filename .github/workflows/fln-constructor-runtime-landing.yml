@@ -13,12 +13,14 @@ on:
       - 'crates/fln-cli/tests/source_instance_factories.rs'
       - 'crates/fln-cli/tests/source_global_stages.rs'
       - 'crates/fln-cli/tests/source_local_templates.rs'
+      - 'crates/fln-cli/tests/source_quotient_runtime.rs'
       - 'examples/native_variants.lean'
       - 'examples/native_recursive_data.lean'
       - 'examples/native_interleaved_specialization.lean'
       - 'examples/native_instance_factories.lean'
       - 'examples/native_global_stages.lean'
       - 'examples/native_local_templates.lean'
+      - 'examples/native_quotient_runtime.lean'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
@@ -49,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p fln --test runtime_partial_recursors --test runtime_recursor_motives --test runtime_minor_strictness --test runtime_interleaved_specialization --test runtime_instance_factories --test runtime_projected_factories --test runtime_global_stages --test runtime_global_chains --test runtime_higher_order --test runtime_known_callbacks --test runtime_specialization --test runtime_local_templates --no-fail-fast 2>&1 | tee target/constructor-runtime/partial-recursors.log
+          cargo test --locked -p fln --test runtime_partial_recursors --test runtime_recursor_motives --test runtime_minor_strictness --test runtime_interleaved_specialization --test runtime_instance_factories --test runtime_projected_factories --test runtime_global_stages --test runtime_global_chains --test runtime_higher_order --test runtime_known_callbacks --test runtime_specialization --test runtime_local_templates --test runtime_quotients --test runtime_quotient_functions --test source_quotients --no-fail-fast 2>&1 | tee target/constructor-runtime/partial-recursors.log
       - name: Test compiler and VM
         shell: bash
         run: |
@@ -64,14 +66,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p fln-cli --test source_local_templates --test source_global_stages --test source_instance_factories --test source_interleaved_runtime --test source_variant_runtime --test source_record_runtime --test source_nat_runtime --test source_local_helpers --test runtime_conditionals --test source_term_binders --no-fail-fast 2>&1 | tee target/constructor-runtime/cli.log
+          cargo test --locked -p fln-cli --test source_quotient_runtime --test source_local_templates --test source_global_stages --test source_instance_factories --test source_interleaved_runtime --test source_variant_runtime --test source_record_runtime --test source_nat_runtime --test source_local_helpers --test runtime_conditionals --test source_term_binders --no-fail-fast 2>&1 | tee target/constructor-runtime/cli.log
       - name: Lint and compile downstream targets
         shell: bash
         run: |
           set -euo pipefail
           cargo clippy --locked -p fln-comp -p fln-vm -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/constructor-runtime/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/constructor-runtime/workspace.log
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/variants.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/nat.rs crates/fln/src/runtime/nat/strict.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/callables/recursors.rs crates/fln/src/runtime/callables/recursors/tests.rs crates/fln/tests/runtime_partial_recursors.rs crates/fln/tests/runtime_recursor_motives.rs crates/fln/tests/runtime_minor_strictness.rs crates/fln/tests/runtime_interleaved_specialization.rs crates/fln/tests/runtime_recursive_data.rs crates/fln/tests/runtime_variants.rs crates/fln-cli/tests/source_interleaved_runtime.rs crates/fln-cli/tests/source_variant_runtime.rs crates/fln-vm/tests/constructor_dispatch.rs crates/fln-comp/src/ingress/constructor_case.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/factories/tests.rs crates/fln/src/runtime/specialize/arguments/factories/projections.rs crates/fln/tests/runtime_instance_factories.rs crates/fln/tests/runtime_projected_factories.rs crates/fln-cli/tests/source_instance_factories.rs crates/fln/src/runtime/global.rs crates/fln/src/runtime/global/applications.rs crates/fln/src/runtime/global/tests.rs crates/fln/tests/runtime_global_stages.rs crates/fln/tests/runtime_global_chains.rs crates/fln-cli/tests/source_global_stages.rs crates/fln/src/runtime/global/callbacks.rs crates/fln/src/runtime/global/callbacks/tests.rs crates/fln/tests/runtime_known_callbacks.rs crates/fln/tests/runtime_specialization.rs crates/fln/src/runtime/proofs.rs crates/fln/src/runtime/proofs/locals.rs crates/fln/src/runtime/proofs/locals/tests.rs crates/fln/tests/runtime_local_templates.rs crates/fln-cli/tests/source_local_templates.rs
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/variants.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/nat.rs crates/fln/src/runtime/nat/strict.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/callables/recursors.rs crates/fln/src/runtime/callables/recursors/tests.rs crates/fln/tests/runtime_partial_recursors.rs crates/fln/tests/runtime_recursor_motives.rs crates/fln/tests/runtime_minor_strictness.rs crates/fln/tests/runtime_interleaved_specialization.rs crates/fln/tests/runtime_recursive_data.rs crates/fln/tests/runtime_variants.rs crates/fln-cli/tests/source_interleaved_runtime.rs crates/fln-cli/tests/source_variant_runtime.rs crates/fln-vm/tests/constructor_dispatch.rs crates/fln-comp/src/ingress/constructor_case.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/factories/tests.rs crates/fln/src/runtime/specialize/arguments/factories/projections.rs crates/fln/tests/runtime_instance_factories.rs crates/fln/tests/runtime_projected_factories.rs crates/fln-cli/tests/source_instance_factories.rs crates/fln/src/runtime/global.rs crates/fln/src/runtime/global/applications.rs crates/fln/src/runtime/global/tests.rs crates/fln/tests/runtime_global_stages.rs crates/fln/tests/runtime_global_chains.rs crates/fln-cli/tests/source_global_stages.rs crates/fln/src/runtime/global/callbacks.rs crates/fln/src/runtime/global/callbacks/tests.rs crates/fln/tests/runtime_known_callbacks.rs crates/fln/tests/runtime_specialization.rs crates/fln/src/runtime/proofs.rs crates/fln/src/runtime/proofs/locals.rs crates/fln/src/runtime/proofs/locals/tests.rs crates/fln/tests/runtime_local_templates.rs crates/fln-cli/tests/source_local_templates.rs crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/transport.rs crates/fln/src/runtime/transport/quotient.rs crates/fln/src/runtime/transport/quotient/partial.rs crates/fln/src/runtime/transport/quotient/tests.rs crates/fln/tests/runtime_quotients.rs crates/fln/tests/runtime_quotient_functions.rs crates/fln-cli/tests/source_quotient_runtime.rs
       - name: Retain exact verification results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

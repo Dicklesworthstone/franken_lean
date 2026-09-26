@@ -1,6 +1,8 @@
 //! Quotient representatives use their carrier's runtime representation. This
 //! is post-admission erasure, not quotient normalization in either checker.
 //! Respectfulness evidence is checked before this pass and never executed.
+mod partial;
+
 use super::*;
 
 impl Preparation<'_> {
@@ -37,7 +39,7 @@ impl Preparation<'_> {
         Ok(Some(args[0].clone()))
     }
 
-    /// Fully supplied primitives retain the ordinary evaluation order of
+    /// Primitive applications retain the ordinary evaluation order of
     /// runtime operands. In particular, the function is computed before the
     /// representative, and neither is substituted, duplicated or discarded.
     /// Unsupplied static parameters and proof-only primitives are not values.
@@ -49,16 +51,29 @@ impl Preparation<'_> {
         let ExprNode::Const { name: n, levels } = head.node() else {
             return Ok(None);
         };
-        let constructor = n == &name("Quot.mk") && levels.len() == 1 && args.len() == 3;
-        let lift = n == &name("Quot.lift") && levels.len() == 2 && args.len() == 6;
+        let constructor = n == &name("Quot.mk") && levels.len() == 1 && (2..=3).contains(&args.len());
+        let lift = n == &name("Quot.lift") && levels.len() == 2 && args.len() >= 3;
         if !constructor && !lift {
             return Ok(None);
+        }
+        if args.len() > self.limits.max_application_args {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ApplicationArguments,
+                limit: self.limits.max_application_args,
+                observed: args.len(),
+            });
         }
         self.check_quotient_family()?;
         let carrier = self.erase_runtime_type(&args[0])?;
         let carrier_value = self
             .value_type(&carrier)?
             .ok_or_else(|| unsupported("quotient carrier representation"))?;
+        let arity = if constructor { 3 } else { 6 };
+        if args.len() < arity {
+            return self
+                .partial_quotient(head, args, constructor, carrier)
+                .map(Some);
+        }
         if constructor {
             return self
                 .typed_callable_result(args[2].clone(), carrier, carrier_value)
@@ -91,17 +106,20 @@ impl Preparation<'_> {
         let value_ref = Expr::bvar(0).map_err(|_| unsupported("quotient value scope"))?;
         let applied = self.typed_callable_result(
             Expr::app(function_ref, value_ref),
-            result,
+            result.clone(),
             result_value,
         )?;
         let body = Expr::let_e(Name::anonymous(), carrier, representative, applied, false);
-        Ok(Some(Expr::let_e(
-            Name::anonymous(),
-            function_type,
-            function,
-            body,
-            false,
-        )))
+        let value = Expr::let_e(Name::anonymous(), function_type, function, body, false);
+        if args.len() == 6 {
+            Ok(Some(value))
+        } else {
+            // Complete lifting before evaluating the first trailing argument;
+            // each returned-function stage finishes before the next argument.
+            self.apply_producer(value, result, &args[6..], 0)?
+                .map(Some)
+                .ok_or_else(|| unsupported("quotient result overapplication"))
+        }
     }
 }
 

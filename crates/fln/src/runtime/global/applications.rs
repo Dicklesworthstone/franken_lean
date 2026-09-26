@@ -9,7 +9,7 @@ struct Stage {
 }
 
 impl Preparation<'_> {
-    pub(super) fn apply_producer(
+    pub(in crate::runtime) fn apply_producer(
         &mut self,
         value: Expr,
         type_: Expr,
@@ -125,7 +125,10 @@ mod tests {
         };
         assert_eq!(*value, call("first", b(3)));
         let ExprNode::LetE {
-            type_, value, body, ..
+            type_,
+            value,
+            body,
+            ..
         } = body.node()
         else {
             panic!("first application precedes second argument");
@@ -137,7 +140,10 @@ mod tests {
         };
         assert_eq!(*value, call("last", b(6)));
         let ExprNode::LetE {
-            type_, value, body, ..
+            type_,
+            value,
+            body,
+            ..
         } = body.node()
         else {
             panic!("second application");
