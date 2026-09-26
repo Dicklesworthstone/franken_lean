@@ -7,6 +7,8 @@ on:
       - 'crates/fln/src/runtime/**'
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/tests/runtime_staged_closures.rs'
+      - 'crates/fln/tests/runtime_staged_specialization.rs'
+      - 'crates/fln/tests/runtime_interleaved_specialization.rs'
       - 'crates/fln-cli/tests/source_multistage_callbacks.rs'
       - 'examples/native_multistage_callbacks.lean'
   workflow_dispatch:
@@ -32,7 +34,7 @@ jobs:
       - name: Check call boundaries, ownership and independent replay
         run: |
           set -euo pipefail
-          cargo test --locked -p fln --lib --test runtime_staged_closures --test runtime_higher_order --test runtime_closure_data --test runtime_mutual_indexed
+          cargo test --locked -p fln --lib --test runtime_staged_closures --test runtime_staged_specialization --test runtime_interleaved_specialization --test runtime_higher_order --test runtime_closure_data --test runtime_mutual_indexed
           cargo test --locked -p fln-cli --test source_multistage_callbacks --test source_empty_runtime
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets

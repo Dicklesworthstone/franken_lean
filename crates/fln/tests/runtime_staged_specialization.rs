@@ -141,3 +141,36 @@ fn failed_admission_and_resource_stops_leave_deterministic_clean_retries() {
     );
     assert_eq!(base.logical_root(&options), root);
 }
+
+const ALIASED: &str = "def aliased (cost : Nat) : (A : Type) -> A -> A := let saved : (A : Type) -> A -> A := (by let paid := expensive cost; intro A x; exact x); saved\n";
+
+#[test]
+fn returned_local_polymorphic_callbacks_execute_at_distinct_types() {
+    run(&format!("{EXPENSIVE}{ALIASED}#eval aliased 5 Nat 42"), "42");
+    run(
+        &format!("{EXPENSIVE}{ALIASED}#eval String.length (aliased 5 String \"answer\")"),
+        "6",
+    );
+    run(
+        "def make (prefix : String) : (A : Type) -> A -> Nat := let saved : (A : Type) -> A -> Nat := (by let text := prefix ++ \"abc\"; intro A x; exact String.length text); saved\n#eval make \"x\" Nat 42",
+        "4",
+    );
+}
+
+#[test]
+fn returning_an_initialized_alias_keeps_strictness_and_shared_callback_work() {
+    let definitions = format!(
+        "{EXPENSIVE}{ALIASED}def use (cost : Nat) : Nat := let saved : Nat -> Nat := aliased cost Nat; saved 42\n"
+    );
+    let once_delta = run(&format!("{definitions}#eval use 100"), "42")
+        - run(&format!("{definitions}#eval use 0"), "42");
+    assert!(once_delta > 100, "the returned initializer was erased");
+    for source in [
+        definitions.replace("saved 42", "saved 20 + saved 22"),
+        definitions.replace("saved 42", "42"),
+    ] {
+        let delta = run(&format!("{source}#eval use 100"), "42")
+            - run(&format!("{source}#eval use 0"), "42");
+        assert_eq!(delta, once_delta, "return aliases changed initialization");
+    }
+}

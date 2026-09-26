@@ -87,6 +87,20 @@ impl Preparation<'_> {
                     break;
                 };
                 self.tick()?;
+                // `let callback := initializer; callback` is the initializer
+                // itself, including all of its strict work. Removing only the
+                // administrative return slot exposes a literal polymorphic
+                // callback without substituting or evaluating its initializer.
+                // Its expression already lives outside the removed let scope.
+                let mut returned = body;
+                while let ExprNode::MData { expr, .. } = returned.node() {
+                    self.tick()?;
+                    returned = expr;
+                }
+                if matches!(returned.node(), ExprNode::BVar { idx: 0 }) {
+                    value = initializer.clone();
+                    continue;
+                }
                 reserve(&mut retained, self.limits.max_context_depth)?;
                 retained.push(Retained::StrictLet {
                     name: decl_name.clone(),
@@ -287,3 +301,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod aliases;
