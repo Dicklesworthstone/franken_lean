@@ -1,0 +1,61 @@
+name: Offline native workspace
+
+# Export only tracked source and the public, pinned Rust compiler. This lets
+# network-isolated development environments run the real workspace locally.
+# No .git directory, credentials, runner environment, or build cache is exported.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-offline-native-workspace.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Export exact source and open implementation beads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fln-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/fln-source/source-commit.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/fln-source/source.tar.gz"
+          python3 - <<'PY' > "$RUNNER_TEMP/fln-source/open-beads.txt"
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          rows = [row for row in rows if row.get('status') not in ('closed', 'tombstone')]
+          rows.sort(key=lambda row: (row.get('priority', 9), row.get('id', '')))
+          for row in rows:
+              print(json.dumps(row, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fln-offline-source-${{ github.sha }}
+          path: ${{ runner.temp }}/fln-source
+          retention-days: 1
+          if-no-files-found: error
+      - name: Install the repository's pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p "$RUNNER_TEMP/fln-compiler"
+          compiler="$(rustup which --toolchain "$channel" rustc)"
+          root="$(dirname "$(dirname "$compiler")")"
+          "$compiler" -Vv > "$RUNNER_TEMP/fln-compiler/compiler-version.txt"
+          tar -C "$root" -czf "$RUNNER_TEMP/fln-compiler/compiler.tar.gz" bin lib libexec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fln-offline-compiler-${{ github.sha }}
+          path: ${{ runner.temp }}/fln-compiler
+          retention-days: 1
+          if-no-files-found: error
