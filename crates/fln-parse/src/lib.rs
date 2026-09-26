@@ -411,6 +411,8 @@ pub type DefinitionParseError = NatDefinitionParseError;
 pub enum SourceCommandKind {
     /// A named source declaration (definition or theorem); never a query.
     Definition,
+    /// An anonymous declaration checked in a discarded environment successor.
+    Example,
     Evaluation,
     Check,
 }
@@ -454,7 +456,10 @@ impl ParsedSourceCommand {
     /// Reconstruct the source-covered query term for `#eval` or `#check`.
     /// Definitions have no command-query payload and return `None`.
     pub fn query_term_normalized(&self) -> Option<&str> {
-        if self.kind == SourceCommandKind::Definition {
+        if matches!(
+            self.kind,
+            SourceCommandKind::Definition | SourceCommandKind::Example
+        ) {
             return None;
         }
         self.source_view.normalized().span_str(self.query_term?)
@@ -531,6 +536,7 @@ fn nat_definition_token_table() -> TokenTable {
         "extends",
         "deriving",
         "def",
+        "example",
         "let",
         "(",
         ")",
@@ -616,6 +622,7 @@ fn source_module_token_table() -> TokenTable {
         "deriving",
         "import",
         "def",
+        "example",
         "#eval",
         "#check",
         "let",
@@ -1967,12 +1974,22 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
             TokenKind::Symbol(symbol)
                 if matches!(
                     symbol.as_str(),
-                    "def" | "theorem" | "instance" | "structure" | "class" | "inductive"
+                    "def"
+                        | "theorem"
+                        | "example"
+                        | "instance"
+                        | "structure"
+                        | "class"
+                        | "inductive"
                 ) =>
             {
                 let parsed = parse_definition(source)?;
                 Ok(ParsedSourceCommand {
-                    kind: SourceCommandKind::Definition,
+                    kind: if symbol == "example" {
+                        SourceCommandKind::Example
+                    } else {
+                        SourceCommandKind::Definition
+                    },
                     source_view: parsed.source_view,
                     syntax: parsed.syntax,
                     epilogue: parsed.epilogue,
@@ -2232,7 +2249,7 @@ fn parse_definition_with_grammar(
     };
     if !matches!(
         tokens.get(declaration_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "instance"))
+        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance"))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
@@ -2242,6 +2259,8 @@ fn parse_definition_with_grammar(
     let is_theorem =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
     let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
+    let is_example =
+        matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "example");
     if declaration_start != 0 && is_instance {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
@@ -2272,17 +2291,19 @@ fn parse_definition_with_grammar(
         None
     };
     let name_index = cursor;
-    if !matches!(
-        tokens.get(cursor).map(|t| &t.kind),
-        Some(TokenKind::Ident(_))
-    ) {
+    if !is_example
+        && !matches!(
+            tokens.get(cursor).map(|t| &t.kind),
+            Some(TokenKind::Ident(_))
+        )
+    {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, cursor),
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
-    cursor += 1;
-    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar {
+    cursor += usize::from(!is_example);
+    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar && !is_example {
         levels::declaration_suffix(&view, &tokens, cursor)?
     } else {
         (None, cursor)
@@ -2342,7 +2363,6 @@ fn parse_definition_with_grammar(
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(declaration_start)?;
-    let declaration_name = leaves.leaf(name_index)?;
 
     let mut modifier_parts = vec![null_node(Vec::new()); 7];
     if declaration_start != 0 {
@@ -2350,13 +2370,17 @@ fn parse_definition_with_grammar(
             command_scope::attributes::inline_syntax(&leaves, &tokens, declaration_start)?;
     }
     let modifiers = Syntax::node(parser_kind(&["Command", "declModifiers"]), modifier_parts);
-    let declaration_id = Syntax::node(
-        parser_kind(&["Command", "declId"]),
-        vec![
-            declaration_name,
-            levels::declaration_syntax(&leaves, universe_suffix)?,
-        ],
-    );
+    let declaration_id = if is_example {
+        None
+    } else {
+        Some(Syntax::node(
+            parser_kind(&["Command", "declId"]),
+            vec![
+                leaves.leaf(name_index)?,
+                levels::declaration_syntax(&leaves, universe_suffix)?,
+            ],
+        ))
+    };
     let parameters = bounded_binder_syntax(&leaves, &view, &tokens, parameter_groups, grammar)?;
     let result_type = if let Some((colon, type_range)) = explicit_result_type {
         null_node(vec![Syntax::node(
@@ -2419,7 +2443,12 @@ fn parse_definition_with_grammar(
             ],
         )
     };
-    let definition = if is_instance {
+    let definition = if is_example {
+        Syntax::node(
+            parser_kind(&["Command", "example"]),
+            vec![definition_keyword, optional_signature, declaration_value],
+        )
+    } else if is_instance {
         let priority = match priority_range {
             None => null_node(Vec::new()),
             Some(range) => {
@@ -2453,7 +2482,7 @@ fn parse_definition_with_grammar(
                 ),
                 definition_keyword,
                 priority,
-                null_node(vec![declaration_id]),
+                null_node(vec![declaration_id.expect("named instance")]),
                 optional_signature,
                 declaration_value,
             ],
@@ -2461,7 +2490,7 @@ fn parse_definition_with_grammar(
     } else {
         let mut parts = vec![
             definition_keyword,
-            declaration_id,
+            declaration_id.expect("named declaration"),
             optional_signature,
             declaration_value,
         ];
@@ -2527,6 +2556,7 @@ pub fn partition_definition_commands(
                 extent,
             }) if matches!(symbol.as_str(), "def" | "structure" | "class" | "inductive")
                 || symbol == "theorem"
+                || symbol == "example"
                 || symbol == "instance"
                 || symbol == "#eval"
                 || symbol == "#check" =>
@@ -2763,6 +2793,46 @@ mod nat_definition_tests {
                 expected: NatDefinitionExpectation::EndOfCommand,
             }
         ));
+    }
+
+    #[test]
+    fn anonymous_examples_have_the_pinned_nameless_tree_and_preserve_source() {
+        for source in [
+            "example : Nat := 7",
+            "example := 7",
+            "example : Type := Nat",
+            "-- example hidden\r\nexample (n : Nat) : n = n := by rfl\r\n",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.kind(), SourceCommandKind::Example);
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes(),
+            );
+            assert!(parsed.query_term_normalized().is_none());
+            let Syntax::Node { kind, args, .. } = parsed.syntax() else {
+                panic!("example must have the canonical declaration wrapper");
+            };
+            assert_eq!(kind, &parser_kind(&["Command", "declaration"]));
+            let Syntax::Node { kind, args, .. } = &args[1] else {
+                panic!("example command must be a node");
+            };
+            assert_eq!(kind, &parser_kind(&["Command", "example"]));
+            assert_eq!(args.len(), 3);
+            assert_eq!(
+                args[1].kind(),
+                Some(&parser_kind(&["Command", "optDeclSig"]))
+            );
+        }
+        let stream = b"example : Nat := 1\r\nexample : Nat := 2\r\ndef kept := 3";
+        let commands = partition_definition_commands(stream).unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(command_scope::partition(stream).unwrap(), commands);
+        for source in ["example : Nat", "example : Nat :=", "example : Nat := )"] {
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+        assert!(parse_nat_definition(b"example : Nat := 7").is_err());
     }
 
     #[test]

@@ -115,6 +115,28 @@ impl Engine {
         let parsed = fln_parse::parse_definition(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        if fln_elab::source::scope::is_example(parsed.syntax()) {
+            let parsed = fln_parse::parse_source_command(source)
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend)?;
+            return Ok(
+                match self
+                    .check_parsed_source_command_in_scope(parsed, options, limits, 0, scope)?
+                {
+                    Outcome::Complete(_) => {
+                        let root = self.logical_root(options);
+                        Outcome::Complete(DeclarationBatchAdmission {
+                            engine: self.clone(),
+                            base_logical_root: root,
+                            result_logical_root: root,
+                            admissions: Vec::new(),
+                        })
+                    }
+                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                },
+            );
+        }
         if fln_elab::source::is_inductive(parsed.syntax()) {
             let candidate = fln_elab::source::scope::elaborate_inductive(
                 parsed.syntax(),

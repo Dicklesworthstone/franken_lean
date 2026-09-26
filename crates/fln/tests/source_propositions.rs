@@ -120,3 +120,76 @@ fn false_propositional_proofs_and_negative_occurrences_never_publish() {
             .contains(&Name::from_components(["recover"]))
     );
 }
+
+#[test]
+fn anonymous_examples_check_propositions_data_and_scoped_parameters_without_publication() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = r#"example : Nat := 7
+example := 8
+example : Type := Nat
+example (n : Nat) : n = n := by rfl
+example {A : Type u} (x : A) : A := x
+namespace Examples
+section
+variable {A : Type u} (x : A) (P : Prop) (h : P)
+example : A := x
+example : P := h
+end
+end Examples"#;
+    let result = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(result.commands, 12);
+    assert_eq!(result.theorems, 0);
+    assert_eq!(result.base_logical_root, root);
+    assert_eq!(result.result_logical_root, root);
+    assert_eq!(result.engine.environment().len(), base.environment().len());
+    assert!(
+        !result
+            .engine
+            .environment()
+            .contains(&Name::from_components(["_example"]))
+    );
+    assert!(
+        !result
+            .engine
+            .environment()
+            .contains(&Name::num(Name::anonymous(), 0))
+    );
+
+    let prefix = "namespace Visible\ndef value : Nat := 7\n";
+    let plain = format!("{prefix}end Visible");
+    let with_example = format!("{prefix}example : value = 7 := by rfl\nend Visible");
+    assert_eq!(
+        check(&plain).result_logical_root,
+        check(&with_example).result_logical_root,
+    );
+}
+
+#[test]
+fn anonymous_example_failures_preserve_the_engine_and_do_not_hide_later_errors() {
+    for source in [
+        "example : Nat := true",
+        "example : 0 = 1 := by rfl",
+        "example : Nat := _example",
+        "example : Nat := «0»",
+        "def before : Nat := 1\nexample : False := by rfl\ndef after := 2",
+        "example : Nat := 7\ndef after : Nat := true",
+        "example : Nat := 7\ndef leak : Nat := _example",
+        "@[simp] example : 0 = 0 := by rfl",
+    ] {
+        refuses(source);
+    }
+    assert_eq!(
+        check("example : 0 = 0 := by rfl\ndef recovered := 7").commands,
+        2
+    );
+}

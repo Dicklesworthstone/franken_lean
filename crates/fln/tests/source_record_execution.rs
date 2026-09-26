@@ -25,6 +25,107 @@ fn value(result: &DefinitionBatchExecution, expected: &str) {
 const POINT: &str = "structure Point where\n  x : Nat\n  y : Nat\n";
 
 #[test]
+fn anonymous_examples_are_silent_checked_commands_between_executions() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let completed = base.execute_source_commands_with_checks(
+        b"example : Type := Nat\ndef answer := 42\nexample : answer = 42 := by rfl\n#check answer\n#eval answer",
+        &options, limits(),
+    ).unwrap().into_complete().unwrap();
+    value(&completed.batch, "42");
+    assert_eq!(completed.command_count, 5);
+    assert_eq!(completed.execution_command_indices, [1, 4]);
+    assert_eq!(completed.checks.len(), 3);
+    assert_eq!(completed.batch.source_evaluation_indices, [1]);
+    assert!(completed.batch.source_admissions.is_empty());
+    for check in &completed.checks {
+        let fln::Declaration::Defn(candidate) = &check.declaration else {
+            panic!("scratch commands produce definition candidates");
+        };
+        assert!(
+            !completed
+                .batch
+                .engine
+                .environment()
+                .contains(&candidate.base.name)
+        );
+    }
+    let plain = base
+        .execute_source_commands_with_checks(
+            b"def answer := 42\n#check answer\n#eval answer",
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    // Evaluations have command-indexed identities; compare the visible named
+    // declaration and the unchanged input rather than those generated rows.
+    assert_eq!(
+        completed
+            .batch
+            .engine
+            .environment()
+            .find(&Name::from_components(["answer"])),
+        plain
+            .batch
+            .engine
+            .environment()
+            .find(&Name::from_components(["answer"])),
+    );
+    assert_eq!(base.logical_root(&options), root);
+    let rejected = base.execute_source_commands_with_checks(
+        b"#eval 42\nexample : 0 = 1 := by rfl",
+        &options,
+        limits(),
+    );
+    assert!(!matches!(rejected, Ok(Outcome::Complete(_))));
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn anonymous_examples_obey_module_import_visibility() {
+    let base = engine();
+    let options = KVMap::new();
+    let a = Name::from_components(["A"]);
+    let b = Name::from_components(["B"]);
+    let main = Name::from_components(["Main"]);
+    for imported in [false, true] {
+        let b_source = if imported {
+            b"import A\nexample : Nat := hidden\ndef visible := 9".as_slice()
+        } else {
+            b"example : Nat := hidden\ndef visible := 9".as_slice()
+        };
+        let modules = [
+            SourceModuleInput {
+                name: &a,
+                source: b"def hidden := 7",
+            },
+            SourceModuleInput {
+                name: &b,
+                source: b_source,
+            },
+            SourceModuleInput {
+                name: &main,
+                source: b"import A\nimport B\n#eval visible",
+            },
+        ];
+        let result =
+            base.execute_source_modules_with_entry_checks(&modules, &main, &options, limits());
+        if imported {
+            let completed = result.unwrap().into_complete().unwrap();
+            value(&completed.entry.batch, "9");
+        } else {
+            assert!(
+                matches!(result, Err(EngineExecutionError::SourceModuleVisibility { module, referenced, .. })
+                if module == b && referenced == Name::from_components(["hidden"]))
+            );
+        }
+    }
+}
+
+#[test]
 fn structure_theorem_and_execution_share_one_atomic_source_stream() {
     let base = engine();
     let opts = KVMap::new();

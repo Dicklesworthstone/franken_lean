@@ -7,12 +7,17 @@ use std::collections::{HashSet, VecDeque};
 
 struct Named<'a> {
     name: Name,
-    value: &'a Syntax,
+    value: ApplicationValue<'a>,
+}
+
+pub(super) enum ApplicationValue<'a> {
+    Syntax(&'a Syntax),
+    Elaborated(Typed),
 }
 
 pub(super) struct NamedApplication<'a> {
     function: Typed,
-    positional: VecDeque<&'a Syntax>,
+    positional: VecDeque<ApplicationValue<'a>>,
     named: Vec<Named<'a>>,
     explicit: bool,
     expected: Option<Expr>,
@@ -22,7 +27,7 @@ pub(super) struct NamedApplication<'a> {
 }
 
 pub(super) struct Argument<'a> {
-    pub(super) syntax: &'a Syntax,
+    pub(super) value: ApplicationValue<'a>,
     pub(super) domain: Expr,
     pub(super) codomain: Expr,
 }
@@ -49,7 +54,7 @@ impl Context {
         for argument in arguments {
             self.tick()?;
             if argument.kind() != Some(&kind) {
-                positional.push_back(argument);
+                positional.push_back(ApplicationValue::Syntax(argument));
                 continue;
             }
             let parts = expect_node(argument, &kind, 5, "named argument")?;
@@ -69,7 +74,7 @@ impl Context {
             }
             named.push(Named {
                 name: name.clone(),
-                value: &parts[3],
+                value: ApplicationValue::Syntax(&parts[3]),
             });
         }
         Ok(NamedApplication {
@@ -126,7 +131,7 @@ impl Context {
                     break;
                 }
             }
-            let syntax = if let Some(index) = selected {
+            let value = if let Some(index) = selected {
                 Some(state.named.remove(index).value)
             } else if !state.explicit && style != BinderInfo::Default {
                 let argument = if style == BinderInfo::InstImplicit {
@@ -139,7 +144,7 @@ impl Context {
             } else {
                 state.positional.pop_front()
             };
-            if let Some(syntax) = syntax {
+            if let Some(value) = value {
                 if state.positional.is_empty()
                     && state.named.is_empty()
                     && !codomain.has_loose_bvar(0)
@@ -148,7 +153,7 @@ impl Context {
                     self.constrain_result_hint(&codomain, expected)?;
                 }
                 return Ok(Some(Argument {
-                    syntax,
+                    value,
                     domain,
                     codomain,
                 }));
@@ -238,6 +243,107 @@ impl Context {
         })();
         self.txn.lctx = state.saved;
         result
+    }
+
+    /// The pinned `Lean.Elab.App.addLValArg` selects the first parameter
+    /// whose type has the receiver's head. Selection never searches for a
+    /// later parameter merely because unification with the first would fail.
+    /// A positional insertion is preferred; otherwise the binder name must
+    /// be usable as a named argument. All ordinary argument checking is still
+    /// performed by the same application worklist.
+    pub(super) fn start_field_application<'a>(
+        &mut self,
+        function: Typed,
+        receiver: Typed,
+        base: &Name,
+        arguments: &'a [Syntax],
+        expected: Option<Expr>,
+        explicit: bool,
+    ) -> Result<NamedApplication<'a>, NatDefinitionElabError> {
+        let mut state = self.start_named_application(function, arguments, expected, explicit)?;
+        let mut trial = self.clone();
+        let selected = trial.field_argument_position(&state, base);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match selected? {
+            Ok(index) => state
+                .positional
+                .insert(index, ApplicationValue::Elaborated(receiver)),
+            Err(name) => state.named.push(Named {
+                name,
+                value: ApplicationValue::Elaborated(receiver),
+            }),
+        }
+        Ok(state)
+    }
+
+    fn field_argument_position(
+        &mut self,
+        state: &NamedApplication<'_>,
+        base: &Name,
+    ) -> Result<Result<usize, Name>, NatDefinitionElabError> {
+        let mut cursor = state.function.type_.clone();
+        let mut positional = 0;
+        let mut remaining: HashSet<_> = state.named.iter().map(|arg| arg.name.clone()).collect();
+        let mut unusable = remaining.clone();
+        loop {
+            self.tick()?;
+            cursor = self.whnf(&cursor)?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = cursor.node()
+            else {
+                return Err(failure(SourceInferenceError::InvalidFieldReceiver(
+                    base.clone(),
+                )));
+            };
+            let supplied = remaining.remove(binder_name);
+            if !supplied && self.field_parameter_matches(binder_type, base)? {
+                if positional <= state.positional.len()
+                    && (state.explicit || *binder_info == BinderInfo::Default)
+                {
+                    return Ok(Ok(positional));
+                }
+                if binder_name.is_anonymous() || unusable.contains(binder_name) {
+                    return Err(failure(SourceInferenceError::InvalidFieldReceiver(
+                        base.clone(),
+                    )));
+                }
+                return Ok(Err(binder_name.clone()));
+            }
+            if !supplied && (state.explicit || *binder_info == BinderInfo::Default) {
+                positional += 1;
+            }
+            unusable.insert(binder_name.clone());
+            let argument = self.hole(binder_type.clone())?;
+            cursor = self.substitute(body, &argument)?;
+        }
+    }
+
+    fn field_parameter_matches(
+        &mut self,
+        type_: &Expr,
+        base: &Name,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let matches = |type_: &Expr| {
+            if base == &Name::from_components(["Function"]) {
+                return matches!(type_.node(), ExprNode::ForallE { .. });
+            }
+            let mut head = type_;
+            while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } = head.node() {
+                head = f;
+            }
+            matches!(head.node(), ExprNode::Const { name, .. } if name == base)
+        };
+        let type_ = self.instantiate(type_)?;
+        if matches(&type_) {
+            return Ok(true);
+        }
+        let reduced =
+            self.whnf_with_transparency(&type_, UnificationTransparency::Abbreviations, true)?;
+        Ok(matches(&reduced))
     }
 
     /// Traverse a temporary, opened telescope so reduction never sees loose

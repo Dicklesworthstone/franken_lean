@@ -10463,7 +10463,8 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
-            | fln::SourceCommandOutput::Check { command_index, .. } => *command_index,
+            | fln::SourceCommandOutput::Check { command_index, .. }
+            | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
         if command_index >= completed.command_count
             || previous_output_command.is_some_and(|previous| previous >= command_index)
@@ -10538,7 +10539,8 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 stdout.push_str(&value.to_string());
                 stdout.push('\n');
             }
-            fln::SourceCommandOutput::Check { check_index, .. } => {
+            fln::SourceCommandOutput::Check { check_index, .. }
+            | fln::SourceCommandOutput::Example { check_index, .. } => {
                 if *check_index != check_output_position {
                     return source_failure(
                         "internal-fault",
@@ -10558,6 +10560,18 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 };
                 check_output_position += 1;
+                if matches!(output, fln::SourceCommandOutput::Example { .. }) {
+                    if check.parsed.kind() != fln::SourceCommandKind::Example {
+                        return source_failure(
+                            "internal-fault",
+                            "silent example did not refer to an example candidate",
+                            false,
+                            SourcePresentation::Lean,
+                            4,
+                        );
+                    }
+                    continue;
+                }
                 let line = match render_lean_source_check_line(check) {
                     Ok(line) => line,
                     Err(error) => return error,

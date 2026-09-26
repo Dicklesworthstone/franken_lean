@@ -162,6 +162,62 @@ fn installed_binary_checks_a_real_source_proof_file() {
         1
     );
 }
+
+#[test]
+fn installed_anonymous_examples_check_silently_execute_queries_and_recover() {
+    let text = "example : Type := Nat\nexample : Nat := 7\nexample : 2 + 2 = 4 := by rfl\ndef answer := 42\n";
+    let path = file(text);
+    let checked = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
+    assert!(checked.stderr.is_empty());
+    let json = String::from_utf8(checked.stdout).unwrap();
+    for expected in ["\"commands\":4", "\"theorems\":0", "\"executed\":false"] {
+        assert!(json.contains(expected), "{json}");
+    }
+    let program = format!("{text}#eval answer\n");
+    std::fs::write(&path, &program).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"42\n");
+    assert!(output.stderr.is_empty());
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\"finalValue\":42")
+    );
+    assert!(output.stderr.is_empty());
+
+    std::fs::write(&path, format!("{program}example : 0 = 1 := by rfl\n")).unwrap();
+    let bad = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(bad.stdout.is_empty());
+    assert!(!bad.stderr.is_empty());
+    std::fs::write(&path, &program).unwrap();
+    let recovered = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert_eq!(recovered.stdout, b"42\n");
+    assert!(recovered.stderr.is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), program);
+}
 #[test]
 fn later_files_can_use_prior_theorems_and_failure_emits_no_partial_success() {
     let one = file("theorem self (x : Nat) : x = x := by rfl");

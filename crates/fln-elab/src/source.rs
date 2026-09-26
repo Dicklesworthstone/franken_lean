@@ -48,6 +48,7 @@ pub enum SourceInferenceError {
     UnknownConstant(Name),
     InvalidNamedArgument(Name),
     DuplicateNamedArgument(Name),
+    InvalidFieldReceiver(Name),
     LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
     ExpectedType,
@@ -90,6 +91,11 @@ impl std::fmt::Display for SourceInferenceError {
             Self::DuplicateNamedArgument(name) => {
                 write!(f, "duplicate named argument `{}`", name.to_display_string())
             }
+            Self::InvalidFieldReceiver(name) => write!(
+                f,
+                "field notation requires a usable parameter with type head `{}`",
+                name.to_display_string()
+            ),
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
             Self::Record(error) => write!(f, "{error}"),
@@ -809,7 +815,7 @@ impl Context {
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
-            Projection(Name, Option<Expr>, bool),
+            Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -818,6 +824,7 @@ impl Context {
             Visit(&'a Syntax, Option<Expr>, bool),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
+            StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
             Argument(Typed, Expr, &'a [Syntax], Option<Expr>, bool),
@@ -940,8 +947,7 @@ impl Context {
                             }
                             let (head, explicit) = self.explicit_application_head(syntax)?;
                             if explicit {
-                                tasks.push(Task::Function(&[], expected, true));
-                                tasks.push(Task::Visit(head, None, false));
+                                tasks.push(Task::StartApplication(head, &[], expected, true));
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
@@ -1045,7 +1051,13 @@ impl Context {
                                     let Syntax::Ident { val: field, .. } = &parts[2] else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    tasks.push(Task::Projection(field.clone(), expected, finish));
+                                    tasks.push(Task::Projection(
+                                        field.clone(),
+                                        &[],
+                                        expected,
+                                        false,
+                                        finish,
+                                    ));
                                     tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
                                 }
@@ -1233,8 +1245,9 @@ impl Context {
                                     }
                                     let (head, explicit) =
                                         self.explicit_application_head(&parts[0])?;
-                                    tasks.push(Task::Function(arguments, expected, explicit));
-                                    tasks.push(Task::Visit(head, None, false));
+                                    tasks.push(Task::StartApplication(
+                                        head, arguments, expected, explicit,
+                                    ));
                                     continue;
                                 }
                                 if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
@@ -1273,14 +1286,36 @@ impl Context {
                                 term
                             });
                         }
-                        Task::Projection(field, expected, finish) => {
+                        Task::Projection(field, arguments, expected, explicit, finish) => {
                             let receiver = values.pop().expect("receiver precedes projection");
-                            let term = self.record_field_path(receiver, &field)?;
-                            values.push(if finish {
-                                self.finish_term(term, expected.as_ref())?
-                            } else {
-                                term
-                            });
+                            match self.resolve_field_path(
+                                receiver,
+                                &field,
+                                !arguments.is_empty(),
+                            )? {
+                                record_terms::FieldResolution::Value(term)
+                                    if arguments.is_empty() =>
+                                {
+                                    values.push(if finish {
+                                        self.finish_term(term, expected.as_ref())?
+                                    } else {
+                                        term
+                                    });
+                                }
+                                record_terms::FieldResolution::Value(term) => {
+                                    values.push(term);
+                                    tasks.push(Task::Function(arguments, expected, explicit));
+                                }
+                                record_terms::FieldResolution::Method {
+                                    function,
+                                    receiver,
+                                    base,
+                                } => {
+                                    tasks.push(Task::NamedNext(self.start_field_application(
+                                        function, receiver, &base, arguments, expected, explicit,
+                                    )?));
+                                }
+                            }
                         }
                         Task::MatchDiscriminant(parts, expected) => {
                             let major = values.pop().expect("match discriminant visit");
@@ -1615,6 +1650,26 @@ impl Context {
                             }
                             tasks.push(Task::Proof(proof));
                         }
+                        Task::StartApplication(head, arguments, expected, explicit) => {
+                            match self.field_application_receiver(head)? {
+                                Some(record_terms::FieldReceiver::Syntax(receiver, field)) => {
+                                    tasks.push(Task::Projection(
+                                        field, arguments, expected, explicit, true,
+                                    ));
+                                    tasks.push(Task::Visit(receiver, None, true));
+                                }
+                                Some(record_terms::FieldReceiver::Elaborated(receiver, field)) => {
+                                    values.push(receiver);
+                                    tasks.push(Task::Projection(
+                                        field, arguments, expected, explicit, true,
+                                    ));
+                                }
+                                None => {
+                                    tasks.push(Task::Function(arguments, expected, explicit));
+                                    tasks.push(Task::Visit(head, None, false));
+                                }
+                            }
+                        }
                         Task::Function(arguments, expected, explicit) => {
                             let function = values.pop().expect("function task follows its visit");
                             if application::has_named(arguments) {
@@ -1627,12 +1682,27 @@ impl Context {
                         }
                         Task::NamedNext(mut state) => {
                             if let Some(argument) = self.next_named_argument(&mut state)? {
-                                tasks.push(Task::NamedArgument(state, argument.codomain));
-                                tasks.push(Task::Visit(
-                                    argument.syntax,
-                                    Some(argument.domain),
-                                    true,
-                                ));
+                                match argument.value {
+                                    application::ApplicationValue::Syntax(syntax) => {
+                                        tasks.push(Task::NamedArgument(state, argument.codomain));
+                                        tasks.push(Task::Visit(
+                                            syntax,
+                                            Some(argument.domain),
+                                            true,
+                                        ));
+                                    }
+                                    application::ApplicationValue::Elaborated(value) => {
+                                        let value =
+                                            self.finish_term(value, Some(&argument.domain))?;
+                                        self.constrain_type(&value.type_, &argument.domain)?;
+                                        self.add_named_argument(
+                                            &mut state,
+                                            &argument.codomain,
+                                            value,
+                                        )?;
+                                        tasks.push(Task::NamedNext(state));
+                                    }
+                                }
                             } else {
                                 values.push(self.finish_named_application(state)?);
                             }
@@ -2288,6 +2358,14 @@ fn definition_in_context(
     syntax: &Syntax,
     context: &mut Context,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    definition_in_context_named(syntax, context, None)
+}
+
+fn definition_in_context_named(
+    syntax: &Syntax,
+    context: &mut Context,
+    generated_name: Option<Name>,
+) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -2344,7 +2422,12 @@ fn definition_in_context(
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
-    let name = &context.enter_declaration(name)?;
+    // Anonymous examples retain their surrounding lookup scope. Their internal
+    // numeric identity is never a source namespace or a recursive source name.
+    let name = &match generated_name {
+        Some(generated) => generated,
+        None => context.enter_declaration(name)?,
+    };
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let signature = expect_node(

@@ -4040,13 +4040,40 @@ impl Engine {
         limits: EngineAdmissionLimits,
         command_index: usize,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
-        let name = fresh_generated_command_name(self.environment(), command_index)?;
-        let declaration = fln_elab::elaborate_check_in_with_budget(
-            parsed.syntax(),
-            name,
-            self.environment(),
-            limits.kernel,
+        self.check_parsed_source_command_in_scope(
+            parsed,
+            options,
+            limits,
+            command_index,
+            &fln_elab::source::scope::SourceScope::default(),
         )
+    }
+
+    fn check_parsed_source_command_in_scope(
+        &self,
+        parsed: ParsedSourceCommand,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        command_index: usize,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
+        let name = fresh_generated_command_name(self.environment(), command_index)?;
+        let declaration = match parsed.kind() {
+            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
+                parsed.syntax(),
+                name,
+                self.environment(),
+                limits.kernel,
+                scope,
+            ),
+            SourceCommandKind::Check => fln_elab::elaborate_check_in_with_budget(
+                parsed.syntax(),
+                name,
+                self.environment(),
+                limits.kernel,
+            ),
+            _ => return Err(EngineExecutionError::StandaloneCheckRequired),
+        }
         .map_err(DefinitionFrontendError::Elaborate)
         .map_err(EngineExecutionError::Frontend)?;
         let checked_type = match &declaration {
@@ -4226,8 +4253,12 @@ impl Engine {
                     error: Box::new(EngineExecutionError::Frontend(error)),
                     at: Some(original_offset),
                 })?;
-            if parsed.kind() == fln_parse::SourceCommandKind::Check {
-                if !allow_checks {
+            if matches!(
+                parsed.kind(),
+                SourceCommandKind::Check | SourceCommandKind::Example
+            ) {
+                let is_example = parsed.kind() == SourceCommandKind::Example;
+                if !allow_checks && !is_example {
                     return Err(EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(EngineExecutionError::StandaloneCheckRequired),
@@ -4257,9 +4288,16 @@ impl Engine {
                 };
                 let check_index = checks.len();
                 checks.push(checked);
-                outputs.push(SourceCommandOutput::Check {
-                    command_index,
-                    check_index,
+                outputs.push(if is_example {
+                    SourceCommandOutput::Example {
+                        command_index,
+                        check_index,
+                    }
+                } else {
+                    SourceCommandOutput::Check {
+                        command_index,
+                        check_index,
+                    }
                 });
                 continue;
             }
@@ -4334,7 +4372,7 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                 }
-                fln_parse::SourceCommandKind::Check => {
+                fln_parse::SourceCommandKind::Check | fln_parse::SourceCommandKind::Example => {
                     return Err(EngineExecutionError::UnexpectedPublication {
                         detail: "source check escaped its scratch-only command branch",
                     });
@@ -4468,7 +4506,10 @@ impl Engine {
                     error: Box::new(EngineExecutionError::Frontend(error)),
                     at: Some(*original_offset),
                 })?;
-            if parsed.kind() != fln_parse::SourceCommandKind::Definition {
+            if !matches!(
+                parsed.kind(),
+                SourceCommandKind::Definition | SourceCommandKind::Example
+            ) {
                 return Err(EngineExecutionError::TerminalCheckDefinitionPrefix { index });
             }
         }
@@ -4593,7 +4634,10 @@ impl Engine {
                         error: Box::new(EngineExecutionError::Frontend(error)),
                         at: Some(*original_offset),
                     })?;
-                if parsed.kind() != fln_parse::SourceCommandKind::Definition {
+                if !matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Definition | SourceCommandKind::Example
+                ) {
                     return Err(EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
                         module: module.name.clone(),
                         index,
@@ -5206,10 +5250,14 @@ impl Engine {
                 })?;
             check_owners.resize(mixed.checks.len(), usize::MAX);
             for output in &mixed.outputs {
-                let SourceCommandOutput::Check {
+                let (SourceCommandOutput::Check {
                     command_index,
                     check_index,
-                } = output
+                }
+                | SourceCommandOutput::Example {
+                    command_index,
+                    check_index,
+                }) = output
                 else {
                     continue;
                 };
@@ -7389,7 +7437,7 @@ pub struct DefinitionExecution {
     pub checker: CheckerAgreement,
 }
 
-/// One bounded `#check` query validated by both checker seats.
+/// One bounded `#check` query or anonymous example validated by both checker seats.
 ///
 /// The generated declaration is admitted only into a scratch successor. That
 /// successor is deliberately not retained here: a check query observes the
@@ -7424,10 +7472,10 @@ pub struct TerminalSourceCheck {
     pub check: SourceCheck,
 }
 
-/// One user-visible output produced by an ordered import-free source stream.
+/// One query or anonymous-check event in an ordered import-free source stream.
 ///
 /// Definitions have no output row. Evaluation rows point into the retained
-/// execution batch; check rows point into the batch's scratch-only check table.
+/// execution batch; checks and silent examples point into the scratch-only table.
 #[derive(Debug)]
 pub enum SourceCommandOutput {
     Evaluation {
@@ -7435,6 +7483,12 @@ pub enum SourceCommandOutput {
         execution_index: usize,
     },
     Check {
+        command_index: usize,
+        check_index: usize,
+    },
+    /// A checked example has no textual output, but its dependencies remain
+    /// visible to the module-visibility validator until the batch is complete.
+    Example {
         command_index: usize,
         check_index: usize,
     },
@@ -12205,7 +12259,8 @@ mod tests {
         for (output, expected) in completed.outputs.iter().zip(expected_commands) {
             let actual = match output {
                 SourceCommandOutput::Evaluation { command_index, .. }
-                | SourceCommandOutput::Check { command_index, .. } => *command_index,
+                | SourceCommandOutput::Check { command_index, .. }
+                | SourceCommandOutput::Example { command_index, .. } => *command_index,
             };
             assert_eq!(actual, expected);
         }

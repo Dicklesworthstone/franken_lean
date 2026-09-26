@@ -184,12 +184,12 @@ fn exact_qualified_names_and_escaped_components_keep_their_identity() {
     );
 }
 #[test]
-fn unknown_fields_do_not_resolve_as_arbitrary_namespace_methods() {
-    let e = check(&engine(), "structure Point where\n  x : Nat\ndef Point.notAField (p : Point) : Nat := 7\ndef point : Point := { x := 2 }").engine;
+fn methods_require_a_receiver_parameter_and_unknown_fields_are_refused() {
+    let e = check(&engine(), "structure Point where\n  x : Nat\ndef Point.notAField (p : Point) : Nat := 7\ndef Point.wrongReceiver (n : Nat) : Nat := n\ndef point : Point := { x := 2 }\ntheorem method : point.notAField = 7 := by rfl").engine;
     let root = e.environment().logical_root(&KVMap::new());
     for text in [
         "def bad : Nat := point.missing",
-        "def bad : Nat := point.notAField",
+        "def bad : Nat := point.wrongReceiver",
         "def bad : Nat := (1).x",
         "def bad : Nat := (point) .x",
         "def bad : Nat := (point). x",

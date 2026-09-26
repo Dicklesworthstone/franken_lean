@@ -84,7 +84,15 @@ fn control(s: &str) -> bool {
 fn declaration(s: &str) -> bool {
     matches!(
         s,
-        "def" | "theorem" | "instance" | "structure" | "class" | "inductive" | "#check" | "#eval"
+        "def"
+            | "theorem"
+            | "example"
+            | "instance"
+            | "structure"
+            | "class"
+            | "inductive"
+            | "#check"
+            | "#eval"
     )
 }
 

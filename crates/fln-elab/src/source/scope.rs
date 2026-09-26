@@ -193,6 +193,90 @@ pub fn elaborate_definition(
     super::definition_scoped(syntax, env, kernel, scope)
 }
 
+/// Elaborate an anonymous example as a definition candidate of any sort.
+///
+/// The pin's `mkDefViewOfExample` reuses ordinary definition elaboration, and
+/// `elabMutualDef` discards its entire successor environment. This function
+/// supplies only the candidate: callers must dual-check it in a scratch
+/// successor, never publish it. The original example syntax remains intact.
+pub fn elaborate_example(
+    syntax: &Syntax,
+    name: Name,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
+
+    if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
+        return Err(NatDefinitionElabError::InvalidGeneratedCheckName);
+    }
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "example declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "example modifiers",
+    )?;
+    // Attribute execution is a separate effect. Refuse unsupported modifiers
+    // instead of silently losing an attribute failure when the scratch closes.
+    for modifier in modifiers {
+        expect_empty_null(modifier, "unmodified example")?;
+    }
+    let example = expect_node(
+        &declaration[1],
+        &parser_kind(&["Command", "example"]),
+        3,
+        "example",
+    )?;
+    expect_atom(&example[0], "example", "example keyword")?;
+    let empty = || Syntax::node(Name::from_components(["null"]), Vec::new());
+    let id = Syntax::node(
+        parser_kind(&["Command", "declId"]),
+        vec![
+            Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::empty_at(BytePos(0)),
+                val: name.clone(),
+                preresolved: Vec::new(),
+            },
+            empty(),
+        ],
+    );
+    let definition = Syntax::node(
+        parser_kind(&["Command", "definition"]),
+        vec![
+            Syntax::Atom {
+                info: SourceInfo::None,
+                val: "def".into(),
+            },
+            id,
+            example[1].clone(),
+            example[2].clone(),
+            empty(),
+        ],
+    );
+    let candidate = Syntax::node(
+        parser_kind(&["Command", "declaration"]),
+        vec![declaration[0].clone(), definition],
+    );
+    let mut context = Context::scoped(env, kernel, scope);
+    super::definition_in_context_named(&candidate, &mut context, Some(name))
+}
+
+/// Recognize the canonical command shape; elaboration still validates its body.
+pub fn is_example(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Command", "declaration"])
+            && args.get(1).and_then(Syntax::kind)
+                == Some(&parser_kind(&["Command", "example"])))
+}
+
 pub fn elaborate_record(
     syntax: &Syntax,
     env: &Environment,

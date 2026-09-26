@@ -19,6 +19,52 @@ The example contains one definition and five theorems: reflexivity, symmetry, co
 
 Earlier declarations are visible to later commands and files. All supplied files must succeed before a success result is emitted. A late refusal exposes no advanced engine snapshot and emits no partial-success record. This command does not compile or run the source program and creates no output artifact. Kernel normalization during proof checking remains necessary and is not runtime program execution.
 
+## Anonymous examples
+
+`example` checks an anonymous declaration and discards its environment successor.
+It accepts propositions, data values, inferred result types, and the same explicit
+and implicit binders as the ordinary declaration path:
+
+```lean
+example : 2 + 2 = 4 := by decide
+example : Nat := 7
+example := 8
+example : Type := Nat
+example {A : Type u} (x : A) : A := x
+```
+
+Examples use the current namespace, opened names, and section variables. Each
+candidate passes K1 and the independent checker; repeated examples add no
+constants, namespace names, or instance registrations. An example-only file has
+identical input and output logical roots. `check-source` counts examples as
+commands, with no theorem declaration added.
+
+The `lean FILE` and `fln run FILE` paths also check examples silently between
+ordinary definitions and queries. The body is never executed. A bad example
+fails the complete command stream without releasing earlier buffered output.
+Imported examples retain their dependency checks, so another module's
+unimported declarations cannot become visible through an example.
+
+This is elaboration and kernel checking support. Declaration modifiers on
+examples remain unsupported, and complete Reference code-generation refusal
+parity remains open under `franken_lean-z8j.1.6.6`; successful scratch checking
+does not establish compiler parity for every possible example body.
+
+## Generalized field notation
+
+Dot notation resolves methods in the receiver type's namespace, including
+`xs.length`, `xs.map f`, `xs.foldr f initial`, and proof methods such as
+`h.symm` when the corresponding declaration is available. The receiver is
+inserted at the first eligible parameter; preceding explicit parameters,
+named arguments, implicit parameters, and partial applications retain their
+ordinary application behavior.
+
+Resolution checks each type alias's namespace before unfolding it, preserving
+alias-specific methods and dictionary-projected receiver types. Function
+receivers use the `Function` namespace. Existing physical and inherited record
+fields retain their behavior. Inherited methods that require searching parent
+namespaces in Lean's C3 order remain unsupported.
+
 ## Equality and rewriting
 
 The source prelude now provides the ordinary indexed `Eq` inductive block, `Eq.refl`, its dependent `Eq.rec` eliminator, and an inferred-argument `rfl` abbreviation. K1 regenerates the eliminator; a forged eliminator regression must reject. Source `=` is propositional equality, distinct from Boolean `==`.

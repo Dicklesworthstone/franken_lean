@@ -9,12 +9,12 @@
 # oracle-investigation, with a note naming the Reference's first error and the owning bead.
 # Fixing a divergence changes the observed outcome, so its row must be updated in the same change.
 crates/fln-cli/tests/fixtures/source_ladder/eval_and_check_output.lean	accept	accept	match	agree	
-crates/fln-cli/tests/fixtures/source_ladder/example_by_decide.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/example_by_decide.lean	accept	accept	match	agree	anonymous example checks in a discarded council successor
 crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/io_main.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
-crates/fln-cli/tests/fixtures/source_ladder/list_literal_length.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/list_literal_length.lean	accept	accept	match	agree	lean resolves List.length field notation and prints 3
 crates/fln-cli/tests/fixtures/source_ladder/nat_definitions_eval_check.lean	accept	accept	match	agree	
 crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse

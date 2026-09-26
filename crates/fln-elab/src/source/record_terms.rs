@@ -72,13 +72,65 @@ pub(super) enum RecordStep<'a> {
     Complete(Typed),
 }
 
+pub(super) enum FieldResolution {
+    Value(Typed),
+    Method {
+        function: Typed,
+        receiver: Typed,
+        base: Name,
+    },
+}
+
+pub(super) enum FieldReceiver<'a> {
+    Syntax(&'a Syntax, Name),
+    Elaborated(Typed, Name),
+}
+
 impl Context {
+    pub(super) fn field_application_receiver<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Option<FieldReceiver<'a>>, NatDefinitionElabError> {
+        let kind = parser_kind(&["Term", "proj"]);
+        if syntax.kind() == Some(&kind) {
+            let parts = expect_node(syntax, &kind, 3, "field projection")?;
+            expect_atom(&parts[1], ".", "field dot")?;
+            let Syntax::Ident { val: field, .. } = &parts[2] else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            return Ok(Some(FieldReceiver::Syntax(&parts[0], field.clone())));
+        }
+        if let Syntax::Ident { val: name, .. } = syntax
+            && let Some((receiver, path)) = self.qualified_field_receiver(name)?
+        {
+            return Ok(Some(FieldReceiver::Elaborated(receiver, path)));
+        }
+        Ok(None)
+    }
     /// Resolve a qualified identifier only after exact local/global lookup has
     /// failed. Names are split structurally: an escaped dot is never a separator.
     pub(super) fn qualified_record_field(
         &mut self,
         name: &Name,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Some((receiver, path)) = self.qualified_field_receiver(name)? else {
+            return Ok(None);
+        };
+        let field = self.resolve_field_path(receiver, &path, false)?;
+        Ok(Some(self.field_value(field)?))
+    }
+
+    /// Splitting is reserved for identifiers that did not resolve as a whole.
+    /// This preserves exact constants, local shadowing and escaped components.
+    pub(super) fn qualified_field_receiver(
+        &mut self,
+        name: &Name,
+    ) -> Result<Option<(Typed, Name)>, NatDefinitionElabError> {
+        if self.txn.lctx.find_by_user_name(name).is_some()
+            || self.resolve_source_name(name)?.is_some()
+        {
+            return Ok(None);
+        }
         let mut prefix = name.clone();
         let mut suffix = Vec::new();
         while !prefix.is_anonymous() {
@@ -97,7 +149,11 @@ impl Context {
                 .find(|local| local.user_name == prefix)
             {
                 Some(Typed {
-                    value: Expr::fvar(local.id.clone()),
+                    value: self
+                        .matrix_aliases
+                        .get(&local.id)
+                        .cloned()
+                        .unwrap_or_else(|| Expr::fvar(local.id.clone())),
                     type_: local.type_.clone(),
                 })
             } else if let Some(resolved) = self.resolve_source_name(&prefix)?
@@ -107,53 +163,193 @@ impl Context {
             } else {
                 None
             };
-            if let Some(mut receiver) = receiver {
-                for (index, field) in suffix.iter().rev().enumerate() {
-                    receiver = match self.record_field(receiver, field) {
-                        Ok(term) => term,
-                        Err(NatDefinitionElabError::Inference(
-                            SourceInferenceError::RecordTerm(RecordTermError::ExpectedRecordType),
-                        )) if index == 0 => {
-                            // A namespace prefix such as Nat is not a receiver.
-                            // Keep its missing constant on the original path.
-                            return Ok(None);
-                        }
-                        Err(error) => return Err(error),
-                    };
+            if let Some(receiver) = receiver {
+                let type_ = self.whnf(&receiver.type_)?;
+                if matches!(type_.node(), ExprNode::Sort { .. }) {
+                    // A namespace prefix such as Nat is not a receiver.
+                    return Ok(None);
                 }
-                return Ok(Some(receiver));
+                let path = suffix
+                    .iter()
+                    .rev()
+                    .fold(Name::anonymous(), |path, part| path.append_core(part));
+                return Ok(Some((receiver, path)));
             }
         }
         Ok(None)
     }
 
-    /// Apply admitted generated projections to the actual receiver. In
-    /// particular, an instance-implicit class receiver must not be replaced by
-    /// a dictionary selected from the surrounding context.
-    pub(super) fn record_field_path(
+    pub(super) fn resolve_field_path(
         &mut self,
         mut receiver: Typed,
         path: &Name,
-    ) -> Result<Typed, NatDefinitionElabError> {
-        let mut parts = Vec::new();
-        let mut name = path.clone();
-        while !name.is_anonymous() {
-            self.tick()?;
-            let LeafView::Str(part) = name.leaf_view() else {
-                return Err(error(RecordTermError::UnknownField(path.clone())));
-            };
-            parts.push(Name::from_components([part]));
-            name = name.parent().clone();
-        }
-        if parts.is_empty() {
+        has_arguments: bool,
+    ) -> Result<FieldResolution, NatDefinitionElabError> {
+        let parts = scope::components(path).map_err(|_| failure(SourceInferenceError::Scope))?;
+        let Some((last, prefix)) = parts.split_last() else {
             return Err(failure(SourceInferenceError::Scope));
+        };
+        for part in prefix {
+            self.tick()?;
+            let field =
+                self.resolve_field(receiver, &Name::from_components([part.as_str()]), false)?;
+            receiver = self.field_value(field)?;
         }
-        for part in parts.iter().rev() {
-            receiver = self.record_field(receiver, part)?;
-        }
-        Ok(receiver)
+        self.resolve_field(
+            receiver,
+            &Name::from_components([last.as_str()]),
+            has_arguments,
+        )
     }
 
+    /// Real fields retain priority over methods. A failed candidate cannot
+    /// leak implicit assignments or instance choices into a method lookup.
+    /// Non-lookup errors, including resource stops, are never swallowed.
+    fn resolve_field(
+        &mut self,
+        mut receiver: Typed,
+        field: &Name,
+        has_arguments: bool,
+    ) -> Result<FieldResolution, NatDefinitionElabError> {
+        self.flush(false)?;
+        self.resolve_instances(false)?;
+        loop {
+            self.tick()?;
+            // Inserted dictionaries may determine the receiver type through
+            // their projections; inspect its head only after resolving them.
+            self.resolve_instances(false)?;
+            receiver.type_ =
+                self.whnf_with_transparency(&receiver.type_, UnificationTransparency::None, true)?;
+            if let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = receiver.type_.node()
+                && (*binder_info == BinderInfo::Implicit
+                    || *binder_info == BinderInfo::InstImplicit
+                    || has_arguments && *binder_info == BinderInfo::StrictImplicit)
+            {
+                let argument = if *binder_info == BinderInfo::InstImplicit {
+                    self.instance_hole(binder_type.clone())?
+                } else {
+                    self.hole(binder_type.clone())?
+                };
+                receiver.type_ = self.substitute(body, &argument)?;
+                receiver.value = Expr::app(receiver.value, argument);
+                continue;
+            }
+            let mut head = &receiver.type_;
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                arguments.push(a.clone());
+                head = f;
+            }
+            let base = match head.node() {
+                ExprNode::Const { name, .. } => name.clone(),
+                ExprNode::ForallE { .. } => Name::from_components(["Function"]),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    // Reduce the dictionary/record supplying a type field,
+                    // preserving the projected field's own alias namespace.
+                    let value = self.whnf(expr)?;
+                    if &value == expr {
+                        return Err(error(RecordTermError::ExpectedRecordType));
+                    }
+                    let mut projected = Expr::proj(struct_name.clone(), *idx, value);
+                    for argument in arguments.into_iter().rev() {
+                        self.tick()?;
+                        projected = Expr::app(projected, argument);
+                    }
+                    receiver.type_ = projected;
+                    continue;
+                }
+                _ => return Err(error(RecordTermError::ExpectedRecordType)),
+            };
+            let definition = self.txn.env.find(&base).cloned();
+            let mut missing = error(RecordTermError::UnknownField(field.clone()));
+            if matches!(definition, Some(ConstantInfo::Induct(_))) {
+                let mut trial = self.clone();
+                let projected = trial.record_field(receiver.clone(), field);
+                self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                match projected {
+                    Ok(value) => {
+                        *self = trial;
+                        return Ok(FieldResolution::Value(value));
+                    }
+                    Err(
+                        reason @ NatDefinitionElabError::Inference(
+                            SourceInferenceError::RecordTerm(
+                                RecordTermError::ExpectedRecordType
+                                | RecordTermError::UnknownField(_),
+                            ),
+                        ),
+                    ) => missing = reason,
+                    Err(reason) => return Err(reason),
+                }
+            }
+            let method = base.append_core(field);
+            // An alias owns its method namespace. Only a failed lookup
+            // unfolds one definition, so intermediate aliases are not skipped
+            // in favor of a field on the final underlying structure.
+            if self.txn.env.contains(&method) {
+                return Ok(FieldResolution::Method {
+                    function: self.constant(&method)?,
+                    receiver,
+                    base,
+                });
+            }
+            let Some(ConstantInfo::Defn(definition)) = definition else {
+                return Err(missing);
+            };
+            if definition.safety != DefinitionSafety::Safe {
+                return Err(missing);
+            }
+            let ExprNode::Const { levels, .. } = head.node() else {
+                return Err(missing);
+            };
+            let mut unfolded =
+                self.instantiate_params(&definition.value, &definition.base.level_params, levels)?;
+            for argument in arguments.into_iter().rev() {
+                self.tick()?;
+                unfolded = Expr::app(unfolded, argument);
+            }
+            receiver.type_ = unfolded;
+        }
+    }
+
+    fn field_value(&mut self, field: FieldResolution) -> Result<Typed, NatDefinitionElabError> {
+        let FieldResolution::Method {
+            function,
+            receiver,
+            base,
+        } = field
+        else {
+            let FieldResolution::Value(value) = field else {
+                unreachable!()
+            };
+            return Ok(value);
+        };
+        let mut state =
+            self.start_field_application(function, receiver, &base, &[], None, false)?;
+        while let Some(argument) = self.next_named_argument(&mut state)? {
+            let application::ApplicationValue::Elaborated(value) = argument.value else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            let value = self.finish_term(value, Some(&argument.domain))?;
+            self.constrain_type(&value.type_, &argument.domain)?;
+            self.add_named_argument(&mut state, &argument.codomain, value)?;
+        }
+        self.finish_named_application(state)
+    }
+
+    /// Apply admitted generated projections to the actual receiver. In
+    /// particular, an instance-implicit class receiver must not be replaced by
+    /// a dictionary selected from the surrounding context.
     pub(super) fn record_field(
         &mut self,
         receiver: Typed,
