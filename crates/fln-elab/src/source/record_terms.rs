@@ -8,6 +8,9 @@ use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod lookup_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordTermError {
     ExpectedRecordType,
@@ -140,6 +143,11 @@ impl Context {
             };
             suffix.push(Name::from_components([part]));
             prefix = prefix.parent().clone();
+            // An unqualified name has no receiver prefix. Anonymous internal
+            // locals are scope slots, not a namespace or an implicit record.
+            if prefix.is_anonymous() {
+                break;
+            }
             let receiver = if let Some(local) = self
                 .txn
                 .lctx
