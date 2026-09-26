@@ -6,6 +6,7 @@
 mod callables;
 mod data_recursion;
 mod empty;
+mod global;
 mod indexed;
 mod mutual;
 mod nat;
@@ -283,7 +284,16 @@ impl<'a> Preparation<'a> {
         let input = if input.has_loose_bvars() {
             input.clone()
         } else {
+            let runtime_expected = expected
+                .as_ref()
+                .map(|type_| self.erase_runtime_type(type_))
+                .transpose()?;
             let erased = self.erase_proofs(input, expected)?;
+            let erased = if let Some(type_) = runtime_expected {
+                self.annotate_execution_value(erased, type_)?
+            } else {
+                erased
+            };
             self.lower_projections(&erased)?
         };
         let mut tasks = vec![Task::Visit(input.clone())];
@@ -327,6 +337,10 @@ impl<'a> Preparation<'a> {
                         }
                         if let Some(reduced) = self.static_apply(&head, &args)? {
                             tasks.push(Task::Visit(reduced));
+                            continue;
+                        }
+                        if let Some(producer) = self.global_producer(&head, &args)? {
+                            tasks.push(Task::Visit(producer));
                             continue;
                         }
                         if let Some(partial) = self.partial_call(&head, &args)? {
@@ -552,6 +566,10 @@ impl<'a> Preparation<'a> {
                         ExprNode::Const { name, .. } => {
                             if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
                                 tasks.push(Task::Visit(constructor));
+                                continue;
+                            }
+                            if let Some(producer) = self.global_producer(&expr, &[])? {
+                                tasks.push(Task::Visit(producer));
                                 continue;
                             }
                             if let Some(partial) = self.partial_call(&expr, &[])? {
