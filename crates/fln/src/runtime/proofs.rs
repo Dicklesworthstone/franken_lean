@@ -4,6 +4,7 @@
 //! Reference's packed ABI and does not change any declaration sent to a checker.
 use super::*;
 use fln_core::level::Level;
+mod locals;
 mod projections;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
@@ -273,6 +274,16 @@ impl Preparation<'_> {
                                 // type bindings, not executable callbacks. Substitute
                                 // capture-avoidantly before erasing runtime annotations.
                                 let body = self.substitution(body, value)?;
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(body, expected));
+                                continue;
+                            }
+                            if let Some(lambda) = self.local_callable_template(value, type_)? {
+                                // A local name must not hide a generic or staged
+                                // literal helper from later call-site specialization.
+                                // Only lambda syntax moves; computed initializers
+                                // retain the ordinary strict binding below.
+                                let body = self.substitution(body, &lambda)?;
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(Frame::Visit(body, expected));
                                 continue;
