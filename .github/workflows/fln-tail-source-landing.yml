@@ -1,0 +1,138 @@
+name: Native tail-call source landing
+
+# Transport the exact locally tested implementation through the authenticated
+# repository connection. Each substantive increment is tested and committed
+# directly to main. A queued run is not evidence that implementation has landed.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-tail-source-landing.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.head_commit.message == 'build(comp): publish tested source-to-native tail-call increments')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Retrieve checksum-pinned implementation increments
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/tail-source-landing
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, urllib.request
+          payloads = [
+              ('runtime', 'df330ebe477b91183ebc59d1a465ff12e07a07b2', 'f076575965e5fab1652c37b143e4bfee6c8b4d51b53f8a9c1a4c61694ec1e4ab'),
+              ('source', 'f7d20a208a9fb2883d5580e2b0eee5f1f6ba2621', '91f4dc7718a66719348f7c323ef546e1c1fa77aa73066415306e39f94ddba85d'),
+          ]
+          for label, sha, checksum in payloads:
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'},
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  blob = json.load(response)
+              compressed = base64.b64decode(blob['content'])
+              assert hashlib.sha1(b'blob ' + str(len(compressed)).encode() + b'\0' + compressed).hexdigest() == sha
+              patch = gzip.decompress(compressed)
+              assert hashlib.sha256(patch).hexdigest() == checksum
+              pathlib.Path('target/tail-source-landing/' + label + '.patch').write_bytes(patch)
+          PY
+      - name: Verify and publish native execution, then source lowering
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          root=target/tail-source-landing
+          verify_runtime() {
+            git diff --check
+            git diff --cached --check
+            cargo test --locked -p fln-comp -p fln-vm --no-fail-fast 2>&1 | tee "$root/runtime-tests.log"
+            cargo clippy --locked -p fln-comp -p fln-vm --all-targets -- -D warnings 2>&1 | tee "$root/runtime-clippy.log"
+            rustfmt --edition 2024 --check --config skip_children=true crates/fln-comp/src/flbc.rs crates/fln-vm/src/interpreter.rs crates/fln-vm/src/interpreter/tail_calls.rs crates/fln-vm/tests/flbc_interpreter.rs crates/fln-vm/tests/tail_calls.rs
+          }
+          verify_source() {
+            verify_runtime
+            cargo test --locked -p fln --test runtime_tail_calls --test runtime_nat_recursion --test runtime_known_callbacks --test runtime_local_templates --test runtime_quotient_functions --no-fail-fast 2>&1 | tee "$root/source-tests.log"
+            cargo test --locked -p fln-cli --test source_tail_calls 2>&1 | tee "$root/cli-tests.log"
+            cargo clippy --locked -p fln-comp -p fln-vm -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee "$root/source-clippy.log"
+            cargo check --locked --workspace --all-targets 2>&1 | tee "$root/workspace-check.log"
+            rustfmt --edition 2024 --check --config skip_children=true crates/fln-comp/src/fir.rs crates/fln-comp/src/fir/tail_calls.rs crates/fln-comp/src/ingress.rs crates/fln-comp/tests/tail_lowering.rs crates/fln/src/runtime/transport/quotient/tests.rs crates/fln/tests/runtime_tail_calls.rs crates/fln-cli/tests/source_tail_calls.rs
+          }
+          check_paths() {
+            python3 -I - "$1" <<'PY'
+          import subprocess, sys
+          common = {'crates/fln-vm/tests/flbc_interpreter.rs'}
+          expected = common | ({'crates/fln-comp/src/flbc.rs', 'crates/fln-vm/src/interpreter.rs', 'crates/fln-vm/src/interpreter/tail_calls.rs', 'crates/fln-vm/tests/tail_calls.rs'} if sys.argv[1] == 'runtime' else {'crates/fln-comp/src/fir.rs', 'crates/fln-comp/src/fir/tail_calls.rs', 'crates/fln-comp/src/ingress.rs', 'crates/fln-comp/tests/tail_lowering.rs', 'crates/fln/src/runtime/transport/quotient/tests.rs', 'crates/fln/tests/runtime_tail_calls.rs', 'crates/fln-cli/tests/source_tail_calls.rs', 'examples/native_tail_recursion.lean'})
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == expected, (paths, expected)
+          statuses = subprocess.check_output(['git', 'diff', '--cached', '--name-status'], text=True).splitlines()
+          assert all(row.split('\t', 1)[0] in {'M', 'A'} for row in statuses), statuses
+          PY
+          }
+          publish() {
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then
+                git rev-parse HEAD | tee "$root/$1-commit.txt"
+                return 0
+              fi
+              test "$attempt" -lt 3
+              git fetch origin main
+              git rebase origin/main
+              "verify_$1"
+            done
+          }
+          # A prior landing run may already have installed one or both stages.
+          # Reverse checks require their complete exact patches, not names or
+          # marker strings. Conflicts stop; no force-push or destructive reset.
+          if git apply --reverse --check "$root/source.patch"; then
+            verify_source
+            git rev-parse HEAD | tee "$root/already-published-commit.txt"
+            exit 0
+          fi
+          if git apply --reverse --check "$root/runtime.patch"; then
+            verify_runtime
+          else
+            git apply --check --index "$root/runtime.patch"
+            git apply --index --whitespace=error "$root/runtime.patch"
+            check_paths runtime
+            verify_runtime
+            git commit -m 'feat(vm): execute checked tail calls with bounded native frames' -m 'Add direct and closure tail-call bytecodes with canonical encoding and exact argument/result ownership validation. Replace frames while preserving caller, thunk and task continuations; retain real pending continuations for overapplication. Version the internal bytecode and ownership witness explicitly. Ten execution regressions cover deep one-frame loops, owned permutations, cancellation, limits, partial applications, caching, task completion, malformed contracts and independent serialized replay. Compiler/VM tests, strict Clippy and scoped formatting pass before publication. No Reference parity or broader milestone closure is claimed.'
+            publish runtime
+          fi
+          git apply --check --index "$root/source.patch"
+          git apply --index --whitespace=error "$root/source.patch"
+          check_paths source
+          verify_source
+          git commit -m 'feat(comp): lower returned calls to bounded native tail execution' -m 'Select only immediately returned direct and closure calls with exact enclosing result ownership. Preserve ordinary calls when widening the result contract is required, all preceding computations and all genuine continuations. Account for removed returns and expanded bindings in instruction budgets and branch offsets. FIR identity and the original declaration checkers remain unchanged.' -m 'Add six independent FIR/FLBC lowering tests, seven source execution tests and an installed lean/fln/serialized-replay regression. Exercise 10,000-iteration loops under eight native frames, owned String permutations, captured callbacks, retained strict work, non-tail frame exhaustion, cancellation/fuel stops and failure-atomic artifacts. Preserve stronger existing tests while updating explicit internal version and frame expectations. Full compiler/VM suites, targeted source/CLI suites, strict Clippy, downstream workspace compilation and scoped formatting pass before publication. Mutual/staged generality and performance parity are not claimed.'
+          publish source
+      - name: Retain implementation and real validation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-tail-source-landing-${{ github.sha }}
+          path: target/tail-source-landing
+          retention-days: 7
+          if-no-files-found: warn
