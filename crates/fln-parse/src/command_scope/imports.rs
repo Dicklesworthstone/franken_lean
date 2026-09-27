@@ -1,6 +1,8 @@
 //! Header-only source import parsing over Vellum's real token stream.
 //! No source is synthesized and the returned body offset names original bytes.
 use super::*;
+use fln_syntax::token::lex_token;
+use fln_syntax::trivia::scan_trivia;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceHeader {
@@ -32,42 +34,46 @@ pub fn parse_source_header(source: &[u8]) -> Result<SourceHeader, DefinitionPars
 fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let tokens = tokens(&view)?;
-    let symbol = |index: usize, wanted: &str| {
-        tokens.get(index).is_some_and(
-            |token| matches!(&token.kind, TokenKind::Symbol(actual) if actual == wanted),
-        )
+    let table = table();
+    // Import discovery is not whole-file validation. Once the first body token
+    // is observed, do not lex its unfinished terms, comments, or later commands.
+    // The ordinary body parser/checker still refuses those exact bytes when
+    // checking the file; no recovered body is installed or called valid here.
+    let first = next_header_token(&view, &table, BytePos(0))?;
+    let (prelude, mut next) = match first {
+        Some(token) if matches!(&token.kind, TokenKind::Symbol(s) if s == "prelude") => {
+            (true, next_header_token(&view, &table, token.extent.end())?)
+        }
+        token => (false, token),
     };
-    let mut cursor = 0;
-    let prelude = symbol(cursor, "prelude");
-    if prelude {
-        cursor += 1;
-    }
     let mut imports = Vec::new();
-    while symbol(cursor, "import") {
-        cursor += 1;
-        let begin = cursor;
+    while let Some(LexedToken { kind: TokenKind::Symbol(symbol), extent }) = &next {
+        if symbol != "import" {
+            break;
+        }
+        next = next_header_token(&view, &table, extent.end())?;
+        let begin = imports.len();
         while let Some(LexedToken {
             kind: TokenKind::Ident(name),
-            ..
-        }) = tokens.get(cursor)
+            extent,
+        }) = &next
         {
             imports.push(name.clone());
-            cursor += 1;
+            next = next_header_token(&view, &table, extent.end())?;
         }
-        if cursor == begin {
+        if imports.len() == begin {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: tokens.get(cursor).map_or(BytePos(source.len()), |token| {
+                at: next.as_ref().map_or(BytePos(source.len()), |token| {
                     view.to_original(token.extent.start())
                 }),
                 expected: NatDefinitionExpectation::ImportedModule,
             });
         }
     }
-    let body_start = if cursor == 0 {
+    let body_start = if !prelude && imports.is_empty() {
         BytePos(0)
     } else {
-        tokens.get(cursor).map_or(BytePos(source.len()), |token| {
+        next.as_ref().map_or(BytePos(source.len()), |token| {
             view.to_original(token.extent.start())
         })
     };
@@ -78,9 +84,71 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     })
 }
 
+fn next_header_token(
+    view: &SourceView,
+    table: &TokenTable,
+    from: BytePos,
+) -> Result<Option<LexedToken>, DefinitionParseError> {
+    let text = view.normalized();
+    let at = scan_trivia(text, from).map_err(|error| NatDefinitionParseError::Lexical {
+        diagnostics: vec![ParseDiagnostic {
+            message: error.message(),
+            at: view.to_original(error.at()),
+        }],
+    })?;
+    if at.0 >= text.len_bytes() {
+        return Ok(None);
+    }
+    lex_token(text, table, at)
+        .map(Some)
+        .map_err(|error| NatDefinitionParseError::Lexical {
+            diagnostics: vec![ParseDiagnostic {
+                message: error.message(),
+                at: view.to_original(error.at()),
+            }],
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfinished_bodies_do_not_prevent_header_discovery_or_become_valid_files() {
+        for body in [
+            "def pending := \"unfinished",
+            "def pending := /- unfinished",
+            "def pending := \t",
+            "def pending := 1\r",
+        ] {
+            let source = format!("prelude\nimport Real\n{body}");
+            let header = parse_source_header(source.as_bytes()).unwrap();
+            assert!(header.prelude);
+            assert_eq!(header.imports, [Name::from_components(["Real"])]);
+            assert_eq!(header.body_start.0, source.find("def pending").unwrap());
+            assert!(partition(&source.as_bytes()[header.body_start.0..]).is_err(),
+                "header discovery must not repair or validate the body: {source}");
+        }
+        let source = b"def pending := \"unfinished";
+        let header = parse_source_header(source).unwrap();
+        assert!(header.imports.is_empty());
+        assert_eq!(header.body_start, BytePos(0));
+    }
+
+    #[test]
+    fn streaming_headers_preserve_repeated_imports_bom_crlf_and_header_errors() {
+        let source = "\u{feff}/- heading -/\r\nprelude\r\nimport A.B «C.D»\r\nimport A.B\r\ndef pending := \"unfinished";
+        let header = parse_source_header(source.as_bytes()).unwrap();
+        assert_eq!(header.imports, [Name::from_components(["A", "B"]),
+            Name::from_components(["C.D"]), Name::from_components(["A", "B"])]);
+        assert_eq!(header.body_start.0, source.find("def pending").unwrap());
+        let source = "\u{feff}prelude\r\nimport 42\r\ndef pending := \"unfinished";
+        let error = parse_source_header(source.as_bytes()).unwrap_err();
+        assert_eq!(error.primary_offset(), Some(BytePos(source.find("42").unwrap())));
+        for source in ["import «unfinished", "import /- unfinished", "import A\tB"] {
+            assert!(parse_source_header(source.as_bytes()).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn original_body_offsets_and_structural_names_survive_header_removal() {
