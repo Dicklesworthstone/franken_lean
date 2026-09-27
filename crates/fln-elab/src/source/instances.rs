@@ -175,13 +175,22 @@ impl Context {
                     Err(error) => return Err(error),
                 }
             }
-            self.flush(false)?;
+            // A failed/blocked candidate publishes no semantic state: only
+            // its spent work survives. The pending equations have already been
+            // flushed on entry (or after the previous successful round), so
+            // retrying them here cannot make progress. In particular, repeated
+            // blocked OfNat/HAdd goals must not exhaust the command budget
+            // before the final default-instance phase becomes eligible.
             if self.txn.mvars.assignments().len() == before {
                 if final_pass && self.resolve_default_instance(&registry)? {
                     continue;
                 }
                 break;
             }
+            // A selected dictionary may reveal dependent output types or
+            // projections. Resume every retained equation after that progress;
+            // skipping a redundant pass is not permission to drop obligations.
+            self.flush(false)?;
         }
         if final_pass
             && self
