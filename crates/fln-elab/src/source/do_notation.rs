@@ -126,7 +126,37 @@ fn lambda(
     ))
 }
 
+// A conditional inside a loop forwards a tagged exit until the loop-level
+// join unwraps it. `allow_return` is independent: an ordinary nested do owns
+// its return scope, but a conditional branch does not introduce a new one.
+#[derive(Clone, Copy)]
+struct SequenceScope<'a> {
+    targets: Option<&'a control::LoopTargets>,
+    signal: bool,
+    require_unit: bool,
+    allow_return: bool,
+}
+
+fn sequence_element(statement: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    let mut item = node(statement, "doSeqItem", 2)?;
+    let separators = children(item.pop().expect("optional semicolon"))?;
+    match separators.as_slice() {
+        [] => {}
+        [separator] => {
+            expect_atom(separator, ";", "do separator")?;
+        }
+        _ => return Err(invalid()),
+    }
+    item.pop().ok_or_else(invalid)
+}
+
 impl Context {
+    fn do_control_name(&mut self) -> Result<Syntax, NatDefinitionElabError> {
+        let serial = self.next;
+        self.fresh_name()?;
+        Ok(ident(Name::num(Name::anonymous(), serial)))
+    }
+
     pub(super) fn do_monad(
         &mut self,
         type_: &Expr,
@@ -220,113 +250,122 @@ impl Context {
         self.expand_do_sequence(sequence, None)
     }
 
-    // A supplied continuation belongs to the current return scope. In
-    // particular, a loop callback must not turn a nonlocal return into pure.
+    // The top-level sequence and conditional branches share the same statement
+    // rules. Only the control-result shape differs inside a branch.
     fn expand_do_sequence(
         &mut self,
         sequence: Syntax,
         mut result: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        let require_unit = result.is_some();
-        let loop_targets = result.as_ref().map(control::LoopTargets::new).transpose()?;
+        let targets = result.as_ref().map(control::LoopTargets::new).transpose()?;
+        let scope = SequenceScope {
+            targets: targets.as_ref(),
+            signal: false,
+            require_unit: result.is_some(),
+            allow_return: targets.is_none(),
+        };
         let statements = sequence_items(sequence)?;
         if statements.is_empty() {
             return Err(invalid());
         }
         for (offset, statement) in statements.into_iter().rev().enumerate() {
             self.tick()?;
-            let mut item = node(statement, "doSeqItem", 2)?;
-            let separators = children(item.pop().expect("optional semicolon"))?;
-            if separators.len() > 1 {
-                return Err(invalid());
-            }
-            if let Some(separator) = separators.first() {
-                expect_atom(separator, ";", "do separator")?;
-            }
-            let element = item.pop().expect("do element");
-            if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
-                result = Some(self.expand_do_conditional(element, result, loop_targets.as_ref())?);
-            } else if control::is_jump(&element) {
-                // Never discard an unreachable source suffix: it may contain
-                // invalid declarations or effects that still need checking.
-                if offset != 0 {
-                    return Err(invalid());
-                }
-                result = Some(control::jump(element, loop_targets.as_ref())?);
-            } else if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
-                // This slice has terminal return only. Rejecting a continuation
-                // is essential: treating early return as pure would run it.
-                if result.is_some() {
-                    return Err(invalid());
-                }
-                let mut parts = node(element, "doReturn", 2)?;
-                let value = children(parts.pop().expect("return value"))?;
-                expect_atom(&parts[0], "return", "return keyword")?;
-                if value.len() != 1 {
-                    return Err(invalid());
-                }
-                result = Some(call(false, value));
-            } else if element.kind() == Some(&parser_kind(&["Term", "doExpr"])) {
-                let mut parts = node(element, "doExpr", 1)?;
-                let action = parts.pop().expect("action");
-                result = Some(if let Some(body) = result {
-                    let serial = self.next;
-                    let _ = self.fresh_name()?;
-                    // Numeric names below anonymous cannot be spelled in source.
-                    let name = ident(Name::num(Name::anonymous(), serial));
-                    let annotation = if require_unit {
-                        unit_annotation()
-                    } else {
-                        null(vec![])
-                    };
-                    call(true, vec![action, lambda(name, annotation, body)?])
-                } else {
-                    action
-                });
-            } else if element.kind() == Some(&parser_kind(&["Term", "doLet"])) {
-                let body = result.take().ok_or_else(invalid)?;
-                let mut parts = node(element, "doLet", 4)?;
-                let declaration = parts.pop().expect("let declaration");
-                let config = parts.pop().expect("let config");
-                expect_empty_null(&parts[1], "immutable do let")?;
-                expect_atom(&parts[0], "let", "let keyword")?;
-                let keyword = parts.remove(0);
-                result = Some(Syntax::node(
-                    parser_kind(&["Term", "let"]),
-                    vec![keyword, config, declaration, atom(";"), body],
-                ));
+            let element = sequence_element(statement)?;
+            result = Some(if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+                self.expand_do_conditional(element, result, targets.as_ref())?
             } else {
-                let body = result.take().ok_or_else(invalid)?;
-                let mut parts = node(element, "doLetArrow", 4)?;
-                let mut declaration = node(parts.pop().expect("bind declaration"), "doIdDecl", 4)?;
-                expect_atom(&parts[0], "let", "bind keyword")?;
-                expect_empty_null(&parts[1], "immutable do bind")?;
-                let config = expect_node(
-                    &parts[2],
-                    &parser_kind(&["Term", "letConfig"]),
-                    1,
-                    "bind config",
-                )?;
-                expect_empty_null(&config[0], "plain bind config")?;
-                let mut value = node(declaration.pop().expect("bind action"), "doExpr", 1)?;
-                let arrow = declaration.pop().expect("bind arrow");
-                if !matches!(&arrow, Syntax::Atom {val,..} if val == "←" || val == "<-") {
-                    return Err(invalid());
-                }
-                let annotation = declaration.pop().expect("bind annotation");
-                let name = declaration.pop().expect("bind name");
-                if !matches!(name, Syntax::Ident { .. }) {
-                    return Err(invalid());
-                }
-                result = Some(call(
-                    true,
-                    vec![
-                        value.pop().expect("action"),
-                        lambda(name, annotation, body)?,
-                    ],
-                ));
-            }
+                self.prepend_do_element(element, result, scope, offset == 0)?
+            });
         }
         result.ok_or_else(invalid)
+    }
+
+    /// Prepend one non-compound statement. This is shared with the conditional
+    /// worklist so branch-local lets and binds cannot acquire weaker checking.
+    fn prepend_do_element(
+        &mut self,
+        element: Syntax,
+        result: Option<Syntax>,
+        scope: SequenceScope<'_>,
+        terminal: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if control::is_jump(&element) {
+            // Never erase unchecked source following an unconditional exit.
+            if !terminal {
+                return Err(invalid());
+            }
+            return if scope.signal {
+                let stop = control::jump_kind(element)?;
+                Ok(scope.targets.ok_or_else(invalid)?.signal(Some(stop)))
+            } else {
+                control::jump(element, scope.targets)
+            };
+        }
+        if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
+            // A branch may return only when there is no enclosing source
+            // continuation. Loop returns are nonlocal and remain unsupported.
+            if !scope.allow_return || result.is_some() {
+                return Err(invalid());
+            }
+            let mut parts = node(element, "doReturn", 2)?;
+            let value = children(parts.pop().expect("return value"))?;
+            expect_atom(&parts[0], "return", "return keyword")?;
+            if value.len() != 1 {
+                return Err(invalid());
+            }
+            return Ok(call(false, value));
+        }
+        if element.kind() == Some(&parser_kind(&["Term", "doExpr"])) {
+            let mut parts = node(element, "doExpr", 1)?;
+            let action = parts.pop().expect("action");
+            return Ok(if let Some(body) = result {
+                let name = self.do_control_name()?;
+                let annotation = if scope.require_unit {
+                    unit_annotation()
+                } else {
+                    null(vec![])
+                };
+                call(true, vec![action, lambda(name, annotation, body)?])
+            } else {
+                action
+            });
+        }
+        let body = result.ok_or_else(invalid)?;
+        if element.kind() == Some(&parser_kind(&["Term", "doLet"])) {
+            let mut parts = node(element, "doLet", 4)?;
+            let declaration = parts.pop().expect("let declaration");
+            let config = parts.pop().expect("let config");
+            expect_empty_null(&parts[1], "immutable do let")?;
+            expect_atom(&parts[0], "let", "let keyword")?;
+            return Ok(Syntax::node(
+                parser_kind(&["Term", "let"]),
+                vec![parts.remove(0), config, declaration, atom(";"), body],
+            ));
+        }
+        let mut parts = node(element, "doLetArrow", 4)?;
+        let mut declaration = node(parts.pop().expect("bind declaration"), "doIdDecl", 4)?;
+        expect_atom(&parts[0], "let", "bind keyword")?;
+        expect_empty_null(&parts[1], "immutable do bind")?;
+        let config = expect_node(
+            &parts[2],
+            &parser_kind(&["Term", "letConfig"]),
+            1,
+            "bind config",
+        )?;
+        expect_empty_null(&config[0], "plain bind config")?;
+        let mut value = node(declaration.pop().expect("bind action"), "doExpr", 1)?;
+        let arrow = declaration.pop().expect("bind arrow");
+        if !matches!(&arrow, Syntax::Atom {val,..} if val == "←" || val == "<-") {
+            return Err(invalid());
+        }
+        let annotation = declaration.pop().expect("bind annotation");
+        let name = declaration.pop().expect("bind name");
+        if !matches!(name, Syntax::Ident { .. }) {
+            return Err(invalid());
+        }
+        Ok(call(
+            true,
+            vec![value.pop().expect("action"), lambda(name, annotation, body)?],
+        ))
     }
 }
