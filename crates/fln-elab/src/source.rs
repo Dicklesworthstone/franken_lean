@@ -586,9 +586,11 @@ impl Context {
 
     /// Keep the abbreviation-only solution when it succeeds: eagerly unfolding
     /// named types can change later instance selection. Only ordinary typing
-    /// equations that defer receive a second, safe-definition conversion pass.
-    /// Both attempts use the transactional solver and retain their spent work;
-    /// resource failures and selection queries never take this fallback.
+    /// equations that defer or encounter a syntactic occurs check receive one
+    /// safe-definition conversion retry. For example, ?A = Id ?A is reflexive
+    /// after delta reduction, not a cyclic assignment. A real cycle still fails
+    /// the unchanged occurs check on the retry. Both attempts are transactional
+    /// and retain spent work; resource failures and selection queries never retry.
     fn unify_source_batch(
         &mut self,
         pairs: &[(Expr, Expr)],
@@ -602,6 +604,8 @@ impl Context {
                 &result,
                 Err(UnificationError::Deferred(
                     UnificationDeferred::UnsupportedEquation | UnificationDeferred::NotAPattern
+                )) | Err(UnificationError::Metavariable(
+                    MetavarError::OccursCheckFailed { .. }
                 ))
             )
         {
@@ -2725,3 +2729,6 @@ pub use inductive::{elaborate_inductive, is_inductive};
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.
 pub use record::{SourceRecord, elaborate_record, is_record};
+
+#[cfg(test)]
+mod conversion_tests;

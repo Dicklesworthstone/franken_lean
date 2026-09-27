@@ -1245,7 +1245,12 @@ impl Context {
         if state.recursive {
             target = self.recursive_parameters(&mut locals, target)?;
         }
-        let expected = self.whnf(&target)?;
+        // Expose the instantiated motive, but preserve the branch's named
+        // result type. Eagerly unfolding State/Reader here loses the monad
+        // before nested do notation can select its dictionary. Ordinary source
+        // conversion still unfolds safe definitions when checking the branch.
+        let expected =
+            self.whnf_with_transparency(&target, UnificationTransparency::Abbreviations, true)?;
         // Fresh generalized parameters shadow their old source names. Clear
         // the old locals only when no retained type or let value needs them;
         // otherwise a captured let would lose its actual free-variable scope.

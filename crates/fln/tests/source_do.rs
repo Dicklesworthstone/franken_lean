@@ -203,3 +203,49 @@ fn do_programs_execute_through_golem() {
         Some("42")
     );
 }
+
+#[test]
+fn constructor_match_branches_preserve_reader_and_identity_monads() {
+    use fln::{EngineExecutionLimits, VmExit};
+    let source = r#"
+def Reader (A : Type) : Type := Nat -> A
+instance readerPure : Pure Reader := { pure := fun x r => x }
+instance readerBind : Bind Reader := { bind := fun action next r => next (action r) r }
+def ask : Reader Nat := fun r => r
+def selected (flag : Bool) : Reader Nat :=
+  match flag with
+  | true => do
+    let n ← ask
+    return (n + 2)
+  | false => do return 7
+def nested (flag : Bool) : Id Nat :=
+  match flag with
+  | true => do
+    let n : Nat ← do return (40 : Nat)
+    return (n + 2)
+  | false => do return 7
+theorem readerBranch : selected true 40 = 42 := by rfl
+theorem otherReaderBranch : selected false 40 = 7 := by rfl
+theorem nestedBranch : nested true = 42 := by rfl
+#eval selected true 40 + nested true
+"#;
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let run = base
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(result) = &run.executions.last().unwrap().exit else {
+        panic!("return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("84")
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}

@@ -165,5 +165,7 @@ def run : State Nat := do
     );
 }
 
+#[path = "for_loops/conditional.rs"]
 mod conditional;
+#[path = "for_loops/control.rs"]
 mod control;
