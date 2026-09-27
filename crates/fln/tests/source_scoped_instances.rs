@@ -183,3 +183,310 @@ fn invalid_registration_and_activation_publish_nothing() {
     active.activate(&env, &n("Alpha")).unwrap();
     prove(env, active, 2);
 }
+
+fn checked(base: &Engine, source: &str) -> fln::SourceFileCheck {
+    base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap()
+}
+
+#[test]
+fn source_scoped_attributes_and_ordinary_open_check_real_proofs() {
+    let result = checked(
+        &base(),
+        include_str!("../../../examples/native_scoped_instances.lean"),
+    );
+    assert_eq!(result.theorems, 5);
+    assert!(result.scope.instance_scopes.is_active(&n("Alternative")));
+    assert!(result.scope.opened.contains(&n("Alternative")));
+    assert_eq!(
+        InstanceRegistry::read(result.engine.environment())
+            .unwrap()
+            .candidates(&n("Selection"))[0]
+            .declaration,
+        n("fallbackSelection")
+    );
+}
+
+#[test]
+fn compound_namespace_exit_restores_each_intermediate_activation() {
+    let result = checked(
+        &base(),
+        r#"
+attribute [instance] fallback
+namespace A
+attribute [scoped instance] omega
+namespace B
+attribute [scoped instance] alpha
+end A.B
+namespace A.B
+theorem nested : chosen = 2 := by rfl
+end B
+theorem parent : chosen = 3 := by rfl
+end A
+theorem outside : chosen = 1 := by rfl
+"#,
+    );
+    assert_eq!(result.theorems, 3);
+    assert!(!result.scope.instance_scopes.is_active(&n("A")));
+    assert!(!result.scope.instance_scopes.is_active(&n("A.B")));
+}
+
+#[test]
+fn scoped_opening_does_not_open_names_and_file_boundaries_restore_visibility() {
+    let base = checked(
+        &base(),
+        r#"
+attribute [instance] fallback
+namespace Alternative
+def hidden : Nat := 7
+attribute [scoped instance] alpha
+end Alternative
+"#,
+    )
+    .engine;
+    assert!(
+        base.check_source_files(
+            &[b"open scoped Alternative\ndef wrong : Nat := hidden"],
+            &KVMap::new(),
+            limits()
+        )
+        .is_err()
+    );
+    let one = b"open scoped Alternative\ntheorem enabled : chosen = 2 := by rfl";
+    let two = b"theorem disabled : chosen = 1 := by rfl";
+    let result = base
+        .check_source_files(&[one.as_slice(), two.as_slice()], &KVMap::new(), limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(result.theorems, 2);
+    assert!(!result.scope.instance_scopes.is_active(&n("Alternative")));
+    checked(
+        &base,
+        "open Alternative\ndef visible : Nat := hidden\ntheorem enabled : chosen = 2 := by rfl",
+    );
+}
+
+#[test]
+fn source_activation_order_and_later_global_registrations_are_not_reordered() {
+    checked(
+        &base(),
+        r#"
+attribute [instance] fallback
+namespace Alpha
+attribute [scoped instance] alpha
+end Alpha
+namespace Omega
+attribute [scoped instance] omega
+end Omega
+open scoped Omega Alpha
+theorem lastOpened : chosen = 2 := by rfl
+open scoped Omega
+theorem repeatedOpen : chosen = 2 := by rfl
+attribute [instance] later
+theorem newerGlobal : chosen = 4 := by rfl
+namespace Alpha
+attribute [scoped instance 2000] alpha
+end Alpha
+theorem reprioritized : chosen = 2 := by rfl
+namespace Alpha
+attribute [scoped instance] alpha
+end Alpha
+theorem originalSlot : chosen = 4 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn failed_scoped_commands_publish_neither_declarations_nor_partial_registrations() {
+    let base = base();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "attribute [scoped instance] alpha",
+        "namespace Alpha\nattribute [scoped instance] alpha missing",
+        "namespace Alpha\nattribute [scoped instance] alpha Pick",
+        "namespace Alpha\nattribute [scoped instance] alpha\nend Alpha\nopen scoped Alpha Missing",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            InstanceRegistry::read(base.environment())
+                .unwrap()
+                .instance_namespaces()
+                .next()
+                .is_none()
+        );
+    }
+    checked(
+        &base,
+        "namespace Alpha\nattribute [scoped instance] alpha\nend Alpha\nopen scoped Alpha\ntheorem recovered : chosen = 2 := by rfl",
+    );
+}
+
+#[test]
+fn coercion_search_uses_the_same_scoped_view_as_ordinary_instance_search() {
+    let seed = Engine::with_coercion_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let base = checked(
+        &seed,
+        r#"
+structure Box where
+  value : Nat
+namespace Conversions
+def boxToNat : Coe Box Nat := Coe.mk (fun b => b.value)
+attribute [scoped instance] boxToNat
+end Conversions
+"#,
+    )
+    .engine;
+    assert!(
+        base.check_source_files(&[b"def absent : Nat := Box.mk 17"], &KVMap::new(), limits())
+            .is_err()
+    );
+    checked(
+        &base,
+        "open scoped Conversions\ndef converted : Nat := Box.mk 17\ntheorem correct : converted = 17 := by rfl",
+    );
+}
+
+#[test]
+fn module_replay_preserves_dormancy_and_cache_invalidation_tracks_scoped_updates() {
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+    let base = base();
+    let names = [n("Library"), n("Consumer")];
+    let library = "attribute [instance] fallback\nnamespace Alternative\nattribute [scoped instance 2000] alpha\nend Alternative\nopen scoped Alternative";
+    let changed = library.replace("2000", "1");
+    let consumer = "import Library\ntheorem dormant : chosen = 1 := by rfl\nopen scoped Alternative\ntheorem active : chosen = 2 := by rfl";
+    let updated = consumer.replace("chosen = 2", "chosen = 1");
+    let mut session = SourceModuleSession::new(
+        base,
+        KVMap::new(),
+        SourceModuleCheckLimits::new(limits()),
+        SourceModuleCacheLimits::default(),
+    );
+    let run = |session: &mut SourceModuleSession, lib: &str, user: &str| {
+        session.check(
+            &[
+                fln::SourceModuleInput {
+                    name: &names[0],
+                    source: lib.as_bytes(),
+                },
+                fln::SourceModuleInput {
+                    name: &names[1],
+                    source: user.as_bytes(),
+                },
+            ],
+            &names[1],
+        )
+    };
+    let first = run(&mut session, library, consumer)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(first.elaborated_modules, 2);
+    let root = first.checked.checked.result_logical_root;
+    let warm = run(&mut session, library, consumer)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(warm.reused_modules, 2);
+    assert_eq!(warm.checked.checked.result_logical_root, root);
+    assert!(run(&mut session, &changed, consumer).is_err());
+    assert_eq!(
+        run(&mut session, library, consumer)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .reused_modules,
+        2
+    );
+    let replaced = run(&mut session, &changed, &updated)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(replaced.elaborated_modules, 2);
+    assert_ne!(replaced.checked.checked.result_logical_root, root);
+}
+
+#[test]
+fn cursor_inspection_and_warm_prefixes_retain_original_scope_chronology() {
+    use fln::source_check::inspect::{ObservationKind, SourceObservation};
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+    let source = "attribute [instance] fallback\nnamespace Alternative\nattribute [scoped instance] alpha\nend Alternative\nopen scoped Alternative\nattribute [instance] later\ntheorem pending : chosen = 4 := by rfl";
+    let module = n("Main");
+    let inputs = [fln::SourceModuleInput {
+        name: &module,
+        source: source.as_bytes(),
+    }];
+    let mut session = SourceModuleSession::new(
+        base(),
+        KVMap::new(),
+        SourceModuleCheckLimits::new(limits()),
+        SourceModuleCacheLimits::default(),
+    );
+    for warm in [false, true] {
+        let inspected = session
+            .inspect(&inputs, &module, source.len(), ObservationKind::Goals)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(
+            matches!(inspected.observation, Some(SourceObservation::Goals { ref goals, .. }) if goals.is_empty())
+        );
+        assert_eq!(inspected.prefix.reused_modules, usize::from(warm));
+        let env = inspected.prefix.checked.checked.engine.environment();
+        assert!(!env.contains(&n("pending")));
+        assert_eq!(names(env, &inspected.scope.instance_scopes)[0], n("later"));
+    }
+    session
+        .check(&inputs, &module)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
+fn damaged_scoped_journal_rows_are_refused_instead_of_becoming_global_candidates() {
+    let base = base();
+    let env = scoped::register(base.environment(), &n("Alternative"), &n("alpha"), 1000).unwrap();
+    let registry_name = n("FrankenLean.sourceInstances.v1");
+    let bytes = env
+        .extension(&registry_name)
+        .unwrap()
+        .entries()
+        .last()
+        .unwrap()
+        .payload
+        .to_vec();
+    let mut extra = bytes.clone();
+    extra.push(0);
+    for payload in [
+        bytes[..bytes.len() - 1].to_vec(),
+        extra,
+        b"FLNINST\x01\x03".to_vec(),
+    ] {
+        let damaged = base
+            .environment()
+            .push_extension_entry(&registry_name, payload)
+            .unwrap();
+        assert!(InstanceRegistry::read(&damaged).is_err());
+        let mut active = scoped::ActiveScopes::default();
+        assert!(active.activate(&damaged, &n("Alternative")).is_err());
+        assert_eq!(active, scoped::ActiveScopes::default());
+    }
+    let mut active = scoped::ActiveScopes::default();
+    active.activate(&env, &n("Alternative")).unwrap();
+    prove(env, active, 2);
+}

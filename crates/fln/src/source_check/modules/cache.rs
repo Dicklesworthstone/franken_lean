@@ -33,6 +33,7 @@ struct CachedModule {
     result_root: LogicalRoot,
     work: usize,
     bytes: usize,
+    scope: fln_elab::source::scope::SourceScope,
 }
 impl CachedModule {
     fn matches(&self, source: &[u8], dependencies: &[(Name, Arc<()>)]) -> bool {
@@ -52,6 +53,7 @@ impl CachedModule {
             theorems: self.theorems,
             base_logical_root: self.base_root,
             result_logical_root: self.result_root,
+            scope: self.scope.clone(),
         }
     }
 }
@@ -323,6 +325,7 @@ pub(super) fn run_collecting(
                     theorems: 0,
                     base_logical_root: root,
                     result_logical_root: root,
+                    scope: fln_elab::source::scope::SourceScope::default(),
                 }))
             } else {
                 imported.check_source_files_recording(
@@ -385,6 +388,7 @@ pub(super) fn run_collecting(
                             result_root: checked.result_logical_root,
                             work: meter.work - before_work,
                             bytes: meter.bytes - before_bytes,
+                            scope: checked.scope.clone(),
                         }),
                     );
                     retained_bytes += module.source.len();

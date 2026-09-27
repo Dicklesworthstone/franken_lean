@@ -245,7 +245,9 @@ impl Context {
     /// Called only inside a speculative coercion context. The root's search
     /// can solve its own prerequisites without requiring unrelated dictionaries.
     fn coercion_instance(&mut self, target: Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let registry = InstanceRegistry::read(&self.txn.env).map_err(registry_error)?;
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
         let saved = self.txn.lctx.clone();
         let suspended = std::mem::take(&mut self.equations);
         let hole = self.instance_hole(target)?;

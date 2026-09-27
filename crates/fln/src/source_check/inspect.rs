@@ -5,12 +5,12 @@ use super::*;
 mod completion;
 mod navigation;
 pub use completion::{CompletionLookupLimits, SourceCompletion, SourceCompletionItem};
-pub use navigation::{DefinitionLookupLimits, SourceDefinition};
 pub use fln_elab::source::inspect::{ObservationKind, ObservedGoal, SourceObservation};
 pub use fln_elab::source::scope::SourceScope;
 use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,
 };
+pub use navigation::{DefinitionLookupLimits, SourceDefinition};
 
 /// The prefix is checked; the observation is provisional elaboration state.
 /// In particular, `Goals { goals: [] }` is not a proof-checking certificate.
@@ -97,30 +97,10 @@ pub(super) fn module(
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     };
     let environment = prefix.checked.checked.engine.environment();
-    let mut scopes = scopes::Scopes::new(environment);
-    for (_, command) in commands.iter().take(selected.map_or(0, |(index, _)| index)) {
-        if let Some(control) = fln_parse::command_scope::parse(command).map_err(|error| {
-            SourceModuleCheckError::Header {
-                module: entry.clone(),
-                error,
-            }
-        })? {
-            // The original prefix check already applied these immutable journals.
-            if matches!(
-                control,
-                fln_parse::command_scope::ScopeCommand::Simp(_)
-                    | fln_parse::command_scope::ScopeCommand::Instance(_)
-            ) {
-                continue;
-            }
-            scopes
-                .check_limits(&control)
-                .map_err(|(resource, limit)| SourceModuleCheckError::Limit { resource, limit })?;
-            scopes
-                .apply(control)
-                .map_err(|message| scope_error(&message))?;
-        }
-    }
+    // Replaying controls against the final environment moves every scoped
+    // activation after later global registrations and loses checked variables.
+    // The successful prefix (including a cache hit) owns the exact lexical state.
+    let scope = prefix.checked.checked.scope.clone();
     let mut observation = None;
     if let Some((command_index, (_, command))) = selected {
         let control = fln_parse::command_scope::parse(command).map_err(|error| {
@@ -152,7 +132,7 @@ pub(super) fn module(
                     parsed.syntax(),
                     environment,
                     limits.source.admission.kernel,
-                    &scopes.current,
+                    &scope,
                     position.0,
                     kind,
                 )
@@ -188,7 +168,7 @@ pub(super) fn module(
     }
     Ok(Outcome::Complete(SourceInspection {
         prefix,
-        scope: scopes.current,
+        scope,
         observation,
     }))
 }

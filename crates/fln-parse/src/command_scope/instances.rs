@@ -1,12 +1,12 @@
-//! Standalone global instance registration and decimal-priority attributes.
-//! Erasure and local/scoped modifiers are deliberately not approximated as
-//! persistent registrations; the ordinary attribute parser refuses them.
+//! Global and namespace-scoped instance attributes with decimal priorities.
+//! Local attributes and erasure are not approximated as persistent registrations.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceAttribute {
     pub declarations: Vec<Name>,
     pub priority: u32,
+    pub scoped: bool,
 }
 
 /// Inspect the existing scope-command token stream, preserving original source
@@ -19,14 +19,16 @@ pub(super) fn parse(
         matches!(tokens.get(at).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == text)
     };
-    if !is(0, "attribute") || !is(1, "[") || !is(2, "instance") {
+    let scoped = is(2, "scoped");
+    let keyword = if scoped { 3 } else { 2 };
+    if !is(0, "attribute") || !is(1, "[") || !is(keyword, "instance") {
         return Ok(None);
     }
     let bad = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
         at: original_position(view, tokens, at),
         expected: NatDefinitionExpectation::EndOfCommand,
     };
-    let mut at = 3;
+    let mut at = keyword + 1;
     let mut priority = 1000;
     if matches!(
         tokens.get(at).map(|token| &token.kind),
@@ -60,6 +62,7 @@ pub(super) fn parse(
     Ok(Some(InstanceAttribute {
         declarations,
         priority,
+        scoped,
     }))
 }
 
@@ -74,6 +77,28 @@ mod tests {
             panic!("instance attribute expected");
         };
         attribute
+    }
+
+    #[test]
+    fn scoped_attributes_keep_visibility_priority_and_original_refusal_offsets() {
+        let source = "/- 😀 -/ attribute [scoped instance 23] A.«b.c» d";
+        let parsed = attribute(source);
+        assert!(parsed.scoped);
+        assert_eq!(parsed.priority, 23);
+        assert_eq!(
+            parsed.declarations,
+            [
+                Name::from_components(["A", "b.c"]),
+                Name::from_components(["d"])
+            ]
+        );
+        assert!(!attribute("attribute [instance] d").scoped);
+        assert!(attribute("attribute [scoped instance] d").scoped);
+        let bad = "/- 😀 -/\r\nattribute [scoped instance 4294967296] d";
+        assert_eq!(
+            parse_command(bad.as_bytes()).unwrap_err().primary_offset(),
+            Some(BytePos(bad.find("4294967296").unwrap()))
+        );
     }
 
     #[test]
@@ -116,7 +141,10 @@ mod tests {
             "attribute [instance] d := 0",
             "attribute [instance] d [simp]",
             "attribute [local instance] d",
-            "attribute [scoped instance] d",
+            "attribute [scoped instance]",
+            "attribute [scoped instance 4294967296] d",
+            "attribute [scoped instance, simp] d",
+            "attribute [scoped local instance] d",
             "attribute [-instance] d",
             "attribute [«instance»] d",
         ] {

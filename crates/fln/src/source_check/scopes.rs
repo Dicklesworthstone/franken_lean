@@ -16,7 +16,110 @@ pub(super) struct Scopes {
     stack: Vec<Frame>,
     namespaces: BTreeSet<Name>,
 }
+
+pub(super) enum TransitionError {
+    Scope(String),
+    Registry(fln_elab::instances::InstanceRegistryError),
+}
+
+impl TransitionError {
+    pub fn into_source(self, file: usize, command: usize, offset: usize) -> SourceCheckError {
+        match self {
+            Self::Scope(message) => SourceCheckError::Scope {
+                file,
+                command,
+                offset,
+                message,
+            },
+            Self::Registry(error) => SourceCheckError::Command {
+                file,
+                command,
+                offset,
+                error: Box::new(EngineExecutionError::Frontend(
+                    DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                        ),
+                    ),
+                )),
+            },
+        }
+    }
+}
+
 impl Scopes {
+    /// Apply lexical effects against the exact predecessor environment. Keep
+    /// activation times in each saved frame, not in the persistent registry.
+    /// A failed command discards its enclosing private source-check batch.
+    pub fn transition(
+        &mut self,
+        command: ScopeCommand,
+        env: &Environment,
+    ) -> Result<(), TransitionError> {
+        match command {
+            ScopeCommand::Namespace(name) => {
+                let parts = components(&name).map_err(|e| TransitionError::Scope(e.to_string()))?;
+                if parts.is_empty() || parts.iter().any(|part| part == "_root_") {
+                    return Err(TransitionError::Scope("invalid namespace label".into()));
+                }
+                // `namespace A.B` is two scopes. Activate A before saving the
+                // frame for B, so `end B` restores A's active instances.
+                for part in parts {
+                    self.apply(ScopeCommand::Namespace(Name::str(Name::anonymous(), part)))
+                        .map_err(TransitionError::Scope)?;
+                    self.current
+                        .instance_scopes
+                        .activate(env, &self.current.namespace)
+                        .map_err(TransitionError::Registry)?;
+                }
+            }
+            ScopeCommand::Open(names) => return self.transition_open(names, false, env),
+            ScopeCommand::OpenScoped(names) => return self.transition_open(names, true, env),
+            other => self.apply(other).map_err(TransitionError::Scope)?,
+        }
+        Ok(())
+    }
+
+    fn transition_open(
+        &mut self,
+        names: Vec<Name>,
+        scoped_only: bool,
+        env: &Environment,
+    ) -> Result<(), TransitionError> {
+        let mut next = self.current.clone();
+        let registry =
+            fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
+        for namespace in registry.instance_namespaces() {
+            self.namespaces.insert(namespace.clone());
+            self.observe(namespace);
+        }
+        let resolved = self.resolve_open(&names).map_err(TransitionError::Scope)?;
+        for namespace in resolved {
+            next.instance_scopes
+                .activate(env, &namespace)
+                .map_err(TransitionError::Registry)?;
+            if !scoped_only && !next.opened.contains(&namespace) {
+                next.opened.push(namespace);
+            }
+        }
+        self.current = next;
+        Ok(())
+    }
+
+    fn resolve_open(&self, names: &[Name]) -> Result<Vec<Name>, String> {
+        let mut resolved = Vec::new();
+        for name in names {
+            let name = self
+                .current
+                .resolve(name, |n| self.namespaces.contains(n))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("unknown namespace `{}`", name.to_display_string()))?;
+            if !resolved.contains(&name) {
+                resolved.push(name);
+            }
+        }
+        Ok(resolved)
+    }
     pub fn new(env: &Environment) -> Self {
         let mut scopes = Self::default();
         for (name, _) in env.constants() {
@@ -71,6 +174,7 @@ impl Scopes {
         }
         let (old, new) = match command {
             ScopeCommand::Open(names) => (self.current.opened.len(), names.len()),
+            ScopeCommand::OpenScoped(names) => (0, names.len()),
             ScopeCommand::Universe(names) => (self.current.universes.len(), names.len()),
             ScopeCommand::Include(names) | ScopeCommand::Omit(names) => (0, names.len()),
             _ => (0, 0),
@@ -85,6 +189,9 @@ impl Scopes {
         match command {
             ScopeCommand::Instance(_) => {
                 return Err("instance attributes require an environment transition".into());
+            }
+            ScopeCommand::OpenScoped(_) => {
+                return Err("scoped opening requires an environment transition".into());
             }
             ScopeCommand::Variable(_) => {
                 return Err("variable commands require checked telescope elaboration".into());
@@ -149,20 +256,12 @@ impl Scopes {
                 }
             }
             ScopeCommand::Open(names) => {
-                let mut resolved = Vec::new();
-                for name in names {
-                    let name = self
-                        .current
-                        .resolve(&name, |n| self.namespaces.contains(n))
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| {
-                            format!("unknown namespace `{}`", name.to_display_string())
-                        })?;
-                    if !self.current.opened.contains(&name) && !resolved.contains(&name) {
-                        resolved.push(name);
+                let resolved = self.resolve_open(&names)?;
+                for name in resolved {
+                    if !self.current.opened.contains(&name) {
+                        self.current.opened.push(name);
                     }
                 }
-                self.current.opened.extend(resolved);
             }
             ScopeCommand::Universe(names) => {
                 let mut seen: BTreeSet<_> = self.current.universes.iter().cloned().collect();

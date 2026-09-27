@@ -13,6 +13,7 @@ pub enum ScopeCommand {
     Section(Option<Name>),
     End(Option<Name>),
     Open(Vec<Name>),
+    OpenScoped(Vec<Name>),
     Universe(Vec<Name>),
     Variable(Syntax),
     Include(Vec<Name>),
@@ -97,7 +98,7 @@ fn declaration(s: &str) -> bool {
 }
 
 /// Recognize complete scope commands, including comments and escaped identifiers.
-/// Unsupported `open ... in`, selective opens, and modifiers are never ignored.
+/// Unsupported `open ... in` and selective opens are never ignored.
 pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -126,8 +127,12 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         }),
         expected: NatDefinitionExpectation::EndOfCommand,
     };
+    let scoped = keyword == "open"
+        && tokens.get(1).is_some_and(
+            |token| matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "scoped"),
+        );
     let mut names = Vec::new();
-    for (index, token) in tokens.iter().enumerate().skip(1) {
+    for (index, token) in tokens.iter().enumerate().skip(if scoped { 2 } else { 1 }) {
         let TokenKind::Ident(name) = &token.kind else {
             return Err(bad(index));
         };
@@ -137,6 +142,7 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         "namespace" if names.len() == 1 => ScopeCommand::Namespace(names.remove(0)),
         "section" if names.len() <= 1 => ScopeCommand::Section(names.pop()),
         "end" if names.len() <= 1 => ScopeCommand::End(names.pop()),
+        "open" if !names.is_empty() && scoped => ScopeCommand::OpenScoped(names),
         "open" if !names.is_empty() => ScopeCommand::Open(names),
         "include" if !names.is_empty() => ScopeCommand::Include(names),
         "omit" if !names.is_empty() => ScopeCommand::Omit(names),
@@ -220,6 +226,31 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
 mod tests {
     use super::*;
     #[test]
+    fn scoped_openings_preserve_structural_names_without_becoming_name_opens() {
+        let source = "-- 😀\r\nopen scoped A.«B.C» D";
+        assert_eq!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::OpenScoped(vec![
+                Name::from_components(["A", "B.C"]),
+                Name::from_components(["D"]),
+            ]))
+        );
+        assert_eq!(
+            parse(b"open A").unwrap(),
+            Some(ScopeCommand::Open(vec![Name::from_components(["A"])]))
+        );
+        for source in [
+            "open scoped",
+            "open scoped A hiding x",
+            "open scoped A in",
+            "open scoped A, B",
+            "open scoped 4",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn scopes_preserve_structural_names_and_original_offsets() {
         let source = b"-- namespace Fake\r\nnamespace Real\r\n-- end Real\r\ndef x := \"end Real\"\r\nsection\r\nuniverse u v\r\nend\r\nend Real\r\n";
         let commands = partition(source).unwrap();
@@ -257,7 +288,8 @@ mod tests {
             "open",
             "open A (x)",
             "open A in",
-            "open scoped A",
+            "open scoped",
+            "open scoped A in",
             "open A hiding x",
             "open A renaming x -> y",
             "universe A.u",

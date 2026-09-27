@@ -31,6 +31,9 @@ pub struct SourceFileCheck {
     pub theorems: usize,
     pub base_logical_root: LogicalRoot,
     pub result_logical_root: LogicalRoot,
+    /// Exact lexical state after the last file's checked command prefix.
+    /// It is not an exported module effect and does not confer proof authority.
+    pub scope: fln_elab::source::scope::SourceScope,
 }
 
 #[derive(Debug)]
@@ -196,6 +199,7 @@ impl Engine {
         let mut engine = self.clone();
         let mut count = 0;
         let mut theorems = 0;
+        let mut final_scope = fln_elab::source::scope::SourceScope::default();
         for (file, source) in sources.iter().enumerate() {
             let mut scopes = scopes::Scopes::new(engine.environment());
             let commands = fln_parse::command_scope::partition(source).map_err(|error| {
@@ -316,13 +320,8 @@ impl Engine {
                         .check_limits(&control)
                         .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
                     scopes
-                        .apply(control)
-                        .map_err(|message| SourceCheckError::Scope {
-                            file,
-                            command: count,
-                            offset: start.0,
-                            message,
-                        })?;
+                        .transition(control, engine.environment())
+                        .map_err(|error| error.into_source(file, count, start.0))?;
                     count += 1;
                     continue;
                 }
@@ -360,6 +359,7 @@ impl Engine {
                 engine = admitted.engine;
                 count += 1;
             }
+            final_scope = scopes.current;
         }
         Ok(Outcome::Complete(SourceFileCheck {
             result_logical_root: engine.logical_root(options),
@@ -368,6 +368,7 @@ impl Engine {
             commands: count,
             theorems,
             base_logical_root,
+            scope: final_scope,
         }))
     }
 }

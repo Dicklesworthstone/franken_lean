@@ -6,6 +6,7 @@
 //! Nothing is inserted into the environment by opening a namespace.
 use super::*;
 use fln_env::extensions::ExtensionState;
+use std::sync::Arc;
 
 const MAX_SCOPES: usize = 4096;
 const MAX_SCOPE_BYTES: usize = 1024 * 1024;
@@ -21,7 +22,7 @@ struct Activation {
 /// Clone it at a section boundary and restore that clone when the section ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveScopes {
-    activations: Vec<Activation>,
+    activations: Arc<Vec<Activation>>,
     anchor: Option<ExtensionState>,
     name_bytes: usize,
 }
@@ -56,7 +57,7 @@ impl ActiveScopes {
         }
         let anchor = env.extension(&extension_name()).cloned();
         let at = anchor.as_ref().map_or(0, ExtensionState::len);
-        self.activations.push(Activation {
+        Arc::make_mut(&mut self.activations).push(Activation {
             namespace: namespace.clone(),
             at,
         });
@@ -177,4 +178,58 @@ pub fn register(
     payload.extend(priority.to_le_bytes());
     write_name(namespace, &mut payload)?;
     append(env, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_limits_are_failure_atomic_and_snapshots_share_their_history() {
+        let env = Environment::new();
+        let mut active = ActiveScopes::default();
+        for index in 0..MAX_SCOPES {
+            active
+                .activate(&env, &Name::num(Name::anonymous(), index as u64))
+                .unwrap();
+        }
+        let saved = active.clone();
+        assert!(Arc::ptr_eq(&saved.activations, &active.activations));
+        assert_eq!(
+            active.activate(&env, &Name::from_components(["overflow"])),
+            Err(InstanceRegistryError::Limit)
+        );
+        assert_eq!(active, saved);
+        // Reopening an existing namespace at the limit is not a new effect.
+        active
+            .activate(&env, &Name::num(Name::anonymous(), 0))
+            .unwrap();
+        assert_eq!(active, saved);
+    }
+
+    #[test]
+    fn aggregate_namespace_bytes_bind_independently_of_activation_count() {
+        let env = Environment::new();
+        let mut active = ActiveScopes::default();
+        let text = "x".repeat(60_000);
+        for index in 0..17 {
+            active
+                .activate(
+                    &env,
+                    &Name::str(Name::anonymous(), format!("{text}{index}")),
+                )
+                .unwrap();
+        }
+        let saved = active.clone();
+        assert_eq!(
+            active.activate(&env, &Name::str(Name::anonymous(), format!("{text}18"))),
+            Err(InstanceRegistryError::Limit)
+        );
+        assert_eq!(active, saved);
+        active
+            .activate(&env, &Name::from_components(["small"]))
+            .unwrap();
+        assert!(active.is_active(&Name::from_components(["small"])));
+        assert!(!saved.is_active(&Name::from_components(["small"])));
+    }
 }

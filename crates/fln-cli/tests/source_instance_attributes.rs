@@ -41,3 +41,26 @@ fn installed_cli_does_not_publish_success_for_a_nonclass_attribute() {
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
 }
+
+#[test]
+fn installed_cli_checks_lexical_scoped_instance_visibility() {
+    let source = fln_core::checked_workspace_root!().join("examples/native_scoped_instances.lean");
+    let before = std::fs::read(&source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "\"outcome\":\"complete\"",
+        "\"authority\":true",
+        "\"theorems\":5",
+        "\"executed\":false",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert_eq!(std::fs::read(source).unwrap(), before);
+}

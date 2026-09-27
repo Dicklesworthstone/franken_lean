@@ -196,6 +196,56 @@ fn imported_and_namespaced_prefix_is_checked_before_inspection() {
     );
     assert_eq!(goals(found).len(), 1);
 }
+
+#[test]
+fn inspection_uses_checked_section_variables_instead_of_replaying_their_commands() {
+    // Proof-only section parameters require explicit inclusion. Inspection must
+    // preserve the checked include state, not make otherwise hidden locals live.
+    let source =
+        "section\nvariable (P : Prop) (h : P)\ninclude h\ntheorem pending : P := by exact h";
+    let result = observe(source, source.rfind('h').unwrap(), ObservationKind::Term);
+    let Some(SourceObservation::Term {
+        expression,
+        type_,
+        locals,
+        ..
+    }) = result.observation
+    else {
+        panic!("expected a checked section-local observation")
+    };
+    let local = locals.find_by_user_name(&name("h")).unwrap();
+    assert_eq!(expression, fln::Expr::fvar(local.id.clone()));
+    assert_eq!(type_, local.type_);
+    assert!(
+        !result
+            .prefix
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("pending"))
+    );
+    assert!(goals(observe(source, source.len(), ObservationKind::Goals)).is_empty());
+}
+
+#[test]
+fn inspection_does_not_expose_unincluded_proof_only_section_parameters() {
+    let source = "section\nvariable (P : Prop) (h : P)\ntheorem pending : P := by exact h";
+    let main = name("Main");
+    let result = session().inspect(
+        &[SourceModuleInput {
+            name: &main,
+            source: source.as_bytes(),
+        }],
+        &main,
+        source.rfind('h').unwrap(),
+        ObservationKind::Term,
+    );
+    assert!(matches!(
+        result,
+        Err(fln::source_check::modules::SourceModuleCheckError::Source { .. })
+    ));
+}
 #[test]
 fn bad_prefix_or_prior_tactic_is_not_presented_as_current_state() {
     for source in [

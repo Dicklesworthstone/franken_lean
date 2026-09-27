@@ -24,6 +24,14 @@ pub(super) fn apply(
             limit: MAX_DECLARATIONS,
         });
     }
+    if attribute.scoped && scope.namespace.is_anonymous() {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "scoped instances require a non-root namespace".into(),
+        });
+    }
     let mut next = environment.clone();
     for requested in attribute.declarations {
         let name = scope
@@ -43,20 +51,26 @@ pub(super) fn apply(
                     requested.to_display_string()
                 ),
             })?;
-        next = fln_elab::instances::set_instance(&next, &name, attribute.priority).map_err(
-            |error| SourceCheckError::Command {
-                file,
-                command,
-                offset,
-                error: Box::new(EngineExecutionError::Frontend(
-                    DefinitionFrontendError::Elaborate(
-                        fln_elab::NatDefinitionElabError::Inference(
-                            fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                        ),
-                    ),
+        next = if attribute.scoped {
+            fln_elab::instances::scoped::register(
+                &next,
+                &scope.namespace,
+                &name,
+                attribute.priority,
+            )
+        } else {
+            fln_elab::instances::set_instance(&next, &name, attribute.priority)
+        }
+        .map_err(|error| SourceCheckError::Command {
+            file,
+            command,
+            offset,
+            error: Box::new(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InstanceRegistry(error),
                 )),
-            },
-        )?;
+            )),
+        })?;
     }
     // A late name/type/registry refusal drops this entire speculative successor.
     Ok(next)
