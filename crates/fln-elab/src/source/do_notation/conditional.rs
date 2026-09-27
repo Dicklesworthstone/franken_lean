@@ -15,16 +15,16 @@ fn skip() -> Syntax {
     call(false, vec![ident(Name::from_components(["_root_", "PUnit", "unit"]))])
 }
 
-struct Branches {
-    header: Vec<Syntax>,
-    yes: Syntax,
-    no: Option<Syntax>,
+pub(super) struct Branches {
+    pub(super) header: Vec<Syntax>,
+    pub(super) yes: Syntax,
+    pub(super) no: Option<Syntax>,
 }
 
 /// Validate every structural slot. An absent else means skip; an explicit
 /// empty or malformed sequence is not an absent else. Else-if list support
 /// remains separate, so no unrecognized clause can be silently dropped.
-fn split(syntax: Syntax) -> Result<Branches, NatDefinitionElabError> {
+pub(super) fn split(syntax: Syntax) -> Result<Branches, NatDefinitionElabError> {
     let mut parts = node(syntax, "doIf", 6)?;
     let mut otherwise = children(parts.pop().expect("else clause"))?;
     let (else_token, no) = match otherwise.len() {

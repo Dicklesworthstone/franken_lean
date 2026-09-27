@@ -8,6 +8,8 @@ use super::*;
 mod conditional;
 mod control;
 mod for_loop;
+mod returns;
+pub(super) use returns::join_parts;
 mod unless;
 
 fn null(args: Vec<Syntax>) -> Syntax {
@@ -209,6 +211,30 @@ impl Context {
         Ok(function)
     }
 
+    /// Preserve the written result parameter of a monadic expected type before
+    /// conversion can erase it. A monad need not be injective in its argument;
+    /// this is a checked choice of Pure's value domain, not an equality theorem.
+    pub(super) fn do_pure_result(
+        &mut self,
+        function: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let Some(expected) = expected else {
+            return Ok(function);
+        };
+        let expected = self.instantiate(expected)?;
+        let ExprNode::App { a: result, .. } = expected.node() else {
+            return Ok(function);
+        };
+        let function = self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
+        let function = self.coerce_function(function)?;
+        let ExprNode::ForallE { binder_type, .. } = function.type_.node() else {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        };
+        self.constrain_type(binder_type, result)?;
+        Ok(function)
+    }
+
     pub(super) fn do_action(&mut self, action: Typed) -> Result<Typed, NatDefinitionElabError> {
         let monad = self.do_monad(&action.type_)?;
         let function = self.do_operation(true, monad)?;
@@ -265,6 +291,9 @@ impl Context {
         sequence: Syntax,
         mut result: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if result.is_none() && self.has_branch_return(&sequence)? {
+            return self.expand_returning_sequence(sequence);
+        }
         let targets = result.as_ref().map(control::LoopTargets::new).transpose()?;
         let scope = SequenceScope {
             targets: targets.as_ref(),
@@ -373,7 +402,10 @@ impl Context {
         }
         Ok(call(
             true,
-            vec![value.pop().expect("action"), lambda(name, annotation, body)?],
+            vec![
+                value.pop().expect("action"),
+                lambda(name, annotation, body)?,
+            ],
         ))
     }
 }

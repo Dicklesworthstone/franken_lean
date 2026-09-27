@@ -175,3 +175,6 @@ mod control;
 
 #[path = "for_loops/branch_sequences.rs"]
 mod branch_sequences;
+
+#[path = "for_loops/early_returns.rs"]
+mod early_returns;

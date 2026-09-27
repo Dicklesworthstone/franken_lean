@@ -162,7 +162,7 @@ fn invalid_unchosen_branch_locals_and_escaping_controls_do_not_publish() {
         "def bad : Id PUnit := do if false then { Pure.pure (f := Id) PUnit.unit; break }",
         "def bad : Id PUnit := do if true then { continue } else { Pure.pure (f := Id) PUnit.unit }",
         "def bad : Id Nat := do { if true then { let x := 7; Pure.pure (f := Id) PUnit.unit }; return x }",
-        "def bad : Id Nat := do { if true then { return 7 }; return 9 }",
+        "def bad : Id Nat := do { if false then { return true }; return 9 }",
         "def bad : Id PUnit := do for x in true do { if false then { return PUnit.unit }; Pure.pure (f := Id) PUnit.unit }",
         "def bad : Id PUnit := do for x in true do if true then { (do continue) }",
         "def bad : Id PUnit := do if true then { Pure.pure (f := Id) PUnit.unit } else { missing }",

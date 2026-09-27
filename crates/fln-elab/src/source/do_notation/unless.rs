@@ -100,8 +100,14 @@ mod tests {
     #[test]
     fn expansion_remains_request_budgeted() {
         let input = input(sequence(vec![term("doExpr", vec![named("action")])]));
+        // ElabBudget uses zero for unlimited, not for an exhausted budget.
+        let mut unlimited = context();
+        unlimited.txn.budget.max_heartbeats = 0;
+        assert!(unlimited.expand_do_node(input.clone(), false).is_ok());
         let mut stopped = context();
-        stopped.txn.budget.max_heartbeats = 0;
+        stopped.txn.budget.max_heartbeats = 1;
+        assert!(stopped.expand_do_node(input.clone(), false).is_ok());
+        assert_eq!(stopped.txn.budget.heartbeats_consumed, 1);
         assert!(matches!(stopped.expand_do_node(input.clone(), false),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))));
         assert!(context().expand_do_node(input, false).is_ok());

@@ -843,6 +843,7 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoAction(&'a [Syntax], Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
@@ -989,6 +990,12 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
+                                    let (name, suffix, body) = do_notation::join_parts(args)?;
+                                    tasks.push(Task::DoJoinValue(name, body, expected.clone()));
+                                    tasks.push(Task::Visit(suffix, expected, true));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nativeDoBind"])
                                     || kind == &parser_kind(&["Term", "nativeDoPure"])
                                 {
@@ -1005,6 +1012,11 @@ impl Context {
                                         tasks.push(Task::Visit(&args[0], None, true));
                                     } else {
                                         let function = self.do_operation(bind, monad)?;
+                                        let function = if bind {
+                                            function
+                                        } else {
+                                            self.do_pure_result(function, expected.as_ref())?
+                                        };
                                         tasks.push(Task::Apply(function, args, expected, false));
                                     }
                                     continue;
@@ -1966,6 +1978,28 @@ impl Context {
                                 opaque,
                             ));
                             tasks.push(Task::Visit(value, Some(annotation.value), true));
+                        }
+                        Task::DoJoinValue(name, body, expected) => {
+                            let value = values.pop().expect("do continuation visit");
+                            // The suffix is checked in the OUTER lexical scope
+                            // against the original expected monad, before alias
+                            // reduction or branch-local binders can obscure it.
+                            let result_type = expected.unwrap_or_else(|| value.type_.clone());
+                            let value = self.do_join_thunk(value, &result_type)?;
+                            // Treat a join as a function parameter while checking
+                            // branches. Expanding its body here would duplicate
+                            // pending dictionaries into dependent local contexts.
+                            // LetBody still emits the actual checked core let.
+                            let saved = self.txn.lctx.clone();
+                            let id = FVarId(self.fresh_name()?);
+                            self.txn.lctx.add_param(
+                                id.clone(),
+                                name.clone(),
+                                value.type_.clone(),
+                                BinderInfo::Default,
+                            );
+                            tasks.push(Task::LetBody(saved, id, name, value, false));
+                            tasks.push(Task::Visit(body, Some(result_type), true));
                         }
                         Task::LetValue(name, annotation, body, expected, opaque) => {
                             let mut value = values.pop().expect("let value visit");
