@@ -78,7 +78,8 @@ fn pattern(
     }
     let mut templates = syntax::Templates::default();
     if let Some(ancestors) = ancestors
-        && !templates.anchor(context, ancestors)?
+        && (!templates.anchor(context, ancestors)?
+            || !templates.allow_instance_outputs(context, frame)?)
     {
         return Ok(None);
     }

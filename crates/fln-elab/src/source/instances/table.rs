@@ -20,7 +20,7 @@ mod outputs;
 const MAX_ENTRIES: usize = MAX_CANDIDATE_ATTEMPTS;
 const MAX_KEY_UNITS: usize = 65_536;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct Key {
     expected: Expr,
     output_types: Vec<Expr>,
@@ -28,6 +28,19 @@ struct Key {
     locals: LocalContext,
     ancestors: Vec<(Expr, Vec<Expr>)>,
 }
+
+// Work accounting is not query identity: two saved alias graphs can produce
+// identical typed templates while taking different amounts of work to build.
+// Every lookup is still metered, and insertion charges the stored key's units.
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.expected == other.expected
+            && self.output_types == other.output_types
+            && self.locals == other.locals
+            && self.ancestors == other.ancestors
+    }
+}
+impl Eq for Key {}
 
 impl Key {
     fn units(&self) -> usize {
@@ -133,11 +146,12 @@ fn replay_outputs(
         type_.clone(),
         frame.target.clone(),
     ));
-    trial.equations.push(SourceEquation::selection(
-        type_.clone(),
-        frame.expected.clone(),
-    ));
-    let result = trial.flush(true);
+    let result = (|| {
+        trial.flush(true)?;
+        let actual = trial.instantiate(type_)?;
+        let expected = trial.instantiate(&frame.expected)?;
+        trial.reconcile_instance_outputs(frame, actual, expected)
+    })();
     context.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
     match result {
         Ok(()) => {
@@ -809,3 +823,6 @@ mod tests {
         assert_eq!(table.entries, 1);
     }
 }
+
+#[cfg(test)]
+mod dictionary_outputs;

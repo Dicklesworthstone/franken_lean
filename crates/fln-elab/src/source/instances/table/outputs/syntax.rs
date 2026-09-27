@@ -17,6 +17,9 @@ enum HoleStep {
 #[derive(Default)]
 pub(super) struct Templates {
     holes: HashMap<MVarId, HoleSlot>,
+    opaque_outputs: std::collections::HashSet<MVarId>,
+    saved_assignments: bool,
+    active_assignments: std::collections::HashSet<MVarId>,
     pub types: Vec<Expr>,
     done: HashMap<(Expr, u32), Expr>,
     levels: levels::LevelTemplates,
@@ -32,7 +35,48 @@ impl Templates {
     }
 
     pub fn units(&self) -> usize {
-        self.done.len() + self.levels.units()
+        self.done.len()
+            + self.levels.units()
+            + self.opaque_outputs.len()
+            + self.active_assignments.len()
+    }
+
+    /// Bare dictionary outputs can be renamed in answer keys, but not in
+    /// cycle keys or arbitrary opaque goals. Read the frame's saved policy and
+    /// scope, never assignments made while exploring the completed candidate.
+    pub fn allow_instance_outputs(
+        &mut self,
+        context: &mut Context,
+        frame: &Frame,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.saved_assignments = true;
+        if frame.base.instance_goals.len() > MAX_KEY_UNITS {
+            return Ok(false);
+        }
+        let mut pending = std::collections::HashSet::new();
+        for id in &frame.base.instance_goals {
+            context.tick()?;
+            pending.insert(id);
+        }
+        let mut expected = &frame.expected;
+        let mut key = &frame.key;
+        while let (ExprNode::App { f: ef, a: ea }, ExprNode::App { f: kf, a: ka }) =
+            (expected.node(), key.node())
+        {
+            context.tick()?;
+            if matches!(ka.node(), ExprNode::BVar { idx: 0 })
+                && let ExprNode::MVar { id } = ea.node()
+                && pending.contains(id)
+            {
+                if self.opaque_outputs.len() >= MAX_KEY_UNITS {
+                    return Ok(false);
+                }
+                self.opaque_outputs.insert(id.clone());
+            }
+            expected = ef;
+            key = kf;
+        }
+        Ok(true)
     }
 
     // Hole types belong to the frame's saved context, not to any lexical binder
@@ -59,7 +103,9 @@ impl Templates {
             ));
         }
         let decl = frame.base.txn.mvars.get_decl(id)?;
-        if decl.kind != MetavarKind::Natural
+        let eligible = decl.kind == MetavarKind::Natural
+            || decl.kind == MetavarKind::SyntheticOpaque && self.opaque_outputs.contains(id);
+        if !eligible
             || decl.depth != 0
             || decl.delayed.is_some()
             || frame.base.txn.mvars.is_assigned(id)
@@ -128,6 +174,41 @@ impl Templates {
                 _ => {}
             }
             if let ExprNode::MVar { id } = expr.node() {
+                // A declared dependent type can still name an earlier natural
+                // hole that was assigned BEFORE this frame was prepared. Follow
+                // that saved alias on the same metered worklist, rather than
+                // rejecting a usable key or consulting the live search store.
+                // Cycle keys retain their old identity rules. Deep, delayed or
+                // foreign-scope aliases remain ineligible for answer sharing.
+                if self.saved_assignments
+                    && let Some(value) = frame.base.txn.mvars.get_assigned_expr(id)
+                {
+                    let Some(decl) = frame.base.txn.mvars.get_decl(id) else {
+                        return Ok(None);
+                    };
+                    if decl.kind != MetavarKind::Natural
+                        || decl.depth != 0
+                        || decl.delayed.is_some()
+                        || decl.lctx != frame.base.txn.lctx
+                        || value.has_loose_bvars()
+                    {
+                        return Ok(None);
+                    }
+                    if finish {
+                        self.active_assignments.remove(id);
+                        let Some(value) = self.done.get(&(value.clone(), depth)).cloned() else {
+                            return Ok(None);
+                        };
+                        self.done.insert(key, value);
+                    } else {
+                        if !self.active_assignments.insert(id.clone()) {
+                            return Ok(None);
+                        }
+                        pending.push((expr.clone(), depth, true));
+                        pending.push((value.clone(), depth, false));
+                    }
+                    continue;
+                }
                 match self.hole(frame, id, depth, finish) {
                     Some(HoleStep::Ready(value)) => {
                         self.done.insert(key, value);

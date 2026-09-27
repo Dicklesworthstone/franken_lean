@@ -124,3 +124,53 @@ fn repeated_impossible_dependent_outputs_reach_fallback_and_recover() {
         "instance leaf : D0 Nat 7 := D0.mk 7\ndef result : Answer := inferInstance\ntheorem preferredValue : result.value = 7 := by rfl",
     );
 }
+
+fn dictionary_tree(depth: usize) -> String {
+    let mut source = String::from(
+        "class Carrier (A : Type) where\n  value : Nat\ndef carrier : Carrier Nat := Carrier.mk 7\nclass D0 (A : outParam Type) [d : Carrier A] where\n  value : Nat\ninstance d0 : @D0 Nat carrier := @D0.mk Nat carrier 7\n",
+    );
+    for level in 1..=depth {
+        let previous = level - 1;
+        source.push_str(&format!(
+            "class D{level} (A : outParam Type) [d : Carrier A] where\n  value : Nat\ninstance d{level} {{A B : Type}} [a : Carrier A] [b : Carrier B] [left : @D{previous} A a] [right : @D{previous} B b] : @D{level} A a := @D{level}.mk A a left.value\n"
+        ));
+    }
+    source.push_str(&format!(
+        "class Answer where\n  value : Nat\ninstance answer {{A : Type}} [a : Carrier A] [dict : @D{depth} A a] : Answer := Answer.mk dict.value\n"
+    ));
+    source
+}
+
+#[test]
+fn repeated_opaque_dictionary_outputs_share_completed_answers() {
+    let base = checked(&engine(), &dictionary_tree(10));
+    checked(
+        &base,
+        "def result : Answer := inferInstance\ntheorem resultValue : result.value = 7 := by rfl",
+    );
+}
+
+#[test]
+fn cached_opaque_dictionary_outputs_resume_without_overwriting_an_earlier_sibling() {
+    checked(
+        &engine(),
+        r#"class Carrier (A : Type) where
+  value : Nat
+def natural : Carrier Nat := Carrier.mk 7
+def boolean : Carrier Bool := Carrier.mk 99
+class D (A : outParam Type) [d : Carrier A] where
+  value : Nat
+instance low : @D Nat natural := @D.mk Nat natural 7
+instance high : @D Bool boolean := @D.mk Bool boolean 99
+class Accept (A : Type) [d : Carrier A] where
+  value : Nat
+instance accept : @Accept Nat natural := @Accept.mk Nat natural 7
+class Root where
+  first : Nat
+  second : Nat
+instance root {A B : Type} [a : Carrier A] [b : Carrier B] [left : @D A a] [right : @D B b] [ok : @Accept B b] : Root := Root.mk left.value right.value
+def result : Root := inferInstance
+theorem firstValue : result.first = 99 := by rfl
+theorem secondValue : result.second = 7 := by rfl"#,
+    );
+}
