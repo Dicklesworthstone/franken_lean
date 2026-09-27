@@ -368,7 +368,10 @@ impl Context {
         if let Some(default) = default {
             candidates = vec![Candidate::Global(default.clone())];
         }
-        let resumable = prepared.expected.has_expr_mvar();
+        // A universe-only unknown is still an open query. A later prerequisite
+        // can rule out its first answer and require an alternative universe;
+        // only fully ground queries may discard their remaining choices.
+        let resumable = prepared.expected.has_expr_mvar() || prepared.expected.has_level_mvar();
         Ok(Some(Frame {
             default_application: default.is_some(),
             resumable,
