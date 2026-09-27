@@ -5,6 +5,7 @@ use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
 
 mod parameters;
+mod reconcile;
 mod table;
 
 const MAX_SEARCH_DEPTH: usize = 128;
@@ -645,9 +646,7 @@ impl Context {
                 // after selection (including ordinary aliases such as Id or
                 // OrderDual). Keep this equation mandatory even when ground;
                 // candidate matching above remains abbreviation-only.
-                self.equations
-                    .push(SourceEquation::instance_result(actual, expected));
-                match self.flush(true) {
+                match self.reconcile_instance_outputs(&frames[index], actual, expected) {
                     Ok(()) => {}
                     Err(error) if nonmatch(&error) => {
                         let failed = frames.pop().expect("current instance frame");

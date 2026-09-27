@@ -172,6 +172,10 @@ fn add_class(env: &Environment, name: &str, depth: usize) -> Environment {
 fn fixture() -> Environment {
     let mut env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
     env = publish(&env, fln_elab::seed::out_param_seed_declaration());
+    env = publish(
+        &env,
+        fln_elab::seed::inhabited::infer_instance_seed_declaration(),
+    );
     env = add_class(&env, "Dict", 0);
     env = add_class(&env, "Family", 1);
     env = add_class(&env, "Further", 2);
@@ -270,7 +274,13 @@ fn local_instances_keep_precedence_over_global_dependent_output_candidates() {
     let ExprNode::Lam { body, .. } = value.value.node() else {
         panic!("local dictionary binder expected");
     };
-    assert_eq!(body, &Expr::bvar(0).unwrap());
+    // inferInstance is an admitted identity definition, not parser magic.
+    // Its explicit dictionary argument must be the local, not a global answer.
+    let ExprNode::App { f, a } = body.node() else {
+        panic!("inferInstance dictionary application expected");
+    };
+    assert!(has_constant(f, "inferInstance"));
+    assert_eq!(a, &Expr::bvar(0).unwrap());
 }
 
 #[test]

@@ -173,3 +173,98 @@ fn recursive_source_search_solves_ready_outputs_before_blocked_prerequisites() {
         assert!(contains(&resolved.value, &n(name)), "missing {name}");
     }
 }
+
+const DEPENDENT_DICTIONARIES: &str = r#"
+class Dict (A : Type) where
+  value : Nat
+class Family (A : outParam Type) [d : Dict A] where
+  value : Nat
+class Further (A : outParam Type) [d : Dict A] [f : @Family A d] where
+  value : Nat
+def dictZero : Dict Nat := @Dict.mk Nat 0
+def dictOne : Dict Nat := @Dict.mk Nat 1
+instance (priority := 2000) familyHigh : @Family Nat dictZero := @Family.mk Nat dictZero 17
+instance (priority := 500) familyLow : @Family Nat dictOne := @Family.mk Nat dictOne 99
+instance further : @Further Nat dictZero familyHigh := @Further.mk Nat dictZero familyHigh 25
+def useFurther {A : Type} [d : Dict A] [f : @Family A d] [g : @Further A d f] (n : Nat) : Nat :=
+  @Family.value A d f + @Further.value A d f g + n
+"#;
+
+#[test]
+fn transitive_opaque_dictionary_outputs_reach_both_checkers_and_native_execution() {
+    let base = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = format!(
+        "{DEPENDENT_DICTIONARIES}\ndef result := useFurther 0\ntheorem correct : result = 42 := by rfl"
+    );
+    let result = checked(&base, &source);
+    for selected in ["dictZero", "familyHigh", "further"] {
+        assert!(contains(&definition(&result, "result").value, &n(selected)));
+    }
+    assert!(!contains(
+        &definition(&result, "result").value,
+        &n("familyLow")
+    ));
+    let source = format!("{DEPENDENT_DICTIONARIES}\n#eval useFurther 0");
+    let result = base
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
+        panic!("native dictionary program did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn dependent_output_conflicts_refuse_without_falling_back_or_publishing_prefixes() {
+    let base = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let base = checked(&base, DEPENDENT_DICTIONARIES);
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    for source in [
+        "def unpublished : Nat := useFurther 0\ndef wrong : @Family Nat dictOne := inferInstance",
+        "def unpublished : Nat := useFurther 0\ndef wrong : @Further Nat dictOne familyLow := inferInstance",
+        "def unpublished : Nat := useFurther 0\ntheorem wrong : useFurther 0 = 99 := by rfl",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err()
+        );
+        assert!(!base.environment().contains(&n("unpublished")));
+        assert_eq!(base.logical_root(&options), root);
+    }
+    checked(
+        &base,
+        "def recovered : Nat := useFurther 0\ntheorem recovery : recovered = 42 := by rfl",
+    );
+}
+
+#[test]
+fn a_local_dependent_output_dictionary_still_precedes_global_candidates() {
+    let base = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let base = checked(&base, DEPENDENT_DICTIONARIES);
+    checked(
+        &base,
+        r#"
+def localChoice [f : @Family Nat dictOne] : @Family Nat dictOne := inferInstance
+theorem localCorrect (f : @Family Nat dictOne) : @localChoice f = f := by rfl
+"#,
+    );
+}
