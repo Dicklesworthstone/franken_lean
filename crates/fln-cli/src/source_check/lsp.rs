@@ -7,6 +7,7 @@ use fln::source_check::modules::{
 use fln_server::dispatch::OpenDocumentSource;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+mod completion;
 mod dependencies;
 mod navigation;
 mod render;
@@ -377,6 +378,9 @@ fn inspect_sources(
         QueryKind::Goals => ObservationKind::Goals,
         QueryKind::Hover => ObservationKind::Term,
         QueryKind::Definition => return navigation::definition(
+            session.as_mut().expect("initialized semantic session"), sources, &inputs, offset,
+        ),
+        QueryKind::Completion => return completion::complete(
             session.as_mut().expect("initialized semantic session"), sources, &inputs, offset,
         ),
     };

@@ -1095,7 +1095,8 @@ fn serve_inner(
             }
             ("$/lean/plainGoal", Some(request_id), state)
             | ("textDocument/hover", Some(request_id), state)
-            | ("textDocument/definition", Some(request_id), state) => {
+            | ("textDocument/definition", Some(request_id), state)
+            | ("textDocument/completion", Some(request_id), state) => {
                 if running_request(output, state, request_id)? {
                     semantic::handle(
                         output,
@@ -1107,8 +1108,7 @@ fn serve_inner(
                     )?;
                 }
             }
-            ("$/lean/plainTermGoal", Some(request_id), state)
-            | ("textDocument/completion", Some(request_id), state) => {
+            ("$/lean/plainTermGoal", Some(request_id), state) => {
                 if running_request(output, state, request_id)? {
                     write_protocol_message(output, null_response(request_id))?;
                 }

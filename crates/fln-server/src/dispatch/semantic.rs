@@ -2,12 +2,15 @@
 //! Providers cannot supply raw JSON, replace source, or publish diagnostics here.
 use super::*;
 use std::ops::Range;
+mod completion;
+pub use completion::CompletionItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Goals,
     Hover,
     Definition,
+    Completion,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +38,11 @@ pub enum Answer {
         source: String,
         range: Range<usize>,
     },
+    Completion {
+        items: Vec<CompletionItem>,
+        range: Range<usize>,
+        is_incomplete: bool,
+    },
 }
 
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
@@ -45,7 +53,7 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
     let response = wire::initialize_response(id);
     response.replacen(
         "\"capabilities\":{",
-        "\"capabilities\":{\"hoverProvider\":true,\"definitionProvider\":true,",
+        "\"capabilities\":{\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
         1,
     )
 }
@@ -76,6 +84,9 @@ fn position(text: &str, offset: usize) -> Result<json::Position, &'static str> {
 
 fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str> {
     let result = match (query.kind, answer) {
+        (QueryKind::Completion, Answer::Completion { items, range, is_incomplete }) => {
+            completion::result(items, range, is_incomplete, query)?
+        }
         (QueryKind::Goals, Answer::Goals { goals }) => {
             let size = goals
                 .iter()
@@ -175,6 +186,7 @@ pub(super) fn handle(
         "$/lean/plainGoal" => QueryKind::Goals,
         "textDocument/hover" => QueryKind::Hover,
         "textDocument/definition" => QueryKind::Definition,
+        "textDocument/completion" => QueryKind::Completion,
         _ => return write_protocol_message(output, error_response(id, -32601, "method not found")),
     };
     let parsed = (|| {
