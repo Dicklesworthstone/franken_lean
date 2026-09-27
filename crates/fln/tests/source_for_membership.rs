@@ -106,8 +106,8 @@ fn invalid_witnesses_and_missing_dependent_dictionaries_leave_the_engine_unchang
     let root = base.logical_root(&KVMap::new());
     for source in [
         "def bad : Id PUnit := do for h : x in 7 do checkWitness 8 x h",
-        "def bad : Id Nat := do { for h : x in 7 do break; return x }",
-        "def bad : Id Nat := do { for h : x in 7 do break; return h }",
+        "def bad : Id Nat := do { for h : x in 7 do { break }; return x }",
+        "def bad : Id Nat := do { for h : x in 7 do { break }; return h }",
         "def bad : Id PUnit := do for h : x in true do Pure.pure (f := Id) PUnit.unit",
         "def bad : Id PUnit := do for h : x in h do checkWitness 7 x h",
         "def bad : Id PUnit := do for _ : x in 7 do break",
@@ -148,3 +148,5 @@ def run : State Nat := do
     };
     assert_eq!(fln_vm::interpreter::nat_decimal(&value.value).as_deref(), Some("37"));
 }
+
+mod unless_tests;

@@ -8,6 +8,7 @@ use super::*;
 mod conditional;
 mod control;
 mod for_loop;
+mod unless;
 
 fn null(args: Vec<Syntax>) -> Syntax {
     Syntax::node(Name::from_components(["null"]), args)
@@ -232,6 +233,13 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "doUnless"])) {
+            if pattern {
+                return Err(invalid());
+            }
+            self.tick()?;
+            return unless::expand(syntax);
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "doFor"])) {
             if pattern {
                 return Err(invalid());

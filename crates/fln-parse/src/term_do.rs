@@ -24,6 +24,7 @@ enum Statement {
     Action,
     Conditional { position: BytePos },
     Return(usize),
+    Unless { keyword: usize, position: BytePos },
     Jump {
         keyword: usize,
         is_break: bool,
@@ -191,6 +192,13 @@ impl Prefix {
             };
             self.phase = Phase::Collection;
             *cursor = in_at + 1;
+        } else if word(tokens, at, "unless") {
+            self.statement = Statement::Unless {
+                keyword: at,
+                position: original_position(view, tokens, at),
+            };
+            self.phase = Phase::Collection;
+            *cursor = at + 1;
         } else if word(tokens, at, "if") {
             // The compound planner owns the explicit-else conditional. Its
             // branches are reclassified as do elements after that single parse.
@@ -213,7 +221,7 @@ impl Prefix {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
             for unsupported in [
-                "match", "while", "repeat", "unless", "try", "have",
+                "match", "while", "repeat", "try", "have",
                 "let_expr",
             ] {
                 if word(tokens, at, unsupported) {
@@ -267,6 +275,35 @@ impl Prefix {
                 Syntax::node(
                     parser_kind(&["Term", if is_break { "doBreak" } else { "doContinue" }]),
                     vec![atom(leaves, keyword, if is_break { "break" } else { "continue" })?],
+                )
+            }
+            Statement::Unless { keyword, position } => {
+                // The body is a doSeq in the surrounding return/loop scope,
+                // not a nested do expression with independent control flow.
+                let mut value = value;
+                let Syntax::Node { kind, args, .. } = &mut value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                let sequence = args.pop().expect("checked unless body");
+                let do_keyword = args.pop().expect("checked unless do keyword");
+                let condition = self.collection.take().ok_or(
+                    NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    },
+                )?;
+                Syntax::node(
+                    parser_kind(&["Term", "doUnless"]),
+                    vec![atom(leaves, keyword, "unless")?, condition, do_keyword, sequence],
                 )
             }
             Statement::For {
@@ -417,8 +454,9 @@ impl Prefix {
             if !word(tokens, at, "do") || at + 1 >= end {
                 return Err(refuse(view, tokens, at));
             }
-            let Statement::For { keyword, .. } = self.statement else {
-                return Err(refuse(view, tokens, at));
+            let keyword = match self.statement {
+                Statement::For { keyword, .. } | Statement::Unless { keyword, .. } => keyword,
+                _ => return Err(refuse(view, tokens, at)),
             };
             if !word(tokens, at + 1, "{")
                 && newline(view, tokens, at + 1)
@@ -712,3 +750,6 @@ mod control_tests {
 
 #[cfg(test)]
 mod membership_tests;
+
+#[cfg(test)]
+mod unless_tests;
