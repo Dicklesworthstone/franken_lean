@@ -1,7 +1,7 @@
-name: Native do-if implementation transfer
+name: Native control-flow implementation transfer
 
-# Materialize the exact previously tested implementation as immutable blobs.
-# The connected caller separately publishes a checked fast-forward to main.
+# Retain exact native-tested source objects; the caller publishes the final
+# functional commit after checking the receipt and concurrent main changes.
 on:
   push:
     branches: [main]
@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify and retain the tested native branch parser
+      - name: Verify and retain checked early-return source
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -38,23 +38,32 @@ jobs:
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           manifest = {
-              'crates/fln-parse/src/lib.rs': ['394bd0b1ddb8778f00aa4cb41550a01ed1d3dec7', '084d420b653939730a742b2561cfaf6be5cdae5e'],
-              'crates/fln-parse/src/matching.rs': ['6490dd1f5544760574c2335a155d374cd5aef818', 'db0c8f8bcaa264906c097913db844696e466aada'],
-              'crates/fln-parse/src/matching/do_scopes.rs': [None, '42878472228b044eb58eeb2b1d4fa2cdc2912861'],
-              'crates/fln-parse/src/term_do.rs': ['2ad172d710622a407427d13531d2c3c0d755b3c8', 'd21f906a06604c75286b3a94b7625b3881e227d9'],
-              'crates/fln-parse/src/term_do/conditional.rs': ['18cc8753c1fd6e2546e5aefdf1f063960f42295c', '6de12233a34d46170ee152536402fe7c9c12ba73'],
-              'crates/fln-parse/tests/do_branches.rs': [None, 'cb1dae1a3f8f64ea6ce6cc0a8137118d775cedc7'],
-              'crates/fln-parse/tests/do_notation.rs': ['a71388e079a4e63c0a2b6ab690cdd0efb5caffbe', '2901145054c23dcb52ea7689e537de53809777b1'],
-              'crates/fln/tests/source_do/for_loops.rs': ['ebb1ecc98c16e16cb03b01114da63e651a9ee0ef', '14d0de05cb37a041fcfd43671ab30464e6319c10'],
-              'crates/fln/tests/source_do/for_loops/branch_sequences.rs': [None, 'f60852a1832f0c66a3567a672612a970807f710e'],
-              'crates/fln/tests/source_do/for_loops/conditional.rs': ['dc2e500443ac2df1576892977927fe12e3e6e23b', 'e2250cc905abf10f2ab9718269e3690325507b06'],
+              'crates/fln-elab/src/source.rs': ['04b1767ea7458fb6e8386b18d12766a7cfd308f5', '2a32b43bb583c76fdb679560abace07ee88a67d9'],
+              'crates/fln-elab/src/source/do_notation.rs': ['080890a0c93bf1b610f1e4c033f859827e3aa10d', '6e54f959268cf7748676c463a3550bc8ed972722'],
+              'crates/fln-elab/src/source/do_notation/conditional.rs': ['ae2dee560693043343cc5c679383bb11badea022', 'e3ab10f2c0a2e16590f3400b3fa7ffcbf9f9c91c'],
+              'crates/fln-elab/src/source/do_notation/returns.rs': [None, 'a0b73baaa4d71e6a1b6de71cc0bb2b852a86d6a4'],
+              'crates/fln-elab/src/source/do_notation/unless.rs': ['23bbaf5e4f7ab79e2e2fccaac8a6f87156a030b6', 'e4c58ab05cd54e02d1da3cb794513478e43cdcf6'],
+              'crates/fln/tests/source_do/for_loops.rs': ['14d0de05cb37a041fcfd43671ab30464e6319c10', '8d40c8f6ec46148b82ef9f24ffec7f22613c694b'],
+              'crates/fln/tests/source_do/for_loops/branch_sequences.rs': ['f60852a1832f0c66a3567a672612a970807f710e', '6bf3ebbad7dcbd8944602a00fefeef5f7b65db6d'],
+              'crates/fln/tests/source_do/for_loops/early_returns.rs': [None, 'c34d69f8963809baa95c2e0194d9b1e102b8bcb0'],
           }
-          source = request('/git/blobs/e503253219aaa90c998e271860030fc17e9579ad')
-          assert source['encoding'] == 'base64'
-          compressed = base64.b64decode(source['content'])
-          assert blob(compressed) == 'e503253219aaa90c998e271860030fc17e9579ad'
-          patch = gzip.decompress(compressed)
-          assert hashlib.sha256(patch).hexdigest() == 'cdb9ef4fe93ddc2661b20392cb87752954fe818f9a916556130082606940b99b'
+          chunks = [
+              'a58a41983210b0e35dedd25408875875907f7afd',
+              '0ddc6a51dd23c4ccf50aed628dfb14315a146a04',
+              '2caad6d7a1891526ff5116160ceed1c2c5b15062',
+              'd92271a839ad23b3bbc47b79e663dfecb0582d78',
+              '8115c5f6a0b2002a53582a55ba0fd4017abe03c0',
+          ]
+          packed = bytearray()
+          for sha in chunks:
+              response = request('/git/blobs/' + sha)
+              assert response['encoding'] == 'base64'
+              data = base64.b64decode(response['content'])
+              assert blob(data) == sha
+              packed.extend(data)
+          assert len(packed) == 8078 and blob(packed) == '5f964ad02a245eaf44160d71c74ee14641fa5ad1'
+          patch = gzip.decompress(packed)
+          assert hashlib.sha256(patch).hexdigest() == '0c8d71dc082493d7c5dd3f00616bc5ee1a405bca5ae253fb44376f91dde55ff1'
           paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
           assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
           assert '\ndeleted file mode ' not in patch.decode()
@@ -62,7 +71,7 @@ jobs:
               file = pathlib.Path(path)
               assert not file.is_symlink()
               assert (blob(file.read_bytes()) if file.exists() else None) == before, path
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-if-transfer'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-return-transfer'
           root.mkdir()
           patch_file = root / 'implementation.patch'
           patch_file.write_bytes(patch)
@@ -79,13 +88,13 @@ jobs:
               'blobs': {path: after for path, (_, after) in manifest.items()},
               'patch_sha256': hashlib.sha256(patch).hexdigest(),
               'published_branch': False,
-              'validation': 'Exact retained locally tested bytes; this transfer does not run Rust tests.',
+              'validation': 'Exact retained native-tested bytes; this transfer does not run Rust tests.',
           }
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
           print(json.dumps(receipt, indent=2), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: native-if-transfer-${{ github.sha }}
-          path: ${{ runner.temp }}/native-if-transfer
+          name: native-return-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/native-return-transfer
           retention-days: 2
           if-no-files-found: error
