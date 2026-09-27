@@ -7,6 +7,7 @@ use std::ops::Range;
 pub enum QueryKind {
     Goals,
     Hover,
+    Definition,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +28,13 @@ pub enum Answer {
         contents: String,
         range: Range<usize>,
     },
+    /// Exact source used by the provider for the target, retained internally
+    /// for coordinate and open-document validation; never sent over the wire.
+    Definition {
+        uri: String,
+        source: String,
+        range: Range<usize>,
+    },
 }
 
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
@@ -37,7 +45,7 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
     let response = wire::initialize_response(id);
     response.replacen(
         "\"capabilities\":{",
-        "\"capabilities\":{\"hoverProvider\":true,",
+        "\"capabilities\":{\"hoverProvider\":true,\"definitionProvider\":true,",
         1,
     )
 }
@@ -106,12 +114,49 @@ fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str>
                 end.character
             )
         }
+        (QueryKind::Definition, Answer::Definition { uri, source, range }) => {
+            if uri.is_empty() || uri.len() > 16 * 1024 || uri.chars().any(char::is_control)
+                || source.len() > MAX_RESULT_BYTES || range.start >= range.end
+            {
+                return Err("semantic definition response exceeds its bounds");
+            }
+            if uri == query.uri && source != query.text {
+                return Err("definition target does not match the accepted source");
+            }
+            let start = position(&source, range.start)?;
+            let end = position(&source, range.end)?;
+            // Refuse boundaries inside CRLF, as well as split UTF-8 scalars.
+            if json::byte_offset(&source, start)? != range.start
+                || json::byte_offset(&source, end)? != range.end
+            {
+                return Err("definition range has no exact LSP coordinate mapping");
+            }
+            format!(
+                "{{\"uri\":{},\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}}}",
+                crate::json_string(&uri), start.line, start.character, end.line, end.character
+            )
+        }
         _ => return Err("semantic provider returned a different query kind"),
     };
     if result.len() > MAX_RESULT_BYTES {
         return Err("semantic response exceeds its wire budget");
     }
     Ok(result)
+}
+
+/// An open import's unsaved editor text dominates any provider/disk snapshot.
+fn validate_target_source(answer: &Answer, sources: &[OpenDocumentSource<'_>]) -> Result<(), &'static str> {
+    if let Answer::Definition { uri, source, .. } = answer {
+        if source.len() > MAX_RESULT_BYTES {
+            return Err("definition target source exceeds its budget");
+        }
+        if let Some(document) = sources.iter().find(|document| document.uri == uri) {
+            if document.text != Some(source.as_str()) {
+                return Err("definition target does not match the accepted editor source");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn handle(
@@ -126,10 +171,11 @@ pub(super) fn handle(
     if !checker.semantic_queries() {
         return write_protocol_message(output, null_response(id));
     }
-    let kind = if method == "$/lean/plainGoal" {
-        QueryKind::Goals
-    } else {
-        QueryKind::Hover
+    let kind = match method {
+        "$/lean/plainGoal" => QueryKind::Goals,
+        "textDocument/hover" => QueryKind::Hover,
+        "textDocument/definition" => QueryKind::Definition,
+        _ => return write_protocol_message(output, error_response(id, -32601, "method not found")),
     };
     let parsed = (|| {
         let DecodedField::Valid(uri) = text_document_uri(params) else {
@@ -171,7 +217,9 @@ pub(super) fn handle(
     };
     let response = match checker.query(query, &sources) {
         Ok(None) => null_response(id),
-        Ok(Some(answer)) => match result_json(answer, query) {
+        Ok(Some(answer)) => match validate_target_source(&answer, &sources)
+            .and_then(|()| result_json(answer, query))
+        {
             Ok(result) => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
                 id.as_json()
@@ -266,3 +314,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod navigation_tests;

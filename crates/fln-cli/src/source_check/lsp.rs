@@ -8,6 +8,7 @@ use fln_server::dispatch::OpenDocumentSource;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod dependencies;
+mod navigation;
 mod render;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
 use fln_server::dispatch::semantic::{Answer, Query, QueryKind};
@@ -375,6 +376,9 @@ fn inspect_sources(
     let wanted = match kind {
         QueryKind::Goals => ObservationKind::Goals,
         QueryKind::Hover => ObservationKind::Term,
+        QueryKind::Definition => return navigation::definition(
+            session.as_mut().expect("initialized semantic session"), sources, &inputs, offset,
+        ),
     };
     let result = session
         .as_mut()
