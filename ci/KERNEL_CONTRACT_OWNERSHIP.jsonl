@@ -1,8 +1,9 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":514,"projection_hash":"b6a959e0d00b64b9925b1d1d6b55f58e347fec43eda39dc34dc1ad40ffd4ae73"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":534,"projection_hash":"a2bded5e1a3f56eeda1b5d281df6f175e5984232daac8df4ceae63c7047e8dd0"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
+{"id":"fln-13lk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
 {"id":"fln-1f8v"}
@@ -12,6 +13,7 @@
 {"id":"fln-22i1"}
 {"id":"fln-23cz"}
 {"id":"fln-2bn5"}
+{"id":"fln-32rr"}
 {"id":"fln-33gl"}
 {"id":"fln-3gv"}
 {"id":"fln-3oj6"}
@@ -31,6 +33,7 @@
 {"id":"fln-544"}
 {"id":"fln-5720"}
 {"id":"fln-5oha"}
+{"id":"fln-5ozm"}
 {"id":"fln-65t5"}
 {"id":"fln-6n1k"}
 {"id":"fln-7gr6"}
@@ -42,6 +45,7 @@
 {"id":"fln-7zrh"}
 {"id":"fln-8138"}
 {"id":"fln-86m"}
+{"id":"fln-883f"}
 {"id":"fln-8fwh"}
 {"id":"fln-8gz3"}
 {"id":"fln-8m1z"}
@@ -49,6 +53,7 @@
 {"id":"fln-8u1d"}
 {"id":"fln-8w8"}
 {"id":"fln-8zsq"}
+{"id":"fln-9908"}
 {"id":"fln-9wya"}
 {"id":"fln-a6q"}
 {"id":"fln-abaz"}
@@ -84,26 +89,32 @@
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
+{"id":"fln-d3wg"}
 {"id":"fln-d4x"}
+{"id":"fln-d7pr"}
 {"id":"fln-db39"}
 {"id":"fln-dcv"}
 {"id":"fln-eae"}
 {"id":"fln-eeyn"}
 {"id":"fln-ehb5"}
+{"id":"fln-elp6"}
 {"id":"fln-env-merge-resource-envelope-9m74"}
 {"id":"fln-euo"}
 {"id":"fln-evidence-runner-bootstrap-btk"}
+{"id":"fln-ew20"}
 {"id":"fln-extended-25-modules-council-4974-9m8q"}
 {"id":"fln-extended-38-modules-council-5982-3k7p"}
 {"id":"fln-extended-56-modules-council-7822-4r9w"}
 {"id":"fln-extended-59-modules-council-8396-5s8t"}
 {"id":"fln-extension-history-checkpoint-identity-41s"}
 {"id":"fln-extension-merge-validation-proof-debt-dt5"}
+{"id":"fln-f7nn"}
 {"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
 {"id":"fln-fur"}
+{"id":"fln-g1mc"}
 {"id":"fln-g6d1"}
 {"id":"fln-giap"}
 {"id":"fln-gjup"}
@@ -121,6 +132,7 @@
 {"id":"fln-hoqd"}
 {"id":"fln-hq6i"}
 {"id":"fln-hqn"}
+{"id":"fln-hvrk"}
 {"id":"fln-i9so"}
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-in1"}
@@ -139,10 +151,12 @@
 {"id":"fln-k63"}
 {"id":"fln-kernel-bounded-decl-admission-ukzx"}
 {"id":"fln-kernel-loc-disclosure-foreign-counter-c118"}
+{"id":"fln-kfdr"}
 {"id":"fln-kfk2"}
 {"id":"fln-kok"}
 {"id":"fln-kpd"}
 {"id":"fln-kx3y"}
+{"id":"fln-kyo0"}
 {"id":"fln-l8f"}
 {"id":"fln-laxj"}
 {"id":"fln-lld"}
@@ -160,6 +174,7 @@
 {"id":"fln-odva"}
 {"id":"fln-okfb"}
 {"id":"fln-olean-doc-self-contradiction-myri"}
+{"id":"fln-otk7"}
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
 {"id":"fln-parity-ledger-freshness-names-the-run-igxr"}
 {"id":"fln-parity-ledger-l2-pinned-source-qydn"}
@@ -175,12 +190,14 @@
 {"id":"fln-qb5"}
 {"id":"fln-qpkj"}
 {"id":"fln-qw78"}
+{"id":"fln-r0yh"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
 {"id":"fln-rwz"}
 {"id":"fln-rzyk"}
 {"id":"fln-s8oo"}
+{"id":"fln-s97y"}
 {"id":"fln-selftest-symlink-blocks-bundle-4yhd"}
 {"id":"fln-sn0w"}
 {"id":"fln-sr2z"}
@@ -195,7 +212,9 @@
 {"id":"fln-uc44"}
 {"id":"fln-um4a"}
 {"id":"fln-uuuz"}
+{"id":"fln-uyuz"}
 {"id":"fln-vneu"}
+{"id":"fln-vokf"}
 {"id":"fln-w0b"}
 {"id":"fln-wasm-judge-browser-kvj"}
 {"id":"fln-wgp"}
@@ -212,6 +231,7 @@
 {"id":"fln-zddn"}
 {"id":"fln-zfyt"}
 {"id":"fln-zp26"}
+{"id":"fln-zrpp"}
 {"id":"fln-zti3"}
 {"id":"franken_lean-008q"}
 {"id":"franken_lean-05g"}
