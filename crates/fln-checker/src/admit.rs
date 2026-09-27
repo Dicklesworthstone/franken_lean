@@ -7957,7 +7957,32 @@ pub fn admit_inductive_with(
         });
     };
     if declaration.safety() != ConstantSafety::Safe {
-        return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+        // The pin admits an unsafe family as it admits a safe one, except that
+        // it skips positivity (`inductive.cpp:443` of the vendored source) and
+        // checks every member in unsafe mode (`:171`). The parameter-free route
+        // judges one: each member's type is checked in its own safety mode, and
+        // a recursive field must be a direct occurrence, so skipping positivity
+        // admits nothing more there. A safe family of any other shape has a
+        // route of its own, so an unsafe one of that shape stays deferred as
+        // unsafe rather than under a shape limit that would not hold.
+        if !declaration.level_parameters().is_empty()
+            || metadata.mutual() != std::slice::from_ref(name)
+            || metadata.num_parameters() != 0
+            || metadata.num_indices() != 0
+            || metadata.num_nested() != 0
+            || metadata.is_reflexive()
+        {
+            return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+        }
+        return admit_parameter_free(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
     }
     if name == &checker_atom("Empty")
         && declaration.level_parameters().is_empty()
@@ -8301,6 +8326,37 @@ pub fn admit_inductive_with(
             &mut cancelled,
         );
     }
+    admit_parameter_free(
+        environment,
+        declarations,
+        inductive,
+        budget,
+        environment_budget,
+        &mut comparison,
+        &mut cancelled,
+    )
+}
+
+/// The parameter-free route: no universe or ordinary parameters, no indices,
+/// one family, direct recursive fields only. It also judges the parameter-free
+/// unsafe families, whose constructors and recursor carry the family's own
+/// safety, as the pin declares them (`inductive.cpp:472`, `:774`).
+fn admit_parameter_free(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
     if !declaration.level_parameters().is_empty() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
             observed: declaration.level_parameters().len(),
@@ -8353,12 +8409,12 @@ pub fn admit_inductive_with(
     }
 
     if let Err(verdict) =
-        declared_type_is_a_type(environment, name, declaration, &budget, &mut cancelled)
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
     {
         return map_member_preamble(name, verdict);
     }
     let mut staged_environment =
-        match stage_inductive_member(environment, inductive, environment_budget, &mut cancelled) {
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
             Ok(environment) => environment,
             Err(verdict) => return verdict,
         };
@@ -8370,7 +8426,7 @@ pub fn admit_inductive_with(
     let mut imported_arena_units = 0usize;
     members.push(name.clone());
     for (index, constructor_name) in metadata.constructors().iter().enumerate() {
-        if let Err(stop) = comparison.comparison(&mut cancelled) {
+        if let Err(stop) = comparison.comparison(cancelled) {
             return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
         }
         if !seen.insert(constructor_name) {
@@ -8400,7 +8456,7 @@ pub fn admit_inductive_with(
                 });
             }
         };
-        if constructor.declaration().safety() != ConstantSafety::Safe
+        if constructor.declaration().safety() != declaration.safety()
             || !constructor.declaration().level_parameters().is_empty()
             || constructor_metadata.inductive() != name
             || constructor_metadata.index() != expected_index
@@ -8435,7 +8491,7 @@ pub fn admit_inductive_with(
         };
         let mut direct_recursive_fields = Vec::new();
         for field in &fields {
-            match classify_field_recursion(field, name, &mut comparison, &mut cancelled) {
+            match classify_field_recursion(field, name, comparison, cancelled) {
                 Ok(FieldRecursion::Absent) => direct_recursive_fields.push(false),
                 Ok(FieldRecursion::DirectSelf) if metadata.is_recursive() => {
                     direct_recursive_fields.push(true);
@@ -8464,7 +8520,7 @@ pub fn admit_inductive_with(
             constructor_name,
             constructor.declaration(),
             &budget,
-            &mut cancelled,
+            cancelled,
         ) {
             Ok(facts) => facts,
             Err(verdict) => return map_member_preamble(constructor_name, verdict),
@@ -8485,7 +8541,7 @@ pub fn admit_inductive_with(
             &staged_environment,
             constructor,
             environment_budget,
-            &mut cancelled,
+            cancelled,
         ) {
             Ok(environment) => environment,
             Err(verdict) => return verdict,
@@ -8536,7 +8592,7 @@ pub fn admit_inductive_with(
         });
     };
     let recursor_levels = recursor.declaration().level_parameters();
-    if recursor.declaration().safety() != ConstantSafety::Safe
+    if recursor.declaration().safety() != declaration.safety()
         || recursor_levels.len() != 1
         || recursor_metadata.mutual() != std::slice::from_ref(name)
         || recursor_metadata.num_parameters() != 0
@@ -8560,8 +8616,8 @@ pub fn admit_inductive_with(
     match compare_inductive_expression(
         recursor.declaration().type_(),
         &expected_recursor_type,
-        &mut comparison,
-        &mut cancelled,
+        comparison,
+        cancelled,
     ) {
         Ok(true) => {}
         Ok(false) => {
@@ -8590,12 +8646,7 @@ pub fn admit_inductive_with(
         else {
             return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
         };
-        match compare_inductive_expression(
-            rule.rhs(),
-            &expected_rhs,
-            &mut comparison,
-            &mut cancelled,
-        ) {
+        match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
             Ok(true) => {}
             Ok(false) => {
                 return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
@@ -8610,16 +8661,13 @@ pub fn admit_inductive_with(
         &recursor_name,
         recursor.declaration(),
         &budget,
-        &mut cancelled,
+        cancelled,
     ) {
         return map_member_preamble(&recursor_name, verdict);
     }
-    if let Err(verdict) = stage_inductive_member(
-        &staged_environment,
-        recursor,
-        environment_budget,
-        &mut cancelled,
-    ) {
+    if let Err(verdict) =
+        stage_inductive_member(&staged_environment, recursor, environment_budget, cancelled)
+    {
         return verdict;
     }
     members.push(recursor_name);

@@ -12222,6 +12222,254 @@ fn kr975_an_unsafe_declaration_is_admitted_into_the_quarantine_not_deferred() {
     }
 }
 
+/// An environment holding one unsafe type, `Handle : Type`.
+fn handle_environment() -> ConstantEnvironment {
+    environment_of(vec![ConstantEntry::new(
+        checker_name("Handle"),
+        header(
+            Vec::new(),
+            decoded(&Expr::sort(Level::one())),
+            ConstantKind::Axiom,
+            ConstantSafety::Unsafe,
+        ),
+    )])
+}
+
+/// `structure Box where h : Handle`, each member carrying its own safety: the
+/// shape of the pin's `Lean.Expr.FoldConstsImpl.State`, a parameter-free
+/// structure over an unsafe field type.
+fn handle_box_entries(
+    family: ConstantSafety,
+    constructor: ConstantSafety,
+    recursor: ConstantSafety,
+) -> Vec<ConstantEntry> {
+    let family_name = primary_name("Box");
+    let make = Name::str(family_name.clone(), "mk");
+    let u = Level::param(primary_name("u"));
+    let box_expr = || Expr::const_(family_name.clone(), Vec::new());
+    let handle = || Expr::const_(primary_name("Handle"), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = primary_pi("t", BinderInfo::Default, box_expr(), Expr::sort(u));
+    let minor_type = primary_pi(
+        "h",
+        BinderInfo::Default,
+        handle(),
+        Expr::app(bv(1), Expr::app(Expr::const_(make, Vec::new()), bv(0))),
+    );
+    let recursor_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive_type.clone(),
+        primary_pi(
+            "minor",
+            BinderInfo::Default,
+            minor_type.clone(),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                box_expr(),
+                Expr::app(bv(2), bv(0)),
+            ),
+        ),
+    );
+    let rule_rhs = Expr::lam(
+        primary_name("motive"),
+        motive_type,
+        Expr::lam(
+            primary_name("minor"),
+            minor_type,
+            Expr::lam(
+                primary_name("h"),
+                handle(),
+                Expr::app(bv(1), bv(0)),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            checker_name("Box"),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                family,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![checker_name("Box")],
+                    vec![checker_qualified(&["Box", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Box", "mk"]),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&primary_pi("h", BinderInfo::Default, handle(), box_expr())),
+                constructor,
+                ConstructorDeclaration::new(checker_name("Box"), 0, 0, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Box", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                decoded(&recursor_type),
+                recursor,
+                RecursorDeclaration::new(
+                    vec![checker_name("Box")],
+                    0,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(
+                        checker_qualified(&["Box", "mk"]),
+                        1,
+                        decoded(&rule_rhs),
+                    )],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn an_unsafe_parameter_free_structure_is_admitted_as_the_pin_admits_it() {
+    let verdict = admit_inductive(
+        &handle_environment(),
+        &handle_box_entries(
+            ConstantSafety::Unsafe,
+            ConstantSafety::Unsafe,
+            ConstantSafety::Unsafe,
+        ),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    match verdict {
+        fln_checker::admit::InductiveVerdict::Admitted(admission) => assert_eq!(
+            admission.members(),
+            [
+                checker_name("Box"),
+                checker_qualified(&["Box", "mk"]),
+                checker_qualified(&["Box", "rec"]),
+            ]
+        ),
+        other => panic!("the unsafe structure must be admitted, got {other:?}"),
+    }
+
+    // Control: the same family marked safe may not mention the unsafe field
+    // type, so the verdict above is the unsafe checking mode at work.
+    let verdict = admit_inductive(
+        &handle_environment(),
+        &handle_box_entries(
+            ConstantSafety::Safe,
+            ConstantSafety::Safe,
+            ConstantSafety::Safe,
+        ),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        format!("{verdict:?}").contains("UnsafeConstant"),
+        "a safe family over an unsafe field type must be refused: {verdict:?}"
+    );
+}
+
+/// The pin declares an unsafe family's constructors and recursor unsafe; a
+/// row that says otherwise is not the declaration it produced.
+#[test]
+fn an_unsafe_family_refuses_members_of_another_safety() {
+    let verdict = admit_inductive(
+        &handle_environment(),
+        &handle_box_entries(
+            ConstantSafety::Unsafe,
+            ConstantSafety::Safe,
+            ConstantSafety::Unsafe,
+        ),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "safe constructor of an unsafe family: {verdict:?}"
+    );
+    let verdict = admit_inductive(
+        &handle_environment(),
+        &handle_box_entries(
+            ConstantSafety::Unsafe,
+            ConstantSafety::Unsafe,
+            ConstantSafety::Safe,
+        ),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "safe recursor of an unsafe family: {verdict:?}"
+    );
+}
+
+/// Only the parameter-free route judges an unsafe family. One with a
+/// parameter would be admitted by another route if it were safe, so it is
+/// deferred as unsafe, not under the parameter-free route's own shape limit.
+#[test]
+fn an_unsafe_family_off_the_parameter_free_route_stays_deferred_as_unsafe() {
+    let mut entries = handle_box_entries(
+        ConstantSafety::Unsafe,
+        ConstantSafety::Unsafe,
+        ConstantSafety::Unsafe,
+    );
+    let family = entries[0].declaration();
+    entries[0] = ConstantEntry::new(
+        checker_name("Box"),
+        ConstantDeclaration::inductive(
+            Vec::new(),
+            family.type_().clone(),
+            ConstantSafety::Unsafe,
+            InductiveDeclaration::new(
+                1,
+                0,
+                vec![checker_name("Box")],
+                vec![checker_qualified(&["Box", "mk"])],
+                0,
+                false,
+                false,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &handle_environment(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Deferred(
+                fln_checker::admit::InductiveSupportLimit::Unsafe
+            )
+        ),
+        "a parameterized unsafe family: {verdict:?}"
+    );
+}
+
 #[test]
 fn kr976_a_partial_body_lands_in_its_own_quarantine_not_the_unsafe_one() {
     // Two different quarantines. One ground for both would leave the verdict
