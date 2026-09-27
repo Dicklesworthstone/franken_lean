@@ -1,0 +1,91 @@
+name: Native do-if implementation transfer
+
+# Materialize the exact previously tested implementation as immutable blobs.
+# The connected caller separately publishes a checked fast-forward to main.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-native-if-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  transfer:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify and retain the tested native branch parser
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + path, data=body, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          manifest = {
+              'crates/fln-parse/src/lib.rs': ['394bd0b1ddb8778f00aa4cb41550a01ed1d3dec7', '084d420b653939730a742b2561cfaf6be5cdae5e'],
+              'crates/fln-parse/src/matching.rs': ['6490dd1f5544760574c2335a155d374cd5aef818', 'db0c8f8bcaa264906c097913db844696e466aada'],
+              'crates/fln-parse/src/matching/do_scopes.rs': [None, '42878472228b044eb58eeb2b1d4fa2cdc2912861'],
+              'crates/fln-parse/src/term_do.rs': ['2ad172d710622a407427d13531d2c3c0d755b3c8', 'd21f906a06604c75286b3a94b7625b3881e227d9'],
+              'crates/fln-parse/src/term_do/conditional.rs': ['18cc8753c1fd6e2546e5aefdf1f063960f42295c', '6de12233a34d46170ee152536402fe7c9c12ba73'],
+              'crates/fln-parse/tests/do_branches.rs': [None, 'cb1dae1a3f8f64ea6ce6cc0a8137118d775cedc7'],
+              'crates/fln-parse/tests/do_notation.rs': ['a71388e079a4e63c0a2b6ab690cdd0efb5caffbe', '2901145054c23dcb52ea7689e537de53809777b1'],
+              'crates/fln/tests/source_do/for_loops.rs': ['ebb1ecc98c16e16cb03b01114da63e651a9ee0ef', '14d0de05cb37a041fcfd43671ab30464e6319c10'],
+              'crates/fln/tests/source_do/for_loops/branch_sequences.rs': [None, 'f60852a1832f0c66a3567a672612a970807f710e'],
+              'crates/fln/tests/source_do/for_loops/conditional.rs': ['dc2e500443ac2df1576892977927fe12e3e6e23b', 'e2250cc905abf10f2ab9718269e3690325507b06'],
+          }
+          source = request('/git/blobs/e503253219aaa90c998e271860030fc17e9579ad')
+          assert source['encoding'] == 'base64'
+          compressed = base64.b64decode(source['content'])
+          assert blob(compressed) == 'e503253219aaa90c998e271860030fc17e9579ad'
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == 'cdb9ef4fe93ddc2661b20392cb87752954fe818f9a916556130082606940b99b'
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in patch.decode()
+          for path, (before, after) in manifest.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink()
+              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-if-transfer'
+          root.mkdir()
+          patch_file = root / 'implementation.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(patch_file)], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error', str(patch_file)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, (_, after) in manifest.items():
+              content = pathlib.Path(path).read_bytes()
+              assert blob(content) == after, path
+              uploaded = request('/git/blobs', {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})
+              assert uploaded['sha'] == after, path
+          receipt = {
+              'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'blobs': {path: after for path, (_, after) in manifest.items()},
+              'patch_sha256': hashlib.sha256(patch).hexdigest(),
+              'published_branch': False,
+              'validation': 'Exact retained locally tested bytes; this transfer does not run Rust tests.',
+          }
+          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-if-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/native-if-transfer
+          retention-days: 2
+          if-no-files-found: error
