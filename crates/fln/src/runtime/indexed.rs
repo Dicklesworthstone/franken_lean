@@ -92,6 +92,9 @@ impl Preparation<'_> {
                     }
                     let mut normal = self.type_head(&source)?;
                     let (head, args) = self.spine(&normal)?;
+                    if let Some(decision) = self.decision_representation(&head, &args)? {
+                        normal = decision;
+                    }
                     if let Some(carrier) = self.quotient_carrier(&head, &args)? {
                         // A quotient has its carrier's representation. Reenter
                         // the same worklist so nested quotients/data/functions

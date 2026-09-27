@@ -126,7 +126,10 @@ impl Preparation<'_> {
             // global specialization, even when this caller supplies a literal.
             // Closed static arguments with independent domains need no lift
             // when substituted under the retained runtime binders.
-            let selected = if binder_type.has_loose_bvars() || !closed(argument) {
+            let proposition = self.proposition_parameter(binder_type)?;
+            let selected = if proposition {
+                Some(erased_proposition())
+            } else if binder_type.has_loose_bvars() || !closed(argument) {
                 None
             } else if self.type_parameter(binder_type)? {
                 Some(argument.clone())
@@ -139,9 +142,17 @@ impl Preparation<'_> {
                 let next_type = self.substitution(body, &selected)?;
                 let next_value = self.substitution(value_body, &selected)?;
                 reserve(&mut static_arguments, self.limits.max_application_args)?;
-                // Keep the exact source argument in the key; only the private
-                // compiler body receives the proven-inert factory result.
-                static_arguments.push((index, argument.clone()));
+                // Keep exact type/dictionary arguments in the key. Only Prop
+                // arguments are layout-independent: use their closed erased
+                // representative, never context-relative indices in a global key.
+                static_arguments.push((
+                    index,
+                    if proposition {
+                        selected
+                    } else {
+                        argument.clone()
+                    },
+                ));
                 type_ = next_type;
                 value = next_value;
                 // Trailing runtime arguments must not change the cached body.

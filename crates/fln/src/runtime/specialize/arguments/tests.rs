@@ -57,6 +57,80 @@ fn type_arguments_after_runtime_parameters_are_erased_without_substituting_value
 }
 
 #[test]
+fn open_propositions_do_not_capture_runtime_locals_in_specialization_keys() {
+    let environment = Environment::new();
+    let binders = [
+        (ty("Nat"), BinderInfo::Default),
+        (Expr::sort(Level::zero()), BinderInfo::Implicit),
+        (Expr::app(ty("Decidable"), b(0)), BinderInfo::InstImplicit),
+        (ty("Nat"), BinderInfo::Default),
+    ];
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    for proposition in [b(0), b(3), ty("someClosedProposition")] {
+        let result = preparation
+            .specialize_arguments(
+                telescope(&binders, ty("Nat"), false),
+                telescope(&binders, b(0), true),
+                &[b(0), proposition, b(1), nat::literal(42)],
+            )
+            .unwrap();
+        assert_eq!(result.static_arguments, vec![(1, erased_proposition())]);
+        assert_eq!(result.runtime_arguments, vec![b(0), b(1), nat::literal(42)]);
+        let retained = [
+            (ty("Nat"), BinderInfo::Default),
+            (
+                Expr::app(ty("Decidable"), erased_proposition()),
+                BinderInfo::InstImplicit,
+            ),
+            (ty("Nat"), BinderInfo::Default),
+        ];
+        assert_eq!(result.type_, telescope(&retained, ty("Nat"), false));
+        assert_eq!(result.value, telescope(&retained, b(0), true));
+        assert!(!result.type_.has_loose_bvars());
+        assert!(!result.value.has_loose_bvars());
+    }
+}
+
+#[test]
+fn erased_propositions_are_closed_propositions_not_a_fabricated_sort_or_proof() {
+    use fln_core::outcome::Outcome;
+    use fln_kernel::verdict::{Budget, Verdict};
+    let proposition = erased_proposition();
+    assert!(!proposition.has_loose_bvars());
+    assert!(!proposition.has_fvar());
+    assert!(!proposition.has_expr_mvar());
+    assert!(!proposition.has_level_mvar());
+    let candidate = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name("proposition"),
+            level_params: vec![],
+            type_: Expr::sort(Level::zero()),
+        },
+        value: proposition,
+        safety: DefinitionSafety::Safe,
+        hints: ReducibilityHints::Abbrev,
+        all: vec![name("proposition")],
+    });
+    assert!(matches!(
+        fln_kernel::check(
+            &Environment::new(),
+            &candidate,
+            Budget::for_stack_bytes(2 * 1024 * 1024)
+        ),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    let environment = Environment::new();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    for level in [Level::one(), Level::param(name("u"))] {
+        assert!(
+            !preparation
+                .proposition_parameter(&Expr::sort(level))
+                .unwrap()
+        );
+    }
+}
+
+#[test]
 fn multiple_interleaved_types_rebase_later_domains_and_earlier_runtime_references() {
     let binders = [
         (ty("Nat"), BinderInfo::Default),

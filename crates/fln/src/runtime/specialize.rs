@@ -14,6 +14,8 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub(super) struct Store {
+    // Cached only after the complete immutable decision-family contract checks.
+    pub(super) decision_family_checked: bool,
     definitions: BTreeMap<Name, DefinitionVal>,
     instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,
@@ -29,7 +31,34 @@ fn closed(expr: &Expr) -> bool {
 fn application(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
     args.into_iter().fold(head, Expr::app)
 }
+
+/// A closed proposition with no environment dependencies. This lives only in
+/// compiler-private types after admission; it never supplies a proof or chooses
+/// the value of a Decidable dictionary. Keeping it distinct from Sort 0 matters:
+/// Prop itself is a type, not a proposition whose inhabitants can be erased.
+fn erased_proposition() -> Expr {
+    Expr::forall_e(
+        Name::anonymous(),
+        Expr::sort(Level::zero()),
+        Expr::forall_e(
+            Name::anonymous(),
+            Expr::bvar(0).expect("fixed proposition domain"),
+            Expr::bvar(1).expect("fixed proposition result"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    )
+}
+
 impl Preparation<'_> {
+    /// A known Prop domain is layout-independent even if its argument mentions
+    /// runtime locals. Ordinary type arguments still require a closed value;
+    /// neither an unknown universe nor a type family is guessed to be Prop.
+    pub(super) fn proposition_parameter(&mut self, domain: &Expr) -> Result<bool, IngressError> {
+        let domain = self.type_head(domain)?;
+        Ok(matches!(domain.node(), ExprNode::Sort { level } if level.is_zero()))
+    }
+
     pub(super) fn forget_constructor_type(&mut self, name: &Name) {
         self.specializations.constructor_types.remove(name);
     }
@@ -525,6 +554,11 @@ impl Preparation<'_> {
             // dropping an action. This also exposes mutual-match minor
             // premises hidden behind the elaborator's local helper lambdas.
             // A call that *returns* a function must still use the strict let.
+            if self.proposition_parameter(binder_type)? {
+                head = self.substitution(body, &erased_proposition())?;
+                consumed += 1;
+                continue;
+            }
             if matches!(argument.node(), ExprNode::Lam { .. })
                 || self.type_parameter(binder_type)? && closed(argument)
             {

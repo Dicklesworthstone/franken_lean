@@ -1,9 +1,10 @@
-//! Erase checked Nat and Bool equality decisions to native Boolean runtime control flow.
+//! Runtime representations for admitted constructive decisions.
 //!
-//! The proof-producing definitions remain unchanged in the admitted environment.
-//! This recognizes their complete seed contracts, including the families and
-//! definitions on which they depend. Other decision procedures stay ordinary
-//! source code; a familiar name alone never authorizes this reduction.
+//! Decidable has a uniform constructor layout independent of its proposition;
+//! the proposition and proof fields are static/erased, but its chosen tag is
+//! computed normally. Nat and Bool equality retain their checked fast paths.
+//! Both transformations check the admitted contracts; a familiar name alone
+//! never authorizes erasure. The logical declarations remain unchanged.
 
 use super::*;
 
@@ -18,6 +19,82 @@ fn required_decision_name(candidate: &Name, carrier: &str, instance: bool) -> bo
 }
 
 impl Preparation<'_> {
+    /// Proposition arguments do not affect Decidable's runtime layout: both
+    /// constructors retain their tag and one erased proof slot. Choose a closed
+    /// representative only AFTER admission, in the compiler's type plane. The
+    /// original proposition, proof and decision are never changed in the logical
+    /// environment. In particular, do not evaluate the decision to choose a tag.
+    pub(super) fn decision_representation(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        if !matches!(head.node(), ExprNode::Const { name: n, levels }
+            if n == &name("Decidable") && levels.is_empty())
+            || arguments.len() != 1
+        {
+            return Ok(None);
+        }
+        if !self.specializations.decision_family_checked {
+            // Recognition includes the proof-field aliases and the closed
+            // representative. A same-named foreign family cannot acquire this
+            // erasure, and a failed check never fills the cached guard.
+            for expected in fln_elab::seed::source_seed_declarations() {
+                self.tick()?;
+                match expected {
+                    Declaration::Inductive(block)
+                        if block.types.iter().any(|family| {
+                            ["Decidable", "True", "False"]
+                                .iter()
+                                .any(|label| family.base.name == name(label))
+                        }) =>
+                    {
+                        for expected in &block.types {
+                            self.tick()?;
+                            if self.environment.find(&expected.base.name)
+                                != Some(&ConstantInfo::Induct(expected.clone()))
+                            {
+                                return Err(unsupported("noncanonical decision family"));
+                            }
+                        }
+                        for expected in &block.ctors {
+                            self.tick()?;
+                            if self.environment.find(&expected.base.name)
+                                != Some(&ConstantInfo::Ctor(expected.clone()))
+                            {
+                                return Err(unsupported("noncanonical decision constructor"));
+                            }
+                        }
+                        for expected in &block.recursors {
+                            self.tick()?;
+                            if self.environment.find(&expected.base.name)
+                                != Some(&ConstantInfo::Rec(expected.clone()))
+                            {
+                                return Err(unsupported("noncanonical decision recursor"));
+                            }
+                        }
+                    }
+                    Declaration::Defn(expected) if expected.base.name == name("Not") => {
+                        if self.environment.find(&expected.base.name)
+                            != Some(&ConstantInfo::Defn(expected))
+                        {
+                            return Err(unsupported("noncanonical decision proof field"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if source_scalar_constructor_binding(self.environment, &name("Bool.false")).is_none() {
+                return Err(unsupported("decision proof erasure unavailable"));
+            }
+            self.specializations.decision_family_checked = true;
+        }
+        Ok(Some(Expr::app(
+            head.clone(),
+            Expr::const_(name("True"), vec![]),
+        )))
+    }
+
     fn checked_equality_decision_contract(
         &mut self,
         carrier: &str,
@@ -230,6 +307,91 @@ mod tests {
 
     fn apply(spelling: &str, operands: impl IntoIterator<Item = Expr>) -> Expr {
         operands.into_iter().fold(constant(spelling), Expr::app)
+    }
+
+    #[test]
+    fn decision_layout_does_not_depend_on_or_evaluate_the_proposition() {
+        let env = environment("Nat", "");
+        let mut prep = Preparation::new(&env, IngressLimits::default());
+        let representative = apply("Decidable", [constant("True")]);
+        for proposition in [
+            constant("True"),
+            constant("False"),
+            Expr::bvar(0).unwrap(),
+            apply("unevaluatedProposition", [nat::literal(17)]),
+        ] {
+            assert_eq!(
+                prep.decision_representation(&constant("Decidable"), &[proposition])
+                    .unwrap(),
+                Some(representative.clone())
+            );
+        }
+        assert!(prep.specializations.decision_family_checked);
+        assert_eq!(
+            prep.value_type(&apply("Decidable", [Expr::bvar(0).unwrap()]))
+                .unwrap(),
+            Some(ValueType::Constructor)
+        );
+    }
+
+    #[test]
+    fn decision_layout_refuses_replaced_authority_and_cannot_cache_a_failed_check() {
+        for replaced in [
+            "Decidable",
+            "Decidable.isTrue",
+            "Decidable.isFalse",
+            "Decidable.rec",
+            "True",
+            "True.intro",
+            "False",
+            "Not",
+            "Bool.false",
+        ] {
+            let env = environment("Nat", replaced);
+            let mut prep = Preparation::new(&env, IngressLimits::default());
+            for _ in 0..2 {
+                assert!(
+                    prep.decision_representation(&constant("Decidable"), &[constant("True")])
+                        .is_err(),
+                    "{replaced}"
+                );
+                assert!(!prep.specializations.decision_family_checked);
+            }
+            assert!(prep.constructors.is_empty());
+        }
+    }
+
+    #[test]
+    fn decision_layout_retains_arity_and_work_limits() {
+        let env = environment("Nat", "");
+        let mut prep = Preparation::new(&env, IngressLimits::default());
+        for (head, args) in [
+            (constant("Decidable"), vec![]),
+            (
+                constant("Decidable"),
+                vec![constant("True"), constant("False")],
+            ),
+            (
+                Expr::const_(name("Decidable"), vec![Level::zero()]),
+                vec![constant("True")],
+            ),
+            (constant("userDecision"), vec![constant("True")]),
+        ] {
+            assert_eq!(prep.decision_representation(&head, &args).unwrap(), None);
+        }
+        assert!(!prep.specializations.decision_family_checked);
+        let mut prep = Preparation::new(
+            &env,
+            IngressLimits {
+                max_nodes: 1,
+                ..IngressLimits::default()
+            },
+        );
+        assert!(matches!(
+            prep.decision_representation(&constant("Decidable"), &[constant("True")]),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(!prep.specializations.decision_family_checked);
     }
 
     // Deliberately install unchecked metadata here to exercise the authority
