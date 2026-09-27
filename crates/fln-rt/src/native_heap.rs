@@ -39,6 +39,8 @@
 //! * **Total interning.** Values stored through `intern` dedup structurally:
 //!   the same value returns the same live handle (R10's dedup), and a freed
 //!   interned value leaves the index so a later intern allocates fresh.
+//!   Mutable access detaches that allocation from interning before returning
+//!   the reference: arbitrary caller mutation cannot leave a stale key behind.
 //! * **Close reclaims.** Closing the heap reclaims every allocation;
 //!   handles into a closed heap refuse, and so does allocation.
 
@@ -182,6 +184,7 @@ enum Slot {
         value: Box<dyn Any + Send + Sync>,
         generation: u32,
         persistent: bool,
+        intern_key: Option<InternKey>,
     },
     /// A freed slot, on the free list, with the generation its NEXT occupant
     /// will carry. `None` for the tail.
@@ -196,6 +199,21 @@ enum Slot {
 /// collision can never silently fuse two values.
 struct InternEntry {
     slot: u32,
+}
+
+type InternKey = (TypeId, TypeId, u64);
+
+fn remove_intern_entry(
+    index: &mut HashMap<InternKey, Vec<InternEntry>>,
+    key: InternKey,
+    slot: u32,
+) {
+    if let Some(entries) = index.get_mut(&key) {
+        entries.retain(|entry| entry.slot != slot);
+        if entries.is_empty() {
+            index.remove(&key);
+        }
+    }
 }
 
 /// Opaque process-local heap identities are never rendered, hashed, or
@@ -221,7 +239,7 @@ pub struct NativeHeap {
     slots: Vec<Slot>,
     free_head: Option<u32>,
     live: usize,
-    intern: HashMap<(TypeId, u64), InternEntry>,
+    intern: HashMap<InternKey, Vec<InternEntry>>,
     closed: bool,
 }
 
@@ -277,6 +295,7 @@ impl NativeHeap {
                 value,
                 generation,
                 persistent,
+                intern_key: None,
             };
             (head, generation)
         } else {
@@ -285,6 +304,7 @@ impl NativeHeap {
                 value,
                 generation: 1,
                 persistent,
+                intern_key: None,
             });
             (index, 1)
         }
@@ -325,10 +345,9 @@ impl NativeHeap {
         self.intern_by(value, key, |a, b| a == b)
     }
 
-    /// Intern with a caller-chosen equality — for value types without
-    /// `PartialEq` (like `Expr`, whose identity discipline is the computed
-    /// hash, upstream's own hash-consing). The equality on a hit is the
-    /// caller's declared one, never an implicit default.
+    /// Intern with a caller-chosen equality. The key hash only selects a
+    /// collision bucket; `eq` must compare full value identity, not just a
+    /// hash. Prefer `intern` for types that implement `Eq`, including `Expr`.
     pub fn intern_by<T, K>(
         &mut self,
         value: T,
@@ -346,25 +365,29 @@ impl NativeHeap {
             key_value.hash(&mut hasher);
             std::hash::Hasher::finish(&hasher)
         };
-        let map_key = (TypeId::of::<K>(), key_hash);
-        if let Some(entry) = self.intern.get(&map_key) {
-            let slot = entry.slot;
-            if let Slot::Occupied { value: stored, .. } = &self.slots[slot as usize]
-                && let Some(stored) = stored.downcast_ref::<T>()
-                && eq(stored, &value)
-            {
-                let generation = match &self.slots[slot as usize] {
-                    Slot::Occupied { generation, .. } => *generation,
-                    Slot::Vacant { .. } => unreachable!(),
-                };
-                return self.handle(slot, generation);
+        let map_key = (TypeId::of::<T>(), TypeId::of::<K>(), key_hash);
+        if let Some(entries) = self.intern.get(&map_key) {
+            for entry in entries {
+                if let Slot::Occupied {
+                    value: stored,
+                    generation,
+                    ..
+                } = &self.slots[entry.slot as usize]
+                    && let Some(stored) = stored.downcast_ref::<T>()
+                    && eq(stored, &value)
+                {
+                    return self.handle(entry.slot, *generation);
+                }
             }
-            // The indexed slot died under the entry (freed) or holds a
-            // different value under a colliding hash: the index is stale,
-            // and the honest move is to replace it below.
         }
         let (index, generation) = self.alloc_slot(Box::new(value), false);
-        self.intern.insert(map_key, InternEntry { slot: index });
+        if let Slot::Occupied { intern_key, .. } = &mut self.slots[index as usize] {
+            *intern_key = Some(map_key);
+        }
+        self.intern
+            .entry(map_key)
+            .or_default()
+            .push(InternEntry { slot: index });
         self.handle(index, generation)
     }
 
@@ -393,7 +416,8 @@ impl NativeHeap {
     }
 
     /// Resolve a handle for writing. A persistent allocation refuses: the
-    /// persistent arm of the tri-state law is immutable.
+    /// persistent arm of the tri-state law is immutable. Successful mutable
+    /// access detaches an interned allocation; refusals leave its index intact.
     pub fn get_mut<T: 'static>(&mut self, handle: NativeHandle<T>) -> Result<&mut T, HeapError> {
         if self.closed {
             return Err(HeapError::Closed);
@@ -409,6 +433,7 @@ impl NativeHeap {
                 value,
                 generation,
                 persistent,
+                intern_key,
             } => {
                 if *generation != handle.generation {
                     return Err(HeapError::StaleHandle);
@@ -416,7 +441,11 @@ impl NativeHeap {
                 if *persistent {
                     return Err(HeapError::PersistentMutation);
                 }
-                value.downcast_mut::<T>().ok_or(HeapError::TypeMismatch)
+                let value = value.downcast_mut::<T>().ok_or(HeapError::TypeMismatch)?;
+                if let Some(key) = intern_key.take() {
+                    remove_intern_entry(&mut self.intern, key, handle.index);
+                }
+                Ok(value)
             }
             Slot::Vacant { .. } => Err(HeapError::StaleHandle),
         }
@@ -434,12 +463,13 @@ impl NativeHeap {
         let Some(slot) = self.slots.get_mut(handle.index as usize) else {
             return Err(HeapError::StaleHandle);
         };
-        let (value_generation, persistent) = match slot {
+        let (value_generation, persistent, same_type, intern_key) = match slot {
             Slot::Occupied {
+                value,
                 generation,
                 persistent,
-                ..
-            } => (*generation, *persistent),
+                intern_key,
+            } => (*generation, *persistent, value.is::<T>(), *intern_key),
             Slot::Vacant { .. } => return Err(HeapError::StaleHandle),
         };
         if value_generation != handle.generation {
@@ -447,6 +477,9 @@ impl NativeHeap {
         }
         if persistent {
             return Err(HeapError::PersistentMutation);
+        }
+        if !same_type {
+            return Err(HeapError::TypeMismatch);
         }
         let index = handle.index;
         // ABA retirement: the next occupant carries generation+1; at u32::MAX
@@ -463,10 +496,11 @@ impl NativeHeap {
             self.free_head = Some(index);
         }
         self.live -= 1;
-        // Any intern entry naming this slot is now stale; drop it so a
-        // later intern allocates fresh rather than resolving to a re-used
-        // slot's different value.
-        self.intern.retain(|_, entry| entry.slot != index);
+        // Only this slot leaves its bucket. Colliding peers keep their identity,
+        // and neither freeing nor mutation needs to scan the whole intern map.
+        if let Some(key) = intern_key {
+            remove_intern_entry(&mut self.intern, key, index);
+        }
         Ok(())
     }
 

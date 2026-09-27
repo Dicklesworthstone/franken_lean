@@ -190,6 +190,75 @@ fn interning_dedups_structurally_and_a_freed_slot_leaves_the_index() {
     assert_eq!(heap.live(), 2, "one freed, one re-interned fresh");
 }
 
+#[test]
+fn colliding_values_and_types_keep_their_own_live_interned_handles() {
+    let mut heap = NativeHeap::new();
+    let first = heap.intern(7_u64, |_| 0_u8);
+    let second = heap.intern(11_u64, |_| 0_u8);
+    let other_type = heap.intern("seven".to_owned(), |_| 0_u8);
+    assert_ne!(first, second);
+    for _ in 0..3 {
+        assert_eq!(heap.intern(7_u64, |_| 0_u8), first);
+        assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
+        assert_eq!(heap.intern("seven".to_owned(), |_| 0_u8), other_type);
+    }
+    assert_eq!(heap.live(), 3);
+    heap.free(first).unwrap();
+    assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
+    assert_eq!(heap.intern("seven".to_owned(), |_| 0_u8), other_type);
+    let replacement = heap.intern(7_u64, |_| 0_u8);
+    assert_ne!(replacement, first);
+    assert_eq!(heap.get(first), Err(HeapError::StaleHandle));
+    assert_eq!(heap.intern(7_u64, |_| 0_u8), replacement);
+    assert_eq!(heap.live(), 3);
+}
+
+#[test]
+fn retyped_free_is_failure_atomic_for_allocations_and_interned_values() {
+    let mut heap = NativeHeap::new();
+    for handle in [heap.alloc(19_u64), heap.intern(23_u64, |_| 0_u8)] {
+        let value = *heap.get(handle).unwrap();
+        let live = heap.live();
+        assert_eq!(
+            heap.free(handle.retype::<String>()),
+            Err(HeapError::TypeMismatch)
+        );
+        assert_eq!(heap.get(handle), Ok(&value));
+        assert_eq!(heap.live(), live);
+    }
+    let canonical = heap.intern(23_u64, |_| 0_u8);
+    assert_eq!(heap.live(), 2);
+    assert_eq!(heap.get(canonical), Ok(&23));
+}
+
+#[test]
+fn mutable_access_detaches_only_the_validated_interned_allocation() {
+    let mut heap = NativeHeap::new();
+    let first = heap.intern(7_u64, |_| 0_u8);
+    let second = heap.intern(11_u64, |_| 0_u8);
+    assert_eq!(
+        heap.get_mut(first.retype::<String>()),
+        Err(HeapError::TypeMismatch)
+    );
+    assert_eq!(
+        heap.intern(7_u64, |_| 0_u8),
+        first,
+        "refusal must not detach"
+    );
+    *heap.get_mut(first).unwrap() = 11;
+    assert_eq!(
+        heap.intern(11_u64, |_| 0_u8),
+        second,
+        "mutation must not replace the canonical peer"
+    );
+    let fresh = heap.intern(7_u64, |_| 0_u8);
+    assert_ne!(fresh, first);
+    assert_eq!(heap.get(first), Ok(&11));
+    heap.free(first).unwrap();
+    assert_eq!(heap.intern(7_u64, |_| 0_u8), fresh);
+    assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
+}
+
 // ---------------------------------------------------------------------------
 // Close reclaims
 // ---------------------------------------------------------------------------
