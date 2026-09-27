@@ -516,3 +516,282 @@ fn deeply_nested_majors_use_heap_continuations_on_a_small_stack() {
         .join()
         .unwrap();
 }
+
+fn mutual_transaction() -> ElabTxn {
+    use fln_elab::inductive::{ConstructorSpec, InductiveSpec, mutual_inductive_declaration};
+    use fln_elab::lctx::LocalDecl;
+    use fln_elab::records::RecordBudget;
+    let field = |text: &str, family: &str| LocalDecl {
+        id: FVarId(name(text)),
+        user_name: name(text),
+        type_: constant(family),
+        value: None,
+        binder_info: BinderInfo::Default,
+        index: 0,
+    };
+    let constructor = |text: &str, fields: Vec<LocalDecl>| ConstructorSpec {
+        name: name(text),
+        fields,
+        result_indices: vec![],
+    };
+    let family = |text: &str, constructors: Vec<ConstructorSpec>| InductiveSpec {
+        name: name(text),
+        level_params: vec![],
+        parameters: vec![],
+        indices: vec![],
+        constructors,
+        result_level: Level::one(),
+    };
+    let declaration = mutual_inductive_declaration(
+        &[
+            family(
+                "Even",
+                vec![
+                    constructor("zero", vec![]),
+                    constructor("succ", vec![field("odd_child", "Odd")]),
+                ],
+            ),
+            family(
+                "Odd",
+                vec![constructor("succ", vec![field("even_child", "Even")])],
+            ),
+        ],
+        RecordBudget::default(),
+    )
+    .unwrap();
+    let mut tx = transaction();
+    let Outcome::Complete(admitted) = admit(&tx.env, declaration, budget().kernel) else {
+        panic!("mutual candidate did not complete admission");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("mutual candidate failed K1 reconstruction");
+    };
+    let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) else {
+        panic!("mutual candidate did not publish");
+    };
+    tx.env = publication.environment;
+    tx
+}
+
+fn mutual_rec(family: &str, major: Expr, zero: Expr, function_result: bool) -> Expr {
+    let result = if function_result {
+        Expr::forall_e(
+            Name::anonymous(),
+            constant("Bool"),
+            constant("Bool"),
+            BinderInfo::Default,
+        )
+    } else {
+        constant("Bool")
+    };
+    let odd_result = if function_result {
+        lam(constant("Bool"), constant("Bool.false"))
+    } else {
+        constant("Bool.true")
+    };
+    apply(
+        Expr::const_(name(&format!("{family}.rec")), vec![Level::one()]),
+        [
+            lam(constant("Even"), result.clone()),
+            lam(constant("Odd"), result.clone()),
+            zero,
+            lam(constant("Odd"), lam(result.clone(), bvar(0))),
+            lam(constant("Even"), lam(result, odd_result)),
+            major,
+        ],
+    )
+}
+
+fn kernel_bool_conversion(tx: &ElabTxn, left: &Expr, right: &Expr) {
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+    use fln_kernel::{Declaration, verdict::Verdict};
+    let type_ = apply(
+        Expr::const_(name("Eq"), vec![Level::one()]),
+        [constant("Bool"), left.clone(), right.clone()],
+    );
+    let value = apply(
+        Expr::const_(name("Eq.refl"), vec![Level::one()]),
+        [constant("Bool"), right.clone()],
+    );
+    let candidate = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name("mutual_conversion_guard"),
+            level_params: vec![],
+            type_,
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![name("mutual_conversion_guard")],
+    });
+    let outcome = fln_kernel::check(&tx.env, &candidate, budget().kernel);
+    assert!(
+        matches!(outcome, Outcome::Complete(Verdict::Accepted { .. })),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn mutual_iota_uses_the_selected_family_and_all_ordered_motives_and_minors() {
+    let mut tx = mutual_transaction();
+    let zero = constant("Even.zero");
+    let odd = Expr::app(constant("Odd.succ"), zero.clone());
+    let even = Expr::app(constant("Even.succ"), odd.clone());
+    for (family, major, expected) in [
+        ("Even", zero, "Bool.false"),
+        ("Odd", odd, "Bool.true"),
+        ("Even", even, "Bool.true"),
+    ] {
+        let term = mutual_rec(family, major, constant("Bool.false"), false);
+        let expected = constant(expected);
+        kernel_bool_conversion(&tx, &term, &expected);
+        tx.unify(&term, &expected, budget())
+            .expect("ordinary mutual iota must agree with K1");
+    }
+}
+
+#[test]
+fn mutual_iota_preserves_applications_after_a_function_valued_major() {
+    let mut tx = mutual_transaction();
+    let major = Expr::app(
+        constant("Even.succ"),
+        Expr::app(constant("Odd.succ"), constant("Even.zero")),
+    );
+    let fold = mutual_rec("Even", major, lam(constant("Bool"), bvar(0)), true);
+    let applied = Expr::app(fold, constant("Bool.true"));
+    kernel_bool_conversion(&tx, &applied, &constant("Bool.false"));
+    tx.unify(&applied, &constant("Bool.false"), budget())
+        .expect("mutual iota keeps the result's argument");
+}
+
+#[test]
+fn mutual_iota_exposes_result_holes_to_checked_assignment() {
+    let mut tx = mutual_transaction();
+    let id = goal(&mut tx, "mutual_result", constant("Bool"));
+    let term = mutual_rec("Even", constant("Even.zero"), Expr::mvar(id.clone()), false);
+    let report = tx
+        .unify(&term, &constant("Bool.true"), budget())
+        .expect("iota exposes the actual result hole");
+    assert_eq!(
+        tx.mvars.get_assigned_expr(&id),
+        Some(&constant("Bool.true"))
+    );
+    assert_eq!(report.kernel_checks, 1);
+}
+
+#[test]
+fn mutual_recursor_from_another_family_cannot_reduce_a_sibling_constructor() {
+    let mut tx = mutual_transaction();
+    let term = mutual_rec("Odd", constant("Even.zero"), constant("Bool.false"), false);
+    let before = tx.clone();
+    assert!(matches!(
+        tx.unify(&term, &constant("Bool.false"), budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&tx, &before);
+}
+
+#[test]
+fn mutual_iota_retries_when_a_later_equation_assigns_the_major() {
+    let mut tx = mutual_transaction();
+    let id = goal(&mut tx, "mutual_major", constant("Even"));
+    let term = mutual_rec(
+        "Even",
+        Expr::mvar(id.clone()),
+        constant("Bool.false"),
+        false,
+    );
+    let report = tx
+        .unify_many_with(
+            &[
+                (term, constant("Bool.false")),
+                (Expr::mvar(id.clone()), constant("Even.zero")),
+            ],
+            budget(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.expression_assignments, vec![id.clone()]);
+    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(
+        tx.mvars.get_assigned_expr(&id),
+        Some(&constant("Even.zero"))
+    );
+}
+
+#[test]
+fn mutual_iota_failure_and_resource_stops_never_publish_selected_assignments() {
+    let mut initial = mutual_transaction();
+    let id = goal(&mut initial, "selected_minor", constant("Bool"));
+    let term = mutual_rec("Even", constant("Even.zero"), Expr::mvar(id.clone()), false);
+    let equations = [(term, constant("Bool.true"))];
+    let control = initial
+        .clone()
+        .unify_many_with(&equations, budget(), &|| false)
+        .unwrap();
+    assert_eq!(control.expression_assignments, vec![id]);
+    for bounded in [
+        {
+            let mut b = budget();
+            b.max_steps = 1;
+            b
+        },
+        {
+            let mut b = budget();
+            b.max_visited_nodes = 1;
+            b
+        },
+        {
+            let mut b = budget();
+            b.max_assignments = 0;
+            b
+        },
+    ] {
+        let mut tx = initial.clone();
+        assert!(matches!(
+            tx.unify_many_with(&equations, bounded, &|| false),
+            Err(UnificationError::StepLimit { .. }
+                | UnificationError::NodeLimit { .. }
+                | UnificationError::AssignmentLimit { .. })
+        ));
+        unchanged(&tx, &initial);
+    }
+    let mut failed = initial.clone();
+    let mut batch = equations.to_vec();
+    batch.push((
+        mutual_rec("Odd", constant("Even.zero"), constant("Bool.false"), false),
+        constant("Bool.false"),
+    ));
+    assert!(matches!(
+        failed.unify_many_with(&batch, budget(), &|| false),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&failed, &initial);
+
+    // Cancel at the successful path's publication barrier, after the selected
+    // assignment has been built and checked. Spent work survives; state does not.
+    let polls = std::cell::Cell::new(0usize);
+    initial
+        .clone()
+        .unify_many_with(&equations, budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
+    let total = polls.get();
+    polls.set(0);
+    let mut cancelled = initial.clone();
+    assert!(matches!(
+        cancelled.unify_many_with(&equations, budget(), &|| {
+            polls.set(polls.get() + 1);
+            polls.get() == total
+        }),
+        Err(UnificationError::Cancelled)
+    ));
+    unchanged(&cancelled, &initial);
+    assert!(cancelled.budget.heartbeats_consumed > initial.budget.heartbeats_consumed);
+}

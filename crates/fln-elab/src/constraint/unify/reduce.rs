@@ -1,8 +1,8 @@
 //! Metered beta/delta/zeta/iota reduction for native unification.
 //!
 //! Eliminator majors use heap continuations rather than recursive calls. Only
-//! registered, safe single-family recursors and initialized quotient primitives
-//! reduce. A blocked major is rebuilt once; it is never re-entered in a loop.
+//! registered, safe single/mutual-family recursors and initialized quotient
+//! primitives reduce. A blocked major is rebuilt once; it is never re-entered in a loop.
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
 mod k;
@@ -138,8 +138,8 @@ impl Engine<'_> {
                             // Iota is independent of delta transparency. Do not
                             // guess the layout of unsupported recursor families.
                             if recursor.is_unsafe
-                                || recursor.num_motives != 1
-                                || recursor.all.len() != 1
+                                || recursor.all.is_empty()
+                                || count(recursor.num_motives)? != recursor.all.len()
                                 || recursor.base.level_params.len() != levels.len()
                             {
                                 break;
@@ -154,6 +154,9 @@ impl Engine<'_> {
                                 self.meter.node()?;
                             }
                             for _ in &recursor.base.level_params {
+                                self.meter.node()?;
+                            }
+                            for _ in &recursor.all {
                                 self.meter.node()?;
                             }
                             let recursor = Box::new(recursor.clone());
@@ -289,7 +292,13 @@ impl Engine<'_> {
         else {
             return Ok(None);
         };
-        let family_name = &recursor.all[0];
+        let Some(ConstantInfo::Ctor(ctor)) = self.work.env.find(constructor_name) else {
+            return Ok(None);
+        };
+        // `all` names the entire mutual block, not the owner of this recursor.
+        // A rule may fire only for a constructor of its own selected family;
+        // neither its position in `all` nor a spelling such as `T.rec` is authority.
+        let family_name = &ctor.induct;
         let Some(ConstantInfo::Induct(family)) = self.work.env.find(family_name) else {
             return Ok(None);
         };
@@ -298,20 +307,46 @@ impl Engine<'_> {
             || family.num_nested != 0
             || family.num_params != recursor.num_params
             || family.all != recursor.all
-            || count(recursor.num_minors)? != family.ctors.len()
             || recursor.rules.len() != family.ctors.len()
         {
             return Ok(None);
         }
-        for _ in &family.ctors {
+        for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
             self.meter.node()?;
+            if &rule.ctor != constructor {
+                return Ok(None);
+            }
         }
         for _ in &family.base.level_params {
             self.meter.node()?;
         }
-        let Some(ConstantInfo::Ctor(ctor)) = self.work.env.find(constructor_name) else {
+        let mut members = HashSet::new();
+        let mut minors = 0usize;
+        for member in &recursor.all {
+            self.meter.node()?;
+            let Some(ConstantInfo::Induct(info)) = self.work.env.find(member) else {
+                return Ok(None);
+            };
+            if !members.insert(member)
+                || &info.base.name != member
+                || info.is_unsafe
+                || info.num_nested != 0
+                || info.all != recursor.all
+                || info.num_params != recursor.num_params
+                || info.base.level_params != family.base.level_params
+            {
+                return Ok(None);
+            }
+            minors = minors
+                .checked_add(info.ctors.len())
+                .ok_or(UnificationError::ExpressionScope)?;
+        }
+        if !members.contains(family_name)
+            || count(recursor.num_motives)? != members.len()
+            || count(recursor.num_minors)? != minors
+        {
             return Ok(None);
-        };
+        }
         let params = count(ctor.num_params)?;
         let fields = count(ctor.num_fields)?;
         if ctor.is_unsafe
