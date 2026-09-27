@@ -16,6 +16,7 @@ use super::*;
 use std::collections::HashMap;
 
 mod outputs;
+mod universes;
 
 const MAX_ENTRIES: usize = MAX_CANDIDATE_ATTEMPTS;
 const MAX_KEY_UNITS: usize = 65_536;
@@ -85,7 +86,10 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
                 shape = sf;
                 expected = ef;
             }
-            _ => return Ok(target == shape && target == expected && !target.has_expr_mvar()),
+            _ => {
+                return Ok(!target.has_expr_mvar()
+                    && universes::compatible_heads(context, expected, target, shape)?);
+            }
         }
     }
 }

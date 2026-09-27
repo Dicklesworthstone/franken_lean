@@ -72,7 +72,11 @@ fn pattern(
                 expected = ef;
                 shape = sf;
             }
-            _ if expected == shape && !expected.has_expr_mvar() => break,
+            _ if !expected.has_expr_mvar()
+                && super::universes::compatible_heads(context, expected, expected, shape)? =>
+            {
+                break;
+            }
             _ => return Ok(None),
         }
     }
