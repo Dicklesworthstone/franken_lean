@@ -40,6 +40,8 @@ pub mod format;
 pub mod ilean;
 pub mod rebuild;
 pub mod region;
+mod source_extension_format;
+pub mod source_extensions;
 pub mod write;
 
 pub use extension_write::{ModuleExtensionInput, encode_module_with_extensions};
