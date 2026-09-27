@@ -4,6 +4,8 @@
 //! src/Lean/Meta/Instances.lean: sha256 48c564b1af0cd39232f8e8f151800009d05e79c7786fef9739da2011233f4517
 //! src/Lean/ScopedEnvExtension.lean: sha256 dfe287a844583ccf6b13b16dbe3e9160d2cd29f0efd5193c76ba3944e1826346
 //! src/Lean/Attributes.lean: sha256 8219a775586b85586ac84665045f0bcbc6cc78c2fd184d2f8c8b78d5bdd8d643
+//! src/Lean/Meta/Tactic/Simp/SimpTheorems.lean: sha256 78b3a7f971d3bd2aeca9c60a7850ec3449b9e48f9730000569fa43fa0274957d
+//! src/Lean/Meta/Tactic/Simp/Attr.lean: sha256 ce45e8a48edbab67408b197257e616091ab55c410254e3d303fe813f7fd42242
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -27,11 +29,35 @@ pub const DEFAULT_PRIORITY: usize = 2;
 pub const DEFAULT_POINTERS: usize = 3;
 pub const DEFAULT_SCALAR_BYTES: usize = 0;
 
+pub const SIMP_THM_KEYS: usize = 0;
+pub const SIMP_THM_LEVEL_PARAMS: usize = 1;
+pub const SIMP_THM_PROOF: usize = 2;
+pub const SIMP_THM_PRIORITY: usize = 3;
+pub const SIMP_THM_POST_SCALAR: usize = 0;
+pub const SIMP_THM_PERM_SCALAR: usize = 1;
+pub const SIMP_THM_ORIGIN: usize = 4;
+pub const SIMP_THM_RFL_SCALAR: usize = 2;
+pub const SIMP_THM_BACKWARD_RFL_SCALAR: usize = 3;
+pub const SIMP_THM_POINTERS: usize = 5;
+pub const SIMP_THM_SCALAR_BYTES: usize = 4;
+
 pub const SCOPE_GLOBAL: u8 = 0;
 pub const SCOPE_SCOPED: u8 = 1;
 pub const ATTRIBUTE_GLOBAL: u8 = 0;
 pub const ATTRIBUTE_LOCAL: u8 = 1;
 pub const ATTRIBUTE_SCOPED: u8 = 2;
+pub const SIMP_ENTRY_THM: u8 = 0;
+pub const SIMP_ENTRY_TO_UNFOLD: u8 = 1;
+pub const SIMP_ENTRY_TO_UNFOLD_THMS: u8 = 2;
+pub const SIMP_ORIGIN_DECL: u8 = 0;
+pub const SIMP_ORIGIN_FVAR: u8 = 1;
+pub const SIMP_ORIGIN_STX: u8 = 2;
+pub const SIMP_ORIGIN_OTHER: u8 = 3;
+pub const SIMP_ORIGIN_DECL_NAME: usize = 0;
+pub const SIMP_ORIGIN_DECL_POINTERS: usize = 1;
+pub const SIMP_ORIGIN_DECL_POST_SCALAR: usize = 0;
+pub const SIMP_ORIGIN_DECL_INV_SCALAR: usize = 1;
+pub const SIMP_EXTENSION: &str = "Lean.Meta.simpExtension";
 pub const CLASS_EXTENSION: &str = "Lean.classExtension";
 pub const INSTANCE_EXTENSION: &str = "Lean.Meta.instanceExtension";
 pub const DEFAULT_EXTENSION: &str = "Lean.Meta.defaultInstanceExtension";

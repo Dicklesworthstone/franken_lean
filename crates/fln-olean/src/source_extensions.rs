@@ -1,4 +1,4 @@
-//! Data-only decoding of the pinned class, instance and default-instance journals.
+//! Data-only decoding of pinned class, instance, default-instance and simp journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -14,7 +14,9 @@ use fln_rt::obj::Obj;
 use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
-pub use format::{CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION};
+pub use format::{CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, SIMP_EXTENSION};
+mod simp;
+pub use simp::{SimpEntry, SimpKind, SimpTheorem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassEntry {
@@ -48,6 +50,7 @@ pub struct SourceExtensions {
     pub classes: Vec<ClassEntry>,
     pub instances: Vec<InstanceEntry>,
     pub defaults: Vec<DefaultEntry>,
+    pub simps: Vec<SimpEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -251,6 +254,7 @@ pub fn decode(
         name(format::CLASS_EXTENSION),
         name(format::INSTANCE_EXTENSION),
         name(format::DEFAULT_EXTENSION),
+        name(format::SIMP_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -287,7 +291,8 @@ pub fn decode(
                 0 => out.classes.push(reader.class(&obj)?),
                 1 => out.instances.push(reader.instance(&obj)?),
                 2 => out.defaults.push(reader.default_instance(&obj)?),
-                _ => unreachable!("three selected extension families"),
+                3 => out.simps.push(reader.simp(&obj)?),
+                _ => unreachable!("four selected extension families"),
             }
         }
     }
