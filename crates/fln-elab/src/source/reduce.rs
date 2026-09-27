@@ -134,8 +134,8 @@ impl Context {
                         Some(ConstantInfo::Rec(recursor)) => {
                             let major = recursor_major(&recursor)?;
                             if recursor.is_unsafe
-                                || recursor.num_motives != 1
-                                || recursor.all.len() != 1
+                                || recursor.all.is_empty()
+                                || recursor.num_motives as usize != recursor.all.len()
                                 || levels.len() != recursor.base.level_params.len()
                                 || major >= arguments.len()
                             {
@@ -244,7 +244,12 @@ impl Context {
         recursor: &RecursorVal,
         arguments: &[Expr],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        if !recursor.k || recursor.rules.len() != 1 || recursor.num_minors != 1 {
+        if !recursor.k
+            || recursor.all.len() != 1
+            || recursor.num_motives != 1
+            || recursor.rules.len() != 1
+            || recursor.num_minors != 1
+        {
             return Ok(None);
         }
         let ExprNode::Const { levels, .. } = head.node() else {
@@ -330,7 +335,7 @@ impl Context {
         Ok(head)
     }
 
-    /// Ordinary constructor reduction for the supported single-family lane.
+    /// Ordinary constructor reduction for unnested single or mutual families.
     /// Unknown majors use the separate, sufficient K gate or remain stuck.
     fn source_iota(
         &mut self,
@@ -343,8 +348,19 @@ impl Context {
         let ExprNode::Const { levels, .. } = rec_head.node() else {
             return Ok(None);
         };
-        let family_name = &recursor.all[0];
-        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(family_name).cloned() else {
+        // The owner is selected by the major's constructor and the recursor's
+        // ordered rules. `all[0]` is only the first member of a mutual block.
+        let family_name = match major_head.node() {
+            ExprNode::Const { name, .. } => match self.txn.env.find(name) {
+                Some(ConstantInfo::Ctor(ctor)) => ctor.induct.clone(),
+                _ => return Ok(None),
+            },
+            ExprNode::Lit {
+                literal: Literal::Nat(_),
+            } if recursor.all == [Name::from_components(["Nat"])] => recursor.all[0].clone(),
+            _ => return Ok(None),
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&family_name).cloned() else {
             return Ok(None);
         };
         if family.is_unsafe
@@ -352,8 +368,40 @@ impl Context {
             || family.num_nested != 0
             || family.num_params != recursor.num_params
             || family.all != recursor.all
-            || recursor.num_minors as usize != family.ctors.len()
             || recursor.rules.len() != family.ctors.len()
+        {
+            return Ok(None);
+        }
+        for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
+            self.tick()?;
+            if &rule.ctor != constructor {
+                return Ok(None);
+            }
+        }
+        let mut members = std::collections::HashSet::new();
+        let mut minors = 0usize;
+        for member in &recursor.all {
+            self.tick()?;
+            let Some(ConstantInfo::Induct(info)) = self.txn.env.find(member) else {
+                return Ok(None);
+            };
+            if !members.insert(member)
+                || &info.base.name != member
+                || info.is_unsafe
+                || info.num_nested != 0
+                || info.all != recursor.all
+                || info.num_params != recursor.num_params
+                || info.base.level_params != family.base.level_params
+            {
+                return Ok(None);
+            }
+            minors = minors
+                .checked_add(info.ctors.len())
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        }
+        if !members.contains(&family_name)
+            || recursor.num_motives as usize != members.len()
+            || recursor.num_minors as usize != minors
         {
             return Ok(None);
         }
@@ -363,9 +411,10 @@ impl Context {
                     return Ok(None);
                 };
                 if ctor.is_unsafe
-                    || &ctor.induct != family_name
+                    || ctor.induct != family_name
                     || ctor.num_params != family.num_params
                     || !family.ctors.contains(name)
+                    || ctor.base.level_params != family.base.level_params
                     || ctor.base.level_params.len() != levels.len()
                     || Some(major_arguments.len())
                         != (ctor.num_params as usize).checked_add(ctor.num_fields as usize)
@@ -383,7 +432,7 @@ impl Context {
             ExprNode::Lit {
                 literal: Literal::Nat(value),
             } if major_arguments.is_empty()
-                && family_name == &Name::from_components(["Nat"])
+                && family_name == Name::from_components(["Nat"])
                 && family.num_params == 0
                 && family.base.level_params.is_empty() =>
             {
@@ -416,7 +465,7 @@ impl Context {
             return Ok(None);
         };
         if ctor.is_unsafe
-            || &ctor.induct != family_name
+            || ctor.induct != family_name
             || ctor.num_fields as usize != fields.len()
             || ctor.num_params != family.num_params
         {
@@ -583,6 +632,127 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    fn conversion_environment() -> Environment {
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let mut env = environment();
+        for source in [
+            "def Identity (A : Type) : Type := A",
+            "def Forget (A : Type) : Type := Nat",
+            "def Grow (A : Type) : Type := Nat -> A",
+        ] {
+            let checked = crate::check_definition_source(source.as_bytes(), &env, budget).unwrap();
+            let Outcome::Complete(admitted) = admit(&env, checked.declaration, budget) else {
+                panic!("alias admission nonanswer");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("alias admission refused");
+            };
+            let Outcome::Complete(Published::Committed(
+                fln_env::environment::DeclarationCommitted::Published(publication),
+            )) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+            else {
+                panic!("alias publication refused");
+            };
+            env = publication.environment;
+        }
+        env
+    }
+
+    fn alias(name: &str, argument: Expr) -> Expr {
+        Expr::app(
+            Expr::const_(Name::from_components([name]), vec![]),
+            argument,
+        )
+    }
+
+    #[test]
+    fn source_typing_can_reduce_apparent_occurs_cycles_without_assigning_reflexive_holes() {
+        let env = conversion_environment();
+        for reversed in [false, true] {
+            let mut ctx = Context::new(&env, Budget::DEFAULT);
+            let hole = ctx.hole(Expr::sort(Level::one())).unwrap();
+            let rhs = alias("Identity", hole.clone());
+            let pair = if reversed {
+                (rhs, hole.clone())
+            } else {
+                (hole.clone(), rhs)
+            };
+            ctx.unify_source_batch(&[pair], true).unwrap();
+            assert!(ctx.txn.mvars.assignments().is_empty());
+            assert_eq!(ctx.instantiate(&hole).unwrap(), hole);
+
+            // Erasing the recursive occurrence must instead infer Nat, and the
+            // ordinary assignment barrier must validate that concrete type.
+            let rhs = alias("Forget", alias("Identity", hole.clone()));
+            ctx.unify_source_batch(&[(hole.clone(), rhs)], true)
+                .unwrap();
+            assert_eq!(ctx.instantiate(&hole).unwrap(), nat_const());
+            assert_eq!(ctx.txn.env, env);
+        }
+    }
+
+    #[test]
+    fn a_true_occurs_cycle_still_refuses_the_whole_source_typing_batch() {
+        let env = conversion_environment();
+        let mut ctx = Context::new(&env, Budget::DEFAULT);
+        let first = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let cyclic = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let before = ctx.txn.clone();
+        let error = ctx
+            .unify_source_batch(
+                &[
+                    (first, nat_const()),
+                    (cyclic.clone(), alias("Grow", alias("Identity", cyclic))),
+                ],
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })
+        ));
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+        assert!(ctx.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+    }
+
+    #[test]
+    fn source_occurs_retry_never_widens_selection_or_turns_exhaustion_into_success() {
+        let env = conversion_environment();
+        let mut selection = Context::new(&env, Budget::DEFAULT);
+        let hole = selection.hole(Expr::sort(Level::one())).unwrap();
+        selection.equations.push(SourceEquation::selection(
+            hole.clone(),
+            alias("Identity", hole),
+        ));
+        let before = selection.txn.clone();
+        assert!(matches!(
+            selection.flush(true),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::Unification(_)
+            ))
+        ));
+        assert_eq!(selection.txn.mvars, before.mvars);
+        assert_eq!(selection.equations.len(), 1);
+
+        let mut limited = Context::new(&env, Budget::DEFAULT);
+        let hole = limited.hole(Expr::sort(Level::one())).unwrap();
+        let before = limited.txn.mvars.clone();
+        limited.txn.budget.max_heartbeats = limited.txn.budget.heartbeats_consumed;
+        assert!(matches!(
+            limited.unify_source_batch(&[(hole.clone(), alias("Forget", hole))], true),
+            Err(UnificationError::HeartbeatLimit)
+        ));
+        assert_eq!(limited.txn.mvars, before);
+        assert_eq!(limited.txn.env, env);
     }
 }
 

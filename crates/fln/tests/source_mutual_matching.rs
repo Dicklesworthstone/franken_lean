@@ -145,6 +145,71 @@ fn dependent_targets_rebind_the_selected_major_without_capturing_a_sibling() {
 }
 
 #[test]
+fn mutual_type_computation_exposes_function_binders_during_source_inference() {
+    check(
+        "def functionType (t : Tree Nat) : Type := match t with | .node n children => Nat -> Nat\n\
+         def callback : functionType (Tree.node 3 (@Forest.nil Nat)) := fun x => x\n\
+         def run (f : functionType (Tree.node 3 (@Forest.nil Nat))) : Nat := f 12\n\
+         theorem computes : run callback = 12 := by rfl\n\
+         def forestType (xs : Forest Nat) : Type := match xs with | .nil => Nat -> Nat | .cons t rest => Bool -> Bool\n\
+         def other : forestType (Forest.cons (Tree.node 1 (@Forest.nil Nat)) (@Forest.nil Nat)) := fun b => b\n\
+         theorem siblingComputes : other true = true := by rfl",
+    );
+}
+
+#[test]
+fn indexed_polymorphic_mutual_reduction_preserves_function_children_and_universes() {
+    let (engine, limits) = with_families(&[
+        "inductive T.{u} (A : Type u) : A -> Type u where | node (x : A) (children : Nat -> F A x) : T A x",
+        "inductive F.{u} (A : Type u) : A -> Type u where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x",
+    ]);
+    let source = "def functionType.{u} (A : Type u) (x : A) (t : T A x) : Type u := match t with | .node y children => A -> A\n\
+                  def run.{u} (A : Type u) (x : A) (f : functionType A x (T.node x (fun n => F.nil x))) : A := f x\n\
+                  theorem atNat : run Nat 7 (fun x => x) = 7 := by rfl\n\
+                  theorem atType : run (Type) Nat (fun x => x) = Nat := by rfl";
+    engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
+fn computed_mutual_function_types_do_not_accept_wrong_arguments_or_publish_a_prefix() {
+    let (engine, limits) = with_families(TREE);
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let prefix = "def functionType (xs : Forest Nat) : Type := match xs with | .nil => Nat -> Nat | .cons t rest => Bool -> Bool\n";
+    for body in [
+        "def bad (f : functionType (@Forest.nil Nat)) : Nat := f true",
+        "def bad (f : functionType (Forest.cons (Tree.node 3 (@Forest.nil Nat)) (@Forest.nil Nat))) : Bool := f 3",
+        "theorem bad (f : functionType (@Forest.nil Nat)) : f 0 = f 1 := by rfl",
+    ] {
+        let source = format!("{prefix}{body}");
+        assert!(
+            engine
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &options,
+                    SourceCheckLimits::new(limits)
+                )
+                .is_err(),
+            "{source}"
+        );
+        assert!(
+            !engine
+                .environment()
+                .contains(&fln::Name::from_components(["functionType"]))
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+}
+
+#[test]
 fn middle_family_and_empty_sibling_use_the_correct_minor_positions() {
     let (engine, limits) = with_families(&[
         "inductive A where | a (b : B)",
