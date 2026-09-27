@@ -10,7 +10,9 @@ permissions:
   contents: read
 jobs:
   transfer:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' &&
+      !startsWith(github.event.head_commit.message, 'feat(source): transfer scoped-instance declarations')
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -96,5 +98,110 @@ jobs:
         with:
           name: native-return-transfer-${{ github.sha }}
           path: ${{ runner.temp }}/native-return-transfer
+          retention-days: 2
+          if-no-files-found: error
+
+  scoped-declarations:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' &&
+      startsWith(github.event.head_commit.message, 'feat(source): transfer scoped-instance declarations')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Materialize exact native-tested scoped declaration objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          def request(path, data=None):
+              req = urllib.request.Request(api + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Accept': 'application/vnd.github+json',
+                           'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          manifest = {
+              'crates/fln-cli/tests/source_instance_attributes.rs': ['c5d545b978740b44ceca33b1b4f25b1da940972f', '2b6446f521545a5bb8df38d1d1109835bbb30655'],
+              'crates/fln-elab/src/source/instance_command.rs': ['624b6b9c5862208f68028fe255fabea1c209ebd0', 'cb47f690507c0eeca545f4e8b36517638c855f6a'],
+              'crates/fln-elab/src/source/scope.rs': ['d7cdda9ac2ffec84ccbe1c50e20612175b64de43', '4097821151ac09f5ee80647d0d8b3a89f6b409f3'],
+              'crates/fln-parse/src/command_scope.rs': ['4ffdb7de82fd60afcd6f790258d180d21839845a', '7bf2c168759cdd9f7ed3f51ecadbd04f071f15e4'],
+              'crates/fln-parse/src/lib.rs': ['084d420b653939730a742b2561cfaf6be5cdae5e', '758034eb6b1af332afe20ce8ebbf7d9529fc26f5'],
+              'crates/fln-parse/tests/scoped_instances.rs': [None, '1d7e7a3e8b24f48b9ef3bc3823770b3488b87b63'],
+              'crates/fln/src/source_records.rs': ['c9dc6c27bff043b8df79622e1d174f52ce384d21', 'ef57ef3f9521df33f7567b9372e3e3ddf800be09'],
+              'crates/fln/tests/source_scoped_declarations.rs': [None, '69aba1013551dfdc5485326eab2e12f911682bc1'],
+              'examples/native_scoped_declarations.lean': [None, '8bf73653f68459d36155ddb12b53f39dac3cd4b6'],
+          }
+          chunks = [
+              '9f9bb9d65958e674bbf1a140714c1d01a2c40a89',
+              'b522529dd67e7ae1bfea354c21b5c66aaaa8962a',
+              'c565d7a34f0c7904ed7b056415f6fbc01948ecc9',
+              '40c312bd722c3f780b615ef66a4ce7e6b40c637a',
+              '2a159ca58f3620e3474baef2805c786dc8fcdc0a',
+              '926765e9365f90ddf656ab02ba0d8a54b655e0e0',
+              'd529c1618ed79af13e60fd2b09a2212e1b183e70',
+              'a4dcdae7109f9eb84d496f351cff202244f6fe5d',
+              'dde5dcc54772b227a2a0cd02527996e17b9a9c7a',
+              '9b121d5fa4c5320539fa2f8261c789fa3ae69fa3',
+              '13b2f43437991ff2a27b38b8f9d2be6c741c5c94',
+              '25255f80b5b2b51cbe3980defdce8df8a607c52e',
+              'a95cf7ca3c53f5b14c74ef4c119f5d79139173d4',
+              '6c63db1be2cff0b21b9e999175fc7083c75e5e10',
+              'b60efdd60e209fb31ee7e70854b7d6c63e7564ed',
+          ]
+          packed = bytearray()
+          for sha in chunks:
+              response = request('/git/blobs/' + sha)
+              assert response['encoding'] == 'base64'
+              data = base64.b64decode(response['content'], validate=False)
+              assert blob(data) == sha
+              packed.extend(data)
+          assert len(packed) == 7607 and blob(packed) == 'f34d907f3567763726f986dba1da046ccca27287'
+          patch = gzip.decompress(packed)
+          assert len(patch) == 31930
+          assert hashlib.sha256(patch).hexdigest() == 'e8a3791fe4bbee02f89b6b8a348655e367a7ba8366b386c814aee4f7b931908e'
+          text = patch.decode()
+          paths = [line.split(' b/', 1)[1] for line in text.splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in text
+          for path, (before, _) in manifest.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink()
+              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-scoped-transfer'
+          root.mkdir()
+          patch_file = root / 'implementation.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(patch_file)], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error', str(patch_file)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, (_, after) in manifest.items():
+              data = pathlib.Path(path).read_bytes()
+              assert blob(data) == after, path
+              uploaded = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert uploaded['sha'] == after, path
+          receipt = {
+              'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'blobs': {path: after for path, (_, after) in manifest.items()},
+              'patch_sha256': hashlib.sha256(patch).hexdigest(),
+              'published_branch': False,
+              'validation': 'Transfers previously native-tested bytes; no Rust tests run in this job.',
+          }
+          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-scoped-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/native-scoped-transfer
           retention-days: 2
           if-no-files-found: error
