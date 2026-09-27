@@ -116,6 +116,7 @@ impl Context {
     pub(super) fn prepare_instance_target(
         &mut self,
         target: &Expr,
+        registry: &InstanceRegistry,
     ) -> Result<Option<PreparedTarget>, NatDefinitionElabError> {
         let mut head = target.clone();
         let mut arguments = Vec::new();
@@ -140,15 +141,33 @@ impl Context {
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
         let base = info.constant_val();
-        let modes = self.instance_parameter_modes(&base.type_)?;
+        let mut modes = self.instance_parameter_modes(&base.type_)?;
+        let imported = registry.imported_class_parameters(name);
+        if let Some(parameters) = imported {
+            for (index, mode) in modes.iter_mut().enumerate() {
+                self.tick()?;
+                if parameters.out_params.contains(&(index as u32)) {
+                    *mode = ParameterMode::Output;
+                } else if *mode == ParameterMode::Output {
+                    *mode = ParameterMode::Input;
+                }
+            }
+        }
         if arguments.len() != modes.len() {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         }
         // Output-only universes must not filter candidate selection, even when
         // the caller already knows them. Reconcile with the original target
         // only after selecting the first successful candidate.
-        let (levels, key_levels) =
-            self.instance_search_levels(&base.type_, &modes, &base.level_params, levels)?;
+        let (levels, key_levels) = if let Some(parameters) = imported {
+            self.instance_explicit_output_levels(
+                &base.level_params,
+                levels,
+                &parameters.out_level_params,
+            )?
+        } else {
+            self.instance_search_levels(&base.type_, &modes, &base.level_params, levels)?
+        };
         let mut telescope = self.instantiate_params(&base.type_, &base.level_params, &levels)?;
         let mut prepared = Expr::const_(name.clone(), levels);
         let mut key = Expr::const_(name.clone(), key_levels);

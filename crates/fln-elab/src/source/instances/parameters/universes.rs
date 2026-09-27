@@ -6,6 +6,37 @@ use fln_core::level::LevelView;
 use std::collections::HashSet;
 
 impl Context {
+    /// Honor the journal's explicit universe policy, including overrides made
+    /// by `univ_out_params` and classes without term parameters. The original
+    /// target remains mandatory during final result reconciliation.
+    pub(super) fn instance_explicit_output_levels(
+        &mut self,
+        params: &[Name],
+        levels: &[Level],
+        outputs: &[u32],
+    ) -> Result<(Vec<Level>, Vec<Level>), NatDefinitionElabError> {
+        self.tick()?;
+        if params.len() != levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let mut prepared = Vec::with_capacity(levels.len());
+        let mut keys = Vec::with_capacity(levels.len());
+        for (index, level) in levels.iter().enumerate() {
+            self.tick()?;
+            if outputs.contains(&(index as u32)) {
+                prepared.push(self.level()?);
+                keys.push(Level::param(Name::num(
+                    Name::from_components(["_fln_instance_output_universe"]),
+                    index as u64,
+                )));
+            } else {
+                prepared.push(level.clone());
+                keys.push(level.clone());
+            }
+        }
+        Ok((prepared, keys))
+    }
+
     pub(super) fn instance_search_levels(
         &mut self,
         class_type: &Expr,
@@ -276,6 +307,29 @@ mod tests {
             .instance_search_levels(&type_at("u"), &[], &[n("u")], &original)
             .unwrap();
         assert_eq!(prepared, original);
+        assert_eq!(key, original);
+    }
+
+    #[test]
+    fn explicit_imported_universe_outputs_have_stable_keys_and_fresh_equations() {
+        let mut context = context();
+        let params = [n("u"), n("v")];
+        let original = [Level::one(), Level::zero()];
+        let (first, first_key) = context
+            .instance_explicit_output_levels(&params, &original, &[0])
+            .unwrap();
+        let (second, second_key) = context
+            .instance_explicit_output_levels(&params, &original, &[0])
+            .unwrap();
+        assert_ne!(first[0], original[0]);
+        assert_ne!(first[0], second[0]);
+        assert_eq!(first[1], original[1]);
+        assert_eq!(first_key, second_key);
+        assert_eq!(first_key[1], original[1]);
+        let (unchanged, key) = context
+            .instance_explicit_output_levels(&params, &original, &[])
+            .unwrap();
+        assert_eq!(unchanged, original);
         assert_eq!(key, original);
     }
 

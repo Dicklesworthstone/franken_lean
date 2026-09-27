@@ -7,6 +7,7 @@
 
 pub mod coercions;
 pub mod defaults;
+pub mod imported;
 pub mod numeric;
 
 use fln_core::expr::{Expr, ExprNode};
@@ -75,6 +76,7 @@ pub struct InstanceEntry {
 pub struct InstanceRegistry {
     classes: BTreeSet<Name>,
     instances: BTreeMap<Name, Vec<InstanceEntry>>,
+    imported: imported::Metadata,
 }
 
 fn extension_name() -> Name {
@@ -107,6 +109,10 @@ pub fn result_head(expr: &Expr) -> Option<Name> {
 impl InstanceRegistry {
     pub fn read(env: &Environment) -> Result<Self, InstanceRegistryError> {
         let Some(extension) = env.extension(&extension_name()) else {
+            let metadata = imported::read(env)?;
+            if !metadata.classes.is_empty() || !metadata.instances.is_empty() {
+                return Err(InstanceRegistryError::Malformed);
+            }
             return Ok(Self::default());
         };
         if extension.descriptor != descriptor() {
@@ -186,6 +192,18 @@ impl InstanceRegistry {
                     .then_with(|| b.order.cmp(&a.order))
             });
         }
+        out.imported = imported::read(env)?;
+        for name in out.imported.classes.keys() {
+            if !out.classes.contains(name) {
+                return Err(InstanceRegistryError::UnknownClass(name.clone()));
+            }
+        }
+        for name in out.imported.instances.keys() {
+            let class = validate_instance(env, name)?;
+            if !out.classes.contains(&class) {
+                return Err(InstanceRegistryError::UnknownClass(class));
+            }
+        }
         Ok(out)
     }
     pub fn is_class(&self, name: &Name) -> bool {
@@ -194,11 +212,21 @@ impl InstanceRegistry {
     pub fn candidates(&self, class: &Name) -> &[InstanceEntry] {
         self.instances.get(class).map_or(&[], Vec::as_slice)
     }
+    pub fn imported_class_parameters(&self, class: &Name) -> Option<&imported::ClassParameters> {
+        self.imported.classes.get(class)
+    }
+    pub fn imported_instance_parameters(
+        &self,
+        name: &Name,
+    ) -> Option<&imported::InstanceParameters> {
+        self.imported.instances.get(name)
+    }
 }
 
 fn validate_class(env: &Environment, name: &Name) -> Result<(), InstanceRegistryError> {
     match env.find(name) {
-        Some(ConstantInfo::Induct(value)) if !value.is_unsafe && value.num_indices == 0 => Ok(()),
+        Some(ConstantInfo::Induct(value)) if !value.is_unsafe => Ok(()),
+        Some(ConstantInfo::Axiom(value)) if !value.is_unsafe => Ok(()),
         _ => Err(InstanceRegistryError::InvalidClass(name.clone())),
     }
 }

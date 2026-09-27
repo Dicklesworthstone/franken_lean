@@ -326,7 +326,7 @@ impl Context {
                 key: target,
             }
         } else {
-            let Some(prepared) = self.prepare_instance_target(&target)? else {
+            let Some(prepared) = self.prepare_instance_target(&target, registry)? else {
                 return Ok(None);
             };
             prepared
@@ -385,6 +385,7 @@ impl Context {
         candidate: &Candidate,
         target: &Expr,
         default_application: bool,
+        registry: &InstanceRegistry,
     ) -> Result<Option<Expansion>, NatDefinitionElabError> {
         let mut term = match candidate {
             Candidate::Local(id) => {
@@ -401,6 +402,8 @@ impl Context {
             Candidate::Global(name) => self.constant(name)?,
         };
         let mut subgoals = Vec::new();
+        let mut positions = Vec::new();
+        let mut position = 0u32;
         loop {
             self.tick()?;
             term.type_ = self.whnf(&term.type_)?;
@@ -420,12 +423,33 @@ impl Context {
                     unreachable!("fresh instance hole")
                 };
                 subgoals.push(id.clone());
+                positions.push(position);
                 arg
             } else {
                 self.hole(binder_type.clone())?
             };
             term.type_ = self.substitute(&body, &arg)?;
             term.value = Expr::app(term.value, arg);
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        }
+        if let Candidate::Global(name) = candidate
+            && let Some(parameters) = registry.imported_instance_parameters(name)
+        {
+            let mut ordered = Vec::with_capacity(subgoals.len());
+            for index in &parameters.synth_order {
+                self.tick()?;
+                let slot = positions
+                    .iter()
+                    .position(|position| position == index)
+                    .ok_or_else(|| registry_error(InstanceRegistryError::Malformed))?;
+                ordered.push(subgoals[slot].clone());
+            }
+            if ordered.len() != subgoals.len() {
+                return Err(registry_error(InstanceRegistryError::Malformed));
+            }
+            subgoals = ordered;
         }
         self.constrain(&term.type_, target)?;
         // The pin applies an explicitly registered default with ordinary
@@ -687,7 +711,12 @@ impl Context {
             let spent = self.txn.budget.heartbeats_consumed;
             *self = frame.base.clone();
             self.txn.budget.heartbeats_consumed = spent;
-            match self.expand_instance(&candidate, &frame.target, frame.default_application) {
+            match self.expand_instance(
+                &candidate,
+                &frame.target,
+                frame.default_application,
+                registry,
+            ) {
                 Ok(expansion) => frame.chosen = expansion,
                 Err(error) if nonmatch(&error) => {}
                 Err(error) => return Err(error),
