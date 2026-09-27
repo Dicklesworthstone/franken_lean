@@ -200,6 +200,22 @@ impl Probe<'_> {
     fn whnf(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<Option<WireExpr>> {
         let budget = self.budget.whnf;
         let result = whnf_with(term, context.reduction(), budget, &mut || self.poll());
+        self.whnf_result(result)
+    }
+    /// See [`crate::whnf::whnf_comparand_with`].
+    fn whnf_comparand(
+        &mut self,
+        term: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<WireExpr>> {
+        let budget = self.budget.whnf;
+        let result =
+            crate::whnf::whnf_comparand_with(term, context.reduction(), budget, &mut || {
+                self.poll()
+            });
+        self.whnf_result(result)
+    }
+    fn whnf_result(&mut self, result: WhnfOutcome) -> Result<Option<WireExpr>> {
         self.check_stop()?;
         match result {
             WhnfOutcome::Complete(result) => Ok(Some(result.term)),
@@ -1008,10 +1024,10 @@ impl Probe<'_> {
                 work.push(Work::Pair(lt, rt, context));
                 continue;
             }
-            let Some(l) = self.whnf(&left, &context)? else {
+            let Some(l) = self.whnf_comparand(&left, &context)? else {
                 fail!()
             };
-            let Some(r) = self.whnf(&right, &context)? else {
+            let Some(r) = self.whnf_comparand(&right, &context)? else {
                 fail!()
             };
             // A changed head may expose ordinary conversion or proof evidence.

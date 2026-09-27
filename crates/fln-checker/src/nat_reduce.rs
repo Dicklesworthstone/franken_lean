@@ -768,13 +768,29 @@ pub(crate) fn is_potential_nat_reduction(term: &WireExpr, root: ExprId) -> bool 
     parse_application_unmetered(term, root).is_some()
 }
 
-/// Whether the KR-313 reducer must refuse a free-variable pair before trying
-/// operand WHNF. The pin permits the open form only inside the domain
-/// comparison selected by an exact `eagerReduce _ _` argument.
+/// Whether the KR-313 reducer must refuse a free-variable form before trying
+/// operand WHNF. For a compared pair, the pin permits the open form only inside
+/// the domain comparison selected by an exact `eagerReduce _ _` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NatReductionScope {
     ClosedPair,
     EagerOpenPair,
+    /// A binary operation at the head of a term being whnf'd, which is not a
+    /// compared pair. The pin's `whnf` offers every form to `reduce_nat`, and
+    /// `reduce_nat` has no free-variable guard: it whnfs each operand and
+    /// computes when both are literals (`type_checker.cpp` lines 595-603 and
+    /// 628-657 of the vendored source). Here a form is offered when its only
+    /// free variables are let-bound to closed values, since each unfolds to its
+    /// value and the operands can then be literals. That is what `omega`
+    /// certificates compute on: refusing them unfolded `Nat.add` and `Nat.mul`
+    /// into their unary recursion on literal operands, and
+    /// `Char.ofOrdinal._proof_3` ran out of 100,000,000 steps where the pin
+    /// takes 7 ms. A form with a variable that is genuinely free is still
+    /// declined, departing from the pin: offering those too normalized open
+    /// operands inside open operands, each on a smaller share of the budget,
+    /// until `ByteArray.isUTF8FirstByte_of_isSome_utf8DecodeChar?` (294 ms
+    /// before) ran out.
+    WhnfHead,
     /// A recursor is computing its discriminant, not comparing a pair, so
     /// there is no companion to check. The discriminant itself must be closed,
     /// and here the checker departs from the pin. The pin's `whnf` offers every
@@ -832,12 +848,15 @@ fn validate_child(input: NatReductionInput, parent: ExprId, child: ExprId) -> Re
 
 #[derive(Debug, Clone, Copy)]
 struct ClosedWork {
+    /// 0 for the term itself, `k` for the value of the `k`th binding followed.
+    arena: usize,
     id: ExprId,
     depth: u32,
 }
 
 fn push_child(
     stack: &mut Vec<ClosedWork>,
+    arena: usize,
     child: ExprId,
     depth: u32,
     parent: ExprId,
@@ -847,7 +866,11 @@ fn push_child(
     validate_child(input, parent, child)?;
     control.push_work(
         stack,
-        ClosedWork { id: child, depth },
+        ClosedWork {
+            arena,
+            id: child,
+            depth,
+        },
         parent.index(),
         NatReductionAllocation::ClosedWalk,
     )
@@ -859,23 +882,70 @@ fn is_closed(
     root: ExprId,
     control: &mut Control<'_>,
 ) -> Result<bool, Halt> {
+    is_closed_in(term, input, root, None, control)
+}
+
+/// Whether `root` has no free variable and no loose bound variable. With
+/// `bindings`, a free variable let-bound there counts as closed when its value
+/// is: normalizing the form unfolds it to that value. Each binding is followed
+/// once.
+fn is_closed_in<'t>(
+    term: &'t WireExpr,
+    input: NatReductionInput,
+    root: ExprId,
+    bindings: Option<&'t WhnfContext>,
+    control: &mut Control<'_>,
+) -> Result<bool, Halt> {
+    let mut arenas: Vec<&'t WireExpr> = vec![term];
+    let mut followed: Vec<&'t WireName> = Vec::new();
     let mut pending = Vec::new();
     control.push_work(
         &mut pending,
-        ClosedWork { id: root, depth: 0 },
+        ClosedWork {
+            arena: 0,
+            id: root,
+            depth: 0,
+        },
         root.index(),
         NatReductionAllocation::ClosedWalk,
     )?;
     while let Some(current) = pending.pop() {
         control.step(current.id.index())?;
-        let node =
-            term.node(current.id)
-                .ok_or(Halt::Fault(NatReductionFault::MissingExpression {
-                    input,
-                    index: current.id.index(),
-                }))?;
+        let arena_index = current.arena;
+        let node = arenas
+            .get(arena_index)
+            .and_then(|arena| arena.node(current.id))
+            .ok_or(Halt::Fault(NatReductionFault::MissingExpression {
+                input,
+                index: current.id.index(),
+            }))?;
         match node {
-            ExprNode::Free { .. } => return Ok(false),
+            ExprNode::Free { name } => {
+                let Some(binding) = bindings.and_then(|context| {
+                    context
+                        .free_bindings()
+                        .iter()
+                        .rev()
+                        .find(|binding| binding.name() == name)
+                }) else {
+                    return Ok(false);
+                };
+                if !followed.contains(&binding.name()) {
+                    followed.push(binding.name());
+                    let value = binding.value();
+                    arenas.push(value);
+                    control.push_work(
+                        &mut pending,
+                        ClosedWork {
+                            arena: arenas.len() - 1,
+                            id: value.root(),
+                            depth: 0,
+                        },
+                        current.id.index(),
+                        NatReductionAllocation::ClosedWalk,
+                    )?;
+                }
+            }
             ExprNode::Bound { index } => {
                 if *index >= current.depth {
                     return Ok(false);
@@ -896,6 +966,7 @@ fn is_closed(
             ExprNode::Apply { function, argument } => {
                 push_child(
                     &mut pending,
+                    arena_index,
                     *function,
                     current.depth,
                     current.id,
@@ -904,6 +975,7 @@ fn is_closed(
                 )?;
                 push_child(
                     &mut pending,
+                    arena_index,
                     *argument,
                     current.depth,
                     current.id,
@@ -919,6 +991,7 @@ fn is_closed(
             } => {
                 push_child(
                     &mut pending,
+                    arena_index,
                     *binder_type,
                     current.depth,
                     current.id,
@@ -927,6 +1000,7 @@ fn is_closed(
                 )?;
                 push_child(
                     &mut pending,
+                    arena_index,
                     *body,
                     current.depth.saturating_add(1),
                     current.id,
@@ -939,6 +1013,7 @@ fn is_closed(
             } => {
                 push_child(
                     &mut pending,
+                    arena_index,
                     *type_,
                     current.depth,
                     current.id,
@@ -947,6 +1022,7 @@ fn is_closed(
                 )?;
                 push_child(
                     &mut pending,
+                    arena_index,
                     *value,
                     current.depth,
                     current.id,
@@ -955,6 +1031,7 @@ fn is_closed(
                 )?;
                 push_child(
                     &mut pending,
+                    arena_index,
                     *body,
                     current.depth.saturating_add(1),
                     current.id,
@@ -965,6 +1042,7 @@ fn is_closed(
             ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
                 push_child(
                     &mut pending,
+                    arena_index,
                     *expression,
                     current.depth,
                     current.id,
@@ -1382,14 +1460,23 @@ fn reduce_inner(
         }
     };
 
-    if scope != NatReductionScope::EagerOpenPair
-        && !is_closed(
+    let candidate_closed = match scope {
+        NatReductionScope::EagerOpenPair => true,
+        NatReductionScope::WhnfHead => is_closed_in(
+            candidate,
+            NatReductionInput::Candidate,
+            candidate_root,
+            Some(context),
+            &mut control,
+        )?,
+        NatReductionScope::ClosedPair | NatReductionScope::DemandedMajor => is_closed(
             candidate,
             NatReductionInput::Candidate,
             candidate_root,
             &mut control,
-        )?
-    {
+        )?,
+    };
+    if !candidate_closed {
         return Ok(NatReductionOutcome::NotReduced {
             reason: NatNotReduced::OpenPair {
                 input: NatReductionInput::Candidate,

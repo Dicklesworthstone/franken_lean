@@ -2702,6 +2702,128 @@ fn an_open_demanded_major_is_not_normalized_for_a_literal() {
         alone.steps
     );
 }
+
+/// The other side of `an_open_nat_operation_whose_operands_normalize_to_literals_computes`:
+/// an operand with a variable that is genuinely free is not normalized in the
+/// hope of a literal. `Nat.add (tower x) 3` for a free `x` would walk all 200
+/// layers of `tower` for nothing, and inside real proofs such walks nest.
+#[test]
+fn a_nat_operation_on_a_genuinely_free_operand_is_not_normalized() {
+    const DEPTH: usize = 200;
+    let succ = |value| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            value,
+        )
+    };
+    let tower = (0..DEPTH).fold(Expr::bvar(0).unwrap(), |inner, _| succ(inner));
+    let mut entries = nat_literal_family_entries();
+    entries.push(definition_entry(
+        "tower",
+        vec![],
+        decoded(&Expr::lam(
+            primary_name("n"),
+            constant("Nat"),
+            tower,
+            BinderInfo::Default,
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let tower_x = Expr::app(constant("tower"), Expr::fvar(FVarId(primary_name("x"))));
+    let term = decoded(&Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "add"]), Vec::new()),
+            tower_x,
+        ),
+        numeric_literal(3),
+    ));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert!(
+        result.steps < DEPTH as u64,
+        "a free operand must not be walked for a literal ({} steps)",
+        result.steps
+    );
+}
+
+/// KR-313 at the head of a term being whnf'd offers an open `Nat.add` to
+/// literal arithmetic, as the pin's `whnf` offers every form to `reduce_nat`.
+/// `x` is let-bound to `5`, so `Nat.add x 3` normalizes both operands to
+/// literals and computes `8`. Refusing it because it names a free variable left
+/// the application to its definition's unary recursion; that is how
+/// `Char.ofOrdinal._proof_3` ran out of 100,000,000 steps.
+#[test]
+fn an_open_nat_operation_whose_operands_normalize_to_literals_computes() {
+    let context = WhnfContext::new(
+        vec![FreeBinding::new(
+            checker_name("x"),
+            decoded(&numeric_literal(5)),
+        )],
+        Vec::new(),
+        constant_environment(Vec::new()),
+    );
+    let term = decoded(&Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "add"]), Vec::new()),
+            Expr::fvar(FVarId(primary_name("x"))),
+        ),
+        numeric_literal(3),
+    ));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        result.term.node(result.term.root()),
+        Some(&ExprNode::NatLiteral { limbs_le: vec![8] }),
+        "an open Nat.add whose operands normalize to literals computes"
+    );
+}
+/// `Nat.succ` is offered on the same terms: its let-bound operand normalizes
+/// to a literal, so the whole application is the next literal, as the pin's
+/// `whnf` produces it.
+#[test]
+fn a_successor_of_a_let_bound_literal_whnfs_to_a_literal() {
+    let context = WhnfContext::new(
+        vec![FreeBinding::new(
+            checker_name("x"),
+            decoded(&numeric_literal(5)),
+        )],
+        Vec::new(),
+        constant_environment(Vec::new()),
+    );
+    let term = decoded(&Expr::app(
+        Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
+        Expr::fvar(FVarId(primary_name("x"))),
+    ));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        result.term.node(result.term.root()),
+        Some(&ExprNode::NatLiteral { limbs_le: vec![6] }),
+    );
+}
+/// Iota normalizes the major with the pin's full `whnf`, which reduces a Nat
+/// operation over let-bound literals: the predecessor of `x + 3`, `x := 5`,
+/// is 7.
+#[test]
+fn a_recursor_major_over_let_bound_literals_reduces_for_iota() {
+    let context = WhnfContext::new(
+        vec![FreeBinding::new(
+            checker_name("x"),
+            decoded(&numeric_literal(5)),
+        )],
+        Vec::new(),
+        constant_environment(nat_literal_family_entries()),
+    );
+    let major = natural_operation(
+        "add",
+        [Expr::fvar(FVarId(primary_name("x"))), numeric_literal(3)],
+    );
+    let term = decoded(&nat_predecessor_application(major));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        result.term.node(result.term.root()),
+        Some(&ExprNode::NatLiteral { limbs_le: vec![7] }),
+    );
+}
 #[test]
 fn demanded_arithmetic_does_not_bypass_a_foreign_recursor_family() {
     let major = natural_operation("beq", [numeric_literal(7), numeric_literal(7)]);

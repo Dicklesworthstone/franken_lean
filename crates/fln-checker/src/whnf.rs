@@ -596,6 +596,8 @@ struct Reducer<'a, 'c> {
     cancelled: &'c mut dyn FnMut() -> bool,
     unfolded_bindings: BTreeSet<usize>,
     delta_mode: DeltaMode,
+    /// Which open operands a Nat operation at the head may normalize.
+    head_nat: NatReductionScope,
     delta_reductions: u64,
     /// Reductions spent normalizing the major of a recursor that then stayed
     /// stuck. Its application is returned with the major it had, so this work
@@ -1060,12 +1062,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control.budget.materialization,
         )
         .with_string(self.remaining_string_budget());
+        // Its caller compares the result, as the pin's `to_cnstr_when_K`
+        // compares types with `is_def_eq`: see `whnf_comparand_with`.
         match whnf_at_mode_with(
             &cursor.arena,
             cursor.root,
             context,
             budget,
             DeltaMode::Eager,
+            NatReductionScope::ClosedPair,
             &mut *self.cancelled,
         ) {
             WhnfOutcome::Complete(result) => {
@@ -2343,6 +2348,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 .with_string(self.remaining_string_budget()),
             NatBudget::new(steps, materialization.max_output_units),
         );
+        // Every operation is offered here, as the pin's `whnf` offers it to
+        // `reduce_nat`; `NatReductionScope::WhnfHead` decides which open
+        // operands may be normalized. Declined, a binary operation would
+        // unfold into its definition's recursion.
         let result = reduce_nat_at_with(
             NatReductionQuery::new(
                 &app.arena,
@@ -2352,7 +2361,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 self.context.source,
             ),
             budget,
-            NatReductionScope::ClosedPair,
+            self.head_nat,
             &mut *self.cancelled,
         );
         match result {
@@ -3351,7 +3360,38 @@ pub(crate) fn whnf_at_with(
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
-    whnf_at_mode_with(term, root, context, budget, DeltaMode::Eager, cancelled)
+    whnf_at_mode_with(
+        term,
+        root,
+        context,
+        budget,
+        DeltaMode::Eager,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
+}
+
+/// WHNF of a term being compared, as opposed to a type or a recursor major.
+/// The pin's conversion never takes the WHNF of a comparand: it reduces a Nat
+/// operation only in lazy delta, and only when neither side has a free
+/// variable (`type_checker.cpp:1007` of the vendored source). A caller that
+/// normalizes comparands to widen conversion must therefore not reduce an
+/// open operation, whatever its free variables are bound to.
+pub(crate) fn whnf_comparand_with(
+    term: &WireExpr,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfOutcome {
+    whnf_at_mode_with(
+        term,
+        term.root(),
+        context,
+        budget,
+        DeltaMode::Eager,
+        NatReductionScope::ClosedPair,
+        cancelled,
+    )
 }
 
 pub(crate) fn whnf_core_at_with(
@@ -3361,7 +3401,15 @@ pub(crate) fn whnf_core_at_with(
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
-    whnf_at_mode_with(term, root, context, budget, DeltaMode::Disabled, cancelled)
+    whnf_at_mode_with(
+        term,
+        root,
+        context,
+        budget,
+        DeltaMode::Disabled,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
 }
 
 pub(crate) fn whnf_delta_step_at_with(
@@ -3371,7 +3419,15 @@ pub(crate) fn whnf_delta_step_at_with(
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
-    whnf_at_mode_with(term, root, context, budget, DeltaMode::Once, cancelled)
+    whnf_at_mode_with(
+        term,
+        root,
+        context,
+        budget,
+        DeltaMode::Once,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
 }
 
 /// Whether the loose index `target` occurs in `term`, counting it at every
@@ -3444,6 +3500,7 @@ fn whnf_at_mode_with(
     context: &WhnfContext,
     budget: WhnfBudget,
     delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
     let mut control = Control::new(budget);
@@ -3459,6 +3516,7 @@ fn whnf_at_mode_with(
         cancelled,
         unfolded_bindings: BTreeSet::new(),
         delta_mode,
+        head_nat,
         delta_reductions: 0,
         discarded_reductions: 0,
         discarded_delta_reductions: 0,
