@@ -17,5 +17,6 @@ fln-kernel = { path = "../fln-kernel" }
 fln-olean = { path = "../fln-olean" }
 fln-parse = { path = "../fln-parse" }
 fln-server = { path = "../fln-server" }
+fln-syntax = { path = "../fln-syntax" }
 fln-verdict = { path = "../fln-verdict" }
 fln-vm = { path = "../fln-vm" }
