@@ -1,18 +1,29 @@
 //! Dependent iteration uses ordinary source classes and both admission seats.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckLimits, VmExit};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckLimits, VmExit,
+};
 
 fn limits() -> SourceCheckLimits {
-    SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)))
+    SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+        2 * 1024 * 1024,
+    )))
 }
 fn checked(base: &Engine, text: &str) -> Engine {
     base.check_source_files(&[text.as_bytes()], &KVMap::new(), limits())
         .unwrap_or_else(|e| panic!("{text}\n{e:?}"))
-        .into_complete().unwrap().engine
+        .into_complete()
+        .unwrap()
+        .engine
 }
 fn engine() -> Engine {
-    let seed = Engine::with_source_seed(limits().admission).unwrap().into_complete().unwrap();
-    checked(&seed, r#"
+    let seed = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    checked(
+        &seed,
+        r#"
 class Pure (f : Type -> Type) where
   pure : {A : Type} -> A -> f A
 class Bind (m : Type -> Type) where
@@ -38,12 +49,15 @@ def natFor {B : Type} (xs : Nat) (b : B) (f : (a : Nat) -> a = xs -> B -> Id (Fo
   stepValue (f xs (by rfl) b)
 instance natIteration : ForIn' Id Nat Nat memberNat := { forIn' := fun xs b f => natFor xs b f }
 def checkWitness (xs x : Nat) (h : x = xs) : Id PUnit := PUnit.unit
-"#)
+"#,
+    )
 }
 
 #[test]
 fn actual_membership_proof_is_usable_inside_the_loop_and_does_not_escape() {
-    checked(&engine(), r#"
+    checked(
+        &engine(),
+        r#"
 def visit (n : Nat) : Id Nat := do
   for h : x in n do
     checkWitness n x h
@@ -54,23 +68,29 @@ def shadow (h : Nat) : Id Nat := do
     checkWitness 7 x h
   return h
 theorem outerScope : shadow 9 = 9 := by rfl
-"#);
+"#,
+    );
 }
 
 #[test]
 fn arbitrary_collection_predicates_come_from_the_local_dictionary() {
-    checked(&engine(), r#"
+    checked(
+        &engine(),
+        r#"
 def dependentVisit {M : Type -> Type} [Pure M] [Bind M] {R A : Type}
     (d : Membership A R) [ForIn' M R A d] (xs : R)
     (action : (x : A) -> @Membership.mem A R d xs x -> M PUnit) : M PUnit := do
   for h : x in xs do
     action x h
-"#);
+"#,
+    );
 }
 
 #[test]
 fn wildcard_and_nested_dependent_loops_keep_fresh_element_and_witness_scopes() {
-    checked(&engine(), r#"
+    checked(
+        &engine(),
+        r#"
 def ignored : Id Nat := do
   for h : _ in 7 do break
   return 42
@@ -81,12 +101,15 @@ def nested : Id PUnit := do
       checkWitness 7 x hx
       checkWitness x y hy
       continue
-"#);
+"#,
+    );
 }
 
 #[test]
 fn namespace_shadowing_cannot_redirect_the_generated_dependent_operation() {
-    checked(&engine(), r#"
+    checked(
+        &engine(),
+        r#"
 namespace ShadowIteration
 def ForIn'.forIn' : Nat := 0
 def ForInStep.done : Nat := 0
@@ -97,7 +120,8 @@ def run : Id Nat := do
   return 19
 theorem value : run = 19 := by rfl
 end ShadowIteration
-"#);
+"#,
+    );
 }
 
 #[test]
@@ -113,10 +137,17 @@ fn invalid_witnesses_and_missing_dependent_dictionaries_leave_the_engine_unchang
         "def bad : Id PUnit := do for _ : x in 7 do break",
         "def bad : Id PUnit := do for h : x in 7 do return PUnit.unit",
     ] {
-        assert!(base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits()).is_err(), "{source}");
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
-    checked(&base, "def recovery : Id PUnit := do for h : x in 7 do checkWitness 7 x h");
+    checked(
+        &base,
+        "def recovery : Id PUnit := do for h : x in 7 do checkWitness 7 x h",
+    );
 }
 
 #[test]
@@ -140,13 +171,23 @@ def run : State Nat := do
   return 42
 #eval (run 3).state
 "#;
-    let result = engine().execute_source_definitions(
-        &[source.as_bytes()], &KVMap::new(), EngineExecutionLimits::new(limits().admission.kernel),
-    ).unwrap_or_else(|e| panic!("{e:?}")).into_complete().unwrap();
+    let result = engine()
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .into_complete()
+        .unwrap();
     let VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
         panic!("dependent loop did not return")
     };
-    assert_eq!(fln_vm::interpreter::nat_decimal(&value.value).as_deref(), Some("37"));
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("37")
+    );
 }
 
+#[path = "source_for_membership/unless_tests.rs"]
 mod unless_tests;
