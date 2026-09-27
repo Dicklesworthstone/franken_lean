@@ -92,6 +92,109 @@ fn nested_objects_and_proof_projections_use_original_lexical_types() {
         "42",
     );
 }
+
+#[test]
+fn projected_callbacks_erase_nested_evidence_before_execution() {
+    run(
+        r#"
+structure Certified where
+  value : Nat
+  proof : value = value
+structure Factory where
+  make : Nat -> Certified
+structure Box (A : Type) where
+  item : A
+def factory : Box Factory := { item := { make := fun n => { value := n, proof := by rfl } } }
+def use (c : Certified) : Nat := c.value
+#eval use (factory.item.make 42)
+"#,
+        "42",
+    );
+    run(
+        r#"
+structure Runner where
+  run : (n : Nat) -> n = n -> Nat
+structure Box (A : Type) where
+  item : A
+def boxed : Box (Box Runner) := { item := { item := { run := fun n h => n + 2 } } }
+#eval boxed.item.item.run 40 (by rfl)
+"#,
+        "42",
+    );
+}
+
+#[test]
+fn projected_templates_keep_runtime_work_and_do_not_execute_erased_evidence() {
+    let prefix = r#"
+structure Certified where
+  value : Nat
+  proof : value = value
+structure Box (A : Type) where
+  item : A
+def work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1
+def factory : Box (Nat -> Certified) :=
+  { item := fun n => { value := work n, proof := by rfl } }
+"#;
+    let zero = run(&format!("{prefix}#eval (factory.item 0).value"), "0");
+    let forty = run(&format!("{prefix}#eval (factory.item 40).value"), "40");
+    assert!(forty > zero + 100, "ordinary callback work was erased");
+    run(
+        &format!("{prefix}#eval if false then (factory.item 1000000000).value else 42"),
+        "42",
+    );
+}
+
+#[test]
+fn direct_core_projections_share_the_post_admission_erasure_barrier() {
+    use fln::{
+        ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Expr, Name, ReducibilityHints,
+    };
+    let options = KVMap::new();
+    let source = b"structure Certified where\n  value : Nat\n  proof : value = value\nstructure Outer where\n  item : Certified\ndef outer : Outer := { item := { value := 42, proof := by rfl } }\ndef use (c : Certified) : Nat := c.value";
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source],
+            &options,
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let name = |text: &str| Name::from_components(text.split('.'));
+    let constant = |text: &str| Expr::const_(name(text), vec![]);
+    let original = engine.logical_root(&options);
+    let candidate = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name("projected"),
+            level_params: vec![],
+            type_: constant("Nat"),
+        },
+        value: Expr::app(
+            constant("use"),
+            Expr::proj(name("Outer"), 0, constant("outer")),
+        ),
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![name("projected")],
+    });
+    let result = engine
+        .execute_definition(candidate, &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(result) = result.exit else {
+        panic!("core projection did not return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(engine.logical_root(&options), original);
+}
 #[test]
 fn fields_before_and_after_a_proof_remain_strict_but_proof_receivers_are_erased() {
     let data = "structure Certified where\n  before : Nat\n  proof : 0 = 0\n  after : Nat\ndef work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1\ndef evidence (n : Nat) : 0 = 0 := let discarded : Nat := work n; by rfl\ndef keep (h : 0 = 0) : Nat := 42\n";

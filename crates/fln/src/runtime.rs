@@ -614,7 +614,9 @@ impl<'a> Preparation<'a> {
                             idx,
                             expr,
                         } => {
-                            if let Some(selected) = self.static_projection(type_name, *idx, expr)? {
+                            if let Some(selected) =
+                                self.executable_projection(type_name, *idx, expr)?
+                            {
                                 tasks.push(Task::Visit(selected));
                                 continue;
                             }

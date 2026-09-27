@@ -96,12 +96,34 @@ impl Preparation<'_> {
         // Only expose a field when this administrative projection is fully
         // resolved. A dynamic receiver still needs the existing lexical,
         // signature-aware projection layout pass after specialization.
-        let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+        let Some(field) = self.executable_projection(struct_name, *idx, expr)? else {
             return Ok(None);
         };
         Ok(Some(
             arguments[arity..].iter().cloned().fold(field, Expr::app),
         ))
+    }
+
+    /// Select only an administratively reducible field, then prepare any
+    /// newly exposed logical body for execution. Static dictionary discovery
+    /// still uses `static_projection` and retains its original type plane.
+    pub(super) fn executable_projection(
+        &mut self,
+        family: &Name,
+        index: u64,
+        receiver: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let Some(field) = self.static_projection(family, index, receiver)? else {
+            return Ok(None);
+        };
+        // The selected field can come from an unfolded logical definition,
+        // not from the already-erased input tree. Reapply the representation
+        // barrier before scheduling it as executable code: a nested record or
+        // callback may still contain original proof fields. The closed static
+        // receiver supplies the complete lexical context; no runtime receiver
+        // is evaluated, duplicated or discarded by this step.
+        let field = self.erase_proofs(&field, None)?;
+        self.lower_projections(&field).map(Some)
     }
 
     /// Reconstruct a source type using explicit continuations. In particular,
