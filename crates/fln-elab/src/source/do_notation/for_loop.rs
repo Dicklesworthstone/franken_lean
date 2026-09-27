@@ -52,7 +52,8 @@ impl Context {
         expect_node(syntax, &marker, 0, "internal loop monad hint")?;
         if name != &Name::from_components(["m"])
             || !matches!(function.value.node(), ExprNode::Const { name, .. }
-                if name == &Name::from_components(["ForIn", "forIn"]))
+                if name == &Name::from_components(["ForIn", "forIn"])
+                    || name == &Name::from_components(["ForIn'", "forIn'"]))
         {
             return Err(invalid());
         }
@@ -101,15 +102,34 @@ impl Context {
             "doForDecl",
             4,
         )?;
-        expect_empty_null(&declaration[0], "loop without membership witness")?;
+        let witness = match expect_null_args(&declaration[0], "optional membership witness")? {
+            [] => None,
+            [name, colon]
+                if matches!(name, Syntax::Ident { val, .. }
+                    if !val.is_anonymous() && val.parent().is_anonymous()) =>
+            {
+                expect_atom(colon, ":", "membership witness separator")?;
+                Some(name.clone())
+            }
+            _ => return Err(invalid()),
+        };
         expect_atom(&declaration[2], "in", "loop membership keyword")?;
-        if !matches!(&declaration[1], Syntax::Ident { val, .. }
-            if !val.is_anonymous() && val.parent().is_anonymous())
-        {
-            return Err(invalid());
-        }
         let collection = declaration.pop().expect("validated collection");
         let name = declaration.remove(1);
+        let name = if name.kind() == Some(&parser_kind(&["Term", "hole"])) {
+            let parts = node(name, "hole", 1)?;
+            expect_atom(&parts[0], "_", "ignored loop element")?;
+            // A wildcard is a binder, not a metavariable to solve. Give it an
+            // unspellable identity so it cannot shadow any surrounding local.
+            self.do_control_name()?
+        } else {
+            if !matches!(&name, Syntax::Ident { val, .. }
+                if !val.is_anonymous() && val.parent().is_anonymous())
+            {
+                return Err(invalid());
+            }
+            name
+        };
         let serial = self.next;
         let _ = self.fresh_name()?;
         let accumulator = ident(Name::num(Name::anonymous(), serial));
@@ -117,13 +137,18 @@ impl Context {
         // Supplying a continuation rejects any return in this sequence. A loop
         // does not establish the independent return scope that `do` establishes.
         let body = self.expand_do_sequence(sequence, Some(call(false, vec![yield_step])))?;
-        let callback = lambda(
-            name,
-            null(vec![]),
-            lambda(accumulator, null(vec![]), body)?,
-        )?;
+        let callback = lambda(accumulator, null(vec![]), body)?;
+        let (operation, callback) = if let Some(witness) = witness {
+            // The admitted operation supplies the dependent proof domain. Do
+            // not guess a Membership instance, duplicate the collection, or
+            // manufacture evidence. Ordinary lambda checking opens a, h, b.
+            (["ForIn'", "forIn'"], lambda(witness, null(vec![]), callback)?)
+        } else {
+            (["ForIn", "forIn"], callback)
+        };
+        let callback = lambda(name, null(vec![]), callback)?;
         let action = application(
-            root(&["ForIn", "forIn"]),
+            root(&operation),
             vec![monad_argument(), collection, root(&["PUnit", "unit"]), callback],
         );
         // Retain a doElem, not a bare term: the enclosing sequence determines
@@ -349,7 +374,7 @@ mod tests {
             };
             args[slot] = named("not_the_required_syntax");
             if slot == 1 {
-                args[slot] = atom("_");
+                args[slot] = atom("(");
             }
             assert!(context().expand_for_loop(bad).is_err());
         }
@@ -383,3 +408,6 @@ mod tests {
         assert!(context().lower_pattern_matrices(&input).is_ok());
     }
 }
+
+#[cfg(test)]
+mod membership_tests;

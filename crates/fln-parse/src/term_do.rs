@@ -32,6 +32,7 @@ enum Statement {
     For {
         keyword: usize,
         name: usize,
+        witness: Option<usize>,
         in_at: usize,
         position: BytePos,
     },
@@ -158,11 +159,25 @@ impl Prefix {
             };
             *cursor = marker + 1;
         } else if word(tokens, at, "for") {
-            let name = at + 1;
-            let in_at = at + 2;
+            let mut name = at + 1;
+            let witness = if word(tokens, name + 1, ":") {
+                if !matches!(tokens.get(name).map(|token| &token.kind),
+                    Some(TokenKind::Ident(name))
+                        if !name.is_anonymous() && name.parent().is_anonymous())
+                {
+                    return Err(refuse(view, tokens, name));
+                }
+                let witness = name;
+                name += 2;
+                Some(witness)
+            } else {
+                None
+            };
+            let in_at = name + 1;
             if in_at >= end
-                || !matches!(&tokens[name].kind, TokenKind::Ident(name)
+                || !(matches!(&tokens[name].kind, TokenKind::Ident(name)
                     if !name.is_anonymous() && name.parent().is_anonymous())
+                    || word(tokens, name, "_"))
                 || !word(tokens, in_at, "in")
             {
                 return Err(refuse(view, tokens, name));
@@ -170,6 +185,7 @@ impl Prefix {
             self.statement = Statement::For {
                 keyword: at,
                 name,
+                witness,
                 in_at,
                 position: original_position(view, tokens, at),
             };
@@ -256,6 +272,7 @@ impl Prefix {
             Statement::For {
                 keyword,
                 name,
+                witness,
                 in_at,
                 position,
             } => {
@@ -283,11 +300,21 @@ impl Prefix {
                             at: position,
                             expected: NatDefinitionExpectation::ScalarValue,
                         })?;
+                let witness = match witness {
+                    Some(at) => null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?]),
+                    None => null_node(vec![]),
+                };
+                let name = leaves.leaf(name)?;
+                let name = if matches!(&name, Syntax::Atom { val, .. } if val == "_") {
+                    Syntax::node(parser_kind(&["Term", "hole"]), vec![name])
+                } else {
+                    name
+                };
                 let declaration = Syntax::node(
                     parser_kind(&["Term", "doForDecl"]),
                     vec![
-                        null_node(vec![]),
-                        leaves.leaf(name)?,
+                        witness,
+                        name,
                         atom(leaves, in_at, "in")?,
                         collection,
                     ],
@@ -610,7 +637,7 @@ mod for_tests {
             "def walk : Nat := do { for x in xs; return 7 }",
             "def walk : Nat := do { for x in xs do {}; return 7 }",
             "def walk : Nat := do { for (x, y) in xs do { visit x }; return 7 }",
-            "def walk : Nat := do { for h : x in xs do { visit x }; return 7 }",
+            "def walk : Nat := do { for h : : x in xs do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs, y in ys do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs do { break 1 }; return 7 }",
             "def walk : Nat := do { for x in xs do { continue action }; return 7 }",
@@ -682,3 +709,6 @@ mod control_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod membership_tests;
