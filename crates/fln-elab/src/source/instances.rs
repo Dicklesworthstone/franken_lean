@@ -91,7 +91,9 @@ impl Context {
         &mut self,
         domain: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        let registry = InstanceRegistry::read(&self.txn.env).map_err(registry_error)?;
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
         let mut trial = self.clone();
         let mut target = domain.clone();
         let result = (|| {
@@ -142,7 +144,9 @@ impl Context {
             return Ok(());
         }
         self.flush(false)?;
-        let registry = InstanceRegistry::read(&self.txn.env).map_err(registry_error)?;
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
         loop {
             let before = self.txn.mvars.assignments().len();
             for id in self.instance_goals.clone() {
@@ -209,7 +213,9 @@ impl Context {
     /// after ordinary synthesis, while postponing unrelated instance goals.
     pub(super) fn resolve_instances_with_defaults(&mut self) -> Result<(), NatDefinitionElabError> {
         self.resolve_instances(false)?;
-        let registry = InstanceRegistry::read(&self.txn.env).map_err(registry_error)?;
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
         while self.resolve_default_instance(&registry)? {
             self.resolve_instances(false)?;
         }

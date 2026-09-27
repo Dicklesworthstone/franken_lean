@@ -262,9 +262,7 @@ pub fn register_instance(
     if !registry.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
-    let env = if parameters.scope.is_none() {
-        super::set_instance(env, declaration, parameters.priority)?
-    } else {
+    let env = if let Some(scope) = &parameters.scope {
         if registry
             .candidates(&class)
             .iter()
@@ -276,7 +274,9 @@ pub fn register_instance(
                 declaration.clone(),
             ));
         }
-        env.clone()
+        super::scoped::register(env, scope, declaration, parameters.priority)?
+    } else {
+        super::set_instance(env, declaration, parameters.priority)?
     };
     let mut payload = MAGIC.to_vec();
     payload.push(1);

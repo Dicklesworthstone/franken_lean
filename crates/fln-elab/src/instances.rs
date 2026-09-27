@@ -9,6 +9,7 @@ pub mod coercions;
 pub mod defaults;
 pub mod imported;
 pub mod numeric;
+pub mod scoped;
 
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
@@ -77,6 +78,8 @@ pub struct InstanceRegistry {
     classes: BTreeSet<Name>,
     instances: BTreeMap<Name, Vec<InstanceEntry>>,
     imported: imported::Metadata,
+    /// Dormant namespace registrations, in their original journal order.
+    scoped: BTreeMap<Name, BTreeMap<Name, Vec<InstanceEntry>>>,
 }
 
 fn extension_name() -> Name {
@@ -144,9 +147,10 @@ impl InstanceRegistry {
                     }
                 }
                 // Tag 1 is the original strict registration operation. Tag 2
-                // is an explicit attribute upsert; old readers refuse that tag
-                // rather than silently ignoring a priority change.
-                1 | 2 => {
+                // is a global attribute upsert; tag 3 is a namespace-scoped
+                // upsert. Old readers refuse new tags instead of treating
+                // dormant registrations as ordinary global instances.
+                1..=3 => {
                     let declaration = read_name(&mut bytes)?;
                     let priority = u32::from_le_bytes(
                         take(&mut bytes, 4)?
@@ -158,20 +162,33 @@ impl InstanceRegistry {
                     {
                         return Err(InstanceRegistryError::Malformed);
                     }
-                    let entries = out.instances.entry(class).or_default();
-                    if let Some(&slot) = positions.get(&declaration) {
-                        if tag == 1 {
+                    let scope = if tag == 3 {
+                        Some(read_name(&mut bytes)?)
+                    } else {
+                        None
+                    };
+                    let entries = match &scope {
+                        Some(scope) => out
+                            .scoped
+                            .entry(scope.clone())
+                            .or_default()
+                            .entry(class)
+                            .or_default(),
+                        None => out.instances.entry(class).or_default(),
+                    };
+                    if let Some((previous_scope, slot)) = positions.get(&declaration) {
+                        if tag == 1 || previous_scope != &scope {
                             return Err(InstanceRegistryError::Malformed);
                         }
                         let previous: &mut InstanceEntry = entries
-                            .get_mut(slot)
+                            .get_mut(*slot)
                             .ok_or(InstanceRegistryError::Malformed)?;
                         if previous.declaration != declaration {
                             return Err(InstanceRegistryError::Malformed);
                         }
                         previous.priority = priority;
                     } else {
-                        positions.insert(declaration.clone(), entries.len());
+                        positions.insert(declaration.clone(), (scope, entries.len()));
                         entries.push(InstanceEntry {
                             declaration,
                             priority,
@@ -198,10 +215,20 @@ impl InstanceRegistry {
                 return Err(InstanceRegistryError::UnknownClass(name.clone()));
             }
         }
-        for name in out.imported.instances.keys() {
+        for (name, parameters) in &out.imported.instances {
             let class = validate_instance(env, name)?;
             if !out.classes.contains(&class) {
                 return Err(InstanceRegistryError::UnknownClass(class));
+            }
+            let registered_scope = out.scoped.iter().find_map(|(scope, classes)| {
+                classes.get(&class).and_then(|rows| {
+                    rows.iter()
+                        .any(|row| &row.declaration == name)
+                        .then_some(scope)
+                })
+            });
+            if registered_scope != parameters.scope.as_ref() {
+                return Err(InstanceRegistryError::Malformed);
             }
         }
         Ok(out)
@@ -220,6 +247,22 @@ impl InstanceRegistry {
         name: &Name,
     ) -> Option<&imported::InstanceParameters> {
         self.imported.instances.get(name)
+    }
+
+    /// Namespaces with dormant instances. Opening names and activating scoped
+    /// registrations are separate operations on the source-scope plane.
+    pub fn instance_namespaces(&self) -> impl Iterator<Item = &Name> {
+        self.scoped.keys()
+    }
+
+    fn is_scoped_instance(&self, declaration: &Name) -> bool {
+        self.scoped.values().any(|classes| {
+            classes.values().any(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| &entry.declaration == declaration)
+            })
+        })
     }
 }
 
@@ -294,10 +337,11 @@ pub fn register_instance(
     if !registry.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
-    if registry
-        .candidates(&class)
-        .iter()
-        .any(|row| &row.declaration == declaration)
+    if registry.is_scoped_instance(declaration)
+        || registry
+            .candidates(&class)
+            .iter()
+            .any(|row| &row.declaration == declaration)
     {
         return Err(InstanceRegistryError::DuplicateInstance(
             declaration.clone(),
@@ -326,6 +370,11 @@ pub fn set_instance(
     priority: u32,
 ) -> Result<Environment, InstanceRegistryError> {
     let registry = InstanceRegistry::read(env)?;
+    if registry.is_scoped_instance(declaration) {
+        return Err(InstanceRegistryError::DuplicateInstance(
+            declaration.clone(),
+        ));
+    }
     let class = validate_instance(env, declaration)?;
     if !registry.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));

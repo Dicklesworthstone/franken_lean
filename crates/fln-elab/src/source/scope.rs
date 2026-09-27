@@ -11,6 +11,7 @@ pub struct SourceScope {
     pub opened: Vec<Name>,
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
+    pub instance_scopes: crate::instances::scoped::ActiveScopes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +323,7 @@ mod tests {
             opened: vec![n("A"), n("B"), n("A")],
             universes: vec![],
             variables: variables::SectionVariables::default(),
+            instance_scopes: crate::instances::scoped::ActiveScopes::default(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];
         let resolve = |name: &str| scope.resolve(&n(name), |x| names.contains(x));
