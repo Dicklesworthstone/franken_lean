@@ -2,7 +2,9 @@
 //! as file checking. The unfinished declaration never reaches either admission
 //! engine and is never installed into a cache as a completely checked module.
 use super::*;
+mod completion;
 mod navigation;
+pub use completion::{CompletionLookupLimits, SourceCompletion, SourceCompletionItem};
 pub use navigation::{DefinitionLookupLimits, SourceDefinition};
 pub use fln_elab::source::inspect::{ObservationKind, ObservedGoal, SourceObservation};
 pub use fln_elab::source::scope::SourceScope;
