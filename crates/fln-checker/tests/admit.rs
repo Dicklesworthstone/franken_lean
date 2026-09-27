@@ -12351,17 +12351,19 @@ fn an_unsafe_parameter_free_structure_is_admitted_as_the_pin_admits_it() {
         AdmissionBudget::unlimited(),
         EnvironmentBudget::unlimited(),
     );
-    match verdict {
-        fln_checker::admit::InductiveVerdict::Admitted(admission) => assert_eq!(
-            admission.members(),
-            [
-                checker_name("Box"),
-                checker_qualified(&["Box", "mk"]),
-                checker_qualified(&["Box", "rec"]),
-            ]
+    let members = [
+        checker_name("Box"),
+        checker_qualified(&["Box", "mk"]),
+        checker_qualified(&["Box", "rec"]),
+    ];
+    assert!(
+        matches!(
+            &verdict,
+            fln_checker::admit::InductiveVerdict::Admitted(admission)
+                if admission.members() == members
         ),
-        other => panic!("the unsafe structure must be admitted, got {other:?}"),
-    }
+        "the unsafe structure must be admitted: {verdict:?}"
+    );
 
     // Control: the same family marked safe may not mention the unsafe field
     // type, so the verdict above is the unsafe checking mode at work.
