@@ -7,7 +7,10 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/fln-offline-native-workspace.yml]
+    paths:
+      - .github/workflows/fln-offline-native-workspace.yml
+      - crates/fln/src/source_check/modules/imported.rs
+      - crates/fln/tests/source_olean_instances.rs
 
 permissions:
   contents: read

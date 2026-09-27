@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 mod artifacts;
 mod cache;
 mod graph;
+pub mod imported;
 mod replay;
 pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
