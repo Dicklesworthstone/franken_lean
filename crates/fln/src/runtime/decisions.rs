@@ -1,4 +1,4 @@
-//! Erase a checked Nat equality decision to its existing Boolean runtime row.
+//! Erase checked Nat and Bool equality decisions to native Boolean runtime control flow.
 //!
 //! The proof-producing definitions remain unchanged in the admitted environment.
 //! This recognizes their complete seed contracts, including the families and
@@ -7,56 +7,51 @@
 
 use super::*;
 
-fn required_decision_name(candidate: &Name, instance: bool) -> bool {
-    [
-        "Nat",
-        "Bool",
-        "Eq",
-        "Decidable",
-        "False",
-        "True",
-        "Not",
-        "decide",
-        "Nat.decEq",
-        "Nat.beq",
-    ]
-    .into_iter()
-    .any(|expected| candidate == &name(expected))
-        || instance && candidate == &name("instDecidableEqNat")
+fn required_decision_name(candidate: &Name, carrier: &str, instance: bool) -> bool {
+    ["Bool", "Eq", "Decidable", "False", "True", "Not", "decide"]
+        .into_iter()
+        .any(|expected| candidate == &name(expected))
+        || candidate == &name(carrier)
+        || candidate == &name(&format!("{carrier}.decEq"))
+        || carrier == "Nat" && candidate == &name("Nat.beq")
+        || instance && candidate == &name(&format!("instDecidableEq{carrier}"))
 }
 
 impl Preparation<'_> {
-    fn checked_nat_decision_contract(&mut self, instance: bool) -> Result<(), IngressError> {
+    fn checked_equality_decision_contract(
+        &mut self,
+        carrier: &str,
+        instance: bool,
+    ) -> Result<(), IngressError> {
         // Use the same candidates admitted by the source seed. Checking only
-        // the instance wrapper would miss a replaced Nat.decEq dependency;
-        // checking only Nat.decEq would miss changed eliminator rules.
+        // the instance wrapper would miss a replaced carrier decEq dependency;
+        // checking only decEq would miss changed eliminator rules.
         for expected in fln_elab::seed::source_seed_declarations() {
             self.tick()?;
             let canonical = match expected {
                 Declaration::Axiom(expected)
-                    if required_decision_name(&expected.base.name, instance) =>
+                    if required_decision_name(&expected.base.name, carrier, instance) =>
                 {
                     matches!(self.environment.find(&expected.base.name),
                         Some(ConstantInfo::Axiom(actual)) if actual == &expected)
                 }
                 Declaration::Defn(expected)
-                    if required_decision_name(&expected.base.name, instance) =>
+                    if required_decision_name(&expected.base.name, carrier, instance) =>
                 {
                     matches!(self.environment.find(&expected.base.name),
                         Some(ConstantInfo::Defn(actual)) if actual == &expected)
                 }
                 Declaration::Inductive(block)
-                    if block
-                        .types
-                        .iter()
-                        .any(|family| required_decision_name(&family.base.name, instance)) =>
+                    if block.types.iter().any(|family| {
+                        required_decision_name(&family.base.name, carrier, instance)
+                    }) =>
                 {
                     for expected in &block.types {
                         self.tick()?;
                         if !matches!(self.environment.find(&expected.base.name),
                             Some(ConstantInfo::Induct(actual)) if actual == expected)
                         {
-                            return Err(unsupported("noncanonical Nat decision family"));
+                            return Err(unsupported("noncanonical equality decision family"));
                         }
                     }
                     for expected in &block.ctors {
@@ -64,7 +59,7 @@ impl Preparation<'_> {
                         if !matches!(self.environment.find(&expected.base.name),
                             Some(ConstantInfo::Ctor(actual)) if actual == expected)
                         {
-                            return Err(unsupported("noncanonical Nat decision constructor"));
+                            return Err(unsupported("noncanonical equality decision constructor"));
                         }
                     }
                     for expected in &block.recursors {
@@ -72,7 +67,7 @@ impl Preparation<'_> {
                         if !matches!(self.environment.find(&expected.base.name),
                             Some(ConstantInfo::Rec(actual)) if actual == expected)
                         {
-                            return Err(unsupported("noncanonical Nat decision recursor"));
+                            return Err(unsupported("noncanonical equality decision recursor"));
                         }
                     }
                     true
@@ -80,13 +75,63 @@ impl Preparation<'_> {
                 _ => continue,
             };
             if !canonical {
-                return Err(unsupported("noncanonical Nat decision definition"));
+                return Err(unsupported("noncanonical equality decision definition"));
             }
         }
         Ok(())
     }
 
+    fn bool_equality_value(&mut self, left: Expr, right: Expr) -> Result<Expr, IngressError> {
+        let bool_type = Expr::const_(name("Bool"), vec![]);
+        let motive = Expr::lam(
+            Name::anonymous(),
+            bool_type.clone(),
+            self.lift(&bool_type, 1)?,
+            BinderInfo::Default,
+        );
+        let right_value = Expr::bvar(0).map_err(|_| unsupported("Boolean equality scope"))?;
+        let left_value = Expr::bvar(1).map_err(|_| unsupported("Boolean equality scope"))?;
+        let negated_right = [
+            motive.clone(),
+            Expr::const_(name("Bool.true"), vec![]),
+            Expr::const_(name("Bool.false"), vec![]),
+            right_value.clone(),
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(name("Bool.rec"), vec![fln_core::level::Level::one()]),
+            Expr::app,
+        );
+        let equality = [motive, negated_right, right_value, left_value]
+            .into_iter()
+            .fold(
+                Expr::const_(name("Bool.rec"), vec![fln_core::level::Level::one()]),
+                Expr::app,
+            );
+        Ok(Expr::let_e(
+            Name::anonymous(),
+            bool_type.clone(),
+            left,
+            Expr::let_e(
+                Name::anonymous(),
+                bool_type,
+                self.lift(&right, 1)?,
+                equality,
+                false,
+            ),
+            false,
+        ))
+    }
+
     pub(super) fn nat_equality_decision(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        self.equality_decision(head, arguments)
+    }
+
+    fn equality_decision(
         &mut self,
         head: &Expr,
         arguments: &[Expr],
@@ -143,17 +188,28 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
-            let instance = callee == &name("instDecidableEqNat");
-            if (!instance && callee != &name("Nat.decEq"))
-                || !levels.is_empty()
-                || operands.len() != 2
-            {
+            let (carrier, instance) = if callee == &name("Nat.decEq") {
+                ("Nat", false)
+            } else if callee == &name("instDecidableEqNat") {
+                ("Nat", true)
+            } else if callee == &name("Bool.decEq") {
+                ("Bool", false)
+            } else if callee == &name("instDecidableEqBool") {
+                ("Bool", true)
+            } else {
+                return Ok(None);
+            };
+            if !levels.is_empty() || operands.len() != 2 {
                 return Ok(None);
             }
-            self.checked_nat_decision_contract(instance)?;
-            let mut result = operands
-                .into_iter()
-                .fold(Expr::const_(name("Nat.beq"), vec![]), Expr::app);
+            self.checked_equality_decision_contract(carrier, instance)?;
+            let mut result = if carrier == "Nat" {
+                operands
+                    .into_iter()
+                    .fold(Expr::const_(name("Nat.beq"), vec![]), Expr::app)
+            } else {
+                self.bool_equality_value(operands[0].clone(), operands[1].clone())?
+            };
             for (name, type_, value, nondep) in bindings.into_iter().rev() {
                 self.tick()?;
                 result = Expr::let_e(name, type_, value, result, nondep);
@@ -178,17 +234,21 @@ mod tests {
 
     // Deliberately install unchecked metadata here to exercise the authority
     // guard itself. Public source ingress still requires both checking engines.
-    fn environment(replaced: &str) -> Environment {
+    fn environment(carrier: &str, replaced: &str) -> Environment {
         let mut environment = Environment::new();
         for declaration in fln_elab::seed::source_seed_declarations() {
             match declaration {
-                Declaration::Axiom(mut value) if required_decision_name(&value.base.name, true) => {
+                Declaration::Axiom(mut value)
+                    if required_decision_name(&value.base.name, carrier, true) =>
+                {
                     if value.base.name == name(replaced) {
                         value.is_unsafe = !value.is_unsafe;
                     }
                     environment = environment.add_decl(ConstantInfo::Axiom(value)).unwrap();
                 }
-                Declaration::Defn(mut value) if required_decision_name(&value.base.name, true) => {
+                Declaration::Defn(mut value)
+                    if required_decision_name(&value.base.name, carrier, true) =>
+                {
                     if value.base.name == name(replaced) {
                         value.value = constant("Bool.false");
                     }
@@ -198,7 +258,7 @@ mod tests {
                     if block
                         .types
                         .iter()
-                        .any(|family| required_decision_name(&family.base.name, true)) =>
+                        .any(|family| required_decision_name(&family.base.name, carrier, true)) =>
                 {
                     for mut value in block.types {
                         if value.base.name == name(replaced) {
@@ -255,18 +315,18 @@ mod tests {
             "True",
             "Not",
         ] {
-            let environment = environment(replaced);
+            let environment = environment("Nat", replaced);
             assert!(
                 Preparation::new(&environment, IngressLimits::default())
-                    .nat_equality_decision(&constant("decide"), &decide_args(decision.clone()))
+                    .equality_decision(&constant("decide"), &decide_args(decision.clone()))
                     .is_err(),
                 "replaced dependency {replaced} was accepted"
             );
         }
-        let environment = environment("");
+        let environment = environment("Nat", "");
         for callee in ["Nat.decEq", "instDecidableEqNat"] {
             let actual = Preparation::new(&environment, IngressLimits::default())
-                .nat_equality_decision(
+                .equality_decision(
                     &constant("decide"),
                     &decide_args(apply(callee, [nat::literal(3), nat::literal(4)])),
                 )
@@ -279,8 +339,71 @@ mod tests {
     }
 
     #[test]
+    fn bool_decision_requires_the_canonical_bool_equality_contract() {
+        let decision = apply(
+            "instDecidableEqBool",
+            [constant("Bool.true"), constant("Bool.false")],
+        );
+        for replaced in [
+            "decide",
+            "Bool.decEq",
+            "instDecidableEqBool",
+            "Bool",
+            "Bool.true",
+            "Bool.rec",
+            "Eq",
+            "Eq.refl",
+            "Eq.rec",
+            "Decidable",
+            "Decidable.isTrue",
+            "Decidable.rec",
+            "False",
+            "True",
+            "Not",
+        ] {
+            let environment = environment("Bool", replaced);
+            assert!(
+                Preparation::new(&environment, IngressLimits::default())
+                    .equality_decision(&constant("decide"), &decide_args(decision.clone()))
+                    .is_err(),
+                "replaced dependency {replaced} was accepted"
+            );
+        }
+        let environment = environment("Bool", "");
+        for callee in ["Bool.decEq", "instDecidableEqBool"] {
+            let actual = Preparation::new(&environment, IngressLimits::default())
+                .equality_decision(
+                    &constant("decide"),
+                    &decide_args(apply(
+                        callee,
+                        [constant("Bool.true"), constant("Bool.false")],
+                    )),
+                )
+                .unwrap()
+                .expect("canonical Boolean equality lowers");
+            let ExprNode::LetE {
+                type_, value, body, ..
+            } = actual.node()
+            else {
+                panic!("left Boolean operand must be strict");
+            };
+            assert_eq!(*type_, constant("Bool"));
+            assert_eq!(*value, constant("Bool.true"));
+            let ExprNode::LetE {
+                type_, value, body, ..
+            } = body.node()
+            else {
+                panic!("right Boolean operand must be strict");
+            };
+            assert_eq!(*type_, constant("Bool"));
+            assert_eq!(*value, constant("Bool.false"));
+            assert!(matches!(body.node(), ExprNode::App { .. }));
+        }
+    }
+
+    #[test]
     fn decision_lambda_wrappers_keep_strict_operands_once_and_in_scope() {
-        let environment = environment("");
+        let environment = environment("Nat", "");
         let variable = |index| Expr::bvar(index).unwrap();
         let lambda = Expr::lam(
             name("a"),
@@ -297,7 +420,7 @@ mod tests {
         let right = apply("Nat.add", [variable(1), nat::literal(4)]);
         let decision = Expr::app(Expr::app(lambda, left.clone()), right);
         let actual = Preparation::new(&environment, IngressLimits::default())
-            .nat_equality_decision(&constant("decide"), &decide_args(decision))
+            .equality_decision(&constant("decide"), &decide_args(decision))
             .unwrap();
         let expected = Expr::let_e(
             name("a"),
@@ -317,11 +440,11 @@ mod tests {
 
     #[test]
     fn unrelated_decisions_remain_ordinary_source_and_budget_stops_are_typed() {
-        let environment = environment("");
+        let environment = environment("Nat", "");
         let mut preparation = Preparation::new(&environment, IngressLimits::default());
         assert_eq!(
             preparation
-                .nat_equality_decision(
+                .equality_decision(
                     &constant("decide"),
                     &decide_args(constant("instDecidableTrue")),
                 )
@@ -330,7 +453,7 @@ mod tests {
         );
         assert_eq!(
             preparation
-                .nat_equality_decision(
+                .equality_decision(
                     &constant("decide"),
                     &decide_args(Expr::app(
                         Expr::app(
@@ -348,7 +471,7 @@ mod tests {
             ..IngressLimits::default()
         };
         assert!(matches!(
-            Preparation::new(&environment, limits).nat_equality_decision(
+            Preparation::new(&environment, limits).equality_decision(
                 &constant("decide"),
                 &decide_args(apply("Nat.decEq", [nat::literal(0), nat::literal(0)])),
             ),
