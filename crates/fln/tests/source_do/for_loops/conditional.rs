@@ -35,7 +35,9 @@ fn conditional_break_and_continue_choose_distinct_exits_without_replaying_effect
 
 #[test]
 fn ordinary_do_conditionals_preserve_terminal_values_and_sequencing() {
-    checked(&state_engine(), r#"
+    checked(
+        &state_engine(),
+        r#"
 def select (flag : Bool) : Id Nat := do
   if flag then (17 : Id Nat) else (23 : Id Nat)
 theorem selectedYes : select true = 17 := by rfl
@@ -49,12 +51,15 @@ theorem noEffects : (effects false 0).state = 209 := by rfl
 def nestedTerm : Id Nat := do
   if true then (do return 42) else (do return 13)
 theorem nestedValue : nestedTerm = 42 := by rfl
-"#);
+"#,
+    );
 }
 
 #[test]
 fn nested_conditionals_and_nested_loops_keep_their_control_scopes() {
-    checked(&state_engine(), r#"
+    checked(
+        &state_engine(),
+        r#"
 def nestedChoices : State PUnit := do
   for x in items do
     if x == 1 then if false then break else continue else mark 2
@@ -67,23 +72,29 @@ def nestedLoops : State PUnit := do
       break
     mark (x * 10 + 9)
 theorem independentLoops : (nestedLoops 0).state = 12192229 := by rfl
-"#);
+"#,
+    );
 }
 
 #[test]
 fn proof_binders_in_conditional_branches_cannot_capture_the_shared_suffix() {
-    checked(&state_engine(), r#"
+    checked(
+        &state_engine(),
+        r#"
 def scoped (h : Nat) : State PUnit := do
   for x in items do
     if h : x = 1 then continue else mark x
     mark h
 theorem outerBinder : (scoped 9 0).state = 209 := by rfl
-"#);
+"#,
+    );
 }
 
 #[test]
 fn abstract_monads_and_collections_share_the_checked_conditional_path() {
-    checked(&engine(), r#"
+    checked(
+        &engine(),
+        r#"
 def visitUntil {M : Type -> Type} [Pure M] [Bind M] {R A : Type} [ForIn M R A]
     (xs : R) (stop : A -> Bool) (action : A -> M PUnit) : M PUnit := do
   for x in xs do
@@ -93,7 +104,8 @@ def filterVisit {M : Type -> Type} [Pure M] [Bind M] {R A : Type} [ForIn M R A]
   for x in xs do
     if skip x then continue else action x
     action x
-"#);
+"#,
+    );
 }
 
 #[test]
@@ -109,13 +121,20 @@ fn invalid_unchosen_branches_and_out_of_scope_exits_do_not_publish() {
         "def bad : State PUnit := do for x in items do if true then return PUnit.unit else mark x",
         "def bad : State PUnit := do for x in items do if true then break 1 else mark x",
         "def bad : State PUnit := do for x in items do if true then continue x else mark x",
-        "def bad : State PUnit := do for x in items do if true then mark x",
+        "def bad : State PUnit := do for x in items do if true then {}",
         "def bad : State PUnit := do { for x in items do { if true then break else continue; missing } }",
     ] {
-        assert!(base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits()).is_err(), "{source}");
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
-    checked(&base, "def recovery : State PUnit := do for x in items do if x == 1 then continue else mark x");
+    checked(
+        &base,
+        "def recovery : State PUnit := do for x in items do if x == 1 then continue else mark x",
+    );
 }
 
 #[test]
@@ -126,12 +145,21 @@ fn conditional_exit_traces_execute_through_the_existing_runtime() {
         ("#eval (stopSecond 0).state", "111210209"),
         ("#eval (onlyExits 0).state", "10209"),
     ] {
-        let result = base.execute_source_definitions(
-            &[query.as_bytes()], &KVMap::new(), EngineExecutionLimits::new(limits().admission.kernel),
-        ).unwrap_or_else(|e| panic!("{query}: {e:?}")).into_complete().unwrap();
+        let result = base
+            .execute_source_definitions(
+                &[query.as_bytes()],
+                &KVMap::new(),
+                EngineExecutionLimits::new(limits().admission.kernel),
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"))
+            .into_complete()
+            .unwrap();
         let VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
             panic!("conditional loop did not return")
         };
-        assert_eq!(fln_vm::interpreter::nat_decimal(&value.value).as_deref(), Some(expected));
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some(expected)
+        );
     }
 }

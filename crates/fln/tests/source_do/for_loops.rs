@@ -135,7 +135,10 @@ fn invalid_actions_dictionaries_and_nonlocal_returns_leave_engine_unchanged() {
         );
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
-    checked(&base, "def recovery : Id PUnit := do for x in true do Pure.pure (f := Id) PUnit.unit");
+    checked(
+        &base,
+        "def recovery : Id PUnit := do for x in true do Pure.pure (f := Id) PUnit.unit",
+    );
 }
 
 #[test]
@@ -169,3 +172,6 @@ def run : State Nat := do
 mod conditional;
 #[path = "for_loops/control.rs"]
 mod control;
+
+#[path = "for_loops/branch_sequences.rs"]
+mod branch_sequences;

@@ -1435,8 +1435,82 @@ fn bounded_term_spliced(
     splices: &mut matching::Splices,
     updates: &std::collections::HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let arrows = term_binders::arrow_openers(tokens, range.clone());
-    let mut lists = collections::Lists::default();
+    bounded_term_frames(
+        leaves, view, tokens, range, grammar, splices, updates, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_do_sequence_spliced(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    updates: &std::collections::HashSet<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    bounded_term_frames(leaves, view, tokens, range, grammar, splices, updates, true)
+}
+
+// Source construction is not part of the term driver's live parsing state.
+// Isolate its alternatives so tactic arguments do not inherit every grouped
+// term's temporary Syntax value on their already-live native parser frame.
+#[inline(never)]
+fn grouped_term_syntax(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    open: usize,
+    ascription: Option<(Syntax, usize)>,
+    inner: Syntax,
+    close: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    Ok(if let Some((value, colon)) = ascription {
+        if matches!(&tokens[colon].kind, TokenKind::Symbol(s) if s == ":=") {
+            Syntax::node(
+                parser_kind(&["Term", "namedArgument"]),
+                vec![
+                    leaves.leaf(open)?,
+                    value,
+                    leaves.leaf(colon)?,
+                    inner,
+                    leaves.leaf(close)?,
+                ],
+            )
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "typeAscription"]),
+                vec![
+                    hygienic_lparen(leaves.leaf(open)?),
+                    value,
+                    leaves.leaf(colon)?,
+                    null_node(vec![inner]),
+                    leaves.leaf(close)?,
+                ],
+            )
+        }
+    } else {
+        Syntax::node(
+            parser_kind(&["Term", "paren"]),
+            vec![
+                hygienic_lparen(leaves.leaf(open)?),
+                inner,
+                leaves.leaf(close)?,
+            ],
+        )
+    })
+}
+
+// Keep sequence initialization off the ordinary term driver's large debug
+// frame. It must retain the existing small-stack bound for tactic arguments
+// and quantifier bodies as well as for the newly supported branch sequences.
+#[inline(never)]
+fn initial_bounded_frames(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    sequence: bool,
+) -> Result<(Vec<BoundedTermFrame>, usize), NatDefinitionParseError> {
     let mut frames = vec![BoundedTermFrame {
         record: None,
         ascription: None,
@@ -1448,6 +1522,29 @@ fn bounded_term_spliced(
         operators: Vec::new(),
     }];
     let mut cursor = range.start;
+    if sequence {
+        let prefix = term_do::Prefix::branch(view, tokens, &mut cursor, range.end)?;
+        frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
+            prefix,
+        ))));
+    }
+    Ok((frames, cursor))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_term_frames(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    updates: &std::collections::HashSet<usize>,
+    sequence: bool,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let arrows = term_binders::arrow_openers(tokens, range.clone());
+    let mut lists = collections::Lists::default();
+    let (mut frames, mut cursor) = initial_bounded_frames(view, tokens, range.clone(), sequence)?;
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
@@ -1868,40 +1965,7 @@ fn bounded_term_spliced(
                     })?;
                 let ascription = frame.ascription.take();
                 let inner = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                let grouped = if let Some((value, colon)) = ascription {
-                    if matches!(&tokens[colon].kind, TokenKind::Symbol(s) if s == ":=") {
-                        Syntax::node(
-                            parser_kind(&["Term", "namedArgument"]),
-                            vec![
-                                leaves.leaf(open)?,
-                                value,
-                                leaves.leaf(colon)?,
-                                inner,
-                                leaves.leaf(index)?,
-                            ],
-                        )
-                    } else {
-                        Syntax::node(
-                            parser_kind(&["Term", "typeAscription"]),
-                            vec![
-                                hygienic_lparen(leaves.leaf(open)?),
-                                value,
-                                leaves.leaf(colon)?,
-                                null_node(vec![inner]),
-                                leaves.leaf(index)?,
-                            ],
-                        )
-                    }
-                } else {
-                    Syntax::node(
-                        parser_kind(&["Term", "paren"]),
-                        vec![
-                            hygienic_lparen(leaves.leaf(open)?),
-                            inner,
-                            leaves.leaf(index)?,
-                        ],
-                    )
-                };
+                let grouped = grouped_term_syntax(leaves, tokens, open, ascription, inner, index)?;
                 frames
                     .last_mut()
                     .expect("the parent term frame remains live")

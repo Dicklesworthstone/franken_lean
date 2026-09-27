@@ -42,9 +42,9 @@ fn malformed_or_unsupported_do_never_drops_a_statement() {
         "do let n ← ; return n",
         "do return 7; return 8",
         "do let mut n := 0; return n",
-        "do for n in ns do return n",
-        "do if c then return 7",
-        "do break",
+        "do for n ns do return n",
+        "do if c then",
+        "do break 7",
         "do let (x, y) ← pair; return x",
         "do read;; return 7",
     ] {
@@ -76,4 +76,17 @@ fn nested_blocks_and_long_sequences_use_heap_frames() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+// Scope and result-type refusals belong to elaboration, not token parsing.
+// Keep positive coverage when a formerly unsupported doElem gains syntax.
+#[test]
+fn newly_supported_control_syntax_is_retained_for_semantic_checking() {
+    for source in [
+        "def work := do for n in ns do return n",
+        "def work := do if c then return 7",
+        "def work := do break",
+    ] {
+        parses(source);
+    }
 }
