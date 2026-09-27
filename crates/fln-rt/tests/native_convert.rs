@@ -259,6 +259,105 @@ fn a_shared_subgraph_projects_once_across_separate_conversions() {
     assert_eq!(heap.live(), 1);
 }
 
+#[test]
+fn colliding_expression_hashes_preserve_full_identity_across_the_membrane() {
+    let mut original = NativeHeap::new();
+    let mut projected = NativeHeap::new();
+    let name = |label| Name::from_components([label]);
+    let lambda = |label, info| {
+        Expr::lam(
+            name(label),
+            Expr::sort(Level::one()),
+            Expr::bvar(0).unwrap(),
+            info,
+        )
+    };
+    let families = [
+        vec![
+            lambda("x", BinderInfo::Default),
+            lambda("y", BinderInfo::Default),
+            lambda("x", BinderInfo::Implicit),
+            Expr::forall_e(
+                name("x"),
+                Expr::sort(Level::one()),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+        ],
+        vec![
+            Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![7, 1]))),
+            Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![7, 2]))),
+        ],
+        vec![
+            Expr::let_e(
+                name("x"),
+                Expr::sort(Level::one()),
+                Expr::sort(Level::zero()),
+                Expr::bvar(0).unwrap(),
+                false,
+            ),
+            Expr::let_e(
+                name("y"),
+                Expr::sort(Level::one()),
+                Expr::sort(Level::zero()),
+                Expr::bvar(0).unwrap(),
+                false,
+            ),
+            Expr::let_e(
+                name("x"),
+                Expr::sort(Level::one()),
+                Expr::sort(Level::zero()),
+                Expr::bvar(0).unwrap(),
+                true,
+            ),
+        ],
+        vec![
+            Expr::mdata(
+                KVMap::from_entries(vec![(name("k"), DataValue::OfNat(1))]),
+                lambda("x", BinderInfo::Default),
+            ),
+            Expr::mdata(
+                KVMap::from_entries(vec![(name("k"), DataValue::OfNat(2))]),
+                lambda("x", BinderInfo::Default),
+            ),
+        ],
+    ];
+    for family in families {
+        let mut handles = Vec::new();
+        for expr in &family {
+            assert_eq!(
+                expr.hash(),
+                family[0].hash(),
+                "real, not mocked, hash collision"
+            );
+            let handle = original.alloc(expr.clone());
+            let object = inject_expr(&original, handle).unwrap();
+            let native = Conversion::new()
+                .project_expr(&mut projected, &object)
+                .unwrap();
+            assert_eq!(projected.get(native).unwrap(), expr);
+            assert!(
+                !handles.contains(&native),
+                "distinct colliding expressions fused"
+            );
+            handles.push(native);
+        }
+        // Revisit every value after all collisions, in reverse order and with
+        // newly allocated foreign graphs. Identity must not depend on the last
+        // colliding value that happened to cross the membrane.
+        let live = projected.live();
+        for (expr, expected) in family.iter().zip(&handles).rev() {
+            let handle = original.alloc(expr.clone());
+            let object = inject_expr(&original, handle).unwrap();
+            let actual = Conversion::new()
+                .project_expr(&mut projected, &object)
+                .unwrap();
+            assert_eq!(actual, *expected);
+        }
+        assert_eq!(projected.live(), live);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The typed failure families
 // ---------------------------------------------------------------------------

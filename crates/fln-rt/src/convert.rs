@@ -472,8 +472,9 @@ impl Conversion {
         self.project_level(obj)
     }
 
-    /// Project a Compat Expr graph into the NativeHeap, deduplicated by the
-    /// terms' own computed hashes (upstream's hash-consing discipline).
+    /// Project a Compat Expr graph into the NativeHeap, deduplicated by full
+    /// structural identity. Cached hashes select buckets, never equality:
+    /// binder annotations, metadata, and all numeral limbs remain observable.
     pub fn project_expr(
         &mut self,
         heap: &mut NativeHeap,
@@ -481,11 +482,7 @@ impl Conversion {
     ) -> Result<NativeHandle<Expr>, ConvertError> {
         self.projected += 1;
         let before = heap.live();
-        let handle = heap.intern_by(
-            self.expr(root)?,
-            |e: &Expr| e.hash(),
-            |a: &Expr, b: &Expr| a.hash() == b.hash(),
-        );
+        let handle = heap.intern(self.expr(root)?, Expr::hash);
         if heap.live() == before {
             self.dedup_hits += 1;
         }
