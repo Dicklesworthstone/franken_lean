@@ -176,6 +176,16 @@ impl Preparation<'_> {
             if self.normalize_type(binder_type)? != self.normalize_type(domain)? {
                 return Ok(value.clone());
             }
+            // Each binder deepens the context. Charge it as context depth
+            // before `reserve`, whose refusal would name program tables.
+            let depth = binders.len().saturating_add(1);
+            if depth > self.limits.max_context_depth {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ContextDepth,
+                    limit: self.limits.max_context_depth,
+                    observed: depth,
+                });
+            }
             reserve(&mut binders, self.limits.max_context_depth)?;
             binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
             body = next_body.clone();
