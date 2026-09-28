@@ -238,10 +238,17 @@ impl InferenceContext {
 
 /// `InferOnly` omits admission-only quarantine checks. Constant arity remains
 /// exact in both modes.
+///
+/// `Checking` carries the safety the pin's type checker runs at
+/// (`m_definition_safety`, vendored type_checker.cpp:120-127): a safe checker
+/// refuses unsafe constants and partial definitions, a partial one refuses
+/// unsafe constants only, and an unsafe one refuses neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceMode {
     InferOnly,
-    Checking { declaration_safety: ConstantSafety },
+    Checking {
+        declaration_safety: DefinitionSafety,
+    },
 }
 
 impl InferenceMode {
@@ -249,11 +256,20 @@ impl InferenceMode {
         matches!(self, InferenceMode::Checking { .. })
     }
 
-    const fn checks_safe_declaration(self) -> bool {
+    const fn refuses_unsafe_references(self) -> bool {
         matches!(
             self,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe
+                declaration_safety: DefinitionSafety::Safe | DefinitionSafety::Partial
+            }
+        )
+    }
+
+    const fn refuses_partial_references(self) -> bool {
+        matches!(
+            self,
+            InferenceMode::Checking {
+                declaration_safety: DefinitionSafety::Safe
             }
         )
     }
@@ -2150,22 +2166,23 @@ fn dispatch_reference(
             if mode.is_checking() {
                 validate_level_roots(term, levels, context, control, cancelled)?;
             }
-            if mode.checks_safe_declaration() {
-                let definition_safety = declaration
-                    .definition_body()
-                    .map(|definition| definition.safety());
-                if declaration.safety() == ConstantSafety::Unsafe
-                    || definition_safety == Some(DefinitionSafety::Unsafe)
-                {
-                    return Err(LeafHalt::Refused(InferenceRefusal::UnsafeConstant {
-                        name: name.clone(),
-                    }));
-                }
-                if definition_safety == Some(DefinitionSafety::Partial) {
-                    return Err(LeafHalt::Refused(InferenceRefusal::PartialConstant {
-                        name: name.clone(),
-                    }));
-                }
+            let definition_safety = declaration
+                .definition_body()
+                .map(|definition| definition.safety());
+            if mode.refuses_unsafe_references()
+                && (declaration.safety() == ConstantSafety::Unsafe
+                    || definition_safety == Some(DefinitionSafety::Unsafe))
+            {
+                return Err(LeafHalt::Refused(InferenceRefusal::UnsafeConstant {
+                    name: name.clone(),
+                }));
+            }
+            if mode.refuses_partial_references()
+                && definition_safety == Some(DefinitionSafety::Partial)
+            {
+                return Err(LeafHalt::Refused(InferenceRefusal::PartialConstant {
+                    name: name.clone(),
+                }));
             }
 
             match instantiate_term_parameters_from_level_roots_with(

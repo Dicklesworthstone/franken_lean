@@ -344,10 +344,12 @@ pub enum AdmissionFault {
 ///
 /// **The reference GATE stays keyed on the header, and that is deliberate and
 /// separate.** `admit` passes `InferenceMode::Checking { declaration_safety }`
-/// from the header, so a `Safe`-header declaration is checked with the gate ON
-/// even when its body marks it unsafe — otherwise a caller could unlock unsafe
-/// references by marking only the body, which is the mark the header does not
-/// advertise. So both keys are conservative, in opposite directions: the gate
+/// from the header (`reference_scope`), so a `Safe`-header declaration is checked
+/// with the unsafe gate ON even when its body marks it unsafe — otherwise a
+/// caller could unlock unsafe references by marking only the body, which is the
+/// mark the header does not advertise. (Partial exists only on the body, and it
+/// opens the partial gate only for a mutual-block member, as the pin's
+/// `add_mutual` does.) So both keys are conservative, in opposite directions: the gate
 /// takes the STRONGER claim about what the declaration may reference, and the
 /// quarantine takes the WEAKER claim about what may reference it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,7 +519,48 @@ pub fn admit_with(
     environment: &ConstantEnvironment,
     candidate: &ConstantEntry,
     budget: AdmissionBudget,
+    cancelled: impl FnMut() -> bool,
+) -> Verdict {
+    admit_scoped(environment, candidate, budget, cancelled, AddedAs::Lone)
+}
+
+/// Which pin entry point a declaration is checked as, which decides two things
+/// for a non-safe definition (fln-tio5). A lone one (`admit`) is the pin's
+/// `add_definition`: only an UNSAFE definition gets its own header in scope
+/// (vendored environment.cpp:163-178), and a partial `defnDecl` is checked by a
+/// default, safe type checker (lines 180-181), so it can neither refer to itself
+/// nor reference another partial constant. A mutual-block member (`admit_block`)
+/// is the pin's `add_mutual` (lines 224-257): the whole block, itself included, is
+/// in scope, and its header and body are checked at the block's safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddedAs {
+    Lone,
+    BlockMember,
+}
+
+/// The safety the pin's type checker runs at while checking `declaration`. The
+/// gate stays keyed on the header's STRONGER claim (see [`Quarantine`]): only an
+/// unsafe header unlocks unsafe references. Partial is marked on the body alone,
+/// and it unlocks partial references only inside a mutual block.
+fn reference_scope(declaration: &ConstantDeclaration, added_as: AddedAs) -> DefinitionSafety {
+    if declaration.safety() == ConstantSafety::Unsafe {
+        DefinitionSafety::Unsafe
+    } else if added_as == AddedAs::BlockMember
+        && declaration.definition_body().map(DefinitionBody::safety)
+            == Some(DefinitionSafety::Partial)
+    {
+        DefinitionSafety::Partial
+    } else {
+        DefinitionSafety::Safe
+    }
+}
+
+fn admit_scoped(
+    environment: &ConstantEnvironment,
+    candidate: &ConstantEntry,
+    budget: AdmissionBudget,
     mut cancelled: impl FnMut() -> bool,
+    added_as: AddedAs,
 ) -> Verdict {
     let name = candidate.name();
     let declaration = candidate.declaration();
@@ -547,11 +590,17 @@ pub fn admit_with(
     if cancelled() {
         return stopped(name, AdmissionPhase::DeclaredType);
     }
-    let declared =
-        match declared_type_is_a_type(environment, name, declaration, &budget, &mut cancelled) {
-            Ok(facts) => facts,
-            Err(verdict) => return verdict,
-        };
+    let declared = match declared_type_is_a_type_at(
+        environment,
+        name,
+        declaration,
+        reference_scope(declaration, added_as),
+        &budget,
+        &mut cancelled,
+    ) {
+        Ok(facts) => facts,
+        Err(verdict) => return verdict,
+    };
 
     // KR-973 and KR-974 — the terminal rule for this declaration's kind.
     if cancelled() {
@@ -564,6 +613,7 @@ pub fn admit_with(
         &declared,
         &budget,
         &mut cancelled,
+        added_as,
     )
 }
 
@@ -633,6 +683,24 @@ fn declared_type_is_a_type(
     budget: &AdmissionBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DeclaredTypeFacts, Verdict> {
+    declared_type_is_a_type_at(
+        environment,
+        name,
+        declaration,
+        reference_scope(declaration, AddedAs::Lone),
+        budget,
+        cancelled,
+    )
+}
+
+fn declared_type_is_a_type_at(
+    environment: &ConstantEnvironment,
+    name: &WireName,
+    declaration: &ConstantDeclaration,
+    scope: DefinitionSafety,
+    budget: &AdmissionBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DeclaredTypeFacts, Verdict> {
     // The candidate is not yet in the environment, so this context is exactly the
     // one KR-970 just proved does not already hold the name: a declaration cannot
     // use itself to justify its own type.
@@ -654,7 +722,7 @@ fn declared_type_is_a_type(
         name,
         declaration.type_(),
         &context,
-        declaration.safety(),
+        scope,
         budget,
         cancelled,
     )
@@ -664,7 +732,7 @@ fn type_is_type_in_context(
     name: &WireName,
     type_: &WireExpr,
     context: &InferenceContext,
-    safety: ConstantSafety,
+    safety: DefinitionSafety,
     budget: &AdmissionBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DeclaredTypeFacts, Verdict> {
@@ -805,6 +873,7 @@ fn terminal_rule(
     declared: &DeclaredTypeFacts,
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
+    added_as: AddedAs,
 ) -> Verdict {
     // KR-975 / KR-976. This used to DEFER every unsafe declaration before the
     // kind was even examined, so the checker could say nothing at all about one.
@@ -853,6 +922,7 @@ fn terminal_rule(
                 body,
                 budget,
                 cancelled,
+                added_as,
             ) {
                 Ok(()) => Verdict::Admitted(Admission {
                     name: name.clone(),
@@ -917,18 +987,29 @@ fn body_matches_declared_type(
     body: &WireExpr,
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
+    added_as: AddedAs,
 ) -> Result<(), Verdict> {
     if cancelled() {
         return Err(stopped_err(name, AdmissionPhase::Body));
     }
 
     // Pin environment.cpp:163-178 (add_definition unsafe branch):
-    // A non-safe definition may be recursive (e.g. `._unsafe_rec` implementation
+    // An UNSAFE definition may be recursive (e.g. `._unsafe_rec` implementation
     // helpers reference themselves). The declared type was already checked against
     // `environment` (which excludes `name`), but the body checks against a scratch
-    // environment holding the definition's own header.
+    // environment holding the definition's own header. A PARTIAL `defnDecl` takes
+    // the pin's other branch, with no header in scope, so it cannot refer to
+    // itself. Partial recursion is admitted as a mutual block (`admit_block`,
+    // the pin's `add_mutual`), which is how Lean adds every partial definition and
+    // how the .olean planner presents them (fln-tio5). K1 reads a lone partial
+    // definition the same way.
+    let own_header_in_scope = match added_as {
+        AddedAs::Lone => quarantine_of(declaration) == Quarantine::Unsafe,
+        AddedAs::BlockMember => quarantine_of(declaration) != Quarantine::None,
+    };
+    let scope = reference_scope(declaration, added_as);
     let body_environment = if declaration.kind() == ConstantKind::Definition
-        && quarantine_of(declaration) != Quarantine::None
+        && own_header_in_scope
         && environment.find(name).is_none()
     {
         let header = ConstantDeclaration::header(
@@ -974,7 +1055,7 @@ fn body_matches_declared_type(
         body,
         &context,
         InferenceMode::Checking {
-            declaration_safety: declaration.safety(),
+            declaration_safety: scope,
         },
         budget.inference,
         &mut *cancelled,
@@ -1052,7 +1133,7 @@ fn body_matches_declared_type(
                 declaration.type_(),
                 &context,
                 InferenceMode::Checking {
-                    declaration_safety: declaration.safety(),
+                    declaration_safety: scope,
                 },
                 probe_budget,
                 &mut *cancelled,
@@ -1307,7 +1388,7 @@ pub fn admit_block_with(
                 };
             }
         };
-        match admit_with(&scoped, entry, budget, &mut cancelled) {
+        match admit_scoped(&scoped, entry, budget, &mut cancelled, AddedAs::BlockMember) {
             Verdict::Admitted(admission) => members.push(admission.name().clone()),
             Verdict::Rejected(rejection) => {
                 return BlockVerdict::MemberRejected {

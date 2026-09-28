@@ -367,10 +367,13 @@ fn constant_arity_universe_and_safety_quarantines_are_mode_exact() {
     let context = InferenceContext::new(Vec::new(), vec![p.clone()], constants)
         .expect("unique checking context");
     let safe_mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let unsafe_mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Unsafe,
+        declaration_safety: DefinitionSafety::Unsafe,
+    };
+    let partial_mode = InferenceMode::Checking {
+        declaration_safety: DefinitionSafety::Partial,
     };
 
     for (levels, actual) in [(Vec::new(), 0), (vec![Level::zero(), Level::one()], 2)] {
@@ -534,6 +537,31 @@ fn constant_arity_universe_and_safety_quarantines_are_mode_exact() {
         ),
         InferenceOutcome::Complete(_)
     ));
+
+    // The pin's partial checker (a mutual block at partial safety) sits between:
+    // it refuses an unsafe constant and accepts a partial one (vendored
+    // type_checker.cpp:120-127).
+    assert!(matches!(
+        infer(
+            &unsafe_constant,
+            &context,
+            partial_mode,
+            InferenceBudget::unlimited()
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::UnsafeConstant { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        infer(
+            &partial_constant,
+            &context,
+            partial_mode,
+            InferenceBudget::unlimited()
+        ),
+        InferenceOutcome::Complete(_)
+    ));
 }
 
 #[test]
@@ -593,7 +621,7 @@ fn generated_level_constructors_preserve_sort_successor_and_constant_instantiati
         );
 
         let checking = InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         };
         if index + 1 == levels.len() {
             for candidate in [&source, &constant] {
@@ -635,7 +663,7 @@ fn forall_telescope_infers_dependent_imax_in_both_modes_and_ignores_binder_style
     let modes = [
         InferenceMode::InferOnly,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
     ];
     let styles = [
@@ -733,7 +761,7 @@ fn forall_domain_and_codomain_sort_validation_is_mode_exact_and_reducible() {
     let modes = [
         InferenceMode::InferOnly,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
     ];
     for mode in modes {
@@ -803,7 +831,7 @@ fn forall_domain_and_codomain_sort_validation_is_mode_exact_and_reducible() {
         &decoded(&reducible),
         &reducible_context,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::unlimited(),
     ));
@@ -963,7 +991,7 @@ fn forall_composes_inside_lambda_and_application_continuations() {
         &decoded(&nested),
         &InferenceContext::empty(ConstantEnvironment::empty()),
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::unlimited(),
     ));
@@ -1026,7 +1054,7 @@ fn forall_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() 
         BinderInfo::StrictImplicit,
     ));
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let baseline = complete(infer(&forall, &context, mode, InferenceBudget::unlimited()));
     assert_eq!(baseline.progress.forall_binders, 1);
@@ -1262,7 +1290,7 @@ fn lambda_telescope_infers_dependent_types_and_preserves_every_binder_style() {
         for mode in [
             InferenceMode::InferOnly,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe,
+                declaration_safety: DefinitionSafety::Safe,
             },
         ] {
             let checking = matches!(mode, InferenceMode::Checking { .. });
@@ -1382,7 +1410,7 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
             &decoded(&missing_lambda),
             &empty,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe,
+                declaration_safety: DefinitionSafety::Safe,
             },
             InferenceBudget::unlimited(),
         ),
@@ -1430,7 +1458,7 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
             &decoded(&invalid),
             &invalid_context,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe,
+                declaration_safety: DefinitionSafety::Safe,
             },
             InferenceBudget::unlimited(),
         ),
@@ -1475,7 +1503,7 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
         &decoded(&reducible),
         &reducible_context,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::unlimited(),
     ));
@@ -1528,7 +1556,7 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
             &decoded(&overflow),
             &overflow_context,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe,
+                declaration_safety: DefinitionSafety::Safe,
             },
             InferenceBudget::unlimited(),
         ),
@@ -1677,7 +1705,7 @@ fn lambda_heads_compose_with_nested_application_continuations() {
         &decoded(&application),
         &context,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::unlimited(),
     ));
@@ -1720,7 +1748,7 @@ fn lambda_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() 
         BinderInfo::Default,
     ));
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let baseline = complete(infer(&lambda, &context, mode, InferenceBudget::unlimited()));
     let exact_steps = baseline.progress.steps;
@@ -1910,7 +1938,7 @@ fn application_checking_instantiates_dependent_and_nondependent_codomains() {
         Vec::new(),
     );
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
 
     let dependent_application = decoded(&Expr::app(
@@ -1992,7 +2020,7 @@ fn infer_only_peels_the_spine_without_inferring_or_converting_arguments() {
             &application,
             &context,
             InferenceMode::Checking {
-                declaration_safety: ConstantSafety::Safe,
+                declaration_safety: DefinitionSafety::Safe,
             },
             InferenceBudget::unlimited(),
         ),
@@ -2008,7 +2036,7 @@ fn application_outcomes_separate_function_mismatch_conversion_and_nested_rules()
     let sort_zero = Expr::sort(Level::zero());
     let sort_one = Expr::sort(Level::one());
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
 
     let nonfunction_context = built_context(
@@ -2155,7 +2183,7 @@ fn application_whnf_uses_safe_definitions_shared_lets_and_validated_projections(
         BinderInfo::Default,
     );
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let definition_context = built_context(
         vec![LocalDeclaration::assumption(
@@ -2311,7 +2339,7 @@ fn eager_reduce_recognition_is_exact_and_query_local() {
         )],
     );
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let eager_argument = Expr::app(
         Expr::app(
@@ -2487,7 +2515,7 @@ fn eager_reduce_drives_open_nat_conversion_without_widening_ordinary_queries() {
         ],
     );
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let wrapped = |head: &str| {
         Expr::app(
@@ -2556,7 +2584,7 @@ fn nested_applications_use_heap_continuations() {
         )),
         &context,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::unlimited(),
     ));
@@ -2595,7 +2623,7 @@ fn application_nested_resources_and_cancellation_are_typed_and_recover_cleanly()
         Expr::fvar(FVarId(primary_name("x"))),
     ));
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let baseline = complete(infer(
         &application,
@@ -2996,7 +3024,7 @@ fn every_resource_boundary_is_typed_and_the_exact_budget_recovers() {
     )
     .expect("unique level context");
     let checking_mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let baseline = complete(infer(
         &checking_sort,
@@ -3060,7 +3088,7 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
     )
     .expect("unique level context");
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
     let baseline = complete(infer(
         &wrapped,
@@ -3652,7 +3680,7 @@ fn let_modes() -> [InferenceMode; 2] {
     [
         InferenceMode::InferOnly,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
     ]
 }
@@ -3857,7 +3885,7 @@ fn kr109_let_resources_and_cancellation_stay_typed_and_recover_cleanly() {
     let decoded_term = decoded(&term);
     let context = built_context(Vec::new(), Vec::new(), Vec::new());
     let mode = InferenceMode::Checking {
-        declaration_safety: ConstantSafety::Safe,
+        declaration_safety: DefinitionSafety::Safe,
     };
 
     let baseline = complete(infer(
@@ -4758,7 +4786,7 @@ fn a_shared_subterm_is_inferred_once() {
         &term,
         &context,
         InferenceMode::Checking {
-            declaration_safety: ConstantSafety::Safe,
+            declaration_safety: DefinitionSafety::Safe,
         },
         InferenceBudget::new(
             100_000,

@@ -15441,3 +15441,101 @@ fn an_unsafe_declaration_unfolds_the_unsafe_definitions_it_references() {
     );
     assert!(matches!(verdict, Verdict::Rejected(_)), "{verdict:?}");
 }
+
+/// Pin `add_definition` (vendored environment.cpp:160-190) puts a definition's own
+/// header in scope only on its UNSAFE branch. A partial `defnDecl` is checked with
+/// no header in scope, so it cannot refer to itself; partial recursion is admitted
+/// as a mutual block (`add_mutual`), which is how Lean adds every partial
+/// definition, singletons included, and how the .olean planner presents them
+/// (fln-tio5). `P : Prop := P` type-checks exactly when `P` is in scope.
+#[test]
+fn kr976_a_lone_partial_definition_cannot_refer_to_itself_but_a_one_member_block_can() {
+    let recursive = |safety| {
+        ConstantEntry::new(
+            checker_name("P"),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                a_type(),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    decoded(&Expr::const_(primary_name("P"), Vec::new())),
+                    ReducibilityHint::Regular(0),
+                    safety,
+                    vec![checker_name("P")],
+                ),
+            ),
+        )
+    };
+    let lone_partial = admit(
+        &nat_environment(),
+        &recursive(DefinitionSafety::Partial),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(
+        matches!(lone_partial, Verdict::Rejected(_)),
+        "a lone partial definition referring to itself: {lone_partial:?}"
+    );
+    assert!(
+        admit(
+            &nat_environment(),
+            &recursive(DefinitionSafety::Unsafe),
+            AdmissionBudget::unlimited()
+        )
+        .is_admitted(),
+        "the pin's unsafe branch puts the header in scope"
+    );
+    assert!(
+        admit_block(
+            &nat_environment(),
+            &[recursive(DefinitionSafety::Partial)],
+            AdmissionBudget::unlimited()
+        )
+        .is_admitted(),
+        "a one-member partial block may refer to itself"
+    );
+}
+
+/// The same pin split, for a reference to ANOTHER partial constant: a partial
+/// `defnDecl` is checked by a safe type checker, which refuses it ("safe
+/// declaration must not contain partial declaration"), while `add_mutual` checks
+/// the block at its own partial safety and accepts it. Measured against the
+/// pinned kernel for fln-tio5 (leantests/partial_defn_pin.lean). `Q` is in the
+/// environment and `P : Prop := Q` is well typed, so safety is the only question.
+#[test]
+fn kr976_a_lone_partial_definition_cannot_reference_a_partial_constant_but_a_block_member_can() {
+    let partial = |name: &str, body: &str| {
+        ConstantEntry::new(
+            checker_name(name),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                a_type(),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    decoded(&Expr::const_(primary_name(body), Vec::new())),
+                    ReducibilityHint::Regular(0),
+                    DefinitionSafety::Partial,
+                    vec![checker_name(name)],
+                ),
+            ),
+        )
+    };
+    let environment = environment_of(vec![partial("Q", "Q")]);
+    let lone = admit(
+        &environment,
+        &partial("P", "Q"),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(
+        matches!(lone, Verdict::Rejected(_)),
+        "a lone partial definition referring to a partial constant: {lone:?}"
+    );
+    let block = admit_block(
+        &environment,
+        &[partial("P", "Q")],
+        AdmissionBudget::unlimited(),
+    );
+    assert!(
+        block.is_admitted(),
+        "a partial block member may refer to a partial constant: {block:?}"
+    );
+}

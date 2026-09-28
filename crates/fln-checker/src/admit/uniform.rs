@@ -1035,7 +1035,7 @@ fn check(
                 ctor_name,
                 &open,
                 &context,
-                ConstantSafety::Safe,
+                DefinitionSafety::Safe,
                 &audit.budget,
                 audit.cancelled,
             )

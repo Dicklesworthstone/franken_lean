@@ -672,7 +672,7 @@ pub(super) fn check(
                     name,
                     &open,
                     &context,
-                    ConstantSafety::Safe,
+                    DefinitionSafety::Safe,
                     &audit.budget,
                     audit.cancelled,
                 )
