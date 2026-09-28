@@ -1981,8 +1981,21 @@ fn definition_height(
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Option<u32>, SlowHalt> {
+    Ok(definition_height_through(reference, sources, context, control, cancelled)?.0)
+}
+
+/// [`definition_height`], also reporting whether the application's head is a
+/// projection (the height is then its structure's).
+fn definition_height_through(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(Option<u32>, bool), SlowHalt> {
     let term = sources.source(reference)?;
     let mut current = reference;
+    let mut through_projection = false;
     loop {
         control.comparison(cancelled)?;
         let node =
@@ -1994,19 +2007,26 @@ fn definition_height(
             ExprNode::Apply { function, .. } => {
                 current = child(current, *function)?;
             }
-            ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+            ExprNode::Metadata { expression, .. } => {
+                current = child(current, *expression)?;
+            }
+            ExprNode::Projection { expression, .. } => {
                 // A stuck projection demands its major premise. Its next
                 // delta step is the definition at that premise's head, not
                 // the projection node itself. WHNF still checks the structure,
                 // constructor and field before reducing the projection.
+                through_projection = true;
                 current = child(current, *expression)?;
             }
             ExprNode::Constant { name, .. } => {
-                return Ok(context
-                    .constants()
-                    .find(name)
-                    .and_then(|constant| context.delta_body(constant))
-                    .map(|definition| definition.hint().delta_height()));
+                return Ok((
+                    context
+                        .constants()
+                        .find(name)
+                        .and_then(|constant| context.delta_body(constant))
+                        .map(|definition| definition.hint().delta_height()),
+                    through_projection,
+                ));
             }
             ExprNode::Bound { .. }
             | ExprNode::Free { .. }
@@ -2016,9 +2036,102 @@ fn definition_height(
             | ExprNode::Forall { .. }
             | ExprNode::Let { .. }
             | ExprNode::NatLiteral { .. }
-            | ExprNode::StringLiteral(_) => return Ok(None),
+            | ExprNode::StringLiteral(_) => return Ok((None, through_projection)),
         }
     }
+}
+
+type PendingPair = (
+    DefEqTerm,
+    DefEqTerm,
+    NatOffsetContext,
+    StringComparisonContext,
+    bool,
+);
+
+/// Each side's definition height, `None` when it does not unfold.
+type HeightPair = (Option<u32>, Option<u32>);
+
+/// The heights for one lazy delta step, applying first the pin's rule for a
+/// projection side (vendored `type_checker.cpp:903-928`): when exactly one side
+/// is headed by an unfoldable constant and the other is a projection
+/// application, the pin reduces the projection side, and unfolds the constant
+/// side only if that makes no progress. [`definition_height`] gives a
+/// projection its structure's height, so without the rule both sides unfold:
+/// `Nat.add x 2048` against `instHAdd.1 y 2048` then walks `Nat.add`'s
+/// structural recursion over 2048 (`Char.succ?_eq._proof_1_13`), where the pin
+/// reaches `Nat.add y 2048` and compares arguments.
+///
+/// `None` means the reduced pair is pending; otherwise the heights select the
+/// sides to unfold. Out of line so `run_slow`'s frame stays small for the
+/// small-stack conversion rigs.
+#[inline(never)]
+fn lazy_delta_heights(
+    (left_reference, right_reference): (DefEqTerm, DefEqTerm),
+    (left, right): (&WireExpr, &WireExpr),
+    generated: &mut Vec<WireExpr>,
+    (pending, offset_context, string_context, decomposed): (
+        &mut Vec<PendingPair>,
+        NatOffsetContext,
+        StringComparisonContext,
+        bool,
+    ),
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<HeightPair>, SlowHalt> {
+    let (left_height, left_projection) = definition_height_through(
+        left_reference,
+        TermSources::new(left, right, generated),
+        context,
+        control,
+        cancelled,
+    )?;
+    let (right_height, right_projection) = definition_height_through(
+        right_reference,
+        TermSources::new(left, right, generated),
+        context,
+        control,
+        cancelled,
+    )?;
+    let left_delta = left_height.is_some() && !left_projection;
+    let right_delta = right_height.is_some() && !right_projection;
+    let projection_side = match (left_delta, right_delta) {
+        (true, false) if right_projection => DefEqSide::Right,
+        (false, true) if left_projection => DefEqSide::Left,
+        _ => return Ok(Some((left_height, right_height))),
+    };
+    let projection_reference = match projection_side {
+        DefEqSide::Left => left_reference,
+        DefEqSide::Right => right_reference,
+    };
+    let result = normalize(
+        projection_reference,
+        TermSources::new(left, right, generated),
+        context,
+        NormalizationMode::DeltaStep,
+        control,
+        cancelled,
+    )?;
+    if result.reductions == 0 {
+        // Unproductive only when the structure has no unfoldable head, and then
+        // its height is already `None`: the constant side alone unfolds, as in
+        // the pin.
+        return Ok(Some((left_height, right_height)));
+    }
+    let reduced = retain_generated(generated, projection_side, result.term);
+    let (next_left, next_right) = match projection_side {
+        DefEqSide::Left => (reduced, right_reference),
+        DefEqSide::Right => (left_reference, reduced),
+    };
+    pending.push((
+        next_left,
+        next_right,
+        offset_context,
+        string_context,
+        decomposed,
+    ));
+    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -3674,20 +3787,20 @@ fn run_slow(
                     continue;
                 }
 
-                let left_height = definition_height(
-                    left_reference,
-                    TermSources::new(left, right, &generated),
+                // The pin reduces a projection side before unfolding the other:
+                // see `lazy_delta_heights`.
+                let Some((left_height, right_height)) = lazy_delta_heights(
+                    (left_reference, right_reference),
+                    (left, right),
+                    &mut generated,
+                    (&mut pending, offset_context, string_context, decomposed),
                     context,
                     &mut control,
                     cancelled,
-                )?;
-                let right_height = definition_height(
-                    right_reference,
-                    TermSources::new(left, right, &generated),
-                    context,
-                    &mut control,
-                    cancelled,
-                )?;
+                )?
+                else {
+                    continue;
+                };
                 let (unfold_left, unfold_right) = match (left_height, right_height) {
                     (None, None) => {
                         if exact_function_eta(

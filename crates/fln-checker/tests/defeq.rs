@@ -165,11 +165,18 @@ fn definition_entry(
 }
 
 fn definition_context(entries: Vec<ConstantEntry>) -> WhnfContext {
+    projection_context(entries, Vec::new())
+}
+
+fn projection_context(
+    entries: Vec<ConstantEntry>,
+    projections: Vec<ProjectionRule>,
+) -> WhnfContext {
     let environment = match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
         other => panic!("constant environment did not build: {other:?}"),
     };
-    WhnfContext::new(Vec::new(), Vec::new(), environment)
+    WhnfContext::new(Vec::new(), projections, environment)
 }
 
 fn equal(left: &WireExpr, right: &WireExpr) -> QuickDefEqResult {
@@ -639,6 +646,52 @@ fn lazy_delta_orders_by_height_and_unfolds_both_sides_only_on_a_tie() {
         tied.delta_unfolds, 2,
         "equal heights must unfold both safe definition heads"
     );
+}
+
+/// The pin's lazy delta step reduces a projection application before it
+/// unfolds a constant on the other side (vendored `type_checker.cpp:903-928`).
+/// `S.0 inst payload` against `step payload`, with `inst := MkS step`: the
+/// projection reduces to `step payload` and the pair closes on the one unfold
+/// of `inst`. `step` stands for `Nat.add`, whose unfolding walks its
+/// structural recursion (`Char.succ?_eq._proof_1_13`); it must never unfold,
+/// whichever of the two definitions is taller.
+#[test]
+fn lazy_delta_reduces_a_projection_before_unfolding_the_other_side() {
+    for (step_height, inst_height) in [(5, 1), (2, 2), (1, 5)] {
+        let context = projection_context(
+            vec![
+                definition_entry(
+                    "step",
+                    decoded(&constant("terminal")),
+                    ReducibilityHint::Regular(step_height),
+                    DefinitionSafety::Safe,
+                ),
+                definition_entry(
+                    "inst",
+                    decoded(&Expr::app(constant("MkS"), constant("step"))),
+                    ReducibilityHint::Regular(inst_height),
+                    DefinitionSafety::Safe,
+                ),
+            ],
+            vec![ProjectionRule::new(
+                checker_name("S"),
+                checker_name("MkS"),
+                0,
+            )],
+        );
+        let step = decoded(&Expr::app(constant("step"), constant("payload")));
+        let projected = decoded(&Expr::app(
+            Expr::proj(name("S"), 0, constant("inst")),
+            constant("payload"),
+        ));
+        for (left, right) in [(&step, &projected), (&projected, &step)] {
+            let progress = slow_equal(left, right, &context);
+            assert_eq!(
+                progress.delta_unfolds, 1,
+                "heights step={step_height} inst={inst_height}: only `inst` may unfold"
+            );
+        }
+    }
 }
 
 #[test]
