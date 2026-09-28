@@ -36,13 +36,13 @@ jobs:
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           manifest = {
-              'crates/fln-elab/src/source/do_notation.rs': ['4c5daef013987ed171331169c1d7cff68c3aef35', '81abafe50418bfda9250fdc111f964b569a40f8d'],
+              'crates/fln-elab/src/source/do_notation.rs': ['46675aaec1c77cee7679b9e0898043780a825b42', 'f6c34bea64cce990278a9c3b03309e0dda95b6ac'],
               'crates/fln-elab/src/source/do_notation/conditional.rs': ['6fe7b6c72f8f023437f4a95ebf690b5555a0aab2', 'e85ad180325e1ea9a2ceef7b5627a9268b3a01bc'],
               'crates/fln-elab/src/source/do_notation/matching.rs': [None, '034f10b979e682ec3b34ac93af8a152f2278ecbe'],
               'crates/fln-elab/src/source/do_notation/returns.rs': ['c358cd1e29d3c1108ad9cb217e86580705f87c60', 'b7e8899eaa3c453f4a53143cac6f49eb2236da39'],
-              'crates/fln-elab/src/source/patterns.rs': ['67555303b178c6fd6733c4650cb87a7a4d323ab8', 'a198a628d5e4836e85a8839c053a3fd443dc6a83'],
+              'crates/fln-elab/src/source/patterns.rs': ['62284c1f653390234e831851885dbcf2f4b323fa', '913acf58f15e0a1e0d8452e485df38e7c73a06d1'],
               'crates/fln-parse/src/matching.rs': ['7bbbd43fd4db467ed0bc7d4c80d992c7c7994976', '9fc05b5003017ddc410fa621345b20952561a07d'],
-              'crates/fln-parse/src/term_do.rs': ['a47dfe6701e8510a008c70cc1d12a803b2371a00', '1e3f46fee57ec442c057ca99b583529365d52e48'],
+              'crates/fln-parse/src/term_do.rs': ['9db527a151c6b06e4d0d94b7baef140e109a65a1', '6c2478324085ab6909fc288dc387f471bcf3d532'],
               'crates/fln-parse/tests/do_match.rs': [None, 'db0ea9685be56e18c54329a2506f96cf4cb41a09'],
               'crates/fln/tests/source_do/for_loops.rs': ['358a6b7331e43239fe0870c9975cc191307c3421', 'ea55f6c8058713e9e23c440b72c69e1c5abfbd38'],
               'crates/fln/tests/source_do/for_loops/match_sequences.rs': [None, '1af576b812dc37737f96c2799d3da656ae2c876e'],
