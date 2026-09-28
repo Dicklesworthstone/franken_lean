@@ -1,4 +1,4 @@
-name: Native pattern-condition object transfer
+name: Native match-branch object transfer
 on:
   push:
     branches: [main]
@@ -16,13 +16,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Verify and retain exact native-tested pattern conditions
+      - name: Preserve concurrent destructuring and retain exact match-branch objects
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          import base64, gzip, hashlib, json, os, pathlib, shutil, subprocess, urllib.request
           api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
           def request(path, data=None):
               req = urllib.request.Request(api + path,
@@ -35,25 +36,31 @@ jobs:
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           manifest = {
-              'crates/fln-parse/src/matching.rs': ['db0c8f8bcaa264906c097913db844696e466aada', '7bbbd43fd4db467ed0bc7d4c80d992c7c7994976'],
-              'crates/fln-parse/src/matching/if_let.rs': [None, '49ef854e87ed3c7be128bf400c0802886be28bc6'],
-              'crates/fln-parse/tests/do_if_let.rs': [None, '00d54337e9f6478e6bad0bc2c81996a99a55b11c'],
-              'crates/fln-elab/src/source/patterns.rs': ['6e64b62f8d93f015fdb9b9d594eb88d41bd4670b', '5c3eb37679b947665818795eb689482f2f922948'],
-              'crates/fln-elab/src/source/do_notation.rs': ['6e54f959268cf7748676c463a3550bc8ed972722', 'deb73696c9ff27d10e8fe3a18e50bcef2b8931e1'],
-              'crates/fln-elab/src/source/do_notation/conditional.rs': ['e3ab10f2c0a2e16590f3400b3fa7ffcbf9f9c91c', '6fe7b6c72f8f023437f4a95ebf690b5555a0aab2'],
-              'crates/fln-elab/src/source/do_notation/returns.rs': ['a0b73baaa4d71e6a1b6de71cc0bb2b852a86d6a4', 'c358cd1e29d3c1108ad9cb217e86580705f87c60'],
-              'crates/fln-elab/src/source/do_notation/if_let.rs': [None, '6f6e3a18dcfec6ade6fab295abd82cae9e3fa996'],
-              'crates/fln/tests/source_do/for_loops.rs': ['8d40c8f6ec46148b82ef9f24ffec7f22613c694b', '358a6b7331e43239fe0870c9975cc191307c3421'],
-              'crates/fln/tests/source_do/for_loops/if_let.rs': [None, '479f1327278c9ed0bd5c7e15ba940b21589928aa'],
+              'crates/fln-elab/src/source/do_notation.rs': ['4c5daef013987ed171331169c1d7cff68c3aef35', None],
+              'crates/fln-elab/src/source/do_notation/conditional.rs': ['6fe7b6c72f8f023437f4a95ebf690b5555a0aab2', 'e85ad180325e1ea9a2ceef7b5627a9268b3a01bc'],
+              'crates/fln-elab/src/source/do_notation/matching.rs': [None, '034f10b979e682ec3b34ac93af8a152f2278ecbe'],
+              'crates/fln-elab/src/source/do_notation/returns.rs': ['c358cd1e29d3c1108ad9cb217e86580705f87c60', 'b7e8899eaa3c453f4a53143cac6f49eb2236da39'],
+              'crates/fln-elab/src/source/patterns.rs': ['67555303b178c6fd6733c4650cb87a7a4d323ab8', None],
+              'crates/fln-parse/src/matching.rs': ['7bbbd43fd4db467ed0bc7d4c80d992c7c7994976', '9fc05b5003017ddc410fa621345b20952561a07d'],
+              'crates/fln-parse/src/term_do.rs': ['a47dfe6701e8510a008c70cc1d12a803b2371a00', None],
+              'crates/fln-parse/tests/do_match.rs': [None, 'db0ea9685be56e18c54329a2506f96cf4cb41a09'],
+              'crates/fln/tests/source_do/for_loops.rs': ['358a6b7331e43239fe0870c9975cc191307c3421', 'ea55f6c8058713e9e23c440b72c69e1c5abfbd38'],
+              'crates/fln/tests/source_do/for_loops/match_sequences.rs': [None, '1af576b812dc37737f96c2799d3da656ae2c876e'],
           }
           chunks = [
-              '481849c14db0a4f678a5dc01589088b6402ca529',
-              '53fc10cde92a16a8c2b4d93fbee5054171941498',
-              'cfe9189ddeb52c12fd203db1a60aaaa74971eca9',
-              'ad5212fe0e7cbad3602b565830abee57070b0e4f',
-              '0f1fb44e0d31241001d82bcb6cb422d20fba89d1',
-              '0d32bd9a8d5c681b2a1489d336ddfa6b398151dc',
-              'a9c5dd5635c0f48ad0e2bfc53422620f1f451eda',
+              '62ca6761e632e90ed0cc46752f48feaac2b98e94',
+              'd66b1655c27d2b8deb7e5ca486045ad4d32ef6cc',
+              '0181bc35062991279d33a5daddbb2c269ff0d45b',
+              'a3a6e446ddd7d93d64623fa60b9d7e01b2f08c50',
+              'cb45a4b5861b2e84c6ab4d179301734497a1ac1a',
+              '86b1d66e64abe3d994ae886fd4893b86671a380b',
+              '6528e9eeb26bb17308fce135ba2218b6ab86b84a',
+              '48aed86e652a93407f1c7a7bc625acaaa8d0f832',
+              '7daa847d794fbc536c657c4fad7302b48fec3fcd',
+              'de8b0d01a9ebb1af5f37236b63b25477c48c36e8',
+              'efe063e22da12fbe08958fd648ef8865b9a0c288',
+              'c0302b112652352720280e2f51d277f30c99f36d',
+              '83d1b0c775e6b8f7fa497b96cf3d4badb47b2cbd',
           ]
           packed = bytearray()
           for sha in chunks:
@@ -62,37 +69,70 @@ jobs:
               data = base64.b64decode(response['content'])
               assert blob(data) == sha
               packed.extend(data)
-          assert len(packed) == 8318 and blob(packed) == '453115c715139f652b0dde63857bee8458e02430'
+          assert len(packed) == 15314 and blob(packed) == '5cf278fabf5bbea887ebe4108dddcb1e0e99ae2e'
           patch = gzip.decompress(packed)
-          assert hashlib.sha256(patch).hexdigest() == '867228665dc388b24025231483561affa8ca4302e16b63f21005a2558eec039a'
+          assert hashlib.sha256(patch).hexdigest() == 'f9b570510285df6c39421047ff4659c0b774e823a4bda6e8b85536bba550b5cf'
           text = patch.decode()
           paths = [line.split(' b/', 1)[1] for line in text.splitlines() if line.startswith('diff --git a/')]
           assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
           assert '\ndeleted file mode ' not in text
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'match-branch-transfer'
+          root.mkdir()
           for path, (before, _) in manifest.items():
               file = pathlib.Path(path)
               assert not file.is_symlink()
               assert (blob(file.read_bytes()) if file.exists() else None) == before, path
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pattern-condition-transfer'
-          root.mkdir()
+              if before is not None:
+                  target = root / 'baseline' / path
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(file, target)
           patch_file = root / 'implementation.patch'
           patch_file.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(patch_file)], check=True)
-          subprocess.run(['git', 'apply', '--whitespace=error', str(patch_file)], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          for path, (_, after) in manifest.items():
+          subprocess.run(['git', 'apply', '--3way', '--index', '--whitespace=error', str(patch_file)], check=True)
+          assert not subprocess.check_output(['git', 'ls-files', '-u']).strip()
+          assert sorted(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()) == sorted(paths)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+          output = {}
+          for path, (_, expected) in manifest.items():
               data = pathlib.Path(path).read_bytes()
-              assert blob(data) == after, path
+              sha = blob(data)
+              if expected is not None:
+                  assert sha == expected, path
               uploaded = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-              assert uploaded['sha'] == after, path
-          receipt = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-              'blobs': {path: after for path, (_, after) in manifest.items()},
-              'patch_sha256': hashlib.sha256(patch).hexdigest(), 'published_branch': False}
+              assert uploaded['sha'] == sha, path
+              output[path] = sha
+              target = root / 'source' / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          # Preserve the concurrent feature's source and tests for local native
+          # composition checks. These files are not edited or republished here.
+          retained = {}
+          for path in [
+              'crates/fln-elab/src/source/do_notation/pattern_binding.rs',
+              'crates/fln-parse/tests/source_do_patterns.rs',
+              'crates/fln/tests/source_do_patterns.rs',
+          ]:
+              file = pathlib.Path(path)
+              assert not file.is_symlink()
+              data = file.read_bytes()
+              retained[path] = blob(data)
+              target = root / 'concurrent' / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          receipt = {
+              'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'before': {path: before for path, (before, _) in manifest.items()},
+              'blobs': output, 'concurrent': retained,
+              'patch_sha256': hashlib.sha256(patch).hexdigest(),
+              'published_branch': False,
+              'validation': 'Three-way merged source retained for caller inspection and native tests before branch publication.',
+          }
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          (root / 'merged.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--full-index', '--binary']))
           print(json.dumps(receipt, indent=2), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pattern-condition-transfer-${{ github.sha }}
-          path: ${{ runner.temp }}/pattern-condition-transfer
+          name: match-branch-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/match-branch-transfer
           retention-days: 2
           if-no-files-found: error
