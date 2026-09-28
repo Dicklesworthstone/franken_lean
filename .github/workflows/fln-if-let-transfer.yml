@@ -18,12 +18,12 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Preserve concurrent destructuring and retain exact match-branch objects
+      - name: Retain the exact inspected and merged match implementation
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
-          import base64, gzip, hashlib, json, os, pathlib, shutil, subprocess, urllib.request
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
           api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
           def request(path, data=None):
               req = urllib.request.Request(api + path,
@@ -36,13 +36,13 @@ jobs:
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           manifest = {
-              'crates/fln-elab/src/source/do_notation.rs': ['4c5daef013987ed171331169c1d7cff68c3aef35', None],
+              'crates/fln-elab/src/source/do_notation.rs': ['4c5daef013987ed171331169c1d7cff68c3aef35', '81abafe50418bfda9250fdc111f964b569a40f8d'],
               'crates/fln-elab/src/source/do_notation/conditional.rs': ['6fe7b6c72f8f023437f4a95ebf690b5555a0aab2', 'e85ad180325e1ea9a2ceef7b5627a9268b3a01bc'],
               'crates/fln-elab/src/source/do_notation/matching.rs': [None, '034f10b979e682ec3b34ac93af8a152f2278ecbe'],
               'crates/fln-elab/src/source/do_notation/returns.rs': ['c358cd1e29d3c1108ad9cb217e86580705f87c60', 'b7e8899eaa3c453f4a53143cac6f49eb2236da39'],
-              'crates/fln-elab/src/source/patterns.rs': ['67555303b178c6fd6733c4650cb87a7a4d323ab8', None],
+              'crates/fln-elab/src/source/patterns.rs': ['67555303b178c6fd6733c4650cb87a7a4d323ab8', 'a198a628d5e4836e85a8839c053a3fd443dc6a83'],
               'crates/fln-parse/src/matching.rs': ['7bbbd43fd4db467ed0bc7d4c80d992c7c7994976', '9fc05b5003017ddc410fa621345b20952561a07d'],
-              'crates/fln-parse/src/term_do.rs': ['a47dfe6701e8510a008c70cc1d12a803b2371a00', None],
+              'crates/fln-parse/src/term_do.rs': ['a47dfe6701e8510a008c70cc1d12a803b2371a00', '1e3f46fee57ec442c057ca99b583529365d52e48'],
               'crates/fln-parse/tests/do_match.rs': [None, 'db0ea9685be56e18c54329a2506f96cf4cb41a09'],
               'crates/fln/tests/source_do/for_loops.rs': ['358a6b7331e43239fe0870c9975cc191307c3421', 'ea55f6c8058713e9e23c440b72c69e1c5abfbd38'],
               'crates/fln/tests/source_do/for_loops/match_sequences.rs': [None, '1af576b812dc37737f96c2799d3da656ae2c876e'],
@@ -78,34 +78,44 @@ jobs:
           assert '\ndeleted file mode ' not in text
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'match-branch-transfer'
           root.mkdir()
+          def retain(section, path, data):
+              target = root / section / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
           for path, (before, _) in manifest.items():
               file = pathlib.Path(path)
               assert not file.is_symlink()
-              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
-              if before is not None:
-                  target = root / 'baseline' / path
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copyfile(file, target)
+              data = file.read_bytes() if file.exists() else None
+              assert (blob(data) if data is not None else None) == before, path
+              if data is not None:
+                  retain('baseline', path, data)
           patch_file = root / 'implementation.patch'
           patch_file.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--3way', '--index', '--whitespace=error', str(patch_file)], check=True)
+          applied = subprocess.run(['git', 'apply', '--3way', '--index', '--whitespace=error', str(patch_file)])
+          if applied.returncode:
+              assert applied.returncode == 1
+              path = 'crates/fln-elab/src/source/do_notation.rs'
+              conflicts = subprocess.check_output(['git', 'diff', '--name-only', '--diff-filter=U'], text=True).splitlines()
+              assert conflicts == [path], conflicts
+              file = pathlib.Path(path)
+              text = file.read_text()
+              conflict = '<<<<<<< ours\nmod pattern_binding;\n=======\nmod matching;\n>>>>>>> theirs\n'
+              assert text.count(conflict) == 1
+              text = text.replace(conflict, 'mod matching;\nmod pattern_binding;\n')
+              assert '<<<<<<<' not in text and '>>>>>>>' not in text
+              file.write_text(text)
+              subprocess.run(['git', 'add', '--', path], check=True)
           assert not subprocess.check_output(['git', 'ls-files', '-u']).strip()
           assert sorted(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()) == sorted(paths)
           subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
           output = {}
           for path, (_, expected) in manifest.items():
               data = pathlib.Path(path).read_bytes()
-              sha = blob(data)
-              if expected is not None:
-                  assert sha == expected, path
+              assert blob(data) == expected, path
               uploaded = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-              assert uploaded['sha'] == sha, path
-              output[path] = sha
-              target = root / 'source' / path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(data)
-          # Preserve the concurrent feature's source and tests for local native
-          # composition checks. These files are not edited or republished here.
+              assert uploaded['sha'] == expected, path
+              output[path] = expected
+              retain('source', path, data)
           retained = {}
           for path in [
               'crates/fln-elab/src/source/do_notation/pattern_binding.rs',
@@ -116,16 +126,14 @@ jobs:
               assert not file.is_symlink()
               data = file.read_bytes()
               retained[path] = blob(data)
-              target = root / 'concurrent' / path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(data)
+              retain('concurrent', path, data)
           receipt = {
               'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'before': {path: before for path, (before, _) in manifest.items()},
               'blobs': output, 'concurrent': retained,
               'patch_sha256': hashlib.sha256(patch).hexdigest(),
               'published_branch': False,
-              'validation': 'Three-way merged source retained for caller inspection and native tests before branch publication.',
+              'validation': 'Exact known merged identities; caller separately runs native checks and publishes the functional commit.',
           }
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
           (root / 'merged.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--full-index', '--binary']))
