@@ -178,3 +178,6 @@ mod branch_sequences;
 
 #[path = "for_loops/early_returns.rs"]
 mod early_returns;
+
+#[path = "for_loops/if_let.rs"]
+mod if_let;

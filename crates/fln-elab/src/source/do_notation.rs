@@ -8,6 +8,7 @@ use super::*;
 mod conditional;
 mod control;
 mod for_loop;
+mod if_let;
 mod returns;
 pub(super) use returns::join_parts;
 mod unless;

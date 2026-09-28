@@ -8,6 +8,7 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 mod do_scopes;
+mod if_let;
 use do_scopes::DoScopes;
 
 pub(super) type Splices = HashMap<usize, (usize, Syntax)>;
@@ -21,6 +22,7 @@ struct ConditionalPlan {
     start: usize,
     depth: usize,
     baseline: usize,
+    pattern_assignment: Option<usize>,
     then_at: Option<usize>,
     else_at: Option<usize>,
     end: usize,
@@ -231,6 +233,7 @@ fn plan(
                         .take_while(|&&b| b == b' ' || b == b'\t')
                         .count()
                 }),
+                pattern_assignment: None,
                 then_at: None,
                 else_at: None,
                 end: range.end,
@@ -309,6 +312,19 @@ fn plan(
                 alternatives: Vec::new(),
                 end: range.end,
             }),
+            "let" if conditionals.last().is_some_and(|p| {
+                p.statement && p.depth == depth && p.start + 1 == at
+            }) => {
+                // A pattern-test header is not a term-local let telescope.
+                // Its binding ends at `then`, not at a later branch semicolon.
+            }
+            ":=" | "←" | "<-" if conditionals.last().is_some_and(|p| {
+                p.statement && p.depth == depth && p.then_at.is_none()
+                    && p.pattern_assignment.is_none()
+                    && is_symbol(tokens, p.start + 1, "let")
+            }) => {
+                conditionals.last_mut().expect("pattern condition").pattern_assignment = Some(at);
+            }
             "let" => lets.push((
                 depth,
                 active.len(),
@@ -870,7 +886,8 @@ fn build_conditional(
 ) -> Result<(), NatDefinitionParseError> {
     let then_at = plan.then_at.expect("planned then");
 
-    let named = is_symbol(tokens, plan.start + 2, ":");
+    let pattern_test = plan.statement && is_symbol(tokens, plan.start + 1, "let");
+    let named = !pattern_test && is_symbol(tokens, plan.start + 2, ":");
     let binding = if named {
         null_node(vec![
             leaves.leaf(plan.start + 1)?,
@@ -879,16 +896,28 @@ fn build_conditional(
     } else {
         null_node(vec![])
     };
-    let begin = plan.start + if named { 3 } else { 1 };
-    let condition = branch_value(
-        leaves,
-        view,
-        tokens,
-        begin..then_at,
-        grammar,
-        splices,
-        updates,
-    )?;
+    let condition = if pattern_test {
+        if_let::condition(leaves, view, tokens, &plan, grammar, splices, updates)?
+    } else {
+        let begin = plan.start + if named { 3 } else { 1 };
+        let predicate = branch_value(
+            leaves,
+            view,
+            tokens,
+            begin..then_at,
+            grammar,
+            splices,
+            updates,
+        )?;
+        if plan.statement {
+            Syntax::node(
+                parser_kind(&["Term", "doIfProp"]),
+                vec![binding.clone(), predicate],
+            )
+        } else {
+            predicate
+        }
+    };
     if plan.statement {
         let yes = bounded_do_sequence_spliced(
             leaves,
@@ -918,7 +947,7 @@ fn build_conditional(
             parser_kind(&["Term", "doIf"]),
             vec![
                 leaves.leaf(plan.start)?,
-                Syntax::node(parser_kind(&["Term", "doIfProp"]), vec![binding, condition]),
+                condition,
                 leaves.leaf(then_at)?,
                 yes,
                 null_node(vec![]),

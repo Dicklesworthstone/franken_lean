@@ -15,8 +15,37 @@ fn skip() -> Syntax {
     call(false, vec![ident(Name::from_components(["_root_", "PUnit", "unit"]))])
 }
 
+pub(super) enum Header {
+    Proposition(Vec<Syntax>),
+    Pattern {
+        operands: Box<(Syntax, Syntax)>,
+        monadic: bool,
+    },
+}
+
+impl Context {
+    pub(super) fn finish_do_condition(
+        &mut self,
+        header: Header,
+        yes: Syntax,
+        no: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        match header {
+            Header::Proposition(mut header) => {
+                header.insert(4, yes);
+                header.push(no);
+                Ok(term("ifThenElse", header))
+            }
+            Header::Pattern { operands, monadic } => {
+                let (pattern, value) = *operands;
+                self.expand_do_pattern_condition(pattern, value, monadic, yes, no)
+            }
+        }
+    }
+}
+
 pub(super) struct Branches {
-    pub(super) header: Vec<Syntax>,
+    pub(super) header: Header,
     pub(super) yes: Syntax,
     pub(super) no: Option<Syntax>,
 }
@@ -44,28 +73,34 @@ pub(super) fn split(syntax: Syntax) -> Result<Branches, NatDefinitionElabError> 
     let yes = parts.pop().expect("then sequence");
     let then_token = parts.pop().expect("then keyword");
     expect_atom(&then_token, "then", "then keyword")?;
-    let mut condition = node(parts.pop().expect("do condition"), "doIfProp", 2)?;
-    let predicate = condition.pop().expect("condition predicate");
-    let binding = condition.pop().expect("optional condition binder");
-    match expect_null_args(&binding, "condition binder")? {
-        [] => {}
-        [binder, colon] => {
-            expect_atom(colon, ":", "condition binder colon")?;
-            if !matches!(binder, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
-                && !matches!(binder, Syntax::Atom { val, .. } if val == "_")
-            {
-                return Err(invalid());
-            }
-        }
-        _ => return Err(invalid()),
-    }
+    let condition = parts.pop().expect("do condition");
     let if_token = parts.pop().expect("if keyword");
     expect_atom(&if_token, "if", "if keyword")?;
-    Ok(Branches {
-        header: vec![if_token, binding, predicate, then_token, else_token],
-        yes,
-        no,
-    })
+    let header = if condition.kind() == Some(&parser_kind(&["Term", "doIfLet"])) {
+        let (pattern, value, monadic) = if_let::parts(condition)?;
+        Header::Pattern {
+            operands: Box::new((pattern, value)),
+            monadic,
+        }
+    } else {
+        let mut condition = node(condition, "doIfProp", 2)?;
+        let predicate = condition.pop().expect("condition predicate");
+        let binding = condition.pop().expect("optional condition binder");
+        match expect_null_args(&binding, "condition binder")? {
+            [] => {}
+            [binder, colon] => {
+                expect_atom(colon, ":", "condition binder colon")?;
+                if !matches!(binder, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+                    && !matches!(binder, Syntax::Atom { val, .. } if val == "_")
+                {
+                    return Err(invalid());
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        Header::Proposition(vec![if_token, binding, predicate, then_token, else_token])
+    };
+    Ok(Branches { header, yes, no })
 }
 
 struct Block<'a> {
@@ -98,7 +133,7 @@ impl Context {
     ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task<'a> {
             Conditional(Syntax, Option<Syntax>, SequenceScope<'a>),
-            Finish(Vec<Syntax>, Option<Syntax>, SequenceScope<'a>),
+            Finish(Header, Option<Syntax>, SequenceScope<'a>),
             Block(Block<'a>),
             Resume(Block<'a>),
             Value(Syntax),
@@ -172,12 +207,10 @@ impl Context {
                     block.result = Some(values.pop().ok_or_else(invalid)?);
                     tasks.push(Task::Block(block));
                 }
-                Task::Finish(mut header, suffix, scope) => {
+                Task::Finish(header, suffix, scope) => {
                     let no = values.pop().ok_or_else(invalid)?;
                     let yes = values.pop().ok_or_else(invalid)?;
-                    header.insert(4, yes);
-                    header.push(no);
-                    let conditional = term("ifThenElse", header);
+                    let conditional = self.finish_do_condition(header, yes, no)?;
                     values.push(self.join_do_conditional(conditional, suffix, scope)?);
                 }
             }

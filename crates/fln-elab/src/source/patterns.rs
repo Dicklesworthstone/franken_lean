@@ -749,6 +749,26 @@ impl Context {
         Ok(result)
     }
 
+    /// Lower a generated pattern conditional at its construction site. Its
+    /// branch bodies have already been processed by the do worklist, so do not
+    /// walk or expand them again. The ordinary matrix compiler and coverage
+    /// witnesses remain authoritative for the new match.
+    pub(super) fn lower_do_pattern_match(
+        &mut self,
+        syntax: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let mut required = Vec::new();
+        let body = self.compile_pattern_matrix(&syntax, &mut required, None)?;
+        Ok(if required.is_empty() {
+            body
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "matrixScope"]),
+                vec![null(required.into_iter().map(identifier).collect()), body],
+            )
+        })
+    }
+
     /// Rebuild once, inside out. Ordinary flat matches are not cloned or changed.
     pub(super) fn lower_pattern_matrices<'a>(
         &mut self,
@@ -806,7 +826,9 @@ impl Context {
                     tasks.push(Task::Node(node, built.len(), pattern));
                     for (index, argument) in args.iter().enumerate().rev() {
                         self.tick()?;
-                        let pattern = if kind == &alternative_kind {
+                        let pattern = if kind == &alternative_kind
+                            || kind == &parser_kind(&["Term", "doIfLet"])
+                        {
                             index == 1
                         } else {
                             pattern

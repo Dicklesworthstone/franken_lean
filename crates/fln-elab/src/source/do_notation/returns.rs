@@ -138,7 +138,7 @@ impl Context {
             Block(Block),
             Resume(Block),
             Conditional(Syntax, Option<Syntax>, bool),
-            Finish(Vec<Syntax>, Option<(Syntax, Syntax)>),
+            Finish(conditional::Header, Option<(Syntax, Syntax)>),
             Value(Syntax),
         }
         let mut work = vec![Task::Block(Block::new(sequence, None, false)?)];
@@ -206,12 +206,10 @@ impl Context {
                     work.push(no);
                     work.push(Task::Block(yes));
                 }
-                Task::Finish(mut header, join) => {
+                Task::Finish(header, join) => {
                     let no = values.pop().ok_or_else(invalid)?;
                     let yes = values.pop().ok_or_else(invalid)?;
-                    header.insert(4, yes);
-                    header.push(no);
-                    let body = term("ifThenElse", header);
+                    let body = self.finish_do_condition(header, yes, no)?;
                     values.push(match join {
                         Some((name, suffix)) => term("nativeDoJoin", vec![name, suffix, body]),
                         None => body,
