@@ -9,6 +9,7 @@ mod conditional;
 mod control;
 mod for_loop;
 mod if_let;
+mod loop_returns;
 mod matching;
 mod pattern_binding;
 mod returns;
@@ -272,6 +273,14 @@ impl Context {
         if syntax.kind() == Some(&parser_kind(&["Term", "doFor"])) {
             if pattern {
                 return Err(invalid());
+            }
+            // A return belongs to the enclosing ordinary do, not this loop's
+            // callback. Keep its sequence until that scope owns the lowering.
+            if self.loop_has_return(&syntax)? {
+                return Ok(Syntax::node(
+                    parser_kind(&["Term", "nativeDoReturningFor"]),
+                    vec![syntax],
+                ));
             }
             return self.expand_for_loop(syntax);
         }

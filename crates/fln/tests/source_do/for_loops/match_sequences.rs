@@ -211,7 +211,7 @@ fn incomplete_patterns_unchosen_errors_and_escaping_scopes_do_not_publish() {
         "def bad : Id Nat := do { match true with | true => { let x := 7; Pure.pure (f := Id) PUnit.unit } | false => { Pure.pure (f := Id) PUnit.unit }; return x }",
         "def bad : Id PUnit := do match true with | true => { break } | false => { Pure.pure (f := Id) PUnit.unit }",
         "def bad : Id PUnit := do match true with | true => { Pure.pure (f := Id) PUnit.unit } | false => { continue }",
-        "def bad : Id PUnit := do for x in true do match true with | true => { return PUnit.unit } | false => { Pure.pure (f := Id) PUnit.unit }",
+        "def bad : Id PUnit := do for x in true do match true with | true => { return 7 } | false => { Pure.pure (f := Id) PUnit.unit }",
         "def bad : Id PUnit := do match true with | true => { let unused : Bool := 7; Pure.pure (f := Id) PUnit.unit } | false => { Pure.pure (f := Id) PUnit.unit }",
         "def bad : Id Nat := do match ← missing with | _ => { return 7 }",
         "def bad : Id Nat := do match ← (7 : Id Nat) with | true => { return 7 } | false => { return 9 }",

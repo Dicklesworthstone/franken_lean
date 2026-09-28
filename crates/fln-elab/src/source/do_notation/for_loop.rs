@@ -1,7 +1,8 @@
 //! Immutable single-collection iteration through the ordinary ForIn dictionary.
 //!
-//! The pattern-planning walk calls this inside out: nested doFor elements have
-//! already become doExpr elements, while a genuine nested do has its own return
+//! The pattern-planning walk calls this inside out: nested doFor elements
+//! without nonlocal returns have become doExpr elements. Return-carrying loops
+//! are retained for the enclosing do worklist; a genuine nested do owns its return
 //! scope. No recursive expansion, collection-specific primitive or runtime loop
 //! is introduced. Instance search and final declaration admission remain unchanged.
 use super::*;
@@ -33,6 +34,12 @@ fn monad_argument() -> Syntax {
     )
 }
 
+pub(super) struct LoopHeader {
+    name: Syntax,
+    witness: Option<Syntax>,
+    collection: Syntax,
+}
+
 impl Context {
     /// Preserve the expected monad before alias reduction (notably Id/State)
     /// can erase its application head. Return a typed named argument so the
@@ -45,6 +52,11 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"])) {
+            return self
+                .do_loop_result_argument(function, name, syntax)
+                .map(Some);
+        }
         let marker = parser_kind(&["Term", "nativeDoForMonad"]);
         if syntax.kind() != Some(&marker) {
             return Ok(None);
@@ -85,10 +97,10 @@ impl Context {
         Ok(Some(Typed { value, type_ }))
     }
 
-    pub(super) fn expand_for_loop(
+    pub(super) fn split_for_loop(
         &mut self,
         syntax: Syntax,
-    ) -> Result<Syntax, NatDefinitionElabError> {
+    ) -> Result<(LoopHeader, Syntax), NatDefinitionElabError> {
         let mut parts = node(syntax, "doFor", 4)?;
         let sequence = parts.pop().expect("validated loop sequence");
         expect_atom(&parts[0], "for", "loop keyword")?;
@@ -130,13 +142,34 @@ impl Context {
             }
             name
         };
-        let serial = self.next;
-        let _ = self.fresh_name()?;
-        let accumulator = ident(Name::num(Name::anonymous(), serial));
+        Ok((
+            LoopHeader { name, witness, collection },
+            sequence,
+        ))
+    }
+
+    pub(super) fn expand_for_loop(
+        &mut self,
+        syntax: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let (header, sequence) = self.split_for_loop(syntax)?;
+        let accumulator = self.do_control_name()?;
         let yield_step = application(root(&["ForInStep", "yield"]), vec![accumulator.clone()]);
-        // Supplying a continuation rejects any return in this sequence. A loop
-        // does not establish the independent return scope that `do` establishes.
+        // Only return-free loops use this lightweight PUnit accumulator.
+        // Nonlocal returns use the enclosing do's result-carrying worklist.
         let body = self.expand_do_sequence(sequence, Some(call(false, vec![yield_step])))?;
+        let action = self.finish_for_loop(header, accumulator, root(&["PUnit", "unit"]), body)?;
+        Ok(Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action]))
+    }
+
+    pub(super) fn finish_for_loop(
+        &mut self,
+        header: LoopHeader,
+        accumulator: Syntax,
+        initial: Syntax,
+        body: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let LoopHeader { name, witness, collection } = header;
         let callback = lambda(accumulator, null(vec![]), body)?;
         let (operation, callback) = if let Some(witness) = witness {
             // The admitted operation supplies the dependent proof domain. Do
@@ -149,11 +182,9 @@ impl Context {
         let callback = lambda(name, null(vec![]), callback)?;
         let action = application(
             root(&operation),
-            vec![monad_argument(), collection, root(&["PUnit", "unit"]), callback],
+            vec![monad_argument(), collection, initial, callback],
         );
-        // Retain a doElem, not a bare term: the enclosing sequence determines
-        // whether to return this action or bind it to the remaining statements.
-        Ok(Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action]))
+        Ok(action)
     }
 }
 
@@ -337,9 +368,9 @@ mod tests {
             vec![atom("return"), null(vec![named("value")])],
         );
         let direct = loop_element(sequence(vec![returning.clone()], false));
-        assert!(expanded(sequence(vec![direct.clone()], false)).is_err());
+        assert!(expanded(sequence(vec![direct.clone()], false)).is_ok());
         let nested_loop = loop_element(sequence(vec![direct], true));
-        assert!(expanded(sequence(vec![nested_loop], true)).is_err());
+        assert!(expanded(sequence(vec![nested_loop], true)).is_ok());
         let nested_do = term("do", vec![atom("do"), sequence(vec![returning], true)]);
         let valid = loop_element(sequence(vec![term("doExpr", vec![nested_do])], false));
         assert!(expanded(sequence(vec![valid], false)).is_ok());

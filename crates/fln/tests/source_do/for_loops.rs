@@ -115,14 +115,14 @@ theorem nestedOrder : (nestedWalk 0).state = 11122122 := by rfl
 }
 
 #[test]
-fn invalid_actions_dictionaries_and_nonlocal_returns_leave_engine_unchanged() {
+fn invalid_actions_dictionaries_and_return_types_leave_engine_unchanged() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
     for source in [
         "def bad : Id PUnit := do for x in true do (7 : Id Nat)",
         "def bad : Id PUnit := do for x in 7 do Pure.pure (f := Id) PUnit.unit",
         "def bad {M : Type -> Type} [Pure M] [Bind M] (action : Nat -> M PUnit) : M PUnit := do for x in true do action x",
-        "def bad : Id PUnit := do for x in true do return PUnit.unit",
+        "def bad : Id PUnit := do for x in true do return 7",
         "def bad : Id Nat := do for x in true do { Pure.pure (f := Id) PUnit.unit }; return x",
         "def bad : Id PUnit := do for x in false do unknownAction x",
         "def bad : Id PUnit := do for h : x in true do Pure.pure (f := Id) PUnit.unit",
@@ -184,3 +184,6 @@ mod if_let;
 
 #[path = "for_loops/match_sequences.rs"]
 mod match_sequences;
+
+#[path = "for_loops/loop_returns.rs"]
+mod loop_returns;

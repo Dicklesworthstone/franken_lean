@@ -45,12 +45,14 @@ struct Block {
     result: Option<Syntax>,
     require_unit: bool,
     terminal: bool,
+    loop_scope: Option<loop_returns::LoopScope>,
 }
 impl Block {
     fn new(
         sequence: Syntax,
         result: Option<Syntax>,
         require_unit: bool,
+        loop_scope: Option<loop_returns::LoopScope>,
     ) -> Result<Self, NatDefinitionElabError> {
         let statements = sequence_items(sequence)?;
         if statements.is_empty() {
@@ -61,13 +63,15 @@ impl Block {
             result,
             require_unit,
             terminal: true,
+            loop_scope,
         })
     }
 }
 
 impl Context {
     /// Inspect only do-element positions. A nested do expression, lambda,
-    /// collection callback or let value owns its own scope and is not scanned.
+    /// or let value owns its own scope and is not scanned. Retained returning
+    /// loops explicitly request this shared worklist.
     /// General matches also need joins to preserve the expected monad through
     /// the equation-refining match checker, even without explicit returns.
     pub(super) fn needs_scoped_join(
@@ -90,6 +94,9 @@ impl Context {
                 if let [_, sequence] = otherwise {
                     work.push((sequence, true));
                 }
+            } else if kind == &parser_kind(&["Term", "nativeDoReturningFor"]) {
+                // Only return-carrying loops survive the inside-out walk.
+                return Ok(true);
             } else if kind == &parser_kind(&["Term", "doMatch"]) {
                 // Unlike a Boolean if, a constructor match may refine the
                 // discriminant's type and introduce equality evidence. Share
@@ -146,11 +153,17 @@ impl Context {
         enum Task {
             Block(Block),
             Resume(Block),
-            Conditional(Syntax, Option<Syntax>, bool),
+            Conditional(
+                Syntax,
+                Option<Syntax>,
+                bool,
+                Option<loop_returns::LoopScope>,
+            ),
+            FinishLoop(Box<loop_returns::LoopBuild>),
             Finish(conditional::Header, usize, Option<(Syntax, Syntax)>),
             Value(Syntax),
         }
-        let mut work = vec![Task::Block(Block::new(sequence, None, false)?)];
+        let mut work = vec![Task::Block(Block::new(sequence, None, false, None)?)];
         let mut values = Vec::new();
         while let Some(task) = work.pop() {
             self.tick()?;
@@ -164,11 +177,24 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
-                    if conditional::is_compound(&element) {
+                    if element.kind() == Some(&parser_kind(&["Term", "nativeDoReturningFor"])) {
+                        let mut element = node(element, "nativeDoReturningFor", 1)?;
+                        let (build, sequence, scope, normal) = self.prepare_returning_loop(
+                            element.pop().expect("retained loop"),
+                            block.result.take(),
+                            block.loop_scope.as_ref(),
+                        )?;
+                        work.push(Task::Resume(block));
+                        work.push(Task::FinishLoop(Box::new(build)));
+                        work.push(Task::Block(Block::new(
+                            sequence, Some(normal), true, Some(scope),
+                        )?));
+                    } else if conditional::is_compound(&element) {
                         let suffix = block.result.take();
                         let require_unit = block.require_unit;
+                        let loop_scope = block.loop_scope.clone();
                         work.push(Task::Resume(block));
-                        work.push(Task::Conditional(element, suffix, require_unit));
+                        work.push(Task::Conditional(element, suffix, require_unit, loop_scope));
                     } else {
                         if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
                             // Only an administrative join can be skipped. Source
@@ -177,10 +203,15 @@ impl Context {
                             if !terminal {
                                 return Err(invalid());
                             }
+                            if block.loop_scope.is_some() {
+                                block.result = Some(self.expand_loop_return(element)?);
+                                work.push(Task::Block(block));
+                                continue;
+                            }
                             block.result = None;
                         }
                         let scope = SequenceScope {
-                            targets: None,
+                            targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
                             signal: false,
                             require_unit: block.require_unit,
                             allow_return: true,
@@ -198,7 +229,11 @@ impl Context {
                     block.result = Some(values.pop().ok_or_else(invalid)?);
                     work.push(Task::Block(block));
                 }
-                Task::Conditional(syntax, suffix, require_unit) => {
+                Task::FinishLoop(build) => {
+                    let body = values.pop().ok_or_else(invalid)?;
+                    values.push(self.finish_returning_loop(*build, body)?);
+                }
+                Task::Conditional(syntax, suffix, require_unit, loop_scope) => {
                     let branches = conditional::split(self, syntax)?;
                     let require_unit = require_unit || suffix.is_some();
                     let join = suffix
@@ -210,9 +245,9 @@ impl Context {
                     for arm in branches.arms.into_iter().rev() {
                         self.tick()?;
                         work.push(match arm {
-                            Some(sequence) => {
-                                Task::Block(Block::new(sequence, next.clone(), require_unit)?)
-                            }
+                            Some(sequence) => Task::Block(Block::new(
+                                sequence, next.clone(), require_unit, loop_scope.clone(),
+                            )?),
                             None => Task::Value(next.clone().unwrap_or_else(skip)),
                         });
                     }

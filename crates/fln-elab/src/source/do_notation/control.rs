@@ -1,6 +1,7 @@
 //! Local loop exits are ordinary ForInStep values, never VM jumps.
 use super::*;
 
+#[derive(Clone)]
 pub(super) struct LoopTargets {
     accumulator: Syntax,
 }

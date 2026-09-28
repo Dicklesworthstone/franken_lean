@@ -118,7 +118,7 @@ fn invalid_unchosen_branches_and_out_of_scope_exits_do_not_publish() {
         "def bad : State PUnit := do for x in items do if false then missing x else mark x",
         "def bad : State PUnit := do for x in items do if true then break else (7 : Id Nat)",
         "def bad : State PUnit := do for x in items do if true then (do continue) else mark x",
-        "def bad : State PUnit := do for x in items do if true then return PUnit.unit else mark x",
+        "def bad : State PUnit := do for x in items do if true then return 7 else mark x",
         "def bad : State PUnit := do for x in items do if true then break 1 else mark x",
         "def bad : State PUnit := do for x in items do if true then continue x else mark x",
         "def bad : State PUnit := do for x in items do if true then {}",

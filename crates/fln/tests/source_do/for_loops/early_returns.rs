@@ -113,7 +113,7 @@ fn unchosen_branches_and_unused_continuations_still_require_checking() {
         "def bad : State Nat := do { if false then { return true }; return 9 }",
         "def bad : State Nat := do { if false then { let x := missing; return 7 }; return 9 }",
         "def bad : State Nat := do { if false then { return 7 }; return x }",
-        "def bad : State Nat := do { for x in items do { if true then { return 7 } }; return 9 }",
+        "def bad : State Nat := do { for x in items do { if true then { return true } }; return 9 }",
     ] {
         fln_parse::parse_definition(source.as_bytes())
             .unwrap_or_else(|e| panic!("negative must reach elaboration: {source}: {e:?}"));
