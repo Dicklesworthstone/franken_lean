@@ -11,6 +11,7 @@
 
 mod memo;
 mod quotient;
+mod sharing;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2175,6 +2176,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     limbs_le: predecessor,
                 },
                 major.root.index(),
+                None,
             )
             .map_err(|halt| composer.map_halt(halt))?;
         let term = composer.finish(root);
@@ -3014,6 +3016,8 @@ struct Composer<'c> {
     levels: Vec<LevelNode>,
     expressions: Vec<ExprNode>,
     sources: Vec<SourceCopy>,
+    shared_levels: sharing::Interned,
+    shared_expressions: sharing::Interned,
 }
 
 struct SourceCopy {
@@ -3038,6 +3042,8 @@ impl<'c> Composer<'c> {
             levels: Vec::new(),
             expressions: Vec::new(),
             sources: Vec::new(),
+            shared_levels: sharing::Interned::default(),
+            shared_expressions: sharing::Interned::default(),
         }
     }
 
@@ -3089,7 +3095,20 @@ impl<'c> Composer<'c> {
             }))
     }
 
-    fn push_level(&mut self, node: LevelNode, at: usize) -> Result<LevelId, ComposeHalt> {
+    fn push_level(
+        &mut self,
+        node: LevelNode,
+        at: usize,
+        source: usize,
+    ) -> Result<LevelId, ComposeHalt> {
+        let hash = sharing::fingerprint(&node);
+        if let Some(id) = self
+            .shared_levels
+            .find(hash, &node, &self.levels, source)
+            .and_then(LevelId::from_index)
+        {
+            return Ok(id);
+        }
         let observed = usize_units(self.levels.len()).saturating_add(1);
         self.control.admit_arena_node(observed, at)?;
         let id = LevelId::from_index(self.levels.len()).ok_or(ComposeHalt::Stop(
@@ -3102,6 +3121,7 @@ impl<'c> Composer<'c> {
             },
         ))?;
         self.levels.push(node);
+        self.shared_levels.record(hash, id.index(), source);
         Ok(id)
     }
 
@@ -3110,7 +3130,7 @@ impl<'c> Composer<'c> {
         self.control
             .output(units, at)
             .map_err(|halt| self.map_halt(halt))?;
-        self.push_expression_charged(node, at)
+        self.push_expression_charged(node, at, None)
             .map_err(|halt| self.map_halt(halt))
     }
 
@@ -3118,7 +3138,22 @@ impl<'c> Composer<'c> {
         &mut self,
         node: ExprNode,
         at: usize,
+        source: Option<usize>,
     ) -> Result<ExprId, ComposeHalt> {
+        // Child IDs and universe IDs have already been mapped into this output
+        // arena. Equality here is exact syntax equality, including every name,
+        // binder style and metadata value; it is not a conversion judgment.
+        // The payload was charged before cloning, even on a sharing hit.
+        let hash = sharing::fingerprint(&node);
+        if let Some(id) = source
+            .and_then(|source| {
+                self.shared_expressions
+                    .find(hash, &node, &self.expressions, source)
+            })
+            .and_then(ExprId::from_index)
+        {
+            return Ok(id);
+        }
         let observed = usize_units(self.expressions.len()).saturating_add(1);
         self.control.admit_arena_node(observed, at)?;
         let id = ExprId::from_index(self.expressions.len()).ok_or(ComposeHalt::Stop(
@@ -3131,6 +3166,9 @@ impl<'c> Composer<'c> {
             },
         ))?;
         self.expressions.push(node);
+        if let Some(source) = source {
+            self.shared_expressions.record(hash, id.index(), source);
+        }
         Ok(id)
     }
 
@@ -3232,7 +3270,7 @@ impl<'c> Composer<'c> {
                 LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
             };
             let copied = self
-                .push_level(mapped, index)
+                .push_level(mapped, index, source_index)
                 .map_err(|halt| self.map_halt(halt))?;
             self.sources[source_index].levels[index] = Some(copied);
         }
@@ -3399,7 +3437,7 @@ impl<'c> Composer<'c> {
                 },
             };
             let id = self
-                .push_expression_charged(mapped, index)
+                .push_expression_charged(mapped, index, Some(source_index))
                 .map_err(|halt| self.map_halt(halt))?;
             self.sources[source_index].expressions[index] = Some(id);
         }
