@@ -40,6 +40,7 @@ impl Plan {
     }
 }
 struct MatchPlan {
+    statement: bool,
     function: bool,
     baseline: usize,
     start: usize,
@@ -122,6 +123,7 @@ fn plan(
     let mut delimiters = Vec::new();
     let mut active: Vec<MatchPlan> = if equations {
         vec![MatchPlan {
+            statement: false,
             function: false,
             baseline: 0,
             start: range.start,
@@ -149,6 +151,16 @@ fn plan(
         }) {
             do_scopes.closed(conditionals.last().expect("ended conditional").start);
             close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+        }
+        // A do-match ends when its final arm leaves the do-sequence scope.
+        // A following pipe still belongs to the match planner, which resolves
+        // nested arm indentation before assigning it to an enclosing match.
+        while active
+            .last()
+            .is_some_and(|p| p.statement && do_scopes.ended(p.start) && !is_symbol(tokens, at, "|"))
+        {
+            do_scopes.closed(active.last().expect("ended do match").start);
+            close(view, tokens, &mut active, &mut done, at)?;
         }
         let statement = do_scopes.statement_at(view, tokens, at, depth);
         if term_locals::word(tokens, at, "do") {
@@ -285,8 +297,9 @@ fn plan(
                 }
             }
             "match" => active.push(MatchPlan {
+                statement: statement.is_some(),
                 function: false,
-                baseline: 0,
+                baseline: statement.unwrap_or(0),
                 start: at,
                 depth,
                 with: None,
@@ -294,6 +307,7 @@ fn plan(
                 end: range.end,
             }),
             "fun" | "λ" if is_symbol(tokens, at + 1, "|") => active.push(MatchPlan {
+                statement: false,
                 function: true,
                 baseline: {
                     let source = view.normalized();
@@ -312,18 +326,27 @@ fn plan(
                 alternatives: Vec::new(),
                 end: range.end,
             }),
-            "let" if conditionals.last().is_some_and(|p| {
-                p.statement && p.depth == depth && p.start + 1 == at
-            }) => {
+            "let"
+                if conditionals
+                    .last()
+                    .is_some_and(|p| p.statement && p.depth == depth && p.start + 1 == at) =>
+            {
                 // A pattern-test header is not a term-local let telescope.
                 // Its binding ends at `then`, not at a later branch semicolon.
             }
-            ":=" | "←" | "<-" if conditionals.last().is_some_and(|p| {
-                p.statement && p.depth == depth && p.then_at.is_none()
-                    && p.pattern_assignment.is_none()
-                    && is_symbol(tokens, p.start + 1, "let")
-            }) => {
-                conditionals.last_mut().expect("pattern condition").pattern_assignment = Some(at);
+            ":=" | "←" | "<-"
+                if conditionals.last().is_some_and(|p| {
+                    p.statement
+                        && p.depth == depth
+                        && p.then_at.is_none()
+                        && p.pattern_assignment.is_none()
+                        && is_symbol(tokens, p.start + 1, "let")
+                }) =>
+            {
+                conditionals
+                    .last_mut()
+                    .expect("pattern condition")
+                    .pattern_assignment = Some(at);
             }
             "let" => lets.push((
                 depth,
@@ -353,7 +376,11 @@ fn plan(
                 {
                     close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
                 }
-                while active.len() > enclosing && active.last().is_some_and(|p| p.depth == depth) {
+                while active.len() > enclosing
+                    && active
+                        .last()
+                        .is_some_and(|p| p.depth == depth && !p.statement)
+                {
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
             }
@@ -395,7 +422,10 @@ fn plan(
                 {
                     close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
                 }
-                while active.last().is_some_and(|p| p.depth == depth) {
+                while active
+                    .last()
+                    .is_some_and(|p| p.depth == depth && (symbol != ":" || !p.statement))
+                {
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
                 if matches!(symbol.as_str(), ")" | "}" | "]" | "⦄")
@@ -466,6 +496,9 @@ fn plan(
                     }
                     last.end = at;
                 }
+                // The preceding arm ended at this pipe, but the match has
+                // not ended: retain it while scanning the next pattern/header.
+                do_scopes.closed(current.start);
                 current.alternatives.push(Alternative {
                     pipe: at,
                     arrow: None,
@@ -473,10 +506,21 @@ fn plan(
                 });
             }
             "=>" | "↦" if active.last().is_some_and(|p| p.depth == depth) => {
-                if let Some(alt) = active.last_mut().and_then(|p| p.alternatives.last_mut())
+                let current = active.last_mut().expect("matching depth");
+                if let Some(alt) = current.alternatives.last_mut()
                     && alt.arrow.is_none()
                 {
                     alt.arrow = Some(at);
+                    if current.statement {
+                        if at + 1 < range.end
+                            && !is_symbol(tokens, at + 1, "{")
+                            && later_line(view, tokens, at + 1, at)
+                            && column(view, tokens, at + 1) < column(view, tokens, alt.pipe)
+                        {
+                            return Err(refuse(view, tokens, at + 1));
+                        }
+                        do_scopes.open(view, tokens, at, depth, Some(current.start), range.end)?;
+                    }
                 }
             }
             _ => {}
@@ -1043,8 +1087,34 @@ fn build_match(
         } else {
             null_node(vec![])
         };
-        let discriminator =
-            bounded_term_spliced(leaves, view, tokens, range, grammar, splices, updates)?;
+        let monadic = plan.statement
+            && (is_symbol(tokens, range.start, "←") || is_symbol(tokens, range.start, "<-"));
+        let discriminator = if monadic {
+            // General mixed nested actions need a separate evaluation-order
+            // planner. This bounded path owns one top-level action only.
+            if arity != 1 || range.start + 1 >= range.end {
+                return Err(refuse(view, tokens, range.start));
+            }
+            let arrow = leaves.leaf(range.start)?;
+            let action = bounded_term_spliced(
+                leaves,
+                view,
+                tokens,
+                range.start + 1..range.end,
+                grammar,
+                splices,
+                updates,
+            )?;
+            Syntax::node(
+                parser_kind(&["Term", "nestedAction"]),
+                vec![
+                    arrow,
+                    Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action]),
+                ],
+            )
+        } else {
+            bounded_term_spliced(leaves, view, tokens, range, grammar, splices, updates)?
+        };
         discriminators.push(Syntax::node(
             parser_kind(&["Term", "matchDiscr"]),
             vec![binding, discriminator],
@@ -1067,15 +1137,27 @@ fn build_match(
                 patterns.push(leaves.leaf(comma)?);
             }
         }
-        let rhs = branch_value(
-            leaves,
-            view,
-            tokens,
-            arrow + 1..alt.end,
-            grammar,
-            splices,
-            updates,
-        )?;
+        let rhs = if plan.statement {
+            bounded_do_sequence_spliced(
+                leaves,
+                view,
+                tokens,
+                arrow + 1..alt.end,
+                grammar,
+                splices,
+                updates,
+            )?
+        } else {
+            branch_value(
+                leaves,
+                view,
+                tokens,
+                arrow + 1..alt.end,
+                grammar,
+                splices,
+                updates,
+            )?
+        };
         alternatives.push(Syntax::node(
             parser_kind(&["Term", "matchAlt"]),
             vec![
@@ -1100,6 +1182,19 @@ fn build_match(
         Syntax::node(
             parser_kind(&["Term", "fun"]),
             vec![leaves.leaf(plan.start)?, alternatives],
+        )
+    } else if plan.statement {
+        Syntax::node(
+            parser_kind(&["Term", "doMatch"]),
+            vec![
+                leaves.leaf(plan.start)?,
+                null_node(vec![]), // optional dependent parameter
+                null_node(vec![]), // optional generalizing parameter
+                null_node(vec![]), // optional motive
+                null_node(discriminators),
+                leaves.leaf(with)?,
+                alternatives,
+            ],
         )
     } else {
         Syntax::node(

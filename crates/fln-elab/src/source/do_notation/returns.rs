@@ -68,7 +68,9 @@ impl Block {
 impl Context {
     /// Inspect only do-element positions. A nested do expression, lambda,
     /// collection callback or let value owns its own scope and is not scanned.
-    pub(super) fn has_branch_return(
+    /// General matches also need joins to preserve the expected monad through
+    /// the equation-refining match checker, even without explicit returns.
+    pub(super) fn needs_scoped_join(
         &mut self,
         sequence: &Syntax,
     ) -> Result<bool, NatDefinitionElabError> {
@@ -88,6 +90,13 @@ impl Context {
                 if let [_, sequence] = otherwise {
                     work.push((sequence, true));
                 }
+            } else if kind == &parser_kind(&["Term", "doMatch"]) {
+                // Unlike a Boolean if, a constructor match may refine the
+                // discriminant's type and introduce equality evidence. Share
+                // its suffix through a checked join so every arm receives the
+                // enclosing expected monad before refinement, rather than
+                // inferring a standalone monadic action without that context.
+                return Ok(true);
             } else if kind == &parser_kind(&["Term", "doSeqIndent"])
                 || kind == &parser_kind(&["Term", "doSeqBracketed"])
                 || kind == &Name::from_components(["null"])
@@ -138,7 +147,7 @@ impl Context {
             Block(Block),
             Resume(Block),
             Conditional(Syntax, Option<Syntax>, bool),
-            Finish(conditional::Header, Option<(Syntax, Syntax)>),
+            Finish(conditional::Header, usize, Option<(Syntax, Syntax)>),
             Value(Syntax),
         }
         let mut work = vec![Task::Block(Block::new(sequence, None, false)?)];
@@ -155,7 +164,7 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
-                    if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+                    if conditional::is_compound(&element) {
                         let suffix = block.result.take();
                         let require_unit = block.require_unit;
                         work.push(Task::Resume(block));
@@ -190,26 +199,27 @@ impl Context {
                     work.push(Task::Block(block));
                 }
                 Task::Conditional(syntax, suffix, require_unit) => {
-                    let branches = conditional::split(syntax)?;
+                    let branches = conditional::split(self, syntax)?;
                     let require_unit = require_unit || suffix.is_some();
                     let join = suffix
                         .map(|suffix| Ok((self.do_control_name()?, suffix)))
                         .transpose()?;
                     // Only the constant-size call is copied, never source code.
                     let next = join.as_ref().map(|(name, _)| resume(name));
-                    let yes = Block::new(branches.yes, next.clone(), require_unit)?;
-                    let no = match branches.no {
-                        Some(no) => Task::Block(Block::new(no, next, require_unit)?),
-                        None => Task::Value(next.unwrap_or_else(skip)),
-                    };
-                    work.push(Task::Finish(branches.header, join));
-                    work.push(no);
-                    work.push(Task::Block(yes));
+                    work.push(Task::Finish(branches.header, values.len(), join));
+                    for arm in branches.arms.into_iter().rev() {
+                        self.tick()?;
+                        work.push(match arm {
+                            Some(sequence) => {
+                                Task::Block(Block::new(sequence, next.clone(), require_unit)?)
+                            }
+                            None => Task::Value(next.clone().unwrap_or_else(skip)),
+                        });
+                    }
                 }
-                Task::Finish(header, join) => {
-                    let no = values.pop().ok_or_else(invalid)?;
-                    let yes = values.pop().ok_or_else(invalid)?;
-                    let body = self.finish_do_condition(header, yes, no)?;
+                Task::Finish(header, start, join) => {
+                    let bodies = values.split_off(start);
+                    let body = self.finish_do_condition(header, bodies)?;
                     values.push(match join {
                         Some((name, suffix)) => term("nativeDoJoin", vec![name, suffix, body]),
                         None => body,
@@ -320,7 +330,7 @@ mod tests {
     fn returns_in_term_scopes_are_not_captured_and_loop_returns_still_refuse() {
         let nested_do = term("do", vec![atom("do"), sequence(vec![returning("inner")])]);
         let input = sequence(vec![term("doExpr", vec![nested_do])]);
-        assert!(!context().has_branch_return(&input).unwrap());
+        assert!(!context().needs_scoped_join(&input).unwrap());
         let input = sequence(vec![condition(sequence(vec![returning("outer")]), None)]);
         let exit = call(
             false,

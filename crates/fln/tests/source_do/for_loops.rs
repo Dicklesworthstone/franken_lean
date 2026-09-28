@@ -181,3 +181,6 @@ mod early_returns;
 
 #[path = "for_loops/if_let.rs"]
 mod if_let;
+
+#[path = "for_loops/match_sequences.rs"]
+mod match_sequences;

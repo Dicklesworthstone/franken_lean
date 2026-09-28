@@ -27,6 +27,9 @@ enum Statement {
     Conditional {
         position: BytePos,
     },
+    Match {
+        position: BytePos,
+    },
     Return(usize),
     Unless {
         keyword: usize,
@@ -228,6 +231,10 @@ impl Prefix {
             };
             self.phase = Phase::Collection;
             *cursor = at + 1;
+        } else if word(tokens, at, "match") {
+            self.statement = Statement::Match {
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "if") {
             // The compound planner owns the explicit-else conditional. Its
             // branches are reclassified as do elements after that single parse.
@@ -249,7 +256,7 @@ impl Prefix {
         } else {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
-            for unsupported in ["match", "while", "repeat", "try", "have", "let_expr"] {
+            for unsupported in ["while", "repeat", "try", "have", "let_expr"] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
                 }
@@ -290,6 +297,17 @@ impl Prefix {
             match self.statement {
                 Statement::Action => Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
                 Statement::Conditional { position } => conditional::element(value, position)?,
+                Statement::Match { position } => {
+                    if !matches!(&value, Syntax::Node { kind, args, .. }
+                        if kind == &parser_kind(&["Term", "doMatch"]) && args.len() == 7)
+                    {
+                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                            at: position,
+                            expected: NatDefinitionExpectation::MatchAlternative,
+                        });
+                    }
+                    value
+                }
                 Statement::Return(at) => Syntax::node(
                     parser_kind(&["Term", "doReturn"]),
                     vec![atom(leaves, at, "return")?, null_node(vec![value])],

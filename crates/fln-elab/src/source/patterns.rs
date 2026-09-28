@@ -757,6 +757,14 @@ impl Context {
         &mut self,
         syntax: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        self.tick()?;
+        // The ordinary flat-match checker already owns exhaustive constructor
+        // arms and discriminant equality binders. Use the identical selection
+        // as the surrounding pattern walk, rather than forcing those matches
+        // through a matrix pass that cannot preserve named equalities yet.
+        if !complex(&syntax, &self.txn.env) {
+            return Ok(syntax);
+        }
         let mut required = Vec::new();
         let body = self.compile_pattern_matrix(&syntax, &mut required, None)?;
         Ok(if required.is_empty() {

@@ -9,6 +9,7 @@ mod conditional;
 mod control;
 mod for_loop;
 mod if_let;
+mod matching;
 mod pattern_binding;
 mod returns;
 pub(super) use returns::join_parts;
@@ -293,7 +294,7 @@ impl Context {
         sequence: Syntax,
         mut result: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        if result.is_none() && self.has_branch_return(&sequence)? {
+        if result.is_none() && self.needs_scoped_join(&sequence)? {
             return self.expand_returning_sequence(sequence);
         }
         let targets = result.as_ref().map(control::LoopTargets::new).transpose()?;
@@ -310,7 +311,7 @@ impl Context {
         for (offset, statement) in statements.into_iter().rev().enumerate() {
             self.tick()?;
             let element = sequence_element(statement)?;
-            result = Some(if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+            result = Some(if conditional::is_compound(&element) {
                 self.expand_do_conditional(element, result, targets.as_ref())?
             } else {
                 self.prepend_do_element(element, result, scope, offset == 0)?

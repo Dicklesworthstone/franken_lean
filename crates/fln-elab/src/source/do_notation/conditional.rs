@@ -12,11 +12,15 @@ fn root(label: &str) -> Syntax {
     ident(Name::from_components(["_root_", "ForInStep", label]))
 }
 fn skip() -> Syntax {
-    call(false, vec![ident(Name::from_components(["_root_", "PUnit", "unit"]))])
+    call(
+        false,
+        vec![ident(Name::from_components(["_root_", "PUnit", "unit"]))],
+    )
 }
 
 pub(super) enum Header {
     Proposition(Vec<Syntax>),
+    Match(Box<super::matching::MatchHeader>),
     Pattern {
         operands: Box<(Syntax, Syntax)>,
         monadic: bool,
@@ -27,10 +31,18 @@ impl Context {
     pub(super) fn finish_do_condition(
         &mut self,
         header: Header,
-        yes: Syntax,
-        no: Syntax,
+        mut bodies: Vec<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if let Header::Match(header) = header {
+            return self.finish_do_match(*header, bodies);
+        }
+        if bodies.len() != 2 {
+            return Err(invalid());
+        }
+        let no = bodies.pop().expect("else branch");
+        let yes = bodies.pop().expect("then branch");
         match header {
+            Header::Match(_) => unreachable!("handled match header"),
             Header::Proposition(mut header) => {
                 header.insert(4, yes);
                 header.push(no);
@@ -46,14 +58,24 @@ impl Context {
 
 pub(super) struct Branches {
     pub(super) header: Header,
-    pub(super) yes: Syntax,
-    pub(super) no: Option<Syntax>,
+    pub(super) arms: Vec<Option<Syntax>>,
 }
 
 /// Validate every structural slot. An absent else means skip; an explicit
 /// empty or malformed sequence is not an absent else. Else-if list support
 /// remains separate, so no unrecognized clause can be silently dropped.
-pub(super) fn split(syntax: Syntax) -> Result<Branches, NatDefinitionElabError> {
+pub(super) fn is_compound(syntax: &Syntax) -> bool {
+    syntax.kind() == Some(&parser_kind(&["Term", "doIf"]))
+        || syntax.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+}
+
+pub(super) fn split(
+    context: &mut Context,
+    syntax: Syntax,
+) -> Result<Branches, NatDefinitionElabError> {
+    if syntax.kind() == Some(&parser_kind(&["Term", "doMatch"])) {
+        return super::matching::split(context, syntax);
+    }
     let mut parts = node(syntax, "doIf", 6)?;
     let mut otherwise = children(parts.pop().expect("else clause"))?;
     let (else_token, no) = match otherwise.len() {
@@ -100,7 +122,10 @@ pub(super) fn split(syntax: Syntax) -> Result<Branches, NatDefinitionElabError> 
         }
         Header::Proposition(vec![if_token, binding, predicate, then_token, else_token])
     };
-    Ok(Branches { header, yes, no })
+    Ok(Branches {
+        header,
+        arms: vec![Some(yes), no],
+    })
 }
 
 struct Block<'a> {
@@ -133,7 +158,7 @@ impl Context {
     ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task<'a> {
             Conditional(Syntax, Option<Syntax>, SequenceScope<'a>),
-            Finish(Header, Option<Syntax>, SequenceScope<'a>),
+            Finish(Header, usize, Option<Syntax>, SequenceScope<'a>),
             Block(Block<'a>),
             Resume(Block<'a>),
             Value(Syntax),
@@ -154,24 +179,24 @@ impl Context {
             match task {
                 Task::Value(value) => values.push(value),
                 Task::Conditional(syntax, suffix, scope) => {
-                    let branches = split(syntax)?;
+                    let branches = split(self, syntax)?;
                     let branch_scope = SequenceScope {
                         targets: scope.targets,
                         signal: scope.targets.is_some(),
                         require_unit: scope.require_unit || suffix.is_some(),
                         allow_return: scope.allow_return && suffix.is_none(),
                     };
-                    let yes = Block::new(branches.yes, branch_scope)?;
-                    let no = match branches.no {
-                        Some(no) => Task::Block(Block::new(no, branch_scope)?),
-                        None => Task::Value(match scope.targets {
-                            Some(targets) => targets.signal(None),
-                            None => skip(),
-                        }),
-                    };
-                    tasks.push(Task::Finish(branches.header, suffix, scope));
-                    tasks.push(no);
-                    tasks.push(Task::Block(yes));
+                    tasks.push(Task::Finish(branches.header, values.len(), suffix, scope));
+                    for arm in branches.arms.into_iter().rev() {
+                        self.tick()?;
+                        tasks.push(match arm {
+                            Some(sequence) => Task::Block(Block::new(sequence, branch_scope)?),
+                            None => Task::Value(match scope.targets {
+                                Some(targets) => targets.signal(None),
+                                None => skip(),
+                            }),
+                        });
+                    }
                 }
                 Task::Block(mut block) => {
                     let Some(statement) = block.statements.pop() else {
@@ -181,7 +206,7 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
-                    if element.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+                    if is_compound(&element) {
                         // A terminal nested conditional already returns the
                         // same signal as its enclosing branch. Do not append
                         // an administrative bind that just forwards that signal.
@@ -207,10 +232,9 @@ impl Context {
                     block.result = Some(values.pop().ok_or_else(invalid)?);
                     tasks.push(Task::Block(block));
                 }
-                Task::Finish(header, suffix, scope) => {
-                    let no = values.pop().ok_or_else(invalid)?;
-                    let yes = values.pop().ok_or_else(invalid)?;
-                    let conditional = self.finish_do_condition(header, yes, no)?;
+                Task::Finish(header, start, suffix, scope) => {
+                    let bodies = values.split_off(start);
+                    let conditional = self.finish_do_condition(header, bodies)?;
                     values.push(self.join_do_conditional(conditional, suffix, scope)?);
                 }
             }
@@ -548,7 +572,14 @@ mod tests {
             let output = context()
                 .expand_do_conditional(input, Some(named("shared_suffix")), Some(&targets))
                 .unwrap();
-            for name in ["initializer", "read_action", "first", "second", "other", "shared_suffix"] {
+            for name in [
+                "initializer",
+                "read_action",
+                "first",
+                "second",
+                "other",
+                "shared_suffix",
+            ] {
                 assert_eq!(count(&output, &Name::from_components([name])), 1, "{name}");
             }
             let parts = expect_node(
@@ -560,21 +591,37 @@ mod tests {
             .unwrap();
             assert_eq!(count(&parts[1], &Name::from_components(["local"])), 0);
             assert_eq!(count(&parts[1], &Name::from_components(["bound"])), 0);
-            assert_eq!(count(&parts[1], &Name::from_components(["shared_suffix"])), 1);
+            assert_eq!(
+                count(&parts[1], &Name::from_components(["shared_suffix"])),
+                1
+            );
         }
     }
 
     #[test]
     fn absent_else_is_skip_but_explicit_empty_sequences_are_refused() {
         let output = context()
-            .expand_do_conditional(branch_blocks(block(vec![action("yes")], false), None), None, None)
+            .expand_do_conditional(
+                branch_blocks(block(vec![action("yes")], false), None),
+                None,
+                None,
+            )
             .unwrap();
-        let parts = expect_node(&output, &parser_kind(&["Term", "ifThenElse"]), 7, "conditional").unwrap();
+        let parts = expect_node(
+            &output,
+            &parser_kind(&["Term", "ifThenElse"]),
+            7,
+            "conditional",
+        )
+        .unwrap();
         assert_eq!(parts[6], skip());
         for bracketed in [false, true] {
             for input in [
                 branch_blocks(block(vec![], bracketed), None),
-                branch_blocks(block(vec![action("yes")], bracketed), Some(block(vec![], bracketed))),
+                branch_blocks(
+                    block(vec![action("yes")], bracketed),
+                    Some(block(vec![], bracketed)),
+                ),
             ] {
                 assert!(context().expand_do_conditional(input, None, None).is_err());
             }
@@ -591,8 +638,15 @@ mod tests {
                 Some(&targets),
             )
             .unwrap();
-        let join = expect_node(&output, &parser_kind(&["Term", "nativeDoBind"]), 2, "join").unwrap();
-        let condition = expect_node(&join[0], &parser_kind(&["Term", "ifThenElse"]), 7, "conditional").unwrap();
+        let join =
+            expect_node(&output, &parser_kind(&["Term", "nativeDoBind"]), 2, "join").unwrap();
+        let condition = expect_node(
+            &join[0],
+            &parser_kind(&["Term", "ifThenElse"]),
+            7,
+            "conditional",
+        )
+        .unwrap();
         assert_eq!(condition[4], targets.signal(Some(true)));
         assert_eq!(condition[6], targets.signal(None));
         assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
@@ -601,7 +655,10 @@ mod tests {
     #[test]
     fn nested_nonterminal_conditional_forwards_the_whole_control_signal() {
         let input = branch_blocks(
-            block(vec![condition(jump(true), jump(false)), action("inner_suffix")], false),
+            block(
+                vec![condition(jump(true), jump(false)), action("inner_suffix")],
+                false,
+            ),
             Some(block(vec![action("other")], false)),
         );
         let targets = control::LoopTargets::new(&normal()).unwrap();
@@ -617,19 +674,47 @@ mod tests {
                 if kind != &parser_kind(&["Term", "nativeDoBind"]) {
                     continue;
                 }
-                let lambda = expect_node(&args[1], &parser_kind(&["Term", "fun"]), 2, "join lambda").unwrap();
-                let basic = expect_node(&lambda[1], &parser_kind(&["Term", "basicFun"]), 4, "join body").unwrap();
+                let lambda =
+                    expect_node(&args[1], &parser_kind(&["Term", "fun"]), 2, "join lambda")
+                        .unwrap();
+                let basic = expect_node(
+                    &lambda[1],
+                    &parser_kind(&["Term", "basicFun"]),
+                    4,
+                    "join body",
+                )
+                .unwrap();
                 if basic[3].kind() != Some(&parser_kind(&["Term", "match"])) {
                     continue;
                 }
                 let [signal] = expect_null_args(&basic[0], "signal binder").unwrap() else {
                     panic!("one generated join binder");
                 };
-                let dispatch = expect_node(&basic[3], &parser_kind(&["Term", "match"]), 6, "dispatcher").unwrap();
-                let alternatives = expect_node(&dispatch[5], &parser_kind(&["Term", "matchAlts"]), 1, "alternatives").unwrap();
+                let dispatch =
+                    expect_node(&basic[3], &parser_kind(&["Term", "match"]), 6, "dispatcher")
+                        .unwrap();
+                let alternatives = expect_node(
+                    &dispatch[5],
+                    &parser_kind(&["Term", "matchAlts"]),
+                    1,
+                    "alternatives",
+                )
+                .unwrap();
                 let alternatives = expect_null_args(&alternatives[0], "alternatives").unwrap();
-                let done = expect_node(&alternatives[0], &parser_kind(&["Term", "matchAlt"]), 4, "done branch").unwrap();
-                let pure = expect_node(&done[3], &parser_kind(&["Term", "nativeDoPure"]), 1, "forwarded value").unwrap();
+                let done = expect_node(
+                    &alternatives[0],
+                    &parser_kind(&["Term", "matchAlt"]),
+                    4,
+                    "done branch",
+                )
+                .unwrap();
+                let pure = expect_node(
+                    &done[3],
+                    &parser_kind(&["Term", "nativeDoPure"]),
+                    1,
+                    "forwarded value",
+                )
+                .unwrap();
                 if &pure[0] == signal {
                     forwarded += 1;
                 } else {
@@ -646,16 +731,33 @@ mod tests {
     #[test]
     fn branch_returns_need_the_outer_return_scope_and_no_pending_source_suffix() {
         let returning = || term("doReturn", vec![atom("return"), null(vec![named("value")])]);
-        let input = || branch_blocks(
-            block(vec![binding("local", "initializer", false), returning()], false),
-            Some(block(vec![action("other")], false)),
-        );
+        let input = || {
+            branch_blocks(
+                block(
+                    vec![binding("local", "initializer", false), returning()],
+                    false,
+                ),
+                Some(block(vec![action("other")], false)),
+            )
+        };
         assert!(context().expand_do_conditional(input(), None, None).is_ok());
-        assert!(context().expand_do_conditional(input(), Some(named("outer_suffix")), None).is_err());
+        assert!(
+            context()
+                .expand_do_conditional(input(), Some(named("outer_suffix")), None)
+                .is_err()
+        );
         let targets = control::LoopTargets::new(&normal()).unwrap();
-        assert!(context().expand_do_conditional(input(), Some(normal()), Some(&targets)).is_err());
+        assert!(
+            context()
+                .expand_do_conditional(input(), Some(normal()), Some(&targets))
+                .is_err()
+        );
         let nested = condition(input(), action("other"));
-        assert!(context().expand_do_conditional(nested, Some(named("outer_suffix")), None).is_err());
+        assert!(
+            context()
+                .expand_do_conditional(nested, Some(named("outer_suffix")), None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -666,12 +768,24 @@ mod tests {
                 block(vec![jump(stop), action("unreachable")], false),
                 Some(block(vec![action("other")], false)),
             );
-            assert!(context().expand_do_conditional(input, Some(normal()), Some(&targets)).is_err());
+            assert!(
+                context()
+                    .expand_do_conditional(input, Some(normal()), Some(&targets))
+                    .is_err()
+            );
         }
-        let malformed = term("doSeqIndent", vec![null(vec![term(
-            "doSeqItem", vec![action("yes"), null(vec![named("hidden")])],
-        )])]);
-        assert!(context().expand_do_conditional(branch_blocks(malformed, None), None, None).is_err());
+        let malformed = term(
+            "doSeqIndent",
+            vec![null(vec![term(
+                "doSeqItem",
+                vec![action("yes"), null(vec![named("hidden")])],
+            )])],
+        );
+        assert!(
+            context()
+                .expand_do_conditional(branch_blocks(malformed, None), None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -688,9 +802,13 @@ mod tests {
         stopped.txn.budget.max_heartbeats = 10;
         assert!(matches!(
             stopped.expand_do_conditional(body.clone(), Some(normal()), Some(&targets)),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
-        let output = context().expand_do_conditional(body, Some(normal()), Some(&targets)).unwrap();
+        let output = context()
+            .expand_do_conditional(body, Some(normal()), Some(&targets))
+            .unwrap();
         assert_eq!(count(&output, &Name::from_components(["test"])), 512);
         assert_eq!(count(&output, &Name::from_components(["suffix"])), 512);
         assert_eq!(count(&output, &Name::from_components(["other"])), 512);
@@ -703,6 +821,9 @@ mod tests {
                 pending.extend(args);
             }
         }
-        assert!(size < 512 * 150, "unexpected continuation multiplication: {size}");
+        assert!(
+            size < 512 * 150,
+            "unexpected continuation multiplication: {size}"
+        );
     }
 }
