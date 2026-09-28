@@ -338,3 +338,6 @@ fn lake_build_uses_checked_metadata_and_original_external_import_order() {
         .unwrap();
     success(output);
 }
+
+#[path = "source_olean_metadata/contexts.rs"]
+mod contexts;

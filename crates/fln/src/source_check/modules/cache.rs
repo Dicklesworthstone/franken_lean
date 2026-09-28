@@ -162,6 +162,7 @@ pub(super) struct CacheView<'a> {
 pub(super) struct RunOptions<'a> {
     pub(super) cache: Option<CacheView<'a>>,
     pub(super) collect_artifacts: bool,
+    pub(super) contexts: Option<&'a contexts::ImportContexts>,
 }
 pub(super) struct Run {
     pub(super) result: SourceModuleSessionCheck,
@@ -191,6 +192,7 @@ pub(super) fn run(
         RunOptions {
             cache,
             collect_artifacts: false,
+            contexts: None,
         },
     )
 }
@@ -207,6 +209,7 @@ pub(super) fn run_collecting(
     let RunOptions {
         cache,
         collect_artifacts,
+        contexts,
     } = run_options;
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -242,9 +245,25 @@ pub(super) fn run_collecting(
             )));
         }
         let dependencies = plan.dependencies_of(index, modules, &mut meter)?;
+        let steps = match contexts {
+            Some(contexts) => contexts.order(index, &plan, modules, &mut meter)?,
+            None => dependencies
+                .iter()
+                .copied()
+                .map(contexts::Step::Source)
+                .collect(),
+        };
+        let imported_base = match contexts {
+            Some(contexts) => match contexts.project(&steps, &mut meter, cancellation)? {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            },
+            None => base.clone(),
+        };
         if collect_artifacts {
             artifacts::validate_import_scope(
-                base,
+                &imported_base,
                 index,
                 &dependencies,
                 &plan,
@@ -290,13 +309,36 @@ pub(super) fn run_collecting(
         } else {
             let before_work = meter.work;
             let before_bytes = meter.bytes;
-            let mut imported = base.clone();
-            for dependency in dependencies {
+            let mut imported = imported_base;
+            for step in steps {
                 if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                     return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                         "source-modules/before-import",
                     )));
                 }
+                let dependency = match step {
+                    contexts::Step::Source(dependency) => dependency,
+                    contexts::Step::External(name) => {
+                        imported = match contexts
+                            .expect("external steps require import contexts")
+                            .replay_metadata(
+                            &name,
+                            imported,
+                            options,
+                            &mut meter,
+                            cancellation,
+                        )? {
+                            Outcome::Complete(engine) => engine,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
+                        continue;
+                    }
+                };
                 let export = exports.get(&dependency).expect("postorder predecessor");
                 imported = match export.replay(
                     imported,

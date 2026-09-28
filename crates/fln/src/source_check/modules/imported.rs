@@ -46,6 +46,7 @@ pub struct SourceMetadataReport {
 
 #[derive(Debug)]
 pub struct SourceOleanImport {
+    pub(super) contexts: super::contexts::ImportContexts,
     /// The metadata-enabled successor. Both checker projections and import
     /// identities are retained; metadata itself grants no declaration authority.
     pub engine: Engine,
@@ -216,7 +217,9 @@ impl Engine {
         let mut defaults = decoded.defaults.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
+        let mut journals = BTreeMap::new();
         for report in &mut reports {
+            let before = engine.environment.clone();
             for _ in 0..report.classes {
                 cancelled!("source-olean/class");
                 let row = classes.next().ok_or(SourceOleanImportError::Internal("class count changed during decode"))?;
@@ -255,6 +258,7 @@ impl Engine {
                 engine.environment = instances::defaults::register(&engine.environment, &row.declaration, row.priority)
                     .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
             }
+            journals.insert(report.module.clone(), (before, engine.environment.clone()));
         }
         if classes.next().is_some() || instances.next().is_some() || defaults.next().is_some() {
             return Err(SourceOleanImportError::Internal("decoded metadata escaped its module inventory"));
@@ -264,7 +268,8 @@ impl Engine {
         // represented by the retained independent-checker projection.
         if bound { engine.imported_environment = Some(engine.environment.clone()); }
         let result_logical_root = engine.logical_root(options);
-        Ok(Outcome::Complete(SourceOleanImport { engine, checked, result_logical_root, modules: reports }))
+        let contexts = super::contexts::ImportContexts::capture(self, &engine, &checked, journals);
+        Ok(Outcome::Complete(SourceOleanImport { engine, checked, result_logical_root, modules: reports, contexts }))
     }
 }
 

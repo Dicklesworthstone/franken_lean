@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 mod artifacts;
 mod cache;
+mod contexts;
 mod graph;
 pub mod imported;
 mod replay;
@@ -61,6 +62,10 @@ pub enum SourceModuleCheckError {
         module: Name,
         import: Name,
     },
+    ImportContext {
+        module: Name,
+        reason: &'static str,
+    },
     Cycle(Name),
     UnreachableModule(Name),
     Limit {
@@ -109,6 +114,9 @@ impl std::fmt::Display for SourceModuleCheckError {
                 module.to_display_string(),
                 import.to_display_string()
             ),
+            Self::ImportContext { module, reason } => write!(
+                f, "module `{}` import context: {reason}", module.to_display_string()
+            ),
             Self::Cycle(name) => write!(
                 f,
                 "source import cycle through `{}`",
@@ -153,7 +161,7 @@ impl SourceModuleCheckError {
             Self::Source { error, .. } => error.disposition(),
             Self::Replay { error, .. } => super::classify(error),
             Self::Limit { .. } => ("resource", false, 3),
-            Self::Extension { .. } => ("inconclusive", false, 3),
+            Self::Extension { .. } | Self::ImportContext { .. } => ("inconclusive", false, 3),
             _ => ("input", false, 1),
         }
     }

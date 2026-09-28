@@ -66,10 +66,10 @@ pub(super) struct PendingArtifact {
     constants: Vec<ConstantInfo>,
 }
 
-/// An import engine is an immutable whole closure. Until the source checker can
-/// project different external worlds, every module must really import that
-/// whole closure, directly or through its local source dependencies. Otherwise
-/// names from an unrelated external sibling could leak into its declarations.
+/// Every artifact must name its entire external base, directly or through local
+/// dependencies. Import receipts project that base per module; legacy explicit
+/// Engine callers must supply the exact world themselves. Neither path may
+/// let an unrelated external sibling leak names into a module's declarations.
 pub(super) fn validate_import_scope(
     base: &Engine,
     index: usize,
@@ -228,6 +228,7 @@ impl Engine {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: true,
+                contexts: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?
@@ -236,17 +237,24 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let mut remaining = write_budget;
-        let mut artifacts = Vec::new();
-        for pending in run.artifacts {
-            let artifact = pending.encode(remaining)?;
-            remaining.max_bytes -= artifact.report.file_bytes;
-            remaining.max_objects -= artifact.report.runtime_objects;
-            artifacts.push(artifact);
-        }
-        Ok(Outcome::Complete(SourceModuleBuild {
-            checked: run.result.checked,
-            artifacts,
-        }))
+        finish(run, write_budget).map(Outcome::Complete)
     }
+}
+
+pub(super) fn finish(
+    run: cache::Run,
+    write_budget: OleanWriteBudget,
+) -> Result<SourceModuleBuild, SourceModuleBuildError> {
+    let mut remaining = write_budget;
+    let mut artifacts = Vec::new();
+    for pending in run.artifacts {
+        let artifact = pending.encode(remaining)?;
+        remaining.max_bytes -= artifact.report.file_bytes;
+        remaining.max_objects -= artifact.report.runtime_objects;
+        artifacts.push(artifact);
+    }
+    Ok(SourceModuleBuild {
+        checked: run.result.checked,
+        artifacts,
+    })
 }
