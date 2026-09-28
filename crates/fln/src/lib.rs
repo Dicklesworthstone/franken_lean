@@ -1704,6 +1704,10 @@ enum ConstantReferenceCollectionError {
     AllocationFailure { requested: usize },
 }
 
+/// Collect the constants `expression` names. A decoded term is a DAG whose
+/// subterms are shared, so each distinct node is presented once: walked as a
+/// tree, `blastDivSubtractShift_decl_eq` alone presents 69,111,656 nodes over
+/// 1,719 distinct ones (bead fln-32rr).
 fn collect_constant_references(
     expression: &Expr,
     names: &mut BTreeSet<Name>,
@@ -1717,7 +1721,15 @@ fn collect_constant_references(
         .try_reserve(1)
         .map_err(|_| ConstantReferenceCollectionError::AllocationFailure { requested: 1 })?;
     pending.push(expression);
+    let mut seen = std::collections::HashSet::<*const ExprNode>::new();
     while let Some(expression) = pending.pop() {
+        seen.try_reserve(1)
+            .map_err(|_| ConstantReferenceCollectionError::AllocationFailure {
+                requested: seen.len().saturating_add(1),
+            })?;
+        if !seen.insert(std::ptr::from_ref(expression.node())) {
+            continue;
+        }
         *presentations = presentations.saturating_add(1);
         if *presentations > limit {
             return Err(ConstantReferenceCollectionError::PresentationLimit {
@@ -15157,6 +15169,41 @@ mod tests {
                 .engine
                 .environment()
                 .contains(&Name::from_components(["lt_pos"]))
+        );
+    }
+
+    /// fln-32rr: shared subterms are presented once. The term doubles one node
+    /// 64 times, so as a tree it has 2^65 - 1 nodes; as a DAG, 65.
+    #[test]
+    fn constant_references_present_each_shared_node_once() {
+        let mut term = Expr::const_(Name::from_components(["shared"]), Vec::new());
+        for _ in 0..64 {
+            term = Expr::app(term.clone(), term);
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut presentations = 0;
+        assert_eq!(
+            super::collect_constant_references(&term, &mut names, &mut presentations, 65),
+            Ok(())
+        );
+        assert_eq!(presentations, 65);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            [Name::from_components(["shared"])]
+        );
+        let mut presentations = 0;
+        assert_eq!(
+            super::collect_constant_references(
+                &term,
+                &mut std::collections::BTreeSet::new(),
+                &mut presentations,
+                64
+            ),
+            Err(super::ConstantReferenceCollectionError::PresentationLimit {
+                observed: 65,
+                limit: 64
+            }),
+            "the limit still bounds distinct nodes"
         );
     }
 
