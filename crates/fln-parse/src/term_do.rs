@@ -1,6 +1,6 @@
 //! Sequential do notation on the ordinary, nonrecursive term-frame stack.
 //!
-//! Every statement owns its original leaves. Immutable named lets, named
+//! Every statement owns its original leaves. Immutable named and pattern lets,
 //! monadic binds, actions and terminal returns support both indentation and
 //! explicit braces. Single-collection, immutable for loops reuse the same
 //! frame stack, including terminal break/continue. Mutable bindings, pattern
@@ -267,7 +267,10 @@ impl Prefix {
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self.phase {
             Phase::Pattern => {
-                word(tokens, at, ":") || word(tokens, at, "←") || word(tokens, at, "<-")
+                word(tokens, at, ":")
+                    || word(tokens, at, ":=")
+                    || word(tokens, at, "←")
+                    || word(tokens, at, "<-")
             }
             Phase::Annotation => {
                 word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-")
@@ -445,10 +448,26 @@ impl Prefix {
         let pure = matches!(&leaves.leaf(assignment)?, Syntax::Atom { val, .. } if val == ":=");
         let config = Syntax::node(parser_kind(&["Term", "letConfig"]), vec![null_node(vec![])]);
         Ok(if pure {
-            let declaration = Syntax::node(
-                parser_kind(&["Term", "letIdDecl"]),
-                vec![
+            let (kind, binder) = if let Some(pattern) = self.pattern.take() {
+                if pattern.kind() == Some(&parser_kind(&["Term", "hole"])) {
+                    // Unlike doIdDecl, the pin's letId accepts `_` binders.
+                    (
+                        "letIdDecl",
+                        Syntax::node(parser_kind(&["Term", "letId"]), vec![pattern]),
+                    )
+                } else {
+                    ("letPatDecl", pattern)
+                }
+            } else {
+                (
+                    "letIdDecl",
                     Syntax::node(parser_kind(&["Term", "letId"]), vec![leaves.leaf(name)?]),
+                )
+            };
+            let declaration = Syntax::node(
+                parser_kind(&["Term", kind]),
+                vec![
+                    binder,
                     null_node(vec![]),
                     annotation,
                     leaves.leaf(assignment)?,
@@ -510,7 +529,10 @@ impl Prefix {
     ) -> Result<(Self, usize), NatDefinitionParseError> {
         if self.phase == Phase::Pattern {
             if at + 1 >= end
-                || !(word(tokens, at, ":") || word(tokens, at, "←") || word(tokens, at, "<-"))
+                || !(word(tokens, at, ":")
+                    || word(tokens, at, ":=")
+                    || word(tokens, at, "←")
+                    || word(tokens, at, "<-"))
             {
                 return Err(refuse(view, tokens, at));
             }
@@ -553,7 +575,6 @@ impl Prefix {
         if self.phase == Phase::Annotation {
             if at + 1 >= end
                 || !(word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-"))
-                || (self.pattern.is_some() && word(tokens, at, ":="))
             {
                 return Err(refuse(view, tokens, at));
             }

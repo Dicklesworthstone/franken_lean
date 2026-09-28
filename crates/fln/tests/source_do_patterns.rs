@@ -213,3 +213,92 @@ theorem suffixScope : outer 40 false = 40 := by rfl
 "#,
     );
 }
+
+#[test]
+fn pure_destructuring_composes_with_monadic_patterns_and_shadowing() {
+    checked(
+        &engine(),
+        r#"
+def pureParts (x : Nat) : Id Nat := do
+  let (Wrapped.mk (Pair.mk x y)) : Wrapped := Wrapped.mk (Pair.mk x 2)
+  let _ : Nat := y
+  let Pair.mk a b ← (Pair.mk x y : Id Pair)
+  return (a + b)
+theorem purePartsValue : pureParts 40 = 42 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn unused_pure_patterns_do_not_erase_invalid_values_or_annotations() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad : Id Nat := do let _ : Bool := 7; return 42",
+        "def bad : Id Nat := do let _ := unknown; return 42",
+        "def bad : Id Nat := do let (Pair.mk x x) := Pair.mk 1 2; return x",
+        "def bad : Id Nat := do let (Pair.mk x y) : Bool := Pair.mk 1 2; return x",
+        "def bad (flag : Bool) : Id Nat := do let (true) := flag; return 42",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    checked(&base, "def recovered : Id Nat := do let _ := 7; return 42");
+}
+
+#[test]
+fn dependent_field_types_survive_pure_destructuring() {
+    checked(
+        &engine(),
+        r#"
+structure Package where
+  domain : Type
+  value : domain
+  tag : Nat
+def unpackPackage (p : Package) : Id Nat := do
+  let (Package.mk A value tag) := p
+  let _ : A := value
+  return tag
+theorem packageValue : unpackPackage (Package.mk Nat 7 42) = 42 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn pure_and_monadic_patterns_compose_with_if_let_and_execute_early_returns() {
+    use fln::{EngineExecutionLimits, VmExit};
+    let source = r#"
+inductive Choice where
+  | empty
+  | pair (value : Pair)
+def choose (choice : Choice) : Id Nat := do
+  let (Pair.mk x y) := Pair.mk 20 22
+  if let Choice.pair (Pair.mk x y) := choice then
+    let Pair.mk y x ← (Pair.mk y x : Id Pair)
+    return (x * 10 + y)
+  return (x + y)
+theorem earlyPattern : choose (Choice.pair (Pair.mk 4 2)) = 42 := by rfl
+theorem laterPattern : choose Choice.empty = 42 := by rfl
+#eval choose (Choice.pair (Pair.mk 4 2)) + choose Choice.empty
+"#;
+    let run = engine()
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(result) = &run.executions.last().unwrap().exit else {
+        panic!("mixed destructuring program did not return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("84")
+    );
+}

@@ -376,6 +376,9 @@ impl Context {
             let config = parts.pop().expect("let config");
             expect_empty_null(&parts[1], "immutable do let")?;
             expect_atom(&parts[0], "let", "let keyword")?;
+            if pattern_binding::is_pattern_let(&declaration)? {
+                return self.expand_do_let_pattern(config, declaration, body);
+            }
             return Ok(Syntax::node(
                 parser_kind(&["Term", "let"]),
                 vec![parts.remove(0), config, declaration, atom(";"), body],

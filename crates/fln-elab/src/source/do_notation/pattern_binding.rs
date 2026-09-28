@@ -1,4 +1,4 @@
-//! Immutable monadic pattern bindings reuse the ordinary checked matcher.
+//! Immutable pure and monadic pattern bindings reuse the ordinary checked matcher.
 //!
 //! The action occurs once, outside the pattern match. A fresh, unspellable
 //! lambda parameter owns its result; neither a failed monadic action nor an
@@ -67,6 +67,98 @@ impl Context {
             vec![
                 action.pop().expect("validated action expression"),
                 lambda(subject, annotation, body)?,
+            ],
+        ))
+    }
+}
+
+pub(super) fn is_pattern_let(declaration: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    let parts = expect_node(
+        declaration,
+        &parser_kind(&["Term", "letDecl"]),
+        1,
+        "do let declaration",
+    )?;
+    let Syntax::Node { kind, args, .. } = &parts[0] else {
+        return Ok(false);
+    };
+    if kind == &parser_kind(&["Term", "letPatDecl"]) {
+        return Ok(true);
+    }
+    if kind != &parser_kind(&["Term", "letIdDecl"]) {
+        return Ok(false);
+    }
+    Ok(matches!(args.first(), Some(Syntax::Node { kind, args, .. })
+        if kind == &parser_kind(&["Term", "letId"])
+            && matches!(args.as_slice(), [pattern]
+                if pattern.kind() == Some(&parser_kind(&["Term", "hole"])))))
+}
+
+impl Context {
+    pub(super) fn expand_do_let_pattern(
+        &mut self,
+        config: Syntax,
+        declaration: Syntax,
+        body: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        self.tick()?;
+        let options = expect_node(
+            &config,
+            &parser_kind(&["Term", "letConfig"]),
+            1,
+            "let config",
+        )?;
+        expect_empty_null(&options[0], "plain pattern let config")?;
+        let mut declaration = node(declaration, "letDecl", 1)?;
+        let declaration = declaration
+            .pop()
+            .expect("validated pattern let declaration");
+        let ignored = declaration.kind() == Some(&parser_kind(&["Term", "letIdDecl"]));
+        let mut parts = node(
+            declaration,
+            if ignored { "letIdDecl" } else { "letPatDecl" },
+            5,
+        )?;
+        let value = parts.pop().expect("validated pattern let value");
+        let assignment = parts.pop().expect("validated pattern let assignment");
+        expect_atom(&assignment, ":=", "pattern let assignment")?;
+        let annotation = parts.pop().expect("validated pattern let annotation");
+        let binders = parts.pop().expect("validated pattern let binders");
+        expect_empty_null(&binders, "pattern let has no function binders")?;
+        let pattern = parts.pop().expect("validated let pattern");
+        let pattern = if ignored {
+            let mut binder = node(pattern, "letId", 1)?;
+            let pattern = binder.pop().expect("validated ignored binder");
+            if pattern.kind() != Some(&parser_kind(&["Term", "hole"])) {
+                return Err(invalid());
+            }
+            pattern
+        } else {
+            pattern
+        };
+        let subject = self.do_control_name()?;
+        let body = self.lower_do_binding_pattern(pattern, subject.clone(), body)?;
+        // Keep the annotated value in an ordinary checked let, including when
+        // the source pattern is `_`. An unused binding must not erase an
+        // invalid value or silently replace its written type annotation.
+        let declaration = Syntax::node(
+            parser_kind(&["Term", "letIdDecl"]),
+            vec![
+                Syntax::node(parser_kind(&["Term", "letId"]), vec![subject]),
+                null(vec![]),
+                annotation,
+                assignment,
+                value,
+            ],
+        );
+        Ok(Syntax::node(
+            parser_kind(&["Term", "let"]),
+            vec![
+                atom("let"),
+                config,
+                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
+                atom(";"),
+                body,
             ],
         ))
     }

@@ -82,3 +82,38 @@ fn long_pattern_bind_chains_stay_on_the_existing_heap_frames() {
     let parsed = parse_definition(source.as_bytes()).unwrap();
     assert_eq!(nodes(parsed.syntax(), "doPatDecl").len(), 128);
 }
+
+#[test]
+fn pure_patterns_retain_the_pinned_let_declaration_layout() {
+    for source in [
+        "def f : Nat := do let (Pair.mk a b) := pair; return a",
+        "def f : Nat := do { let (Pair.mk a b) : Pair := pair; return b }",
+        "def f : Nat := do let (_) : Nat := 7; return 42",
+    ] {
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        let patterns = nodes(parsed.syntax(), "letPatDecl");
+        assert_eq!(patterns.len(), 1, "{source}");
+        assert_eq!(patterns[0].len(), 5);
+        assert!(matches!(&patterns[0][1], Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["null"]) && args.is_empty()));
+        assert!(matches!(&patterns[0][3], Syntax::Atom { val, .. } if val == ":="));
+    }
+}
+
+#[test]
+fn pure_wildcards_remain_let_id_binders_in_the_pinned_syntax() {
+    let parsed = parse_definition(b"def f : Nat := do let _ : Nat := 7; return 42").unwrap();
+    assert!(nodes(parsed.syntax(), "letPatDecl").is_empty());
+    assert_eq!(nodes(parsed.syntax(), "letIdDecl").len(), 1);
+    assert_eq!(nodes(parsed.syntax(), "hole").len(), 1);
+}
+
+#[test]
+fn mixed_pure_and_monadic_pattern_headers_keep_separate_state() {
+    let source =
+        "def f : Nat := do let (Pair.mk x y) := pair; let _ ← action; let n := x; return n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    assert_eq!(nodes(parsed.syntax(), "letPatDecl").len(), 1);
+    assert_eq!(nodes(parsed.syntax(), "doPatDecl").len(), 1);
+    assert_eq!(nodes(parsed.syntax(), "letIdDecl").len(), 1);
+}
