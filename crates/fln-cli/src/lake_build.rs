@@ -1,7 +1,9 @@
 //! Checked TOML package module builds. Only the Reference's `+Module:olean`
 //! facet is complete here; library defaults also require other Lean artifacts.
 use super::*;
-use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
+use fln::source_check::modules::{
+    SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession, parse_source_header,
+};
 use fln::{Name, Outcome};
 use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
@@ -307,12 +309,27 @@ fn load_sources(
     Ok(modules)
 }
 
+struct Compilation {
+    artifacts: BTreeMap<Name, Vec<u8>>,
+    elaborated_modules: usize,
+    reused_modules: usize,
+}
+
 fn compile(
     root: &Path,
     entries: &[Name],
     modules: &BTreeMap<Name, Module>,
-) -> Result<BTreeMap<Name, Vec<u8>>, Failure> {
+) -> Result<Compilation, Failure> {
     let mut artifacts = BTreeMap::new();
+    let mut elaborated_modules = 0usize;
+    let mut reused_modules = 0usize;
+    // Retain only one external world, never one large engine per target. Target
+    // order is observable on failure and is not rearranged to manufacture hits.
+    let mut active: Option<(Vec<Name>, SourceModuleSession)> = None;
+    let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
+        SOURCE_RUN_KERNEL_STACK_BYTES,
+    ));
+    let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
     let mut artifact_bytes = 0usize;
     for entry in entries {
         let mut closure = BTreeSet::new();
@@ -357,14 +374,26 @@ fn compile(
                 )));
             }
         }
-        // The facade still validates cycles and each module's external visibility.
-        let base = source_check::load_build_base(&external, root).map_err(
-            |(class, detail, authority)| Failure {
-                class,
-                detail,
-                authority,
-            },
-        )?;
+        // The exact ordered external roots bind this invocation's immutable
+        // import snapshot. Disk outputs never become checked cache entries.
+        if active.as_ref().is_none_or(|(roots, _)| roots != &external) {
+            let base = source_check::load_build_base(&external, root).map_err(
+                |(class, detail, authority)| Failure {
+                    class,
+                    detail,
+                    authority,
+                },
+            )?;
+            active = Some((
+                external,
+                SourceModuleSession::new(
+                    base,
+                    fln::KVMap::new(),
+                    limits,
+                    SourceModuleCacheLimits::default(),
+                ),
+            ));
+        }
         let inputs: Vec<_> = closure
             .iter()
             .map(|name| fln::SourceModuleInput {
@@ -372,16 +401,15 @@ fn compile(
                 source: &modules.get(name).expect("loaded dependency").source,
             })
             .collect();
-        let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
-            SOURCE_RUN_KERNEL_STACK_BYTES,
-        ));
-        let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
         let budget = fln::OleanWriteBudget {
             max_bytes: MAX_ARTIFACT_BYTES as u64,
             ..Default::default()
         };
-        let built = base
-            .compile_source_modules(&inputs, entry, &fln::KVMap::new(), limits, budget)
+        let built = active
+            .as_mut()
+            .expect("the current external context is installed")
+            .1
+            .compile(&inputs, entry, budget)
             .map_err(|error| {
                 let (class, authority, _) = error.disposition();
                 Failure {
@@ -405,6 +433,8 @@ fn compile(
                 ));
             }
         };
+        elaborated_modules += built.elaborated_modules;
+        reused_modules += built.reused_modules;
         for artifact in built.artifacts {
             if let Some(previous) = artifacts.get(&artifact.name) {
                 if previous != &artifact.bytes {
@@ -424,7 +454,11 @@ fn compile(
             artifacts.insert(artifact.name, artifact.bytes);
         }
     }
-    Ok(artifacts)
+    Ok(Compilation {
+        artifacts,
+        elaborated_modules,
+        reused_modules,
+    })
 }
 
 fn publish(
@@ -534,7 +568,11 @@ fn build(
     let config = config(&root)?;
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
-    let artifacts = compile(&root, &entries, &modules)?;
+    let Compilation {
+        artifacts,
+        elaborated_modules,
+        reused_modules,
+    } = compile(&root, &entries, &modules)?;
     let paths = publish(
         &root,
         &root.join(&config.build_dir).join("lib/lean"),
@@ -547,13 +585,13 @@ fn build(
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":0,\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\"}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":0,\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\"}}\n",
             json_string(&config.name),
             artifacts.len()
         )
     } else {
         format!(
-            "Built {} checked .olean modules for {} (0 cached).\n",
+            "Built {} checked .olean modules for {} (0 disk cached; {reused_modules} module checks reused).\n",
             artifacts.len(),
             config.name
         )
