@@ -2,10 +2,10 @@
 //!
 //! This module deliberately derives scope and traversal facts from the wire nodes
 //! themselves. It never consumes the primary expression data word. Rewrites are
-//! memoized per (node, binder context), never per node alone: the shared wire
-//! schema meets one node beneath different binder depths, and scope is a property
-//! of the occurrence's context, not merely of the arena slot. A node shared in the
-//! input is rewritten once per context it is met in, so a DAG costs its size.
+//! memoized per (node, binder context) when variables can be affected: the shared
+//! wire schema meets one node beneath different binder depths. Independently
+//! derived input-scope facts prove when a rewrite is a pure copy, allowing those
+//! subterms to retain their sharing across depths and substitution input roles.
 
 use std::collections::BTreeMap;
 
@@ -435,8 +435,16 @@ pub(crate) fn inspect_nodes_with(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Mode {
-    Rewrite { scope: u64 },
-    Raise { amount: u64, cutoff: u64 },
+    /// No variable in this subterm can be affected by the operation. Unlike a
+    /// rewrite, this mode is independent of the occurrence's binder depth.
+    Copy,
+    Rewrite {
+        scope: u64,
+    },
+    Raise {
+        amount: u64,
+        cutoff: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -559,6 +567,38 @@ impl std::hash::Hasher for KeyHasher {
 type VisitMemo =
     std::collections::HashMap<VisitKey, ExprId, std::hash::BuildHasherDefault<KeyHasher>>;
 
+/// Raw, occurrence-independent scope facts. These describe the INPUT node,
+/// not its rewritten result. They are learned on the ordinary postorder walk,
+/// so preserving an unaffected DAG needs neither another traversal nor facts
+/// imported from the primary checker.
+#[derive(Clone, Copy, Default)]
+struct RewriteScope {
+    external: u64,
+    free: bool,
+}
+
+impl RewriteScope {
+    fn union(self, other: Self) -> Self {
+        Self {
+            external: self.external.max(other.external),
+            free: self.free || other.free,
+        }
+    }
+
+    fn beneath_binder(self) -> Self {
+        Self {
+            external: self.external.saturating_sub(1),
+            ..self
+        }
+    }
+}
+
+type ScopeMemo = std::collections::HashMap<
+    (TermInput, ExprId),
+    RewriteScope,
+    std::hash::BuildHasherDefault<KeyHasher>,
+>;
+
 /// Past this many subject nodes a pure copy keys its visits in the map, so its
 /// table never costs more than the arena it indexes could.
 const DENSE_COPY_MAX_NODES: usize = 1 << 22;
@@ -624,13 +664,118 @@ struct Transformer<'a, 'c> {
     compact_levels: bool,
     values: Vec<ExprId>,
     tasks: Vec<Task>,
-    /// Each (arena, node, binder context) is rewritten once: a node shared in
-    /// the input is shared in the output, so a DAG costs its size, not the
-    /// size of its tree.
+    /// Each affected (arena, node, binder context) is rewritten once. Proven
+    /// copies share one entry across contexts, without reusing a changed result
+    /// as the original input node.
     memo: Visited,
+    scopes: Option<ScopeMemo>,
 }
 
 impl<'a, 'c> Transformer<'a, 'c> {
+    fn canonical_input(&self, input: TermInput) -> TermInput {
+        if input == TermInput::Replacement
+            && self
+                .replacement
+                .is_some_and(|(term, _)| std::ptr::eq(term, self.subject))
+        {
+            // A beta/zeta replacement is often a cursor into the subject's
+            // own arena. Equal arena addresses, not equal hashes, establish
+            // that copying the same raw node can reuse the same output.
+            TermInput::Subject
+        } else {
+            input
+        }
+    }
+
+    fn canonical_mode(&self, input: TermInput, id: ExprId, mode: Mode) -> Mode {
+        match mode {
+            Mode::Copy | Mode::Raise { amount: 0, .. } => return Mode::Copy,
+            Mode::Rewrite { .. }
+                if matches!(
+                    self.operation,
+                    Operation::Raise
+                        | Operation::CloseMany {
+                            binder_count: 0,
+                            ..
+                        }
+                ) =>
+            {
+                return Mode::Copy;
+            }
+            _ => {}
+        }
+        let Some(scope) = self.scopes.as_ref().and_then(|memo| memo.get(&(input, id))) else {
+            return mode;
+        };
+        let unchanged = match mode {
+            Mode::Copy => true,
+            Mode::Raise { cutoff, .. } => scope.external <= cutoff,
+            Mode::Rewrite { scope: depth } => match self.operation {
+                Operation::Raise => true,
+                Operation::Bound { target } => {
+                    scope.external <= depth.saturating_add(u64::from(target))
+                }
+                Operation::Free { .. } => !scope.free,
+                Operation::Close { .. } | Operation::CloseMany { .. } => {
+                    !scope.free && scope.external <= depth
+                }
+            },
+        };
+        if unchanged { Mode::Copy } else { mode }
+    }
+
+    fn remember_scope(&mut self, input: TermInput, id: ExprId) -> Result<(), Halt> {
+        let Some(scopes) = self.scopes.as_ref() else {
+            return Ok(());
+        };
+        if scopes.contains_key(&(input, id)) {
+            return Ok(());
+        }
+        let child = |id: ExprId| {
+            scopes
+                .get(&(input, id))
+                .copied()
+                .ok_or(Halt::Fault(TermFault::MissingExpression {
+                    input,
+                    index: id.index(),
+                }))
+        };
+        let facts = match self.expression(input, id)? {
+            ExprNode::Bound { index } => RewriteScope {
+                external: u64::from(*index) + 1,
+                free: false,
+            },
+            ExprNode::Free { .. } => RewriteScope {
+                external: 0,
+                free: true,
+            },
+            ExprNode::Apply { function, argument } => child(*function)?.union(child(*argument)?),
+            ExprNode::Lambda {
+                binder_type, body, ..
+            }
+            | ExprNode::Forall {
+                binder_type, body, ..
+            } => child(*binder_type)?.union(child(*body)?.beneath_binder()),
+            ExprNode::Let {
+                type_, value, body, ..
+            } => child(*type_)?
+                .union(child(*value)?)
+                .union(child(*body)?.beneath_binder()),
+            ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+                child(*expression)?
+            }
+            ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Constant { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_) => RewriteScope::default(),
+        };
+        if let Some(scopes) = self.scopes.as_mut() {
+            scopes.insert((input, id), facts);
+        }
+        Ok(())
+    }
+
     fn input(&self, input: TermInput) -> Result<&'a WireExpr, Halt> {
         match input {
             TermInput::Subject => Ok(self.subject),
@@ -965,6 +1110,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
     fn visit_bound(&mut self, index: u32, mode: Mode, at: usize) -> Result<(), Halt> {
         match mode {
+            Mode::Copy => self.emit(ExprNode::Bound { index }, at),
             Mode::Raise { amount, cutoff } => {
                 let index = Self::raised(index, amount, cutoff, at, &self.control)?;
                 self.emit(ExprNode::Bound { index }, at)
@@ -1007,6 +1153,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
     fn child_modes(mode: Mode) -> (Mode, Mode) {
         match mode {
+            Mode::Copy => (Mode::Copy, Mode::Copy),
             Mode::Rewrite { scope } => (
                 mode,
                 Mode::Rewrite {
@@ -1033,6 +1180,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     return self.visit_bound(*index, mode, id.index());
                 }
                 ExprNode::Free { name } => Some(match mode {
+                    Mode::Copy => FreeAction::Retain,
                     Mode::Raise { .. } => FreeAction::Retain,
                     Mode::Rewrite { scope } => match self.operation {
                         Operation::Close { name: target } if name == target => {
@@ -1338,6 +1486,8 @@ impl<'a, 'c> Transformer<'a, 'c> {
         while let Some(task) = self.tasks.pop() {
             match task {
                 Task::Visit { input, id, mode } => {
+                    let input = self.canonical_input(input);
+                    let mode = self.canonical_mode(input, id, mode);
                     if let Some(done) = self.memo.get(&(input, id, mode)) {
                         self.values.push(done);
                         continue;
@@ -1352,6 +1502,10 @@ impl<'a, 'c> Transformer<'a, 'c> {
                         .last()
                         .ok_or(Halt::Fault(TermFault::ValueStack { entries: 0 }))?;
                     self.memo.insert(key, done);
+                    self.remember_scope(key.0, key.1)?;
+                    if self.canonical_mode(key.0, key.1, key.2) == Mode::Copy {
+                        self.memo.insert((key.0, key.1, Mode::Copy), done);
+                    }
                 }
             }
         }
@@ -1433,6 +1587,10 @@ fn transform_subterms_with(
         values: Vec::new(),
         tasks: Vec::new(),
         memo: Visited::for_plan(&plan, subject_root),
+        scopes: (!(plan.replacement.is_none()
+            && matches!(plan.operation, Operation::Raise)
+            && matches!(plan.root_mode, Mode::Rewrite { .. })))
+        .then(ScopeMemo::default),
     };
     outcome(transformer.run(plan.root_mode))
 }
@@ -1644,6 +1802,7 @@ pub fn substitute_free_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whnf::{WhnfBudget, WhnfContext, WhnfOutcome, whnf};
     use crate::wire::LevelNode;
 
     const CHAIN: usize = 1000;
@@ -1817,5 +1976,325 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn id(index: usize) -> ExprId {
+        ExprId::from_index(index).expect("bounded test arena")
+    }
+
+    /// One closed DAG is used as every binder domain, and also replaces the
+    /// outer variable beneath all the binders. Both cursors belong to one arena.
+    fn scoped_diamond(depth: u32, diamonds: usize) -> (WireExpr, ExprId) {
+        let mut nodes = vec![ExprNode::Sort {
+            level: LevelId::ZERO,
+        }];
+        for _ in 0..diamonds {
+            let child = id(nodes.len() - 1);
+            nodes.push(ExprNode::Apply {
+                function: child,
+                argument: child,
+            });
+        }
+        let replacement = id(nodes.len() - 1);
+        nodes.push(ExprNode::Bound { index: depth });
+        for _ in 0..depth {
+            nodes.push(lambda(replacement, id(nodes.len() - 1)));
+        }
+        let root = id(nodes.len() - 1);
+        (
+            WireExpr::from_parts(nodes, vec![LevelNode::Zero], root),
+            replacement,
+        )
+    }
+
+    #[test]
+    fn substitution_preserves_an_unaffected_dag_across_scopes_and_input_roles() {
+        let (term, replacement) = scoped_diamond(128, 24);
+        let count = term.nodes().len() as u64;
+        let result = substitute_bound_subterms_with(
+            &term,
+            term.root(),
+            0,
+            &term,
+            replacement,
+            TermBudget::new(count * 3, count * 12).with_max_arena_nodes(count),
+            &mut || false,
+        );
+        let TermOutcome::Complete(result) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(result.nodes().len(), term.nodes().len() - 1);
+        let mut cursor = result.root();
+        let mut shared_domain = None;
+        for _ in 0..128 {
+            let ExprNode::Lambda {
+                binder_type, body, ..
+            } = result.node(cursor).unwrap()
+            else {
+                panic!("lost binder")
+            };
+            assert_eq!(*shared_domain.get_or_insert(*binder_type), *binder_type);
+            cursor = *body;
+        }
+        assert_eq!(
+            Some(cursor),
+            shared_domain,
+            "replacement shares the original closed DAG"
+        );
+    }
+
+    #[test]
+    fn unchanged_scopes_never_supply_an_active_bound_rewrite() {
+        for first_is_bound in [false, true] {
+            let term = WireExpr::from_parts(
+                vec![
+                    ExprNode::Bound { index: 0 },
+                    ExprNode::Sort {
+                        level: LevelId::ZERO,
+                    },
+                    lambda(id(1), id(0)),
+                    ExprNode::Apply {
+                        function: id(if first_is_bound { 0 } else { 2 }),
+                        argument: id(if first_is_bound { 2 } else { 0 }),
+                    },
+                ],
+                vec![LevelNode::Zero],
+                id(3),
+            );
+            let replacement = WireExpr::from_parts(
+                vec![ExprNode::NatLiteral { limbs_le: vec![7] }],
+                vec![],
+                id(0),
+            );
+            let result = substitute_bound(&term, 0, &replacement, TermBudget::unlimited());
+            let TermOutcome::Complete(result) = result else {
+                panic!("{result:?}")
+            };
+            let ExprNode::Apply { function, argument } = result.node(result.root()).unwrap() else {
+                panic!("lost application")
+            };
+            let (bound, nested) = if first_is_bound {
+                (*function, *argument)
+            } else {
+                (*argument, *function)
+            };
+            assert!(
+                matches!(result.node(bound), Some(ExprNode::NatLiteral { limbs_le }) if limbs_le == &[7])
+            );
+            let ExprNode::Lambda { body, .. } = result.node(nested).unwrap() else {
+                panic!("lost lambda")
+            };
+            assert_eq!(result.node(*body), Some(&ExprNode::Bound { index: 0 }));
+        }
+    }
+
+    #[test]
+    fn equal_slot_numbers_in_different_arenas_never_alias() {
+        let subject = WireExpr::from_parts(
+            vec![
+                ExprNode::NatLiteral { limbs_le: vec![7] },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Apply {
+                    function: id(0),
+                    argument: id(1),
+                },
+            ],
+            vec![],
+            id(2),
+        );
+        let replacement = WireExpr::from_parts(
+            vec![ExprNode::NatLiteral { limbs_le: vec![9] }],
+            vec![],
+            id(0),
+        );
+        let result = substitute_bound(&subject, 0, &replacement, TermBudget::unlimited());
+        let TermOutcome::Complete(result) = result else {
+            panic!("{result:?}")
+        };
+        let ExprNode::Apply { function, argument } = result.node(result.root()).unwrap() else {
+            panic!("lost app")
+        };
+        assert_ne!(function, argument);
+        assert!(
+            matches!(result.node(*function), Some(ExprNode::NatLiteral { limbs_le }) if limbs_le == &[7])
+        );
+        assert!(
+            matches!(result.node(*argument), Some(ExprNode::NatLiteral { limbs_le }) if limbs_le == &[9])
+        );
+    }
+
+    #[test]
+    fn shared_scope_rewrites_keep_every_observed_stop_typed_and_recover() {
+        let (term, replacement) = scoped_diamond(6, 5);
+        let pristine = term.clone();
+        let mut polls = 0;
+        let success = substitute_bound_subterms_with(
+            &term,
+            term.root(),
+            0,
+            &term,
+            replacement,
+            TermBudget::unlimited(),
+            &mut || {
+                polls += 1;
+                false
+            },
+        );
+        assert!(matches!(success, TermOutcome::Complete(_)));
+        for stop in 1..=polls {
+            let mut calls = 0;
+            let result = substitute_bound_subterms_with(
+                &term,
+                term.root(),
+                0,
+                &term,
+                replacement,
+                TermBudget::unlimited(),
+                &mut || {
+                    calls += 1;
+                    calls == stop
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    TermOutcome::Inconclusive(TermStop::Cancelled { .. })
+                ),
+                "poll {stop}: {result:?}"
+            );
+            assert_eq!(term, pristine);
+        }
+        for budget in [
+            TermBudget::new(0, u64::MAX),
+            TermBudget::new(u64::MAX, 0),
+            TermBudget::unlimited().with_max_arena_nodes(1),
+        ] {
+            assert!(matches!(
+                substitute_bound_subterms_with(
+                    &term,
+                    term.root(),
+                    0,
+                    &term,
+                    replacement,
+                    budget,
+                    &mut || false,
+                ),
+                TermOutcome::Inconclusive(TermStop::Resource { .. })
+            ));
+        }
+        assert_eq!(
+            substitute_bound_subterms_with(
+                &term,
+                term.root(),
+                0,
+                &term,
+                replacement,
+                TermBudget::unlimited(),
+                &mut || false,
+            ),
+            success
+        );
+    }
+
+    /// `let x := z; let x := f x x; ...; x`. The binary value is shared
+    /// across lexical depths in the input, just as imported let-bound circuits
+    /// share syntax. Its normal form denotes an exponential tree but is a DAG
+    /// with two application nodes per layer.
+    fn circuit_lets(depth: usize) -> (WireExpr, WireExpr) {
+        let mut nodes = vec![
+            ExprNode::Free { name: name("T") },
+            ExprNode::Free { name: name("z") },
+            ExprNode::Free { name: name("f") },
+            ExprNode::Bound { index: 0 },
+            ExprNode::Apply {
+                function: id(2),
+                argument: id(3),
+            },
+            ExprNode::Apply {
+                function: id(4),
+                argument: id(3),
+            },
+        ];
+        let mut body = id(3);
+        for _ in 0..depth {
+            nodes.push(ExprNode::Let {
+                declaration_name: name("x"),
+                type_: id(0),
+                value: id(5),
+                body,
+                non_dependent: false,
+            });
+            body = id(nodes.len() - 1);
+        }
+        nodes.push(ExprNode::Let {
+            declaration_name: name("x"),
+            type_: id(0),
+            value: id(1),
+            body,
+            non_dependent: false,
+        });
+        let root = id(nodes.len() - 1);
+        let input = WireExpr::from_parts(nodes, vec![], root);
+        let mut nodes = vec![
+            ExprNode::Free { name: name("z") },
+            ExprNode::Free { name: name("f") },
+        ];
+        let mut root = id(0);
+        for _ in 0..depth {
+            let partial = id(nodes.len());
+            nodes.push(ExprNode::Apply {
+                function: id(1),
+                argument: root,
+            });
+            nodes.push(ExprNode::Apply {
+                function: partial,
+                argument: root,
+            });
+            root = id(nodes.len() - 1);
+        }
+        (input, WireExpr::from_parts(nodes, vec![], root))
+    }
+
+    #[test]
+    fn zeta_reduction_keeps_a_shared_let_circuit_linear() {
+        let depth = 48;
+        let (input, expected) = circuit_lets(depth);
+        let bound = (4 * depth + 16) as u64;
+        let budget = WhnfBudget::new(
+            10_000,
+            (depth + 1) as u64,
+            TermBudget::new(bound * 4, bound * 10).with_max_arena_nodes(bound),
+        );
+        let result = whnf(&input, &WhnfContext::default(), budget);
+        let WhnfOutcome::Complete(result) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(result.reductions, (depth + 1) as u64);
+        assert_eq!(result.term.nodes().len(), 2 * depth + 2);
+        assert!(matches!(
+            crate::defeq::def_eq(
+                &result.term,
+                &expected,
+                &WhnfContext::default(),
+                crate::defeq::DefEqBudget::unlimited(),
+            ),
+            crate::defeq::DefEqOutcome::Equal(_)
+        ));
+        // Inspect the actual DAG, not an expanded rendering of its 2^48 leaves.
+        let mut root = result.term.root();
+        for _ in 0..depth {
+            let ExprNode::Apply { function, argument } = result.term.node(root).unwrap() else {
+                panic!("lost application")
+            };
+            let ExprNode::Apply { argument: left, .. } = result.term.node(*function).unwrap()
+            else {
+                panic!("lost partial application")
+            };
+            assert_eq!(left, argument);
+            root = *argument;
+        }
+        assert!(
+            matches!(result.term.node(root), Some(ExprNode::Free { name: value }) if value == &name("z"))
+        );
     }
 }
