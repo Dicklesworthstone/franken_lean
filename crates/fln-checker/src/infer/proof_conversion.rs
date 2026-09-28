@@ -1004,21 +1004,26 @@ impl Probe<'_> {
                 work.extend(obligations.into_iter().rev());
                 continue;
             }
+            // Both witnesses must independently type-check as proofs. The two
+            // proposition types become a further conversion obligation; merely
+            // inhabiting Prop never equates distinct propositions. This runs
+            // before the untyped conversion, as the pin's `is_def_eq_core` runs
+            // `is_def_eq_proof_irrel` before `lazy_delta_reduction` (vendored
+            // type_checker.cpp:1117, 1121): untyped, two proofs can only be
+            // compared by reducing them, and a transport along an `omega`
+            // equation cost `PartialMatch.isLongestMatchAt` its whole budget.
+            if let Some(lt) = self.proof_type(&left, &context)?
+                && let Some(rt) = self.proof_type(&right, &context)?
+            {
+                work.push(Work::Pair(lt, rt, context));
+                continue;
+            }
             if !skip {
                 match self.equal(&left, &right, &context)? {
                     Some(true) => continue,
                     Some(false) => fail!(),
                     None => {}
                 }
-            }
-            // Both witnesses must independently type-check as proofs. The two
-            // proposition types become a further conversion obligation; merely
-            // inhabiting Prop never equates distinct propositions.
-            if let Some(lt) = self.proof_type(&left, &context)?
-                && let Some(rt) = self.proof_type(&right, &context)?
-            {
-                work.push(Work::Pair(lt, rt, context));
-                continue;
             }
             if let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)? {
                 work.push(Work::Pair(lt, rt, context));

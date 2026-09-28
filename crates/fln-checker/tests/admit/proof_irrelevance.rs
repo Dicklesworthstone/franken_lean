@@ -696,3 +696,156 @@ fn undecided_arguments_under_one_regular_head_defer_to_typed_conversion() {
          `T (slow q) ≟ T (slow p)`: conversion unfolded `slow` instead of deferring"
     );
 }
+
+/// `R (s p)` against `R (t p)`, where `s p` and `t p` are proofs of one
+/// proposition that untyped conversion equates only by walking about 2ⁿ leaf
+/// pairs, and `R` is regular. The same-head shortcut defers the argument pair
+/// within its bound, and the typed lane then settles it by proof irrelevance
+/// before trying untyped conversion, as the pin's `is_def_eq_core` runs
+/// `is_def_eq_proof_irrel` before `lazy_delta_reduction` (vendored
+/// type_checker.cpp:1117, 1121). The other way round, the lane walks the pair
+/// untyped first: a transport along an `omega` equation cost
+/// `PartialMatch.isLongestMatchAt` its whole budget that way.
+#[test]
+fn the_typed_lane_tries_proof_irrelevance_before_an_untyped_walk() {
+    use fln_checker::defeq::def_eq_with;
+    use fln_checker::whnf::WhnfContext;
+    const DEPTH: usize = 16;
+    let (env, s, t) = doubling_proof_pair(DEPTH);
+    let walk_polls = Cell::new(0_u64);
+    let _ = def_eq_with(
+        &decoded(&s),
+        &decoded(&t),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            walk_polls.set(walk_polls.get() + 1);
+            false
+        },
+    );
+    let walk = walk_polls.get();
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(
+        &env,
+        &candidate("d", app(c("R"), [t]), c("w")),
+        AdmissionBudget::unlimited(),
+        || {
+            polls.set(polls.get() + 1);
+            false
+        },
+    );
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    assert!(
+        walk > admission,
+        "admission polled {admission} times, more than the {walk}-poll untyped walk of \
+         the proof pair: the typed lane walked it before trying proof irrelevance"
+    );
+}
+
+/// `sₖ x = g (sₖ₋₁ x) (sₖ₋₁ x)` from `s₀ x = x`, and the same chain again
+/// named `tₖ`, so `sₙ p ≟ tₙ p` holds but untyped conversion reaches it only by
+/// walking about 2ⁿ leaf pairs.
+fn doubling_chains(depth: usize) -> Vec<ConstantEntry> {
+    let x = || Expr::bvar(0).expect("bound variable");
+    let mut entries = Vec::new();
+    for prefix in ["s", "t"] {
+        entries.push(definition(
+            &format!("{prefix}0"),
+            decoded(&pi(c("P"), c("P"))),
+            decoded(&lam(c("P"), x())),
+        ));
+        for k in 1..=depth {
+            let below = app(c(&format!("{prefix}{}", k - 1)), [x()]);
+            entries.push(definition(
+                &format!("{prefix}{k}"),
+                decoded(&pi(c("P"), c("P"))),
+                decoded(&lam(c("P"), app(c("g"), [below.clone(), below]))),
+            ));
+        }
+    }
+    entries
+}
+
+/// `P`, `p`, `g : P → P → P`, `U : Type`, the doubling chains to `depth`,
+/// `R : P → Type := fun _ => U`, and `w : R (s p)`; returns the environment and
+/// the proofs `s p` and `t p` at `depth`.
+fn doubling_proof_pair(depth: usize) -> (ConstantEnvironment, Expr, Expr) {
+    let mut entries = vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("g", pi(c("P"), pi(c("P"), c("P")))),
+        entry("U", Expr::sort(Level::one())),
+    ];
+    entries.extend(doubling_chains(depth));
+    entries.push(definition(
+        "R",
+        decoded(&pi(c("P"), Expr::sort(Level::one()))),
+        decoded(&lam(c("P"), c("U"))),
+    ));
+    let s = app(c(&format!("s{depth}")), [c("p")]);
+    let t = app(c(&format!("t{depth}")), [c("p")]);
+    entries.push(entry("w", app(c("R"), [s.clone()])));
+    (environment_of(entries), s, t)
+}
+
+/// The same-head shortcut only accelerates, so an argument pair it cannot
+/// settle within its bound is deferred to the typed caller rather than allowed
+/// to spend the query's budget. `R (s₂₀ p)` against `R (t₂₀ p)`, `R` regular:
+/// the shortcut puts the proofs `s₂₀ p ≟ t₂₀ p` to untyped conversion, which
+/// needs more than the whole budget below. Bounded, the pair defers, and typed
+/// conversion closes it by proof irrelevance. Unbounded, the budget runs out and
+/// the checker has no answer, as `PartialMatch.isLongestMatchAt` had none.
+#[test]
+fn a_same_head_argument_past_its_bound_defers_instead_of_exhausting_the_query() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq_with};
+    use fln_checker::whnf::WhnfContext;
+    const DEPTH: usize = 20;
+    const WORK: u64 = 400_000;
+    let (env, s, t) = doubling_proof_pair(DEPTH);
+    let mut budget = AdmissionBudget::unlimited();
+    for defeq in [&mut budget.conversion, &mut budget.inference.defeq] {
+        defeq.max_slow_comparisons = WORK;
+        defeq.max_normalizations = WORK;
+        defeq.whnf.max_steps = WORK;
+    }
+    let plain = def_eq_with(
+        &decoded(&s),
+        &decoded(&t),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        budget.conversion,
+        || false,
+    );
+    assert!(
+        matches!(plain, DefEqOutcome::Inconclusive(_)),
+        "untyped conversion alone must not settle the pair within the budget for \
+         this test to mean anything: {plain:?}"
+    );
+    let verdict = admit(&env, &candidate("d", app(c("R"), [t]), c("w")), budget);
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+}
+
+/// Deferring the same-head shortcut's argument pair recovers only from a stop
+/// its own bound caused. A cancellation observed inside the bounded attempt is
+/// the query's, and ends it (FL-INV-07): a cancelled check is never turned into
+/// a deferral that later work could complete. The cancellation here is seen
+/// once, well inside the attempt, so nothing after it would stop the check a
+/// second time.
+#[test]
+fn a_cancellation_inside_the_shortcut_bound_is_not_deferred() {
+    let (env, _, t) = doubling_proof_pair(16);
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(
+        &env,
+        &candidate("d", app(c("R"), [t]), c("w")),
+        AdmissionBudget::unlimited(),
+        || {
+            polls.set(polls.get() + 1);
+            polls.get() == 50_000
+        },
+    );
+    assert!(
+        matches!(verdict, Verdict::Inconclusive(_)),
+        "a cancellation inside the bounded shortcut must end the check: {verdict:?}"
+    );
+}

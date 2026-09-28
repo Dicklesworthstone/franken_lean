@@ -3335,6 +3335,23 @@ pub(crate) enum UndecidedArguments {
     Defer,
 }
 
+/// Work one argument pair of the same-head shortcut may spend under
+/// [`UndecidedArguments::Defer`] before the pair is deferred to the typed
+/// caller: comparisons, normalizations and WHNF steps each; ten times as many
+/// arena nodes and a hundred times as many owned units.
+///
+/// The pin's shortcut compares arguments with its full conversion
+/// (`is_def_eq_args`, vendored type_checker.cpp:943), which settles two proofs
+/// of one proposition by proof irrelevance before any unfolding (lines 1117 and
+/// 1121). Untyped, the same pair can only be approached by reduction: in
+/// `Init.Data.String.Lemmas.Pattern.String.ForwardSearcher`,
+/// `PartialMatch.isLongestMatchAt` compares `h.2` with a transport along an
+/// `omega` equation, and reducing that transport evaluated the certificate until
+/// the query's whole budget was gone (42.6 s, no answer; the pin needs 2 ms).
+/// The shortcut only accelerates, so giving up on it decides nothing: the pair
+/// defers exactly as an undecided one does, and typed conversion takes it.
+const DEFERRED_SHORTCUT_ARGUMENT_WORK: u64 = 100_000;
+
 /// The query-wide choices of one conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConversionScope {
@@ -3452,7 +3469,20 @@ fn regular_same_head_apps_def_eq(
             Some(Remembered::NotProven) => return Ok(SameHeadArguments::Unfold),
             None => {}
         }
-        let sub_budget = control.remaining_defeq_budget();
+        let remaining = control.remaining_defeq_budget();
+        let (sub_budget, bounded) = match scope.arguments {
+            UndecidedArguments::Defer => deferred_shortcut_budget(remaining),
+            UndecidedArguments::Unfold => (remaining, false),
+        };
+        // A cancellation can reach the attempt's stop through any nested
+        // reduction, so it is recorded where it is observed rather than read
+        // back out of the stop.
+        let mut saw_cancellation = false;
+        let mut observed = || {
+            let stop = cancelled();
+            saw_cancellation |= stop;
+            stop
+        };
         let outcome = def_eq_scoped_with(
             &left_wire,
             &right_wire,
@@ -3460,8 +3490,18 @@ fn regular_same_head_apps_def_eq(
             sub_budget,
             scope,
             memo,
-            cancelled,
+            &mut observed,
         );
+        // A stop the bound caused defers the pair, as an undecided one does. A
+        // cancellation, or a stop of the query's own budget, remains its stop.
+        if bounded
+            && !saw_cancellation
+            && let DefEqOutcome::Inconclusive(stop) = &outcome
+        {
+            control.absorb_defeq_progress(&stop_progress(stop));
+            memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+            return Ok(SameHeadArguments::Undecided);
+        }
         match outcome {
             DefEqOutcome::Equal(progress) => {
                 control.absorb_defeq_progress(&progress);
@@ -3500,6 +3540,37 @@ fn regular_same_head_apps_def_eq(
     }
 
     Ok(SameHeadArguments::Equal)
+}
+
+/// `remaining`, bounded by [`DEFERRED_SHORTCUT_ARGUMENT_WORK`], and whether the
+/// bound is below the query's own remaining budget in any dimension. When it is
+/// not, a stop is the query's own and must not be deferred.
+fn deferred_shortcut_budget(remaining: DefEqBudget) -> (DefEqBudget, bool) {
+    let work = DEFERRED_SHORTCUT_ARGUMENT_WORK;
+    let mut budget = remaining;
+    budget.max_slow_comparisons = remaining.max_slow_comparisons.min(work);
+    budget.max_normalizations = remaining.max_normalizations.min(work);
+    budget.max_materialized_arena_nodes = remaining
+        .max_materialized_arena_nodes
+        .min(work.saturating_mul(10));
+    budget.max_materialized_owned_units = remaining
+        .max_materialized_owned_units
+        .min(work.saturating_mul(100));
+    budget.whnf.max_steps = remaining.whnf.max_steps.min(work);
+    (budget, budget != remaining)
+}
+
+/// The work a stopped conversion had done, so a caller that recovers from the
+/// stop still charges it.
+fn stop_progress(stop: &DefEqStop) -> DefEqProgress {
+    match stop {
+        DefEqStop::Quick(_) => DefEqProgress::default(),
+        DefEqStop::Resource { progress, .. }
+        | DefEqStop::Cancelled { progress, .. }
+        | DefEqStop::Whnf { progress, .. }
+        | DefEqStop::NatReduction { progress, .. }
+        | DefEqStop::StringExpansion { progress, .. } => *progress,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
