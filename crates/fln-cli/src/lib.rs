@@ -46,6 +46,13 @@ pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 
 /// Native stack provided to the kernel worker used by both source front doors.
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
+/// Stack (and so kernel depth budget) for every `check-olean` thread: the
+/// single artifact, the strict module set, and the frontier's coordinator and
+/// workers. Stdlib proofs nest deeper than a source run's 2 MiB allows:
+/// `Init.Data.Char.Ordinal` stopped at depth 1,588 against 1,587 in the S9
+/// frontier, while the per-declaration probe with a 64 MiB budget admits all
+/// 91 of its declarations.
+const OLEAN_CHECK_KERNEL_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
@@ -6107,7 +6114,7 @@ fn check_olean_part_bytes(
     .fold(0_usize, usize::saturating_add);
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
             let engine = fln::Engine::from_environment(fln::Environment::new());
             match engine.check_olean_artifact_parts(
@@ -6117,7 +6124,7 @@ fn check_olean_part_bytes(
                 &fln::KVMap::new(),
                 fln::OleanCheckLimits::new(
                     max_bytes,
-                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                    fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
                 ),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
@@ -8287,7 +8294,7 @@ fn check_olean_module_frontier(
 ) -> MultiplexerOutput {
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean-frontier".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
             let inputs: Vec<fln::OleanModuleInput<'_>> = modules
                 .iter()
@@ -8332,11 +8339,11 @@ fn check_olean_module_frontier(
                 &fln::KVMap::new(),
                 fln::OleanCheckLimits::new(
                     max_bytes,
-                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                    fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
                 ),
                 fln::OleanFrontierJobs {
                     threads: jobs,
-                    worker_stack_bytes: SOURCE_RUN_KERNEL_STACK_BYTES,
+                    worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
                 },
                 &mut stream,
             ) {
@@ -8535,7 +8542,7 @@ fn check_olean_module_bytes(
     });
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean-set".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
             let inputs: Vec<fln::OleanModuleInput<'_>> = modules
                 .iter()
@@ -8552,7 +8559,7 @@ fn check_olean_module_bytes(
                 &fln::KVMap::new(),
                 fln::OleanCheckLimits::new(
                     max_bytes,
-                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                    fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
                 ),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
