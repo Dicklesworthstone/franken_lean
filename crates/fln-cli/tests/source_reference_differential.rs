@@ -371,3 +371,161 @@ fn class_rules_refuse_an_unclassified_false_acceptance() {
         &row("fln-defect", "bead franken_lean-z8j.1.6.3")
     ));
 }
+
+/// The seed-dialect freeze, held without the pin (bead fln-ew20): every file
+/// this repository presents as Lean has a ledger row, and a row that does not
+/// `agree` with the Reference must be one of `DIVERGENCE_ALLOWANCE`. Whether
+/// each row still describes the real outcome is the pinned rig's job above.
+fn freeze_problems(
+    files: &[String],
+    ledger: &BTreeMap<String, LedgerRow>,
+    allowance: &[&str],
+) -> Vec<String> {
+    let allowed: std::collections::BTreeSet<&str> = allowance.iter().copied().collect();
+    let mut problems = Vec::new();
+    for file in files {
+        match ledger.get(file) {
+            None => problems.push(format!(
+                "{file}: no ledger row; derive it with the pinned rig, and a new example must agree"
+            )),
+            Some(row) if row.class != "agree" && !allowed.contains(file.as_str()) => {
+                problems.push(format!(
+                    "{file}: class `{}` is outside the frozen divergence allowance; a new or changed \
+                     example must agree with the Reference",
+                    row.class
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    problems
+}
+
+#[test]
+fn every_corpus_file_has_a_row_and_no_new_divergence_is_admitted() {
+    let root = fln_core::checked_workspace_root!();
+    let files = corpus(&root);
+    let ledger = load_ledger(&root);
+    assert!(
+        files.len() >= 100 && ledger.len() >= 100,
+        "corpus {} files, ledger {} rows: a broken scan is not a clean corpus",
+        files.len(),
+        ledger.len()
+    );
+    let problems = freeze_problems(&files, &ledger, DIVERGENCE_ALLOWANCE);
+    assert!(
+        problems.is_empty(),
+        "{} freeze problem(s) in {LEDGER}:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn the_freeze_refuses_unledgered_or_newly_divergent_files_and_admits_a_repair() {
+    let row = |class: &str| LedgerRow {
+        reference: "accept".to_owned(),
+        frankenlean: "accept".to_owned(),
+        output: "match".to_owned(),
+        class: class.to_owned(),
+        note: String::new(),
+    };
+    let files: Vec<String> = ["a.lean", "b.lean", "c.lean"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut ledger = BTreeMap::from([
+        ("a.lean".to_owned(), row("agree")),
+        ("b.lean".to_owned(), row("fln-defect")),
+    ]);
+    // `c.lean` has no row, and `b.lean` diverges without an allowance entry.
+    let problems = freeze_problems(&files, &ledger, &[]);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[0].starts_with("b.lean: class `fln-defect`"),
+        "{problems:?}"
+    );
+    assert!(
+        problems[1].starts_with("c.lean: no ledger row"),
+        "{problems:?}"
+    );
+    // An allowed divergence passes; a missing row still does not.
+    ledger.insert("c.lean".to_owned(), row("agree"));
+    assert!(freeze_problems(&files, &ledger, &["b.lean"]).is_empty());
+    assert_eq!(freeze_problems(&files, &ledger, &[]).len(), 1);
+    // A repaired row agrees, so its entry can be deleted.
+    ledger.insert("b.lean".to_owned(), row("agree"));
+    assert!(freeze_problems(&files, &ledger, &[]).is_empty());
+}
+
+/// Rows that did not agree with the Reference when the freeze was enforced
+/// (fln-ew20, measured at 022c8ce3). One-way: delete an entry once its row
+/// agrees; never add one.
+const DIVERGENCE_ALLOWANCE: &[&str] = &[
+    "crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/io_main.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean",
+    "crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean",
+    "examples/native_closure_data.lean",
+    "examples/native_constrained_matching.lean",
+    "examples/native_constrained_recursion.lean",
+    "examples/native_constructor_equalities.lean",
+    "examples/native_constructor_equality.lean",
+    "examples/native_constructor_tactics.lean",
+    "examples/native_context_generalization.lean",
+    "examples/native_decidable_cases.lean",
+    "examples/native_decision_proofs.lean",
+    "examples/native_default_simp.lean",
+    "examples/native_dependent_indices.lean",
+    "examples/native_do.lean",
+    "examples/native_empty_elimination.lean",
+    "examples/native_equality_transport.lean",
+    "examples/native_equations.lean",
+    "examples/native_expression_elimination.lean",
+    "examples/native_function_children.lean",
+    "examples/native_goal_control.lean",
+    "examples/native_heterogeneous_equality.lean",
+    "examples/native_index_refinement.lean",
+    "examples/native_indexed.lean",
+    "examples/native_indexed_elimination.lean",
+    "examples/native_indexed_function_children.lean",
+    "examples/native_indexed_vectors.lean",
+    "examples/native_induction.lean",
+    "examples/native_induction_specialization.lean",
+    "examples/native_instance_attributes.lean",
+    "examples/native_interleaved_specialization.lean",
+    "examples/native_local_proofs.lean",
+    "examples/native_logical_rewriting.lean",
+    "examples/native_matrix_recursion.lean",
+    "examples/native_mutual_data.lean",
+    "examples/native_mutual_folds.lean",
+    "examples/native_mutual_function_children.lean",
+    "examples/native_mutual_groups.lean",
+    "examples/native_mutual_indexed.lean",
+    "examples/native_option_decide.lean",
+    "examples/native_parameterized_recursion.lean",
+    "examples/native_pattern_matching.lean",
+    "examples/native_pattern_matrices.lean",
+    "examples/native_proposition_conditionals.lean",
+    "examples/native_quotients.lean",
+    "examples/native_record_values.lean",
+    "examples/native_records.lean",
+    "examples/native_recursion.lean",
+    "examples/native_refinement.lean",
+    "examples/native_scoped_instances.lean",
+    "examples/native_scopes.lean",
+    "examples/native_section_inductives.lean",
+    "examples/native_section_records.lean",
+    "examples/native_simp_all.lean",
+    "examples/native_simp_hypotheses.lean",
+    "examples/native_simpa.lean",
+    "examples/native_simplification.lean",
+    "examples/native_tactic_repetition.lean",
+];

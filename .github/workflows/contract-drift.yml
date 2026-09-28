@@ -296,6 +296,16 @@ jobs:
             --test pinned_nat_council \
             --no-fail-fast -- --include-ignored --nocapture
 
+      - name: hold the Reference-differential ledger to the pinned Reference (fln-ew20)
+        shell: bash
+        run: |
+          # The product gate enforces the seed-dialect freeze from the ledger
+          # without the pin; this is where every ledger row is re-derived from the
+          # real Reference. FLN_REQUIRE_REFERENCE turns the rig's typed SKIP into a
+          # failure, so an absent pin cannot pass as an agreeing ledger.
+          FLN_REQUIRE_REFERENCE=1 cargo test --locked -p fln-cli \
+            --test source_reference_differential --no-fail-fast
+
       - name: run the certificate-format independent-checker lane
         shell: bash
         run: |
