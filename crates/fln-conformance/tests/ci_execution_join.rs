@@ -395,6 +395,15 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
         "not evidence for any claim — a regeneration ceremony that only PRINTS rows for a \
          human to review, and never writes the corpus",
     ),
+    (
+        "crates/fln-cli/tests/cli_personalities_and_verbs.rs",
+        "check_olean_continue_resolves_imports_across_roots",
+        "on demand for its cost (Init.Prelude through the council, 108 s in a debug build) and \
+         the pin. The root join itself is held per commit by \
+         `check_olean_continue_joins_module_set_roots`, and resolution across modules by fln's \
+         pin-dependent `olean_frontier` tests. Nothing per commit re-derives resolution ACROSS \
+         ROOTS through the CLI, and this declaration does not claim otherwise",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -439,7 +448,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// latter is an hours-scale bounded corpus observation. Declaring them prevents an
 /// ignored run from masquerading as per-commit evidence without inventing a ceremony
 /// that cannot provide equivalent coverage.
-const IGNORED_PRODUCER_CEILING: usize = 13;
+///
+/// 13 -> 14 for `check_olean_continue_resolves_imports_across_roots`, which `12e358b1`
+/// landed `#[ignore]`d and undeclared, reddening this suite for every pane from
+/// 2026-09-26. Declared from its own docstring. The remainder (no per-commit
+/// cross-root resolution through the CLI) is stated in the entry, not papered over.
+const IGNORED_PRODUCER_CEILING: usize = 14;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1793,7 +1807,10 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=5 rows=7 citations=8 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=6 rows=7 citations=8 all-rows-declared=true
+    //
+    // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
+    // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.
     //
     // `rows` and `citations` fell 10 -> 7 and 11 -> 8 when `fln-7odd`, `fln-corpus-thread-matrix-93te`
     // and `fln-kx3y` were migrated off file-granular citations; `surfaces` is unmoved because
