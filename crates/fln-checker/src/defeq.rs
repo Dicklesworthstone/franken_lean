@@ -3562,7 +3562,7 @@ fn deferred_shortcut_budget(remaining: DefEqBudget) -> (DefEqBudget, bool) {
 
 /// The work a stopped conversion had done, so a caller that recovers from the
 /// stop still charges it.
-fn stop_progress(stop: &DefEqStop) -> DefEqProgress {
+pub(crate) fn stop_progress(stop: &DefEqStop) -> DefEqProgress {
     match stop {
         DefEqStop::Quick(_) => DefEqProgress::default(),
         DefEqStop::Resource { progress, .. }

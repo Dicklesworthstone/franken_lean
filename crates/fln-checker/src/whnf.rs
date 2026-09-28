@@ -12,11 +12,26 @@
 mod memo;
 mod quotient;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
 use memo::WhnfMemo;
+
+/// Work the KR-317 gate's conversion may spend (see
+/// `Reducer::k_constructor_types_convert`): comparisons, normalizations, WHNF
+/// steps and reductions each, ten times as many arena nodes and a hundred
+/// times as many owned units.
+const K_GATE_CONVERSION_WORK: u64 = 100_000;
+
+thread_local! {
+    /// Whether a KR-317 gate's conversion is running on this thread. That
+    /// conversion reduces through WHNF, which may meet another K recursor; the
+    /// inner gate then uses the structural comparison alone, so conversions
+    /// never nest inside WHNF on the host stack.
+    static K_GATE_CONVERTING: Cell<bool> = const { Cell::new(false) };
+}
 
 use crate::environment::{
     ConstantDeclaration, ConstantEnvironment, DefinitionBody, DefinitionSafety, RecursorDeclaration,
@@ -370,6 +385,13 @@ pub enum WhnfFault {
     },
     NonCanonicalNatLiteral {
         at: usize,
+    },
+    /// The KR-317 gate's conversion faulted (see
+    /// `Reducer::k_constructor_types_convert`). A fault is never read as a
+    /// gate miss.
+    KGateConversion {
+        at: usize,
+        fault: Box<crate::defeq::DefEqFault>,
     },
 }
 
@@ -1383,6 +1405,93 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(true)
     }
 
+    /// The KR-317 gate by the checker's own conversion, for what the structural
+    /// comparison cannot tell. The pin gates K on full `is_def_eq`
+    /// (`to_cnstr_when_K`, inductive.h:31). A cast along `hcast : w * (idx + 1)
+    /// = w * idx + w` (Std.Tactic.BVDecide ... Operations.Cpop) has indices that
+    /// are equal only by unfolding `Nat.mul` on a successor. Missing the gate
+    /// there sent WHNF to normalize the proof `hcast` itself, which spent the
+    /// whole budget of `blastExtractAndExtend.go._unary.eq_def`.
+    ///
+    /// Only `Equal` passes the gate: any other outcome, including a stop within
+    /// `K_GATE_CONVERSION_WORK`, leaves the major as it is, as a structural
+    /// miss does. The work is charged to this reduction, and a cancellation
+    /// observed during it stops this reduction too.
+    fn k_constructor_types_convert(
+        &mut self,
+        domain: &Arc<WireExpr>,
+        result: &Arc<WireExpr>,
+        at: usize,
+    ) -> Result<bool, Halt> {
+        if K_GATE_CONVERTING.with(Cell::get) {
+            return Ok(false);
+        }
+        let memo = self.context.source.memo().cloned();
+        if let Some(equal) = memo
+            .as_ref()
+            .and_then(|memo| memo.recall_k_gate(domain, result))
+        {
+            self.control.step(at, self.cancelled)?;
+            return Ok(equal);
+        }
+        let work = K_GATE_CONVERSION_WORK;
+        let budget = crate::defeq::DefEqBudget::new(
+            crate::defeq::QuickDefEqBudget::new(work, work),
+            work,
+            work,
+            work.saturating_mul(10),
+            work.saturating_mul(100),
+            WhnfBudget::new(work, work, self.control.budget.materialization),
+        );
+        let context = self.context.source;
+        let cancelled = &mut *self.cancelled;
+        let mut saw_cancellation = false;
+        K_GATE_CONVERTING.with(|converting| converting.set(true));
+        let outcome = crate::defeq::def_eq_with(domain, result, context, budget, || {
+            let stop = cancelled();
+            saw_cancellation |= stop;
+            stop
+        });
+        K_GATE_CONVERTING.with(|converting| converting.set(false));
+        let (equal, progress) = match &outcome {
+            crate::defeq::DefEqOutcome::Equal(progress) => (true, *progress),
+            crate::defeq::DefEqOutcome::NotEqual { progress, .. }
+            | crate::defeq::DefEqOutcome::Deferred { progress, .. }
+            | crate::defeq::DefEqOutcome::Refused { progress, .. } => (false, *progress),
+            crate::defeq::DefEqOutcome::Inconclusive(stop) => {
+                (false, crate::defeq::stop_progress(stop))
+            }
+            crate::defeq::DefEqOutcome::InternalFault(fault) => {
+                return Err(Halt::Fault(WhnfFault::KGateConversion {
+                    at,
+                    fault: Box::new(fault.clone()),
+                }));
+            }
+        };
+        if saw_cancellation {
+            return Err(Halt::Stop(Box::new(WhnfStop::Cancelled {
+                at,
+                polls: self.control.polls,
+                completed_steps: self.control.steps,
+                completed_reductions: self.control.reductions,
+            })));
+        }
+        self.control.steps = self
+            .control
+            .steps
+            .saturating_add(progress.whnf_steps)
+            .saturating_add(progress.slow_comparisons);
+        self.control.reductions = self
+            .control
+            .reductions
+            .saturating_add(progress.whnf_reductions);
+        if let Some(memo) = memo {
+            memo.remember_k_gate(Arc::clone(domain), Arc::clone(result), equal);
+        }
+        self.control.step(at, self.cancelled)?;
+        Ok(equal)
+    }
+
     /// A sufficient conversion gate for KR-317. Compare demanded application
     /// arguments after checker-owned WHNF instead of requiring identical syntax.
     /// This permits equal types computed by recursors/projections without making
@@ -1725,8 +1834,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
         };
         // The pin's gate: the constructed constructor's type must be defeq to
         // the major's type. Here: the reconstructed result type must match
-        // the spine-derived domain by a sufficient checker-owned conversion.
-        if !self.k_constructor_types_equal(&domain_cursor, &result_cursor)? {
+        // the spine-derived domain by a sufficient checker-owned conversion,
+        // structural first and the full conversion when that cannot tell.
+        if !self.k_constructor_types_equal(&domain_cursor, &result_cursor)?
+            && !self.k_constructor_types_convert(
+                &domain_cursor.arena,
+                &result_cursor.arena,
+                current.root.index(),
+            )?
+        {
             return Ok(None);
         }
         // Build the nullary constructor applied to the domain's parameters.

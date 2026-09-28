@@ -3245,3 +3245,115 @@ fn a_structure_major_does_not_copy_the_premises_its_type_does_not_mention() {
         "the recursor spent {recursor_extra} polls on a large minor, its beta step {beta_extra}"
     );
 }
+
+/// `P (fun z => kid z)` against `P (fun z => z)`, `kid` a regular definition of
+/// the identity, and optionally `P (fun z => other)`.
+fn k_endpoints_under_a_binder() -> (WhnfContext, Expr, Expr, Expr) {
+    let mut entries = eqs_family_entries();
+    entries.push(definition_entry(
+        "kid",
+        Vec::new(),
+        decoded(&Expr::lam(
+            primary_name("x"),
+            constant("A"),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let under = |body: Expr| {
+        Expr::app(
+            constant("P"),
+            Expr::lam(primary_name("z"), constant("A"), body, BinderInfo::Default),
+        )
+    };
+    (
+        definition_context(entries),
+        under(Expr::app(constant("kid"), Expr::bvar(0).unwrap())),
+        under(Expr::bvar(0).unwrap()),
+        under(constant("other")),
+    )
+}
+
+/// The KR-317 gate falls back to the checker's conversion when its structural
+/// comparison cannot tell, as the pin gates K on full `is_def_eq`. These
+/// endpoints are equal only by unfolding `kid` under a binder, which the
+/// structural comparison deliberately does not do. Without the fallback, the
+/// cast stays stuck and a caller normalizes its proof instead: that is how
+/// `blastExtractAndExtend.go._unary.eq_def` (Operations.Cpop) spent its whole
+/// budget on a cast along `w * (idx + 1) = w * idx + w`. Distinct endpoints
+/// still leave the cast stuck.
+#[test]
+fn k_gate_falls_back_to_conversion_when_the_structural_comparison_cannot_tell() {
+    let (context, unfolding, identity, other) = k_endpoints_under_a_binder();
+    let WhnfOutcome::Complete(result) = whnf(
+        &decoded(&k_application(constant("A"), unfolding.clone(), identity)),
+        &context,
+        WhnfBudget::unlimited(),
+    ) else {
+        panic!("the K gate must complete");
+    };
+    assert_eq!(
+        root_constant_name(&result.term),
+        Some(&checker_name("KTestMinor")),
+        "endpoints equal by conversion must pass the K gate"
+    );
+    let WhnfOutcome::Complete(result) = whnf(
+        &decoded(&k_application(constant("A"), unfolding, other)),
+        &context,
+        WhnfBudget::unlimited(),
+    ) else {
+        panic!("distinct endpoints must remain a completed stuck expression");
+    };
+    assert!(
+        matches!(
+            result.term.node(result.term.root()),
+            Some(ExprNode::Apply { .. })
+        ),
+        "distinct endpoints must leave the cast stuck"
+    );
+}
+
+/// The KR-317 gate's conversion outcome is remembered for the context: a second
+/// cast whose gate compares the same two types reads it instead of converting
+/// again. The casts differ only in their evidence, so neither is the other's
+/// whole-term memo entry. The conversion runs on a fixed budget, so the
+/// remembered outcome is the one a recomputation would reach. In Cpop, 240 gate
+/// misses were 32 distinct pairs.
+#[test]
+fn a_k_gate_conversion_is_not_repeated_for_the_same_pair() {
+    let (context, unfolding, identity, _) = k_endpoints_under_a_binder();
+    let cast = |evidence: &str| {
+        [
+            constant("A"),
+            unfolding.clone(),
+            constant("KTestMotive"),
+            constant("KTestMinor"),
+            identity.clone(),
+            Expr::fvar(FVarId(primary_name(evidence))),
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(Name::from_components(["EqS", "rec"]), vec![Level::one()]),
+            Expr::app,
+        )
+    };
+    let mut steps = Vec::new();
+    for evidence in ["firstEvidence", "secondEvidence"] {
+        let WhnfOutcome::Complete(result) =
+            whnf(&decoded(&cast(evidence)), &context, WhnfBudget::unlimited())
+        else {
+            panic!("the K gate must complete");
+        };
+        assert_eq!(
+            root_constant_name(&result.term),
+            Some(&checker_name("KTestMinor"))
+        );
+        steps.push(result.steps);
+    }
+    assert!(
+        steps[1] < steps[0],
+        "the second cast repeated the gate's conversion: {steps:?} steps"
+    );
+}

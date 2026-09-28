@@ -67,11 +67,22 @@ const MAX_STORED_NODES: usize = 1 << 20;
 /// a lookup compare more than this many terms.
 const MAX_BUCKET_ENTRIES: usize = 8;
 
+/// One remembered KR-317 gate outcome: the two types compared and whether they
+/// converted.
+struct GateEntry {
+    domain: Arc<WireExpr>,
+    result: Arc<WireExpr>,
+    equal: bool,
+}
+
 #[derive(Default)]
 struct Table {
     /// Keyed by a fixed fingerprint, so the order of results never depends on the
     /// process; entries in a bucket are compared exactly.
     buckets: HashMap<u64, Vec<Entry>>,
+    /// KR-317 gate outcomes by conversion, keyed the same way (see
+    /// `WhnfMemo::recall_k_gate`). They share the entry and node bounds.
+    k_gate: HashMap<u64, Vec<GateEntry>>,
     entries: usize,
     stored_nodes: usize,
 }
@@ -223,6 +234,67 @@ impl WhnfMemo {
         table.entries += 1;
         table.stored_nodes = table.stored_nodes.saturating_add(nodes);
     }
+}
+
+impl WhnfMemo {
+    /// The KR-317 gate's conversion outcome for exactly these two types, if one
+    /// was recorded. The conversion runs on the fixed `K_GATE_CONVERSION_WORK`,
+    /// so, as for the results above, its outcome depends only on the pair and
+    /// the context: recording it changes no answer and saves the conversion. In
+    /// Cpop, 240 gate misses were 32 distinct pairs.
+    pub(super) fn recall_k_gate(&self, domain: &WireExpr, result: &WireExpr) -> Option<bool> {
+        let table = self.0.lock().ok()?;
+        table
+            .k_gate
+            .get(&pair_fingerprint(domain, result))?
+            .iter()
+            .find(|entry| *entry.domain == *domain && *entry.result == *result)
+            .map(|entry| entry.equal)
+    }
+
+    /// Record a gate outcome. Never called for a cancelled or faulted
+    /// conversion, whose outcome is not a function of the pair.
+    pub(super) fn remember_k_gate(
+        &self,
+        domain: Arc<WireExpr>,
+        result: Arc<WireExpr>,
+        equal: bool,
+    ) {
+        let Ok(mut table) = self.0.lock() else {
+            return;
+        };
+        let nodes = domain.nodes().len().saturating_add(result.nodes().len());
+        if table.entries >= MAX_ENTRIES
+            || table.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
+        {
+            return;
+        }
+        let bucket = table
+            .k_gate
+            .entry(pair_fingerprint(&domain, &result))
+            .or_default();
+        if bucket.len() >= MAX_BUCKET_ENTRIES
+            || bucket
+                .iter()
+                .any(|entry| entry.domain == domain && entry.result == result)
+        {
+            return;
+        }
+        bucket.push(GateEntry {
+            domain,
+            result,
+            equal,
+        });
+        table.entries += 1;
+        table.stored_nodes = table.stored_nodes.saturating_add(nodes);
+    }
+}
+
+fn pair_fingerprint(domain: &WireExpr, result: &WireExpr) -> u64 {
+    let mut hasher = Fingerprinter::default();
+    domain.hash(&mut hasher);
+    result.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
