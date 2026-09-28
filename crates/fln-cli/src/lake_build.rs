@@ -349,31 +349,9 @@ fn compile(
                 external.push(name);
             }
         }
-        // Metadata is one immutable imported world for this build. Validate
-        // order as well as membership: even the same modules in reverse order
-        // can select a different equal-priority dictionary. Context projection
-        // remains unsupported, not an excuse to alter a dependency's meaning.
-        for local in &closure {
-            let mut local_seen = BTreeSet::new();
-            let mut local_pending = vec![local.clone()];
-            let mut local_external = Vec::new();
-            while let Some(name) = local_pending.pop() {
-                if !local_seen.insert(name.clone()) {
-                    continue;
-                }
-                if let Some(module) = modules.get(&name) {
-                    local_pending.extend(module.imports.iter().rev().cloned());
-                } else {
-                    local_external.push(name);
-                }
-            }
-            if local_external != external {
-                return Err(Failure::unsupported(format!(
-                    "module {} requires a distinct .olean metadata context; local modules must share the same ordered external roots",
-                    local.to_display_string()
-                )));
-            }
-        }
+        // The import receipt retains exact per-module declaration and metadata
+        // provenance. The facade projects each local module's own external
+        // closure and declared order; sibling imports are never ambient.
         // The exact ordered external roots bind this invocation's immutable
         // import snapshot. Disk outputs never become checked cache entries.
         if active.as_ref().is_none_or(|(roots, _)| roots != &external) {
@@ -384,15 +362,21 @@ fn compile(
                     authority,
                 },
             )?;
-            active = Some((
-                external,
-                SourceModuleSession::new(
+            let session = match base {
+                Some(base) => SourceModuleSession::from_imports(
                     base,
                     fln::KVMap::new(),
                     limits,
                     SourceModuleCacheLimits::default(),
                 ),
-            ));
+                None => SourceModuleSession::new(
+                    fln::Engine::from_environment(fln::Environment::new()),
+                    fln::KVMap::new(),
+                    limits,
+                    SourceModuleCacheLimits::default(),
+                ),
+            };
+            active = Some((external, session));
         }
         let inputs: Vec<_> = closure
             .iter()

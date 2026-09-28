@@ -1,12 +1,13 @@
 //! User-facing source proof checking. No compiler or VM is entered.
 use super::*;
+use fln::source_check::modules::imported::SourceOleanImport;
 mod imports;
 pub(super) mod lsp;
 
 pub(super) fn load_build_base(
     roots: &[fln::Name],
     source_root: &Path,
-) -> Result<fln::Engine, (&'static str, String, bool)> {
+) -> Result<Option<SourceOleanImport>, (&'static str, String, bool)> {
     imports::load_build_base(roots, source_root)
         .map_err(|error| (error.class, error.detail, error.authority))
 }
@@ -127,7 +128,7 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
-            let result = match loaded.check(&engine, limits) {
+            let result = match loaded.check(&engine, olean_base.as_ref(), limits) {
                 Ok(fln::Outcome::Complete(result)) => result,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source check exhausted its configured resources", false, json, 3),
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source check encountered an internal fault", false, json, 4),

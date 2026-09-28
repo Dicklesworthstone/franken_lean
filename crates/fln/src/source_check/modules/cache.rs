@@ -69,6 +69,7 @@ impl CachedModule {
 /// an answer for different source bytes or dependency identities.
 pub struct SourceModuleSession {
     base: Engine,
+    contexts: Option<Box<contexts::ImportContexts>>,
     options: KVMap,
     limits: SourceModuleCheckLimits,
     retention: SourceModuleCacheLimits,
@@ -91,6 +92,7 @@ impl SourceModuleSession {
     ) -> Self {
         Self {
             base,
+            contexts: None,
             options,
             limits,
             retention,
@@ -98,6 +100,22 @@ impl SourceModuleSession {
             source_bytes: 0,
         }
     }
+    /// Bind reuse to a private council-checked import receipt. Every module
+    /// is checked in its own declared external context, including on cold
+    /// compilation; warm entries still require exact source/dependency identity.
+    /// Caller-editable import reports and output bytes never supply authority.
+    pub fn from_imports(
+        imported: imported::SourceOleanImport,
+        options: KVMap,
+        limits: SourceModuleCheckLimits,
+        retention: SourceModuleCacheLimits,
+    ) -> Self {
+        let contexts = imported.contexts;
+        let mut session = Self::new(contexts.complete.clone(), options, limits, retention);
+        session.contexts = Some(Box::new(contexts));
+        session
+    }
+
     /// Observe an unfinished declaration against the exact checked import and
     /// command prefix. The declaration at the cursor is never admitted.
     pub fn inspect(
@@ -150,7 +168,7 @@ impl SourceModuleSession {
                     limits: self.retention,
                 }),
                 collect_artifacts: true,
-                contexts: None,
+                contexts: self.contexts.as_deref(),
             },
         )
         .map_err(SourceModuleBuildError::Check)?
@@ -202,14 +220,18 @@ impl SourceModuleSession {
             entries: &self.entries,
             limits: self.retention,
         };
-        let outcome = run(
+        let outcome = run_collecting(
             &self.base,
             modules,
             entry,
             &self.options,
             self.limits,
             cancellation,
-            Some(view),
+            RunOptions {
+                cache: Some(view),
+                collect_artifacts: false,
+                contexts: self.contexts.as_deref(),
+            },
         )?;
         Ok(match outcome {
             Outcome::Complete(run) => {

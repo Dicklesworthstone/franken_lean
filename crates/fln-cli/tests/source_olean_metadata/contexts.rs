@@ -1,7 +1,8 @@
 //! Real serialized artifact closures exercise the private per-module receipt.
 use super::*;
 use fln::source_check::modules::{
-    SourceModuleBuildError, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
+    SourceModuleBuildError, SourceModuleCacheLimits, SourceModuleCheck, SourceModuleCheckError,
+    SourceModuleCheckLimits, SourceModuleSession,
     imported::{SourceOleanImport, SourceOleanImportLimits},
 };
 
@@ -400,4 +401,197 @@ fn metadata_and_encoding_budgets_remain_aggregate_and_unsupported_exports_refuse
             SourceModuleCheckError::Extension { .. }
         ))
     ));
+}
+
+#[test]
+fn full_receipt_retains_checked_repeated_proofs_without_lending_them_to_a_subset() {
+    let project = Project::new();
+    project.module(
+        "Core",
+        &[
+            axiom("P", Expr::sort(Level::zero())),
+            axiom("firstProof", c("P")),
+            axiom("secondProof", c("P")),
+        ],
+        &[],
+        vec![],
+    );
+    for (module, proof) in [("A", "firstProof"), ("B", "secondProof")] {
+        let theorem = ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: n("shared"),
+                level_params: vec![],
+                type_: c("P"),
+            },
+            value: c(proof),
+            all: vec![n("shared")],
+        });
+        project.module(module, &[theorem], &["Core"], vec![]);
+    }
+    let receipt = imported(&project);
+    checked(
+        &receipt,
+        &[(
+            "Main",
+            "prelude\nimport A B\ntheorem useShared : P := shared\n",
+        )],
+    );
+    // The full checker keeps the first coherent copy. A receipt for B alone
+    // must not silently substitute A's proof just because the names match.
+    let names = [n("Main")];
+    let source = ["prelude\nimport B\ntheorem useShared : P := shared\n"];
+    assert!(matches!(
+        receipt.check_source_modules(
+            &inputs(&names, &source),
+            &n("Main"),
+            &KVMap::new(),
+            limits(),
+            None
+        ),
+        Err(SourceModuleCheckError::ImportContext { .. })
+    ));
+}
+
+#[test]
+fn private_context_sessions_reuse_artifacts_without_lending_sibling_dictionaries() {
+    let mut receipt = imported(&fixture());
+    receipt.engine = Engine::from_environment(Environment::new());
+    receipt.checked.modules.clear();
+    let mut session = SourceModuleSession::from_imports(
+        receipt,
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let names = [n("Left"), n("Right"), n("Main")];
+    let sources = [
+        "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
+        "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
+        "prelude\nimport Left Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n",
+    ];
+    let run = |session: &mut SourceModuleSession, sources: &[&str]| {
+        session.compile(
+            &inputs(&names, sources),
+            &n("Main"),
+            OleanWriteBudget::default(),
+        )
+    };
+    let mut cold = run(&mut session, &sources)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((cold.elaborated_modules, cold.reused_modules), (3, 0));
+    let original: Vec<_> = cold
+        .artifacts
+        .iter()
+        .map(|a| (a.name.clone(), a.bytes.clone()))
+        .collect();
+    cold.artifacts[0].bytes.fill(0);
+    let warm = run(&mut session, &sources)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((warm.elaborated_modules, warm.reused_modules), (0, 3));
+    for (actual, (name, bytes)) in warm.artifacts.iter().zip(&original) {
+        assert_eq!((&actual.name, &actual.bytes), (name, bytes));
+    }
+    let mut bad = sources;
+    bad[1] = "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueA\n";
+    assert!(run(&mut session, &bad).is_err());
+    assert_eq!(session.retained_modules(), 3);
+    let tiny = OleanWriteBudget {
+        max_bytes: 1,
+        ..OleanWriteBudget::default()
+    };
+    assert!(
+        session
+            .compile(&inputs(&names, &sources), &n("Main"), tiny)
+            .is_err()
+    );
+    assert_eq!(session.retained_modules(), 3);
+    let recovered = run(&mut session, &sources)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        (recovered.elaborated_modules, recovered.reused_modules),
+        (0, 3)
+    );
+}
+
+#[test]
+fn warm_context_session_cancellation_preserves_the_successful_cache() {
+    struct StopAfter {
+        calls: AtomicUsize,
+        after: usize,
+    }
+    impl CancellationProbe for StopAfter {
+        fn is_cancelled(&self) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed) >= self.after
+        }
+    }
+    let mut session = SourceModuleSession::from_imports(
+        imported(&fixture()),
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let names = [n("Local"), n("Main")];
+    let sources = [
+        "prelude\nimport A\ndef localValue : Class := a\n",
+        "prelude\nimport Local B\ndef mainValue : Class := b\n",
+    ];
+    let inputs = inputs(&names, &sources);
+    session
+        .compile(&inputs, &n("Main"), OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let probe = StopAfter {
+        calls: AtomicUsize::new(0),
+        after: usize::MAX,
+    };
+    let warm = session
+        .compile_with_cancel(
+            &inputs,
+            &n("Main"),
+            OleanWriteBudget::default(),
+            Some(&probe),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(warm.reused_modules, 2);
+    let checkpoints = probe.calls.load(Ordering::Relaxed);
+    assert!(checkpoints > 5);
+    for after in 0..checkpoints {
+        let probe = StopAfter {
+            calls: AtomicUsize::new(0),
+            after,
+        };
+        assert!(
+            matches!(
+                session
+                    .compile_with_cancel(
+                        &inputs,
+                        &n("Main"),
+                        OleanWriteBudget::default(),
+                        Some(&probe)
+                    )
+                    .unwrap(),
+                Outcome::Inconclusive(_)
+            ),
+            "checkpoint {after}"
+        );
+        assert_eq!(session.retained_modules(), 2);
+    }
+    let recovered = session
+        .compile(&inputs, &n("Main"), OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        (recovered.elaborated_modules, recovered.reused_modules),
+        (0, 2)
+    );
 }

@@ -10,6 +10,7 @@
 use super::*;
 pub(super) mod editor;
 mod metadata;
+use fln::source_check::modules::imported::SourceOleanImport;
 use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{LeafView, Name, Outcome, SourceFileCheck, SourceModuleInput};
 use std::collections::BTreeMap;
@@ -32,6 +33,7 @@ pub(super) struct OleanBase {
     pub(super) declarations: usize,
     declaration_root: fln::LogicalRoot,
     metadata: Vec<fln::source_check::modules::imported::SourceMetadataReport>,
+    receipt: SourceOleanImport,
 }
 
 pub(super) struct Failure {
@@ -98,36 +100,6 @@ impl Loaded {
         if self.oleans.is_empty() {
             return seed().map(|engine| (engine, None));
         }
-        // An immutable import base cannot represent different metadata worlds
-        // per local module yet. Refuse before council/metadata activation rather
-        // than let a sibling module silently influence instance selection.
-        if let Inputs::Modules { names, sources } = &self.inputs {
-            let mut graph = BTreeMap::new();
-            for (name, source) in names.iter().zip(sources) {
-                let header = parse_source_header(source).map_err(|error| {
-                    Failure::new(
-                        "input",
-                        &format!("{}: {error}", name.to_display_string()),
-                        false,
-                        1,
-                    )
-                })?;
-                graph.insert(name.clone(), header.imports);
-            }
-            for name in names {
-                if metadata::ordered_roots(&graph, std::slice::from_ref(name)) != self.olean_roots {
-                    return Err(Failure::new(
-                        "unsupported",
-                        &format!(
-                            "module {} requires a distinct .olean metadata context; local modules must share the same ordered external roots",
-                            name.to_display_string()
-                        ),
-                        false,
-                        3,
-                    ));
-                }
-            }
-        }
         let inputs: Vec<fln::OleanModuleInput<'_>> = self
             .oleans
             .iter()
@@ -165,12 +137,13 @@ impl Loaded {
                     .map(|module| module.declarations.len())
                     .sum();
                 Ok((
-                    checked.engine,
+                    checked.engine.clone(),
                     Some(OleanBase {
                         modules: checked.checked.modules.len(),
                         declarations,
                         declaration_root: checked.checked.result_logical_root,
-                        metadata: checked.modules,
+                        metadata: checked.modules.clone(),
+                        receipt: checked,
                     }),
                 ))
             }
@@ -192,6 +165,7 @@ impl Loaded {
     pub(super) fn check(
         &self,
         engine: &fln::Engine,
+        olean_base: Option<&OleanBase>,
         limits: fln::SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, Failure> {
         match &self.inputs {
@@ -215,13 +189,26 @@ impl Loaded {
                     .zip(sources)
                     .map(|(name, source)| SourceModuleInput { name, source })
                     .collect();
-                engine
-                    .check_source_modules(
+                // The receipt projects each module's exact external world and
+                // interleaves external journals with local source exports.
+                // A shared ambient engine cannot preserve these semantics.
+                let checked = if let Some(base) = olean_base {
+                    base.receipt.check_source_modules(
+                        &inputs,
+                        &names[0],
+                        &fln::KVMap::new(),
+                        SourceModuleCheckLimits::new(limits),
+                        None,
+                    )
+                } else {
+                    engine.check_source_modules(
                         &inputs,
                         &names[0],
                         &fln::KVMap::new(),
                         SourceModuleCheckLimits::new(limits),
                     )
+                };
+                checked
                     .map(|outcome| outcome.map_complete(|result| result.checked))
                     .map_err(|error| {
                         let (class, authority, exit) = error.disposition();
@@ -510,7 +497,10 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
 
 /// Builds use the same bounded import loader and dual-checker admission as
 /// source checking, but never substitute a synthetic seed for missing imports.
-pub(super) fn load_build_base(roots: &[Name], source_root: &Path) -> Result<fln::Engine, Failure> {
+pub(super) fn load_build_base(
+    roots: &[Name],
+    source_root: &Path,
+) -> Result<Option<SourceOleanImport>, Failure> {
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
@@ -519,7 +509,7 @@ pub(super) fn load_build_base(roots: &[Name], source_root: &Path) -> Result<fln:
     };
     loaded
         .base_engine(|| Ok(fln::Engine::from_environment(fln::Environment::new())))
-        .map(|(engine, _)| engine)
+        .map(|(_, base)| base.map(|base| base.receipt))
 }
 
 fn validate_component(component: &str) -> Result<(), Failure> {

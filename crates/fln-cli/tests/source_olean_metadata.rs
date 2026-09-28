@@ -233,16 +233,20 @@ fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
 #[test]
 fn imports_through_local_modules_preserve_declared_not_discovery_order() {
     let p = fixture();
-    p.write("Wrapper.lean", "prelude\nimport B A\n");
+    p.write("Wrapper.lean", "prelude\nimport B A\ndef wrapperUse [d : Class] : Class := d\ndef wrapperChoice : Family wrapperUse := valueA\n");
     // Filesystem discovery sees external A before visiting Wrapper. Metadata
     // replay must nevertheless visit Wrapper's B before the following A.
     p.write("Main.lean", source("Wrapper A", "valueA"));
     p.success();
     p.write("Main.lean", source("A Wrapper", "valueB"));
+    p.success();
+    // The wrapper's dictionary remains A even while its consumer chooses B.
+    // Supplying A for the consumer is still rejected, not accepted by the
+    // wrapper's otherwise correctly isolated context.
+    p.write("Main.lean", source("A Wrapper", "valueA"));
     let refused = p.run();
-    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(!refused.status.success(), "{refused:?}");
     assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("distinct .olean metadata context"));
 }
 
 #[test]
@@ -341,3 +345,6 @@ fn lake_build_uses_checked_metadata_and_original_external_import_order() {
 
 #[path = "source_olean_metadata/contexts.rs"]
 mod contexts;
+
+#[path = "source_olean_metadata/installed_contexts.rs"]
+mod installed_contexts;

@@ -18,6 +18,7 @@ struct ExternalModule {
 #[derive(Debug)]
 pub(super) struct ImportContexts {
     origin: Engine,
+    declarations: Engine,
     pub(super) complete: Engine,
     modules: BTreeMap<Name, ExternalModule>,
 }
@@ -78,6 +79,7 @@ impl ImportContexts {
             .collect();
         Self {
             origin: origin.clone(),
+            declarations: checked.engine.clone(),
             complete: complete.clone(),
             modules,
         }
@@ -148,6 +150,24 @@ impl ImportContexts {
         meter: &mut Meter,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
+        meter.work(steps.len())?;
+        // The private planner emits each external module once. When the whole
+        // set is present, retain its original council projection, including the
+        // chosen representative of subsumed repeated proofs. This is not a
+        // subset reconstruction and must not require identical raw copies.
+        if steps
+            .iter()
+            .filter(|step| matches!(step, Step::External(_)))
+            .count()
+            == self.modules.len()
+        {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-modules/project-import",
+                )));
+            }
+            return Ok(Outcome::Complete(self.declarations.clone()));
+        }
         let mut engine = self.origin.clone();
         let bound = engine.environment == Environment::new()
             || engine.imported_environment.as_ref() == Some(&engine.environment);

@@ -269,6 +269,7 @@ impl Engine {
         if bound { engine.imported_environment = Some(engine.environment.clone()); }
         let result_logical_root = engine.logical_root(options);
         let contexts = super::contexts::ImportContexts::capture(self, &engine, &checked, journals);
+        cancelled!("source-olean/after-context-capture");
         Ok(Outcome::Complete(SourceOleanImport { engine, checked, result_logical_root, modules: reports, contexts }))
     }
 }
