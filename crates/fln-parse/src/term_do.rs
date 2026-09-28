@@ -8,6 +8,7 @@
 use super::*;
 use term_locals::word;
 mod conditional;
+mod fallback;
 
 pub(super) struct Prefix {
     keyword: usize,
@@ -92,6 +93,10 @@ fn newline(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
 fn closing(tokens: &[LexedToken], at: usize) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind),
         Some(TokenKind::Symbol(s)) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ","))
+}
+
+fn is_failure_value(syntax: &Syntax) -> bool {
+    syntax.kind() == Some(&parser_kind(&["Term", "nativeDoFailureValue"]))
 }
 
 impl Prefix {
@@ -293,135 +298,13 @@ impl Prefix {
         value: Syntax,
         semi: Option<usize>,
     ) -> Result<(), NatDefinitionParseError> {
-        let element =
-            match self.statement {
-                Statement::Action => Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
-                Statement::Conditional { position } => conditional::element(value, position)?,
-                Statement::Match { position } => {
-                    if !matches!(&value, Syntax::Node { kind, args, .. }
-                        if kind == &parser_kind(&["Term", "doMatch"]) && args.len() == 7)
-                    {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::MatchAlternative,
-                        });
-                    }
-                    value
-                }
-                Statement::Return(at) => Syntax::node(
-                    parser_kind(&["Term", "doReturn"]),
-                    vec![atom(leaves, at, "return")?, null_node(vec![value])],
-                ),
-                Statement::Jump {
-                    keyword,
-                    is_break,
-                    position,
-                } => {
-                    if value != leaves.leaf(keyword)? {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::EndOfCommand,
-                        });
-                    }
-                    Syntax::node(
-                        parser_kind(&["Term", if is_break { "doBreak" } else { "doContinue" }]),
-                        vec![atom(
-                            leaves,
-                            keyword,
-                            if is_break { "break" } else { "continue" },
-                        )?],
-                    )
-                }
-                Statement::Unless { keyword, position } => {
-                    // The body is a doSeq in the surrounding return/loop scope,
-                    // not a nested do expression with independent control flow.
-                    let mut value = value;
-                    let Syntax::Node { kind, args, .. } = &mut value else {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        });
-                    };
-                    if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        });
-                    }
-                    let sequence = args.pop().expect("checked unless body");
-                    let do_keyword = args.pop().expect("checked unless do keyword");
-                    let condition = self.collection.take().ok_or(
-                        NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        },
-                    )?;
-                    Syntax::node(
-                        parser_kind(&["Term", "doUnless"]),
-                        vec![
-                            atom(leaves, keyword, "unless")?,
-                            condition,
-                            do_keyword,
-                            sequence,
-                        ],
-                    )
-                }
-                Statement::For {
-                    keyword,
-                    name,
-                    witness,
-                    in_at,
-                    position,
-                } => {
-                    // The loop's `do` introduces a doSeq, not a new return scope.
-                    // Reuse the nested parser frame, then remove only its wrapper.
-                    let mut value = value;
-                    let Syntax::Node { kind, args, .. } = &mut value else {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        });
-                    };
-                    if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        });
-                    }
-                    let sequence = args.pop().expect("checked do sequence");
-                    let do_keyword = args.pop().expect("checked do keyword");
-                    let collection = self.collection.take().ok_or(
-                        NatDefinitionParseError::OutsideSeedGrammar {
-                            at: position,
-                            expected: NatDefinitionExpectation::ScalarValue,
-                        },
-                    )?;
-                    let witness = match witness {
-                        Some(at) => null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?]),
-                        None => null_node(vec![]),
-                    };
-                    let name = leaves.leaf(name)?;
-                    let name = if matches!(&name, Syntax::Atom { val, .. } if val == "_") {
-                        Syntax::node(parser_kind(&["Term", "hole"]), vec![name])
-                    } else {
-                        name
-                    };
-                    let declaration = Syntax::node(
-                        parser_kind(&["Term", "doForDecl"]),
-                        vec![witness, name, atom(leaves, in_at, "in")?, collection],
-                    );
-                    Syntax::node(
-                        parser_kind(&["Term", "doFor"]),
-                        vec![
-                            atom(leaves, keyword, "for")?,
-                            null_node(vec![declaration]),
-                            do_keyword,
-                            sequence,
-                        ],
-                    )
-                }
-                Statement::Binding { .. } => self.binding_element(leaves, value)?,
-            };
+        let element = match self.statement {
+            Statement::Binding { .. } if is_failure_value(&value) => {
+                self.failure_binding(leaves, value)?
+            }
+            Statement::Binding { .. } => self.binding_element(leaves, value)?,
+            _ => self.nonbinding_element(leaves, value)?,
+        };
         self.items.push(Syntax::node(
             parser_kind(&["Term", "doSeqItem"]),
             vec![
@@ -435,6 +318,145 @@ impl Prefix {
             ],
         ));
         Ok(())
+    }
+    // Dispatch before allocating the independent constructor frames. Refutable
+    // bindings already sit inside a bounded compound-term parser invocation.
+    #[inline(never)]
+    fn nonbinding_element(
+        &mut self,
+        leaves: &Leaves,
+        value: Syntax,
+    ) -> Result<Syntax, NatDefinitionParseError> {
+        Ok(match self.statement {
+            Statement::Action => Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
+            Statement::Conditional { position } => conditional::element(value, position)?,
+            Statement::Match { position } => {
+                if !matches!(&value, Syntax::Node { kind, args, .. }
+                        if kind == &parser_kind(&["Term", "doMatch"]) && args.len() == 7)
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::MatchAlternative,
+                    });
+                }
+                value
+            }
+            Statement::Return(at) => Syntax::node(
+                parser_kind(&["Term", "doReturn"]),
+                vec![atom(leaves, at, "return")?, null_node(vec![value])],
+            ),
+            Statement::Jump {
+                keyword,
+                is_break,
+                position,
+            } => {
+                if value != leaves.leaf(keyword)? {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::EndOfCommand,
+                    });
+                }
+                Syntax::node(
+                    parser_kind(&["Term", if is_break { "doBreak" } else { "doContinue" }]),
+                    vec![atom(
+                        leaves,
+                        keyword,
+                        if is_break { "break" } else { "continue" },
+                    )?],
+                )
+            }
+            Statement::Unless { keyword, position } => {
+                // The body is a doSeq in the surrounding return/loop scope,
+                // not a nested do expression with independent control flow.
+                let mut value = value;
+                let Syntax::Node { kind, args, .. } = &mut value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                let sequence = args.pop().expect("checked unless body");
+                let do_keyword = args.pop().expect("checked unless do keyword");
+                let condition =
+                    self.collection
+                        .take()
+                        .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                            at: position,
+                            expected: NatDefinitionExpectation::ScalarValue,
+                        })?;
+                Syntax::node(
+                    parser_kind(&["Term", "doUnless"]),
+                    vec![
+                        atom(leaves, keyword, "unless")?,
+                        condition,
+                        do_keyword,
+                        sequence,
+                    ],
+                )
+            }
+            Statement::For {
+                keyword,
+                name,
+                witness,
+                in_at,
+                position,
+            } => {
+                // The loop's `do` introduces a doSeq, not a new return scope.
+                // Reuse the nested parser frame, then remove only its wrapper.
+                let mut value = value;
+                let Syntax::Node { kind, args, .. } = &mut value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"]) || args.len() != 2 {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                let sequence = args.pop().expect("checked do sequence");
+                let do_keyword = args.pop().expect("checked do keyword");
+                let collection =
+                    self.collection
+                        .take()
+                        .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                            at: position,
+                            expected: NatDefinitionExpectation::ScalarValue,
+                        })?;
+                let witness = match witness {
+                    Some(at) => null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?]),
+                    None => null_node(vec![]),
+                };
+                let name = leaves.leaf(name)?;
+                let name = if matches!(&name, Syntax::Atom { val, .. } if val == "_") {
+                    Syntax::node(parser_kind(&["Term", "hole"]), vec![name])
+                } else {
+                    name
+                };
+                let declaration = Syntax::node(
+                    parser_kind(&["Term", "doForDecl"]),
+                    vec![witness, name, atom(leaves, in_at, "in")?, collection],
+                );
+                Syntax::node(
+                    parser_kind(&["Term", "doFor"]),
+                    vec![
+                        atom(leaves, keyword, "for")?,
+                        null_node(vec![declaration]),
+                        do_keyword,
+                        sequence,
+                    ],
+                )
+            }
+            Statement::Binding { .. } => unreachable!("bindings have a separate frame"),
+        })
     }
     // Keep binding-construction temporaries off the shared statement frame.
     // A long do block still uses heap frames, including in an unoptimized build
@@ -613,7 +635,8 @@ impl Prefix {
             self.statement,
             Statement::Return(_) | Statement::Jump { .. }
         );
-        let binding = matches!(self.statement, Statement::Binding { .. });
+        let binding = matches!(self.statement, Statement::Binding { .. })
+            && !is_failure_value(&expression);
         self.item(leaves, expression, semi)?;
         if let Some((_, close)) = &mut self.braces {
             if next < end && word(tokens, next, "}") {
@@ -655,7 +678,9 @@ impl Prefix {
             });
         }
         if self.phase != Phase::Done {
-            if self.phase != Phase::Value || matches!(self.statement, Statement::Binding { .. }) {
+            if self.phase != Phase::Value
+                || (matches!(self.statement, Statement::Binding { .. }) && !is_failure_value(&value))
+            {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: BytePos(0),
                     expected: NatDefinitionExpectation::ScalarValue,

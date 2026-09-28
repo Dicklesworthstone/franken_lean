@@ -8,6 +8,7 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 mod do_scopes;
+mod fallback;
 mod if_let;
 use do_scopes::DoScopes;
 
@@ -30,12 +31,14 @@ struct ConditionalPlan {
 enum Plan {
     Match(MatchPlan),
     Conditional(ConditionalPlan),
+    Fallback(fallback::FallbackPlan),
 }
 impl Plan {
     fn start(&self) -> usize {
         match self {
             Self::Match(p) => p.start,
             Self::Conditional(p) => p.start,
+            Self::Fallback(p) => p.start,
         }
     }
 }
@@ -137,11 +140,18 @@ fn plan(
     };
     let mut conditionals: Vec<ConditionalPlan> = Vec::new();
     let mut lets = Vec::new();
+    let mut fallbacks = Vec::new();
     let mut done = Vec::new();
     let mut do_scopes = DoScopes::default();
     for at in range.clone() {
         let depth = delimiters.len();
-        do_scopes.before(view, tokens, at, depth, &conditionals, &active);
+        let failure = fallback::candidate(tokens, at, depth, lets.last(), active.len());
+        do_scopes.before(
+            view, tokens, at, depth, &conditionals, &active, failure.is_some(),
+        );
+        fallback::advance(
+            view, tokens, at, depth, &mut do_scopes, &mut fallbacks, &mut done,
+        )?;
         while conditionals.last().is_some_and(|p| {
             p.statement
                 && do_scopes.ended(p.start)
@@ -170,7 +180,9 @@ fn plan(
         // compound expressions opened in that value; its containing branch
         // continues with the next local declaration or result expression.
         while lets.last().is_some_and(|&(depth, _, _, keyword, _)| {
-            depth == delimiters.len() && local_line_break(view, tokens, keyword, keyword, at)
+            failure.is_none()
+                && depth == delimiters.len()
+                && local_line_break(view, tokens, keyword, keyword, at)
         }) {
             let (_, enclosing, enclosing_conditionals, _, _) =
                 lets.pop().expect("offside local declaration");
@@ -448,8 +460,16 @@ fn plan(
             "|" => {
                 while conditionals.last().is_some_and(|p| {
                     p.depth == depth && active.last().is_none_or(|m| m.start < p.start)
+                        && failure.is_none_or(|(start, _)| p.start > start)
                 }) {
                     close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+                }
+                if let Some((start, assignment)) = failure {
+                    lets.pop();
+                    let p = fallback::open(view, tokens, start, assignment, at, depth, range.end)?;
+                    do_scopes.open(view, tokens, at, depth, Some(start), range.end)?;
+                    fallbacks.push(p);
+                    continue;
                 }
                 // Indented tactic alternatives belong to the proof parser,
                 // not the surrounding expression match. Keep their leaves in
@@ -533,6 +553,7 @@ fn plan(
     while !active.is_empty() {
         close(view, tokens, &mut active, &mut done, range.end)?;
     }
+    fallback::finish(&mut fallbacks, &mut done, range.end);
     if !delimiters.is_empty() {
         return Err(refuse(view, tokens, range.end));
     }
@@ -903,6 +924,7 @@ fn parse_planned(
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
                     || is_symbol(tokens, at, "match")
+                    || is_symbol(tokens, at, "|")
                     || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
                         && is_symbol(tokens, at + 1, "|"))
             }))
@@ -1225,6 +1247,9 @@ fn parse_compound(
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     for planned in plan(view, tokens, range.clone(), equations)? {
         match planned {
+            Plan::Fallback(plan) => {
+                fallback::build(leaves, view, tokens, plan, grammar, &mut splices, &updates)?;
+            }
             Plan::Conditional(plan) => {
                 build_conditional(leaves, view, tokens, plan, grammar, &mut splices, &updates)?;
             }

@@ -7,6 +7,7 @@
 use super::*;
 mod conditional;
 mod control;
+mod fallback;
 mod for_loop;
 mod if_let;
 mod loop_returns;

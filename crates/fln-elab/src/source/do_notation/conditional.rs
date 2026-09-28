@@ -20,6 +20,7 @@ fn skip() -> Syntax {
 
 pub(super) enum Header {
     Proposition(Vec<Syntax>),
+    Binding(Box<super::fallback::Header>),
     Match(Box<super::matching::MatchHeader>),
     Pattern {
         operands: Box<(Syntax, Syntax)>,
@@ -43,6 +44,7 @@ impl Context {
         let yes = bodies.pop().expect("then branch");
         match header {
             Header::Match(_) => unreachable!("handled match header"),
+            Header::Binding(header) => self.finish_do_fallback(*header, yes, no),
             Header::Proposition(mut header) => {
                 header.insert(4, yes);
                 header.push(no);
@@ -67,12 +69,16 @@ pub(super) struct Branches {
 pub(super) fn is_compound(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "doIf"]))
         || syntax.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+        || fallback::is_binding(syntax)
 }
 
 pub(super) fn split(
     context: &mut Context,
     syntax: Syntax,
 ) -> Result<Branches, NatDefinitionElabError> {
+    if fallback::is_binding(&syntax) {
+        return fallback::split(syntax);
+    }
     if syntax.kind() == Some(&parser_kind(&["Term", "doMatch"])) {
         return super::matching::split(context, syntax);
     }

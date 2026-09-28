@@ -32,7 +32,20 @@ impl DoScopes {
         owner: Option<usize>,
         end: usize,
     ) -> Result<(), NatDefinitionParseError> {
-        let start = introducer + 1;
+        self.open_at(view, tokens, introducer, introducer + 1, depth, owner, end)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn open_at(
+        &mut self,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        introducer: usize,
+        start: usize,
+        depth: usize,
+        owner: Option<usize>,
+        end: usize,
+    ) -> Result<(), NatDefinitionParseError> {
         let braced = is_symbol(tokens, start, "{");
         let first = start + usize::from(braced);
         if first >= end {
@@ -72,6 +85,7 @@ impl DoScopes {
             || column(view, tokens, at) >= p.baseline
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn before(
         &mut self,
         view: &SourceView,
@@ -80,6 +94,7 @@ impl DoScopes {
         depth: usize,
         conditionals: &[ConditionalPlan],
         matches: &[MatchPlan],
+        failure: bool,
     ) {
         let else_target = is_symbol(tokens, at, "else")
             .then(|| {
@@ -95,7 +110,7 @@ impl DoScopes {
                     .map(|p| p.start)
             })
             .flatten();
-        let match_target = is_symbol(tokens, at, "|")
+        let match_target = (is_symbol(tokens, at, "|") && !failure)
             .then(|| {
                 matches
                     .iter()
