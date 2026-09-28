@@ -1,5 +1,6 @@
 //! Per-module, checked declaration products for the native Lake `.olean` facet.
 use super::*;
+use std::sync::Arc;
 
 /// One basic (pre-module-system) `.olean`, containing only its own constants.
 #[derive(Debug)]
@@ -15,6 +16,10 @@ pub struct SourceModuleArtifact {
 pub struct SourceModuleBuild {
     pub checked: SourceModuleCheck,
     pub artifacts: Vec<SourceModuleArtifact>,
+    /// Module snapshots reused from this process's checked build session.
+    /// Every returned artifact is still encoded under this call's writer budget.
+    pub reused_modules: usize,
+    pub elaborated_modules: usize,
 }
 
 #[derive(Debug)]
@@ -154,7 +159,7 @@ impl PendingArtifact {
     }
 
     fn encode(
-        self,
+        &self,
         budget: OleanWriteBudget,
     ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
         let encoded = encode_olean_module(
@@ -178,7 +183,7 @@ impl PendingArtifact {
             error,
         })?;
         Ok(SourceModuleArtifact {
-            name: self.name,
+            name: self.name.clone(),
             bytes: encoded.bytes,
             report: encoded.report,
         })
@@ -206,18 +211,7 @@ impl Engine {
         limits: SourceModuleCheckLimits,
         write_budget: OleanWriteBudget,
     ) -> Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
-        if self.environment() != &Environment::new()
-            && self.imported_environment.as_ref() != Some(self.environment())
-        {
-            return Err(SourceModuleBuildError::UnboundBase);
-        }
-        for module in modules {
-            if self.imported_modules().contains(module.name) {
-                return Err(SourceModuleBuildError::Check(
-                    SourceModuleCheckError::DuplicateModule(module.name.clone()),
-                ));
-            }
-        }
+        validate_base(self, modules)?;
         let run = match cache::run_collecting(
             self,
             modules,
@@ -256,5 +250,55 @@ pub(super) fn finish(
     Ok(SourceModuleBuild {
         checked: run.result.checked,
         artifacts,
+        reused_modules: run.result.reused_modules,
+        elaborated_modules: run.result.elaborated_modules,
     })
+}
+
+/// The same authority boundary applies to cold and cached artifact builds.
+pub(super) fn validate_base(
+    base: &Engine,
+    modules: &[SourceModuleInput<'_>],
+) -> Result<(), SourceModuleBuildError> {
+    if base.environment() != &Environment::new()
+        && base.imported_environment.as_ref() != Some(base.environment())
+    {
+        return Err(SourceModuleBuildError::UnboundBase);
+    }
+    for module in modules {
+        if base.imported_modules().contains(module.name) {
+            return Err(SourceModuleBuildError::Check(
+                SourceModuleCheckError::DuplicateModule(module.name.clone()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Encoding never imports persisted cache bytes. Reused, privately captured
+/// declaration products obey fresh aggregate writer limits and cancellation.
+/// The caller publishes its new cache only after this complete batch succeeds.
+pub(super) fn encode_pending(
+    pending: &[Arc<PendingArtifact>],
+    mut remaining: OleanWriteBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Result<Outcome<Vec<SourceModuleArtifact>>, SourceModuleBuildError> {
+    let mut artifacts = Vec::new();
+    for product in pending {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-modules/before-encoding",
+            )));
+        }
+        let artifact = product.encode(remaining)?;
+        remaining.max_bytes -= artifact.report.file_bytes;
+        remaining.max_objects -= artifact.report.runtime_objects;
+        artifacts.push(artifact);
+    }
+    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+        return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+            "source-modules/before-build-publication",
+        )));
+    }
+    Ok(Outcome::Complete(artifacts))
 }

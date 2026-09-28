@@ -27,6 +27,9 @@ struct CachedModule {
     dependencies: Vec<(Name, Arc<()>)>,
     engine: Engine,
     export: Arc<replay::Export>,
+    /// Present only after artifact-mode import/extension checks. Checking and
+    /// compilation use different header semantics and cannot share cache hits.
+    artifact: Option<Arc<artifacts::PendingArtifact>>,
     commands: usize,
     theorems: usize,
     base_root: LogicalRoot,
@@ -107,6 +110,71 @@ impl SourceModuleSession {
         super::super::inspect::module(self, modules, entry, offset, kind, self.limits)
     }
 
+    /// Check a module closure and encode its own checked declarations as real
+    /// `.olean` artifacts. Reuse is process-local, bound to this session's exact
+    /// base, options, source bytes and dependency identities. No disk cache or
+    /// caller-authored artifact can supply an admission result.
+    ///
+    /// Unlike `check`, this applies Lean's implicit Init imports and refuses
+    /// unbound seeds and unsupported extension serialization. A failed check,
+    /// encoding, or cancellation preserves the previous successful cache.
+    pub fn compile(
+        &mut self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        write_budget: OleanWriteBudget,
+    ) -> Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
+        self.compile_with_cancel(modules, entry, write_budget, None)
+    }
+
+    /// Cancellation is checked during graph traversal and between artifact
+    /// encodings, including immediately before cache/artifact publication.
+    pub fn compile_with_cancel(
+        &mut self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        write_budget: OleanWriteBudget,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
+        artifacts::validate_base(&self.base, modules)?;
+        let run = match run_collecting(
+            &self.base,
+            modules,
+            entry,
+            &self.options,
+            self.limits,
+            cancellation,
+            RunOptions {
+                cache: Some(CacheView {
+                    entries: &self.entries,
+                    limits: self.retention,
+                }),
+                collect_artifacts: true,
+                contexts: None,
+            },
+        )
+        .map_err(SourceModuleBuildError::Check)?
+        {
+            Outcome::Complete(run) => run,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let artifacts = match artifacts::encode_pending(&run.artifacts, write_budget, cancellation)?
+        {
+            Outcome::Complete(artifacts) => artifacts,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        self.entries = run.entries;
+        self.source_bytes = run.source_bytes;
+        Ok(Outcome::Complete(SourceModuleBuild {
+            checked: run.result.checked,
+            artifacts,
+            reused_modules: run.result.reused_modules,
+            elaborated_modules: run.result.elaborated_modules,
+        }))
+    }
+
     pub fn retained_modules(&self) -> usize {
         self.entries.len()
     }
@@ -166,7 +234,7 @@ pub(super) struct RunOptions<'a> {
 }
 pub(super) struct Run {
     pub(super) result: SourceModuleSessionCheck,
-    pub(super) artifacts: Vec<artifacts::PendingArtifact>,
+    pub(super) artifacts: Vec<Arc<artifacts::PendingArtifact>>,
     entries: BTreeMap<Name, Arc<CachedModule>>,
     source_bytes: usize,
 }
@@ -288,7 +356,10 @@ pub(super) fn run_collecting(
         let hit = cache
             .as_ref()
             .and_then(|view| view.entries.get(module.name))
-            .filter(|cached| cached.matches(module.source, &identities));
+            .filter(|cached| {
+                cached.artifact.is_some() == collect_artifacts
+                    && cached.matches(module.source, &identities)
+            });
         let keep = cache.as_ref().is_some_and(|view| {
             pending.len() < view.limits.max_modules
                 && retained_bytes
@@ -298,6 +369,9 @@ pub(super) fn run_collecting(
         let mut checked = if let Some(cached) = hit {
             meter.work(cached.work)?;
             meter.bytes(cached.bytes)?;
+            if let Some(artifact) = &cached.artifact {
+                artifacts.push(Arc::clone(artifact));
+            }
             exports.insert(index, Arc::clone(&cached.export));
             stamps.insert(index, Arc::clone(&cached.stamp));
             if keep {
@@ -402,16 +476,20 @@ pub(super) fn run_collecting(
                 declarations,
                 &mut meter,
             )?);
-            if collect_artifacts {
+            let artifact = if collect_artifacts {
                 export.require_artifact_support(module.name)?;
-                artifacts.push(artifacts::PendingArtifact::capture(
+                let artifact = Arc::new(artifacts::PendingArtifact::capture(
                     module.name,
                     header,
                     imported.environment(),
                     checked.engine.environment(),
                     &mut meter,
                 )?);
-            }
+                artifacts.push(Arc::clone(&artifact));
+                Some(artifact)
+            } else {
+                None
+            };
             if cache.is_some() {
                 let stamp = Arc::new(());
                 stamps.insert(index, Arc::clone(&stamp));
@@ -424,6 +502,7 @@ pub(super) fn run_collecting(
                             dependencies: identities,
                             engine: checked.engine.clone(),
                             export: Arc::clone(&export),
+                            artifact,
                             commands: checked.commands,
                             theorems: checked.theorems,
                             base_root: checked.base_logical_root,
