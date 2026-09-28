@@ -59,6 +59,8 @@ dependencies = [
  "fln-core",
  "fln-hash",
  "fln-lake",
+ "fln-olean",
+ "fln-rt",
  "fln-server",
 ]
 

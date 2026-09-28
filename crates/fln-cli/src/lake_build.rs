@@ -66,7 +66,6 @@ struct Library {
 struct Module {
     source: Vec<u8>,
     imports: Vec<Name>,
-    external: BTreeSet<Name>,
 }
 
 fn name(text: &str) -> Result<Name, Failure> {
@@ -298,22 +297,12 @@ fn load_sources(
             .checked_add(imports.len())
             .filter(|n| *n <= MAX_IMPORTS)
             .ok_or_else(|| Failure::new("resource", "source import count exceeds 4096"))?;
-        let mut external = BTreeSet::new();
         for imported in &imports {
             if source_path(imported, libraries)?.is_some() {
                 pending.insert(imported.clone());
-            } else {
-                external.insert(imported.clone());
             }
         }
-        modules.insert(
-            module,
-            Module {
-                source,
-                imports,
-                external,
-            },
-        );
+        modules.insert(module, Module { source, imports });
     }
     Ok(modules)
 }
@@ -327,41 +316,55 @@ fn compile(
     let mut artifact_bytes = 0usize;
     for entry in entries {
         let mut closure = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut external = Vec::new();
         let mut pending = vec![entry.clone()];
         while let Some(name) = pending.pop() {
-            if !closure.insert(name.clone()) {
+            if !seen.insert(name.clone()) {
                 continue;
             }
-            let module = modules
-                .get(&name)
-                .ok_or_else(|| Failure::input("missing local source dependency"))?;
-            pending.extend(
-                module
-                    .imports
-                    .iter()
-                    .filter(|name| modules.contains_key(*name))
-                    .cloned(),
-            );
+            if let Some(module) = modules.get(&name) {
+                closure.insert(name);
+                // Preserve declared order across local dependencies. Sorting
+                // external roots changes equal-priority instance selection.
+                pending.extend(module.imports.iter().rev().cloned());
+            } else {
+                external.push(name);
+            }
         }
-        // The facade verifies each module's transitive external visibility
-        // against this rechecked base, including imports through local modules.
-        let external: BTreeSet<_> = closure
-            .iter()
-            .flat_map(|name| {
-                modules
-                    .get(name)
-                    .expect("loaded dependency")
-                    .external
-                    .iter()
-                    .cloned()
-            })
-            .collect();
-        let base = source_check::load_build_base(&external.into_iter().collect::<Vec<_>>(), root)
-            .map_err(|(class, detail, authority)| Failure {
-            class,
-            detail,
-            authority,
-        })?;
+        // Metadata is one immutable imported world for this build. Validate
+        // order as well as membership: even the same modules in reverse order
+        // can select a different equal-priority dictionary. Context projection
+        // remains unsupported, not an excuse to alter a dependency's meaning.
+        for local in &closure {
+            let mut local_seen = BTreeSet::new();
+            let mut local_pending = vec![local.clone()];
+            let mut local_external = Vec::new();
+            while let Some(name) = local_pending.pop() {
+                if !local_seen.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(module) = modules.get(&name) {
+                    local_pending.extend(module.imports.iter().rev().cloned());
+                } else {
+                    local_external.push(name);
+                }
+            }
+            if local_external != external {
+                return Err(Failure::unsupported(format!(
+                    "module {} requires a distinct .olean metadata context; local modules must share the same ordered external roots",
+                    local.to_display_string()
+                )));
+            }
+        }
+        // The facade still validates cycles and each module's external visibility.
+        let base = source_check::load_build_base(&external, root).map_err(
+            |(class, detail, authority)| Failure {
+                class,
+                detail,
+                authority,
+            },
+        )?;
         let inputs: Vec<_> = closure
             .iter()
             .map(|name| fln::SourceModuleInput {

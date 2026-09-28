@@ -9,6 +9,7 @@
 //! from an `.olean` enters the environment unchecked.
 use super::*;
 pub(super) mod editor;
+mod metadata;
 use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{LeafView, Name, Outcome, SourceFileCheck, SourceModuleInput};
 use std::collections::BTreeMap;
@@ -29,6 +30,8 @@ pub(super) struct OleanImport {
 pub(super) struct OleanBase {
     pub(super) modules: usize,
     pub(super) declarations: usize,
+    declaration_root: fln::LogicalRoot,
+    metadata: Vec<fln::source_check::modules::imported::SourceMetadataReport>,
 }
 
 pub(super) struct Failure {
@@ -83,6 +86,7 @@ pub(super) struct Loaded {
     inputs: Inputs,
     pub(super) total_bytes: usize,
     oleans: Vec<OleanImport>,
+    olean_roots: Vec<Name>,
 }
 impl Loaded {
     /// The base engine source is checked against: the council-admitted
@@ -93,6 +97,36 @@ impl Loaded {
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
         if self.oleans.is_empty() {
             return seed().map(|engine| (engine, None));
+        }
+        // An immutable import base cannot represent different metadata worlds
+        // per local module yet. Refuse before council/metadata activation rather
+        // than let a sibling module silently influence instance selection.
+        if let Inputs::Modules { names, sources } = &self.inputs {
+            let mut graph = BTreeMap::new();
+            for (name, source) in names.iter().zip(sources) {
+                let header = parse_source_header(source).map_err(|error| {
+                    Failure::new(
+                        "input",
+                        &format!("{}: {error}", name.to_display_string()),
+                        false,
+                        1,
+                    )
+                })?;
+                graph.insert(name.clone(), header.imports);
+            }
+            for name in names {
+                if metadata::ordered_roots(&graph, std::slice::from_ref(name)) != self.olean_roots {
+                    return Err(Failure::new(
+                        "unsupported",
+                        &format!(
+                            "module {} requires a distinct .olean metadata context; local modules must share the same ordered external roots",
+                            name.to_display_string()
+                        ),
+                        false,
+                        3,
+                    ));
+                }
+            }
         }
         let inputs: Vec<fln::OleanModuleInput<'_>> = self
             .oleans
@@ -112,16 +146,20 @@ impl Loaded {
             fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
         );
         let checked = fln::Engine::from_environment(fln::Environment::new())
-            .check_olean_modules(&inputs, &fln::KVMap::new(), limits)
-            .map_err(|error| Failure {
-                class: "input",
-                detail: format!("importing .olean modules: {error}"),
-                authority: false,
-                exit: 1,
-            })?;
+            .import_olean_modules_for_source(
+                &inputs,
+                &self.olean_roots,
+                &fln::KVMap::new(),
+                fln::source_check::modules::imported::SourceOleanImportLimits {
+                    max_roots: MAX_IMPORTS,
+                    ..fln::source_check::modules::imported::SourceOleanImportLimits::new(limits)
+                },
+            )
+            .map_err(metadata::failure)?;
         match checked {
             Outcome::Complete(checked) => {
                 let declarations = checked
+                    .checked
                     .modules
                     .iter()
                     .map(|module| module.declarations.len())
@@ -129,8 +167,10 @@ impl Loaded {
                 Ok((
                     checked.engine,
                     Some(OleanBase {
-                        modules: checked.modules.len(),
+                        modules: checked.checked.modules.len(),
                         declarations,
+                        declaration_root: checked.checked.result_logical_root,
+                        metadata: checked.modules,
                     }),
                 ))
             }
@@ -214,6 +254,7 @@ pub(super) fn load(
             inputs: Inputs::Files(sources),
             total_bytes,
             oleans: Vec::new(),
+            olean_roots: Vec::new(),
         });
     }
     if paths.len() != 1 {
@@ -249,6 +290,7 @@ pub(super) fn load(
     let mut cursor = 0usize;
     let mut import_rows = 0usize;
     let mut olean_roots: Vec<Name> = Vec::new();
+    let mut source_imports = BTreeMap::new();
     while cursor < sources.len() {
         let header = parse_source_header(&sources[cursor]).map_err(|error| {
             Failure::input(format!(
@@ -260,6 +302,7 @@ pub(super) fn load(
             .checked_add(header.imports.len())
             .filter(|n| *n <= MAX_IMPORTS)
             .ok_or_else(|| Failure::resource("source import count exceeds 4096"))?;
+        source_imports.insert(names[cursor].clone(), header.imports.clone());
         for name in header.imports {
             if by_name.contains_key(&name) || olean_roots.contains(&name) {
                 continue;
@@ -308,6 +351,9 @@ pub(super) fn load(
         }
         cursor += 1;
     }
+    // Discovery order is breadth-first filesystem work, not Lean import order.
+    // Resolve external roots by walking the source headers left-to-right first.
+    let olean_roots = metadata::ordered_roots(&source_imports, &names[..1]);
     let oleans = if olean_roots.is_empty() {
         Vec::new()
     } else {
@@ -317,6 +363,7 @@ pub(super) fn load(
         inputs: Inputs::Modules { names, sources },
         total_bytes,
         oleans,
+        olean_roots,
     })
 }
 
@@ -468,6 +515,7 @@ pub(super) fn load_build_base(roots: &[Name], source_root: &Path) -> Result<fln:
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
         oleans: load_olean_closure(roots, source_root)?,
+        olean_roots: roots.to_vec(),
     };
     loaded
         .base_engine(|| Ok(fln::Engine::from_environment(fln::Environment::new())))

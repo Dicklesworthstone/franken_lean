@@ -133,9 +133,7 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source check encountered an internal fault", false, json, 4),
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            let olean_json = olean_base.as_ref().map_or(String::new(), |base| {
-                format!(",\"oleanImports\":{{\"trust\":\"recheck\",\"modules\":{},\"declarations\":{}}}", base.modules, base.declarations)
-            });
+            let olean_json = olean_base.as_ref().map_or_else(String::new, |base| base.json());
             let stdout = if json {
                 format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,

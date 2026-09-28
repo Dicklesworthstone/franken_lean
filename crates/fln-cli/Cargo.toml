@@ -15,3 +15,6 @@ fln-hash = { path = "../fln-hash" }
 fln-lake = { path = "../fln-lake" }
 fln-server = { path = "../fln-server" }
 
+[dev-dependencies]
+fln-olean = { path = "../fln-olean" }
+fln-rt = { path = "../fln-rt" }

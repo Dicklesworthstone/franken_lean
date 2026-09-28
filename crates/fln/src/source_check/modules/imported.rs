@@ -87,6 +87,28 @@ impl std::fmt::Display for SourceOleanImportError {
     }
 }
 impl std::error::Error for SourceOleanImportError {}
+impl SourceOleanImportError {
+    /// Metadata resource stops are nonanswers, not evidence of malformed input.
+    /// `Check` retains its own declaration-checking disposition separately.
+    pub fn metadata_resource_exhausted(&self) -> bool {
+        match self {
+            Self::Limit(_)
+            | Self::Registry {
+                error: InstanceRegistryError::Limit,
+                ..
+            }
+            | Self::Capture {
+                error:
+                    OleanRegionError::BudgetExhausted { .. }
+                    | OleanRegionError::PayloadBudgetExhausted { .. },
+                ..
+            } => true,
+            Self::Decode(error) => error.is_resource(),
+            _ => false,
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, SourceOleanImportError>;
 
 impl Engine {

@@ -55,11 +55,11 @@ fn a_real_prelude_import_is_council_admitted_and_journaled() {
         "{stdout}"
     );
     assert!(stdout.contains("\"theorems\":2"), "{stdout}");
-    // The real Prelude, admitted by the council: its logical root is the one
-    // `fln check-olean` reports for the pinned Init/Prelude.olean.
+    // Keep the exact prior declaration-only council root independently of
+    // the source base root, which now also includes native metadata replay.
     assert!(
         stdout.contains(
-            "\"baseLogicalRoot\":\"a6ddda2c686b7badff7fb82388f59c1ccf821019684d8dbd19abe5066f874203\""
+            "\"declarationLogicalRoot\":\"a6ddda2c686b7badff7fb82388f59c1ccf821019684d8dbd19abe5066f874203\""
         ),
         "{stdout}"
     );
