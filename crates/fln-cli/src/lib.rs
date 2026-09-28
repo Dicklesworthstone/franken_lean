@@ -3768,7 +3768,8 @@ fn admission_error_disposition(error: &fln::EngineAdmissionError) -> (&'static s
         // Disagrees, NoAnswer, Exhausted, or incomparable bounds. `run` already
         // renders the same variant as inconclusive; folding a checker non-answer
         // into checker-disagreement / exit 1 is an FL-INV-07 promotion.
-        fln::EngineAdmissionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+        fln::EngineAdmissionError::CouncilHalted { .. }
+        | fln::EngineAdmissionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
         fln::EngineAdmissionError::CheckerBridge { .. }
         | fln::EngineAdmissionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         fln::EngineAdmissionError::EmptyBatch
@@ -10702,7 +10703,8 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
                 ("execution", true, 1)
             }
         }
-        fln::EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+        fln::EngineExecutionError::CouncilHalted { .. }
+        | fln::EngineExecutionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
         fln::EngineExecutionError::CheckerBridge { .. }
         | fln::EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         _ => ("execution", true, 1),

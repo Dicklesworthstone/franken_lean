@@ -387,7 +387,7 @@ fn an_independent_checker_nonanswer_still_vetoes_a_kernel_accepted_mutual_block(
         }
         let result = predecessor.admit_declaration(candidate(&f), &options, limits);
         match result {
-            Err(fln::EngineAdmissionError::CouncilHalted { .. }) => {}
+            Err(fln::EngineAdmissionError::CouncilNoAnswer { .. }) => {}
             Err(error) => panic!("wrong nonanswer at staging={staging_stop}: {error:?}"),
             Ok(_) => panic!("checker budget was not exhausted at staging={staging_stop}"),
         }

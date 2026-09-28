@@ -100,7 +100,8 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
     match error {
         EngineExecutionError::BatchCommand { error, .. } => classify(error),
         EngineExecutionError::KernelRejected { .. } => ("kernel-rejection", true, 1),
-        EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+        EngineExecutionError::CouncilHalted { .. }
+        | EngineExecutionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
         EngineExecutionError::CheckerBridge { .. }
         | EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),

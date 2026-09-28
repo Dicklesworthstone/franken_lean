@@ -197,3 +197,66 @@ fn a_failing_module_blocks_only_its_dependents() {
         .join()
         .expect("the checking thread completes");
 }
+
+/// FL-INV-07 (bead `fln-s97y`): a module whose planning budget runs out was not
+/// answered, so its row is `Inconclusive`, never `Failed`, and its dependent is
+/// still blocked. The planted limit is the only difference from the control
+/// above, where the same Prelude is accepted.
+#[test]
+fn a_planted_planning_limit_is_inconclusive_and_still_blocks_dependents() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let modules = ["Init.Prelude", "Init.Coe"];
+            let names: Vec<Name> = modules.iter().map(|module| name(module)).collect();
+            let parts: Vec<[Vec<u8>; 3]> =
+                modules.iter().map(|module| read_parts(&lib, module)).collect();
+            let mut limits =
+                OleanCheckLimits::new(256 * 1024 * 1024, Budget::for_stack_bytes(STACK));
+            limits.max_dependency_presentations = 0;
+            let inputs: Vec<OleanModuleInput<'_>> = names
+                .iter()
+                .zip(&parts)
+                .map(|(name, [exported, server, private])| OleanModuleInput {
+                    name,
+                    artifact: exported,
+                    server_artifact: Some(server),
+                    private_artifact: Some(private),
+                })
+                .collect();
+            let frontier = Engine::from_environment(Environment::new())
+                .check_olean_frontier_observed(&inputs, &KVMap::new(), limits, &mut |_| {})
+                .expect("the set itself is well formed");
+            let verdict = |module: &str| {
+                &frontier
+                    .rows
+                    .iter()
+                    .find(|row| row.name == name(module))
+                    .expect("a row per module")
+                    .verdict
+            };
+            assert!(
+                matches!(
+                    verdict("Init.Prelude"),
+                    OleanModuleVerdict::Inconclusive(fln::Inconclusive {
+                        cause: fln_core::outcome::InconclusiveCause::ResourceExhausted { usage },
+                        ..
+                    }) if usage.allowed == 0 && usage.is_genuine_exhaustion()
+                ),
+                "a planning budget stop is a non-answer, got {:?}",
+                verdict("Init.Prelude")
+            );
+            assert!(
+                matches!(verdict("Init.Coe"), OleanModuleVerdict::Blocked { by } if *by == name("Init.Prelude")),
+                "a dependent of an unanswered module is blocked, never checked"
+            );
+            assert!(frontier.engine.imported_modules().is_empty());
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}

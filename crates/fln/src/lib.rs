@@ -930,6 +930,51 @@ pub struct CheckedOleanModule {
     pub declarations: Vec<OleanCheckedDeclaration>,
 }
 
+/// The frontier's verdict for a module whose check ended in an error.
+///
+/// FL-INV-07: a council whose objecting seats were all silent or ran out
+/// ([`EngineAdmissionError::CouncilNoAnswer`]) and a planning budget that ran
+/// out are non-answers, so the module is `Inconclusive`, never refused. Our own
+/// accounting failing is an `InternalFault`. A kernel rejection, a council
+/// disagreement and a malformed artifact stay `Failed`, and so, for now, do a
+/// host allocation failure and a decode budget stop: neither carries the
+/// allowance a [`ResourceUsage`](fln_core::outcome::ResourceUsage) must report.
+fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
+    fn admission_leaf(error: &EngineAdmissionError) -> &EngineAdmissionError {
+        match error {
+            EngineAdmissionError::BatchDeclaration { error, .. } => admission_leaf(error),
+            other => other,
+        }
+    }
+    let fault = |detail: String| {
+        OleanModuleVerdict::InternalFault(InternalFault::new("olean frontier", detail))
+    };
+    match &error {
+        OleanCheckError::Admission(admission) => match admission_leaf(admission) {
+            EngineAdmissionError::CouncilNoAnswer { summary } => OleanModuleVerdict::Inconclusive(
+                Inconclusive::dependency_unavailable(format!("council had no answer: {summary}")),
+            ),
+            leaf @ (EngineAdmissionError::CheckerBridge { .. }
+            | EngineAdmissionError::UnexpectedPublication { .. }) => fault(leaf.to_string()),
+            _ => OleanModuleVerdict::Failed(error),
+        },
+        OleanCheckError::DependencyPresentationLimit { observed, limit }
+        | OleanCheckError::DeclarationLimit { observed, limit } => {
+            OleanModuleVerdict::Inconclusive(Inconclusive::resource(
+                fln_core::outcome::ResourceUsage {
+                    reason: fln_core::diag::ResourceReason::StructuralBudget {
+                        unit: fln_core::diag::StructuralUnit::ProducedNodes,
+                    },
+                    allowed: u64::try_from(*limit).unwrap_or(u64::MAX),
+                    observed: u64::try_from(*observed).unwrap_or(u64::MAX),
+                },
+            ))
+        }
+        OleanCheckError::InternalInvariant { .. } => fault(error.to_string()),
+        _ => OleanModuleVerdict::Failed(error),
+    }
+}
+
 /// One module's outcome in an [`Engine::check_olean_frontier`] run.
 #[derive(Debug)]
 pub enum OleanModuleVerdict {
@@ -3270,10 +3315,10 @@ impl Engine {
                             }
                         }
                         Some(Err(_)) => match decoded[index].take() {
-                            Some(Err(error)) => OleanModuleVerdict::Failed(error),
+                            Some(Err(error)) => frontier_error_verdict(error),
                             _ => continue,
                         },
-                        None => OleanModuleVerdict::Failed(OleanCheckError::InternalInvariant {
+                        None => frontier_error_verdict(OleanCheckError::InternalInvariant {
                             detail: "frontier module was visited twice",
                         }),
                     };
@@ -3426,7 +3471,7 @@ impl Engine {
         };
         let engine = match self.frontier_closure_engine(&job) {
             Ok(engine) => engine,
-            Err(error) => return finish(OleanModuleVerdict::Failed(error), None),
+            Err(error) => return finish(frontier_error_verdict(error), None),
         };
         let start = engine.environment.clone();
         match engine.check_decoded_olean(job.artifact, options, limits) {
@@ -3461,7 +3506,7 @@ impl Engine {
             Ok(Outcome::InternalFault(fault)) => {
                 finish(OleanModuleVerdict::InternalFault(fault), None)
             }
-            Err(error) => finish(OleanModuleVerdict::Failed(error), None),
+            Err(error) => finish(frontier_error_verdict(error), None),
         }
     }
 
@@ -3905,6 +3950,13 @@ impl Engine {
             CouncilOutcome::Agreed(checked) => checked,
             CouncilOutcome::KernelRejected { class, message, .. } => {
                 return Err(EngineAdmissionError::KernelRejected { class, message });
+            }
+            // A halt with no disagreement is a non-answer about the declaration
+            // (FL-INV-07); only a disagreement is evidence against it.
+            CouncilOutcome::Halted(halt) if halt.is_purely_resource() => {
+                return Err(EngineAdmissionError::CouncilNoAnswer {
+                    summary: halt.summary(),
+                });
             }
             CouncilOutcome::Halted(halt) => {
                 return Err(EngineAdmissionError::CouncilHalted {
@@ -8072,7 +8124,13 @@ pub enum EngineAdmissionError {
         class: RejectClass,
         message: String,
     },
+    /// A council seat disagreed with the kernel's acceptance.
     CouncilHalted {
+        summary: String,
+    },
+    /// Every objecting seat was silent or ran out: nothing was learned about the
+    /// declaration (FL-INV-07), and it was not published.
+    CouncilNoAnswer {
         summary: String,
     },
     CheckerBridge {
@@ -8111,6 +8169,9 @@ impl fmt::Display for EngineAdmissionError {
                 )
             }
             Self::CouncilHalted { summary } => write!(formatter, "council halted: {summary}"),
+            Self::CouncilNoAnswer { summary } => {
+                write!(formatter, "council had no answer: {summary}")
+            }
             Self::CheckerBridge { detail } => {
                 write!(formatter, "independent checker bridge failed: {detail}")
             }
@@ -8216,7 +8277,13 @@ pub enum EngineExecutionError {
         class: RejectClass,
         message: String,
     },
+    /// A council seat disagreed with the kernel's acceptance.
     CouncilHalted {
+        summary: String,
+    },
+    /// Every objecting seat was silent or ran out: nothing was learned about the
+    /// declaration (FL-INV-07), and it was not published.
+    CouncilNoAnswer {
         summary: String,
     },
     CheckerBridge {
@@ -8377,6 +8444,9 @@ impl fmt::Display for EngineExecutionError {
                 )
             }
             Self::CouncilHalted { summary } => write!(formatter, "council halted: {summary}"),
+            Self::CouncilNoAnswer { summary } => {
+                write!(formatter, "council had no answer: {summary}")
+            }
             Self::CheckerBridge { detail } => {
                 write!(formatter, "independent checker bridge failed: {detail}")
             }
@@ -8432,6 +8502,7 @@ impl From<EngineAdmissionError> for EngineExecutionError {
                 Self::KernelRejected { class, message }
             }
             EngineAdmissionError::CouncilHalted { summary } => Self::CouncilHalted { summary },
+            EngineAdmissionError::CouncilNoAnswer { summary } => Self::CouncilNoAnswer { summary },
             EngineAdmissionError::CheckerBridge { detail } => Self::CheckerBridge { detail },
             EngineAdmissionError::DuplicateName { name } => Self::DuplicateName { name },
             EngineAdmissionError::UnexpectedPublication { detail } => {
@@ -9812,7 +9883,7 @@ mod tests {
                 &KVMap::new(),
                 candidate_only,
             ),
-            Err(EngineAdmissionError::CouncilHalted { .. })
+            Err(EngineAdmissionError::CouncilNoAnswer { .. })
         ));
         assert!(
             !uncached
@@ -9939,8 +10010,8 @@ mod tests {
         limits.checker.admission.conversion.quick.max_comparisons = 0;
         let result = engine.admit_declaration(declaration, &KVMap::new(), limits);
         assert!(
-            matches!(result, Err(EngineAdmissionError::CouncilHalted { .. })),
-            "checker exhaustion must halt the council, got {result:?}"
+            matches!(result, Err(EngineAdmissionError::CouncilNoAnswer { .. })),
+            "checker exhaustion is a council non-answer, not a halt, got {result:?}"
         );
         assert!(engine.environment().is_empty());
     }
@@ -9988,7 +10059,7 @@ mod tests {
         limits.checker.admission.conversion.quick.max_comparisons = 0;
         assert!(matches!(
             engine.admit_declaration(declaration, &KVMap::new(), limits),
-            Err(EngineAdmissionError::CouncilHalted { .. })
+            Err(EngineAdmissionError::CouncilNoAnswer { .. })
         ));
         assert!(
             !engine
@@ -10622,7 +10693,7 @@ mod tests {
             .expect_err("the facade checker non-answer must veto the Verdict successor");
         assert!(matches!(
             error,
-            EngineBvDecideError::Admission(EngineAdmissionError::CouncilHalted {
+            EngineBvDecideError::Admission(EngineAdmissionError::CouncilNoAnswer {
                 ref summary
             }) if summary.contains("fln-checker") && summary.contains("no answer")
         ));
@@ -10696,7 +10767,7 @@ mod tests {
             .expect_err("a checker non-answer must consume the publication capability");
         assert!(matches!(
             error,
-            EngineExecutionError::CouncilHalted { ref summary }
+            EngineExecutionError::CouncilNoAnswer { ref summary }
                 if summary.contains("fln-checker") && summary.contains("no answer")
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10790,7 +10861,7 @@ mod tests {
             .expect_err("the same budget cannot reconstruct a two-constant base");
         assert!(matches!(
             error,
-            EngineExecutionError::CouncilHalted { ref summary }
+            EngineExecutionError::CouncilNoAnswer { ref summary }
                 if summary.contains("fln-checker") && summary.contains("no answer")
         ));
         assert_eq!(uncached.logical_root(&options), before);
@@ -10814,7 +10885,7 @@ mod tests {
             .expect_err("a checker non-answer must veto even the Nat seed successor");
         assert!(matches!(
             error,
-            EngineAdmissionError::CouncilHalted { ref summary }
+            EngineAdmissionError::CouncilNoAnswer { ref summary }
                 if summary.contains("fln-checker") && summary.contains("no answer")
         ));
 
@@ -10934,7 +11005,7 @@ mod tests {
             .expect_err("the same budget cannot reconstruct the multi-row base");
         assert!(matches!(
             error,
-            EngineAdmissionError::CouncilHalted { ref summary }
+            EngineAdmissionError::CouncilNoAnswer { ref summary }
                 if summary.contains("fln-checker") && summary.contains("no answer")
         ));
         assert_eq!(uncached.logical_root(&options), uncached_root);
@@ -12292,7 +12363,7 @@ mod tests {
             .expect_err("an independent-checker non-answer vetoes a source check");
         assert!(matches!(
             stopped,
-            EngineExecutionError::CouncilHalted { ref summary }
+            EngineExecutionError::CouncilNoAnswer { ref summary }
                 if summary.contains("fln-checker") && summary.contains("no answer")
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -12723,7 +12794,7 @@ mod tests {
                 .check_terminal_source_modules(&empty_graph, &main, &options, constrained)
                 .expect_err("an independent-checker non-answer vetoes an imported query"),
             EngineExecutionError::BatchCommand { index: 0, error, .. }
-                if matches!(*error, EngineExecutionError::CouncilHalted { .. })
+                if matches!(*error, EngineExecutionError::CouncilNoAnswer { .. })
         ));
         assert_eq!(engine.logical_root(&options), before);
         assert!(matches!(
@@ -15087,5 +15158,92 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["lt_pos"]))
         );
+    }
+
+    /// FL-INV-07: a frontier row whose council had no answer, or which ran past a
+    /// structural limit, is a non-answer. Only a disagreement or a kernel
+    /// rejection is a failure.
+    #[test]
+    fn frontier_rows_type_non_answers_as_inconclusive_and_refusals_as_failed() {
+        use fln_core::outcome::{Inconclusive, InconclusiveCause};
+
+        let no_answer = super::frontier_error_verdict(OleanCheckError::Admission(
+            EngineAdmissionError::BatchDeclaration {
+                index: 3,
+                error: Box::new(EngineAdmissionError::CouncilNoAnswer {
+                    summary: "checker: budget exhausted".to_owned(),
+                }),
+            },
+        ));
+        assert!(
+            matches!(
+                &no_answer,
+                super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::DependencyUnavailable { what },
+                    ..
+                }) if what.text().contains("checker: budget exhausted")
+            ),
+            "a nested council non-answer must be inconclusive, got {no_answer:?}"
+        );
+
+        for error in [
+            OleanCheckError::DependencyPresentationLimit {
+                observed: 101,
+                limit: 100,
+            },
+            OleanCheckError::DeclarationLimit {
+                observed: 7,
+                limit: 6,
+            },
+        ] {
+            let verdict = super::frontier_error_verdict(error);
+            assert!(
+                matches!(
+                    &verdict,
+                    super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                        cause: InconclusiveCause::ResourceExhausted { usage },
+                        ..
+                    }) if usage.is_genuine_exhaustion()
+                ),
+                "a structural limit must be a genuine exhaustion, got {verdict:?}"
+            );
+        }
+
+        for error in [
+            OleanCheckError::Admission(EngineAdmissionError::CouncilHalted {
+                summary: "checker disagreed".to_owned(),
+            }),
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                index: 0,
+                error: Box::new(EngineAdmissionError::KernelRejected {
+                    class: RejectClass::LooseBVar,
+                    message: "loose bound variable".to_owned(),
+                }),
+            }),
+        ] {
+            let verdict = super::frontier_error_verdict(error);
+            assert!(
+                matches!(verdict, super::OleanModuleVerdict::Failed(_)),
+                "a disagreement or rejection must stay a failure, got {verdict:?}"
+            );
+        }
+
+        for error in [
+            OleanCheckError::InternalInvariant {
+                detail: "frontier module was visited twice",
+            },
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                index: 1,
+                error: Box::new(EngineAdmissionError::CheckerBridge {
+                    detail: "the checker council agreed without an admission record".to_owned(),
+                }),
+            }),
+        ] {
+            let verdict = super::frontier_error_verdict(error);
+            assert!(
+                matches!(verdict, super::OleanModuleVerdict::InternalFault(_)),
+                "our own accounting failing is an internal fault, got {verdict:?}"
+            );
+        }
     }
 }
