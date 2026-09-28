@@ -830,6 +830,8 @@ impl Context {
                             || kind == &parser_kind(&["Term", "doIfLet"])
                         {
                             index == 1
+                        } else if kind == &parser_kind(&["Term", "doPatDecl"]) {
+                            pattern || index == 0
                         } else {
                             pattern
                         };

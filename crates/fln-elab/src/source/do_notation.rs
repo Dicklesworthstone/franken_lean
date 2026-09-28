@@ -9,6 +9,7 @@ mod conditional;
 mod control;
 mod for_loop;
 mod if_let;
+mod pattern_binding;
 mod returns;
 pub(super) use returns::join_parts;
 mod unless;
@@ -381,7 +382,7 @@ impl Context {
             ));
         }
         let mut parts = node(element, "doLetArrow", 4)?;
-        let mut declaration = node(parts.pop().expect("bind declaration"), "doIdDecl", 4)?;
+        let declaration = parts.pop().expect("bind declaration");
         expect_atom(&parts[0], "let", "bind keyword")?;
         expect_empty_null(&parts[1], "immutable do bind")?;
         let config = expect_node(
@@ -391,6 +392,10 @@ impl Context {
             "bind config",
         )?;
         expect_empty_null(&config[0], "plain bind config")?;
+        if declaration.kind() == Some(&parser_kind(&["Term", "doPatDecl"])) {
+            return self.expand_do_pattern_binding(declaration, body);
+        }
+        let mut declaration = node(declaration, "doIdDecl", 4)?;
         let mut value = node(declaration.pop().expect("bind action"), "doExpr", 1)?;
         let arrow = declaration.pop().expect("bind arrow");
         if !matches!(&arrow, Syntax::Atom {val,..} if val == "←" || val == "<-") {

@@ -18,6 +18,7 @@ pub(super) struct Prefix {
     statement: Statement,
     annotation: Option<Syntax>,
     collection: Option<Syntax>,
+    pattern: Option<Syntax>,
     phase: Phase,
 }
 #[derive(Clone, Copy)]
@@ -52,6 +53,7 @@ enum Statement {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    Pattern,
     Annotation,
     Collection,
     Value,
@@ -116,6 +118,7 @@ impl Prefix {
             statement: Statement::Action,
             annotation: None,
             collection: None,
+            pattern: None,
             phase: Phase::Value,
         };
         p.begin(view, tokens, cursor, end)?;
@@ -145,31 +148,38 @@ impl Prefix {
         }
         self.annotation = None;
         self.collection = None;
+        self.pattern = None;
         self.phase = Phase::Value;
         let at = *cursor;
         if word(tokens, at, "let") {
             let name = at + 1;
-            if name >= end
-                || !matches!(tokens[name].kind, TokenKind::Ident(_))
-                || word(tokens, name, "mut")
-                || word(tokens, name, "rec")
-            {
+            if name >= end || word(tokens, name, "mut") || word(tokens, name, "rec") {
                 return Err(refuse(view, tokens, name));
             }
-            let marker = at + 2;
-            if marker >= end {
-                return Err(refuse(view, tokens, marker));
+            let marker = name + 1;
+            let named = matches!(tokens[name].kind, TokenKind::Ident(_))
+                && (word(tokens, marker, ":")
+                    || word(tokens, marker, ":=")
+                    || word(tokens, marker, "←")
+                    || word(tokens, marker, "<-"));
+            if !named {
+                // Parse the complete pattern on the ordinary heap term frame.
+                // Parentheses keep inner delimiters out of this header phase.
+                self.statement = Statement::Binding {
+                    keyword: at,
+                    name,
+                    colon: None,
+                    assignment: None,
+                };
+                self.phase = Phase::Pattern;
+                *cursor = name;
+                return Ok(());
             }
             let (colon, assignment) = if word(tokens, marker, ":") {
                 self.phase = Phase::Annotation;
                 (Some(marker), None)
-            } else if word(tokens, marker, ":=")
-                || word(tokens, marker, "←")
-                || word(tokens, marker, "<-")
-            {
-                (None, Some(marker))
             } else {
-                return Err(refuse(view, tokens, marker));
+                (None, Some(marker))
             };
             self.statement = Statement::Binding {
                 keyword: at,
@@ -256,6 +266,9 @@ impl Prefix {
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self.phase {
+            Phase::Pattern => {
+                word(tokens, at, ":") || word(tokens, at, "←") || word(tokens, at, "<-")
+            }
             Phase::Annotation => {
                 word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-")
             }
@@ -452,15 +465,29 @@ impl Prefix {
                 ],
             )
         } else {
-            let declaration = Syntax::node(
-                parser_kind(&["Term", "doIdDecl"]),
-                vec![
-                    leaves.leaf(name)?,
-                    annotation,
-                    leaves.leaf(assignment)?,
-                    Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
-                ],
-            );
+            let action = Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]);
+            let declaration = if let Some(pattern) = self.pattern.take() {
+                Syntax::node(
+                    parser_kind(&["Term", "doPatDecl"]),
+                    vec![
+                        pattern,
+                        annotation,
+                        leaves.leaf(assignment)?,
+                        action,
+                        null_node(vec![]),
+                    ],
+                )
+            } else {
+                Syntax::node(
+                    parser_kind(&["Term", "doIdDecl"]),
+                    vec![
+                        leaves.leaf(name)?,
+                        annotation,
+                        leaves.leaf(assignment)?,
+                        action,
+                    ],
+                )
+            };
             Syntax::node(
                 parser_kind(&["Term", "doLetArrow"]),
                 vec![
@@ -481,6 +508,28 @@ impl Prefix {
         expression: Syntax,
         end: usize,
     ) -> Result<(Self, usize), NatDefinitionParseError> {
+        if self.phase == Phase::Pattern {
+            if at + 1 >= end
+                || !(word(tokens, at, ":") || word(tokens, at, "←") || word(tokens, at, "<-"))
+            {
+                return Err(refuse(view, tokens, at));
+            }
+            let Statement::Binding {
+                colon, assignment, ..
+            } = &mut self.statement
+            else {
+                return Err(refuse(view, tokens, at));
+            };
+            self.pattern = Some(expression);
+            if word(tokens, at, ":") {
+                *colon = Some(at);
+                self.phase = Phase::Annotation;
+            } else {
+                *assignment = Some(at);
+                self.phase = Phase::Value;
+            }
+            return Ok((self, at + 1));
+        }
         if self.phase == Phase::Collection {
             if !word(tokens, at, "do") || at + 1 >= end {
                 return Err(refuse(view, tokens, at));
@@ -502,6 +551,12 @@ impl Prefix {
             return Ok((self, at));
         }
         if self.phase == Phase::Annotation {
+            if at + 1 >= end
+                || !(word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-"))
+                || (self.pattern.is_some() && word(tokens, at, ":="))
+            {
+                return Err(refuse(view, tokens, at));
+            }
             self.annotation = Some(expression);
             let Statement::Binding { assignment, .. } = &mut self.statement else {
                 unreachable!("binding annotation")
@@ -624,7 +679,10 @@ pub(super) fn layout(
         }
         match frame.prefix.as_ref()? {
             term_locals::Prefix::Do(p)
-                if !matches!(p.phase, Phase::Annotation | Phase::Collection) =>
+                if !matches!(
+                    p.phase,
+                    Phase::Pattern | Phase::Annotation | Phase::Collection
+                ) =>
             {
                 if p.braces.is_some() && word(tokens, at, "}") {
                     return Some(false);
