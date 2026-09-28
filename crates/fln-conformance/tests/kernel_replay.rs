@@ -484,14 +484,19 @@ fn reduction_gap_family(name: &Name) -> &'static str {
 }
 
 /// The kernel `Declaration` for a singleton-unit constant. Definitions of
-/// EVERY safety level check (bead franken_lean-ap6: unsafe definitions take
-/// the pin's two-phase path, partial definitions the safe path). Inductive and
-/// quotient members are assembled into their block envelopes by
-/// `prepare_replay_from`; every remaining singleton kind has a kernel envelope.
+/// EVERY safety level check (bead franken_lean-ap6): an unsafe definition
+/// takes the pin's two-phase `add_definition` path, and a partial one arrives
+/// as the one-member `mutualDefnDecl` Lean adds it as (fln-tio5) — the pin
+/// refuses a self-recursive partial `defnDecl`. Inductive and quotient members
+/// are assembled into their block envelopes by `prepare_replay_from`; every
+/// remaining singleton kind has a kernel envelope.
 fn as_declaration(info: &ConstantInfo) -> Option<Declaration> {
     match info {
         ConstantInfo::Axiom(v) => Some(Declaration::Axiom(v.clone())),
         ConstantInfo::Thm(v) => Some(Declaration::Thm(v.clone())),
+        ConstantInfo::Defn(v) if v.safety == DefinitionSafety::Partial => {
+            Some(Declaration::Mutual(vec![v.clone()]))
+        }
         ConstantInfo::Defn(v) => Some(Declaration::Defn(v.clone())),
         ConstantInfo::Opaque(v) => Some(Declaration::Opaque(v.clone())),
         _ => None,

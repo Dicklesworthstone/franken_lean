@@ -1621,7 +1621,14 @@ fn build_olean_declaration_units(
             });
             continue;
         };
-        if definition.all.len() <= 1 || definition.safety == DefinitionSafety::Safe {
+        // Lean adds every partial definition as a `mutualDefnDecl`, a singleton
+        // included, and the pin's `add_definition` would refuse a partial one that
+        // recurses (fln-tio5). So a partial definition is presented as the mutual
+        // unit it was admitted as; a singleton unsafe one keeps `add_definition`'s
+        // unsafe branch, which accepts the same recursion.
+        let singleton_definition = definition.all.is_empty()
+            || (definition.all.len() == 1 && definition.safety != DefinitionSafety::Partial);
+        if singleton_definition || definition.safety == DefinitionSafety::Safe {
             let declaration = checked_olean_declaration(info)?;
             let unit = units.len();
             constant_units[index] = unit;

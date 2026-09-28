@@ -6210,10 +6210,12 @@ fn kr977_mutual_definition_shape_is_nonempty_uniform_and_nonsafe() {
 
 #[test]
 fn kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated() {
-    // Pin add_definition/add_mutual semantics: a PARTIAL definition may
-    // reference itself (header → add → body in the scratch env); a SAFE
-    // definition may reference neither partial nor unsafe declarations
-    // (KR-976/KR-975), while an UNSAFE definition may reference unsafe ones.
+    // Pin add_definition/add_mutual semantics, measured against the pinned
+    // kernel (fln-tio5): a PARTIAL definition may reference itself or another
+    // partial one only as a mutual block (`add_mutual`); as a `defnDecl` it is
+    // checked by a default safe checker with no pre-add. A SAFE definition may
+    // reference neither partial nor unsafe declarations (KR-976/KR-975), while
+    // an UNSAFE definition may reference unsafe ones and recurse.
     let env = admit(&Environment::new(), &axiom("A", sort1()));
     let a = || Expr::const_(n("A"), vec![]);
     let mk_defn = |name: &str, safety: DefinitionSafety, value: Expr| {
@@ -6241,10 +6243,19 @@ fn kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated() {
         BinderInfo::Default,
     );
     let partial_decl = mk_defn("selfRec", DefinitionSafety::Partial, self_body.clone());
-    let verdict = check(&env, &partial_decl, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&check(&env, &partial_decl, Budget::DEFAULT)),
+        Some(RejectClass::UnknownConstant),
+        "a self-recursive partial defnDecl is refused, as the pin refuses it"
+    );
+    let as_mutual = |declaration: &Declaration| match declaration {
+        Declaration::Defn(value) => Declaration::Mutual(vec![value.clone()]),
+        other => other.clone(),
+    };
+    let verdict = check(&env, &as_mutual(&partial_decl), Budget::DEFAULT);
     assert!(
         verdict.is_accepted(),
-        "self-recursive partial definitions admit via the scratch env; got {verdict:?}"
+        "a self-recursive partial definition admits as a one-member mutual block; got {verdict:?}"
     );
     // The SAME body as a SAFE definition rejects: no pre-add, unknown constant
     // (rename to keep the one-name law out of the picture).
@@ -6297,6 +6308,23 @@ fn kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated() {
         reject_class(&check(&env, &safe_uses_partial, Budget::DEFAULT)),
         Some(RejectClass::SafetyViolation),
         "a safe definition must not reference a partial one (KR-976)"
+    );
+    // The pin gives a partial `defnDecl` the same safe checker, so it may not
+    // reference a partial definition either; as a mutual block it may.
+    let partial_uses_partial = mk_defn(
+        "partialUsesPartial",
+        DefinitionSafety::Partial,
+        Expr::const_(n("selfRec"), vec![]),
+    );
+    assert_eq!(
+        reject_class(&check(&env, &partial_uses_partial, Budget::DEFAULT)),
+        Some(RejectClass::SafetyViolation),
+        "a partial defnDecl must not reference a partial definition"
+    );
+    let verdict = check(&env, &as_mutual(&partial_uses_partial), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "a partial mutual block may reference a partial definition; got {verdict:?}"
     );
     let unsafe_id = mk_defn(
         "unsafeId",

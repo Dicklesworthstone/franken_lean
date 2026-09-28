@@ -107,13 +107,16 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
         }
         _ => {}
     }
-    // Pin add_definition (unsafe branch) / add_mutual (partial|unsafe):
-    // a NON-SAFE definition checks its header against `env`, is added to a
-    // scratch environment (non-safe definitions may be recursive — the
-    // `._unsafe_rec` implementation helpers reference themselves), and checks
-    // its body there, under a checker running at the definition's own safety.
+    // Pin add_definition (environment.cpp:160-190): only an UNSAFE definition
+    // checks its header against `env`, is added to a scratch environment (so it
+    // may be recursive), and checks its body there under an unsafe checker. A
+    // PARTIAL `defnDecl` takes the other branch, a default (safe) type checker
+    // with no pre-add: the pin rejects it when it is self-recursive (unknown
+    // constant) or references a partial constant. Partial recursion is admitted
+    // only as a mutual block (`add_mutual`, above), which is how Lean adds
+    // partial definitions and how the .olean planner presents them (fln-tio5).
     if let Declaration::Defn(v) = decl
-        && v.safety != DefinitionSafety::Safe
+        && v.safety == DefinitionSafety::Unsafe
     {
         return check_nonsafe_definition(env, v, budget);
     }
@@ -154,11 +157,12 @@ fn recursive_header(definition: &DefinitionVal) -> DefinitionVal {
     }
 }
 
-/// Pin environment.cpp:160/225 (`add_definition` unsafe branch, `add_mutual`):
-/// header first (name/level laws + the type is a sort, under a checker at the
-/// definition's own safety), then the body against a scratch env CONTAINING
-/// the definition, defeq to the declared type. Non-safe definitions can be
-/// recursive — that is exactly why the body checks after the add.
+/// Pin environment.cpp:163-178 (`add_definition`, unsafe branch): header
+/// first (name/level laws + the type is a sort, under an unsafe checker), then
+/// the body against a scratch env CONTAINING the definition, defeq to the
+/// declared type. Unsafe definitions can be recursive — that is exactly why
+/// the body checks after the add. A partial `Declaration::Defn` never comes
+/// here (fln-tio5); partial recursion goes through `add_mutual`.
 fn check_nonsafe_definition(
     env: &Environment,
     v: &DefinitionVal,
