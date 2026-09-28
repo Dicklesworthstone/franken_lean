@@ -11,9 +11,9 @@ pub mod imported;
 pub mod numeric;
 pub mod scoped;
 
-use fln_core::expr::{Expr, ExprNode};
+use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
-use fln_env::constants::{ConstantInfo, DefinitionSafety};
+use fln_env::constants::{ConstantInfo, DefinitionSafety, ReducibilityHints};
 use fln_env::environment::Environment;
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
@@ -107,6 +107,74 @@ pub fn result_head(expr: &Expr) -> Option<Name> {
         }
     }
     None
+}
+
+/// An instance type's binder telescope and class, with safe abbreviations
+/// unfolded at the head: the registry half of instance search's
+/// `instance_type`, at the same `UnificationTransparency::Abbreviations`
+/// (safe, `Abbrev` hints, matching level arity). The Reference derives both the
+/// instance key and its synthesis order from `forallMetaTelescopeReducing`
+/// (vendored Meta/Instances.lean:107, 171), so `instDecidableEqBool :
+/// DecidableEq Bool` is a `Decidable` instance: `DecidableEq α` abbreviates
+/// `(a b : α) → Decidable (a = b)` (Prelude.lean:1011). A regular definition
+/// is not unfolded, so an instance keyed through one stays a typed refusal.
+pub fn instance_telescope(env: &Environment, type_: &Expr) -> Option<(Vec<BinderInfo>, Name)> {
+    let mut current = type_.clone();
+    let mut binders = Vec::new();
+    for _ in 0..MAX_ENTRY_BYTES {
+        let next = match current.node() {
+            ExprNode::ForallE {
+                binder_info, body, ..
+            } => {
+                binders.push(*binder_info);
+                body.clone()
+            }
+            ExprNode::MData { expr, .. } => expr.clone(),
+            _ => {
+                let mut head = &current;
+                let mut args = Vec::new();
+                while let ExprNode::App { f, a } = head.node() {
+                    args.push(a.clone());
+                    head = f;
+                }
+                args.reverse();
+                match head.node() {
+                    ExprNode::Const { name, levels } => match env.find(name) {
+                        Some(ConstantInfo::Defn(definition))
+                            if definition.safety == DefinitionSafety::Safe
+                                && definition.hints == ReducibilityHints::Abbrev
+                                && definition.base.level_params.len() == levels.len() =>
+                        {
+                            // Universe instantiation cannot change a head
+                            // constant, so only the value's lambdas are applied.
+                            beta(&definition.value, &args)?
+                        }
+                        _ => return Some((binders, name.clone())),
+                    },
+                    ExprNode::Lam { .. } if !args.is_empty() => beta(head, &args)?,
+                    _ => return None,
+                }
+            }
+        };
+        current = next;
+    }
+    None
+}
+
+/// Apply `args` to `function`, substituting through as many leading lambdas as
+/// there are arguments and re-applying the rest.
+fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
+    let mut body = function;
+    let mut taken = 0;
+    while taken < args.len() {
+        let ExprNode::Lam { body: inner, .. } = body.node() else {
+            break;
+        };
+        body = inner;
+        taken += 1;
+    }
+    let result = body.subst_loose(0, &args[..taken]).ok()?;
+    Some(args[taken..].iter().cloned().fold(result, Expr::app))
 }
 
 impl InstanceRegistry {
@@ -287,7 +355,8 @@ fn validate_instance(env: &Environment, name: &Name) -> Result<Name, InstanceReg
     if !safe {
         return Err(InstanceRegistryError::InvalidInstance(name.clone()));
     }
-    result_head(&info.constant_val().type_)
+    instance_telescope(env, &info.constant_val().type_)
+        .map(|(_, class)| class)
         .ok_or_else(|| InstanceRegistryError::InvalidInstance(name.clone()))
 }
 

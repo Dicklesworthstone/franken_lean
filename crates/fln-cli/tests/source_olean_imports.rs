@@ -71,6 +71,32 @@ fn a_real_prelude_import_is_council_admitted_and_journaled() {
     );
 }
 
+/// Source over the real Prelude's classes (bead `fln-13lk`). `instDecidableEqBool`
+/// and its peers are stated through the `DecidableEq` abbreviation, which the
+/// Reference keys under `Decidable`; before the registry unfolded it, activating
+/// the Prelude's metadata refused every `import Init.Prelude`. `==` on `Nat`
+/// reaches `instBEqOfDecidableEq [DecidableEq α]`, so the search also has to use
+/// such an instance as a prerequisite. The counts are the Reference's own
+/// `Init.Prelude` entries in `classExtension`, `instanceExtension` and
+/// `defaultInstanceExtension` (75, 151 and 18 at the pin), so none is dropped.
+#[test]
+fn real_prelude_classes_and_instances_elaborate_source() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let (code, stdout, stderr) = check_source("prelude_classes");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("\"commands\":4"), "{stdout}");
+    assert!(stdout.contains("\"theorems\":2"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "\"oleanMetadata\":{\"classes\":75,\"instances\":151,\"defaultInstances\":18,"
+        ),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn an_import_found_nowhere_is_refused_naming_the_search_path() {
     let (code, stdout, stderr) = check_source("missing");

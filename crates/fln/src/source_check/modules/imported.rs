@@ -247,7 +247,8 @@ impl Engine {
                 cancelled!("source-olean/default");
                 let row = defaults.next().ok_or(SourceOleanImportError::Internal("default count changed during decode"))?;
                 let actual = engine.environment.find(&row.declaration)
-                    .and_then(|info| instances::result_head(&info.constant_val().type_));
+                    .and_then(|info| instances::instance_telescope(&engine.environment, &info.constant_val().type_))
+                    .map(|(_, class)| class);
                 if actual.as_ref() != Some(&row.class) {
                     return Err(SourceOleanImportError::Metadata { module: report.module.clone(), declaration: row.declaration, reason: "default instance class does not match its checked type" });
                 }

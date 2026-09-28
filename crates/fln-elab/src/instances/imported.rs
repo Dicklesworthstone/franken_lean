@@ -135,7 +135,10 @@ fn validate_order(
     let info = env
         .find(declaration)
         .ok_or_else(|| InstanceRegistryError::UnknownDeclaration(declaration.clone()))?;
-    let binders = telescope(info)?;
+    // Synthesis positions index the Reference's reducing telescope
+    // (computeSynthOrder), so an abbreviation's binders count too.
+    let (binders, _) = instance_telescope(env, &info.constant_val().type_)
+        .ok_or_else(|| InstanceRegistryError::InvalidInstance(declaration.clone()))?;
     validate_indices(&parameters.synth_order, binders.len())?;
     let expected: Vec<_> = binders
         .iter()

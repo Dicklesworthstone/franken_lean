@@ -214,17 +214,29 @@ mod tests {
 
     fn budget() -> Budget { Budget::for_stack_bytes(2 * 1024 * 1024) }
     fn environment() -> Environment {
-        let mut env = Environment::new();
-        for declaration in crate::seed::source_seed_declarations() {
-            let Outcome::Complete(admitted) = admit(&env, declaration, budget()) else { panic!("seed nonanswer") };
-            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else { panic!("seed rejection") };
-            env = match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
-                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => result.environment,
-                Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
-                other => panic!("seed publication {other:?}"),
-            };
+        crate::seed::source_seed_declarations()
+            .into_iter()
+            .fold(Environment::new(), publish)
+    }
+    fn publish(env: Environment, declaration: Declaration) -> Environment {
+        let Outcome::Complete(admitted) = admit(&env, declaration, budget()) else {
+            panic!("seed nonanswer")
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("seed rejection")
+        };
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
+                result.environment
+            }
+            Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+            other => panic!("seed publication {other:?}"),
         }
-        env
     }
     fn option(carrier: Expr) -> Expr { Expr::app(constant("Option", vec![Level::zero()]), carrier) }
     fn none(carrier: Expr) -> Expr { Expr::app(constant("Option.none", vec![Level::zero()]), carrier) }
@@ -297,6 +309,72 @@ mod tests {
         let candidate = definition("wrong_carrier", vec![], &[], type_, value);
         let result = fln_kernel::check(&env, &candidate, budget());
         assert!(matches!(result, Outcome::Complete(Verdict::Rejected { .. })), "{result:?}");
+    }
+    /// The Reference states an equality instance through the abbreviation, as
+    /// `instDecidableEqBool : DecidableEq Bool`, and keys it under `Decidable`
+    /// (fln-13lk). Registering one must file it there, and the search must use
+    /// it; a syntactic head would refuse it as an instance of an unknown class.
+    #[test]
+    fn an_instance_stated_through_the_decidable_eq_abbreviation_is_a_decidable_instance() {
+        use crate::instances::{InstanceRegistry, register_class, register_instance};
+        let reference_form = definition(
+            "refDecEqNat",
+            vec![],
+            &[],
+            Expr::app(
+                constant("DecidableEq", vec![Level::one()]),
+                constant("Nat", vec![]),
+            ),
+            constant("instDecidableEqNat", vec![]),
+        );
+        let env =
+            register_class(&publish(environment(), reference_form), &name("Decidable")).unwrap();
+        let env = register_instance(&env, &name("refDecEqNat"), 1000).unwrap();
+        let registry = InstanceRegistry::read(&env).unwrap();
+        let rows: Vec<_> = registry
+            .candidates(&name("Decidable"))
+            .iter()
+            .map(|row| row.declaration.clone())
+            .collect();
+        assert_eq!(rows, [name("refDecEqNat")]);
+        let checked = crate::check_definition_source(
+            b"theorem zz : (0 : Nat) = 0 := by decide",
+            &env,
+            budget(),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(
+            matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+            "{:?}",
+            checked.outcome
+        );
+        // An instance stated through a regular definition is not unfolded.
+        let alias = Declaration::Defn(DefinitionVal {
+            hints: ReducibilityHints::Regular(1),
+            ..match definition(
+                "NatEqDecision",
+                vec![],
+                &[],
+                Expr::sort(Level::one()),
+                Expr::app(
+                    constant("DecidableEq", vec![Level::one()]),
+                    constant("Nat", vec![]),
+                ),
+            ) {
+                Declaration::Defn(value) => value,
+                _ => unreachable!(),
+            }
+        });
+        let env = publish(env, alias);
+        let through_alias = definition(
+            "aliasDecEqNat",
+            vec![],
+            &[],
+            constant("NatEqDecision", vec![]),
+            constant("instDecidableEqNat", vec![]),
+        );
+        let env = publish(env, through_alias);
+        assert!(register_instance(&env, &name("aliasDecEqNat"), 1000).is_err());
     }
     #[test]
     fn native_search_builds_nested_and_higher_universe_option_dictionaries() {
