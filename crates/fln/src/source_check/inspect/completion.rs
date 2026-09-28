@@ -395,8 +395,7 @@ mod tests {
 
     #[test]
     fn lexical_work_and_filter_sizes_are_bounded() {
-        let mut limits = CompletionLookupLimits::default();
-        limits.max_tokens = 0;
+        let mut limits = CompletionLookupLimits { max_tokens: 0, ..CompletionLookupLimits::default() };
         assert!(matches!(completion_token(b"value", 5, limits),
             Err(SourceModuleCheckError::Limit { resource: "completion tokens", .. })));
         limits.max_tokens = 100;

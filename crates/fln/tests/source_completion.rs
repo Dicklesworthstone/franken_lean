@@ -88,8 +88,7 @@ fn result_limits_are_deterministic_and_never_hide_truncation() {
         let entry = Name::from_components(["Main"]);
         let inputs = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
         let cursor = source.rfind("choice_").unwrap() + "choice_".len();
-        let mut limits = CompletionLookupLimits::default();
-        limits.max_items = 2;
+        let mut limits = CompletionLookupLimits { max_items: 2, ..CompletionLookupLimits::default() };
         let query = |session: &mut SourceModuleSession, limits| {
             match session.complete_with_limits(&inputs, &entry, cursor, limits).unwrap() {
                 Outcome::Complete(Some(result)) => result,

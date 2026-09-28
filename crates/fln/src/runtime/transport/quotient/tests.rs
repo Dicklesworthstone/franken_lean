@@ -147,15 +147,19 @@ fn malformed_arities_and_proof_only_primitives_are_not_runtime_values() {
 #[test]
 fn quotient_lowering_respects_work_and_context_budgets() {
     let environment = environment(false);
-    let mut limits = IngressLimits::default();
-    limits.max_nodes = 0;
+    let limits = IngressLimits {
+        max_nodes: 0,
+        ..IngressLimits::default()
+    };
     assert!(
         Preparation::new(&environment, limits)
             .erase_data_indices(&q(ty("Nat"), ty("relation")))
             .is_err()
     );
-    let mut limits = IngressLimits::default();
-    limits.max_context_depth = 1;
+    let limits = IngressLimits {
+        max_context_depth: 1,
+        ..IngressLimits::default()
+    };
     assert!(matches!(
         Preparation::new(&environment, limits).quotient_operation(
             &head("Quot.lift", 2),

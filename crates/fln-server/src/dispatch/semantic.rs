@@ -161,10 +161,10 @@ fn validate_target_source(answer: &Answer, sources: &[OpenDocumentSource<'_>]) -
         if source.len() > MAX_RESULT_BYTES {
             return Err("definition target source exceeds its budget");
         }
-        if let Some(document) = sources.iter().find(|document| document.uri == uri) {
-            if document.text != Some(source.as_str()) {
-                return Err("definition target does not match the accepted editor source");
-            }
+        if let Some(document) = sources.iter().find(|document| document.uri == uri)
+            && document.text != Some(source.as_str())
+        {
+            return Err("definition target does not match the accepted editor source");
         }
     }
     Ok(())
