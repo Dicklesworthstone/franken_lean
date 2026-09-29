@@ -1199,14 +1199,6 @@ pub enum BlockRejection {
         first: usize,
         second: usize,
     },
-    /// KR-977a — a member carries no mutual list, so it is not part of a block
-    /// at all and was supplied to a block entry point by mistake.
-    MemberDeclaresNoBlock { member: WireName },
-    /// KR-977a — membership is not symmetric: this member's mutual list differs
-    /// from the block actually supplied. Membership is a property of the SET, so
-    /// a per-declaration opinion that disagrees with its peers is a defect rather
-    /// than a preference.
-    AsymmetricMembership { member: WireName },
     /// KR-977b — the block's members do not share one safety class.
     NonUniformSafety {
         member: WireName,
@@ -9911,29 +9903,11 @@ fn block_shape(block: &[ConstantEntry]) -> Result<(), BlockRejection> {
         }
     }
 
-    // Membership is symmetric: every member's own mutual list must name exactly
-    // the block supplied. Compared as SETS rather than sequences, because the
-    // order a declaration lists its peers in is not a semantic fact and refusing
-    // a permutation would be a wall against a correct block.
-    let supplied: BTreeSet<&WireName> = block.iter().map(ConstantEntry::name).collect();
-    for entry in block {
-        let Some(body) = entry.declaration().definition_body() else {
-            return Err(BlockRejection::MemberDeclaresNoBlock {
-                member: entry.name().clone(),
-            });
-        };
-        if body.mutual().is_empty() {
-            return Err(BlockRejection::MemberDeclaresNoBlock {
-                member: entry.name().clone(),
-            });
-        }
-        let declared: BTreeSet<&WireName> = body.mutual().iter().collect();
-        if declared != supplied {
-            return Err(BlockRejection::AsymmetricMembership {
-                member: entry.name().clone(),
-            });
-        }
-    }
+    // A member's own mutual list is not read. The pin's `add_mutual`
+    // (environment.cpp) judges the block it is handed and never a member's
+    // `all`, and Mathlib relies on that: `compile_inductive` admits its compiled
+    // recursors as one block whose members carry their inductive's block
+    // (`{ rv with .. }`), not each other's names (bead fln-r0yh).
     Ok(())
 }
 

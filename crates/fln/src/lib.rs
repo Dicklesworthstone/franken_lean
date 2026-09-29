@@ -1639,6 +1639,43 @@ fn build_olean_declaration_units(
             });
             continue;
         }
+        // Mathlib's `compile_inductive` (Mathlib/Util/CompileInductive.lean)
+        // builds each compiled recursor as `{ rv with name, value, .. }`, so its
+        // `all` is the recursor's inductive block (`[List]`), not the
+        // definitions it was admitted with. The pin's `add_mutual` never reads
+        // `all`. A definition whose `all` does not name it is grouped with every
+        // non-safe definition of the same safety sharing that `all`: the one
+        // `mutualDefnDecl` that built them.
+        if !definition.all.contains(&definition.base.name) {
+            let mut member_indices = Vec::new();
+            let mut members = Vec::new();
+            for (candidate_index, candidate) in constants.iter().enumerate() {
+                let ConstantInfo::Defn(candidate) = candidate else {
+                    continue;
+                };
+                if candidate.safety == definition.safety
+                    && candidate.all == definition.all
+                    && !candidate.all.contains(&candidate.base.name)
+                    && constant_units[candidate_index] == usize::MAX
+                {
+                    member_indices.push(candidate_index);
+                    members.push(candidate.clone());
+                }
+            }
+            let unit = units.len();
+            for member_index in &member_indices {
+                constant_units[*member_index] = unit;
+            }
+            units.push(OleanDeclarationUnit {
+                constant_indices: member_indices,
+                names: members
+                    .iter()
+                    .map(|member| member.base.name.clone())
+                    .collect(),
+                declaration: Declaration::Mutual(members),
+            });
+            continue;
+        }
         let mut member_indices = Vec::new();
         member_indices
             .try_reserve_exact(definition.all.len())
@@ -9496,6 +9533,147 @@ mod tests {
         assert_eq!(
             checked.declarations[1].checker.ground,
             CheckerAdmissionGround::PartialQuarantine
+        );
+    }
+
+    /// Bead fln-r0yh: Mathlib's `compile_inductive` admits its compiled
+    /// recursors as one `mutualDefnDecl` whose members carry the inductive's
+    /// `all` (`{ rv with .. }`), never their own names. Such definitions are
+    /// grouped by that `all` and safety: a mutually recursive pair and a
+    /// self-recursive singleton each check as the block they were admitted as,
+    /// and definitions of different safety are never merged.
+    #[test]
+    fn standalone_olean_check_groups_definitions_whose_all_names_a_recursor_block() {
+        let recursor_block = vec![Name::from_components(["Fixture", "Tree"])];
+        let mut pair = mutual_olean_declarations();
+        for info in &mut pair[..2] {
+            let ConstantInfo::Defn(definition) = info else {
+                panic!("the first two fixture rows are mutual definitions")
+            };
+            definition.all = recursor_block.clone();
+        }
+        let base = Name::from_components(["Fixture", "mutualBase"]);
+        let lone = Name::from_components(["Fixture", "compiledRec"]);
+        pair.push(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: lone.clone(),
+                level_params: Vec::new(),
+                type_: Expr::const_(base.clone(), Vec::new()),
+            },
+            value: Expr::const_(lone.clone(), Vec::new()),
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Partial,
+            all: vec![Name::from_components(["Fixture", "List"])],
+        }));
+        let bytes = standalone_olean(&pair);
+        let outcome = Engine::from_environment(Environment::new())
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("definitions carrying their recursor block's `all` reach both checkers");
+        let Outcome::Complete(checked) = outcome else {
+            panic!("the compiled-recursor fixture must complete: {outcome:?}");
+        };
+        assert_eq!(checked.engine.environment().len(), 4);
+        assert_eq!(checked.decoded.constants, pair);
+        let checker_of = |name: &str| {
+            checked
+                .declarations
+                .iter()
+                .find(|declaration| declaration.name.to_display_string() == name)
+                .map(|declaration| declaration.checker)
+                .expect("every row is reported")
+        };
+        assert_eq!(
+            checker_of("Fixture.mutualLeft"),
+            checker_of("Fixture.mutualRight"),
+            "the mutually recursive pair is one authority transition"
+        );
+        assert_eq!(
+            checker_of("Fixture.compiledRec").ground,
+            CheckerAdmissionGround::PartialQuarantine
+        );
+
+        // A different `all` is a different admission: a pair referring to each
+        // other across two `all` lists is a dependency cycle between two units,
+        // refused as unplannable rather than admitted as a block nobody built.
+        let mut crossed = pair.clone();
+        let ConstantInfo::Defn(left) = &mut crossed[1] else {
+            panic!("the second fixture row is the left mutual definition")
+        };
+        left.all = vec![Name::from_components(["Fixture", "Other"])];
+        let bytes = standalone_olean(&crossed);
+        assert!(
+            matches!(
+                Engine::from_environment(Environment::new()).check_olean_artifact(
+                    &bytes,
+                    &KVMap::new(),
+                    OleanCheckLimits::new(bytes.len(), test_budget()),
+                ),
+                Err(OleanCheckError::DependencyCycle { .. })
+            ),
+            "definitions with different `all` lists are never merged into one block"
+        );
+
+        // A definition whose `all` names itself keeps the ordinary envelope, even
+        // when another definition's foreign `all` names it too: the two are not
+        // one block unless their own records say so.
+        let mut self_named = pair.clone();
+        let left_name = Name::from_components(["Fixture", "mutualLeft"]);
+        for info in &mut self_named[..2] {
+            let ConstantInfo::Defn(definition) = info else {
+                panic!("the first two fixture rows are mutual definitions")
+            };
+            definition.all = vec![left_name.clone()];
+        }
+        let bytes = standalone_olean(&self_named);
+        assert!(
+            matches!(
+                Engine::from_environment(Environment::new()).check_olean_artifact(
+                    &bytes,
+                    &KVMap::new(),
+                    OleanCheckLimits::new(bytes.len(), test_budget()),
+                ),
+                Err(OleanCheckError::DependencyCycle { .. })
+            ),
+            "a self-named definition is not absorbed into a foreign group"
+        );
+
+        // Different safety under one `all` is not one admission (the pin's
+        // `add_mutual` refuses a block that mixes safeties): given closed
+        // bodies, the partial and the unsafe definition each check alone.
+        let witness = Name::from_components(["Fixture", "baseWitness"]);
+        let mut mixed = pair.clone();
+        for (position, info) in mixed[..2].iter_mut().enumerate() {
+            let ConstantInfo::Defn(definition) = info else {
+                panic!("the first two fixture rows are mutual definitions")
+            };
+            definition.value = Expr::const_(witness.clone(), Vec::new());
+            if position == 1 {
+                definition.safety = DefinitionSafety::Unsafe;
+            }
+        }
+        mixed.push(ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: witness,
+                level_params: Vec::new(),
+                type_: Expr::const_(base, Vec::new()),
+            },
+            is_unsafe: false,
+        }));
+        let bytes = standalone_olean(&mixed);
+        let outcome = Engine::from_environment(Environment::new())
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("a partial and an unsafe definition sharing one `all` are two units");
+        assert!(
+            matches!(outcome, Outcome::Complete(_)),
+            "mixed safety must not be merged into one refused block: {outcome:?}"
         );
     }
 

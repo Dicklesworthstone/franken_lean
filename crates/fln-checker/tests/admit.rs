@@ -13521,35 +13521,43 @@ fn kr977a_each_shape_defect_is_refused_on_its_own_variant() {
         }
         other => panic!("a repeated member must be refused on its own variant, got {other:?}"),
     }
+}
 
-    // Asymmetric membership: B thinks the block is {B, C}, but {A, B} was supplied.
-    let asymmetric = vec![
-        member("A", &["A", "B"], DefinitionSafety::Unsafe),
-        member("B", &["B", "C"], DefinitionSafety::Unsafe),
-    ];
-    match admit_block(&env, &asymmetric, budget) {
-        BlockVerdict::Rejected(BlockRejection::AsymmetricMembership { member: name }) => {
-            assert_eq!(name, checker_name("B"));
-        }
-        other => panic!("asymmetric membership must be refused on its own variant, got {other:?}"),
-    }
-
-    // A declaration carrying no mutual list is not part of a block at all.
-    let lone = vec![definition("A", a_type(), nat_constant())];
-    assert!(
-        matches!(
-            admit_block(&env, &lone, budget),
-            BlockVerdict::Rejected(BlockRejection::MemberDeclaresNoBlock { .. })
+#[test]
+fn kr977_member_mutual_lists_are_not_read_as_at_the_pin() {
+    // The pin's `add_mutual` judges the block it is handed and never a member's
+    // `all`. Mathlib's `compile_inductive` relies on that: its compiled recursors
+    // carry their inductive's block, not each other's names (bead fln-r0yh).
+    let env = nat_environment();
+    let budget = AdmissionBudget::unlimited();
+    let unsafe_member = |name, block| member(name, block, DefinitionSafety::Unsafe);
+    for (label, block) in [
+        (
+            "asymmetric",
+            vec![
+                unsafe_member("A", &["A", "B"]),
+                unsafe_member("B", &["B", "C"]),
+            ],
         ),
-        "a member declaring no block must be refused on its own variant"
-    );
+        (
+            "an inductive's block",
+            vec![unsafe_member("A", &["Tree"]), unsafe_member("B", &["Tree"])],
+        ),
+        ("empty", vec![unsafe_member("A", &[])]),
+    ] {
+        assert!(
+            admit_block(&env, &block, budget).is_admitted(),
+            "{label} membership lists must not decide the block"
+        );
+    }
 }
 
 #[test]
 fn kr977a_membership_is_compared_as_a_set_so_a_permutation_is_not_a_defect() {
-    // The order a declaration lists its peers in is not a semantic fact, and
-    // refusing a permutation would be a wall against a correct block. This is
-    // the direction a set-vs-sequence comparison gets wrong silently.
+    // The name predates bead fln-r0yh: membership lists are no longer compared
+    // at all (kr977_member_mutual_lists_are_not_read_as_at_the_pin), so a
+    // permuted list is admitted a fortiori. Kept under its name for gii.26's
+    // manifest citation.
     let permuted = vec![
         member("A", &["B", "A"], DefinitionSafety::Unsafe),
         member("B", &["A", "B"], DefinitionSafety::Unsafe),
