@@ -31,8 +31,10 @@ fn instance(name: &str, priority: usize, order: &[usize], scope: Option<&str>) -
     instance_value(name, Expr::const_(n(name), vec![]), priority, order, scope)
 }
 fn instance_value(name: &str, value: Expr, priority: usize, order: &[usize], scope: Option<&str>) -> Obj {
+    let mut heap = fln_rt::native_heap::NativeHeap::new();
+    let handle = heap.alloc(value);
     let entry = Obj::mk_ctor(0, vec![
-        array(&[]), inject_expr(&value).unwrap(), Obj::mk_nat(priority),
+        array(&[]), inject_expr(&heap, handle).unwrap(), Obj::mk_nat(priority),
         Obj::mk_ctor(1, vec![inject_name(&n(name))], &[]), array(order),
     ], &[if scope.is_some() { 2 } else { 0 }]);
     match scope {
@@ -122,8 +124,8 @@ fn roots_control_equal_priority_order_and_shared_imports_replay_once() {
     aggregate.metadata.max_entries = 2;
     assert!(matches!(base.import_olean_modules_for_source(&modules, &[a.clone(), b.clone()], &KVMap::new(), aggregate), Err(SourceOleanImportError::Limit("metadata entries"))));
     aggregate.metadata.max_entries = 3;
-    assert!(base.import_olean_modules_for_source(&modules, &[a.clone(), b.clone()], &KVMap::new(), aggregate).unwrap().into_complete().is_some());
-    assert!(matches!(base.import_olean_modules_for_source(&modules, &[a], &KVMap::new(), limits()), Err(SourceOleanImportError::UnreachableModule(_))));
+    assert!(base.import_olean_modules_for_source(&modules, &[a.clone(), b.clone()], &KVMap::new(), aggregate).unwrap().into_complete().is_ok());
+    assert!(matches!(base.import_olean_modules_for_source(&modules, std::slice::from_ref(&a), &KVMap::new(), limits()), Err(SourceOleanImportError::UnreachableModule(_))));
 }
 
 #[test]
