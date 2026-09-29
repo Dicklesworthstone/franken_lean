@@ -86,7 +86,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   unsafe-block-objects:
-    if: startsWith(github.event.head_commit.message, 'feat(checker): stage tested unsafe-block reconstruction objects')
+    if: >-
+      startsWith(github.event.head_commit.message, 'feat(checker): stage tested unsafe-block reconstruction objects')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
