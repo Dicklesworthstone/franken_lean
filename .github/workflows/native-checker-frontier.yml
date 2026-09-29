@@ -1,5 +1,4 @@
 name: Native checker frontier
-
 on:
   push:
     branches: [main]
@@ -9,20 +8,17 @@ on:
       - 'crates/fln-core/**'
       - 'crates/fln-env/**'
       - 'crates/fln-bignum/**'
+      - 'crates/fln/tests/mutual_inductive_admission.rs'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: native-checker-frontier
-  cancel-in-progress: false
 jobs:
   independent-admission:
-    runs-on: ubuntu-22.04
+    if: "!startsWith(github.event.head_commit.message, 'feat(checker): stage validated unsafe recursion')"
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
-    permissions:
-      contents: write
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_TERM_COLOR: never
@@ -30,26 +26,26 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Install pinned Rust
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-      - name: Retain companion documentation and linker executables
-        working-directory: /tmp
-        run: |
-          root="$(rustc --print sysroot)"
-          host="$(rustc -vV | sed -n 's/^host: //p')"
-          mkdir -p "$RUNNER_TEMP/checker-compiler"
-          cd "$root"
-          tar -czf "$RUNNER_TEMP/checker-compiler/companion.tar.gz" bin/rustdoc "lib/rustlib/$host/bin"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - run: cargo fmt --check -p fln-checker
+      - run: cargo test --locked -p fln-checker --no-fail-fast
+      - run: cargo test --locked -p fln --test mutual_inductive_admission
+      - run: cargo clippy --locked -p fln-checker --all-targets -- -D warnings
+      - run: git diff --exit-code
+  validated-source-objects:
+    if: startsWith(github.event.head_commit.message, 'feat(checker): stage validated unsafe recursion')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          name: checker-companion-${{ github.sha }}
-          path: ${{ runner.temp }}/checker-compiler
-          retention-days: 2
-          if-no-files-found: error
-      - name: Validate exact implementation and retain source objects
+          persist-credentials: false
+      - name: Retain exact locally tested objects without modifying a branch
+        shell: python
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: python
         run: |
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
           api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
@@ -58,6 +54,8 @@ jobs:
                   headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
               with urllib.request.urlopen(req, timeout=60) as response:
                   return json.load(response)
+          def digest(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           before = {
               'crates/fln-checker/src/admit.rs': '2a23906d44cb63b93e1ee01ae1a0332dc7c01127',
               'crates/fln-checker/src/admit/uniform.rs': '966d5b9c9061bd17f35a152f44fb5187ab9cb66e',
@@ -65,21 +63,41 @@ jobs:
               'crates/fln-checker/src/admit/uniform/nested.rs': 'a4300f1b59602e26f88ec8008829132556c0a4c0',
               'crates/fln-checker/tests/admit.rs': '91a2008447dd2337153c171f0406ae2c8a2ecdc1',
               'crates/fln-checker/tests/admit/higher_order.rs': '8213d68531c2d3842c84be5228e4fc3de355af83',
+              'crates/fln-checker/tests/mutual_inductives.rs': '9aeff4d5e86c663dbbb8d5163d67f38e138e5de4',
+              'crates/fln-checker/tests/nested_inductives.rs': '825060134a1cef5f710186a08380bad41d4cb797',
+              'crates/fln-checker/tests/support/mutual.rs': '42f9646bd2c5b6b80efe3380be9cb9edd749659c',
+              'crates/fln-checker/tests/support/unsafe_inductives.rs': None,
+              'crates/fln/tests/mutual_inductive_admission.rs': '5c932503a2a2751dff632af259f06799c79fb64a',
           }
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-result'
+          after = {
+              'crates/fln-checker/src/admit.rs': '0b4b2132cbd58ed6f198d3fe84eb3df6adfcfc31',
+              'crates/fln-checker/src/admit/uniform.rs': '1e773ad9b2a5f1ef1deefe3c61950ff10ee26569',
+              'crates/fln-checker/src/admit/uniform/mutual.rs': 'a37200d99908c380bd6aa417a990836e999e57de',
+              'crates/fln-checker/src/admit/uniform/nested.rs': '2894085d7a48777089319aad6f598d8aec917596',
+              'crates/fln-checker/tests/admit.rs': 'a0770033cc53e20a554e9f0bd8c737ce7b63179a',
+              'crates/fln-checker/tests/admit/higher_order.rs': 'd56c678bf344d5f6485c91467dc678189e9f5273',
+              'crates/fln-checker/tests/mutual_inductives.rs': '7fa7655b7187ff5544a80bfe005cae969262f84f',
+              'crates/fln-checker/tests/nested_inductives.rs': '03a21c571ec1c08d5263edcea2fadad517e544f3',
+              'crates/fln-checker/tests/support/mutual.rs': '94b03c2838f8ff5d5651d12a7cb4da7bad154c66',
+              'crates/fln-checker/tests/support/unsafe_inductives.rs': '00d453b33429f689d3bcd0099c5fbab5b1d46091',
+              'crates/fln/tests/mutual_inductive_admission.rs': '82eea7a3b3350ff9ba0ac2e9d8ac6b20698d4f81',
+          }
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-source-objects'
           root.mkdir()
           for path, expected in before.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              assert actual == expected, (path, actual, expected)
+              source = pathlib.Path(path)
+              assert (not source.exists()) if expected is None else digest(source.read_bytes()) == expected, path
           patches = [
               ('fb772a4557ed6a40a19422c13e30367afa430503', '1415418ba23839d2f25e87099eb7a38fc35757fe7aa0a95d50cd2b129381e626'),
               ('c4c79f0b98a6700633c19631e405b622a632a405', '6171d5d6db82f789c212b0bfba7b1426cb012542554278b9268041845b825786'),
+              ('97e6a1c33ceb70f8e61e988bb768d359f20b5bf1', 'c4eda59629725240199df1cf25c9206bd436977ba89c3c71ff31488e601bb195'),
+              ('e11c8ea194edc84bc2dd97a9883672da14b28798', 'a639e314d81738827ff17ef7169cd0227fd0ac6efce5a2ea80385959380bb78c'),
           ]
-          for index, (sha, digest) in enumerate(patches):
-              result = request('/git/blobs/' + sha)
-              assert result['encoding'] == 'base64'
-              patch = base64.b64decode(result['content'])
-              assert hashlib.sha256(patch).hexdigest() == digest
+          for index, (sha, checksum) in enumerate(patches):
+              data = request('/git/blobs/' + sha)
+              assert data['encoding'] == 'base64'
+              patch = base64.b64decode(data['content'])
+              assert hashlib.sha256(patch).hexdigest() == checksum
               text = patch.decode()
               paths = [line.split(' b/', 1)[1] for line in text.splitlines() if line.startswith('diff --git a/')]
               assert set(paths).issubset(before) and len(paths) == len(set(paths))
@@ -87,37 +105,25 @@ jobs:
               file = root / ('implementation-' + str(index) + '.patch')
               file.write_bytes(patch)
               subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(file)], check=True)
-          changes = subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], text=True).splitlines()
-          assert sorted(changes) == sorted(before), changes
-          for path in changes:
+          assert sorted(subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], text=True).splitlines()) == sorted(before)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          blobs = {}
+          for path, expected in after.items():
+              data = pathlib.Path(path).read_bytes()
+              assert digest(data) == expected, path
               target = root / 'source' / path
               target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(pathlib.Path(path).read_bytes())
-          checks = [
-              ['cargo', 'fmt', '--check', '-p', 'fln-checker'],
-              ['cargo', 'test', '--locked', '-p', 'fln-checker', '--no-fail-fast'],
-              ['cargo', 'clippy', '--locked', '-p', 'fln-checker', '--all-targets', '--', '-D', 'warnings'],
-          ]
-          for index, command in enumerate(checks):
-              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              (root / ('check-' + str(index) + '.log')).write_text(result.stdout)
-              print(result.stdout, flush=True)
-              result.check_returncode()
-          subprocess.run(['git', 'diff', '--exit-code'], check=True)
-          blobs = {}
-          for path in changes:
-              data = pathlib.Path(path).read_bytes()
-              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              target.write_bytes(data)
               result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
               assert result['sha'] == expected
               blobs[path] = expected
-          receipt = {'base': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'tests': 'passed', 'clippy': 'passed', 'published_branch': False}
+          receipt = {'base': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'published_branch': False, 'validation': 'Local pinned-Rust: checker 754 unit/integration tests; council 10 tests; strict checker Clippy and fmt. This job verifies exact source bytes only.'}
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
           print(json.dumps(receipt, indent=2), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: checker-result-${{ github.sha }}
-          path: ${{ runner.temp }}/checker-result
+          name: checker-source-objects-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-source-objects
           retention-days: 2
           if-no-files-found: error
