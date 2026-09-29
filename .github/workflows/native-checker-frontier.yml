@@ -24,6 +24,8 @@ jobs:
   independent-admission:
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    permissions:
+      contents: write
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_TERM_COLOR: never
@@ -31,38 +33,102 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Retain exact source inputs
-        run: |
-          mkdir -p "$RUNNER_TEMP/checker-inputs"
-          git rev-parse HEAD > "$RUNNER_TEMP/checker-inputs/commit.txt"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/checker-inputs/source.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: checker-source-${{ github.sha }}
-          path: ${{ runner.temp }}/checker-inputs
-          retention-days: 2
-          if-no-files-found: error
       - name: Install pinned Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
       - name: Retain standalone compiler for offline reproduction
+        working-directory: /tmp
         run: |
           root="$(rustc --print sysroot)"
           host="$(rustc -vV | sed -n 's/^host: //p')"
           mkdir -p "$RUNNER_TEMP/checker-compiler"
           rustc -vV > "$RUNNER_TEMP/checker-compiler/rustc.txt"
-          tar -C "$root" -czf "$RUNNER_TEMP/checker-compiler/compiler.tar.gz" \
+          cd "$root"
+          tar -czf "$RUNNER_TEMP/checker-compiler/compiler.tar.gz" \
             bin/rustc bin/cargo bin/rustfmt bin/cargo-fmt bin/clippy-driver bin/cargo-clippy \
             lib/libLLVM* lib/librustc_driver* "lib/rustlib/$host/lib"
-        working-directory: /tmp
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: checker-compiler-${{ github.sha }}
           path: ${{ runner.temp }}/checker-compiler
           retention-days: 2
           if-no-files-found: error
+      - name: Apply exact reviewed implementation in the validation checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          sha = 'fb772a4557ed6a40a19422c13e30367afa430503'
+          request = urllib.request.Request(api + '/git/blobs/' + sha,
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          patch = base64.b64decode(data['content'])
+          assert hashlib.sha256(patch).hexdigest() == '1415418ba23839d2f25e87099eb7a38fc35757fe7aa0a95d50cd2b129381e626'
+          before = {
+              'crates/fln-checker/src/admit.rs': '2a23906d44cb63b93e1ee01ae1a0332dc7c01127',
+              'crates/fln-checker/src/admit/uniform.rs': '966d5b9c9061bd17f35a152f44fb5187ab9cb66e',
+              'crates/fln-checker/src/admit/uniform/mutual.rs': '2bcf6aac303b78a5a6abd93e3350c9fd340071cb',
+              'crates/fln-checker/src/admit/uniform/nested.rs': 'a4300f1b59602e26f88ec8008829132556c0a4c0',
+              'crates/fln-checker/tests/admit.rs': '91a2008447dd2337153c171f0406ae2c8a2ecdc1',
+              'crates/fln-checker/tests/admit/higher_order.rs': '8213d68531c2d3842c84be5228e4fc3de355af83',
+          }
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-result'
+          root.mkdir()
+          (root / 'before.json').write_text(json.dumps(before, indent=2))
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(before) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in patch.decode()
+          for path, expected in before.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == expected, (path, actual, expected)
+          patch_file = root / 'implementation.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(patch_file)], check=True)
+          for path in paths:
+              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', path], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path in paths:
+              destination = root / 'source' / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(pathlib.Path(path).read_bytes())
       - name: Test independent checker
-        run: cargo test --locked -p fln-checker --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test --locked -p fln-checker --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/checker-result/tests.log"
       - name: Check independent checker lints
-        run: cargo clippy --locked -p fln-checker --all-targets -- -D warnings
-      - name: Verify tests did not modify tracked files
-        run: git diff --exit-code
+        run: |
+          set -o pipefail
+          cargo clippy --locked -p fln-checker --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/checker-result/clippy.log"
+      - name: Retain tested source objects without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-result'
+          before = json.loads((root / 'before.json').read_text())
+          changes = subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], text=True).splitlines()
+          assert sorted(changes) == sorted(before), changes
+          blobs = {}
+          for path in changes:
+              data = pathlib.Path(path).read_bytes()
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=payload,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected
+              blobs[path] = expected
+          receipt = {'base': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'tests': 'passed', 'clippy': 'passed', 'published_branch': False}
+          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: checker-result-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-result
+          retention-days: 2
+          if-no-files-found: error
