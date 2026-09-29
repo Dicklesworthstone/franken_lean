@@ -12,14 +12,11 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: native-checker-frontier
   cancel-in-progress: false
-
 jobs:
   independent-admission:
     runs-on: ubuntu-22.04
@@ -35,37 +32,32 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-      - name: Retain standalone compiler for offline reproduction
+      - name: Retain companion documentation and linker executables
         working-directory: /tmp
         run: |
           root="$(rustc --print sysroot)"
           host="$(rustc -vV | sed -n 's/^host: //p')"
           mkdir -p "$RUNNER_TEMP/checker-compiler"
-          rustc -vV > "$RUNNER_TEMP/checker-compiler/rustc.txt"
           cd "$root"
-          tar -czf "$RUNNER_TEMP/checker-compiler/compiler.tar.gz" \
-            bin/rustc bin/cargo bin/rustfmt bin/cargo-fmt bin/clippy-driver bin/cargo-clippy \
-            lib/libLLVM* lib/librustc_driver* "lib/rustlib/$host/lib"
+          tar -czf "$RUNNER_TEMP/checker-compiler/companion.tar.gz" bin/rustdoc "lib/rustlib/$host/bin"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: checker-compiler-${{ github.sha }}
+          name: checker-companion-${{ github.sha }}
           path: ${{ runner.temp }}/checker-compiler
           retention-days: 2
           if-no-files-found: error
-      - name: Apply exact reviewed implementation in the validation checkout
+      - name: Validate exact implementation and retain source objects
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
           api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
-          sha = 'fb772a4557ed6a40a19422c13e30367afa430503'
-          request = urllib.request.Request(api + '/git/blobs/' + sha,
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              data = json.load(response)
-          patch = base64.b64decode(data['content'])
-          assert hashlib.sha256(patch).hexdigest() == '1415418ba23839d2f25e87099eb7a38fc35757fe7aa0a95d50cd2b129381e626'
+          def request(path, data=None):
+              req = urllib.request.Request(api + path, data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
           before = {
               'crates/fln-checker/src/admit.rs': '2a23906d44cb63b93e1ee01ae1a0332dc7c01127',
               'crates/fln-checker/src/admit/uniform.rs': '966d5b9c9061bd17f35a152f44fb5187ab9cb66e',
@@ -76,55 +68,52 @@ jobs:
           }
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-result'
           root.mkdir()
-          (root / 'before.json').write_text(json.dumps(before, indent=2))
-          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-          assert sorted(paths) == sorted(before) and len(paths) == len(set(paths))
-          assert '\ndeleted file mode ' not in patch.decode()
           for path, expected in before.items():
               actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
               assert actual == expected, (path, actual, expected)
-          patch_file = root / 'implementation.patch'
-          patch_file.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(patch_file)], check=True)
-          for path in paths:
-              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', path], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          for path in paths:
-              destination = root / 'source' / path
-              destination.parent.mkdir(parents=True, exist_ok=True)
-              destination.write_bytes(pathlib.Path(path).read_bytes())
-      - name: Test independent checker
-        run: |
-          set -o pipefail
-          cargo test --locked -p fln-checker --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/checker-result/tests.log"
-      - name: Check independent checker lints
-        run: |
-          set -o pipefail
-          cargo clippy --locked -p fln-checker --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/checker-result/clippy.log"
-      - name: Retain tested source objects without changing any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-result'
-          before = json.loads((root / 'before.json').read_text())
+          patches = [
+              ('fb772a4557ed6a40a19422c13e30367afa430503', '1415418ba23839d2f25e87099eb7a38fc35757fe7aa0a95d50cd2b129381e626'),
+              ('c4c79f0b98a6700633c19631e405b622a632a405', '6171d5d6db82f789c212b0bfba7b1426cb012542554278b9268041845b825786'),
+          ]
+          for index, (sha, digest) in enumerate(patches):
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              patch = base64.b64decode(result['content'])
+              assert hashlib.sha256(patch).hexdigest() == digest
+              text = patch.decode()
+              paths = [line.split(' b/', 1)[1] for line in text.splitlines() if line.startswith('diff --git a/')]
+              assert set(paths).issubset(before) and len(paths) == len(set(paths))
+              assert '\ndeleted file mode ' not in text
+              file = root / ('implementation-' + str(index) + '.patch')
+              file.write_bytes(patch)
+              subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(file)], check=True)
           changes = subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], text=True).splitlines()
           assert sorted(changes) == sorted(before), changes
+          for path in changes:
+              target = root / 'source' / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(pathlib.Path(path).read_bytes())
+          checks = [
+              ['cargo', 'fmt', '--check', '-p', 'fln-checker'],
+              ['cargo', 'test', '--locked', '-p', 'fln-checker', '--no-fail-fast'],
+              ['cargo', 'clippy', '--locked', '-p', 'fln-checker', '--all-targets', '--', '-D', 'warnings'],
+          ]
+          for index, command in enumerate(checks):
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (root / ('check-' + str(index) + '.log')).write_text(result.stdout)
+              print(result.stdout, flush=True)
+              result.check_returncode()
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
           blobs = {}
           for path in changes:
               data = pathlib.Path(path).read_bytes()
               expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=payload,
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
+              result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
               assert result['sha'] == expected
               blobs[path] = expected
           receipt = {'base': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'tests': 'passed', 'clippy': 'passed', 'published_branch': False}
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
-          print(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
