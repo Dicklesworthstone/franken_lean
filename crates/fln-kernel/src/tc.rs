@@ -1675,11 +1675,10 @@ pub(crate) struct TypeChecker<'a> {
     infer_only_cache: ExprResultCache,
     whnf_core_cache: ExprResultCache,
     /// Results of the cheap-projection core reduction (`whnf_core_for_defeq`,
-    /// the pin's `whnf_core(e, false, true)`), split by whether the computation
-    /// left some projection's structure unreduced. An insensitive result is
-    /// exactly the full-mode result, so it is also kept in `whnf_core_cache`; a
-    /// sensitive one is valid for the cheap mode only.
-    whnf_core_cheap_cache: ExprResultCache,
+    /// the pin's `whnf_core(e, false, true)`) that left some projection's
+    /// structure unreduced: valid for the cheap mode only. A cheap result that
+    /// did not is exactly the full-mode result and goes into `whnf_core_cache`,
+    /// which both modes read, as the pin's single cache is.
     whnf_core_cheap_sensitive_cache: ExprResultCache,
     /// How many times the cheap-projection core reduction has left a
     /// projection's structure unreduced, directly or by replaying a sensitive
@@ -1743,7 +1742,6 @@ impl<'a> TypeChecker<'a> {
             infer_cache: ExprResultCache::new(),
             infer_only_cache: ExprResultCache::new(),
             whnf_core_cache: ExprResultCache::rolling(),
-            whnf_core_cheap_cache: ExprResultCache::rolling(),
             whnf_core_cheap_sensitive_cache: ExprResultCache::rolling(),
             cheap_proj_events: 0,
             major_coercion_outcomes: HashMap::new(),
@@ -2624,7 +2622,7 @@ impl<'a> TypeChecker<'a> {
         self.whnf_core_mode(e, depth, false)
     }
 
-    /// The pin's defeq projection pre-pass uses `cheap_proj = true`: reduce a
+    /// The pin's defeq pre-pass uses `cheap_proj = true` for every pair: reduce a
     /// projection scrutinee without delta so `a.i =?= b.i` can compare `a` and
     /// `b` before either side opens an expensive definition. Lazy delta continues
     /// in this mode too, as the pin does (see `lazy_delta_uncached`). Its results
@@ -2635,29 +2633,23 @@ impl<'a> TypeChecker<'a> {
 
     fn whnf_core_mode(&mut self, e: &Expr, depth: u32, cheap_proj: bool) -> KResult<Expr> {
         self.step(depth)?;
-        if !cheap_proj
-            && let Some(cached) = self
-                .whnf_core_cache
-                .get(e, &self.locals, &self.local_positions)
+        // Both modes read the full cache, as the pin's `whnf_core` reads its one
+        // cache whatever its flags: the cheap mode may return a full-mode result.
+        if let Some(cached) = self
+            .whnf_core_cache
+            .get(e, &self.locals, &self.local_positions)
         {
             return Ok(cached);
         }
-        if cheap_proj {
-            if let Some(cached) =
-                self.whnf_core_cheap_cache
-                    .get(e, &self.locals, &self.local_positions)
-            {
-                return Ok(cached);
-            }
-            if let Some(cached) =
+        if cheap_proj
+            && let Some(cached) =
                 self.whnf_core_cheap_sensitive_cache
                     .get(e, &self.locals, &self.local_positions)
-            {
-                // Replaying a result a projection affected makes the caller's
-                // result projection-sensitive too.
-                self.cheap_proj_events += 1;
-                return Ok(cached);
-            }
+        {
+            // Replaying a result a projection affected makes the caller's
+            // result projection-sensitive too.
+            self.cheap_proj_events += 1;
+            return Ok(cached);
         }
         let cheap_events_before = self.cheap_proj_events;
         // Peel mdata / zeta / let-bound fvars / projection nests on the heap.
@@ -2874,22 +2866,9 @@ impl<'a> TypeChecker<'a> {
             ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
         );
         if result != *e || cache_identity {
-            if !cheap_proj {
-                self.whnf_core_cache.insert(
-                    e.clone(),
-                    result.clone(),
-                    &self.locals,
-                    &self.local_positions,
-                );
-            } else if self.cheap_proj_events == cheap_events_before {
-                // No projection's structure was left unreduced, so this is
-                // exactly the full-mode result and the full cache may reuse it.
-                self.whnf_core_cheap_cache.insert(
-                    e.clone(),
-                    result.clone(),
-                    &self.locals,
-                    &self.local_positions,
-                );
+            // A cheap computation with no projection event did exactly what the
+            // full mode does, so its result is the full-mode result.
+            if !cheap_proj || self.cheap_proj_events == cheap_events_before {
                 self.whnf_core_cache.insert(
                     e.clone(),
                     result.clone(),
@@ -3886,24 +3865,12 @@ impl<'a> TypeChecker<'a> {
             // KR-305: normalize both sides without delta, then RE-RUN the
             // head rules on the reduced pair (beta/zeta/iota can expose Sort
             // or binder heads whose levels are equivalent but not
-            // structurally equal).
-            let cheap_projection_pair = matches!(
-                (t.node(), s.node()),
-                (
-                    ExprNode::Proj { idx: left, .. },
-                    ExprNode::Proj { idx: right, .. },
-                ) if left == right
-            );
-            let tn = if cheap_projection_pair {
-                self.whnf_core_for_defeq(&t, depth + 1)?
-            } else {
-                self.whnf_core(&t, depth + 1)?
-            };
-            let sn = if cheap_projection_pair {
-                self.whnf_core_for_defeq(&s, depth + 1)?
-            } else {
-                self.whnf_core(&s, depth + 1)?
-            };
+            // structurally equal). Every pair uses the cheap-proj mode, as
+            // the pin's `is_def_eq_core` does: a lone projection keeps its
+            // structure unreduced until lazy delta has had its chance, rather
+            // than opening the structure's definitions here.
+            let tn = self.whnf_core_for_defeq(&t, depth + 1)?;
+            let sn = self.whnf_core_for_defeq(&s, depth + 1)?;
             if (tn != t || sn != s)
                 && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
             {
@@ -9000,25 +8967,33 @@ mod tests {
             "a caller that replayed a sensitive result is sensitive too"
         );
 
-        // A result no projection touched is exactly the full-mode result: it is
-        // retained for the cheap mode and shared with the full cache.
+        // A result no projection touched is exactly the full-mode result, so it
+        // goes into the full cache.
         let redex = Expr::app(identity_of(&d_ty), x.clone());
         assert_eq!(tc.whnf_core_for_defeq(&redex, 0).expect("cheap"), x);
-        assert_eq!(
-            tc.whnf_core_cheap_cache
-                .get(&redex, &tc.locals, &tc.local_positions),
-            Some(x.clone())
-        );
         assert_eq!(
             tc.whnf_core_cache
                 .get(&redex, &tc.locals, &tc.local_positions),
             Some(x.clone())
+        );
+        assert_eq!(
+            tc.whnf_core_cheap_sensitive_cache
+                .get(&redex, &tc.locals, &tc.local_positions),
+            None
         );
 
         // The full mode reduces both, which is why sharing either would be wrong.
         let mut full = TypeChecker::new(&env, &[], Budget::DEFAULT);
         assert_eq!(full.whnf_core(&head, 0).expect("full"), identity_of(&d_ty));
         assert_eq!(full.whnf_core(&applied, 0).expect("full"), x);
+        // And the cheap mode reuses what the full mode cached, as the pin's
+        // `whnf_core` reads its one cache whatever its flags.
+        assert_eq!(
+            full.whnf_core_for_defeq(&head, 0)
+                .expect("cheap after full"),
+            identity_of(&d_ty),
+            "the cheap mode reads the full-mode cache"
+        );
 
         fn identity_of(d_ty: &Expr) -> Expr {
             Expr::lam(

@@ -8925,9 +8925,35 @@ fn lazy_delta_leaves_a_projection_structure_unreduced_as_the_pin_does() {
         "the projection pair decides this in a few steps, without opening the chain: {verdict:?}"
     );
 
-    // Not covered here: a pair where only one side is a definition and the other
-    // is already a bare projection. K1's defeq pre-pass still reduces a lone
-    // projection with the full `whnf_core` (the pin's `is_def_eq_core` uses the
-    // cheap one for every pair), so that case opens the chain before lazy delta
-    // runs. It is a separate deviation, recorded on bead fln-hvrk.
+    // Only one side is a definition; the other is already a bare projection. The
+    // pin's defeq pre-pass (`is_def_eq_core`) reduces every pair with the cheap
+    // `whnf_core`, so `(c_N (idD d)).0` keeps its structure unreduced until lazy
+    // delta has unfolded `wrap d` into a matching projection. A full `whnf_core`
+    // there opens the whole chain first.
+    let lone_projection = Expr::proj(n("S"), 0, call(&last, call("idD", d.clone())));
+    let one_sided = defn(
+        "probe_one_sided",
+        call("P", lone_projection.clone()),
+        Expr::const_(n("p"), vec![]),
+    );
+    let verdict = check(&env, &one_sided, budget);
+    assert!(
+        verdict.is_accepted(),
+        "the lone projection waits for lazy delta and the chain stays closed: {verdict:?}"
+    );
+
+    // The same pair with its sides exchanged: the lone projection is the value's
+    // type and `wrap d` the declared one, so the other side of the pre-pass and the
+    // other one-sided arm of lazy delta decide it.
+    let env = admit(&env, &axiom("q", call("P", lone_projection)));
+    let mirrored = defn(
+        "probe_one_sided_mirrored",
+        call("P", call("wrap", d.clone())),
+        Expr::const_(n("q"), vec![]),
+    );
+    let verdict = check(&env, &mirrored, budget);
+    assert!(
+        verdict.is_accepted(),
+        "with the sides exchanged the chain still stays closed: {verdict:?}"
+    );
 }
