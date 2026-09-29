@@ -261,13 +261,17 @@ impl DependencyScanSeen {
 enum DependencyScanRefusal {
     Permanent,
     MissingFvar(FVarId),
+    /// The row did not fit under the dependency-cell cap. The next reclaim
+    /// (`remove_dead_rows`) retires it: the cells it lacked may have been held
+    /// by rows that can never be live again.
+    CellCap,
 }
 
 impl DependencyScanRefusal {
     /// `true` while this row must still suppress reuse in this context.
     fn blocks(&self, local_positions: &HashMap<FVarId, usize>) -> bool {
         match self {
-            Self::Permanent => true,
+            Self::Permanent | Self::CellCap => true,
             Self::MissingFvar(id) => !local_positions.contains_key(id),
         }
     }
@@ -427,6 +431,39 @@ fn dependencies_are_present(dependencies: &[LocalDependency], locals: &[LocalDec
     })
 }
 
+/// Remove every row whose local dependencies are not all present. A binder's
+/// generation is never reused, so such a row can never be live again: it only
+/// holds dependency cells. Returns the rows and cells removed.
+fn remove_dead_rows<K, E>(
+    buckets: &mut HashMap<K, Vec<E>>,
+    locals: &[LocalDecl],
+    dependencies: impl Fn(&E) -> &[LocalDependency],
+) -> (usize, usize) {
+    let (mut rows, mut cells) = (0, 0);
+    buckets.retain(|_, bucket| {
+        bucket.retain(|entry| {
+            let present = dependencies_are_present(dependencies(entry), locals);
+            if !present {
+                rows += 1;
+                cells += dependencies(entry).len();
+            }
+            present
+        });
+        !bucket.is_empty()
+    });
+    (rows, cells)
+}
+
+/// A reclaim is due when fewer cells are left than one row may need, and at
+/// least a quarter of the table's rows have been inserted or attempted since
+/// the last reclaim, so each walk over the table is paid for by those inserts.
+fn dead_row_reclaim_due(cells: usize, entries: usize, inserts_since: usize) -> bool {
+    cells
+        > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS
+            .saturating_sub(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY)
+        && inserts_since >= entries / 4
+}
+
 struct ExprResultCacheEntry {
     key: Expr,
     value: Expr,
@@ -451,6 +488,9 @@ struct ExprResultCache {
     max_entries: usize,
     max_bucket_entries: usize,
     rollover_on_saturation: bool,
+    /// Inserts since the last dead-row reclaim, and the reclaims run.
+    inserts_since_reclaim: usize,
+    dead_row_reclaims: usize,
 }
 
 impl ExprResultCache {
@@ -484,6 +524,8 @@ impl ExprResultCache {
             max_entries,
             max_bucket_entries,
             rollover_on_saturation: false,
+            inserts_since_reclaim: 0,
+            dead_row_reclaims: 0,
         }
     }
 
@@ -689,6 +731,19 @@ impl ExprResultCache {
         self.priority_next_replacement = (index + 1) % TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS;
     }
 
+    /// See `remove_dead_rows`. The cell-cap refusals go too: the cells those
+    /// rows lacked may be free now.
+    fn reclaim_dead_rows(&mut self, locals: &[LocalDecl]) {
+        let (rows, cells) =
+            remove_dead_rows(&mut self.buckets, locals, |entry| &entry.dependencies);
+        self.entries -= rows;
+        self.local_dependency_cells -= cells;
+        self.dependency_scan_refusals
+            .retain(|_, refusal| !matches!(refusal, DependencyScanRefusal::CellCap));
+        self.inserts_since_reclaim = 0;
+        self.dead_row_reclaims += 1;
+    }
+
     fn insert_with_collision_policy(
         &mut self,
         key: Expr,
@@ -697,6 +752,16 @@ impl ExprResultCache {
         local_positions: &HashMap<FVarId, usize>,
         replace_collision: bool,
     ) {
+        self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
+        if (key.has_fvar() || value.has_fvar())
+            && dead_row_reclaim_due(
+                self.local_dependency_cells,
+                self.entries,
+                self.inserts_since_reclaim,
+            )
+        {
+            self.reclaim_dead_rows(locals);
+        }
         let packed = (key.data().0, locals.len());
         let prior_scopes = self
             .cross_scope
@@ -831,7 +896,7 @@ impl ExprResultCache {
         {
             if self.dependency_scan_refusals.len() < self.max_entries {
                 self.dependency_scan_refusals
-                    .insert(packed, DependencyScanRefusal::Permanent);
+                    .insert(packed, DependencyScanRefusal::CellCap);
             }
             return;
         }
@@ -891,6 +956,9 @@ struct PositiveDefEqCache {
     local_dependency_scan_nodes: usize,
     max_entries: usize,
     max_bucket_entries: usize,
+    /// Inserts since the last dead-row reclaim, and the reclaims run.
+    inserts_since_reclaim: usize,
+    dead_row_reclaims: usize,
 }
 
 struct PositiveDefEqCacheEntry {
@@ -920,6 +988,8 @@ impl PositiveDefEqCache {
             local_dependency_scan_nodes: 0,
             max_entries,
             max_bucket_entries,
+            inserts_since_reclaim: 0,
+            dead_row_reclaims: 0,
         }
     }
 
@@ -1018,6 +1088,18 @@ impl PositiveDefEqCache {
         }
     }
 
+    /// See `remove_dead_rows` and `ExprResultCache::reclaim_dead_rows`.
+    fn reclaim_dead_rows(&mut self, locals: &[LocalDecl]) {
+        let (rows, cells) =
+            remove_dead_rows(&mut self.buckets, locals, |entry| &entry.dependencies);
+        self.entries -= rows;
+        self.local_dependency_cells -= cells;
+        self.dependency_scan_refusals
+            .retain(|_, refusal| !matches!(refusal, DependencyScanRefusal::CellCap));
+        self.inserts_since_reclaim = 0;
+        self.dead_row_reclaims += 1;
+    }
+
     fn insert(
         &mut self,
         left: Expr,
@@ -1025,6 +1107,16 @@ impl PositiveDefEqCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) {
+        self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
+        if (left.has_fvar() || right.has_fvar())
+            && dead_row_reclaim_due(
+                self.local_dependency_cells,
+                self.entries,
+                self.inserts_since_reclaim,
+            )
+        {
+            self.reclaim_dead_rows(locals);
+        }
         let packed = Self::scoped_key(&left, &right, locals.len());
         let identity = Self::packed_key(&left, &right);
         let prior_scopes = self
@@ -1153,7 +1245,7 @@ impl PositiveDefEqCache {
         {
             if self.dependency_scan_refusals.len() < self.max_entries {
                 self.dependency_scan_refusals
-                    .insert(packed, DependencyScanRefusal::Permanent);
+                    .insert(packed, DependencyScanRefusal::CellCap);
             }
             return;
         }
@@ -10381,6 +10473,155 @@ mod tests {
                 "the termination-critical identity must replace both row and cross-scope collision pointers without widening either bound"
             );
         }
+    }
+
+    /// Bead fln-hvrk. A row whose binder has closed can never be live again
+    /// (generations are never reused), so it only holds dependency cells. When
+    /// the cells run short, such rows are reclaimed before an insert is refused;
+    /// live rows stay, the cap still holds, and the walk is amortized.
+    #[test]
+    fn dead_dependency_rows_are_reclaimed_before_the_cell_cap_refuses() {
+        let env = Environment::new();
+        let binder = |text: &str| FVarId(Name::str(Name::anonymous(), text));
+        let tag = |text: String| Expr::const_(Name::str(Name::anonymous(), text), Vec::new());
+        let sort = Expr::sort(Level::zero());
+        let value = Expr::sort(Level::one());
+        let cap = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS;
+
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let outer_id = binder("reclaimOuter");
+        tc.adopt_local(outer_id.clone(), sort.clone());
+        tc.adopt_local(binder("reclaimInner"), sort.clone());
+        let outer = Expr::fvar(outer_id.clone());
+        let inner = Expr::fvar(binder("reclaimInner"));
+        let on_outer = |i: usize| Expr::app(outer.clone(), tag(format!("reclaimRow{i}")));
+        for i in 0..8 {
+            tc.whnf_cache
+                .insert(on_outer(i), value.clone(), &tc.locals, &tc.local_positions);
+        }
+        assert_eq!(
+            (tc.whnf_cache.entries, tc.whnf_cache.local_dependency_cells),
+            (8, 8)
+        );
+        // The rest of the table is taken: one cell is left.
+        tc.whnf_cache.local_dependency_cells += cap - 9;
+
+        // Every row is live, so the reclaim frees nothing and a two-binder row
+        // does not fit: it is refused under the cap, as before.
+        let pair = Expr::app(
+            Expr::app(outer.clone(), inner),
+            tag("reclaimPair".to_owned()),
+        );
+        tc.whnf_cache
+            .insert(pair.clone(), value.clone(), &tc.locals, &tc.local_positions);
+        assert_eq!(tc.whnf_cache.dead_row_reclaims, 1);
+        assert_eq!(tc.whnf_cache.entries, 8);
+        assert_eq!(
+            tc.whnf_cache.get(&pair, &tc.locals, &tc.local_positions),
+            None
+        );
+        assert!(matches!(
+            tc.whnf_cache
+                .dependency_scan_refusals
+                .get(&(pair.data().0, tc.locals.len())),
+            Some(DependencyScanRefusal::CellCap)
+        ));
+
+        // A one-binder row fits exactly, and no second walk runs so soon.
+        let last = on_outer(8);
+        tc.whnf_cache
+            .insert(last.clone(), value.clone(), &tc.locals, &tc.local_positions);
+        assert_eq!(
+            tc.whnf_cache.get(&last, &tc.locals, &tc.local_positions),
+            Some(value.clone())
+        );
+        assert_eq!(tc.whnf_cache.local_dependency_cells, cap);
+        assert_eq!(tc.whnf_cache.dead_row_reclaims, 1);
+
+        // Close both binders and open one again under the same name: every row
+        // above is dead. The next insert reclaims them all and fits.
+        tc.truncate_locals(0);
+        tc.adopt_local(outer_id, sort);
+        let reopened = on_outer(9);
+        tc.whnf_cache.insert(
+            reopened.clone(),
+            value.clone(),
+            &tc.locals,
+            &tc.local_positions,
+        );
+        assert_eq!(tc.whnf_cache.dead_row_reclaims, 2);
+        assert_eq!(
+            tc.whnf_cache
+                .get(&reopened, &tc.locals, &tc.local_positions),
+            Some(value)
+        );
+        assert_eq!(tc.whnf_cache.entries, 1);
+        assert_eq!(tc.whnf_cache.local_dependency_cells, cap - 8);
+        assert!(
+            !tc.whnf_cache
+                .dependency_scan_refusals
+                .values()
+                .any(|refusal| matches!(refusal, DependencyScanRefusal::CellCap)),
+            "a reclaim retires the cell-cap refusals"
+        );
+
+        // The positive defeq cache reclaims the same way, and retires its
+        // cell-cap refusals with the dead rows.
+        let mut facts = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let fact_id = binder("reclaimFact");
+        facts.adopt_local(fact_id.clone(), Expr::sort(Level::zero()));
+        facts.adopt_local(binder("reclaimFactSecond"), Expr::sort(Level::zero()));
+        let fact = Expr::fvar(fact_id.clone());
+        let second = Expr::fvar(binder("reclaimFactSecond"));
+        facts.positive_def_eq_cache.insert(
+            fact.clone(),
+            Expr::app(fact.clone(), tag("reclaimFactRight".to_owned())),
+            &facts.locals,
+            &facts.local_positions,
+        );
+        assert_eq!(facts.positive_def_eq_cache.entries, 1);
+        facts.positive_def_eq_cache.local_dependency_cells = cap - 1;
+        let both = Expr::app(
+            Expr::app(fact.clone(), second),
+            tag("reclaimFactBoth".to_owned()),
+        );
+        facts.positive_def_eq_cache.insert(
+            fact.clone(),
+            both.clone(),
+            &facts.locals,
+            &facts.local_positions,
+        );
+        assert_eq!(facts.positive_def_eq_cache.dead_row_reclaims, 1);
+        assert!(matches!(
+            facts.positive_def_eq_cache.dependency_scan_refusals.get(
+                &PositiveDefEqCache::scoped_key(&fact, &both, facts.locals.len())
+            ),
+            Some(DependencyScanRefusal::CellCap)
+        ));
+        facts.truncate_locals(0);
+        facts.adopt_local(fact_id, Expr::sort(Level::zero()));
+        let other = Expr::app(fact.clone(), tag("reclaimFactOther".to_owned()));
+        facts.positive_def_eq_cache.insert(
+            fact.clone(),
+            other.clone(),
+            &facts.locals,
+            &facts.local_positions,
+        );
+        assert_eq!(facts.positive_def_eq_cache.dead_row_reclaims, 2);
+        assert_eq!(facts.positive_def_eq_cache.entries, 1);
+        assert!(facts.positive_def_eq_cache.contains(
+            &fact,
+            &other,
+            &facts.locals,
+            &facts.local_positions
+        ));
+        assert!(
+            !facts
+                .positive_def_eq_cache
+                .dependency_scan_refusals
+                .values()
+                .any(|refusal| matches!(refusal, DependencyScanRefusal::CellCap))
+        );
     }
 
     #[test]
