@@ -1,0 +1,68 @@
+name: Native checker frontier
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-checker-frontier.yml'
+      - 'crates/fln-checker/**'
+      - 'crates/fln-core/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-bignum/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-checker-frontier
+  cancel-in-progress: false
+
+jobs:
+  independent-admission:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Retain exact source inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/checker-inputs"
+          git rev-parse HEAD > "$RUNNER_TEMP/checker-inputs/commit.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/checker-inputs/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checker-source-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-inputs
+          retention-days: 2
+          if-no-files-found: error
+      - name: Install pinned Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Retain standalone compiler for offline reproduction
+        run: |
+          root="$(rustc --print sysroot)"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p "$RUNNER_TEMP/checker-compiler"
+          rustc -vV > "$RUNNER_TEMP/checker-compiler/rustc.txt"
+          tar -C "$root" -czf "$RUNNER_TEMP/checker-compiler/compiler.tar.gz" \
+            bin/rustc bin/cargo bin/rustfmt bin/cargo-fmt bin/clippy-driver bin/cargo-clippy \
+            lib/libLLVM* lib/librustc_driver* "lib/rustlib/$host/lib"
+        working-directory: /tmp
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checker-compiler-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-compiler
+          retention-days: 2
+          if-no-files-found: error
+      - name: Test independent checker
+        run: cargo test --locked -p fln-checker --no-fail-fast
+      - name: Check independent checker lints
+        run: cargo clippy --locked -p fln-checker --all-targets -- -D warnings
+      - name: Verify tests did not modify tracked files
+        run: git diff --exit-code
