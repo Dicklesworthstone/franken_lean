@@ -85,3 +85,84 @@ jobs:
           path: target/elab-functional
           if-no-files-found: warn
           retention-days: 7
+  unsafe-block-objects:
+    if: startsWith(github.event.head_commit.message, 'feat(checker): stage tested unsafe-block reconstruction objects')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Transfer exact locally tested source objects without updating a branch
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+          request = urllib.request.Request(api + '/git/blobs/4d7fe892a8a89daf41787e7b1547b68a7d6303cd', headers=headers)
+          with urllib.request.urlopen(request, timeout=60) as response:
+              compressed = base64.b64decode(json.load(response)['content'])
+          assert hashlib.sha256(compressed).hexdigest() == '1318a6edce3fb19f7d5f2cd15f3d5b0ba12f64634180d01128a3ba2d1d8497c1'
+          patch = gzip.decompress(compressed)
+          before = {
+              'crates/fln-checker/src/admit.rs': '2a23906d44cb63b93e1ee01ae1a0332dc7c01127',
+              'crates/fln-checker/src/admit/uniform.rs': '966d5b9c9061bd17f35a152f44fb5187ab9cb66e',
+              'crates/fln-checker/src/admit/uniform/mutual.rs': '2bcf6aac303b78a5a6abd93e3350c9fd340071cb',
+              'crates/fln-checker/src/admit/uniform/nested.rs': 'a4300f1b59602e26f88ec8008829132556c0a4c0',
+              'crates/fln-checker/tests/admit.rs': '91a2008447dd2337153c171f0406ae2c8a2ecdc1',
+              'crates/fln-checker/tests/admit/higher_order.rs': '8213d68531c2d3842c84be5228e4fc3de355af83',
+              'crates/fln-checker/tests/mutual_inductives.rs': '9aeff4d5e86c663dbbb8d5163d67f38e138e5de4',
+              'crates/fln-checker/tests/support/safety.rs': None,
+          }
+          after = {
+              'crates/fln-checker/src/admit.rs': '8cfcd7d6da8b68d2cbaedda2b29048f6940585be',
+              'crates/fln-checker/src/admit/uniform.rs': 'd3ff01d4117df15b970e638fa4ebd2e7f323157c',
+              'crates/fln-checker/src/admit/uniform/mutual.rs': '437aa18b1b491182d2b8c31cfc8662997257c973',
+              'crates/fln-checker/src/admit/uniform/nested.rs': '5d2e0892f615305d67dea21e00417feba032ecb4',
+              'crates/fln-checker/tests/admit.rs': 'c90bbfa31cb22b43ae894503bdcc7290087d4bf3',
+              'crates/fln-checker/tests/admit/higher_order.rs': '1f278584dad65ac322a57a8b1737590df10c2e93',
+              'crates/fln-checker/tests/mutual_inductives.rs': 'ac950dc52d16bbb26d8277dfec8ac7bfd69a8617',
+              'crates/fln-checker/tests/support/safety.rs': 'bd17f5cf87d887d3377cd78ac589119a9abd330b',
+          }
+          def blob_hash(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(before) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in patch.decode()
+          for path, expected in before.items():
+              p = pathlib.Path(path)
+              if expected is None:
+                  assert not p.exists(), path
+              else:
+                  assert blob_hash(p.read_bytes()) == expected, path
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'unsafe-block-objects'
+          out.mkdir()
+          patch_path = out / 'implementation.patch'
+          patch_path.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(patch_path)], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error', str(patch_path)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, expected in after.items():
+              assert blob_hash(pathlib.Path(path).read_bytes()) == expected, path
+          blobs = {}
+          for path, expected in after.items():
+              payload = json.dumps({'encoding': 'base64', 'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode()}).encode()
+              request = urllib.request.Request(api + '/git/blobs', data=payload, headers=headers)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected
+              blobs[path] = expected
+          receipt = {'checkout': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'published_branch': False, 'validation': 'Local pinned-Rust checker 750 passed; strict Clippy passed; this job verifies byte identity only'}
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unsafe-block-objects-${{ github.sha }}
+          path: ${{ runner.temp }}/unsafe-block-objects
+          retention-days: 2
+          if-no-files-found: error
