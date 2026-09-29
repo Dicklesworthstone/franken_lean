@@ -899,6 +899,9 @@ fn is_closed_in<'t>(
     let mut arenas: Vec<&'t WireExpr> = vec![term];
     let mut followed: Vec<&'t WireName> = Vec::new();
     let mut pending = Vec::new();
+    // Each node expanded so far, with the least binder depth it was expanded at.
+    let mut expanded: std::collections::HashMap<(usize, ExprId), u32> =
+        std::collections::HashMap::new();
     control.push_work(
         &mut pending,
         ClosedWork {
@@ -910,6 +913,26 @@ fn is_closed_in<'t>(
         NatReductionAllocation::ClosedWalk,
     )?;
     while let Some(current) = pending.pop() {
+        // A node already expanded at no greater depth adds nothing: that walk
+        // counted as loose every index this one would, and more, having fewer
+        // binders in scope. Terms are shared, so walking once per path instead
+        // of once per node is exponential in the sharing; the pin pays nothing
+        // here, reading `has_fvar` and the loose range cached on each node.
+        let key = (current.arena, current.id);
+        if expanded
+            .get(&key)
+            .is_some_and(|depth| *depth <= current.depth)
+        {
+            continue;
+        }
+        expanded.try_reserve(1).map_err(|_| {
+            Halt::stop(NatReductionStop::AllocationFailed {
+                allocation: NatReductionAllocation::ClosedWalk,
+                requested: 1,
+                progress: control.progress,
+            })
+        })?;
+        expanded.insert(key, current.depth);
         control.step(current.id.index())?;
         let arena_index = current.arena;
         let node = arenas
@@ -1713,5 +1736,164 @@ pub(crate) fn reduce_nat_at_with(
         },
         Err(Halt::Stop(stop)) => NatReductionOutcome::Inconclusive(*stop),
         Err(Halt::Fault(fault)) => NatReductionOutcome::InternalFault(fault),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(index: usize) -> ExprId {
+        ExprId::from_index(index).expect("a small test arena")
+    }
+
+    fn literal(value: u64) -> ExprNode {
+        ExprNode::NatLiteral {
+            limbs_le: vec![value],
+        }
+    }
+
+    /// `Nat.add 2 3`.
+    fn two_plus_three() -> WireExpr {
+        let add = WireName::from_parts(vec![
+            NamePart::Text("Nat".to_owned()),
+            NamePart::Text("add".to_owned()),
+        ]);
+        WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: add,
+                    levels: Vec::new(),
+                },
+                literal(2),
+                literal(3),
+                ExprNode::Apply {
+                    function: id(0),
+                    argument: id(1),
+                },
+                ExprNode::Apply {
+                    function: id(3),
+                    argument: id(2),
+                },
+            ],
+            Vec::new(),
+            id(4),
+        )
+    }
+
+    fn reduced_to_five(outcome: &NatReductionOutcome) -> Option<&NatReductionProgress> {
+        match outcome {
+            NatReductionOutcome::Reduced(result)
+                if result.term.node(result.term.root())
+                    == Some(&ExprNode::NatLiteral { limbs_le: vec![5] }) =>
+            {
+                Some(&result.progress)
+            }
+            _ => None,
+        }
+    }
+
+    /// Bead fln-e44s. `a_48 = a_47 a_47`, ..., `a_0 = 7`: 49 nodes, a tree of
+    /// 2^48 paths. A companion this shared costs the pin nothing, whose
+    /// `has_fvar` is cached per node; walking it once per path exhausted the
+    /// checker's work items on `Std.Http.instInhabitedCustomStatus._proof_1`,
+    /// whose companion is the whole `decide` term. Walked once per node, the
+    /// closed pair reduces within a budget of a thousand work items.
+    #[test]
+    fn a_shared_companion_is_walked_once_per_node() {
+        let mut nodes = vec![literal(7)];
+        for level in 1..=48 {
+            nodes.push(ExprNode::Apply {
+                function: id(level - 1),
+                argument: id(level - 1),
+            });
+        }
+        let companion = WireExpr::from_parts(nodes, Vec::new(), id(48));
+        let budget = NatReductionBudget {
+            max_steps: 1_000,
+            max_work_items: 1_000,
+            ..NatReductionBudget::unlimited()
+        };
+        let outcome = reduce_nat(
+            &two_plus_three(),
+            &companion,
+            &WhnfContext::default(),
+            budget,
+        );
+        let progress = reduced_to_five(&outcome);
+        assert!(progress.is_some(), "{outcome:?}");
+        if let Some(progress) = progress {
+            assert!(progress.work_items < 200, "{progress:?}");
+        }
+    }
+
+    /// A node first reached under a binder, where its `#0` is bound, and then
+    /// at depth 0, where the same `#0` is loose, must be walked again: the
+    /// companion `#0 (fun (_ : 1) => #0)` shares one `#0` node and is open. The
+    /// same term with the loose occurrence removed is closed.
+    #[test]
+    fn a_node_reached_again_with_fewer_binders_is_walked_again() {
+        let open = WireExpr::from_parts(
+            vec![
+                ExprNode::Bound { index: 0 },
+                literal(1),
+                ExprNode::Lambda {
+                    binder_name: WireName::default(),
+                    binder_type: id(1),
+                    body: id(0),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Apply {
+                    function: id(0),
+                    argument: id(2),
+                },
+            ],
+            Vec::new(),
+            id(3),
+        );
+        let outcome = reduce_nat(
+            &two_plus_three(),
+            &open,
+            &WhnfContext::default(),
+            NatReductionBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                NatReductionOutcome::NotReduced {
+                    reason: NatNotReduced::OpenPair {
+                        input: NatReductionInput::Companion,
+                    },
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let closed = WireExpr::from_parts(
+            vec![
+                ExprNode::Bound { index: 0 },
+                literal(1),
+                ExprNode::Lambda {
+                    binder_name: WireName::default(),
+                    binder_type: id(1),
+                    body: id(0),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Apply {
+                    function: id(2),
+                    argument: id(1),
+                },
+            ],
+            Vec::new(),
+            id(3),
+        );
+        let outcome = reduce_nat(
+            &two_plus_three(),
+            &closed,
+            &WhnfContext::default(),
+            NatReductionBudget::unlimited(),
+        );
+        assert!(reduced_to_five(&outcome).is_some(), "{outcome:?}");
     }
 }
