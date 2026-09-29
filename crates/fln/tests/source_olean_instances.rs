@@ -161,7 +161,7 @@ fn malformed_metadata_cannot_return_a_checked_prefix_or_poison_recovery() {
     ] {
         let bytes = encoded(&constants, &[], extensions);
         let name = n("Library");
-        assert!(base.import_olean_modules_for_source(&[input(&name, &bytes)], &[name.clone()], &KVMap::new(), limits()).is_err());
+        assert!(base.import_olean_modules_for_source(&[input(&name, &bytes)], std::slice::from_ref(&name), &KVMap::new(), limits()).is_err());
         assert_eq!(base.logical_root(&KVMap::new()), before);
         assert!(!base.environment().contains(&n("Pick")));
     }
@@ -180,7 +180,7 @@ fn invalid_declaration_never_reaches_metadata_activation() {
     }));
     let bytes = encoded(&constants, &[], vec![(CLASS, vec![class("Pick", &[])]), (INSTANCE, vec![instance("dictionary", 1000, &[], None)])]);
     let name = n("Library");
-    assert!(matches!(base.import_olean_modules_for_source(&[input(&name, &bytes)], &[name.clone()], &KVMap::new(), limits()), Err(SourceOleanImportError::Check(_))));
+    assert!(matches!(base.import_olean_modules_for_source(&[input(&name, &bytes)], std::slice::from_ref(&name), &KVMap::new(), limits()), Err(SourceOleanImportError::Check(_))));
     assert!(!base.environment().contains(&n("Pick")));
 }
 
@@ -194,18 +194,18 @@ fn limits_and_final_cancellation_preserve_the_original_engine() {
     let modules = [input(&name, &bytes)];
     let mut constrained = limits();
     constrained.metadata.max_entries = 1;
-    assert!(base.import_olean_modules_for_source(&modules, &[name.clone()], &KVMap::new(), constrained).is_err());
+    assert!(base.import_olean_modules_for_source(&modules, std::slice::from_ref(&name), &KVMap::new(), constrained).is_err());
     constrained = limits(); constrained.metadata.max_objects = 0;
-    assert!(base.import_olean_modules_for_source(&modules, &[name.clone()], &KVMap::new(), constrained).is_err());
+    assert!(base.import_olean_modules_for_source(&modules, std::slice::from_ref(&name), &KVMap::new(), constrained).is_err());
     constrained = limits(); constrained.max_capture_bytes = 0;
-    assert!(base.import_olean_modules_for_source(&modules, &[name.clone()], &KVMap::new(), constrained).is_err());
+    assert!(base.import_olean_modules_for_source(&modules, std::slice::from_ref(&name), &KVMap::new(), constrained).is_err());
     struct Cancel { calls: AtomicUsize, at: usize }
     impl CancellationProbe for Cancel {
         fn is_cancelled(&self) -> bool { self.calls.fetch_add(1, Ordering::Relaxed) >= self.at }
     }
     // before council, capture, before decode, class, instance, publication.
     let cancel = Cancel { calls: AtomicUsize::new(0), at: 5 };
-    let outcome = base.import_olean_modules_for_source_with_cancel(&modules, &[name.clone()], &KVMap::new(), limits(), Some(&cancel)).unwrap();
+    let outcome = base.import_olean_modules_for_source_with_cancel(&modules, std::slice::from_ref(&name), &KVMap::new(), limits(), Some(&cancel)).unwrap();
     assert!(matches!(outcome, Outcome::Inconclusive(_)));
     assert_eq!(cancel.calls.load(Ordering::Relaxed), 6);
     assert_eq!(base.logical_root(&KVMap::new()), before);
