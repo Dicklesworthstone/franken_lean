@@ -8828,3 +8828,106 @@ fn kr973_an_unsafe_declaration_unfolds_the_unsafe_definitions_it_references() {
         "a safe declaration still may not reference an unsafe definition"
     );
 }
+
+// ---- fln-hvrk: lazy delta leaves a projection's structure unreduced ------------------
+
+/// Bead fln-hvrk. The pin's `lazy_delta_reduction_step` continues every unfold with
+/// `whnf_core(.., false, true)`: a projection's structure is reduced without delta.
+/// `wrap x := (c_N x).0` is an abbreviation, so lazy delta unfolds both sides of
+/// `wrap d =?= wrap (idD d)` rather than comparing their arguments. Each `(c_N _).0` then
+/// stays stuck, and the projection pair compares `c_N d =?= c_N (idD d)` by arguments,
+/// which costs one unfold of `idD`. Reducing the projections' structures instead opens the
+/// whole chain of `N` definitions on both sides. K1 did exactly that on
+/// `goCache._mutual.eq_def`, which it could not answer even at 200M steps.
+#[test]
+fn lazy_delta_leaves_a_projection_structure_unreduced_as_the_pin_does() {
+    const CHAIN: u32 = 2_000;
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d_ty = Expr::const_(n("D"), vec![]);
+    let env = add_structure(&env, "S", "mk", sort1(), std::slice::from_ref(&d_ty));
+    let s_ty = Expr::const_(n("S"), vec![]);
+    let arrow = |codomain: &Expr| {
+        Expr::forall_e(n("x"), d_ty.clone(), codomain.clone(), BinderInfo::Default)
+    };
+    let x = Expr::bvar(0).expect("packs");
+    let lam = |body: Expr| Expr::lam(n("x"), d_ty.clone(), body, BinderInfo::Default);
+    let definition = |name: &str, type_: Expr, value: Expr, hints| {
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            value,
+            hints,
+            safety: DefinitionSafety::Safe,
+            all: vec![n(name)],
+        })
+    };
+    let call = |name: &str, arg: Expr| Expr::app(Expr::const_(n(name), vec![]), arg);
+
+    let mut env = admit(
+        &env,
+        &definition(
+            "c0",
+            arrow(&s_ty),
+            lam(call("mk", x.clone())),
+            ReducibilityHints::Regular(1),
+        ),
+    );
+    for i in 1..=CHAIN {
+        let previous = format!("c{}", i - 1);
+        env = admit(
+            &env,
+            &definition(
+                &format!("c{i}"),
+                arrow(&s_ty),
+                lam(call(&previous, x.clone())),
+                ReducibilityHints::Regular(i + 1),
+            ),
+        );
+    }
+    let last = format!("c{CHAIN}");
+    let env = admit(
+        &env,
+        &definition(
+            "wrap",
+            arrow(&d_ty),
+            lam(Expr::proj(n("S"), 0, call(&last, x.clone()))),
+            ReducibilityHints::Abbrev,
+        ),
+    );
+    let env = admit(
+        &env,
+        &definition(
+            "idD",
+            arrow(&d_ty),
+            lam(x.clone()),
+            ReducibilityHints::Regular(1),
+        ),
+    );
+    let env = admit(&env, &axiom("P", arrow(&sort1())));
+    let env = admit(&env, &axiom("d", d_ty.clone()));
+    let d = Expr::const_(n("d"), vec![]);
+    let env = admit(&env, &axiom("p", call("P", call("wrap", d.clone()))));
+
+    let budget = Budget::DEFAULT.narrowed(3_000, Budget::DEFAULT.depth);
+
+    // Both sides unfold `wrap`.
+    let probe = defn(
+        "probe",
+        call("P", call("wrap", call("idD", d.clone()))),
+        Expr::const_(n("p"), vec![]),
+    );
+    let verdict = check(&env, &probe, budget);
+    assert!(
+        verdict.is_accepted(),
+        "the projection pair decides this in a few steps, without opening the chain: {verdict:?}"
+    );
+
+    // Not covered here: a pair where only one side is a definition and the other
+    // is already a bare projection. K1's defeq pre-pass still reduces a lone
+    // projection with the full `whnf_core` (the pin's `is_def_eq_core` uses the
+    // cheap one for every pair), so that case opens the chain before lazy delta
+    // runs. It is a separate deviation, recorded on bead fln-hvrk.
+}

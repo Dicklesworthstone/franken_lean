@@ -1674,6 +1674,17 @@ pub(crate) struct TypeChecker<'a> {
     infer_cache: ExprResultCache,
     infer_only_cache: ExprResultCache,
     whnf_core_cache: ExprResultCache,
+    /// Results of the cheap-projection core reduction (`whnf_core_for_defeq`,
+    /// the pin's `whnf_core(e, false, true)`), split by whether the computation
+    /// left some projection's structure unreduced. An insensitive result is
+    /// exactly the full-mode result, so it is also kept in `whnf_core_cache`; a
+    /// sensitive one is valid for the cheap mode only.
+    whnf_core_cheap_cache: ExprResultCache,
+    whnf_core_cheap_sensitive_cache: ExprResultCache,
+    /// How many times the cheap-projection core reduction has left a
+    /// projection's structure unreduced, directly or by replaying a sensitive
+    /// cached result (see `whnf_core_mode`).
+    cheap_proj_events: u64,
     whnf_cache: ExprResultCache,
     positive_def_eq_cache: PositiveDefEqCache,
     /// Landed lazy-delta outcome memo (bead `fln-4hol` item 2): bounded,
@@ -1732,6 +1743,9 @@ impl<'a> TypeChecker<'a> {
             infer_cache: ExprResultCache::new(),
             infer_only_cache: ExprResultCache::new(),
             whnf_core_cache: ExprResultCache::rolling(),
+            whnf_core_cheap_cache: ExprResultCache::rolling(),
+            whnf_core_cheap_sensitive_cache: ExprResultCache::rolling(),
+            cheap_proj_events: 0,
             major_coercion_outcomes: HashMap::new(),
             major_coercion_outcome_rows: 0,
             major_coercion_scan_nodes: 0,
@@ -2612,9 +2626,9 @@ impl<'a> TypeChecker<'a> {
 
     /// The pin's defeq projection pre-pass uses `cheap_proj = true`: reduce a
     /// projection scrutinee without delta so `a.i =?= b.i` can compare `a` and
-    /// `b` before either side opens an expensive definition. Cheap results are
-    /// not mixed into the full-WHNF cache, so this mode is reserved for the
-    /// matching-projection case rather than every defeq pair.
+    /// `b` before either side opens an expensive definition. Lazy delta continues
+    /// in this mode too, as the pin does (see `lazy_delta_uncached`). Its results
+    /// are cached apart from full-mode ones (see `whnf_core_mode`).
     fn whnf_core_for_defeq(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
         self.whnf_core_mode(e, depth, true)
     }
@@ -2628,6 +2642,24 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(cached);
         }
+        if cheap_proj {
+            if let Some(cached) =
+                self.whnf_core_cheap_cache
+                    .get(e, &self.locals, &self.local_positions)
+            {
+                return Ok(cached);
+            }
+            if let Some(cached) =
+                self.whnf_core_cheap_sensitive_cache
+                    .get(e, &self.locals, &self.local_positions)
+            {
+                // Replaying a result a projection affected makes the caller's
+                // result projection-sensitive too.
+                self.cheap_proj_events += 1;
+                return Ok(cached);
+            }
+        }
+        let cheap_events_before = self.cheap_proj_events;
         // Peel mdata / zeta / let-bound fvars / projection nests on the heap.
         // Convert can inject a 400-deep `.1.1.1` nest; one native frame per
         // KR-204 used to abort the check that found it (FL-INV-07). Cheap-proj
@@ -2793,6 +2825,12 @@ impl<'a> TypeChecker<'a> {
                     current = expr;
                     depth += 1;
                     self.step(depth)?;
+                    if cheap_proj {
+                        // The cheap mode reduces this structure without delta,
+                        // where the full mode would not stop there, so this
+                        // computation's result may differ from full mode's.
+                        self.cheap_proj_events += 1;
+                    }
                     // Pin: the non-cheap path fully WHNFs the scrutinee
                     // (including delta) before the first `reduce_proj`. MData
                     // is WHNF-transparent, so expose its payload before
@@ -2835,13 +2873,37 @@ impl<'a> TypeChecker<'a> {
             e.node(),
             ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
         );
-        if !cheap_proj && (result != *e || cache_identity) {
-            self.whnf_core_cache.insert(
-                e.clone(),
-                result.clone(),
-                &self.locals,
-                &self.local_positions,
-            );
+        if result != *e || cache_identity {
+            if !cheap_proj {
+                self.whnf_core_cache.insert(
+                    e.clone(),
+                    result.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                );
+            } else if self.cheap_proj_events == cheap_events_before {
+                // No projection's structure was left unreduced, so this is
+                // exactly the full-mode result and the full cache may reuse it.
+                self.whnf_core_cheap_cache.insert(
+                    e.clone(),
+                    result.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                );
+                self.whnf_core_cache.insert(
+                    e.clone(),
+                    result.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                );
+            } else {
+                self.whnf_core_cheap_sensitive_cache.insert(
+                    e.clone(),
+                    result.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                );
+            }
         }
         Ok(result)
     }
@@ -4356,34 +4418,35 @@ impl<'a> TypeChecker<'a> {
             }
             let ht = self.definition_height(&t);
             let hs = self.definition_height(&s);
-            // Cheap projection reduction belongs to the matching-projection
-            // pre-pass. A delta-unfolded body uses ordinary cached WHNF: making
-            // every retry cheap discards reusable non-projection normal forms
-            // and can turn a small proof into repeated full-tree walks.
+            // Pin `lazy_delta_reduction_step` continues every unfold with
+            // `whnf_core(.., false, true)`: a projection's structure is reduced
+            // without delta, so `(f a).i =?= (f b).i` reaches the projection-pair
+            // rule and compares `f a =?= f b` by their arguments instead of
+            // evaluating `f`. Continuing with the full `whnf_core` (06ff1e7a)
+            // made K1 evaluate concrete AIG array lookups the pin never unfolds,
+            // and left `goCache._mutual.eq_def` a no-answer even at 200M steps
+            // (bead fln-hvrk). What 06ff1e7a needed, reuse of these normal
+            // forms, is kept by the cheap mode's own caches (`whnf_core_mode`).
             match (ht, hs) {
                 (None, None) => return Ok(LazyDelta::Stuck(t, s)),
                 (Some(_), None) => match self.unfold_definition(&t, depth)? {
-                    // A delta-unfolded body uses ordinary cached WHNF:
-                    // making every retry cheap discards reusable
-                    // non-projection normal forms and can turn a small
-                    // proof into repeated full-tree walks.
-                    Some(next) => t = self.whnf_core(&next, depth)?,
+                    Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (None, Some(_)) => match self.unfold_definition(&s, depth)? {
-                    Some(next) => s = self.whnf_core(&next, depth)?,
+                    Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (Some(a), Some(b)) => {
                     if a >= b {
                         match self.unfold_definition(&t, depth)? {
-                            Some(next) => t = self.whnf_core(&next, depth)?,
+                            Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
                     if b >= a {
                         match self.unfold_definition(&s, depth)? {
-                            Some(next) => s = self.whnf_core(&next, depth)?,
+                            Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
@@ -8793,6 +8856,178 @@ mod tests {
             tc.whnf(&term, 0).expect("full projection WHNF completes") == expected,
             "metadata must not prevent full WHNF from delta-normalizing a projection scrutinee"
         );
+    }
+
+    /// Bead fln-hvrk. A cheap-mode result that left a projection's structure
+    /// unreduced is valid for the cheap mode only: the full mode would have
+    /// reduced that structure. It is cached apart and kept out of the full cache,
+    /// and a caller that replays it is kept out too.
+    #[test]
+    fn a_projection_sensitive_cheap_result_stays_out_of_the_full_cache() {
+        use fln_env::constants::{
+            AxiomVal, ConstantVal, ConstructorVal, DefinitionVal, InductiveVal,
+        };
+
+        let named = |text: &str| Name::str(Name::anonymous(), text);
+        let axiom = |name: &Name, type_: Expr| {
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            })
+        };
+        let d_name = named("cheapProjD");
+        let d_ty = Expr::const_(d_name.clone(), Vec::new());
+        let env = publish_checked(
+            &Environment::new(),
+            axiom(&d_name, Expr::sort(Level::one())),
+        );
+        let point = named("cheapProjPoint");
+        let env = publish_checked(&env, axiom(&point, d_ty.clone()));
+        let arrow = |codomain: Expr| {
+            Expr::forall_e(
+                Name::anonymous(),
+                d_ty.clone(),
+                codomain,
+                BinderInfo::Default,
+            )
+        };
+
+        // A one-constructor structure whose field is a function D → D, added
+        // directly: only its shape matters to these reductions.
+        let structure = named("CheapProjProbe");
+        let mk = Name::str(structure.clone(), "mk");
+        let env = env
+            .add_decl(ConstantInfo::Induct(InductiveVal {
+                base: ConstantVal {
+                    name: structure.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                num_params: 0,
+                num_indices: 0,
+                all: vec![structure.clone()],
+                ctors: vec![mk.clone()],
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            }))
+            .expect("adds the structure");
+        let env = env
+            .add_decl(ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: mk.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        arrow(d_ty.clone()),
+                        Expr::const_(structure.clone(), Vec::new()),
+                        BinderInfo::Default,
+                    ),
+                },
+                induct: structure.clone(),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            }))
+            .expect("adds the constructor");
+        // source _ := mk (fun y => y): delta exposes the constructor.
+        let source = named("cheapProjSource");
+        let identity = Expr::lam(
+            Name::anonymous(),
+            d_ty.clone(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: source.clone(),
+                    level_params: Vec::new(),
+                    type_: arrow(Expr::const_(structure.clone(), Vec::new())),
+                },
+                value: Expr::lam(
+                    Name::anonymous(),
+                    d_ty.clone(),
+                    Expr::app(Expr::const_(mk, Vec::new()), identity),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![source.clone()],
+            }),
+        );
+        let x = Expr::const_(point, Vec::new());
+        let head = Expr::proj(
+            structure,
+            0,
+            Expr::app(Expr::const_(source, Vec::new()), x.clone()),
+        );
+        let applied = Expr::app(head.clone(), x.clone());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+
+        assert_eq!(
+            tc.whnf_core_for_defeq(&head, 0).expect("cheap"),
+            head,
+            "the cheap mode leaves the projection's structure unreduced"
+        );
+        assert_eq!(
+            tc.whnf_core_cheap_sensitive_cache
+                .get(&head, &tc.locals, &tc.local_positions),
+            Some(head.clone())
+        );
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&head, &tc.locals, &tc.local_positions),
+            None,
+            "a projection-sensitive cheap result must not enter the full cache"
+        );
+        assert_eq!(
+            tc.whnf_core_for_defeq(&applied, 0).expect("cheap"),
+            applied,
+            "the application over the replayed stuck head stays stuck"
+        );
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&applied, &tc.locals, &tc.local_positions),
+            None,
+            "a caller that replayed a sensitive result is sensitive too"
+        );
+
+        // A result no projection touched is exactly the full-mode result: it is
+        // retained for the cheap mode and shared with the full cache.
+        let redex = Expr::app(identity_of(&d_ty), x.clone());
+        assert_eq!(tc.whnf_core_for_defeq(&redex, 0).expect("cheap"), x);
+        assert_eq!(
+            tc.whnf_core_cheap_cache
+                .get(&redex, &tc.locals, &tc.local_positions),
+            Some(x.clone())
+        );
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&redex, &tc.locals, &tc.local_positions),
+            Some(x.clone())
+        );
+
+        // The full mode reduces both, which is why sharing either would be wrong.
+        let mut full = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert_eq!(full.whnf_core(&head, 0).expect("full"), identity_of(&d_ty));
+        assert_eq!(full.whnf_core(&applied, 0).expect("full"), x);
+
+        fn identity_of(d_ty: &Expr) -> Expr {
+            Expr::lam(
+                Name::anonymous(),
+                d_ty.clone(),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            )
+        }
     }
 
     #[test]
