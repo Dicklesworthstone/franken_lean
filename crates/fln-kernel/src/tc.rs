@@ -4488,13 +4488,25 @@ impl<'a> TypeChecker<'a> {
             // forms, is kept by the cheap mode's own caches (`whnf_core_mode`).
             match (ht, hs) {
                 (None, None) => return Ok(LazyDelta::Stuck(t, s)),
-                (Some(_), None) => match self.unfold_definition(&t, depth)? {
-                    Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
-                    None => return Ok(LazyDelta::Stuck(t, s)),
+                // With one side a definition, the pin first tries to reduce the
+                // other side when it is a projection application
+                // (`try_unfold_proj_app`), so `expensive_term =?= instFoo.1 a`
+                // does not open `expensive_term`. Without it K1 walked
+                // `Nat.add`'s recursion on `Char.succ?_eq._proof_1_13`,
+                // 19.1M steps against the pin's 45 ms (bead fln-e44s).
+                (Some(_), None) => match self.try_unfold_proj_app(&s, depth)? {
+                    Some(next) => s = next,
+                    None => match self.unfold_definition(&t, depth)? {
+                        Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
+                        None => return Ok(LazyDelta::Stuck(t, s)),
+                    },
                 },
-                (None, Some(_)) => match self.unfold_definition(&s, depth)? {
-                    Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
-                    None => return Ok(LazyDelta::Stuck(t, s)),
+                (None, Some(_)) => match self.try_unfold_proj_app(&t, depth)? {
+                    Some(next) => t = next,
+                    None => match self.unfold_definition(&s, depth)? {
+                        Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
+                        None => return Ok(LazyDelta::Stuck(t, s)),
+                    },
                 },
                 (Some(a), Some(b)) => {
                     if a >= b {
@@ -4515,6 +4527,22 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
+    }
+
+    /// Pinned `try_unfold_proj_app`: an application whose head is a projection
+    /// (a bare projection included, as `get_app_fn` returns it) is reduced with
+    /// the full `whnf_core`, which puts the projected structure through `whnf`.
+    /// `None` when that changes nothing.
+    fn try_unfold_proj_app(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+        let mut head = e;
+        while let ExprNode::App { f, .. } = head.node() {
+            head = f;
+        }
+        if !matches!(head.node(), ExprNode::Proj { .. }) {
+            return Ok(None);
+        }
+        let reduced = self.whnf_core(e, depth)?;
+        Ok((reduced != *e).then_some(reduced))
     }
 
     /// Pinned `lazy_delta_proj_reduction`: unfold the projection scrutinees

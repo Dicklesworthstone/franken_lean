@@ -8925,35 +8925,129 @@ fn lazy_delta_leaves_a_projection_structure_unreduced_as_the_pin_does() {
         "the projection pair decides this in a few steps, without opening the chain: {verdict:?}"
     );
 
-    // Only one side is a definition; the other is already a bare projection. The
-    // pin's defeq pre-pass (`is_def_eq_core`) reduces every pair with the cheap
-    // `whnf_core`, so `(c_N (idD d)).0` keeps its structure unreduced until lazy
-    // delta has unfolded `wrap d` into a matching projection. A full `whnf_core`
-    // there opens the whole chain first.
-    let lone_projection = Expr::proj(n("S"), 0, call(&last, call("idD", d.clone())));
-    let one_sided = defn(
-        "probe_one_sided",
-        call("P", lone_projection.clone()),
-        Expr::const_(n("p"), vec![]),
+    // Both sides are bare projections. The pin's defeq pre-pass (`is_def_eq_core`)
+    // reduces every pair with the cheap `whnf_core`, so neither `(c_N d).0` nor
+    // `(c_N (idD d)).0` has its structure reduced; neither is a definition, so
+    // lazy delta stops at once, and the projection pair compares `c_N d =?=
+    // c_N (idD d)` by arguments. A full `whnf_core` in the pre-pass opens the
+    // chain on both sides first.
+    //
+    // (This test used to probe `wrap d` against a lone projection here and
+    // assert the chain stayed closed. The pin does not keep it closed there: with
+    // one side a definition, `try_unfold_proj_app` reduces the projection with the
+    // full `whnf_core`, which puts its structure through `whnf`. K1 lacked that
+    // step, and the assertion recorded the gap as the pin's behaviour; see
+    // `lazy_delta_reduces_a_projection_application_before_unfolding_the_other_side`.)
+    let env = admit(
+        &env,
+        &axiom(
+            "r",
+            call("P", Expr::proj(n("S"), 0, call(&last, d.clone()))),
+        ),
     );
-    let verdict = check(&env, &one_sided, budget);
+    let pair = defn(
+        "probe_projection_pair",
+        call(
+            "P",
+            Expr::proj(n("S"), 0, call(&last, call("idD", d.clone()))),
+        ),
+        Expr::const_(n("r"), vec![]),
+    );
+    let verdict = check(&env, &pair, budget);
     assert!(
         verdict.is_accepted(),
-        "the lone projection waits for lazy delta and the chain stays closed: {verdict:?}"
+        "two projections are compared by their structures' arguments and the chain stays closed: {verdict:?}"
     );
+}
 
-    // The same pair with its sides exchanged: the lone projection is the value's
-    // type and `wrap d` the declared one, so the other side of the pre-pass and the
-    // other one-sided arm of lazy delta decide it.
-    let env = admit(&env, &axiom("q", call("P", lone_projection)));
-    let mirrored = defn(
-        "probe_one_sided_mirrored",
-        call("P", call("wrap", d.clone())),
-        Expr::const_(n("q"), vec![]),
+// ---- fln-e44s: a projection application is reduced before the other side unfolds ------
+
+/// Bead fln-e44s. The pin's `lazy_delta_reduction_step`, with exactly one side a
+/// definition, first tries `try_unfold_proj_app` on the other side:
+/// `expensive_term =?= instFoo.1 a` reduces `instFoo.1 a` rather than unfold
+/// `expensive_term`. Here `e_N` is a chain of `N` definitions ending in an axiom
+/// `g`, and `inst : F := mk e_N`, so `inst.0 d` reduces to `e_N d` in a few steps
+/// and the two sides then share a head; unfolding `e_N d` instead walks the whole
+/// chain. K1 lacked the step, and `Char.succ?_eq._proof_1_13` walked `Nat.add`'s
+/// recursion against an instance projection for 19.1M steps (the pin: 45 ms).
+/// Both arms of lazy delta, with the definition on either side.
+#[test]
+fn lazy_delta_reduces_a_projection_application_before_unfolding_the_other_side() {
+    const CHAIN: u32 = 2_000;
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d_ty = Expr::const_(n("D"), vec![]);
+    let endo = Expr::forall_e(n("x"), d_ty.clone(), d_ty.clone(), BinderInfo::Default);
+    let env = add_structure(&env, "F", "mkF", sort1(), std::slice::from_ref(&endo));
+    let f_ty = Expr::const_(n("F"), vec![]);
+    let definition = |name: &str, type_: Expr, value: Expr, hints| {
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            value,
+            hints,
+            safety: DefinitionSafety::Safe,
+            all: vec![n(name)],
+        })
+    };
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let mut env = admit(&env, &axiom("g", endo.clone()));
+    env = admit(
+        &env,
+        &definition(
+            "e0",
+            endo.clone(),
+            constant("g"),
+            ReducibilityHints::Regular(1),
+        ),
     );
-    let verdict = check(&env, &mirrored, budget);
-    assert!(
-        verdict.is_accepted(),
-        "with the sides exchanged the chain still stays closed: {verdict:?}"
+    for i in 1..=CHAIN {
+        env = admit(
+            &env,
+            &definition(
+                &format!("e{i}"),
+                endo.clone(),
+                constant(&format!("e{}", i - 1)),
+                ReducibilityHints::Regular(i + 1),
+            ),
+        );
+    }
+    let last = format!("e{CHAIN}");
+    let env = admit(
+        &env,
+        &definition(
+            "inst",
+            f_ty,
+            Expr::app(constant("mkF"), constant(&last)),
+            ReducibilityHints::Regular(1),
+        ),
     );
+    let env = admit(
+        &env,
+        &axiom(
+            "P",
+            Expr::forall_e(n("x"), d_ty.clone(), sort1(), BinderInfo::Default),
+        ),
+    );
+    let env = admit(&env, &axiom("d", d_ty));
+    let d = constant("d");
+    let expensive = Expr::app(constant(&last), d.clone());
+    let projected = Expr::app(Expr::proj(n("F"), 0, constant("inst")), d);
+    let p_of = |e: &Expr| Expr::app(constant("P"), e.clone());
+    let env = admit(&env, &axiom("p", p_of(&expensive)));
+    let env = admit(&env, &axiom("q", p_of(&projected)));
+
+    let budget = Budget::DEFAULT.narrowed(1_000, Budget::DEFAULT.depth);
+    for (name, type_, value) in [
+        ("probe_projection_declared", p_of(&projected), "p"),
+        ("probe_projection_inferred", p_of(&expensive), "q"),
+    ] {
+        let verdict = check(&env, &defn(name, type_, constant(value)), budget);
+        assert!(
+            verdict.is_accepted(),
+            "{name}: the projection application is reduced and the chain stays closed: {verdict:?}"
+        );
+    }
 }
