@@ -2647,6 +2647,86 @@ fn open_arithmetic_demands_do_not_turn_spent_work_into_false_progress() {
         "{outcome:?}"
     );
 }
+/// With one side a definition and the other a projection application, the
+/// checker reduces the projection side first, as the pin's
+/// `try_unfold_proj_app` does. When that reduction spends work but rebuilds the
+/// same term it is no progress: the pin compares the result with its input, and
+/// the definition side unfolds. Here the projected structure is the stuck cast
+/// of `failed_k_gate_work_does_not_resubmit_an_unchanged_conversion_pair`,
+/// whose K gate fails after spending reductions; `Finset.choose_eq_iff`
+/// resubmitted such a pair, over a stuck `Eq.rec`, for 24.9M comparisons. Both
+/// sides of the rule, within the sibling test's eight normalizations.
+#[test]
+fn a_projection_side_rebuilt_unchanged_lets_the_definition_side_unfold() {
+    let identity = Expr::lam(
+        primary_name("x"),
+        constant("A"),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    // `(EqS.rec A (id a) KTestMotive KTestMinor b evidence).0`
+    let stuck = |a: Expr, b: Expr, evidence: Expr| {
+        let cast = [
+            constant("A"),
+            Expr::app(identity.clone(), a),
+            constant("KTestMotive"),
+            constant("KTestMinor"),
+            b,
+            evidence,
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(Name::from_components(["EqS", "rec"]), vec![Level::one()]),
+            Expr::app,
+        );
+        Expr::proj(primary_name("GeneratedStructure"), 0, cast)
+    };
+    let body = stuck(
+        Expr::bvar(2).unwrap(),
+        Expr::bvar(1).unwrap(),
+        Expr::bvar(0).unwrap(),
+    );
+    let unfolds_to_stuck = ["a", "b", "evidence"]
+        .iter()
+        .rev()
+        .fold(body, |body, name| {
+            Expr::lam(
+                primary_name(*name),
+                constant("A"),
+                body,
+                BinderInfo::Default,
+            )
+        });
+    let mut entries = eqs_family_entries();
+    entries.push(definition_entry(
+        "wrapStuck",
+        Vec::new(),
+        decoded(&unfolds_to_stuck),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = WhnfContext::new(
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name("GeneratedStructure"),
+            checker_name("GeneratedConstructor"),
+            0,
+        )],
+        constant_environment(entries),
+    );
+    let free = |name: &str| Expr::fvar(FVarId(primary_name(name)));
+    let (a, b, evidence) = (free("pointA"), free("pointB"), free("KTestEvidence"));
+    let wrapped = [a.clone(), b.clone(), evidence.clone()]
+        .into_iter()
+        .fold(constant("wrapStuck"), Expr::app);
+    let projected = stuck(a, b, evidence);
+    let mut budget = DefEqBudget::unlimited();
+    budget.max_normalizations = 8;
+    for (left, right) in [(wrapped.clone(), projected.clone()), (projected, wrapped)] {
+        let outcome = def_eq(&decoded(&left), &decoded(&right), &context, budget);
+        assert!(matches!(outcome, DefEqOutcome::Equal(_)), "{outcome:?}");
+    }
+}
 /// An open discriminant is not evaluated as a literal. The pin's `reduce_nat`
 /// would try it, so this is a deliberate departure (see
 /// `NatReductionScope::DemandedMajor`). The major `wrap (tower x)` normalizes

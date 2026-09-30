@@ -2120,6 +2120,25 @@ fn lazy_delta_heights(
         return Ok(Some((left_height, right_height)));
     }
     let reduced = retain_generated(generated, projection_side, result.term);
+    // The pin's `try_unfold_proj_app` compares the reduced term with its input
+    // (`e_new != e`), not the work spent. Reductions can rebuild the same term:
+    // a K gate over a stuck `Eq.rec` spends them and changes nothing. Pushing
+    // that back as progress resubmits the pair until a budget runs out
+    // (`Finset.choose_eq_iff`: 24.9M comparisons), so it counts as no progress
+    // and the constant side alone unfolds.
+    if eta_structurally_equal(
+        reduced,
+        projection_reference,
+        0,
+        TermSources::new(left, right, generated),
+        control,
+        cancelled,
+    )? {
+        return Ok(Some(match projection_side {
+            DefEqSide::Left => (None, right_height),
+            DefEqSide::Right => (left_height, None),
+        }));
+    }
     let (next_left, next_right) = match projection_side {
         DefEqSide::Left => (reduced, right_reference),
         DefEqSide::Right => (left_reference, reduced),
