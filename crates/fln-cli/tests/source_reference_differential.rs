@@ -479,7 +479,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_constructor_equalities.lean",
     "examples/native_constructor_equality.lean",
     "examples/native_constructor_tactics.lean",
-    "examples/native_context_generalization.lean",
     "examples/native_decidable_cases.lean",
     "examples/native_decision_proofs.lean",
     "examples/native_default_simp.lean",
@@ -523,9 +522,7 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_scopes.lean",
     "examples/native_section_inductives.lean",
     "examples/native_section_records.lean",
-    "examples/native_simp_all.lean",
     "examples/native_simp_hypotheses.lean",
     "examples/native_simpa.lean",
-    "examples/native_simplification.lean",
     "examples/native_tactic_repetition.lean",
 ];

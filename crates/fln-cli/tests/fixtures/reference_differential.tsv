@@ -34,7 +34,7 @@ examples/native_constrained_recursion.lean	reject	accept	n/a	fln-defect	Referenc
 examples/native_constructor_equalities.lean	reject	accept	n/a	fln-defect	Reference 7: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
 examples/native_constructor_equality.lean	reject	accept	n/a	fln-defect	Reference 9: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
 examples/native_constructor_tactics.lean	reject	check-only	n/a	fln-defect	Reference 21: numerals are data in Lean, but the expected type is a proposition | tactic goal-management divergence (franken_lean-z8j.1.6.1)
-examples/native_context_generalization.lean	accept	reject	n/a	unsupported	REGRESSED: agreed when the ledger was last measured (cdb1c023); the drop-in lean now refuses it (fln-ew20 re-measure at 022c8ce3)
+examples/native_context_generalization.lean	accept	accept	match	agree	agrees again: generalize defaults its numeral like the pin (fln-ffce; had regressed with 75c8f103)
 examples/native_decidable_cases.lean	reject	check-only	n/a	fln-defect	Reference 18: unexpected token 'scoped'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
 examples/native_decision_proofs.lean	reject	accept	n/a	missing-prelude	Reference 2: `not_false` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_decisions.lean	accept	accept	match	agree	
@@ -110,14 +110,14 @@ examples/native_scoped_instances.lean	accept	check-only	n/a	unsupported	drop-in 
 examples/native_scopes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_section_records.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
-examples/native_simp_all.lean	accept	reject	n/a	unsupported	REGRESSED: agreed when the ledger was last measured (cdb1c023); the drop-in lean now refuses it (fln-ew20 re-measure at 022c8ce3)
+examples/native_simp_all.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
 examples/native_simp_hypotheses.lean	reject	accept	n/a	fln-defect	Reference 11: unsolved goals | tactic goal-management divergence (franken_lean-z8j.1.6.1)
 examples/native_simpa.lean	reject	check-only	n/a	fln-defect	Reference 16: Tactic `assumption` failed | tactic goal-management divergence (franken_lean-z8j.1.6.1)
-examples/native_simplification.lean	accept	reject	n/a	unsupported	REGRESSED: agreed when the ledger was last measured (cdb1c023); the drop-in lean now refuses it (fln-ew20 re-measure at 022c8ce3)
+examples/native_simplification.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
 examples/native_singleton_inference.lean	accept	accept	match	agree	
 examples/native_staged_callbacks.lean	accept	accept	match	agree	
 examples/native_structural_selection.lean	accept	accept	match	agree	
-examples/native_tactic_alternatives.lean	reject	reject	n/a	agree	fixed: both FrankenLean doors now reject, as the Reference does (was fln-defect, franken_lean-z8j.1.6.2)
+examples/native_tactic_alternatives.lean	accept	accept	match	agree	valid Lean since binders named with the reserved keywords `local`/`scoped` were renamed and the Type-field record became an `example` (fln-lvdh); the old "both reject" was an unrelated elaboration failure
 examples/native_tactic_repetition.lean	reject	check-only	n/a	fln-defect	Reference 47: unexpected token 'local'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
 examples/native_tactic_sequencing.lean	accept	accept	match	agree	
 examples/native_term_binders.lean	accept	accept	match	agree	

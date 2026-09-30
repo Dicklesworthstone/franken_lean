@@ -142,6 +142,12 @@ impl Context {
     /// for closed arithmetic over the exact seed primitives: unrestricted
     /// kernel conversion would also unfold ordinary definitions, exceeding
     /// automatic closure's reducible transparency. Final admission checks both seats.
+    ///
+    /// Numerals and operators are elaborated as their class terms
+    /// (`OfNat.ofNat Nat 2 (instOfNatNat 2)`, `HAdd.hAdd Nat Nat Nat ...`), so an
+    /// application whose head is not an exact primitive is unfolded with the
+    /// same abbreviation transparency as the operands; it qualifies only if
+    /// that exposes a primitive, a literal, or another reducible application.
     fn rewrite_arithmetic_reflexivity(
         &mut self,
         goal: &ProofGoal,
@@ -150,39 +156,54 @@ impl Context {
     ) -> Result<bool, NatDefinitionElabError> {
         let left = self.instantiate(left)?;
         let right = self.instantiate(right)?;
-        let mut work = vec![&left, &right];
+        // K1 runs in an empty local context: only closed terms qualify, even when
+        // a reduction below would have discarded the open part.
+        if [&left, &right].iter().any(|term| {
+            term.has_fvar()
+                || term.has_expr_mvar()
+                || term.has_level_mvar()
+                || term.has_loose_bvars()
+        }) {
+            return Ok(false);
+        }
+        let mut work = vec![left.clone(), right.clone()];
+        // Every visited term stays alive, so an allocation identity is never reused.
+        let mut visited = Vec::new();
         let mut seen = HashSet::new();
         while let Some(term) = work.pop() {
             if !seen.insert(term.allocation_identity()) {
                 continue;
             }
             self.tick()?;
-            match term.node() {
+            let mut head = &term;
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                arguments.push(a.clone());
+                head = f;
+            }
+            match head.node() {
                 ExprNode::Lit {
                     literal: Literal::Nat(_),
-                } => {}
-                ExprNode::App { f, a } => work.extend([f, a]),
-                ExprNode::MData { expr, .. } => work.push(expr),
-                ExprNode::Const { name, levels } if levels.is_empty() => {
-                    let Some(Declaration::Axiom(expected)) =
-                        crate::seed::source_intrinsic_seed_declaration(name)
-                    else {
-                        return Ok(false);
-                    };
-                    let mut result = &expected.base.type_;
-                    while let ExprNode::ForallE { body, .. } = result.node() {
-                        result = body;
-                    }
-                    if !matches!(result.node(), ExprNode::Const { name, levels }
-                        if name == &Name::from_components(["Nat"]) && levels.is_empty())
-                        || self.txn.env.find(name)
-                            != Some(&fln_env::constants::ConstantInfo::Axiom(expected))
-                    {
-                        return Ok(false);
-                    }
+                } if arguments.is_empty() => {}
+                ExprNode::MData { expr, .. } if arguments.is_empty() => work.push(expr.clone()),
+                ExprNode::Const { name, levels }
+                    if levels.is_empty() && self.exact_nat_intrinsic(name) =>
+                {
+                    work.extend(arguments);
                 }
-                _ => return Ok(false),
+                _ => {
+                    let reduced = self.whnf_with_transparency(
+                        &term,
+                        UnificationTransparency::Abbreviations,
+                        false,
+                    )?;
+                    if reduced == term {
+                        return Ok(false);
+                    }
+                    work.push(reduced);
+                }
             }
+            visited.push(term);
         }
         match fln_kernel::check_def_eq(&self.txn.env, &[], &left, &right, self.kernel) {
             Outcome::Complete(Verdict::Accepted { .. }) => Ok(true),
@@ -194,6 +215,23 @@ impl Context {
                 },
             )))),
         }
+    }
+
+    /// `name` is one of the seed's Nat intrinsics returning `Nat`, and the
+    /// environment holds exactly the seed's axiom under that name.
+    fn exact_nat_intrinsic(&self, name: &Name) -> bool {
+        let Some(Declaration::Axiom(expected)) =
+            crate::seed::source_intrinsic_seed_declaration(name)
+        else {
+            return false;
+        };
+        let mut result = &expected.base.type_;
+        while let ExprNode::ForallE { body, .. } = result.node() {
+            result = body;
+        }
+        matches!(result.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["Nat"]) && levels.is_empty())
+            && self.txn.env.find(name) == Some(&fln_env::constants::ConstantInfo::Axiom(expected))
     }
 
     pub(in crate::source) fn rewrite_proof_term<'a>(

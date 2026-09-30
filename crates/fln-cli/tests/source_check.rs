@@ -2072,8 +2072,8 @@ fn installed_tactic_alternatives_rollback_and_reject_failed_suffixes() {
         if valid {
             let json = String::from_utf8(result.stdout).unwrap();
             for field in [
-                "\"commands\":11",
-                "\"theorems\":7",
+                "\"commands\":10",
+                "\"theorems\":6",
                 "\"authority\":true",
                 "\"executed\":false",
             ] {

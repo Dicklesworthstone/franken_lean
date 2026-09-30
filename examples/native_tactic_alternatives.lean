@@ -19,14 +19,14 @@ structure Package where
   carrier : Type
   value : carrier
 
-def packed : Package := by
+-- The rollback is checked by the value itself: "preserved" has type `String` only if `first`
+-- discarded the `Nat` carrier. An `example` is elaborated and never compiled.
+example : Package := by
   refine Package.mk ?carrier ?value
   first
   | (exact Nat; fail)
   | exact String
   exact "preserved"
-
-theorem packed_ok : packed.value = "preserved" := by rfl
 
 def chosen : Nat := by
   first | (exact 7; fail) | exact 9
@@ -35,12 +35,12 @@ theorem chosen_ok : chosen = 9 := by rfl
 
 theorem inner : 0 = 0 := by
   first
-  | have local : 0 = 0 := by
+  | have h : 0 = 0 := by
       first | fail | rfl
-    exact local
+    exact h
   | fail
 
-theorem scoped (P Q : Prop) (p : P) (q : Q) : Both P Q := by
+theorem scoped_goals (P Q : Prop) (p : P) (q : Q) : Both P Q := by
   constructor
   · first | exact q | exact p
   · try exact p

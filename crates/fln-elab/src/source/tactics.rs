@@ -831,12 +831,25 @@ impl Context {
         opaque: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
-        self.resolve_instances(false)?;
+        // The pin elaborates a tactic `have`/`let` value with `Tactic.elabTerm`,
+        // whose `synthesizeSyntheticMVars (postpone := .no)` applies default
+        // instances and refuses what stays unsynthesized (`have h : String := 1`
+        // fails there, so `first`/`repeat` move on instead of binding it).
+        self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         let value = Typed {
             value: self.instantiate(&value.value)?,
             type_: self.instantiate(&value.type_)?,
         };
+        // Expression holes only: universe variables may still be settled later.
+        let mut holes = std::collections::HashSet::new();
+        holes.extend(self.txn.mvars.collect_mvars(&value.value));
+        holes.extend(self.txn.mvars.collect_mvars(&value.type_));
+        if !holes.is_empty() {
+            return Err(failure(SourceInferenceError::UnresolvedHoles {
+                count: holes.len(),
+            }));
+        }
         let id = FVarId(self.fresh_name()?);
         let local = LocalDecl {
             id: id.clone(),

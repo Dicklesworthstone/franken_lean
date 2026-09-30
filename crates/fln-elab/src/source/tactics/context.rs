@@ -44,7 +44,10 @@ impl Context {
             return Err(error(TacticError::InvalidGeneralization));
         }
         self.txn.lctx = goal.lctx.clone();
-        self.resolve_instances(false)?;
+        // The pin elaborates the generalized term with `Tactic.elabTerm`, whose
+        // `synthesizeSyntheticMVars (postpone := .no)` applies default instances:
+        // `generalize 3 = x` generalizes `(3 : Nat)`.
+        self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         let expression = self.instantiate(&term.value)?;
         let domain = self.instantiate(&term.type_)?;
