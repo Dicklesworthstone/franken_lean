@@ -911,6 +911,16 @@ pub struct CheckedOlean {
     pub declarations: Vec<OleanCheckedDeclaration>,
 }
 
+/// [`CheckedOlean`] before its logical roots are computed.
+struct UnrootedOlean {
+    engine: Engine,
+    decoded: DecodedOlean,
+    declarations: Vec<OleanCheckedDeclaration>,
+    /// Nothing was admitted: `engine` is the checking engine's clone, so the
+    /// result root is the base root.
+    unchanged: bool,
+}
+
 /// Borrowed bytes and their authoritative module name in a closed import set.
 #[derive(Debug, Clone, Copy)]
 pub struct OleanModuleInput<'a> {
@@ -3530,7 +3540,7 @@ impl Engine {
             Err(error) => return finish(frontier_error_verdict(error), None),
         };
         let start = engine.environment.clone();
-        match engine.check_decoded_olean(job.artifact, options, limits) {
+        match engine.check_decoded_olean_unrooted(job.artifact, options, limits) {
             Ok(Outcome::Complete(checked)) => {
                 let declarations = checked.declarations.len();
                 let admitted = checked
@@ -3805,8 +3815,37 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
-        let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
+        let checked = match self.check_decoded_olean_unrooted(decoded, options, limits)? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let base_logical_root = self.logical_root(options);
+        let result_logical_root = if checked.unchanged {
+            base_logical_root
+        } else {
+            checked.engine.logical_root(options)
+        };
+        Ok(Outcome::Complete(CheckedOlean {
+            engine: checked.engine,
+            decoded: checked.decoded,
+            base_logical_root,
+            result_logical_root,
+            declarations: checked.declarations,
+        }))
+    }
+
+    /// [`Engine::check_decoded_olean`] without the two whole-environment logical
+    /// roots, for the frontier, whose rows carry neither. Each root encodes and
+    /// hashes every constant of the environment, which on a Mathlib-sized closure
+    /// is a large share of a small module's check.
+    fn check_decoded_olean_unrooted(
+        &self,
+        decoded: DecodedOlean,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<Outcome<UnrootedOlean>, OleanCheckError> {
+        let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
         if plan.order.is_empty() {
             let mut checked: Vec<OleanCheckedDeclaration> = plan
                 .already_present
@@ -3818,12 +3857,11 @@ impl Engine {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
-            return Ok(Outcome::Complete(CheckedOlean {
+            return Ok(Outcome::Complete(UnrootedOlean {
                 engine: self.clone(),
                 decoded,
-                base_logical_root,
-                result_logical_root: base_logical_root,
                 declarations: checked,
+                unchanged: true,
             }));
         }
 
@@ -3888,13 +3926,11 @@ impl Engine {
                 detail: "checked declaration count differs from the decoded declaration table",
             });
         }
-        let result_logical_root = engine.logical_root(options);
-        Ok(Outcome::Complete(CheckedOlean {
+        Ok(Outcome::Complete(UnrootedOlean {
             engine,
             decoded,
-            base_logical_root,
-            result_logical_root,
             declarations: checked,
+            unchanged: false,
         }))
     }
 
