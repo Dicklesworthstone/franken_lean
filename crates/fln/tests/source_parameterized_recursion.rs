@@ -58,7 +58,7 @@ fn generic_append_generalizes_the_trailing_list_argument() {
         "{SEQ}\
         def append {{A : Type}} (xs : Seq A) (ys : Seq A) : Seq A := match xs with | .nil => ys | .cons x tail => Seq.cons x (append tail ys)\n\
         theorem right_nil {{A : Type}} (xs : Seq A) : append xs Seq.nil = xs := by\n  induction xs with\n  | nil => rfl\n  | cons x tail ih => simp only [append, ih]\n\
-        theorem example : append (Seq.cons 1 Seq.nil) (Seq.cons 2 Seq.nil) = Seq.cons 1 (Seq.cons 2 Seq.nil) := by rfl"
+        theorem sample : append (Seq.cons 1 Seq.nil) (Seq.cons 2 Seq.nil) = Seq.cons 1 (Seq.cons 2 Seq.nil) := by rfl"
     ));
 }
 
@@ -77,7 +77,7 @@ fn multiple_uniform_parameters_keep_their_order_in_all_rules() {
         "inductive Tree (A B : Type) where | left (value : A) | right (value : B) | fork (l r : Tree A B)\n\
         def copy {A B : Type} (tree : Tree A B) : Tree A B := match tree with | .left x => Tree.left x | .right y => Tree.right y | .fork l r => Tree.fork (copy l) (copy r)\n\
         theorem copy_ok {A B : Type} (tree : Tree A B) : copy tree = tree := by\n  induction tree with\n  | left x => rfl\n  | right y => rfl\n  | fork l r hl hr => simp only [copy, hl, hr]\n\
-        def example : Tree Nat Bool := Tree.fork (Tree.left 11) (Tree.right true)",
+        def sample : Tree Nat Bool := Tree.fork (Tree.left 11) (Tree.right true)",
     );
 }
 
@@ -86,12 +86,12 @@ fn dependent_parameter_types_and_constructor_fields_remain_scoped() {
     check(
         "inductive Tagged (A : Type) (tag : A) where | nil | cons (value : A) (tail : Tagged A tag)\n\
         def size {A : Type} {tag : A} (xs : Tagged A tag) : Nat := match xs with | .nil => 0 | .cons value tail => size tail + 1\n\
-        theorem example : size (Tagged.cons 9 (Tagged.nil : Tagged Nat 7)) = 1 := by rfl",
+        theorem sample : size (Tagged.cons 9 (Tagged.nil : Tagged Nat 7)) = 1 := by rfl",
     );
     check(
         "inductive Payloads (A : Type) (P : A -> Type) where | nil | cons (x : A) (value : P x) (tail : Payloads A P)\n\
         def count {A : Type} {P : A -> Type} (xs : Payloads A P) : Nat := match xs with | .nil => 0 | .cons x value tail => count tail + 1\n\
-        theorem example : count (Payloads.cons 7 true (Payloads.nil : Payloads Nat (fun n => Bool))) = 1 := by rfl",
+        theorem sample : count (Payloads.cons 7 true (Payloads.nil : Payloads Nat (fun n => Bool))) = 1 := by rfl",
     );
 }
 

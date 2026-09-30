@@ -31,7 +31,7 @@ fn indexed_induction_computes_length_and_proves_it_equals_the_index() {
     check(&format!(
         "{VEC}{LENGTH}\
         theorem length_ok {{A : Type}} (n : Nat) (xs : Vec A n) : length n xs = n := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => simp only [length, ih]\n\
-        theorem example : length 2 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 2 := by rfl"
+        theorem sample : length 2 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 2 := by rfl"
     ));
 }
 
@@ -40,7 +40,7 @@ fn indexed_induction_can_return_data_at_the_refined_index() {
     check(&format!(
         "{VEC}{COPY}\
         theorem copy_ok {{A : Type}} (n : Nat) (xs : Vec A n) : copy n xs = xs := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => simp only [copy, ih]\n\
-        theorem example : copy 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl"
+        theorem sample : copy 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl"
     ));
 }
 
@@ -49,7 +49,7 @@ fn dependent_index_telescopes_are_abstracted_in_family_order() {
     check(
         "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (value : P a) : Witness A P a value\n\
         def extract {A : Type} {P : A -> Type} (a : A) (value : P a) (w : Witness A P a value) : P a := by\n  cases w with\n  | intro x v => exact v\n\
-        theorem example : extract 3 true (Witness.intro 3 true : Witness Nat (fun x => Bool) 3 true) = true := by rfl",
+        theorem sample : extract 3 true (Witness.intro 3 true : Witness Nat (fun x => Bool) 3 true) = true := by rfl",
     );
 }
 
@@ -59,7 +59,7 @@ fn index_dependent_proofs_and_values_are_specialized_together() {
         "{VEC}\
         theorem proof {{A : Type}} (n : Nat) (xs : Vec A n) (h : n = n) : n = n := by\n  cases xs with\n  | nil => exact h\n  | cons k x tail => exact h\n\
         def other {{A : Type}} (n : Nat) (xs ys : Vec A n) : Vec A n := by\n  cases xs with\n  | nil => exact ys\n  | cons k x tail => exact ys\n\
-        theorem example : other 1 (Vec.cons 0 7 Vec.nil) (Vec.cons 0 9 Vec.nil) = Vec.cons 0 9 Vec.nil := by rfl"
+        theorem sample : other 1 (Vec.cons 0 7 Vec.nil) (Vec.cons 0 9 Vec.nil) = Vec.cons 0 9 Vec.nil := by rfl"
     ));
 }
 
@@ -166,7 +166,7 @@ fn dependent_indexed_branches_preserve_lets_and_nested_contexts() {
     check(&format!(
         "{VEC}\
         def remembered {{A : Type}} (n : Nat) (xs : Vec A n) : Nat := let saved := n; by\n  cases xs with\n  | nil => exact saved\n  | cons k x tail => exact saved\n\
-        theorem example : remembered 1 (Vec.cons 0 7 Vec.nil) = 1 := by rfl"
+        theorem sample : remembered 1 (Vec.cons 0 7 Vec.nil) = 1 := by rfl"
     ));
     check(&format!(
         "{VEC}\

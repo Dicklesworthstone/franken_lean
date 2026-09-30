@@ -171,8 +171,8 @@ fn indexed_recursion_tracks_each_childs_distinct_multiple_indices() {
 def weight {A : Type} (from to : A) (path : Path A from to) : Nat := match path with
   | .refl a => 1
   | .step a b c left right => weight a b left + weight b c right
-def example : Path Nat 7 7 := Path.step 7 7 7 (Path.refl 7) (Path.refl 7)
-theorem ok : weight 7 7 example = 2 := by rfl",
+def sample : Path Nat 7 7 := Path.step 7 7 7 (Path.refl 7) (Path.refl 7)
+theorem ok : weight 7 7 sample = 2 := by rfl",
     );
 }
 
