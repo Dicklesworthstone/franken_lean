@@ -3842,15 +3842,15 @@ impl Engine {
             };
             declarations.push(unit.declaration.clone());
         }
-        let admitted = match self
-            .admit_declarations(&declarations, options, limits.admission)
+        let (engine, checkers) = match self
+            .admit_declarations_unrooted(&declarations, options, limits.admission)
             .map_err(OleanCheckError::Admission)?
         {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        if admitted.admissions.len() != plan.order.len() {
+        if checkers.len() != plan.order.len() {
             return Err(OleanCheckError::InternalInvariant {
                 detail: "admission result count differs from the authority-unit plan",
             });
@@ -3862,7 +3862,7 @@ impl Engine {
                 resource: ".olean completed declaration records",
                 requested: decoded.constants.len(),
             })?;
-        for (unit_index, admission) in plan.order.iter().zip(&admitted.admissions) {
+        for (unit_index, checker) in plan.order.iter().zip(&checkers) {
             let Some(unit) = plan.units.get(*unit_index) else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "completed declaration unit is outside the unit table",
@@ -3871,17 +3871,14 @@ impl Engine {
             for name in &unit.names {
                 checked.push(OleanCheckedDeclaration {
                     name: name.clone(),
-                    checker: admission.checker,
+                    checker: *checker,
                 });
             }
         }
         for (name, checker) in plan.already_present {
             checked.push(OleanCheckedDeclaration { name, checker });
         }
-        match admitted
-            .engine
-            .recheck_subsumed_repeats(plan.subsumed, options, limits.admission)?
-        {
+        match engine.recheck_subsumed_repeats(plan.subsumed, options, limits.admission)? {
             Outcome::Complete(rechecked) => checked.extend(rechecked),
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -3891,11 +3888,12 @@ impl Engine {
                 detail: "checked declaration count differs from the decoded declaration table",
             });
         }
+        let result_logical_root = engine.logical_root(options);
         Ok(Outcome::Complete(CheckedOlean {
-            engine: admitted.engine,
+            engine,
             decoded,
-            base_logical_root: admitted.base_logical_root,
-            result_logical_root: admitted.result_logical_root,
+            base_logical_root,
+            result_logical_root,
             declarations: checked,
         }))
     }
@@ -3932,7 +3930,7 @@ impl Engine {
                         }
                     }
                     match self
-                        .admit_declaration(Declaration::Thm(theorem), options, limits)
+                        .admit_declaration_unrooted(Declaration::Thm(theorem), options, limits)
                         .map_err(OleanCheckError::Admission)?
                     {
                         Outcome::Complete(admission) => admission.checker,
@@ -3975,6 +3973,33 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
+        let admitted = match self.admit_declaration_unrooted(declaration, options, limits)? {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // `self` is immutable, so its root is the same before or after the council.
+        let base_logical_root = self.logical_root(options);
+        let result_logical_root = admitted.engine.environment.logical_root(options);
+        Ok(Outcome::Complete(DeclarationAdmission {
+            engine: admitted.engine,
+            declaration: admitted.declaration,
+            base_logical_root,
+            result_logical_root,
+            checker: admitted.checker,
+        }))
+    }
+
+    /// [`Self::admit_declaration`] without the two logical roots. Each root is a
+    /// pass over the whole environment (every constant's name encoded and sorted),
+    /// about 0.8 s at Mathlib's 133K constants; the `.olean` check admits a module
+    /// one declaration at a time and reads neither, so it pays for them nowhere.
+    fn admit_declaration_unrooted(
+        &self,
+        declaration: Declaration,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
         if !matches!(
             declaration,
             Declaration::Axiom(_)
@@ -3990,7 +4015,6 @@ impl Engine {
             });
         }
 
-        let base_logical_root = self.logical_root(options);
         let checker_review = review_with_independent_checker(
             &self.environment,
             self.checker_environment.as_ref(),
@@ -4064,9 +4088,8 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let result_logical_root = environment.logical_root(options);
 
-        Ok(Outcome::Complete(DeclarationAdmission {
+        Ok(Outcome::Complete(UnrootedAdmission {
             engine: Engine {
                 environment,
                 checker_environment: Some(checker_environment),
@@ -4081,10 +4104,47 @@ impl Engine {
                 options: options.clone(),
             },
             declaration,
-            base_logical_root,
-            result_logical_root,
             checker,
         }))
+    }
+
+    /// The `.olean` check's batch: [`Self::admit_declarations`] without the root
+    /// transitions it records for continuity checks, which the check never reads.
+    /// A Mathlib module of a few hundred declarations spent most of its council
+    /// time recomputing them, two whole-environment passes per declaration.
+    fn admit_declarations_unrooted(
+        &self,
+        declarations: &[Declaration],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<(Engine, Vec<CheckerAgreement>)>, EngineAdmissionError> {
+        if declarations.is_empty() {
+            return Err(EngineAdmissionError::EmptyBatch);
+        }
+        let mut checkers = Vec::new();
+        checkers
+            .try_reserve_exact(declarations.len())
+            .map_err(|_| EngineAdmissionError::AllocationFailure {
+                resource: "declaration batch results",
+                requested: declarations.len(),
+            })?;
+        let mut engine = self.clone();
+        for (index, declaration) in declarations.iter().cloned().enumerate() {
+            let admitted = match engine.admit_declaration_unrooted(declaration, options, limits) {
+                Ok(Outcome::Complete(admitted)) => admitted,
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+                Err(error) => {
+                    return Err(EngineAdmissionError::BatchDeclaration {
+                        index,
+                        error: Box::new(error),
+                    });
+                }
+            };
+            engine = admitted.engine;
+            checkers.push(admitted.checker);
+        }
+        Ok(Outcome::Complete((engine, checkers)))
     }
 
     /// Admit and publish a nonempty declaration sequence atomically.
@@ -7716,6 +7776,14 @@ pub struct DeclarationAdmission {
     pub result_logical_root: LogicalRoot,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+}
+
+/// One admission without its root transition: what
+/// `Engine::admit_declaration_unrooted` returns, and all the `.olean` check reads.
+struct UnrootedAdmission {
+    engine: Engine,
+    declaration: Declaration,
+    checker: CheckerAgreement,
 }
 
 /// The authoritative result of one atomic nonempty admission batch.
