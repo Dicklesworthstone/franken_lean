@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 #[path = "support/mutual.rs"]
 mod fixtures;
+#[path = "support/safety.rs"]
+mod safety;
 use fixtures::{Fixture, Mutation, fixture};
 use fln_checker::admit::{
     AdmissionBudget, InductiveRejection, InductiveSupportLimit, InductiveVerdict, admit_inductive,
@@ -374,4 +376,121 @@ fn inconsistent_sorts_and_universe_telescopes_cannot_gain_mutual_admission() {
     let mut f = fixture(true, false, false, 2, Mutation::None);
     f.rec_levels[0] = fixtures::name("u");
     assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+}
+
+#[test]
+fn unsafe_mutual_blocks_support_parameters_indices_and_negative_function_domains() {
+    for f in [
+        fixture(false, false, false, 3, Mutation::None),
+        fixture(true, true, false, 2, Mutation::None),
+        fixture(true, true, true, 2, Mutation::None),
+        fixture(true, false, true, 3, Mutation::NegativeCrossFamily),
+    ] {
+        let rs = safety::unsafe_rows(&rows(&f));
+        let result = verdict(&rs);
+        assert!(result.is_admitted(), "{result:?}");
+        let mut reversed = rs;
+        reversed.reverse();
+        assert!(verdict(&reversed).is_admitted());
+    }
+    assert!(matches!(
+        verdict(&rows(&fixture(
+            true,
+            false,
+            true,
+            3,
+            Mutation::NegativeCrossFamily
+        ))),
+        InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { .. })
+    ));
+}
+
+#[test]
+fn unsafe_mutual_blocks_reject_mixed_safety_and_forged_recursors() {
+    let rs = safety::unsafe_rows(&rows(&fixture(
+        true,
+        false,
+        true,
+        3,
+        Mutation::NegativeCrossFamily,
+    )));
+    for i in 0..rs.len() {
+        let mut changed = rs.clone();
+        changed[i] = safety::retag(&changed[i], ConstantSafety::Safe);
+        let result = verdict(&changed);
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "row {i}: {result:?}"
+        );
+    }
+    for mutation in [
+        Mutation::WrongCallFamily,
+        Mutation::SwapMotives,
+        Mutation::SwapMinors,
+        Mutation::MissingInductionHypothesis,
+        Mutation::MissingArgumentLambda,
+        Mutation::WrongChildIndex,
+        Mutation::FalseRecursive,
+        Mutation::FalseReflexive,
+    ] {
+        let result = verdict(&safety::unsafe_rows(&rows(&fixture(
+            true, true, true, 2, mutation,
+        ))));
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "{mutation:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn unsafe_mutual_admission_stops_atomically_and_retries() {
+    let rs = safety::unsafe_rows(&rows(&fixture(
+        true,
+        false,
+        true,
+        2,
+        Mutation::NegativeCrossFamily,
+    )));
+    let base = empty();
+    let before = base.clone();
+    let mut polls = 0;
+    assert!(
+        admit_inductive_with(
+            &base,
+            &rs,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+            || {
+                polls += 1;
+                false
+            }
+        )
+        .is_admitted()
+    );
+    for stop in [1, 10, polls / 2, polls - 1, polls] {
+        let mut calls = 0;
+        let result = admit_inductive_with(
+            &base,
+            &rs,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+            || {
+                calls += 1;
+                calls >= stop
+            },
+        );
+        assert!(
+            matches!(result, InductiveVerdict::Inconclusive(_)),
+            "{result:?}"
+        );
+    }
+    let mut budget = AdmissionBudget::unlimited();
+    budget.conversion.quick.max_comparisons = 1;
+    assert!(matches!(
+        admit_inductive(&base, &rs, budget, EnvironmentBudget::unlimited()),
+        InductiveVerdict::Inconclusive(_)
+    ));
+    assert_eq!(base, before);
+    assert!(verdict(&rs).is_admitted());
 }

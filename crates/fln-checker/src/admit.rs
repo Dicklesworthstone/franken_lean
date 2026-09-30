@@ -8029,25 +8029,32 @@ pub fn admit_inductive_with(
             name: name.clone(),
         });
     };
-    if declaration.safety() != ConstantSafety::Safe {
-        // The pin admits an unsafe family as it admits a safe one, except that
-        // it skips positivity (`inductive.cpp:443` of the vendored source) and
-        // checks every member in unsafe mode (`:171`). The parameter-free route
-        // judges one: each member's type is checked in its own safety mode, and
-        // a recursive field must be a direct occurrence, so skipping positivity
-        // admits nothing more there. A safe family of any other shape has a
-        // route of its own, so an unsafe one of that shape stays deferred as
-        // unsafe rather than under a shape limit that would not hold.
-        if !declaration.level_parameters().is_empty()
-            || metadata.mutual() != std::slice::from_ref(name)
-            || metadata.num_parameters() != 0
-            || metadata.num_indices() != 0
-            || metadata.num_nested() != 0
-            || metadata.is_reflexive()
-        {
+    if declaration.safety() == ConstantSafety::Unsafe {
+        // Unsafe changes the checking quarantine and skips KR-606, not the
+        // telescope, universe, metadata or recursor reconstruction laws.
+        // Keep the original direct, parameter-free route and its resource
+        // behavior; larger families use the same constructor-derived engine
+        // as safe families, without the safe-only fixed-name seed routes.
+        if metadata.num_nested() != 0 {
             return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
         }
-        return admit_parameter_free(
+        if declaration.level_parameters().is_empty()
+            && metadata.mutual() == std::slice::from_ref(name)
+            && metadata.num_parameters() == 0
+            && metadata.num_indices() == 0
+            && !metadata.is_reflexive()
+        {
+            return admit_parameter_free(
+                environment,
+                declarations,
+                inductive,
+                budget,
+                environment_budget,
+                &mut comparison,
+                &mut cancelled,
+            );
+        }
+        return uniform::admit(
             environment,
             declarations,
             inductive,

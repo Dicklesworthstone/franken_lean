@@ -1117,6 +1117,7 @@ pub(in crate::admit) fn admit(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> InductiveVerdict {
     let mut audit = Audit {
+        safety: inductive.declaration().safety(),
         budget,
         comparison,
         cancelled,

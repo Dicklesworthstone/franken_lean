@@ -1,6 +1,8 @@
 //! Hand-built recursor fixtures; neither source nor primary inductive generator.
 #![forbid(unsafe_code)]
 use super::*;
+#[path = "../support/safety.rs"]
+mod safety;
 use fln_checker::admit::{InductiveRejection, InductiveVerdict};
 use fln_core::expr::FVarId;
 #[derive(Clone)]
@@ -46,6 +48,7 @@ enum Mutation {
     WrongMinor,
     WrongUniverse,
     Negative,
+    NegativeOnly,
 }
 fn fixture(mutation: Mutation) -> Vec<ConstantEntry> {
     let a = B::new("A", Expr::sort(Level::one()));
@@ -53,7 +56,7 @@ fn fixture(mutation: Mutation) -> Vec<ConstantEntry> {
     let leaf_value = B::new("value", a.e());
     let first = B::new(
         "x",
-        if matches!(mutation, Mutation::Negative) {
+        if matches!(mutation, Mutation::Negative | Mutation::NegativeOnly) {
             family.clone()
         } else {
             a.e()
@@ -63,7 +66,15 @@ fn fixture(mutation: Mutation) -> Vec<ConstantEntry> {
     let seed = B::new("seed", a.e());
     let children = B::new(
         "children",
-        close(&[first.clone(), second.clone()], family.clone(), false),
+        close(
+            &[first.clone(), second.clone()],
+            if matches!(mutation, Mutation::NegativeOnly) {
+                a.e()
+            } else {
+                family.clone()
+            },
+            false,
+        ),
     );
     let major = B::new("major", family.clone());
     let motive = B::new(
@@ -99,7 +110,11 @@ fn fixture(mutation: Mutation) -> Vec<ConstantEntry> {
     let m1 = B::new(
         "fork",
         close(
-            &[seed.clone(), children.clone(), ih.clone()],
+            &if matches!(mutation, Mutation::NegativeOnly) {
+                vec![seed.clone(), children.clone()]
+            } else {
+                vec![seed.clone(), children.clone(), ih.clone()]
+            },
             app(motive.e(), [fork]),
             false,
         ),
@@ -138,6 +153,8 @@ fn fixture(mutation: Mutation) -> Vec<ConstantEntry> {
     };
     let rhs = if matches!(mutation, Mutation::WrongMinor) {
         app(m0.e(), [seed.e()])
+    } else if matches!(mutation, Mutation::NegativeOnly) {
+        app(m1.e(), [seed.e(), children.e()])
     } else {
         app(m1.e(), [seed.e(), children.e(), ih_value])
     };
@@ -302,4 +319,122 @@ fn higher_order_admission_resource_and_cancellation_stops_are_recoverable() {
     );
     assert_eq!(env, before);
     assert!(verdict(Mutation::None).is_admitted());
+}
+
+#[test]
+fn unsafe_parameterized_functions_keep_checked_recursors_without_positivity() {
+    for mutation in [Mutation::None, Mutation::Negative, Mutation::NegativeOnly] {
+        let result = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &safety::unsafe_rows(&fixture(mutation)),
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(result.is_admitted(), "{result:?}");
+    }
+    // A negative-only field has no IH, but both KR-607 occurrence flags are true.
+    // Both kinds of negative occurrence must still fail the SAFE judgment.
+    for mutation in [Mutation::Negative, Mutation::NegativeOnly] {
+        assert!(matches!(
+            verdict(mutation),
+            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { .. })
+        ));
+    }
+}
+
+#[test]
+fn unsafe_parameterized_family_cannot_forge_its_safety_flags_or_computation_rules() {
+    for mutation in [
+        Mutation::FalseRecursive,
+        Mutation::FalseReflexive,
+        Mutation::WrongMinor,
+        Mutation::WrongUniverse,
+        Mutation::SwapChildrenArguments,
+        Mutation::MissingLambda,
+    ] {
+        let result = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &safety::unsafe_rows(&fixture(mutation)),
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "{result:?}"
+        );
+    }
+    let original = safety::unsafe_rows(&fixture(Mutation::Negative));
+    for i in 1..original.len() {
+        let mut rows = original.clone();
+        rows[i] = safety::retag(&rows[i], ConstantSafety::Safe);
+        let result = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &rows,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "row {i}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn unsafe_parameterized_family_retains_safe_reference_quarantine() {
+    use fln_checker::infer::{
+        InferenceContext, InferenceMode, InferenceOutcome, InferenceRefusal, infer,
+    };
+    let rows = safety::unsafe_rows(&fixture(Mutation::NegativeOnly));
+    assert!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &rows,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        )
+        .is_admitted()
+    );
+    let env = environment_of(rows.clone());
+    let context = InferenceContext::empty(env);
+    for row in &rows {
+        let term = if row.name() == &checker_qualified(&["Higher", "rec"]) {
+            decoded(&constant("Higher.rec", vec![Level::one()]))
+        } else if row.name() == &checker_name("Higher") {
+            decoded(&constant("Higher", vec![]))
+        } else if row.name() == &checker_qualified(&["Higher", "leaf"]) {
+            decoded(&constant("Higher.leaf", vec![]))
+        } else {
+            decoded(&constant("Higher.fork", vec![]))
+        };
+        let result = infer(
+            &term,
+            &context,
+            InferenceMode::Checking {
+                declaration_safety: DefinitionSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                result,
+                InferenceOutcome::Refused {
+                    refusal: InferenceRefusal::UnsafeConstant { .. },
+                    ..
+                }
+            ),
+            "safe reference: {result:?}"
+        );
+        assert!(matches!(
+            infer(
+                &term,
+                &context,
+                InferenceMode::Checking {
+                    declaration_safety: DefinitionSafety::Unsafe,
+                },
+                InferenceBudget::unlimited()
+            ),
+            InferenceOutcome::Complete(_)
+        ));
+    }
 }

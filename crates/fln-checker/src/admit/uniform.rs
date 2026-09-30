@@ -47,6 +47,9 @@ struct Shape<'a> {
     motive_universe: Option<&'a WireName>,
 }
 struct Audit<'a> {
+    // The block's declared safety controls only positivity and the inference
+    // quarantine. Every constructor/recursor must carry this same safety.
+    safety: ConstantSafety,
     budget: AdmissionBudget,
     comparison: &'a mut StructuralComparisonControl,
     cancelled: &'a mut dyn FnMut() -> bool,
@@ -120,6 +123,44 @@ pub(super) fn proposition_result(declaration: &ConstantDeclaration, count: u32) 
 }
 
 impl Audit<'_> {
+    fn checking_safety(&self) -> DefinitionSafety {
+        match self.safety {
+            ConstantSafety::Safe => DefinitionSafety::Safe,
+            ConstantSafety::Unsafe => DefinitionSafety::Unsafe,
+        }
+    }
+
+    /// KR-607 inspects occurrences, not the induction hypotheses generated for
+    /// them. In unsafe blocks a negative/nonuniform field can mention a family
+    /// without being a recursive argument of its recursor (KR-605/801).
+    fn occurrence_flags(
+        &mut self,
+        fields: &[Binder],
+        names: &[WireName],
+    ) -> Result<(bool, bool), InductiveVerdict> {
+        let mut recursive = false;
+        let mut reflexive = false;
+        for field in fields {
+            self.tick()?;
+            let probe = ConstructorField {
+                source: &field.domain,
+                name: &field.name,
+                style: field.style,
+                type_root: field.domain.root(),
+            };
+            for name in names {
+                if field_mentions_inductive(&probe, name, self.comparison, self.cancelled)? {
+                    recursive = true;
+                    reflexive |= matches!(
+                        field.domain.node(field.domain.root()),
+                        Some(ExprNode::Forall { .. })
+                    );
+                    break;
+                }
+            }
+        }
+        Ok((recursive, reflexive))
+    }
     fn tick(&mut self) -> Result<(), InductiveVerdict> {
         self.comparison
             .comparison(self.cancelled)
@@ -334,7 +375,9 @@ impl Audit<'_> {
                         style: BinderStyle::Default,
                         type_root: *binder_type,
                     };
-                    if field_mentions_inductive(&probe, name, self.comparison, self.cancelled)? {
+                    if self.safety == ConstantSafety::Safe
+                        && field_mentions_inductive(&probe, name, self.comparison, self.cancelled)?
+                    {
                         return Err(constructor_error(name));
                     }
                     count = count.saturating_add(1);
@@ -817,6 +860,7 @@ pub(super) fn admit(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> InductiveVerdict {
     let mut audit = Audit {
+        safety: inductive.declaration().safety(),
         budget,
         comparison,
         cancelled,
@@ -873,6 +917,18 @@ fn check(
                 observed: p.saturating_add(q),
                 limit: MAX_NONRECURSIVE_FIELDS,
             },
+        ));
+    }
+    // Reject an impossible claimed telescope rather than treating malformed
+    // parameter metadata as an unsupported unsafe declaration.
+    if peel_binders_at(declaration.type_(), declaration.type_().root(), p + q).is_none() {
+        return Err(constructor_error(name));
+    }
+    if !positive_result(declaration, (p + q) as u32)
+        && !proposition_result(declaration, (p + q) as u32)
+    {
+        return Err(InductiveVerdict::Deferred(
+            InductiveSupportLimit::ResultUniverse,
         ));
     }
     let n = metadata.constructors().len();
@@ -953,6 +1009,7 @@ fn check(
     let mut constructors = Vec::with_capacity(n);
     let mut seen_constructors = BTreeSet::new();
     let mut total_fields = 0usize;
+    let mut unsafe_flags = (false, false);
     for (index, ctor_name) in metadata.constructors().iter().enumerate() {
         audit.tick()?;
         if !seen_constructors.insert(ctor_name) {
@@ -984,7 +1041,7 @@ fn check(
                 },
             ));
         }
-        if decl.safety() != ConstantSafety::Safe
+        if decl.safety() != audit.safety
             || decl.level_parameters() != levels
             || cm.inductive() != name
             || cm.index() as usize != index
@@ -1006,6 +1063,12 @@ fn check(
             return Err(constructor_error(ctor_name));
         }
         let (fields, result) = audit.peel(&field_tail, f)?;
+        if audit.safety == ConstantSafety::Unsafe {
+            let (recursive, reflexive) =
+                audit.occurrence_flags(&fields, std::slice::from_ref(name))?;
+            unsafe_flags.0 |= recursive;
+            unsafe_flags.1 |= reflexive;
+        }
         let result_indices = audit
             .family_indices(&result, name, levels, p, f, q)?
             .ok_or_else(|| constructor_error(ctor_name))?;
@@ -1016,7 +1079,7 @@ fn check(
                 audit.recursive_field(&field.domain, name, levels, p, field_index, q)?
             {
                 recursive.push(child);
-            } else {
+            } else if audit.safety == ConstantSafety::Safe {
                 let probe = ConstructorField {
                     source: &field.domain,
                     name: &field.name,
@@ -1035,7 +1098,7 @@ fn check(
                 ctor_name,
                 &open,
                 &context,
-                DefinitionSafety::Safe,
+                audit.checking_safety(),
                 &audit.budget,
                 audit.cancelled,
             )
@@ -1079,13 +1142,18 @@ fn check(
             result_indices,
         });
     }
-    let reflexive = constructors
-        .iter()
-        .flat_map(|c| &c.recursive)
-        .any(|field| !field.arguments.is_empty());
-    if metadata.is_reflexive() != reflexive
-        || metadata.is_recursive() != constructors.iter().any(|c| !c.recursive.is_empty())
-    {
+    let (recursive, reflexive) = if audit.safety == ConstantSafety::Unsafe {
+        unsafe_flags
+    } else {
+        (
+            constructors.iter().any(|c| !c.recursive.is_empty()),
+            constructors
+                .iter()
+                .flat_map(|c| &c.recursive)
+                .any(|field| !field.arguments.is_empty()),
+        )
+    };
+    if metadata.is_reflexive() != reflexive || metadata.is_recursive() != recursive {
         return Err(constructor_error(name));
     }
     let rec_name = checker_child(name, "rec");
@@ -1110,7 +1178,7 @@ fn check(
         rec_levels == levels
     };
     let k_target = proposition && n == 1 && constructors[0].fields.is_empty();
-    if rec_decl.safety() != ConstantSafety::Safe
+    if rec_decl.safety() != audit.safety
         || !level_policy
         || rec.mutual() != std::slice::from_ref(name)
         || rec.num_parameters() as usize != p
@@ -1193,6 +1261,7 @@ mod annotation_tests {
         let mut control = StructuralComparisonControl::new(budget.conversion.quick);
         let mut poll = || cancelled;
         let mut audit = Audit {
+            safety: ConstantSafety::Safe,
             budget,
             comparison: &mut control,
             cancelled: &mut poll,
@@ -1375,6 +1444,7 @@ mod annotation_tests {
         let mut control = StructuralComparisonControl::new(budget.conversion.quick);
         let mut poll = || cancelled;
         let mut audit = Audit {
+            safety: ConstantSafety::Safe,
             budget,
             comparison: &mut control,
             cancelled: &mut poll,

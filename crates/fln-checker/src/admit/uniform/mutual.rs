@@ -1,4 +1,4 @@
-//! Independent reconstruction of a bounded, safe mutual data-inductive block.
+//! Independent reconstruction of a bounded mutual data-inductive block.
 //!
 //! All type headers are checked against the predecessor before any are staged.
 //! Constructor telescopes determine the ordered motives, minors and recursive
@@ -71,7 +71,9 @@ impl Block<'_> {
                 Some(ExprNode::Forall {
                     binder_type, body, ..
                 }) => {
-                    if mentions_any(audit, term, *binder_type, &self.names)? {
+                    if audit.safety == ConstantSafety::Safe
+                        && mentions_any(audit, term, *binder_type, &self.names)?
+                    {
                         return Err(constructor_error(&self.names[0]));
                     }
                     tail = *body;
@@ -89,12 +91,22 @@ impl Block<'_> {
                 field,
                 info.indices.len(),
             )? {
+                let mut valid = true;
                 for index in &recursive.indices {
                     if mentions_any(audit, index, index.root(), &self.names)? {
-                        return Err(constructor_error(info.entry.name()));
+                        valid = false;
+                        break;
                     }
                 }
-                return Ok(Some(Child { family, recursive }));
+                if valid {
+                    return Ok(Some(Child { family, recursive }));
+                }
+                if audit.safety == ConstantSafety::Safe {
+                    return Err(constructor_error(info.entry.name()));
+                }
+                // Unsafe fields still need KR-605 to receive an induction
+                // hypothesis. A cross-family index occurrence is an ordinary
+                // field, not permission to construct an invalid recursive call.
             }
         }
         if mentions_any(audit, term, term.root(), &self.names)? {
@@ -104,7 +116,9 @@ impl Block<'_> {
             if let Some(reduced) = reduced_codomain(audit, term)? {
                 return self.child(audit, &reduced, field);
             }
-            return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Recursive));
+            if audit.safety == ConstantSafety::Safe {
+                return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Recursive));
+            }
         }
         Ok(None)
     }
@@ -386,6 +400,7 @@ pub(in crate::admit) fn admit(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> InductiveVerdict {
     let mut audit = Audit {
+        safety: inductive.declaration().safety(),
         budget,
         comparison,
         cancelled,
@@ -499,8 +514,8 @@ pub(super) fn check(
         let metadata = declaration
             .inductive_metadata()
             .ok_or_else(|| constructor_error(name))?;
-        if declaration.safety() != ConstantSafety::Safe {
-            return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe));
+        if declaration.safety() != audit.safety {
+            return Err(constructor_error(name));
         }
         if metadata.num_nested() != 0 {
             return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
@@ -589,6 +604,7 @@ pub(super) fn check(
     }
     let mut constructor_names = BTreeSet::new();
     let mut total_fields = 0usize;
+    let mut unsafe_flags = (false, false);
     for family in 0..block.families.len() {
         let info = &block.families[family];
         let metadata = info
@@ -620,7 +636,7 @@ pub(super) fn check(
             if total_fields > MAX_NONRECURSIVE_FIELDS {
                 return Err(field_limit(total_fields));
             }
-            if declaration.safety() != ConstantSafety::Safe
+            if declaration.safety() != audit.safety
                 || declaration.level_parameters() != block.levels
                 || cm.inductive() != info.entry.name()
                 || cm.index() as usize != index
@@ -640,6 +656,11 @@ pub(super) fn check(
                 return Err(constructor_error(name));
             }
             let (fields, result) = audit.peel(&tail, f)?;
+            if audit.safety == ConstantSafety::Unsafe {
+                let (recursive, reflexive) = audit.occurrence_flags(&fields, &block.names)?;
+                unsafe_flags.0 |= recursive;
+                unsafe_flags.1 |= reflexive;
+            }
             let result_indices = audit
                 .family_indices(
                     &result,
@@ -672,7 +693,7 @@ pub(super) fn check(
                     name,
                     &open,
                     &context,
-                    DefinitionSafety::Safe,
+                    audit.checking_safety(),
                     &audit.budget,
                     audit.cancelled,
                 )
@@ -702,12 +723,18 @@ pub(super) fn check(
             });
         }
     }
-    let recursive = block.minors.iter().any(|c| !c.children.is_empty());
-    let reflexive = block
-        .minors
-        .iter()
-        .flat_map(|c| &c.children)
-        .any(|c| !c.recursive.arguments.is_empty());
+    let (recursive, reflexive) = if audit.safety == ConstantSafety::Unsafe {
+        unsafe_flags
+    } else {
+        (
+            block.minors.iter().any(|c| !c.children.is_empty()),
+            block
+                .minors
+                .iter()
+                .flat_map(|c| &c.children)
+                .any(|c| !c.recursive.arguments.is_empty()),
+        )
+    };
     for family in &block.families {
         let metadata = family
             .entry
@@ -748,7 +775,7 @@ pub(super) fn check(
             .recursor_metadata()
             .ok_or_else(|| recursor_error(&name))?;
         let levels = declaration.level_parameters();
-        if declaration.safety() != ConstantSafety::Safe
+        if declaration.safety() != audit.safety
             || levels.len() != block.levels.len() + 1
             || levels[1..] != block.levels
             || block.levels.contains(&levels[0])

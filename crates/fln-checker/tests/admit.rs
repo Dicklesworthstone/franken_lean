@@ -12427,11 +12427,10 @@ fn an_unsafe_family_refuses_members_of_another_safety() {
     );
 }
 
-/// Only the parameter-free route judges an unsafe family. One with a
-/// parameter would be admitted by another route if it were safe, so it is
-/// deferred as unsafe, not under the parameter-free route's own shape limit.
+/// Extending the unsafe route must not make a claimed parameter into a real
+/// binder: this unchanged malformed input has one parameter but no telescope.
 #[test]
-fn an_unsafe_family_off_the_parameter_free_route_stays_deferred_as_unsafe() {
+fn an_unsafe_family_with_forged_parameter_metadata_is_rejected() {
     let mut entries = handle_box_entries(
         ConstantSafety::Unsafe,
         ConstantSafety::Unsafe,
@@ -12464,8 +12463,8 @@ fn an_unsafe_family_off_the_parameter_free_route_stays_deferred_as_unsafe() {
     assert!(
         matches!(
             verdict,
-            fln_checker::admit::InductiveVerdict::Deferred(
-                fln_checker::admit::InductiveSupportLimit::Unsafe
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
             )
         ),
         "a parameterized unsafe family: {verdict:?}"
