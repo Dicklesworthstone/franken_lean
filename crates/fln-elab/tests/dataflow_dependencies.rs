@@ -51,12 +51,19 @@ fn dependencies(graph: &DataflowGraph, id: usize) -> HashSet<CommandId> {
 fn barriers_order_both_predecessors_and_successors() {
     let mut graph = DataflowGraph::new();
     graph.add_node(node(0, EffectSummary::new()));
-    graph.add_node(node(1, effects([CommandEffect::Opaque { reason: "syntax".into() }])));
+    graph.add_node(node(
+        1,
+        effects([CommandEffect::Opaque {
+            reason: "syntax".into(),
+        }]),
+    ));
     graph.add_node(node(2, EffectSummary::new()));
     assert_eq!(dependencies(&graph, 1), HashSet::from([CommandId(0)]));
     assert_eq!(dependencies(&graph, 2), HashSet::from([CommandId(1)]));
-    assert_eq!(graph.affected_commands(&[CommandId(0)]).unwrap(),
-        vec![CommandId(0), CommandId(1), CommandId(2)]);
+    assert_eq!(
+        graph.affected_commands(&[CommandId(0)]).unwrap(),
+        vec![CommandId(0), CommandId(1), CommandId(2)]
+    );
 }
 
 #[test]
@@ -68,10 +75,18 @@ fn raw_war_and_waw_dependencies_are_bidirectionally_indexed() {
     graph.add_node(node(3, effects([write("absent")])));
     assert_eq!(dependencies(&graph, 1), HashSet::from([CommandId(0)]));
     assert!(dependencies(&graph, 2).contains(&CommandId(1)));
-    assert_eq!(dependencies(&graph, 3), HashSet::from([CommandId(0), CommandId(1), CommandId(2)]));
+    assert_eq!(
+        dependencies(&graph, 3),
+        HashSet::from([CommandId(0), CommandId(1), CommandId(2)])
+    );
     for current in graph.nodes() {
         for predecessor in graph.dependencies_of(current.id).unwrap() {
-            assert!(graph.dependents_of(*predecessor).unwrap().contains(&current.id));
+            assert!(
+                graph
+                    .dependents_of(*predecessor)
+                    .unwrap()
+                    .contains(&current.id)
+            );
         }
     }
 }
@@ -94,10 +109,23 @@ fn primary_and_secondary_names_join_typed_effects() {
 #[test]
 fn instance_and_grammar_dependencies_do_not_require_name_references() {
     let pairs = [
-        (CommandEffect::WritesInstance { class_head: name("C"), instance_name: name("i") },
-         CommandEffect::ReadsInstances { class_head: name("C") }),
-        (CommandEffect::WritesGrammar { category: name("term") },
-         CommandEffect::ReadsGrammar { category: name("term") }),
+        (
+            CommandEffect::WritesInstance {
+                class_head: name("C"),
+                instance_name: name("i"),
+            },
+            CommandEffect::ReadsInstances {
+                class_head: name("C"),
+            },
+        ),
+        (
+            CommandEffect::WritesGrammar {
+                category: name("term"),
+            },
+            CommandEffect::ReadsGrammar {
+                category: name("term"),
+            },
+        ),
     ];
     for (writer, reader) in pairs {
         for pair in [[writer.clone(), reader.clone()], [reader, writer]] {
@@ -112,16 +140,24 @@ fn instance_and_grammar_dependencies_do_not_require_name_references() {
 #[test]
 fn ambient_capabilities_and_generic_extension_writes_are_barriers() {
     for effect in [
-        CommandEffect::UsesCapability { capability_id: "filesystem".into() },
-        CommandEffect::WritesEnvExtension { extension_name: name("unknown") },
+        CommandEffect::UsesCapability {
+            capability_id: "filesystem".into(),
+        },
+        CommandEffect::WritesEnvExtension {
+            extension_name: name("unknown"),
+        },
     ] {
         let barrier = effects([effect]);
         assert!(barrier.is_barrier());
         assert!(!barrier.is_replay_safe());
         for observer in [
             EffectSummary::new(),
-            effects([CommandEffect::ReadsOption { key: "trace".into() }]),
-            effects([CommandEffect::ReadsSimpSet { simp_name: name("simp") }]),
+            effects([CommandEffect::ReadsOption {
+                key: "trace".into(),
+            }]),
+            effects([CommandEffect::ReadsSimpSet {
+                simp_name: name("simp"),
+            }]),
         ] {
             assert!(!barrier.commutes_with(&observer));
             assert!(!observer.commutes_with(&barrier));
@@ -132,8 +168,13 @@ fn ambient_capabilities_and_generic_extension_writes_are_barriers() {
 #[test]
 fn registry_writes_cannot_be_replayed_without_their_deltas() {
     for effect in [
-        CommandEffect::WritesInstance { class_head: name("C"), instance_name: name("i") },
-        CommandEffect::WritesGrammar { category: name("term") },
+        CommandEffect::WritesInstance {
+            class_head: name("C"),
+            instance_name: name("i"),
+        },
+        CommandEffect::WritesGrammar {
+            category: name("term"),
+        },
     ] {
         assert!(!effects([effect]).is_replay_safe());
     }
@@ -146,7 +187,10 @@ fn disjoint_commands_stay_independent() {
     graph.add_node(node(0, effects([read("a"), write("b")])));
     graph.add_node(node(1, effects([read("a"), write("c")])));
     assert!(dependencies(&graph, 1).is_empty());
-    assert_eq!(graph.affected_commands(&[CommandId(0)]).unwrap(), vec![CommandId(0)]);
+    assert_eq!(
+        graph.affected_commands(&[CommandId(0)]).unwrap(),
+        vec![CommandId(0)]
+    );
 }
 
 #[test]
@@ -157,8 +201,12 @@ fn transitive_diamond_invalidation_is_deduplicated_and_source_ordered() {
     graph.add_node(node(90, effects([read("a"), write("c")])));
     graph.add_node(node(1, effects([read("b"), read("c")])));
     graph.add_node(node(8, effects([write("unrelated")])));
-    assert_eq!(graph.affected_commands(&[CommandId(40), CommandId(40)]).unwrap(),
-        vec![CommandId(40), CommandId(3), CommandId(90), CommandId(1)]);
+    assert_eq!(
+        graph
+            .affected_commands(&[CommandId(40), CommandId(40)])
+            .unwrap(),
+        vec![CommandId(40), CommandId(3), CommandId(90), CommandId(1)]
+    );
 }
 
 #[test]
@@ -167,7 +215,12 @@ fn invalid_command_identities_fail_closed() {
     graph.add_node(node(2, EffectSummary::new()));
     assert!(graph.affected_commands(&[CommandId(99)]).is_err());
     graph.add_node(node(2, effects([write("a")])));
-    assert!(graph.validate().unwrap_err().contains("duplicate command ID"));
+    assert!(
+        graph
+            .validate()
+            .unwrap_err()
+            .contains("duplicate command ID")
+    );
     assert!(graph.affected_commands(&[]).is_err());
 }
 
@@ -180,11 +233,15 @@ fn observed_effects_add_edges_without_mutating_the_source_graph() {
     let observed = BTreeMap::from([(CommandId(1), effects([read("a")]))]);
     let refined = graph.with_observed_effects(&observed).unwrap();
     assert!(dependencies(&graph, 1).is_empty());
-    assert_eq!(refined.affected_commands(&[CommandId(0)]).unwrap(),
-        vec![CommandId(0), CommandId(1), CommandId(2)]);
-    assert!(graph.with_observed_effects(&BTreeMap::from([
-        (CommandId(99), EffectSummary::new())
-    ])).is_err());
+    assert_eq!(
+        refined.affected_commands(&[CommandId(0)]).unwrap(),
+        vec![CommandId(0), CommandId(1), CommandId(2)]
+    );
+    assert!(
+        graph
+            .with_observed_effects(&BTreeMap::from([(CommandId(99), EffectSummary::new())]))
+            .is_err()
+    );
 }
 
 #[test]
@@ -202,16 +259,37 @@ fn footprint_join_preserves_demotions() {
 #[test]
 fn commutativity_is_symmetric_for_the_effect_vocabulary() {
     let variants = [
-        read("a"), write("a"), write("b"),
-        CommandEffect::ReadsInstances { class_head: name("C") },
-        CommandEffect::WritesInstance { class_head: name("C"), instance_name: name("i") },
-        CommandEffect::ReadsGrammar { category: name("term") },
-        CommandEffect::WritesGrammar { category: name("term") },
-        CommandEffect::ReadsSimpSet { simp_name: name("simp") },
-        CommandEffect::ReadsOption { key: "trace".into() },
-        CommandEffect::WritesEnvExtension { extension_name: name("ext") },
-        CommandEffect::UsesCapability { capability_id: "io".into() },
-        CommandEffect::Opaque { reason: "unknown".into() },
+        read("a"),
+        write("a"),
+        write("b"),
+        CommandEffect::ReadsInstances {
+            class_head: name("C"),
+        },
+        CommandEffect::WritesInstance {
+            class_head: name("C"),
+            instance_name: name("i"),
+        },
+        CommandEffect::ReadsGrammar {
+            category: name("term"),
+        },
+        CommandEffect::WritesGrammar {
+            category: name("term"),
+        },
+        CommandEffect::ReadsSimpSet {
+            simp_name: name("simp"),
+        },
+        CommandEffect::ReadsOption {
+            key: "trace".into(),
+        },
+        CommandEffect::WritesEnvExtension {
+            extension_name: name("ext"),
+        },
+        CommandEffect::UsesCapability {
+            capability_id: "io".into(),
+        },
+        CommandEffect::Opaque {
+            reason: "unknown".into(),
+        },
     ];
     for a in &variants {
         for b in &variants {
@@ -227,18 +305,43 @@ fn indexed_dependencies_match_pairwise_effect_conflicts() {
     // Reproducible generated graphs, without a random-number dependency. This
     // tests the live Rust index against the public commutativity specification.
     let variants = [
-        read("a"), write("a"), read("b"), write("b"),
-        CommandEffect::ReadsInstances { class_head: name("a") },
-        CommandEffect::WritesInstance { class_head: name("a"), instance_name: name("i") },
-        CommandEffect::WritesInstance { class_head: name("b"), instance_name: name("i") },
-        CommandEffect::ReadsGrammar { category: name("a") },
-        CommandEffect::WritesGrammar { category: name("a") },
-        CommandEffect::WritesGrammar { category: name("b") },
-        CommandEffect::ReadsSimpSet { simp_name: name("a") },
+        read("a"),
+        write("a"),
+        read("b"),
+        write("b"),
+        CommandEffect::ReadsInstances {
+            class_head: name("a"),
+        },
+        CommandEffect::WritesInstance {
+            class_head: name("a"),
+            instance_name: name("i"),
+        },
+        CommandEffect::WritesInstance {
+            class_head: name("b"),
+            instance_name: name("i"),
+        },
+        CommandEffect::ReadsGrammar {
+            category: name("a"),
+        },
+        CommandEffect::WritesGrammar {
+            category: name("a"),
+        },
+        CommandEffect::WritesGrammar {
+            category: name("b"),
+        },
+        CommandEffect::ReadsSimpSet {
+            simp_name: name("a"),
+        },
         CommandEffect::ReadsOption { key: "a".into() },
-        CommandEffect::WritesEnvExtension { extension_name: name("a") },
-        CommandEffect::UsesCapability { capability_id: "io".into() },
-        CommandEffect::Opaque { reason: "opaque".into() },
+        CommandEffect::WritesEnvExtension {
+            extension_name: name("a"),
+        },
+        CommandEffect::UsesCapability {
+            capability_id: "io".into(),
+        },
+        CommandEffect::Opaque {
+            reason: "opaque".into(),
+        },
     ];
     let mut seed = 0x5eed_u64;
     let mut next = || {
@@ -266,9 +369,13 @@ fn indexed_dependencies_match_pairwise_effect_conflicts() {
                 current.referenced_names.push(name("b"));
             }
             let current_effects = current.dependency_effects();
-            let expected: HashSet<_> = graph.nodes().iter()
+            let expected: HashSet<_> = graph
+                .nodes()
+                .iter()
                 .filter(|previous| {
-                    !previous.dependency_effects().commutes_with(&current_effects)
+                    !previous
+                        .dependency_effects()
+                        .commutes_with(&current_effects)
                 })
                 .map(|previous| previous.id)
                 .collect();
@@ -279,17 +386,25 @@ fn indexed_dependencies_match_pairwise_effect_conflicts() {
         graph.validate().unwrap();
         let mut expected = HashSet::from([graph.nodes()[0].id]);
         for current in graph.nodes() {
-            if graph.dependencies_of(current.id).unwrap().iter()
+            if graph
+                .dependencies_of(current.id)
+                .unwrap()
+                .iter()
                 .any(|dependency| expected.contains(dependency))
             {
                 expected.insert(current.id);
             }
         }
-        let expected: Vec<_> = graph.nodes().iter()
+        let expected: Vec<_> = graph
+            .nodes()
+            .iter()
             .filter(|current| expected.contains(&current.id))
             .map(|current| current.id)
             .collect();
-        assert_eq!(graph.affected_commands(&[graph.nodes()[0].id]).unwrap(), expected);
+        assert_eq!(
+            graph.affected_commands(&[graph.nodes()[0].id]).unwrap(),
+            expected
+        );
     }
 }
 
@@ -303,5 +418,8 @@ fn large_disjoint_graph_has_no_accidental_edges_or_invalidation() {
     for current in graph.nodes() {
         assert!(graph.dependencies_of(current.id).unwrap().is_empty());
     }
-    assert_eq!(graph.affected_commands(&[CommandId(2048)]).unwrap(), vec![CommandId(2048)]);
+    assert_eq!(
+        graph.affected_commands(&[CommandId(2048)]).unwrap(),
+        vec![CommandId(2048)]
+    );
 }

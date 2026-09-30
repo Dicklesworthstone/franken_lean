@@ -25,7 +25,10 @@ fn membership_binders_and_wildcards_preserve_every_original_leaf() {
     ] {
         let parsed = parse_definition(source.as_bytes()).unwrap();
         assert_eq!(parsed.reconstruct_original(), source.as_bytes());
-        assert_eq!(parsed.reconstruct_normalized().unwrap(), source.replace("\r\n", "\n").as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace("\r\n", "\n").as_bytes()
+        );
         let declarations = declarations(parsed.syntax());
         assert_eq!(declarations.len(), 1);
         let parts = declarations[0];
@@ -58,8 +61,14 @@ fn nested_witnesses_and_conditional_terms_keep_distinct_headers() {
 #[test]
 fn malformed_membership_headers_never_fall_back_to_ordinary_for() {
     for header in [
-        "h : : x in xs", "_ : x in xs", "A.h : x in xs", "h : A.x in xs",
-        "h : in xs", "h : (x, y) in xs", "h : x xs", "h : x in",
+        "h : : x in xs",
+        "_ : x in xs",
+        "A.h : x in xs",
+        "h : A.x in xs",
+        "h : in xs",
+        "h : (x, y) in xs",
+        "h : x xs",
+        "h : x in",
     ] {
         let source = format!("def run : Nat := do {{ for {header} do {{ visit }}; return 7 }}");
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
@@ -70,5 +79,8 @@ fn malformed_membership_headers_never_fall_back_to_ordinary_for() {
 fn missing_dependent_loop_body_reports_original_crlf_position() {
     let source = "def run : Nat := do\r\n  for h : x in xs do\r\n  return 7";
     let error = parse_definition(source.as_bytes()).unwrap_err();
-    assert_eq!(error.primary_offset(), Some(BytePos(source.find("return").unwrap())));
+    assert_eq!(
+        error.primary_offset(),
+        Some(BytePos(source.find("return").unwrap()))
+    );
 }

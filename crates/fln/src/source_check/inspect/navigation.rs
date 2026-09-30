@@ -85,27 +85,33 @@ impl SourceModuleSession {
         let mut found = None;
         let mut visited = 0usize;
         for module in &inspected.prefix.checked.module_order {
-            let input = inputs.iter().find(|input| input.name == module).ok_or_else(|| {
-                SourceModuleCheckError::MissingModule {
+            let input = inputs
+                .iter()
+                .find(|input| input.name == module)
+                .ok_or_else(|| SourceModuleCheckError::MissingModule {
                     importer: entry.clone(),
                     module: module.clone(),
-                }
-            })?;
+                })?;
             let header = modules::parse_source_header(input.source).map_err(|error| {
-                SourceModuleCheckError::Header { module: module.clone(), error }
+                SourceModuleCheckError::Header {
+                    module: module.clone(),
+                    error,
+                }
             })?;
             let commands = fln_parse::command_scope::partition(
                 &input.source[header.body_start.0..],
-            ).map_err(|error| SourceModuleCheckError::Header {
+            )
+            .map_err(|error| SourceModuleCheckError::Header {
                 module: module.clone(),
                 error: error.with_original_offset(header.body_start),
             })?;
             // Inspection checked only the current command's prefix, NOT its
             // body or later commands. Never search those unchecked bytes.
             let count = if module == entry {
-                commands.iter().rposition(|(start, _)| {
-                    header.body_start.0 + start.0 <= offset
-                }).unwrap_or(0)
+                commands
+                    .iter()
+                    .rposition(|(start, _)| header.body_start.0 + start.0 <= offset)
+                    .unwrap_or(0)
             } else {
                 commands.len()
             };
@@ -114,7 +120,8 @@ impl SourceModuleSession {
             // not be executed again (including variable/attribute journals).
             let mut scopes = super::super::scopes::Scopes::default();
             for (command_index, (start, command)) in commands.iter().take(count).enumerate() {
-                visited = visited.checked_add(1)
+                visited = visited
+                    .checked_add(1)
                     .filter(|n| *n <= limits.max_commands)
                     .ok_or_else(|| limit("definition commands", limits.max_commands))?;
                 let base = header.body_start.0 + start.0;
@@ -125,13 +132,18 @@ impl SourceModuleSession {
                     }
                 })?;
                 if let Some(control) = control {
-                    if matches!(control, ScopeCommand::Namespace(_) | ScopeCommand::Section(_)
-                        | ScopeCommand::End(_))
-                    {
-                        scopes.check_limits(&control).map_err(|(resource, size)| limit(resource, size))?;
-                        scopes.apply(control).map_err(|message| source_error(
-                            module, command_index, base, message,
-                        ))?;
+                    if matches!(
+                        control,
+                        ScopeCommand::Namespace(_)
+                            | ScopeCommand::Section(_)
+                            | ScopeCommand::End(_)
+                    ) {
+                        scopes
+                            .check_limits(&control)
+                            .map_err(|(resource, size)| limit(resource, size))?;
+                        scopes.apply(control).map_err(|message| {
+                            source_error(module, command_index, base, message)
+                        })?;
                     }
                     continue;
                 }
@@ -141,23 +153,46 @@ impl SourceModuleSession {
                         error: error.with_original_offset(fln_parse::BytePos(base)),
                     }
                 })?;
-                let Some((name, range)) = explicit_name(parsed.syntax()) else { continue };
+                let Some((name, range)) = explicit_name(parsed.syntax()) else {
+                    continue;
+                };
                 let absolute = scopes.current.declaration_name(name).map_err(|error| {
                     source_error(module, command_index, base, error.to_string())
                 })?;
                 if &absolute != target {
                     continue;
                 }
-                let range = base + parsed.source_view().to_original(fln_parse::BytePos(range.start)).0
-                    ..base + parsed.source_view().to_original(fln_parse::BytePos(range.end)).0;
+                let range = base
+                    + parsed
+                        .source_view()
+                        .to_original(fln_parse::BytePos(range.start))
+                        .0
+                    ..base
+                        + parsed
+                            .source_view()
+                            .to_original(fln_parse::BytePos(range.end))
+                            .0;
                 let text = std::str::from_utf8(input.source).map_err(|_| {
-                    source_error(module, command_index, base, "definition source is not UTF-8".into())
+                    source_error(
+                        module,
+                        command_index,
+                        base,
+                        "definition source is not UTF-8".into(),
+                    )
                 })?;
                 if range.is_empty() || text.get(range.clone()).is_none() || found.is_some() {
-                    return Err(source_error(module, command_index, base,
-                        "definition location is invalid or ambiguous".into()));
+                    return Err(source_error(
+                        module,
+                        command_index,
+                        base,
+                        "definition location is invalid or ambiguous".into(),
+                    ));
                 }
-                found = Some(SourceDefinition { name: absolute, module: module.clone(), range });
+                found = Some(SourceDefinition {
+                    name: absolute,
+                    module: module.clone(),
+                    range,
+                });
             }
         }
         Ok(Outcome::Complete(found))
@@ -167,16 +202,29 @@ impl SourceModuleSession {
 fn limit(resource: &'static str, limit: usize) -> SourceModuleCheckError {
     SourceModuleCheckError::Limit { resource, limit }
 }
-fn source_error(module: &Name, command: usize, offset: usize, message: String) -> SourceModuleCheckError {
+fn source_error(
+    module: &Name,
+    command: usize,
+    offset: usize,
+    message: String,
+) -> SourceModuleCheckError {
     SourceModuleCheckError::Source {
         module: module.clone(),
-        error: SourceCheckError::Scope { file: 0, command, offset, message },
+        error: SourceCheckError::Scope {
+            file: 0,
+            command,
+            offset,
+            message,
+        },
     }
 }
 
 /// Strip only elaborator-inserted application/metadata wrappers. Reducing or
 /// unfolding here would navigate to a dependency of the selected declaration.
-fn constant_head(expression: &Expr, max_steps: usize) -> Result<Option<&Name>, SourceModuleCheckError> {
+fn constant_head(
+    expression: &Expr,
+    max_steps: usize,
+) -> Result<Option<&Name>, SourceModuleCheckError> {
     let mut current = expression;
     for _ in 0..max_steps {
         match current.node() {
@@ -192,20 +240,29 @@ fn constant_head(expression: &Expr, max_steps: usize) -> Result<Option<&Name>, S
 /// Inspect only the declaration header, never identifiers inside a body, local
 /// helper, quotation or example. More generated shapes require explicit origins.
 fn explicit_name(syntax: &Syntax) -> Option<(&Name, Range<usize>)> {
-    let Syntax::Node { kind, args, .. } = syntax else { return None };
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
     if kind != &Name::from_components(["Lean", "Parser", "Command", "declaration"]) {
         return None;
     }
-    let Syntax::Node { kind, args, .. } = args.get(1)? else { return None };
-    if !["definition", "theorem", "abbrev", "opaque"].iter().any(|name| {
-        kind == &Name::from_components(["Lean", "Parser", "Command", *name])
-    }) {
+    let Syntax::Node { kind, args, .. } = args.get(1)? else {
+        return None;
+    };
+    if !["definition", "theorem", "abbrev", "opaque"]
+        .iter()
+        .any(|name| kind == &Name::from_components(["Lean", "Parser", "Command", *name]))
+    {
         return None;
     }
-    let Syntax::Node { kind, args, .. } = args.get(1)? else { return None };
+    let Syntax::Node { kind, args, .. } = args.get(1)? else {
+        return None;
+    };
     if kind != &Name::from_components(["Lean", "Parser", "Command", "declId"]) {
         return None;
     }
-    let Syntax::Ident { val, info, .. } = args.first()? else { return None };
+    let Syntax::Ident { val, info, .. } = args.first()? else {
+        return None;
+    };
     Some((val, info.pos(true)?.0..info.end_pos(true)?.0))
 }

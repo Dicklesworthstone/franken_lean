@@ -143,7 +143,11 @@ impl Context {
             name
         };
         Ok((
-            LoopHeader { name, witness, collection },
+            LoopHeader {
+                name,
+                witness,
+                collection,
+            },
             sequence,
         ))
     }
@@ -169,13 +173,20 @@ impl Context {
         initial: Syntax,
         body: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        let LoopHeader { name, witness, collection } = header;
+        let LoopHeader {
+            name,
+            witness,
+            collection,
+        } = header;
         let callback = lambda(accumulator, null(vec![]), body)?;
         let (operation, callback) = if let Some(witness) = witness {
             // The admitted operation supplies the dependent proof domain. Do
             // not guess a Membership instance, duplicate the collection, or
             // manufacture evidence. Ordinary lambda checking opens a, h, b.
-            (["ForIn'", "forIn'"], lambda(witness, null(vec![]), callback)?)
+            (
+                ["ForIn'", "forIn'"],
+                lambda(witness, null(vec![]), callback)?,
+            )
         } else {
             (["ForIn", "forIn"], callback)
         };
@@ -253,16 +264,24 @@ mod tests {
         let mut context = context();
         let marker = term("nativeDoForMonad", vec![]);
         for (function_name, argument_name) in [
-            (Name::from_components(["unrelated"]), Name::from_components(["m"])),
-            (Name::from_components(["ForIn", "forIn"]), Name::from_components(["wrong"])),
+            (
+                Name::from_components(["unrelated"]),
+                Name::from_components(["m"]),
+            ),
+            (
+                Name::from_components(["ForIn", "forIn"]),
+                Name::from_components(["wrong"]),
+            ),
         ] {
             let function = Typed {
                 value: Expr::const_(function_name, vec![]),
                 type_: Expr::sort(Level::one()),
             };
-            assert!(context
-                .do_for_monad_argument(&function, &argument_name, &marker, None)
-                .is_err());
+            assert!(
+                context
+                    .do_for_monad_argument(&function, &argument_name, &marker, None)
+                    .is_err()
+            );
         }
     }
 
@@ -273,15 +292,17 @@ mod tests {
             value: Expr::const_(Name::from_components(["ForIn", "forIn"]), vec![]),
             type_: Expr::sort(Level::one()),
         };
-        assert!(context
-            .do_for_monad_argument(
-                &function,
-                &Name::from_components(["m"]),
-                &term("hole", vec![atom("_")]),
-                None,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            context
+                .do_for_monad_argument(
+                    &function,
+                    &Name::from_components(["m"]),
+                    &term("hole", vec![atom("_")]),
+                    None,
+                )
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(context.next, 0);
     }
 
@@ -332,10 +353,7 @@ mod tests {
 
     #[test]
     fn nested_loops_and_outer_continuations_use_the_existing_heap_walk() {
-        let inner = loop_element(sequence(
-            vec![term("doExpr", vec![named("action")])],
-            false,
-        ));
+        let inner = loop_element(sequence(vec![term("doExpr", vec![named("action")])], false));
         let outer = loop_element(sequence(vec![inner], true));
         let result = expanded(sequence(
             vec![
@@ -350,23 +368,26 @@ mod tests {
         };
         assert_eq!(kind, &parser_kind(&["Term", "nativeDoBind"]));
         assert_eq!(
-            count_name(&args[0], &Name::from_components(["_root_", "ForIn", "forIn"])),
+            count_name(
+                &args[0],
+                &Name::from_components(["_root_", "ForIn", "forIn"])
+            ),
             2
         );
         // The continuation contains neither iteration nor a loop's x binder.
         // Its reference resolves in the outer source context, never the callback.
         assert_eq!(count_name(&args[1], &Name::from_components(["x"])), 1);
-        assert_eq!(count_name(&args[1], &Name::from_components(["collection"])), 0);
+        assert_eq!(
+            count_name(&args[1], &Name::from_components(["collection"])),
+            0
+        );
         assert_eq!(count_name(&result, &Name::num(Name::anonymous(), 0)), 2);
         assert_eq!(count_name(&result, &Name::num(Name::anonymous(), 2)), 2);
     }
 
     #[test]
     fn loop_returns_are_nonlocal_but_nested_do_returns_have_their_own_scope() {
-        let returning = term(
-            "doReturn",
-            vec![atom("return"), null(vec![named("value")])],
-        );
+        let returning = term("doReturn", vec![atom("return"), null(vec![named("value")])]);
         let direct = loop_element(sequence(vec![returning.clone()], false));
         assert!(expanded(sequence(vec![direct.clone()], false)).is_ok());
         let nested_loop = loop_element(sequence(vec![direct], true));
@@ -378,10 +399,7 @@ mod tests {
 
     #[test]
     fn malformed_loops_and_pattern_loops_fail_closed() {
-        let good = loop_element(sequence(
-            vec![term("doExpr", vec![named("action")])],
-            false,
-        ));
+        let good = loop_element(sequence(vec![term("doExpr", vec![named("action")])], false));
         assert!(context().expand_do_node(good.clone(), true).is_err());
         for slot in 0..4 {
             let mut bad = good.clone();

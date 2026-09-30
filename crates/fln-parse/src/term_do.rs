@@ -635,8 +635,8 @@ impl Prefix {
             self.statement,
             Statement::Return(_) | Statement::Jump { .. }
         );
-        let binding = matches!(self.statement, Statement::Binding { .. })
-            && !is_failure_value(&expression);
+        let binding =
+            matches!(self.statement, Statement::Binding { .. }) && !is_failure_value(&expression);
         self.item(leaves, expression, semi)?;
         if let Some((_, close)) = &mut self.braces {
             if next < end && word(tokens, next, "}") {
@@ -679,7 +679,8 @@ impl Prefix {
         }
         if self.phase != Phase::Done {
             if self.phase != Phase::Value
-                || (matches!(self.statement, Statement::Binding { .. }) && !is_failure_value(&value))
+                || (matches!(self.statement, Statement::Binding { .. })
+                    && !is_failure_value(&value))
             {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: BytePos(0),

@@ -33,7 +33,9 @@ const EXAMPLE: &str = include_str!("../../../examples/native_instance_factories.
 fn packaged_polymorphic_dictionaries_pass_both_checkers_and_execute() {
     execute(EXAMPLE, "42");
     execute(
-        &format!("{EXAMPLE}\nstructure Outer (K : Type) where\n  bundle : DictionaryBundle K\ndef makeOuter (K : Type) : Outer K := {{ bundle := makeBundle K }}\n#eval invokeEcho (K := Nat) (chosen := (makeOuter Nat).bundle.dictionary) 42"),
+        &format!(
+            "{EXAMPLE}\nstructure Outer (K : Type) where\n  bundle : DictionaryBundle K\ndef makeOuter (K : Type) : Outer K := {{ bundle := makeBundle K }}\n#eval invokeEcho (K := Nat) (chosen := (makeOuter Nat).bundle.dictionary) 42"
+        ),
         "42",
     );
 }

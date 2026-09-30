@@ -47,7 +47,11 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
         token => (false, token),
     };
     let mut imports = Vec::new();
-    while let Some(LexedToken { kind: TokenKind::Symbol(symbol), extent }) = &next {
+    while let Some(LexedToken {
+        kind: TokenKind::Symbol(symbol),
+        extent,
+    }) = &next
+    {
         if symbol != "import" {
             break;
         }
@@ -126,8 +130,10 @@ mod tests {
             assert!(header.prelude);
             assert_eq!(header.imports, [Name::from_components(["Real"])]);
             assert_eq!(header.body_start.0, source.find("def pending").unwrap());
-            assert!(partition(&source.as_bytes()[header.body_start.0..]).is_err(),
-                "header discovery must not repair or validate the body: {source}");
+            assert!(
+                partition(&source.as_bytes()[header.body_start.0..]).is_err(),
+                "header discovery must not repair or validate the body: {source}"
+            );
         }
         let source = b"def pending := \"unfinished";
         let header = parse_source_header(source).unwrap();
@@ -139,12 +145,21 @@ mod tests {
     fn streaming_headers_preserve_repeated_imports_bom_crlf_and_header_errors() {
         let source = "\u{feff}/- heading -/\r\nprelude\r\nimport A.B «C.D»\r\nimport A.B\r\ndef pending := \"unfinished";
         let header = parse_source_header(source.as_bytes()).unwrap();
-        assert_eq!(header.imports, [Name::from_components(["A", "B"]),
-            Name::from_components(["C.D"]), Name::from_components(["A", "B"])]);
+        assert_eq!(
+            header.imports,
+            [
+                Name::from_components(["A", "B"]),
+                Name::from_components(["C.D"]),
+                Name::from_components(["A", "B"])
+            ]
+        );
         assert_eq!(header.body_start.0, source.find("def pending").unwrap());
         let source = "\u{feff}prelude\r\nimport 42\r\ndef pending := \"unfinished";
         let error = parse_source_header(source.as_bytes()).unwrap_err();
-        assert_eq!(error.primary_offset(), Some(BytePos(source.find("42").unwrap())));
+        assert_eq!(
+            error.primary_offset(),
+            Some(BytePos(source.find("42").unwrap()))
+        );
         for source in ["import «unfinished", "import /- unfinished", "import A\tB"] {
             assert!(parse_source_header(source.as_bytes()).is_err(), "{source}");
         }

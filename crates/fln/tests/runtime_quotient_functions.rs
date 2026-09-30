@@ -28,7 +28,10 @@ fn execute(source: &str, expected: &str) -> u64 {
 
 #[test]
 fn constructors_and_lifters_are_reusable_first_class_functions() {
-    execute(include_str!("../../../examples/native_quotient_runtime.lean"), "42");
+    execute(
+        include_str!("../../../examples/native_quotient_runtime.lean"),
+        "42",
+    );
     execute(
         r#"
 def Q : Type := Quot (fun (a b : Nat) => a = b)

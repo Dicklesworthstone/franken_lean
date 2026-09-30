@@ -3,18 +3,15 @@
 use super::*;
 
 impl Preparation<'_> {
-    fn quotient_residual_type(
-        &mut self,
-        head: &Expr,
-        args: &[Expr],
-    ) -> Result<Expr, IngressError> {
+    fn quotient_residual_type(&mut self, head: &Expr, args: &[Expr]) -> Result<Expr, IngressError> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Err(unsupported("quotient residual head"));
         };
         let Some(ConstantInfo::Quot(info)) = self.environment.find(name) else {
             return Err(unsupported("quotient residual declaration"));
         };
-        let mut type_ = self.universe_instance(&info.base.type_, &info.base.level_params, levels)?;
+        let mut type_ =
+            self.universe_instance(&info.base.type_, &info.base.level_params, levels)?;
         for argument in args {
             self.tick()?;
             let normal = self.type_head(&type_)?;
@@ -67,7 +64,8 @@ impl Preparation<'_> {
         let result_value = self
             .value_type(&remaining)?
             .ok_or_else(|| unsupported("quotient residual result"))?;
-        let depth = missing + captured + 1 + usize::from(matches!(result_value, ValueType::Closure(_)));
+        let depth =
+            missing + captured + 1 + usize::from(matches!(result_value, ValueType::Closure(_)));
         if depth > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
                 resource: IngressResource::ContextDepth,

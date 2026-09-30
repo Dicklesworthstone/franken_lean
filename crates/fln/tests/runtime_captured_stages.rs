@@ -51,8 +51,8 @@ fn captured_stages_retain_owned_string_environments() {
 fn returning_a_captured_stage_does_not_recompute_its_completed_prefix() {
     let source = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\ndef use (cost : Nat) : Nat := let f : Nat -> Nat -> Nat -> Nat := (by intro x; let work := expensive cost; intro y; let a := work + x + y; intro z; exact a + z); let g := f 1; let keep : Nat -> Nat -> Nat -> Nat := (by let marker := cost + 0; exact fun ignored => g); let h := keep 0; h 20 21\n";
     let repeated = source.replace("h 20 21", "h 9 11 + h 9 11");
-    let once = run(&format!("{source}#eval use 100"), "42")
-        - run(&format!("{source}#eval use 0"), "42");
+    let once =
+        run(&format!("{source}#eval use 100"), "42") - run(&format!("{source}#eval use 0"), "42");
     let twice = run(&format!("{repeated}#eval use 100"), "42")
         - run(&format!("{repeated}#eval use 0"), "42");
     assert!(once > 100, "the completed strict prefix was dropped");

@@ -29,9 +29,19 @@ fn close(locals: &[&LocalDecl], mut body: Expr, lambda: bool) -> Expr {
             .abstract_fvar(&local.id, 0)
             .expect("fixed Option decision telescope");
         body = if lambda {
-            Expr::lam(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::lam(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         } else {
-            Expr::forall_e(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::forall_e(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         };
     }
     body
@@ -47,13 +57,30 @@ fn decision(proposition: Expr) -> Expr {
 }
 fn verdict(proposition: Expr, proof: Expr, positive: bool) -> Expr {
     app(
-        constant(if positive { "Decidable.isTrue" } else { "Decidable.isFalse" }, vec![]),
+        constant(
+            if positive {
+                "Decidable.isTrue"
+            } else {
+                "Decidable.isFalse"
+            },
+            vec![],
+        ),
         [proposition, proof],
     )
 }
-fn definition(label: &str, levels: Vec<Name>, locals: &[&LocalDecl], type_: Expr, value: Expr) -> Declaration {
+fn definition(
+    label: &str,
+    levels: Vec<Name>,
+    locals: &[&LocalDecl],
+    type_: Expr,
+    value: Expr,
+) -> Declaration {
     Declaration::Defn(DefinitionVal {
-        base: ConstantVal { name: name(label), level_params: levels, type_: close(locals, type_, false) },
+        base: ConstantVal {
+            name: name(label),
+            level_params: levels,
+            type_: close(locals, type_, false),
+        },
         value: close(locals, value, true),
         hints: ReducibilityHints::Abbrev,
         safety: DefinitionSafety::Safe,
@@ -71,19 +98,35 @@ impl Terms {
     fn local(&mut self, label: &str, type_: Expr, binder_info: BinderInfo) -> LocalDecl {
         let id = FVarId(name(&format!("_fln_option_decision.{label}_{}", self.next)));
         self.next += 1;
-        LocalDecl { id, user_name: name(label), type_, value: None, binder_info, index: 0 }
+        LocalDecl {
+            id,
+            user_name: name(label),
+            type_,
+            value: None,
+            binder_info,
+            index: 0,
+        }
     }
     fn explicit(&mut self, label: &str, type_: Expr) -> LocalDecl {
         self.local(label, type_, BinderInfo::Default)
     }
     fn option(&self) -> Expr {
-        Expr::app(constant("Option", vec![self.universe.clone()]), self.alpha.clone())
+        Expr::app(
+            constant("Option", vec![self.universe.clone()]),
+            self.alpha.clone(),
+        )
     }
     fn none(&self) -> Expr {
-        Expr::app(constant("Option.none", vec![self.universe.clone()]), self.alpha.clone())
+        Expr::app(
+            constant("Option.none", vec![self.universe.clone()]),
+            self.alpha.clone(),
+        )
     }
     fn some(&self, value: Expr) -> Expr {
-        app(constant("Option.some", vec![self.universe.clone()]), [self.alpha.clone(), value])
+        app(
+            constant("Option.some", vec![self.universe.clone()]),
+            [self.alpha.clone(), value],
+        )
     }
     fn equality(&self, left: Expr, right: Expr) -> Expr {
         eq(self.option(), self.sort.clone(), left, right)
@@ -97,20 +140,54 @@ impl Terms {
     // The carrier universe is explicit: Option.{u} and its elements live in
     // Sort (u+1), not Sort u. The transported family is proposition-valued.
     #[allow(clippy::too_many_arguments)]
-    fn transport(&mut self, endpoint: &LocalDecl, left: Expr, right: Expr, evidence: Expr, proposition: Expr, proof: Expr) -> Expr {
-        let equality = self.explicit("transport_equality", eq(endpoint.type_.clone(), self.sort.clone(), left.clone(), fv(endpoint)));
+    fn transport(
+        &mut self,
+        endpoint: &LocalDecl,
+        left: Expr,
+        right: Expr,
+        evidence: Expr,
+        proposition: Expr,
+        proof: Expr,
+    ) -> Expr {
+        let equality = self.explicit(
+            "transport_equality",
+            eq(
+                endpoint.type_.clone(),
+                self.sort.clone(),
+                left.clone(),
+                fv(endpoint),
+            ),
+        );
         app(
             constant("Eq.rec", vec![Level::zero(), self.sort.clone()]),
-            [endpoint.type_.clone(), left, close(&[endpoint, &equality], proposition, true), proof, right, evidence],
+            [
+                endpoint.type_.clone(),
+                left,
+                close(&[endpoint, &equality], proposition, true),
+                proof,
+                right,
+                evidence,
+            ],
         )
     }
     fn mismatch(&mut self, element: Expr, none_left: bool) -> Expr {
-        let (left, right) = if none_left { (self.none(), self.some(element)) } else { (self.some(element), self.none()) };
-        let hypothesis = self.explicit("different_constructors", self.equality(left.clone(), right.clone()));
+        let (left, right) = if none_left {
+            (self.none(), self.some(element))
+        } else {
+            (self.some(element), self.none())
+        };
+        let hypothesis = self.explicit(
+            "different_constructors",
+            self.equality(left.clone(), right.clone()),
+        );
         let endpoint = self.explicit("endpoint", self.option());
         let major = self.explicit("discriminator", self.option());
         let field = self.explicit("field", self.alpha.clone());
-        let (no, yes) = if none_left { ("True", "False") } else { ("False", "True") };
+        let (no, yes) = if none_left {
+            ("True", "False")
+        } else {
+            ("False", "True")
+        };
         let predicate = self.rec(
             Level::one(),
             close(&[&major], Expr::sort(Level::zero()), true),
@@ -118,7 +195,14 @@ impl Terms {
             close(&[&field], constant(yes, vec![]), true),
             fv(&endpoint),
         );
-        let proof = self.transport(&endpoint, left, right, fv(&hypothesis), predicate, constant("True.intro", vec![]));
+        let proof = self.transport(
+            &endpoint,
+            left,
+            right,
+            fv(&hypothesis),
+            predicate,
+            constant("True.intro", vec![]),
+        );
         close(&[&hypothesis], proof, true)
     }
     fn congruence(&mut self, left: Expr, right: Expr, evidence: Expr) -> Expr {
@@ -140,24 +224,58 @@ impl Terms {
             close(&[&field], fv(&field), true),
             fv(&endpoint),
         );
-        let predicate = eq(self.alpha.clone(), self.sort.clone(), left.clone(), extracted);
+        let predicate = eq(
+            self.alpha.clone(),
+            self.sort.clone(),
+            left.clone(),
+            extracted,
+        );
         let proof = refl(self.alpha.clone(), self.sort.clone(), left.clone());
-        self.transport(&endpoint, self.some(left), self.some(right), evidence, predicate, proof)
+        self.transport(
+            &endpoint,
+            self.some(left),
+            self.some(right),
+            evidence,
+            predicate,
+            proof,
+        )
     }
     fn some_decision(&mut self, dictionary: Expr, left: Expr, right: Expr) -> Expr {
-        let small = eq(self.alpha.clone(), self.sort.clone(), left.clone(), right.clone());
+        let small = eq(
+            self.alpha.clone(),
+            self.sort.clone(),
+            left.clone(),
+            right.clone(),
+        );
         let large = self.equality(self.some(left.clone()), self.some(right.clone()));
         let d = self.explicit("element_decision", decision(small.clone()));
         let yes = self.explicit("element_equality", small.clone());
-        let no = self.explicit("element_inequality", Expr::app(constant("Not", vec![]), small.clone()));
+        let no = self.explicit(
+            "element_inequality",
+            Expr::app(constant("Not", vec![]), small.clone()),
+        );
         let h = self.explicit("some_equality", large.clone());
         let injection = self.injectivity(left.clone(), right.clone(), fv(&h));
-        let negative = close(&[&no], verdict(large.clone(), close(&[&h], Expr::app(fv(&no), injection), true), false), true);
+        let negative = close(
+            &[&no],
+            verdict(
+                large.clone(),
+                close(&[&h], Expr::app(fv(&no), injection), true),
+                false,
+            ),
+            true,
+        );
         let congruence = self.congruence(left.clone(), right.clone(), fv(&yes));
         let positive = close(&[&yes], verdict(large.clone(), congruence, true), true);
         app(
             constant("Decidable.rec", vec![Level::one()]),
-            [small, close(&[&d], decision(large), true), negative, positive, app(dictionary, [left, right])],
+            [
+                small,
+                close(&[&d], decision(large), true),
+                negative,
+                positive,
+                app(dictionary, [left, right]),
+            ],
         )
     }
 }
@@ -167,39 +285,85 @@ impl Terms {
 pub fn option_equality_decision_seed_declaration() -> Declaration {
     let universe = Level::param(name("u"));
     let sort = universe.clone().succ().expect("fixed Option universe");
-    let mut terms = Terms { next: 0, universe, sort: sort.clone(), alpha: Expr::sort(Level::zero()) };
+    let mut terms = Terms {
+        next: 0,
+        universe,
+        sort: sort.clone(),
+        alpha: Expr::sort(Level::zero()),
+    };
     let alpha = terms.local("alpha", Expr::sort(sort.clone()), BinderInfo::Implicit);
     terms.alpha = fv(&alpha);
-    let dictionary = terms.local("inst", Expr::app(constant("DecidableEq", vec![sort.clone()]), fv(&alpha)), BinderInfo::InstImplicit);
+    let dictionary = terms.local(
+        "inst",
+        Expr::app(constant("DecidableEq", vec![sort.clone()]), fv(&alpha)),
+        BinderInfo::InstImplicit,
+    );
     let a = terms.explicit("a", terms.option());
     let b = terms.explicit("b", terms.option());
     let major = terms.explicit("major", terms.option());
     let x = terms.explicit("x", fv(&alpha));
     let y = terms.explicit("y", fv(&alpha));
     let none_eq = terms.equality(terms.none(), terms.none());
-    let none_same = verdict(none_eq, refl(terms.option(), sort.clone(), terms.none()), true);
+    let none_same = verdict(
+        none_eq,
+        refl(terms.option(), sort.clone(), terms.none()),
+        true,
+    );
     let none_some_type = terms.equality(terms.none(), terms.some(fv(&y)));
     let none_some_proof = terms.mismatch(fv(&y), true);
     let none_some = close(&[&y], verdict(none_some_type, none_some_proof, false), true);
-    let none_branch = close(&[&b], terms.rec(
-        Level::one(),
-        close(&[&major], decision(terms.equality(terms.none(), fv(&major))), true),
-        none_same, none_some, fv(&b),
-    ), true);
+    let none_branch = close(
+        &[&b],
+        terms.rec(
+            Level::one(),
+            close(
+                &[&major],
+                decision(terms.equality(terms.none(), fv(&major))),
+                true,
+            ),
+            none_same,
+            none_some,
+            fv(&b),
+        ),
+        true,
+    );
     let some_none_type = terms.equality(terms.some(fv(&x)), terms.none());
     let some_none_proof = terms.mismatch(fv(&x), false);
     let some_none = verdict(some_none_type, some_none_proof, false);
     let some_some = terms.some_decision(fv(&dictionary), fv(&x), fv(&y));
-    let some_branch = close(&[&x, &b], terms.rec(
-        Level::one(),
-        close(&[&major], decision(terms.equality(terms.some(fv(&x)), fv(&major))), true),
-        some_none, close(&[&y], some_some, true), fv(&b),
-    ), true);
-    let motive = close(&[&major], close(&[&b], decision(terms.equality(fv(&major), fv(&b))), false), true);
+    let some_branch = close(
+        &[&x, &b],
+        terms.rec(
+            Level::one(),
+            close(
+                &[&major],
+                decision(terms.equality(terms.some(fv(&x)), fv(&major))),
+                true,
+            ),
+            some_none,
+            close(&[&y], some_some, true),
+            fv(&b),
+        ),
+        true,
+    );
+    let motive = close(
+        &[&major],
+        close(&[&b], decision(terms.equality(fv(&major), fv(&b))), false),
+        true,
+    );
     // The outer result is a function over Option alpha: its universe is u+1,
     // although each individual Decidable result lives in Sort 1.
-    let value = Expr::app(terms.rec(sort, motive, none_branch, some_branch, fv(&a)), fv(&b));
-    definition("instDecidableEqOption", vec![name("u")], &[&alpha, &dictionary, &a, &b], decision(terms.equality(fv(&a), fv(&b))), value)
+    let value = Expr::app(
+        terms.rec(sort, motive, none_branch, some_branch, fv(&a)),
+        fv(&b),
+    );
+    definition(
+        "instDecidableEqOption",
+        vec![name("u")],
+        &[&alpha, &dictionary, &a, &b],
+        decision(terms.equality(fv(&a), fv(&b))),
+        value,
+    )
 }
 
 #[cfg(test)]
@@ -212,7 +376,9 @@ mod tests {
     use fln_kernel::council::{Council, CouncilOutcome, convene};
     use fln_kernel::verdict::{Budget, Verdict};
 
-    fn budget() -> Budget { Budget::for_stack_bytes(2 * 1024 * 1024) }
+    fn budget() -> Budget {
+        Budget::for_stack_bytes(2 * 1024 * 1024)
+    }
     fn environment() -> Environment {
         crate::seed::source_seed_declarations()
             .into_iter()
@@ -238,26 +404,61 @@ mod tests {
             other => panic!("seed publication {other:?}"),
         }
     }
-    fn option(carrier: Expr) -> Expr { Expr::app(constant("Option", vec![Level::zero()]), carrier) }
-    fn none(carrier: Expr) -> Expr { Expr::app(constant("Option.none", vec![Level::zero()]), carrier) }
-    fn some(carrier: Expr, element: Expr) -> Expr { app(constant("Option.some", vec![Level::zero()]), [carrier, element]) }
-    fn dictionary(carrier: Expr, element_dictionary: Expr) -> Expr {
-        app(constant("instDecidableEqOption", vec![Level::zero()]), [carrier, element_dictionary])
+    fn option(carrier: Expr) -> Expr {
+        Expr::app(constant("Option", vec![Level::zero()]), carrier)
     }
-    fn assert_decision(env: &Environment, carrier: Expr, element_dictionary: Expr, left: Expr, right: Expr, expected: bool) {
-        let proposition = eq(option(carrier.clone()), Level::one(), left.clone(), right.clone());
+    fn none(carrier: Expr) -> Expr {
+        Expr::app(constant("Option.none", vec![Level::zero()]), carrier)
+    }
+    fn some(carrier: Expr, element: Expr) -> Expr {
+        app(
+            constant("Option.some", vec![Level::zero()]),
+            [carrier, element],
+        )
+    }
+    fn dictionary(carrier: Expr, element_dictionary: Expr) -> Expr {
+        app(
+            constant("instDecidableEqOption", vec![Level::zero()]),
+            [carrier, element_dictionary],
+        )
+    }
+    fn assert_decision(
+        env: &Environment,
+        carrier: Expr,
+        element_dictionary: Expr,
+        left: Expr,
+        right: Expr,
+        expected: bool,
+    ) {
+        let proposition = eq(
+            option(carrier.clone()),
+            Level::one(),
+            left.clone(),
+            right.clone(),
+        );
         let evidence = app(dictionary(carrier, element_dictionary), [left, right]);
         let value = app(constant("decide", vec![]), [proposition, evidence]);
         for result in [expected, !expected] {
             let bool_ = constant("Bool", vec![]);
-            let type_ = eq(bool_.clone(), Level::one(), value.clone(), constant(if result { "Bool.true" } else { "Bool.false" }, vec![]));
+            let type_ = eq(
+                bool_.clone(),
+                Level::one(),
+                value.clone(),
+                constant(if result { "Bool.true" } else { "Bool.false" }, vec![]),
+            );
             let proof = refl(bool_, Level::one(), value.clone());
             let candidate = definition("decision_test", vec![], &[], type_, proof);
             let verdict = fln_kernel::check(env, &candidate, budget());
             if result == expected {
-                assert!(matches!(verdict, Outcome::Complete(Verdict::Accepted { .. })), "{verdict:?}");
+                assert!(
+                    matches!(verdict, Outcome::Complete(Verdict::Accepted { .. })),
+                    "{verdict:?}"
+                );
             } else {
-                assert!(matches!(verdict, Outcome::Complete(Verdict::Rejected { .. })), "{verdict:?}");
+                assert!(
+                    matches!(verdict, Outcome::Complete(Verdict::Rejected { .. })),
+                    "{verdict:?}"
+                );
             }
         }
     }
@@ -267,10 +468,21 @@ mod tests {
         let nat = constant("Nat", vec![]);
         let zero = constant("Nat.zero", vec![]);
         let one = Expr::app(constant("Nat.succ", vec![]), zero.clone());
-        let values = [none(nat.clone()), some(nat.clone(), zero), some(nat.clone(), one)];
+        let values = [
+            none(nat.clone()),
+            some(nat.clone(), zero),
+            some(nat.clone(), one),
+        ];
         for (i, left) in values.iter().enumerate() {
             for (j, right) in values.iter().enumerate() {
-                assert_decision(&env, nat.clone(), constant("Nat.decEq", vec![]), left.clone(), right.clone(), i == j);
+                assert_decision(
+                    &env,
+                    nat.clone(),
+                    constant("Nat.decEq", vec![]),
+                    left.clone(),
+                    right.clone(),
+                    i == j,
+                );
             }
         }
     }
@@ -280,16 +492,33 @@ mod tests {
         let bool_ = constant("Bool", vec![]);
         let inner = option(bool_.clone());
         let dict = dictionary(bool_.clone(), constant("Bool.decEq", vec![]));
-        let values = [none(inner.clone()), some(inner.clone(), none(bool_.clone())), some(inner.clone(), some(bool_.clone(), constant("Bool.false", vec![]))), some(inner.clone(), some(bool_, constant("Bool.true", vec![])))];
+        let values = [
+            none(inner.clone()),
+            some(inner.clone(), none(bool_.clone())),
+            some(
+                inner.clone(),
+                some(bool_.clone(), constant("Bool.false", vec![])),
+            ),
+            some(inner.clone(), some(bool_, constant("Bool.true", vec![]))),
+        ];
         for (i, left) in values.iter().enumerate() {
             for (j, right) in values.iter().enumerate() {
-                assert_decision(&env, inner.clone(), dict.clone(), left.clone(), right.clone(), i == j);
+                assert_decision(
+                    &env,
+                    inner.clone(),
+                    dict.clone(),
+                    left.clone(),
+                    right.clone(),
+                    i == j,
+                );
             }
         }
     }
     #[test]
     fn generic_candidate_contains_no_unresolved_or_escaping_variables() {
-        let Declaration::Defn(candidate) = option_equality_decision_seed_declaration() else { unreachable!() };
+        let Declaration::Defn(candidate) = option_equality_decision_seed_declaration() else {
+            unreachable!()
+        };
         assert_eq!(candidate.safety, DefinitionSafety::Safe);
         for term in [&candidate.base.type_, &candidate.value] {
             assert!(!term.has_fvar());
@@ -304,11 +533,17 @@ mod tests {
     fn a_dictionary_for_the_wrong_carrier_cannot_forge_an_option_decision() {
         let env = environment();
         let nat = constant("Nat", vec![]);
-        let type_ = Expr::app(constant("DecidableEq", vec![Level::one()]), option(nat.clone()));
+        let type_ = Expr::app(
+            constant("DecidableEq", vec![Level::one()]),
+            option(nat.clone()),
+        );
         let value = dictionary(nat, constant("Bool.decEq", vec![]));
         let candidate = definition("wrong_carrier", vec![], &[], type_, value);
         let result = fln_kernel::check(&env, &candidate, budget());
-        assert!(matches!(result, Outcome::Complete(Verdict::Rejected { .. })), "{result:?}");
+        assert!(
+            matches!(result, Outcome::Complete(Verdict::Rejected { .. })),
+            "{result:?}"
+        );
     }
     /// The Reference states an equality instance through the abbreviation, as
     /// `instDecidableEqBool : DecidableEq Bool`, and keys it under `Decidable`
@@ -380,7 +615,12 @@ mod tests {
     fn native_search_builds_nested_and_higher_universe_option_dictionaries() {
         use crate::instances::{register_class, register_instance};
         let mut env = register_class(&environment(), &name("Decidable")).unwrap();
-        for label in ["instDecidableEqNat", "instDecidableEqBool", "instDecidableEqOption", "instDecidableNot"] {
+        for label in [
+            "instDecidableEqNat",
+            "instDecidableEqBool",
+            "instDecidableEqOption",
+            "instDecidableNot",
+        ] {
             env = register_instance(&env, &name(label), 1000).unwrap();
         }
         for source in [
@@ -392,11 +632,19 @@ mod tests {
         ] {
             let checked = crate::check_definition_source(source.as_bytes(), &env, budget())
                 .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
-            assert!(matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}\n{:?}", checked.outcome);
+            assert!(
+                matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                "{source}\n{:?}",
+                checked.outcome
+            );
         }
-        let source = b"theorem false_claim : (Option.some 0 : Option Nat) = Option.some 1 := by decide";
+        let source =
+            b"theorem false_claim : (Option.some 0 : Option Nat) = Option.some 1 := by decide";
         if let Ok(checked) = crate::check_definition_source(source, &env, budget()) {
-            assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })));
+            assert!(!matches!(
+                checked.outcome,
+                Outcome::Complete(Verdict::Accepted { .. })
+            ));
         }
     }
 }

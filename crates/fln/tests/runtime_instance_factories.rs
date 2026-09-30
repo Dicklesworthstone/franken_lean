@@ -50,11 +50,15 @@ fn inferred_parameterized_dictionaries_can_contain_polymorphic_methods() {
 #[test]
 fn factory_methods_preserve_owned_values_and_callback_representations() {
     execute(
-        &format!("{ECHO}#eval let f : Nat -> Nat := Echo.echo (K := Nat) (fun (n : Nat) => n + 1); f 41"),
+        &format!(
+            "{ECHO}#eval let f : Nat -> Nat := Echo.echo (K := Nat) (fun (n : Nat) => n + 1); f 41"
+        ),
         "42",
     );
     execute(
-        &format!("{ECHO}def run (suffix : String) : Nat := String.length (Echo.echo (K := String) (\"a\" ++ suffix))\n#eval run \"xyz\""),
+        &format!(
+            "{ECHO}def run (suffix : String) : Nat := String.length (Echo.echo (K := String) (\"a\" ++ suffix))\n#eval run \"xyz\""
+        ),
         "4",
     );
 }
@@ -106,18 +110,24 @@ instance idBind : Bind Id := makeBind Bool
 #[test]
 fn monad_operations_use_applied_factories_without_a_trusted_monad_evaluator() {
     execute(
-        &format!("{MONAD}def work (n : Nat) : Id Nat := do\n  let x ← (n : Id Nat)\n  return (x + 1)\n#eval work 41"),
+        &format!(
+            "{MONAD}def work (n : Nat) : Id Nat := do\n  let x ← (n : Id Nat)\n  return (x + 1)\n#eval work 41"
+        ),
         "42",
     );
     execute(
-        &format!("{MONAD}def mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (n : Nat) => n + 1) 41 : Id Nat)"),
+        &format!(
+            "{MONAD}def mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (n : Nat) => n + 1) 41 : Id Nat)"
+        ),
         "42",
     );
 }
 
 #[test]
 fn ordinary_computed_factory_fields_still_consume_vm_work() {
-    let program = |cost| format!(r#"
+    let program = |cost| {
+        format!(
+            r#"
 class Probe (A : Type) where
   call : A -> A
   unused : Nat
@@ -127,10 +137,15 @@ def makeProbe (K : Type) (n : Nat) : Probe Nat :=
 instance computed : Probe Nat := makeProbe Nat {cost}
 def useProbe [chosen : Probe Nat] (n : Nat) : Nat := Probe.call n
 #eval useProbe 42
-"#);
+"#
+        )
+    };
     let idle = execute(&program(0), "42");
     let busy = execute(&program(30), "42");
-    assert!(busy > idle + 30, "factory initializer vanished: {idle} vs {busy}");
+    assert!(
+        busy > idle + 30,
+        "factory initializer vanished: {idle} vs {busy}"
+    );
     let base = engine();
     let root = base.logical_root(&KVMap::new());
     let mut bounded = limits();

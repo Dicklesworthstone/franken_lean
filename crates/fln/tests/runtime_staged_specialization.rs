@@ -32,7 +32,8 @@ fn run(source: &str, expected: &str) -> u64 {
     value.usage.steps
 }
 
-const EXPENSIVE: &str = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n";
+const EXPENSIVE: &str =
+    "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n";
 const STAGED: &str = "def staged (cost : Nat) : {A : Type} -> A -> A := by let paid := expensive cost; intro A x; exact x\n";
 
 #[test]
@@ -85,8 +86,8 @@ fn repeated_calls_share_the_completed_stage_and_uncalled_lambdas_remain_lazy() {
     let twice = definitions.replace("saved 42", "saved 20 + saved 22");
     let once_delta = run(&format!("{definitions}#eval use 100"), "42")
         - run(&format!("{definitions}#eval use 0"), "42");
-    let twice_delta = run(&format!("{twice}#eval use 100"), "42")
-        - run(&format!("{twice}#eval use 0"), "42");
+    let twice_delta =
+        run(&format!("{twice}#eval use 100"), "42") - run(&format!("{twice}#eval use 0"), "42");
     assert!(once_delta > 100);
     assert_eq!(once_delta, twice_delta, "the initializer was duplicated");
 

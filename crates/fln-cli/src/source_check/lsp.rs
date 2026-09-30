@@ -377,12 +377,22 @@ fn inspect_sources(
     let wanted = match kind {
         QueryKind::Goals => ObservationKind::Goals,
         QueryKind::Hover => ObservationKind::Term,
-        QueryKind::Definition => return navigation::definition(
-            session.as_mut().expect("initialized semantic session"), sources, &inputs, offset,
-        ),
-        QueryKind::Completion => return completion::complete(
-            session.as_mut().expect("initialized semantic session"), sources, &inputs, offset,
-        ),
+        QueryKind::Definition => {
+            return navigation::definition(
+                session.as_mut().expect("initialized semantic session"),
+                sources,
+                &inputs,
+                offset,
+            );
+        }
+        QueryKind::Completion => {
+            return completion::complete(
+                session.as_mut().expect("initialized semantic session"),
+                sources,
+                &inputs,
+                offset,
+            );
+        }
     };
     let result = session
         .as_mut()

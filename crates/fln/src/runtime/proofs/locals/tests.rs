@@ -24,13 +24,7 @@ fn staged() -> (Expr, Expr) {
         pi(ty("Nat"), pi(ty("Nat"), ty("Nat"))),
         lam(
             ty("Nat"),
-            Expr::let_e(
-                name("saved"),
-                ty("Nat"),
-                b(0),
-                lam(ty("Nat"), b(1)),
-                false,
-            ),
+            Expr::let_e(name("saved"), ty("Nat"), b(0), lam(ty("Nat"), b(1)), false),
         ),
     )
 }
@@ -92,13 +86,7 @@ fn capture_avoiding_substitution_reopens_an_outer_value_below_a_new_binder() {
     let type_ = pi(ty("Nat"), pi(ty("Nat"), ty("Nat")));
     let value = lam(
         ty("Nat"),
-        Expr::let_e(
-            name("saved"),
-            ty("Nat"),
-            b(1),
-            lam(ty("Nat"), b(1)),
-            false,
-        ),
+        Expr::let_e(name("saved"), ty("Nat"), b(1), lam(ty("Nat"), b(1)), false),
     );
     let environment = Environment::new();
     let mut preparation = Preparation::new(&environment, IngressLimits::default());
@@ -111,10 +99,7 @@ fn capture_avoiding_substitution_reopens_an_outer_value_below_a_new_binder() {
     let actual = preparation.substitution(&body, &literal).unwrap();
     let expected = lam(
         ty("Nat"),
-        Expr::app(
-            Expr::app(value.lift_loose(0, 1).unwrap(), b(0)),
-            b(1),
-        ),
+        Expr::app(Expr::app(value.lift_loose(0, 1).unwrap(), b(0)), b(1)),
     );
     assert_eq!(actual, expected);
 }

@@ -48,7 +48,10 @@ mod tests {
         Expr::const_(name(label), vec![])
     }
     fn dictionary(first: Expr, second: Expr) -> Expr {
-        application(c("Dictionary.mk"), [Expr::sort(Level::zero()), first, second])
+        application(
+            c("Dictionary.mk"),
+            [Expr::sort(Level::zero()), first, second],
+        )
     }
     fn project(index: u64, value: Expr) -> Expr {
         Expr::proj(name("Dictionary"), index, value)
@@ -131,7 +134,11 @@ mod tests {
                 0,
                 application(
                     Expr::const_(name("Dictionary.mk"), vec![Level::one()]),
-                    [Expr::sort(Level::zero()), nat::literal(41), nat::literal(42)],
+                    [
+                        Expr::sort(Level::zero()),
+                        nat::literal(41),
+                        nat::literal(42),
+                    ],
                 ),
             ),
         ] {
@@ -173,9 +180,19 @@ mod tests {
             c("Dictionary.mk"),
             [c("runtimeAxiom"), nat::literal(41), nat::literal(42)],
         );
-        assert!(preparation.instance_factory_value(&invalid).unwrap().is_none());
+        assert!(
+            preparation
+                .instance_factory_value(&invalid)
+                .unwrap()
+                .is_none()
+        );
         let bad_level = Expr::const_(name("OpaqueType"), vec![Level::one()]);
-        assert!(preparation.instance_factory_value(&bad_level).unwrap().is_none());
+        assert!(
+            preparation
+                .instance_factory_value(&bad_level)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

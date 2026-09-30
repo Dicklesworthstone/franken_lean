@@ -51,7 +51,8 @@ impl Preparation<'_> {
         let ExprNode::Const { name: n, levels } = head.node() else {
             return Ok(None);
         };
-        let constructor = n == &name("Quot.mk") && levels.len() == 1 && (2..=3).contains(&args.len());
+        let constructor =
+            n == &name("Quot.mk") && levels.len() == 1 && (2..=3).contains(&args.len());
         let lift = n == &name("Quot.lift") && levels.len() == 2 && args.len() >= 3;
         if !constructor && !lift {
             return Ok(None);

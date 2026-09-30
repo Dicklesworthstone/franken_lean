@@ -22,14 +22,11 @@ fn execute(source: &str, expected: &str) {
         panic!("execution did not return");
     };
     assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(expected));
-    let replay = fln::execute_flbc_artifact(
-        &execution.flbc_artifact,
-        &KVMap::new(),
-        Default::default(),
-    )
-    .unwrap()
-    .into_complete()
-    .unwrap();
+    let replay =
+        fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), Default::default())
+            .unwrap()
+            .into_complete()
+            .unwrap();
     let VmExit::Returned(value) = replay else {
         panic!("replay did not return");
     };
@@ -51,7 +48,9 @@ fn successive_callback_stages_keep_concrete_types_owned_values_and_captures() {
         "42",
     );
     execute(
-        &format!("{PIPELINE}\ndef run (suffix : String) : Nat := String.length (pipeline \"a\" (fun s => s ++ suffix) (fun s => s ++ s))\n#eval run \"bc\""),
+        &format!(
+            "{PIPELINE}\ndef run (suffix : String) : Nat := String.length (pipeline \"a\" (fun s => s ++ suffix) (fun s => s ++ s))\n#eval run \"bc\""
+        ),
         "6",
     );
 }
@@ -66,9 +65,11 @@ fn flat_returned_callbacks_underapply_through_their_existing_suffix_interfaces()
 
 #[test]
 fn unused_intermediate_result_does_not_delay_the_call_that_computed_it() {
-    let source = |n| format!(
-        "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n{PIPELINE}\n#eval let result : (Nat -> Nat) -> Nat := pipeline {n} spend; 42"
-    );
+    let source = |n| {
+        format!(
+            "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n{PIPELINE}\n#eval let result : (Nat -> Nat) -> Nat := pipeline {n} spend; 42"
+        )
+    };
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);

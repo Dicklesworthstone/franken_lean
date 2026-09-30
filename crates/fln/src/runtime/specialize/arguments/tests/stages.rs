@@ -112,7 +112,11 @@ fn zero_argument_producers_preserve_all_initialization_before_the_static_binder(
     let value = strict(
         "first",
         call("observe", nat::literal(0)),
-        strict("second", call("observe", b(0)), telescope(&binders, b(0), true)),
+        strict(
+            "second",
+            call("observe", b(0)),
+            telescope(&binders, b(0), true),
+        ),
     );
     let environment = Environment::new();
     let result = Preparation::new(&environment, IngressLimits::default())
@@ -163,7 +167,11 @@ fn trailing_runtime_arguments_cannot_change_a_cached_strict_stage() {
     };
     let value = telescope(
         &[(ty("Nat"), BinderInfo::Default)],
-        strict("paid", call("observe", b(0)), body.lift_loose(0, 1).unwrap()),
+        strict(
+            "paid",
+            call("observe", b(0)),
+            body.lift_loose(0, 1).unwrap(),
+        ),
         true,
     );
     let environment = Environment::new();
@@ -172,7 +180,11 @@ fn trailing_runtime_arguments_cannot_change_a_cached_strict_stage() {
         .specialize_arguments(type_.clone(), value.clone(), &[nat::literal(1), ty("Nat")])
         .unwrap();
     let saturated = preparation
-        .specialize_arguments(type_, value, &[nat::literal(99), ty("Nat"), nat::literal(42)])
+        .specialize_arguments(
+            type_,
+            value,
+            &[nat::literal(99), ty("Nat"), nat::literal(42)],
+        )
         .unwrap();
     assert_eq!(partial.type_, saturated.type_);
     assert_eq!(partial.value, saturated.value);

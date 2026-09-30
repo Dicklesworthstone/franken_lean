@@ -74,7 +74,10 @@ fn applied_factories_produce_inert_constructor_values_without_changing_inputs() 
         Some(call("Dictionary.mk", [nat::literal(42), nat::literal(42)]))
     );
     assert_eq!(input, original);
-    assert_eq!(evaluate(&environment, &input), evaluate(&environment, &input));
+    assert_eq!(
+        evaluate(&environment, &input),
+        evaluate(&environment, &input)
+    );
 }
 
 #[test]
@@ -206,7 +209,12 @@ fn private_bodies_receive_normalized_dictionaries_but_keys_keep_original_argumen
     );
     let value = lam(
         c("Nat"),
-        Expr::lam(Name::anonymous(), c("Dictionary"), b(0), BinderInfo::InstImplicit),
+        Expr::lam(
+            Name::anonymous(),
+            c("Dictionary"),
+            b(0),
+            BinderInfo::InstImplicit,
+        ),
     );
     let input = call("factory", [nat::literal(42)]);
     let mut preparation = Preparation::new(&environment, IngressLimits::default());
@@ -217,7 +225,10 @@ fn private_bodies_receive_normalized_dictionaries_but_keys_keep_original_argumen
     assert_eq!(result.runtime_arguments, vec![b(0)]);
     assert_eq!(
         result.value,
-        lam(c("Nat"), call("Dictionary.mk", [nat::literal(42), nat::literal(42)]))
+        lam(
+            c("Nat"),
+            call("Dictionary.mk", [nat::literal(42), nat::literal(42)])
+        )
     );
     assert!(!result.value.has_loose_bvars());
 }

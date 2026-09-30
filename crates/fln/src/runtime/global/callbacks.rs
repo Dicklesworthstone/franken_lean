@@ -48,9 +48,7 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let definition = match self.environment.find(name) {
-            Some(ConstantInfo::Defn(definition))
-                if definition.safety == DefinitionSafety::Safe =>
-            {
+            Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
                 Some(definition.clone())
             }
             Some(_) => None,
@@ -60,7 +58,9 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if definition.base.level_params.len() != levels.len()
-            || levels.iter().any(|level| level.has_mvar() || level.has_param())
+            || levels
+                .iter()
+                .any(|level| level.has_mvar() || level.has_param())
         {
             return Ok(None);
         }
@@ -87,11 +87,8 @@ impl Preparation<'_> {
             &definition.base.level_params,
             levels,
         )?;
-        definition.value = self.universe_instance(
-            &definition.value,
-            &definition.base.level_params,
-            levels,
-        )?;
+        definition.value =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
         definition.base.level_params.clear();
         // Detect against original source types first. Ordinary flat callbacks
         // keep the existing catalog path and need no body/layout preparation.

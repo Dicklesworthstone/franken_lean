@@ -115,7 +115,9 @@ impl std::fmt::Display for SourceModuleCheckError {
                 import.to_display_string()
             ),
             Self::ImportContext { module, reason } => write!(
-                f, "module `{}` import context: {reason}", module.to_display_string()
+                f,
+                "module `{}` import context: {reason}",
+                module.to_display_string()
             ),
             Self::Cycle(name) => write!(
                 f,

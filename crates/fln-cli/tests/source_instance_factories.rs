@@ -14,10 +14,8 @@ fn success(output: Output) -> String {
 
 #[test]
 fn factory_dictionary_program_checks_executes_exports_and_replays() {
-    let directory = std::env::temp_dir().join(format!(
-        "fln-instance-factories-{}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("fln-instance-factories-{}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
     let source = directory.join("Example.lean");
     let artifact = directory.join("Example.flbc");

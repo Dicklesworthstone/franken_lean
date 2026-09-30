@@ -82,21 +82,30 @@ impl SourceModuleSession {
         }
         let mut bytes = 0usize;
         for input in inputs {
-            bytes = bytes.checked_add(input.source.len())
+            bytes = bytes
+                .checked_add(input.source.len())
                 .filter(|n| *n <= limits.max_source_bytes)
                 .ok_or_else(|| limit("completion source bytes", limits.max_source_bytes))?;
         }
-        let index = inputs.iter().position(|input| input.name == entry)
+        let index = inputs
+            .iter()
+            .position(|input| input.name == entry)
             .ok_or_else(|| SourceModuleCheckError::MissingModule {
-                importer: entry.clone(), module: entry.clone(),
+                importer: entry.clone(),
+                module: entry.clone(),
             })?;
         let source = inputs[index].source;
         let text = std::str::from_utf8(source)
             .map_err(|_| invalid(entry, offset, "completion source is not UTF-8"))?;
         if offset > text.len() || !text.is_char_boundary(offset) {
-            return Err(invalid(entry, offset, "completion position is not a source byte boundary"));
+            return Err(invalid(
+                entry,
+                offset,
+                "completion position is not a source byte boundary",
+            ));
         }
-        if offset > 0 && source.get(offset - 1) == Some(&b'\r')
+        if offset > 0
+            && source.get(offset - 1) == Some(&b'\r')
             && source.get(offset) == Some(&b'\n')
         {
             return Err(invalid(entry, offset, "completion position bisects CRLF"));
@@ -108,18 +117,24 @@ impl SourceModuleSession {
         let Some((range, filter)) = completion_token(source, offset, limits)? else {
             return Ok(Outcome::Complete(None));
         };
-        let header = modules::parse_source_header(&source[..range.start])
-            .map_err(|error| SourceModuleCheckError::Header { module: entry.clone(), error })?;
+        let header = modules::parse_source_header(&source[..range.start]).map_err(|error| {
+            SourceModuleCheckError::Header {
+                module: entry.clone(),
+                error,
+            }
+        })?;
         if range.start < header.body_start.0 {
             return Ok(Outcome::Complete(None));
         }
         // The incomplete identifier need not be valid declaration syntax.
         // Only the already-typed bytes preceding it choose the command prefix;
         // the ordinary checker remains the sole authority over that prefix.
-        let commands = fln_parse::command_scope::partition(&source[header.body_start.0..range.start])
-            .map_err(|error| SourceModuleCheckError::Header {
-                module: entry.clone(), error: error.with_original_offset(header.body_start),
-            })?;
+        let commands =
+            fln_parse::command_scope::partition(&source[header.body_start.0..range.start])
+                .map_err(|error| SourceModuleCheckError::Header {
+                    module: entry.clone(),
+                    error: error.with_original_offset(header.body_start),
+                })?;
         if commands.len() > limits.max_commands {
             return Err(limit("completion commands", limits.max_commands));
         }
@@ -128,7 +143,11 @@ impl SourceModuleSession {
         };
         let prefix_end = header.body_start.0 + start.0;
         if text.get(range.clone()).is_none() {
-            return Err(invalid(entry, offset, "completion range is outside the accepted source"));
+            return Err(invalid(
+                entry,
+                offset,
+                "completion range is outside the accepted source",
+            ));
         }
         let mut prefix_inputs = inputs.to_vec();
         prefix_inputs[index].source = &source[..prefix_end];
@@ -168,7 +187,10 @@ impl SourceModuleSession {
         let mut result_bytes = 0usize;
         let mut items = Vec::new();
         for item in names.into_values() {
-            let size = item.label.len().checked_add(item.replacement.len())
+            let size = item
+                .label
+                .len()
+                .checked_add(item.replacement.len())
                 .and_then(|size| result_bytes.checked_add(size));
             let Some(size) = size.filter(|size| *size <= limits.max_result_bytes) else {
                 incomplete = true;
@@ -177,7 +199,11 @@ impl SourceModuleSession {
             result_bytes = size;
             items.push(item);
         }
-        Ok(Outcome::Complete(Some(SourceCompletion { range, items, is_incomplete: incomplete })))
+        Ok(Outcome::Complete(Some(SourceCompletion {
+            range,
+            items,
+            is_incomplete: incomplete,
+        })))
     }
 }
 
@@ -187,7 +213,12 @@ fn limit(resource: &'static str, limit: usize) -> SourceModuleCheckError {
 fn invalid(module: &Name, offset: usize, message: &str) -> SourceModuleCheckError {
     SourceModuleCheckError::Source {
         module: module.clone(),
-        error: SourceCheckError::Scope { file: 0, command: 0, offset, message: message.to_owned() },
+        error: SourceCheckError::Scope {
+            file: 0,
+            command: 0,
+            offset,
+            message: message.to_owned(),
+        },
     }
 }
 
@@ -202,10 +233,14 @@ fn source_name(name: &Name, max_bytes: usize) -> Result<Option<(String, String)>
         if parts.len() >= 256 {
             return Ok(None);
         }
-        let LeafView::Str(part) = current.leaf_view() else { return Ok(None) };
-        bytes = bytes.checked_add(part.len())
+        let LeafView::Str(part) = current.leaf_view() else {
+            return Ok(None);
+        };
+        bytes = bytes
+            .checked_add(part.len())
             .and_then(|n| n.checked_add(usize::from(!parts.is_empty())))
-            .filter(|n| *n <= max_bytes).ok_or(())?;
+            .filter(|n| *n <= max_bytes)
+            .ok_or(())?;
         let mut chars = part.chars();
         if !chars.next().is_some_and(is_id_first) || !chars.all(is_id_rest) {
             return Ok(None);
@@ -213,7 +248,9 @@ fn source_name(name: &Name, max_bytes: usize) -> Result<Option<(String, String)>
         parts.push(part.to_owned());
         current = current.parent();
     }
-    let Some(leaf) = parts.first().cloned() else { return Ok(None) };
+    let Some(leaf) = parts.first().cloned() else {
+        return Ok(None);
+    };
     parts.reverse();
     Ok(Some((parts.join("."), leaf)))
 }
@@ -223,7 +260,9 @@ fn source_name(name: &Name, max_bytes: usize) -> Result<Option<(String, String)>
 /// comment bodies need a separate skip because the reference treats their
 /// openers as parser tokens, not whitespace.
 fn completion_token(
-    source: &[u8], offset: usize, limits: CompletionLookupLimits,
+    source: &[u8],
+    offset: usize,
+    limits: CompletionLookupLimits,
 ) -> Result<Option<(Range<usize>, String)>, SourceModuleCheckError> {
     let original = SourceText::from_utf8(source)
         .map_err(|_| limit("completion UTF-8 source", limits.max_source_bytes))?;
@@ -237,22 +276,31 @@ fn completion_token(
     }
     let cursor = view.from_original(BytePos(offset)).or_else(|| {
         (bytes.get(offset) == Some(&b'\r') && bytes.get(offset + 1) == Some(&b'\n'))
-            .then(|| view.from_original(BytePos(offset + 1))).flatten()
+            .then(|| view.from_original(BytePos(offset + 1)))
+            .flatten()
     });
-    let Some(cursor) = cursor else { return Ok(None) };
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
     let text = view.normalized();
     let table = TokenTable::new();
     let mut at = BytePos(0);
     let mut tokens = 0usize;
     while at.0 < text.len_bytes() && at.0 <= cursor.0 {
-        tokens = tokens.checked_add(1).filter(|n| *n <= limits.max_tokens)
+        tokens = tokens
+            .checked_add(1)
+            .filter(|n| *n <= limits.max_tokens)
             .ok_or_else(|| limit("completion tokens", limits.max_tokens))?;
-        let Ok(stop) = scan_trivia(text, at) else { return Ok(None) };
+        let Ok(stop) = scan_trivia(text, at) else {
+            return Ok(None);
+        };
         if stop.0 > cursor.0 || stop.0 >= text.len_bytes() {
             return Ok(None);
         }
         if opens_doc_comment(text, stop) {
-            let Some(end) = doc_comment_end(text.as_bytes(), stop.0) else { return Ok(None) };
+            let Some(end) = doc_comment_end(text.as_bytes(), stop.0) else {
+                return Ok(None);
+            };
             if cursor.0 < end {
                 return Ok(None);
             }
@@ -262,17 +310,24 @@ fn completion_token(
         match lex_token(text, &table, stop) {
             Ok(token) => {
                 let mut end = token.extent.end().0;
-                if end <= stop.0 { return Ok(None) }
+                if end <= stop.0 {
+                    return Ok(None);
+                }
                 // The lexer stops before a trailing dot in an unfinished name.
                 // Include precisely that dot when the cursor is immediately after it.
-                if matches!(&token.kind, TokenKind::Ident(_)) && cursor.0 == end + 1
+                if matches!(&token.kind, TokenKind::Ident(_))
+                    && cursor.0 == end + 1
                     && text.as_bytes().get(end) == Some(&b'.')
                 {
                     end += 1;
                 }
                 if stop.0 < cursor.0 && cursor.0 <= end {
-                    if !matches!(&token.kind, TokenKind::Ident(_)) { return Ok(None) }
-                    let Some(raw) = text.as_str().get(stop.0..cursor.0) else { return Ok(None) };
+                    if !matches!(&token.kind, TokenKind::Ident(_)) {
+                        return Ok(None);
+                    }
+                    let Some(raw) = text.as_str().get(stop.0..cursor.0) else {
+                        return Ok(None);
+                    };
                     if raw.len() > limits.max_name_bytes {
                         return Err(limit("completion filter bytes", limits.max_name_bytes));
                     }
@@ -281,10 +336,15 @@ fn completion_token(
                     if raw.strip_suffix('.').unwrap_or(raw).split('.').any(|part| {
                         let mut chars = part.chars();
                         !chars.next().is_some_and(is_id_first) || !chars.all(is_id_rest)
-                    }) { return Ok(None) }
+                    }) {
+                        return Ok(None);
+                    }
                     let filter = raw.to_owned();
-                    return Ok(Some((original_boundary(&view, bytes, stop)
-                        ..original_boundary(&view, bytes, BytePos(end)), filter)));
+                    return Ok(Some((
+                        original_boundary(&view, bytes, stop)
+                            ..original_boundary(&view, bytes, BytePos(end)),
+                        filter,
+                    )));
                 }
                 at = BytePos(end);
             }
@@ -305,7 +365,8 @@ fn completion_token(
 
 fn original_boundary(view: &SourceView, original: &[u8], at: BytePos) -> usize {
     let offset = view.to_original(at).0;
-    if offset > 0 && original.get(offset - 1) == Some(&b'\r')
+    if offset > 0
+        && original.get(offset - 1) == Some(&b'\r')
         && original.get(offset) == Some(&b'\n')
     {
         offset - 1
@@ -319,11 +380,16 @@ fn doc_comment_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 1usize;
     while at < bytes.len() {
         match (bytes.get(at), bytes.get(at + 1)) {
-            (Some(b'/'), Some(b'-')) => { depth = depth.checked_add(1)?; at += 2; }
+            (Some(b'/'), Some(b'-')) => {
+                depth = depth.checked_add(1)?;
+                at += 2;
+            }
             (Some(b'-'), Some(b'/')) => {
                 depth -= 1;
                 at += 2;
-                if depth == 0 { return Some(at) }
+                if depth == 0 {
+                    return Some(at);
+                }
             }
             _ => at += 1,
         }
@@ -344,21 +410,32 @@ mod tests {
     fn partial_and_qualified_names_replace_the_whole_identifier() {
         let source = "def use : Nat := Demo.value";
         let start = source.find("Demo").unwrap();
-        assert_eq!(token(source, start + 7), Some((start..source.len(), "Demo.va".into())));
+        assert_eq!(
+            token(source, start + 7),
+            Some((start..source.len(), "Demo.va".into()))
+        );
         let source = "def use : Nat := Demo.";
         let start = source.find("Demo").unwrap();
-        assert_eq!(token(source, source.len()), Some((start..source.len(), "Demo.".into())));
+        assert_eq!(
+            token(source, source.len()),
+            Some((start..source.len(), "Demo.".into()))
+        );
         let source = "def use : Nat := _root_.Demo.va";
         let start = source.find("_root_").unwrap();
-        assert_eq!(token(source, source.len()), Some((start..source.len(), "_root_.Demo.va".into())));
+        assert_eq!(
+            token(source, source.len()),
+            Some((start..source.len(), "_root_.Demo.va".into()))
+        );
     }
 
     #[test]
     fn original_unicode_and_crlf_offsets_survive_the_lexical_view() {
         let source = "-- heading\r\ndef use : Nat := αvalue";
         let start = source.find("αvalue").unwrap();
-        assert_eq!(token(source, start + "αva".len()),
-            Some((start..source.len(), "αva".into())));
+        assert_eq!(
+            token(source, start + "αva".len()),
+            Some((start..source.len(), "αva".into()))
+        );
         let source = "-- heading\r\ndef use : Nat := αvalue\r\n";
         let start = source.find("αvalue").unwrap();
         let end = start + "αvalue".len();
@@ -369,9 +446,16 @@ mod tests {
     #[test]
     fn comments_and_literals_never_become_completion_prefixes() {
         for source in [
-            "-- value", "/- value -/", "/-- value -/", "/-! value -/",
-            "/-- nested /- comment -/ value -/", "\"value\"", "'v'",
-            "/- value", "/-- value", "\"value",
+            "-- value",
+            "/- value -/",
+            "/-- value -/",
+            "/-! value -/",
+            "/-- nested /- comment -/ value -/",
+            "\"value\"",
+            "'v'",
+            "/- value",
+            "/-- value",
+            "\"value",
         ] {
             let offset = source.find('v').unwrap() + 1;
             assert_eq!(token(source, offset), None, "{source}");
@@ -384,23 +468,44 @@ mod tests {
 
     #[test]
     fn malformed_or_escaped_partial_names_are_not_reinterpreted() {
-        for source in ["def use := Demo..", "def use := «a.b»,", "def use := «value", "def use := 12"] {
+        for source in [
+            "def use := Demo..",
+            "def use := «a.b»,",
+            "def use := «value",
+            "def use := 12",
+        ] {
             assert_eq!(token(source, source.len()), None, "{source}");
         }
         assert_eq!(source_name(&Name::from_components(["a.b"]), 4096), Ok(None));
         assert_eq!(source_name(&Name::default(), 4096), Ok(None));
-        assert_eq!(source_name(&Name::from_components(["x"]), 1), Ok(Some(("x".into(), "x".into()))));
+        assert_eq!(
+            source_name(&Name::from_components(["x"]), 1),
+            Ok(Some(("x".into(), "x".into())))
+        );
         assert!(source_name(&Name::from_components(["xx"]), 1).is_err());
     }
 
     #[test]
     fn lexical_work_and_filter_sizes_are_bounded() {
-        let mut limits = CompletionLookupLimits { max_tokens: 0, ..CompletionLookupLimits::default() };
-        assert!(matches!(completion_token(b"value", 5, limits),
-            Err(SourceModuleCheckError::Limit { resource: "completion tokens", .. })));
+        let mut limits = CompletionLookupLimits {
+            max_tokens: 0,
+            ..CompletionLookupLimits::default()
+        };
+        assert!(matches!(
+            completion_token(b"value", 5, limits),
+            Err(SourceModuleCheckError::Limit {
+                resource: "completion tokens",
+                ..
+            })
+        ));
         limits.max_tokens = 100;
         limits.max_name_bytes = 2;
-        assert!(matches!(completion_token(b"value", 5, limits),
-            Err(SourceModuleCheckError::Limit { resource: "completion filter bytes", .. })));
+        assert!(matches!(
+            completion_token(b"value", 5, limits),
+            Err(SourceModuleCheckError::Limit {
+                resource: "completion filter bytes",
+                ..
+            })
+        ));
     }
 }

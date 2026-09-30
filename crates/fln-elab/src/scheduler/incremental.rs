@@ -177,9 +177,10 @@ impl IncrementalScheduler {
         graph.validate()?;
         for &id in changed {
             let current = graph.dependencies_of(id).is_some();
-            let previous = self.committed.as_ref().is_some_and(|cache| {
-                cache.source_graph.dependencies_of(id).is_some()
-            });
+            let previous = self
+                .committed
+                .as_ref()
+                .is_some_and(|cache| cache.source_graph.dependencies_of(id).is_some());
             if !current && !previous {
                 return Err(format!("unknown changed command ID {id}"));
             }
@@ -187,8 +188,11 @@ impl IncrementalScheduler {
         let Some(cache) = &self.committed else {
             return Ok(graph.nodes().iter().map(|node| node.id).collect());
         };
-        let same_layout = graph.nodes().iter().map(|node| node.id)
-            .eq(cache.source_graph.nodes().iter().map(|node| node.id));
+        let same_layout = graph.nodes().iter().map(|node| node.id).eq(cache
+            .source_graph
+            .nodes()
+            .iter()
+            .map(|node| node.id));
         if !same_layout || &cache.budget != budget {
             return Ok(graph.nodes().iter().map(|node| node.id).collect());
         }
@@ -200,9 +204,10 @@ impl IncrementalScheduler {
                 || previous.referenced_names != current.referenced_names
                 || previous.declared_effects != current.declared_effects
                 || !Arc::ptr_eq(&previous.elab_fn, &current.elab_fn)
-                || !cache.products.get(&current.id).is_some_and(|product| {
-                    product_footprint(current, product).is_replay_safe()
-                })
+                || !cache
+                    .products
+                    .get(&current.id)
+                    .is_some_and(|product| product_footprint(current, product).is_replay_safe())
             {
                 dirty.insert(current.id);
             }

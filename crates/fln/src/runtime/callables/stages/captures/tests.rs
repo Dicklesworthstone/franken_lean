@@ -1,6 +1,10 @@
 use super::*;
 
-fn interface(prep: &mut Preparation<'_>, parameters: Vec<ValueType>, result: ValueType) -> ValueType {
+fn interface(
+    prep: &mut Preparation<'_>,
+    parameters: Vec<ValueType>,
+    result: ValueType,
+) -> ValueType {
     prep.stage_interface(ClosureSignature {
         parameter_ownership: borrowed_runtime_parameters(parameters.len()).unwrap(),
         parameters,
@@ -86,7 +90,10 @@ fn aliases_in_argument_initializers_are_lexical_not_global_expression_keys() {
         argument(0, second),
     );
     let original = source.clone();
-    assert_eq!(prep.captured_result(&source, &[staged, flat]).unwrap(), None);
+    assert_eq!(
+        prep.captured_result(&source, &[staged, flat]).unwrap(),
+        None
+    );
     assert_eq!(prep.lambdas[0].result, staged);
     assert_eq!(prep.lambdas[1].result, flat);
     assert_eq!(source, original);

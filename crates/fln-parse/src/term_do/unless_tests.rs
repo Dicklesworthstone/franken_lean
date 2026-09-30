@@ -5,7 +5,10 @@ fn count(syntax: &Syntax, kind: &str) -> usize {
     let mut work = vec![syntax];
     let mut result = 0;
     while let Some(syntax) = work.pop() {
-        if let Syntax::Node { kind: actual, args, .. } = syntax {
+        if let Syntax::Node {
+            kind: actual, args, ..
+        } = syntax
+        {
             result += usize::from(actual == &kind);
             work.extend(args);
         }
@@ -20,7 +23,10 @@ fn guarded_multi_statement_blocks_round_trip_without_new_do_scopes() {
     ] {
         let parsed = parse_definition(source.as_bytes()).unwrap();
         assert_eq!(parsed.reconstruct_original(), source.as_bytes());
-        assert_eq!(parsed.reconstruct_normalized().unwrap(), source.replace("\r\n", "\n").as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace("\r\n", "\n").as_bytes()
+        );
         assert_eq!(count(parsed.syntax(), "doUnless"), 1);
         assert_eq!(count(parsed.syntax(), "do"), 1);
         assert_eq!(count(parsed.syntax(), "doLet"), 1);
@@ -50,8 +56,12 @@ fn missing_guard_predicates_delimiters_and_bodies_remain_refusals() {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
     let source = "def run := do\r\n  unless flag do\r\n  return 7";
-    assert_eq!(parse_definition(source.as_bytes()).unwrap_err().primary_offset(),
-        Some(BytePos(source.find("return").unwrap())));
+    assert_eq!(
+        parse_definition(source.as_bytes())
+            .unwrap_err()
+            .primary_offset(),
+        Some(BytePos(source.find("return").unwrap()))
+    );
 }
 #[test]
 fn parenthesized_predicates_and_escaped_guard_names_are_not_reinterpreted() {

@@ -10,13 +10,15 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_elab::dataflow::{CommandId, DataflowGraph, DataflowNode, ElabUnitProduct};
-use fln_elab::effects::{CommandEffect, DeclAspect, EffectSummary};
 use fln_elab::decision::DecisionRecord;
+use fln_elab::effects::{CommandEffect, DeclAspect, EffectSummary};
 use fln_elab::info::{Info, InfoTree};
 use fln_elab::messages::Message;
 use fln_elab::scheduler::{DeterministicScheduler, IncrementalOutput, IncrementalScheduler};
 use fln_elab::txn::ElabBudget;
-use fln_env::constants::{ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+use fln_env::constants::{
+    ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+};
 use fln_env::environment::Environment;
 
 type CommandOutcome = Outcome<Result<ElabUnitProduct, String>>;
@@ -34,7 +36,10 @@ fn effects(values: impl IntoIterator<Item = CommandEffect>) -> EffectSummary {
 }
 
 fn read(value: &str) -> CommandEffect {
-    CommandEffect::ReadsDecl { name: name(value), aspect: DeclAspect::All }
+    CommandEffect::ReadsDecl {
+        name: name(value),
+        aspect: DeclAspect::All,
+    }
 }
 
 fn published(value: &str, revision: usize) -> ElabUnitProduct {
@@ -43,18 +48,22 @@ fn published(value: &str, revision: usize) -> ElabUnitProduct {
         level = Level::succ(level).unwrap();
     }
     let mut product = ElabUnitProduct::empty();
-    product.admitted_decls.push(ConstantInfo::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: name(value),
-            level_params: Vec::new(),
-            type_: Expr::sort(Level::succ(level.clone()).unwrap()),
-        },
-        value: Expr::sort(level),
-        hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
-        all: Vec::new(),
-    }));
-    product.messages.push(Message::info(format!("{value}:{revision}")));
+    product
+        .admitted_decls
+        .push(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name(value),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::succ(level.clone()).unwrap()),
+            },
+            value: Expr::sort(level),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: Vec::new(),
+        }));
+    product
+        .messages
+        .push(Message::info(format!("{value}:{revision}")));
     product.info_tree = Some(InfoTree::Node(
         Info::CommandInfo { name: name(value) },
         Vec::new(),
@@ -111,17 +120,24 @@ fn counts(n: usize) -> Vec<Arc<AtomicUsize>> {
 }
 
 fn snapshot(calls: &[Arc<AtomicUsize>]) -> Vec<usize> {
-    calls.iter().map(|counter| counter.load(Ordering::SeqCst)).collect()
+    calls
+        .iter()
+        .map(|counter| counter.load(Ordering::SeqCst))
+        .collect()
 }
 
 fn simple_nodes(calls: &[Arc<AtomicUsize>]) -> Vec<DataflowNode> {
-    ["A", "B", "C"].into_iter().enumerate().map(|(id, label)| {
-        let mut node = command(id, &calls[id], EffectSummary::new(), move |_| {
-            Outcome::complete(Ok(published(label, 0)))
-        });
-        node.name = Some(name(label));
-        node
-    }).collect()
+    ["A", "B", "C"]
+        .into_iter()
+        .enumerate()
+        .map(|(id, label)| {
+            let mut node = command(id, &calls[id], EffectSummary::new(), move |_| {
+                Outcome::complete(Ok(published(label, 0)))
+            });
+            node.name = Some(name(label));
+            node
+        })
+        .collect()
 }
 
 #[test]
@@ -131,7 +147,10 @@ fn warm_run_reuses_every_product_and_replays_canonical_outputs() {
     let mut cache = IncrementalScheduler::new(&Environment::new());
     let cold = execute(&mut cache, &graph, &[]);
     let warm = execute(&mut cache, &graph, &[]);
-    assert_eq!(cold.executed_commands, vec![CommandId(0), CommandId(1), CommandId(2)]);
+    assert_eq!(
+        cold.executed_commands,
+        vec![CommandId(0), CommandId(1), CommandId(2)]
+    );
     assert!(warm.executed_commands.is_empty());
     assert_eq!(warm.reused_commands, cold.executed_commands);
     assert_eq!(snapshot(&calls), vec![1, 1, 1]);
@@ -139,8 +158,10 @@ fn warm_run_reuses_every_product_and_replays_canonical_outputs() {
     assert_eq!(warm.output.effects, cold.output.effects);
     assert_eq!(warm.output.info_trees, cold.output.info_trees);
     assert_eq!(warm.output.decisions, cold.output.decisions);
-    assert_eq!(warm.output.final_environment.logical_root(&KVMap::new()),
-        cold.output.final_environment.logical_root(&KVMap::new()));
+    assert_eq!(
+        warm.output.final_environment.logical_root(&KVMap::new()),
+        cold.output.final_environment.logical_root(&KVMap::new())
+    );
 }
 
 #[test]
@@ -171,18 +192,25 @@ fn explicit_edit_reexecutes_the_observed_dependency_cone_only() {
     execute(&mut cache, &graph, &[]);
     revision.store(1, Ordering::SeqCst);
     let updated = execute(&mut cache, &graph, &[CommandId(0)]);
-    assert_eq!(updated.executed_commands, vec![CommandId(0), CommandId(1), CommandId(2)]);
+    assert_eq!(
+        updated.executed_commands,
+        vec![CommandId(0), CommandId(1), CommandId(2)]
+    );
     assert_eq!(updated.reused_commands, vec![CommandId(3)]);
     assert_eq!(snapshot(&calls), vec![2, 2, 2, 1]);
     let cold = match DeterministicScheduler::execute_sequential(
-        &graph, &Environment::new(), &ElabBudget::default(),
+        &graph,
+        &Environment::new(),
+        &ElabBudget::default(),
     ) {
         Outcome::Complete(Ok(output)) => output,
         other => panic!("cold oracle failed: {other:?}"),
     };
     assert_eq!(updated.output.messages, cold.messages);
-    assert_eq!(updated.output.final_environment.logical_root(&KVMap::new()),
-        cold.final_environment.logical_root(&KVMap::new()));
+    assert_eq!(
+        updated.output.final_environment.logical_root(&KVMap::new()),
+        cold.final_environment.logical_root(&KVMap::new())
+    );
 }
 
 #[test]
@@ -231,11 +259,13 @@ fn new_dynamic_publication_invalidates_previously_negative_queries() {
     let b = command(1, &calls[1], EffectSummary::new(), |environment| {
         let mut product = published("Y", 0);
         product.effects.record(read("X"));
-        product.messages.push(Message::info(if environment.contains(&name("X")) {
-            "X present"
-        } else {
-            "X absent"
-        }));
+        product
+            .messages
+            .push(Message::info(if environment.contains(&name("X")) {
+                "X present"
+            } else {
+                "X absent"
+            }));
         Outcome::complete(Ok(product))
     });
     let c = command(2, &calls[2], effects([read("Y")]), |_| {
@@ -246,12 +276,27 @@ fn new_dynamic_publication_invalidates_previously_negative_queries() {
     execute(&mut cache, &graph, &[]);
     publish.store(1, Ordering::SeqCst);
     let positive = execute(&mut cache, &graph, &[CommandId(0)]);
-    assert_eq!(positive.executed_commands, vec![CommandId(0), CommandId(1), CommandId(2)]);
-    assert!(positive.output.messages.iter().any(|message| message.text == "X present"));
+    assert_eq!(
+        positive.executed_commands,
+        vec![CommandId(0), CommandId(1), CommandId(2)]
+    );
+    assert!(
+        positive
+            .output
+            .messages
+            .iter()
+            .any(|message| message.text == "X present")
+    );
     publish.store(0, Ordering::SeqCst);
     let negative = execute(&mut cache, &graph, &[CommandId(0)]);
     assert!(!negative.output.final_environment.contains(&name("X")));
-    assert!(negative.output.messages.iter().any(|message| message.text == "X absent"));
+    assert!(
+        negative
+            .output
+            .messages
+            .iter()
+            .any(|message| message.text == "X absent")
+    );
     assert_eq!(snapshot(&calls), vec![3, 3, 3]);
 }
 
@@ -265,7 +310,13 @@ fn deleting_a_command_removes_its_declarations_and_messages() {
     let output = execute(&mut cache, &remaining, &[CommandId(0)]);
     assert!(!output.output.final_environment.contains(&name("A")));
     assert!(output.output.final_environment.contains(&name("B")));
-    assert!(!output.output.messages.iter().any(|message| message.text.starts_with("A:")));
+    assert!(
+        !output
+            .output
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with("A:"))
+    );
     assert!(output.reused_commands.is_empty());
     assert_eq!(snapshot(&calls), vec![1, 2, 2]);
 }
@@ -278,7 +329,10 @@ fn reorder_and_empty_module_rebuild_from_the_fixed_base() {
     execute(&mut cache, &graph(nodes.clone()), &[]);
     nodes.reverse();
     let reordered = execute(&mut cache, &graph(nodes), &[]);
-    assert_eq!(reordered.output.committed_order, vec![CommandId(2), CommandId(1), CommandId(0)]);
+    assert_eq!(
+        reordered.output.committed_order,
+        vec![CommandId(2), CommandId(1), CommandId(0)]
+    );
     assert!(reordered.reused_commands.is_empty());
     let empty = execute(&mut cache, &DataflowGraph::new(), &[]);
     assert_eq!(empty.output.final_environment.len(), 0);
@@ -300,13 +354,23 @@ fn failed_rebuild_cannot_replace_the_last_successful_cache() {
     changed[2] = command(2, &bad_calls[1], EffectSummary::new(), |_| {
         Outcome::complete(Err("rebuild rejected".into()))
     });
-    assert!(matches!(cache.execute(&graph(changed), &[], &ElabBudget::default()),
-        Outcome::Complete(Err(_))));
+    assert!(matches!(
+        cache.execute(&graph(changed), &[], &ElabBudget::default()),
+        Outcome::Complete(Err(_))
+    ));
     let recovered = execute(&mut cache, &original, &[]);
     assert!(recovered.executed_commands.is_empty());
     assert_eq!(recovered.output.messages, expected.output.messages);
-    assert_eq!(recovered.output.final_environment.logical_root(&KVMap::new()),
-        expected.output.final_environment.logical_root(&KVMap::new()));
+    assert_eq!(
+        recovered
+            .output
+            .final_environment
+            .logical_root(&KVMap::new()),
+        expected
+            .output
+            .final_environment
+            .logical_root(&KVMap::new())
+    );
     assert_eq!(snapshot(&calls), vec![1, 1, 1]);
 }
 
@@ -334,7 +398,11 @@ fn nonanswers_are_never_cached_or_promoted() {
             assert!(matches!(outcome, Outcome::Inconclusive(_)));
         }
         assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
-        assert!(execute(&mut cache, &original, &[]).executed_commands.is_empty());
+        assert!(
+            execute(&mut cache, &original, &[])
+                .executed_commands
+                .is_empty()
+        );
         assert_eq!(snapshot(&calls), vec![1, 1, 1]);
     }
 }
@@ -345,9 +413,15 @@ fn unknown_edit_ids_fail_before_callbacks_and_leave_the_cache_intact() {
     let graph = graph(simple_nodes(&calls));
     let mut cache = IncrementalScheduler::new(&Environment::new());
     execute(&mut cache, &graph, &[]);
-    assert!(matches!(cache.execute(&graph, &[CommandId(999)], &ElabBudget::default()),
-        Outcome::Complete(Err(_))));
-    assert!(execute(&mut cache, &graph, &[]).executed_commands.is_empty());
+    assert!(matches!(
+        cache.execute(&graph, &[CommandId(999)], &ElabBudget::default()),
+        Outcome::Complete(Err(_))
+    ));
+    assert!(
+        execute(&mut cache, &graph, &[])
+            .executed_commands
+            .is_empty()
+    );
     assert_eq!(snapshot(&calls), vec![1, 1, 1]);
 }
 
@@ -355,7 +429,9 @@ fn unknown_edit_ids_fail_before_callbacks_and_leave_the_cache_intact() {
 fn opaque_commands_run_each_time_and_invalidate_their_suffix() {
     let calls = counts(3);
     let mut nodes = simple_nodes(&calls);
-    nodes[1].declared_effects.record(CommandEffect::Opaque { reason: "ambient".into() });
+    nodes[1].declared_effects.record(CommandEffect::Opaque {
+        reason: "ambient".into(),
+    });
     let graph = graph(nodes);
     let mut cache = IncrementalScheduler::new(&Environment::new());
     execute(&mut cache, &graph, &[]);
@@ -369,7 +445,11 @@ fn opaque_commands_run_each_time_and_invalidate_their_suffix() {
 fn typed_registry_writers_are_not_replayed_from_declaration_only_products() {
     let calls = counts(3);
     let mut nodes = simple_nodes(&calls);
-    nodes[1].declared_effects.record(CommandEffect::WritesGrammar { category: name("term") });
+    nodes[1]
+        .declared_effects
+        .record(CommandEffect::WritesGrammar {
+            category: name("term"),
+        });
     let graph = graph(nodes);
     let mut cache = IncrementalScheduler::new(&Environment::new());
     execute(&mut cache, &graph, &[]);
@@ -384,7 +464,10 @@ fn changed_budget_and_explicit_clear_discard_reuse() {
     let graph = graph(simple_nodes(&calls));
     let mut cache = IncrementalScheduler::new(&Environment::new());
     execute(&mut cache, &graph, &[]);
-    let budget = ElabBudget { max_heartbeats: 500, ..ElabBudget::default() };
+    let budget = ElabBudget {
+        max_heartbeats: 500,
+        ..ElabBudget::default()
+    };
     match cache.execute(&graph, &[], &budget) {
         Outcome::Complete(Ok(output)) => assert_eq!(output.executed_commands.len(), 3),
         other => panic!("changed budget run failed: {other:?}"),
@@ -399,21 +482,31 @@ fn replacing_the_base_environment_invalidates_import_sensitive_products() {
     let calls = counts(1);
     let observer = command(0, &calls[0], effects([read("Imported")]), |environment| {
         let mut product = ElabUnitProduct::empty();
-        product.messages.push(Message::info(if environment.contains(&name("Imported")) {
-            "imported"
-        } else {
-            "missing"
-        }));
+        product
+            .messages
+            .push(Message::info(if environment.contains(&name("Imported")) {
+                "imported"
+            } else {
+                "missing"
+            }));
         Outcome::complete(Ok(product))
     });
     let observer_graph = graph(vec![observer]);
     let mut cache = IncrementalScheduler::new(&Environment::new());
-    assert_eq!(execute(&mut cache, &observer_graph, &[]).output.messages[0].text, "missing");
-    let import = command(0, &Arc::new(AtomicUsize::new(0)), EffectSummary::new(), |_| {
-        Outcome::complete(Ok(published("Imported", 0)))
-    });
+    assert_eq!(
+        execute(&mut cache, &observer_graph, &[]).output.messages[0].text,
+        "missing"
+    );
+    let import = command(
+        0,
+        &Arc::new(AtomicUsize::new(0)),
+        EffectSummary::new(),
+        |_| Outcome::complete(Ok(published("Imported", 0))),
+    );
     let base = match DeterministicScheduler::execute_sequential(
-        &graph(vec![import]), &Environment::new(), &ElabBudget::default(),
+        &graph(vec![import]),
+        &Environment::new(),
+        &ElabBudget::default(),
     ) {
         Outcome::Complete(Ok(output)) => output.final_environment,
         other => panic!("base construction failed: {other:?}"),
@@ -430,8 +523,10 @@ fn duplicate_graph_ids_cannot_enter_the_incremental_cache() {
     let mut nodes = simple_nodes(&calls);
     nodes[1].id = nodes[0].id;
     let mut cache = IncrementalScheduler::new(&Environment::new());
-    assert!(matches!(cache.execute(&graph(nodes), &[], &ElabBudget::default()),
-        Outcome::Complete(Err(_))));
+    assert!(matches!(
+        cache.execute(&graph(nodes), &[], &ElabBudget::default()),
+        Outcome::Complete(Err(_))
+    ));
     assert_eq!(snapshot(&calls), vec![0, 0, 0]);
 }
 
@@ -447,8 +542,10 @@ fn inserting_a_command_rebuilds_and_publishes_its_new_product() {
     nodes.insert(1, added);
     let output = execute(&mut cache, &graph(nodes), &[CommandId(90)]);
     assert!(output.output.final_environment.contains(&name("Added")));
-    assert_eq!(output.output.committed_order,
-        vec![CommandId(0), CommandId(90), CommandId(1), CommandId(2)]);
+    assert_eq!(
+        output.output.committed_order,
+        vec![CommandId(0), CommandId(90), CommandId(1), CommandId(2)]
+    );
     assert!(output.reused_commands.is_empty());
     assert_eq!(snapshot(&calls), vec![2, 2, 2, 1]);
 }

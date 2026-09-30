@@ -97,9 +97,7 @@ impl Context {
             } else if kind == &parser_kind(&["Term", "nativeDoReturningFor"]) {
                 // Only return-carrying loops survive the inside-out walk.
                 return Ok(true);
-            } else if kind == &parser_kind(&["Term", "doMatch"])
-                || fallback::is_binding(syntax)
-            {
+            } else if kind == &parser_kind(&["Term", "doMatch"]) || fallback::is_binding(syntax) {
                 // Unlike a Boolean if, a constructor match may refine the
                 // discriminant's type and introduce equality evidence. Share
                 // its suffix through a checked join so every arm receives the
@@ -189,7 +187,10 @@ impl Context {
                         work.push(Task::Resume(block));
                         work.push(Task::FinishLoop(Box::new(build)));
                         work.push(Task::Block(Block::new(
-                            sequence, Some(normal), true, Some(scope),
+                            sequence,
+                            Some(normal),
+                            true,
+                            Some(scope),
                         )?));
                     } else if conditional::is_compound(&element) {
                         let suffix = block.result.take();
@@ -248,7 +249,10 @@ impl Context {
                         self.tick()?;
                         work.push(match arm {
                             Some(sequence) => Task::Block(Block::new(
-                                sequence, next.clone(), require_unit, loop_scope.clone(),
+                                sequence,
+                                next.clone(),
+                                require_unit,
+                                loop_scope.clone(),
                             )?),
                             None => Task::Value(next.clone().unwrap_or_else(skip)),
                         });

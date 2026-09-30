@@ -147,10 +147,22 @@ fn plan(
         let depth = delimiters.len();
         let failure = fallback::candidate(tokens, at, depth, lets.last(), active.len());
         do_scopes.before(
-            view, tokens, at, depth, &conditionals, &active, failure.is_some(),
+            view,
+            tokens,
+            at,
+            depth,
+            &conditionals,
+            &active,
+            failure.is_some(),
         );
         fallback::advance(
-            view, tokens, at, depth, &mut do_scopes, &mut fallbacks, &mut done,
+            view,
+            tokens,
+            at,
+            depth,
+            &mut do_scopes,
+            &mut fallbacks,
+            &mut done,
         )?;
         while conditionals.last().is_some_and(|p| {
             p.statement
@@ -459,7 +471,8 @@ fn plan(
             }
             "|" => {
                 while conditionals.last().is_some_and(|p| {
-                    p.depth == depth && active.last().is_none_or(|m| m.start < p.start)
+                    p.depth == depth
+                        && active.last().is_none_or(|m| m.start < p.start)
                         && failure.is_none_or(|(start, _)| p.start > start)
                 }) {
                     close_conditional(view, tokens, &mut conditionals, &mut done, at)?;

@@ -40,7 +40,11 @@ fn returned_polymorphic_initializers_keep_strict_work_and_its_outer_capture() {
     );
     let environment = Environment::new();
     let result = Preparation::new(&environment, IngressLimits::default())
-        .specialize_arguments(type_, value, &[nat::literal(7), ty("Nat"), nat::literal(42)])
+        .specialize_arguments(
+            type_,
+            value,
+            &[nat::literal(7), ty("Nat"), nat::literal(42)],
+        )
         .unwrap();
     assert_eq!(
         result.type_,

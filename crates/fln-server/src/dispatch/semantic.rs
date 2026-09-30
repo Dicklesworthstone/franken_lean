@@ -84,9 +84,14 @@ fn position(text: &str, offset: usize) -> Result<json::Position, &'static str> {
 
 fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str> {
     let result = match (query.kind, answer) {
-        (QueryKind::Completion, Answer::Completion { items, range, is_incomplete }) => {
-            completion::result(items, range, is_incomplete, query)?
-        }
+        (
+            QueryKind::Completion,
+            Answer::Completion {
+                items,
+                range,
+                is_incomplete,
+            },
+        ) => completion::result(items, range, is_incomplete, query)?,
         (QueryKind::Goals, Answer::Goals { goals }) => {
             let size = goals
                 .iter()
@@ -126,8 +131,11 @@ fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str>
             )
         }
         (QueryKind::Definition, Answer::Definition { uri, source, range }) => {
-            if uri.is_empty() || uri.len() > 16 * 1024 || uri.chars().any(char::is_control)
-                || source.len() > MAX_RESULT_BYTES || range.start >= range.end
+            if uri.is_empty()
+                || uri.len() > 16 * 1024
+                || uri.chars().any(char::is_control)
+                || source.len() > MAX_RESULT_BYTES
+                || range.start >= range.end
             {
                 return Err("semantic definition response exceeds its bounds");
             }
@@ -144,7 +152,11 @@ fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str>
             }
             format!(
                 "{{\"uri\":{},\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}}}",
-                crate::json_string(&uri), start.line, start.character, end.line, end.character
+                crate::json_string(&uri),
+                start.line,
+                start.character,
+                end.line,
+                end.character
             )
         }
         _ => return Err("semantic provider returned a different query kind"),
@@ -156,7 +168,10 @@ fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str>
 }
 
 /// An open import's unsaved editor text dominates any provider/disk snapshot.
-fn validate_target_source(answer: &Answer, sources: &[OpenDocumentSource<'_>]) -> Result<(), &'static str> {
+fn validate_target_source(
+    answer: &Answer,
+    sources: &[OpenDocumentSource<'_>],
+) -> Result<(), &'static str> {
     if let Answer::Definition { uri, source, .. } = answer {
         if source.len() > MAX_RESULT_BYTES {
             return Err("definition target source exceeds its budget");

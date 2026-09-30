@@ -125,10 +125,7 @@ mod tests {
         };
         assert_eq!(*value, call("first", b(3)));
         let ExprNode::LetE {
-            type_,
-            value,
-            body,
-            ..
+            type_, value, body, ..
         } = body.node()
         else {
             panic!("first application precedes second argument");
@@ -140,10 +137,7 @@ mod tests {
         };
         assert_eq!(*value, call("last", b(6)));
         let ExprNode::LetE {
-            type_,
-            value,
-            body,
-            ..
+            type_, value, body, ..
         } = body.node()
         else {
             panic!("second application");
@@ -210,8 +204,12 @@ mod tests {
             ..IngressLimits::default()
         };
         assert!(matches!(
-            Preparation::new(&environment, limits)
-                .apply_producer(call("producer", b(0)), pi(pi(ty())), &[b(0), b(0)], 2),
+            Preparation::new(&environment, limits).apply_producer(
+                call("producer", b(0)),
+                pi(pi(ty())),
+                &[b(0), b(0)],
+                2
+            ),
             Err(IngressError::ResourceLimit {
                 resource: IngressResource::ContextDepth,
                 limit: 6,

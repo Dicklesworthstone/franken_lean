@@ -12,7 +12,9 @@ fn environment(changed: bool) -> Environment {
         if changed && declaration.kind == QuotKind::Lift {
             declaration.kind = QuotKind::Ind;
         }
-        environment = environment.add_decl(ConstantInfo::Quot(declaration)).unwrap();
+        environment = environment
+            .add_decl(ConstantInfo::Quot(declaration))
+            .unwrap();
     }
     environment
 }
@@ -183,7 +185,10 @@ fn partial_constructors_have_a_typed_identity_body() {
         panic!("typed constructor function");
     };
     assert_eq!(*body, b(0));
-    let ExprNode::Lam { binder_type, body, .. } = value.node() else {
+    let ExprNode::Lam {
+        binder_type, body, ..
+    } = value.node()
+    else {
         panic!("missing representative parameter");
     };
     assert_eq!(*binder_type, ty("Nat"));
@@ -208,7 +213,10 @@ fn partial_lift_captures_the_supplied_function_before_returning() {
     let ExprNode::LetE { value, .. } = body.node() else {
         panic!("typed residual function");
     };
-    let ExprNode::Lam { binder_type, body, .. } = value.node() else {
+    let ExprNode::Lam {
+        binder_type, body, ..
+    } = value.node()
+    else {
         panic!("representative parameter");
     };
     assert_eq!(*binder_type, ty("Nat"));
@@ -223,8 +231,13 @@ fn an_overapplied_result_finishes_lifting_before_its_next_argument() {
         .quotient_operation(
             &head("Quot.lift", 2),
             &[
-                ty("Nat"), ty("r"), result_type, ty("f"), ty("proof"),
-                app(ty("representative"), [b(0)]), app(ty("afterLift"), [b(0)]),
+                ty("Nat"),
+                ty("r"),
+                result_type,
+                ty("f"),
+                ty("proof"),
+                app(ty("representative"), [b(0)]),
+                app(ty("afterLift"), [b(0)]),
             ],
         )
         .unwrap()
@@ -242,13 +255,24 @@ fn an_overapplied_result_finishes_lifting_before_its_next_argument() {
 #[test]
 fn scalar_overapplication_is_not_dropped_and_argument_budgets_remain_enforced() {
     let environment = environment(false);
-    let args = [ty("Nat"), ty("r"), ty("Nat"), ty("f"), ty("proof"), b(0), b(1)];
+    let args = [
+        ty("Nat"),
+        ty("r"),
+        ty("Nat"),
+        ty("f"),
+        ty("proof"),
+        b(0),
+        b(1),
+    ];
     assert!(
         Preparation::new(&environment, IngressLimits::default())
             .quotient_operation(&head("Quot.lift", 2), &args)
             .is_err()
     );
-    let limits = IngressLimits { max_application_args: 6, ..IngressLimits::default() };
+    let limits = IngressLimits {
+        max_application_args: 6,
+        ..IngressLimits::default()
+    };
     assert!(matches!(
         Preparation::new(&environment, limits).quotient_operation(&head("Quot.lift", 2), &args),
         Err(IngressError::ResourceLimit {

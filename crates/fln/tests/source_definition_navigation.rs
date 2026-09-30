@@ -4,24 +4,40 @@ use fln::source_check::inspect::{DefinitionLookupLimits, SourceDefinition};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits, SourceModuleInput};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits, SourceModuleInput,
+};
 
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
 fn session() -> SourceModuleSession {
     let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    let base = Engine::with_source_seed(admission).unwrap().into_complete().unwrap();
+    let base = Engine::with_source_seed(admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
     SourceModuleSession::new(
-        base, KVMap::new(), SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),
+        base,
+        KVMap::new(),
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),
         SourceModuleCacheLimits::default(),
     )
 }
 fn lookup(source: &str, at: usize) -> Option<SourceDefinition> {
     let main = name("Main");
-    session().definition(&[SourceModuleInput { name: &main, source: source.as_bytes() }], &main, at)
+    session()
+        .definition(
+            &[SourceModuleInput {
+                name: &main,
+                source: source.as_bytes(),
+            }],
+            &main,
+            at,
+        )
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
-        .into_complete().unwrap()
+        .into_complete()
+        .unwrap()
 }
 
 #[test]
@@ -87,10 +103,25 @@ fn checked_imports_map_resolved_names_to_the_owning_module() {
     let lib = name("Lib");
     let source = "import Lib\nopen Library\ndef pending : Nat := value";
     let library = "namespace Library\ndef value : Nat := 3\nend Library";
-    let found = session().definition(&[
-        SourceModuleInput { name: &main, source: source.as_bytes() },
-        SourceModuleInput { name: &lib, source: library.as_bytes() },
-    ], &main, source.rfind("value").unwrap()).unwrap().into_complete().unwrap().unwrap();
+    let found = session()
+        .definition(
+            &[
+                SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &lib,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main,
+            source.rfind("value").unwrap(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .unwrap();
     assert_eq!(found.name, name("Library.value"));
     assert_eq!(found.module, lib);
     assert_eq!(&library[found.range], "value");
@@ -103,26 +134,65 @@ fn imported_source_edits_relocate_origins_without_stale_cache_hits() {
     let source = "import Lib\ndef pending : Nat := value";
     let mut checker = session();
     for library in ["def value : Nat := 1", "-- 😀\r\n\r\ndef value : Nat := 2"] {
-        let found = checker.definition(&[
-            SourceModuleInput { name: &main, source: source.as_bytes() },
-            SourceModuleInput { name: &lib, source: library.as_bytes() },
-        ], &main, source.rfind("value").unwrap()).unwrap().into_complete().unwrap().unwrap();
+        let found = checker
+            .definition(
+                &[
+                    SourceModuleInput {
+                        name: &main,
+                        source: source.as_bytes(),
+                    },
+                    SourceModuleInput {
+                        name: &lib,
+                        source: library.as_bytes(),
+                    },
+                ],
+                &main,
+                source.rfind("value").unwrap(),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .unwrap();
         assert_eq!(found.module, lib);
         assert_eq!(found.range.start, library.find("def value").unwrap() + 4);
         assert_eq!(&library[found.range], "value");
     }
-    assert!(checker.definition(&[
-        SourceModuleInput { name: &main, source: source.as_bytes() },
-        SourceModuleInput { name: &lib, source: b"def removed : Nat := 2" },
-    ], &main, source.rfind("value").unwrap()).is_err());
+    assert!(
+        checker
+            .definition(
+                &[
+                    SourceModuleInput {
+                        name: &main,
+                        source: source.as_bytes()
+                    },
+                    SourceModuleInput {
+                        name: &lib,
+                        source: b"def removed : Nat := 2"
+                    },
+                ],
+                &main,
+                source.rfind("value").unwrap()
+            )
+            .is_err()
+    );
 }
 
 #[test]
 fn an_invalid_prefix_is_not_navigation_authority() {
     let main = name("Main");
     let source = "theorem bad : False := by exact True.intro\ndef value : Nat := 1\ndef pending : Nat := value";
-    assert!(session().definition(&[SourceModuleInput { name: &main, source: source.as_bytes() }],
-        &main, source.rfind("value").unwrap()).is_err());
+    assert!(
+        session()
+            .definition(
+                &[SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes()
+                }],
+                &main,
+                source.rfind("value").unwrap()
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -137,17 +207,42 @@ fn declaration_body_is_not_unfolded_to_a_different_navigation_target() {
 fn lookup_limits_and_invalid_positions_refuse_instead_of_returning_partial_locations() {
     let main = name("Main");
     let source = "-- 😀\ndef value : Nat := 1\ndef pending : Nat := value";
-    let inputs = [SourceModuleInput { name: &main, source: source.as_bytes() }];
+    let inputs = [SourceModuleInput {
+        name: &main,
+        source: source.as_bytes(),
+    }];
     let at = source.rfind("value").unwrap();
     for limits in [
-        DefinitionLookupLimits { max_source_bytes: 1, ..DefinitionLookupLimits::default() },
-        DefinitionLookupLimits { max_modules: 0, ..DefinitionLookupLimits::default() },
-        DefinitionLookupLimits { max_commands: 0, ..DefinitionLookupLimits::default() },
-        DefinitionLookupLimits { max_head_steps: 0, ..DefinitionLookupLimits::default() },
+        DefinitionLookupLimits {
+            max_source_bytes: 1,
+            ..DefinitionLookupLimits::default()
+        },
+        DefinitionLookupLimits {
+            max_modules: 0,
+            ..DefinitionLookupLimits::default()
+        },
+        DefinitionLookupLimits {
+            max_commands: 0,
+            ..DefinitionLookupLimits::default()
+        },
+        DefinitionLookupLimits {
+            max_head_steps: 0,
+            ..DefinitionLookupLimits::default()
+        },
     ] {
-        assert!(matches!(session().definition_with_limits(&inputs, &main, at, limits),
-            Err(SourceModuleCheckError::Limit { .. })));
+        assert!(matches!(
+            session().definition_with_limits(&inputs, &main, at, limits),
+            Err(SourceModuleCheckError::Limit { .. })
+        ));
     }
-    assert!(session().definition(&inputs, &main, source.len() + 1).is_err());
-    assert!(session().definition(&inputs, &main, source.find('😀').unwrap() + 1).is_err());
+    assert!(
+        session()
+            .definition(&inputs, &main, source.len() + 1)
+            .is_err()
+    );
+    assert!(
+        session()
+            .definition(&inputs, &main, source.find('😀').unwrap() + 1)
+            .is_err()
+    );
 }

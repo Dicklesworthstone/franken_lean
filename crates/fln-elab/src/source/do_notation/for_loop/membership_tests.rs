@@ -8,15 +8,27 @@ fn named(name: &str) -> Syntax {
     ident(Name::from_components([name]))
 }
 fn context() -> Context {
-    Context::new(&Environment::new(), Budget::for_stack_bytes(2 * 1024 * 1024))
+    Context::new(
+        &Environment::new(),
+        Budget::for_stack_bytes(2 * 1024 * 1024),
+    )
 }
 fn loop_(witness: Syntax, name: Syntax, body: Syntax) -> Syntax {
-    term("doFor", vec![
-        atom("for"),
-        null(vec![term("doForDecl", vec![witness, name, atom("in"), named("collection")])]),
-        atom("do"),
-        term("doSeqIndent", vec![null(vec![term("doSeqItem", vec![body, null(vec![])])])]),
-    ])
+    term(
+        "doFor",
+        vec![
+            atom("for"),
+            null(vec![term(
+                "doForDecl",
+                vec![witness, name, atom("in"), named("collection")],
+            )]),
+            atom("do"),
+            term(
+                "doSeqIndent",
+                vec![null(vec![term("doSeqItem", vec![body, null(vec![])])])],
+            ),
+        ],
+    )
 }
 fn witness() -> Syntax {
     null(vec![named("h"), atom(":")])
@@ -35,7 +47,13 @@ fn count(syntax: &Syntax, name: &Name) -> usize {
 }
 fn binder_and_body(syntax: &Syntax) -> (&Syntax, &Syntax) {
     let parts = expect_node(syntax, &parser_kind(&["Term", "fun"]), 2, "callback").unwrap();
-    let parts = expect_node(&parts[1], &parser_kind(&["Term", "basicFun"]), 4, "callback binder").unwrap();
+    let parts = expect_node(
+        &parts[1],
+        &parser_kind(&["Term", "basicFun"]),
+        4,
+        "callback binder",
+    )
+    .unwrap();
     let [name] = expect_null_args(&parts[0], "single callback binder").unwrap() else {
         panic!("single binder")
     };
@@ -44,7 +62,11 @@ fn binder_and_body(syntax: &Syntax) -> (&Syntax, &Syntax) {
 
 #[test]
 fn callback_opens_element_then_proof_then_accumulator_without_copying_collection() {
-    let input = loop_(witness(), named("x"), term("doContinue", vec![atom("continue")]));
+    let input = loop_(
+        witness(),
+        named("x"),
+        term("doContinue", vec![atom("continue")]),
+    );
     let output = context().expand_for_loop(input).unwrap();
     let parts = expect_node(&output, &parser_kind(&["Term", "doExpr"]), 1, "loop action").unwrap();
     let parts = expect_node(&parts[0], &parser_kind(&["Term", "app"]), 2, "operation").unwrap();
@@ -91,28 +113,55 @@ fn dependent_monad_hint_retains_the_same_checked_operation_guards() {
     let marker = term("nativeDoForMonad", vec![]);
     let function = Typed {
         value: Expr::const_(Name::from_components(["ForIn'", "forIn'"]), vec![]),
-        type_: Expr::forall_e(Name::from_components(["m"]), Expr::sort(Level::one()),
-            Expr::sort(Level::one()), BinderInfo::Implicit),
+        type_: Expr::forall_e(
+            Name::from_components(["m"]),
+            Expr::sort(Level::one()),
+            Expr::sort(Level::one()),
+            BinderInfo::Implicit,
+        ),
     };
-    let argument = context.do_for_monad_argument(&function, &Name::from_components(["m"]), &marker, None).unwrap().unwrap();
+    let argument = context
+        .do_for_monad_argument(&function, &Name::from_components(["m"]), &marker, None)
+        .unwrap()
+        .unwrap();
     assert!(matches!(argument.value.node(), ExprNode::MVar { .. }));
     assert_eq!(argument.type_, Expr::sort(Level::one()));
-    assert!(context.do_for_monad_argument(&function, &Name::from_components(["wrong"]), &marker, None).is_err());
-    let wrong = Typed { value: Expr::const_(Name::from_components(["Shadow", "ForIn'", "forIn'"]), vec![]), ..function };
-    assert!(context.do_for_monad_argument(&wrong, &Name::from_components(["m"]), &marker, None).is_err());
+    assert!(
+        context
+            .do_for_monad_argument(&function, &Name::from_components(["wrong"]), &marker, None)
+            .is_err()
+    );
+    let wrong = Typed {
+        value: Expr::const_(
+            Name::from_components(["Shadow", "ForIn'", "forIn'"]),
+            vec![],
+        ),
+        ..function
+    };
+    assert!(
+        context
+            .do_for_monad_argument(&wrong, &Name::from_components(["m"]), &marker, None)
+            .is_err()
+    );
 }
 
 #[test]
 fn malformed_witnesses_and_wildcards_are_rejected_before_callback_construction() {
     for witness in [
-        null(vec![named("h")]), null(vec![named("h"), atom("=")]),
-        null(vec![atom("_"), atom(":")]), null(vec![root(&["h"]), atom(":")]),
+        null(vec![named("h")]),
+        null(vec![named("h"), atom("=")]),
+        null(vec![atom("_"), atom(":")]),
+        null(vec![root(&["h"]), atom(":")]),
         null(vec![named("h"), atom(":"), named("extra")]),
     ] {
         let input = loop_(witness, named("x"), term("doBreak", vec![atom("break")]));
         assert!(context().expand_for_loop(input).is_err());
     }
-    for name in [term("hole", vec![]), term("hole", vec![named("x")]), atom("_")] {
+    for name in [
+        term("hole", vec![]),
+        term("hole", vec![named("x")]),
+        atom("_"),
+    ] {
         let input = loop_(witness(), name, term("doContinue", vec![atom("continue")]));
         assert!(context().expand_for_loop(input).is_err());
     }

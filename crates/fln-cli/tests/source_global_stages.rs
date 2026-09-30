@@ -14,10 +14,8 @@ fn success(output: Output) -> String {
 
 #[test]
 fn producers_and_successive_callbacks_compile_execute_and_replay_atomically() {
-    let directory = std::env::temp_dir().join(format!(
-        "fln-global-producer-stages-{}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("fln-global-producer-stages-{}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
     let source = directory.join("Example.lean");
     let artifact = directory.join("Example.flbc");

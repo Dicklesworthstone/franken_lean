@@ -36,13 +36,20 @@ def readQ (q : Q) : Nat :=
 
 #[test]
 fn quotient_values_cross_function_arguments_records_and_branches() {
-    execute(&format!("{READ}\n#eval readQ (Quot.mk (fun a b => a = b) 42)"), "42");
     execute(
-        &format!("{READ}\nstructure Wrapped where\n  payload : Q\ndef use (w : Wrapped) : Nat := readQ w.payload\n#eval use {{ payload := Quot.mk (fun a b => a = b) 42 }}"),
+        &format!("{READ}\n#eval readQ (Quot.mk (fun a b => a = b) 42)"),
         "42",
     );
     execute(
-        &format!("{READ}\ndef choose (b : Bool) : Q := if b then Quot.mk (fun a b => a = b) 42 else Quot.mk (fun a b => a = b) 7\n#eval readQ (choose true)"),
+        &format!(
+            "{READ}\nstructure Wrapped where\n  payload : Q\ndef use (w : Wrapped) : Nat := readQ w.payload\n#eval use {{ payload := Quot.mk (fun a b => a = b) 42 }}"
+        ),
+        "42",
+    );
+    execute(
+        &format!(
+            "{READ}\ndef choose (b : Bool) : Q := if b then Quot.mk (fun a b => a = b) 42 else Quot.mk (fun a b => a = b) 7\n#eval readQ (choose true)"
+        ),
         "42",
     );
 }
@@ -79,14 +86,18 @@ def ignoreQ (q : Quot (fun (a b : Nat) => True)) : Nat :=
 "#;
     let idle = execute(&source.replace("count 30", "count 0"), "42");
     let busy = execute(source, "42");
-    assert!(busy > idle + 30, "representative work disappeared: {idle} vs {busy}");
+    assert!(
+        busy > idle + 30,
+        "representative work disappeared: {idle} vs {busy}"
+    );
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
     let mut bounded = limits();
     bounded.vm.max_steps = idle;
     assert!(matches!(
-        base.execute_source_definitions(&[source.as_bytes()], &options, bounded).unwrap(),
+        base.execute_source_definitions(&[source.as_bytes()], &options, bounded)
+            .unwrap(),
         Outcome::Inconclusive(_)
     ));
     assert_eq!(base.logical_root(&options), root);
@@ -102,7 +113,10 @@ fn invalid_respectfulness_is_rejected_before_erasure_and_retry_is_deterministic(
         "#eval Quot.lift (fun (n : Nat) => n) _ (Quot.mk (fun (a b : Nat) => a = b) 42)",
         "def forged : Nat := Quot.lift (fun (n : Nat) => n) (fun (a b : Nat) (h : True) => rfl) (Quot.mk (fun (a b : Nat) => True) 42)\n#eval 7",
     ] {
-        assert!(base.execute_source_definitions(&[source.as_bytes()], &options, limits()).is_err());
+        assert!(
+            base.execute_source_definitions(&[source.as_bytes()], &options, limits())
+                .is_err()
+        );
         assert_eq!(base.logical_root(&options), root);
     }
     let source = format!("{READ}\n#eval readQ (Quot.mk (fun a b => a = b) 42)");

@@ -42,12 +42,15 @@ fn execute(source: &str, expected: &str) -> u64 {
 }
 
 const APPLY: &str = "def applyBoth (f : Nat -> Nat -> Nat) (a b : Nat) : Nat := f a b\n";
-const SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
+const SPEND: &str =
+    "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
 fn known_staged_callbacks_execute_through_the_ordinary_higher_order_consumer() {
     execute(
-        &format!("{APPLY}#eval applyBoth (fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y) 20 21"),
+        &format!(
+            "{APPLY}#eval applyBoth (fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y) 20 21"
+        ),
         "42",
     );
 }
@@ -59,7 +62,9 @@ fn specialization_carries_open_runtime_captures_and_owned_string_values() {
         "8",
     );
     execute(
-        &format!("{APPLY}def run (delta : Nat) : Nat := applyBoth (fun (x : Nat) => let saved : Nat := delta + x; fun (y : Nat) => saved + y) 20 16\n#eval run 6"),
+        &format!(
+            "{APPLY}def run (delta : Nat) : Nat := applyBoth (fun (x : Nat) => let saved : Nat := delta + x; fun (y : Nat) => saved + y) 20 16\n#eval run 6"
+        ),
         "42",
     );
 }
@@ -67,7 +72,9 @@ fn specialization_carries_open_runtime_captures_and_owned_string_values() {
 #[test]
 fn partially_applied_consumers_and_interleaved_templates_keep_concrete_types() {
     execute(
-        &format!("{APPLY}#eval let saved : Nat -> Nat := applyBoth (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y) 20; saved 21"),
+        &format!(
+            "{APPLY}#eval let saved : Nat -> Nat := applyBoth (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y) 20; saved 21"
+        ),
         "42",
     );
     execute(
@@ -78,11 +85,20 @@ fn partially_applied_consumers_and_interleaved_templates_keep_concrete_types() {
 
 #[test]
 fn an_unused_partial_result_still_performs_the_callback_first_stage() {
-    let definitions = format!("{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n");
-    let program = |cost| format!("{definitions}#eval ignorePartial (fun (n : Nat) => let paid : Nat := spend n; fun (y : Nat) => y) {cost}");
+    let definitions = format!(
+        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n"
+    );
+    let program = |cost| {
+        format!(
+            "{definitions}#eval ignorePartial (fun (n : Nat) => let paid : Nat := spend n; fun (y : Nat) => y) {cost}"
+        )
+    };
     let idle = execute(&program(0), "42");
     let busy = execute(&program(30), "42");
-    assert!(busy > idle + 30, "required stage was dropped: {idle} vs {busy}");
+    assert!(
+        busy > idle + 30,
+        "required stage was dropped: {idle} vs {busy}"
+    );
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
@@ -98,8 +114,13 @@ fn an_unused_partial_result_still_performs_the_callback_first_stage() {
 
 #[test]
 fn unused_ordinary_operands_are_strict_even_when_callback_code_is_specialized() {
-    let definitions = format!("{SPEND}def use (ignored : Nat) (f : Nat -> Nat -> Nat) : Nat := f 20 21\n");
-    let program = |cost| format!("{definitions}#eval use (spend {cost}) (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y)");
+    let definitions =
+        format!("{SPEND}def use (ignored : Nat) (f : Nat -> Nat -> Nat) : Nat := f 20 21\n");
+    let program = |cost| {
+        format!(
+            "{definitions}#eval use (spend {cost}) (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y)"
+        )
+    };
     let idle = execute(&program(0), "42");
     let busy = execute(&program(30), "42");
     assert!(
@@ -134,7 +155,9 @@ fn budget_stops_and_invalid_callbacks_do_not_publish_or_poison_a_retry() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let source = format!("{APPLY}#eval applyBoth (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y) 20 21");
+    let source = format!(
+        "{APPLY}#eval applyBoth (fun (x : Nat) => let n : Nat := x + 1; fun (y : Nat) => n + y) 20 21"
+    );
     let mut tiny = limits();
     tiny.ingress.max_nodes = 1;
     assert!(

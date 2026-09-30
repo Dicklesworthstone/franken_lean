@@ -80,11 +80,7 @@ impl SchedulerOutput {
 
     /// No output escapes unless the entire run completes. Declaration admission
     /// still uses the ordinary environment door, including on cache replay.
-    fn commit(
-        &mut self,
-        id: CommandId,
-        product: ElabUnitProduct,
-    ) -> Outcome<Result<(), String>> {
+    fn commit(&mut self, id: CommandId, product: ElabUnitProduct) -> Outcome<Result<(), String>> {
         for decl in &product.admitted_decls {
             match self.final_environment.try_add_decl_with_budget(
                 decl.clone(),
@@ -235,9 +231,11 @@ impl DeterministicScheduler {
             while end < limit {
                 let candidate = &nodes[end];
                 if !candidate.dependency_effects().is_replay_safe()
-                    || !graph.dependencies_of(candidate.id).is_some_and(|dependencies| {
-                        dependencies.iter().all(|id| committed.contains(id))
-                    })
+                    || !graph
+                        .dependencies_of(candidate.id)
+                        .is_some_and(|dependencies| {
+                            dependencies.iter().all(|id| committed.contains(id))
+                        })
                 {
                     break;
                 }
@@ -269,15 +267,16 @@ impl DeterministicScheduler {
                     Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
                 };
                 if concurrent
-                    && product.as_ref().is_some_and(|product| {
-                        !product_footprint(node, product).is_replay_safe()
-                    })
+                    && product
+                        .as_ref()
+                        .is_some_and(|product| !product_footprint(node, product).is_replay_safe())
                 {
                     return undeclared_replay_effect(node.id);
                 }
                 let needs_rebase = match &product {
-                    Some(product) => index > 0
-                        && !product_footprint(node, product).commutes_with(&intervening),
+                    Some(product) => {
+                        index > 0 && !product_footprint(node, product).commutes_with(&intervening)
+                    }
                     None => true,
                 };
                 if needs_rebase {
@@ -331,7 +330,9 @@ impl DeterministicScheduler {
 fn undeclared_replay_effect(id: CommandId) -> Outcome<Result<SchedulerOutput, String>> {
     Outcome::InternalFault(InternalFault::new(
         "FL-INV-01",
-        format!("command {id} reported a non-replayable effect after parallel execution; \
-                 declare it before scheduling"),
+        format!(
+            "command {id} reported a non-replayable effect after parallel execution; \
+                 declare it before scheduling"
+        ),
     ))
 }

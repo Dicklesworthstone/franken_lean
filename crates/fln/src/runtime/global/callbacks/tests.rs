@@ -138,10 +138,7 @@ fn open_callback_captures_are_lifted_across_retained_arguments_without_capture()
         local(
             "last",
             b(2),
-            Expr::app(
-                Expr::app(callback.lift_loose(0, 2).unwrap(), b(1)),
-                b(0),
-            ),
+            Expr::app(Expr::app(callback.lift_loose(0, 2).unwrap(), b(1)), b(0)),
         ),
     );
     assert_eq!(actual, expected);

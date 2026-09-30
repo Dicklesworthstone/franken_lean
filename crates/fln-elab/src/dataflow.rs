@@ -186,7 +186,11 @@ impl DataflowGraph {
         } else {
             deps.extend(self.barriers.iter().copied());
         }
-        let accesses: Vec<_> = footprint.effects().iter().filter_map(keyed_access).collect();
+        let accesses: Vec<_> = footprint
+            .effects()
+            .iter()
+            .filter_map(keyed_access)
+            .collect();
         for (key, write) in &accesses {
             if let Some(previous) = self.accesses.get(key) {
                 deps.extend(previous.writers.iter().copied());

@@ -14,7 +14,8 @@ fn success(output: Output) -> String {
 
 #[test]
 fn quotient_functions_execute_export_replay_and_preserve_artifacts_on_failure() {
-    let directory = std::env::temp_dir().join(format!("fln-quotient-runtime-{}", std::process::id()));
+    let directory =
+        std::env::temp_dir().join(format!("fln-quotient-runtime-{}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
     let source = directory.join("Example.lean");
     let artifact = directory.join("Example.flbc");
@@ -47,7 +48,9 @@ fn quotient_functions_execute_export_replay_and_preserve_artifacts_on_failure() 
     );
     assert!(replay.contains("\"returnValue\":42"), "{replay}");
     let retained = std::fs::read(&artifact).unwrap();
-    let invalid = format!("{program}\n#eval Quot.lift (fun (n : Nat) => n) (fun (a b : Nat) (h : True) => rfl) (Quot.mk (fun (a b : Nat) => True) 7)\n");
+    let invalid = format!(
+        "{program}\n#eval Quot.lift (fun (n : Nat) => n) (fun (a b : Nat) (h : True) => rfl) (Quot.mk (fun (a b : Nat) => True) 7)\n"
+    );
     std::fs::write(&source, &invalid).unwrap();
     for destination in [artifact.clone(), directory.join("Failed.flbc")] {
         let failure = Command::new(env!("CARGO_BIN_EXE_fln"))
