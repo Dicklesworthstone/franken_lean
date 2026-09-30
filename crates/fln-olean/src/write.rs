@@ -28,6 +28,8 @@ use fln_rt::obj::Obj;
 use crate::format;
 use crate::region::ModuleImport;
 
+pub mod source;
+
 type WResult<T> = Result<T, WriteError>;
 
 /// Fresh writer formats implemented by this module.
@@ -799,6 +801,14 @@ impl Encoder {
     }
 
     fn module_root(&mut self, input: ModuleWriteInput<'_>) -> WResult<Obj> {
+        self.module_root_with_entries(input, None)
+    }
+
+    fn module_root_with_entries(
+        &mut self,
+        input: ModuleWriteInput<'_>,
+        entries: Option<Obj>,
+    ) -> WResult<Obj> {
         require_object_fields(
             format::IMPORT_FIELDS,
             &["module"],
@@ -834,7 +844,10 @@ impl Encoder {
             extra_const_names.push(self.name(name)?);
         }
         let extra_const_names = self.array(extra_const_names)?;
-        let entries = self.array(Vec::new())?;
+        let entries = match entries {
+            Some(entries) => entries,
+            None => self.array(Vec::new())?,
+        };
 
         require_object_fields(
             format::MODULE_DATA_FIELDS,
@@ -1139,9 +1152,24 @@ pub fn encode_module(
     header: OleanWriteHeader<'_>,
     budget: WriteBudget,
 ) -> WResult<EncodedModule> {
+    encode_module_metadata(input, None, header, budget)
+}
+
+fn encode_module_metadata(
+    input: ModuleWriteInput<'_>,
+    metadata: Option<&source::SourceMetadata>,
+    header: OleanWriteHeader<'_>,
+    budget: WriteBudget,
+) -> WResult<EncodedModule> {
     let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget, header.version)?;
-    let root_object = encoder.module_root(input)?;
+    let root_object = match metadata {
+        Some(metadata) => {
+            let entries = encoder.source_entries(metadata)?;
+            encoder.module_root_with_entries(input, Some(entries))?
+        }
+        None => encoder.module_root(input)?,
+    };
     let finished = finish_region(
         encoder,
         root_object,

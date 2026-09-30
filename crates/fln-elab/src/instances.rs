@@ -7,6 +7,7 @@
 
 pub mod coercions;
 pub mod defaults;
+pub mod export;
 pub mod imported;
 pub mod numeric;
 pub mod scoped;

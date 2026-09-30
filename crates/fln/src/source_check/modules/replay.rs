@@ -29,7 +29,11 @@ impl Export {
         &self,
         module: &Name,
     ) -> Result<(), SourceModuleCheckError> {
-        if let Some(suffix) = self.extensions.first() {
+        if let Some(suffix) = self
+            .extensions
+            .iter()
+            .find(|suffix| !fln_elab::instances::export::supports(&suffix.descriptor))
+        {
             return Err(extension_error(
                 module,
                 &suffix.descriptor.name,

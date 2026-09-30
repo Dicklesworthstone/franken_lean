@@ -9,6 +9,9 @@ use fln::{
     OleanWriteBudget, Outcome, SourceCheckLimits, SourceModuleInput,
 };
 
+#[path = "source_module_artifacts/classes.rs"]
+mod classes;
+
 fn name(value: &str) -> Name {
     Name::from_components(value.split('.'))
 }
@@ -191,7 +194,7 @@ fn native_extension_effects_are_not_silently_lost_in_serialization() {
         &initial,
         &[(
             "Main",
-            "prelude\nclass Container (A : Type) where\n  value : A",
+            "prelude\nclass Container (A : Type) where\n  value : A\ninstance wrapped (A : Type) (a : A) : Container A := Container.mk a",
         )],
         OleanWriteBudget::default(),
     )

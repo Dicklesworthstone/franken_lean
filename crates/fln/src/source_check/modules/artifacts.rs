@@ -1,5 +1,6 @@
 //! Per-module, checked declaration products for the native Lake `.olean` facet.
 use super::*;
+use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
 use std::sync::Arc;
 
 /// One basic (pre-module-system) `.olean`, containing only its own constants.
@@ -69,6 +70,7 @@ pub(super) struct PendingArtifact {
     name: Name,
     imports: Vec<OleanModuleImport>,
     constants: Vec<ConstantInfo>,
+    metadata: SourceMetadata,
 }
 
 /// Every artifact must name its entire external base, directly or through local
@@ -151,10 +153,47 @@ impl PendingArtifact {
                 });
             }
         }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let exported =
+            fln_elab::instances::export::classes(base, checked, remaining).map_err(|error| {
+                match error {
+                    fln_elab::instances::InstanceRegistryError::Limit => {
+                        SourceModuleCheckError::Limit {
+                            resource: "module work",
+                            limit: meter.limits.max_work,
+                        }
+                    }
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::instances::export::journal_name(),
+                        reason: "invalid class metadata export",
+                    },
+                }
+            })?;
+        let (classes, work) = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+            module: name.clone(),
+            extension: fln_elab::instances::export::journal_name(),
+            reason: "instance indexing has no pinned artifact serializer yet",
+        })?;
+        meter.work(work)?;
+        let mut metadata = SourceMetadata::default();
+        for class in classes {
+            meter.bytes(
+                4 * (class.parameters.out_params.len() + class.parameters.out_level_params.len()),
+            )?;
+            metadata
+                .classes
+                .push(fln_olean::source_extensions::ClassEntry {
+                    name: class.name,
+                    out_params: class.parameters.out_params,
+                    out_level_params: class.parameters.out_level_params,
+                });
+        }
         Ok(Self {
             name: name.clone(),
             imports,
             constants,
+            metadata,
         })
     }
 
@@ -162,13 +201,14 @@ impl PendingArtifact {
         &self,
         budget: OleanWriteBudget,
     ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
-        let encoded = encode_olean_module(
+        let encoded = encode_module_with_source_metadata(
             OleanModuleWriteInput {
                 is_module: false,
                 imports: &self.imports,
                 constants: &self.constants,
                 extra_const_names: &[],
             },
+            &self.metadata,
             OleanWriteHeader {
                 version: OLEAN_ACCEPTED_VERSIONS[0],
                 flags: 1,

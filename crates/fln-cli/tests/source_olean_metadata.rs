@@ -348,3 +348,6 @@ mod contexts;
 
 #[path = "source_olean_metadata/installed_contexts.rs"]
 mod installed_contexts;
+
+#[path = "source_olean_metadata/class_exports.rs"]
+mod class_exports;

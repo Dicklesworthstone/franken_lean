@@ -281,7 +281,7 @@ fn checking_cache_cannot_skip_implicit_init_or_extension_serialization_refusals(
     let mut session = session();
     for source in [
         "def identity (P : Prop) (h : P) : P := h",
-        "prelude\nclass Container (A : Type) where\n  value : A",
+        "prelude\nclass Container (A : Type) where\n  value : A\ninstance wrapped (A : Type) (a : A) : Container A := Container.mk a",
     ] {
         let files = [("Main", source)];
         let names = [name("Main")];
