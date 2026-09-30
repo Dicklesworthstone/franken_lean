@@ -4834,6 +4834,13 @@ const WORKFLOW_UNSEALED_ALLOWANCE: &[(&str, &str, &str)] = &[
         "if grep -nE",
         "a bootstrap snippet invokes python3 without -I",
     ),
+    // Not a launch: a string literal that splits the retained 34df040e copy of this workflow at its
+    // original launch line, whose bytes are pinned by blob hash, so it must keep that line's text.
+    (
+        ".github/workflows/fln-try-catch-transfer.yml",
+        "script = textwrap.dedent(text.split(",
+        "old + \":.github/workflows/fln-try-catch-transfer.yml\"",
+    ),
 ];
 
 /// `.github/workflows/*.{yml,yaml}`, workspace-relative, with their text.

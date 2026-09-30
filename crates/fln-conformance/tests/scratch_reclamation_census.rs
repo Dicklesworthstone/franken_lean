@@ -99,6 +99,22 @@ const SELF_CLEANING: &[(&str, &str)] = &[
         "crates/fln-cli/tests/native_relation_tactics.rs",
         "remove_file",
     ),
+    // The lake build and module-build packages: every package root is removed on drop.
+    (
+        "crates/fln-cli/tests/lake_build_session.rs",
+        "remove_dir_all",
+    ),
+    (
+        "crates/fln-cli/tests/lake_module_build.rs",
+        "remove_dir_all",
+    ),
+    // The LSP completion and navigation fixtures: the one written file, then the
+    // uniquely-created directory, are removed on drop.
+    ("crates/fln-cli/tests/lsp_completion.rs", "remove_dir"),
+    (
+        "crates/fln-cli/tests/lsp_definition_navigation.rs",
+        "remove_dir",
+    ),
 ];
 
 /// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits, and
@@ -126,11 +142,16 @@ const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/source_empty_runtime.rs",
     "crates/fln-cli/tests/source_equality_decisions.rs",
     "crates/fln-cli/tests/source_expression_elimination.rs",
+    "crates/fln-cli/tests/source_floats.rs",
+    "crates/fln-cli/tests/source_global_stages.rs",
     "crates/fln-cli/tests/source_ground_projections.rs",
     "crates/fln-cli/tests/source_hypothesis_rewriting.rs",
     "crates/fln-cli/tests/source_indexed_function_children.rs",
     "crates/fln-cli/tests/source_indexed_runtime.rs",
+    "crates/fln-cli/tests/source_instance_factories.rs",
+    "crates/fln-cli/tests/source_interleaved_runtime.rs",
     "crates/fln-cli/tests/source_local_helpers.rs",
+    "crates/fln-cli/tests/source_local_templates.rs",
     "crates/fln-cli/tests/source_logic.rs",
     "crates/fln-cli/tests/source_logical_rewriting.rs",
     "crates/fln-cli/tests/source_match_equations.rs",
@@ -141,8 +162,10 @@ const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/source_mutual_indexed.rs",
     "crates/fln-cli/tests/source_nat_runtime.rs",
     "crates/fln-cli/tests/source_nested_lets.rs",
+    "crates/fln-cli/tests/source_olean_metadata.rs",
     "crates/fln-cli/tests/source_proof_indices.rs",
     "crates/fln-cli/tests/source_proof_runtime.rs",
+    "crates/fln-cli/tests/source_quotient_runtime.rs",
     "crates/fln-cli/tests/source_quotients.rs",
     "crates/fln-cli/tests/source_record_runtime.rs",
     "crates/fln-cli/tests/source_scopes.rs",

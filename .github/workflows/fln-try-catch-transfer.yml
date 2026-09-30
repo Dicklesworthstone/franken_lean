@@ -16,7 +16,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PYTHON'
+          python3 -I - <<'PYTHON'
           import hashlib, pathlib, subprocess, textwrap
           old = "34df040e005b73990a5f66b48d5f4537877103c6"
           subprocess.run(["git", "fetch", "--depth=1", "origin", old], check=True)

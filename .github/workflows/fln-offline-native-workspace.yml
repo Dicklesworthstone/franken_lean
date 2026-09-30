@@ -30,7 +30,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fln-source"
           git rev-parse HEAD > "$RUNNER_TEMP/fln-source/source-commit.txt"
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/fln-source/source.tar.gz"
-          python3 - <<'PY' > "$RUNNER_TEMP/fln-source/open-beads.txt"
+          python3 -I - <<'PY' > "$RUNNER_TEMP/fln-source/open-beads.txt"
           import json
           from pathlib import Path
           rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           mkdir -p "$RUNNER_TEMP/fln-compiler"
           compiler="$(rustup which --toolchain "$channel" rustc)"
