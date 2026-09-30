@@ -3739,3 +3739,45 @@ fn a_shared_function_position_is_reduced_within_its_application() {
     let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
     assert_eq!(natural(&result), Some(2));
 }
+
+/// The KR-317 gate normalizes each side of its structural comparison with
+/// bounded work (`K_GATE_NORMALIZATION_WORK`): running out is a gate miss that
+/// falls through to the gate's lazy conversion, never a stop of the reduction
+/// that asked. `loop x` never reaches a weak head normal form, and
+/// `(fun y => y) (loop x)` is conversion-equal to it after one beta step, as
+/// the pin's `is_def_eq` sees; so the gate passes and the recursor fires.
+#[test]
+fn a_k_gate_side_that_runs_away_falls_through_to_the_conversion() {
+    let mut entries = eqs_family_entries();
+    entries.push(definition_entry(
+        "loop",
+        vec![],
+        decoded(&Expr::lam(
+            primary_name("x"),
+            constant("A"),
+            Expr::app(constant("loop"), Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let spin = Expr::app(constant("loop"), Expr::fvar(FVarId(primary_name("pointX"))));
+    let identity = Expr::lam(
+        primary_name("y"),
+        constant("A"),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let call = decoded(&k_application(
+        constant("A"),
+        spin.clone(),
+        Expr::app(identity, spin),
+    ));
+    let budget = WhnfBudget::new(20_000_000, 20_000_000, TermBudget::unlimited());
+    let result = complete(whnf(&call, &context, budget));
+    assert_eq!(
+        root_constant_name(&result.term),
+        Some(&checker_name("KTestMinor"))
+    );
+}

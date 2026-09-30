@@ -26,6 +26,14 @@ use memo::WhnfMemo;
 /// times as many owned units.
 const K_GATE_CONVERSION_WORK: u64 = 100_000;
 
+/// Steps and reductions one side's normalization may spend in the KR-317 gate's
+/// structural comparison (`Reducer::k_constructor_types_equal`). Running out is
+/// a gate miss that falls through to the gate's conversion, never a stop of the
+/// reduction that asked: normalizing an open index such as `n - 57344` unfolds
+/// `Nat.sub` into 57,344 levels of recursion, where the conversion compares the
+/// two sides lazily, as the pin's `is_def_eq` does.
+const K_GATE_NORMALIZATION_WORK: u64 = 10 * K_GATE_CONVERSION_WORK;
+
 thread_local! {
     /// Whether a KR-317 gate's conversion is running on this thread. That
     /// conversion reduces through WHNF, which may meet another K recursor; the
@@ -342,6 +350,44 @@ pub enum WhnfStop {
         completed_steps: u64,
         completed_reductions: u64,
     },
+}
+
+impl WhnfStop {
+    /// The steps and reductions the stopped run had completed.
+    pub(crate) const fn completed_work(&self) -> (u64, u64) {
+        match self {
+            WhnfStop::NatReduction {
+                completed_steps,
+                completed_reductions,
+                ..
+            }
+            | WhnfStop::Resource {
+                completed_steps,
+                completed_reductions,
+                ..
+            }
+            | WhnfStop::Cancelled {
+                completed_steps,
+                completed_reductions,
+                ..
+            }
+            | WhnfStop::Materialization {
+                completed_steps,
+                completed_reductions,
+                ..
+            }
+            | WhnfStop::DefinitionInstantiation {
+                completed_steps,
+                completed_reductions,
+                ..
+            }
+            | WhnfStop::StringExpansion {
+                completed_steps,
+                completed_reductions,
+                ..
+            } => (*completed_steps, *completed_reductions),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1485,11 +1531,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
     }
 
-    /// Normalize the demanded recursor major, including its definitions even
-    /// when outer conversion delays delta reduction. The pin likewise uses
-    /// full WHNF for ordinary recursor majors (`type_checker.cpp`,
-    /// `reduce_recursor`). Absorb the sub-run's work into the remaining budget.
-    fn whnf_recursor_major(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
+    /// Normalize one side of the KR-317 gate's structural comparison, including
+    /// its definitions even when outer conversion delays delta reduction.
+    /// Absorb the sub-run's work into the remaining budget. `None` when it runs
+    /// out of `K_GATE_NORMALIZATION_WORK`: the caller takes that as a gate miss,
+    /// and a cancellation still stops this reduction.
+    fn whnf_recursor_major(&mut self, cursor: &Cursor) -> Result<Option<Cursor>, Halt> {
         if !cursor.env.is_empty() {
             let term = self.close(cursor, WhnfPhase::Iota)?;
             let root = term.root();
@@ -1500,11 +1547,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control
                 .budget
                 .max_steps
-                .saturating_sub(self.control.steps),
+                .saturating_sub(self.control.steps)
+                .min(K_GATE_NORMALIZATION_WORK),
             self.control
                 .budget
                 .max_reductions
-                .saturating_sub(self.control.reductions),
+                .saturating_sub(self.control.reductions)
+                .min(K_GATE_NORMALIZATION_WORK),
             self.control.budget.materialization,
         )
         .with_string(self.remaining_string_budget());
@@ -1527,10 +1576,22 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     .saturating_add(result.delta_reductions);
                 self.has_auxiliary_work |= result.has_auxiliary_work;
                 self.absorb_string(result.string_progress);
-                self.reduce_demanded_nat(result.term)
+                self.reduce_demanded_nat(result.term).map(Some)
             }
             WhnfOutcome::Refused(refusal) => Err(Halt::Refusal(refusal)),
-            WhnfOutcome::Inconclusive(stop) => Err(Halt::Stop(Box::new(stop))),
+            WhnfOutcome::Inconclusive(stop @ WhnfStop::Cancelled { .. }) => {
+                Err(Halt::Stop(Box::new(stop)))
+            }
+            WhnfOutcome::Inconclusive(stop) => {
+                // The work is spent all the same; charging it here stops this
+                // reduction when its own budget, not the gate's, ran out.
+                let (steps, reductions) = stop.completed_work();
+                self.control.steps = self.control.steps.saturating_add(steps);
+                self.control.reductions = self.control.reductions.saturating_add(reductions);
+                self.control.step(cursor.root.index(), self.cancelled)?;
+                self.has_auxiliary_work = true;
+                Ok(None)
+            }
             WhnfOutcome::InternalFault(fault) => Err(Halt::Fault(fault)),
         }
     }
@@ -1988,8 +2049,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 continue;
             }
             self.has_auxiliary_work = true;
-            let left = self.whnf_recursor_major(&left)?;
-            let right = self.whnf_recursor_major(&right)?;
+            let Some(left) = self.whnf_recursor_major(&left)? else {
+                return Ok(false);
+            };
+            let Some(right) = self.whnf_recursor_major(&right)? else {
+                return Ok(false);
+            };
             if self.structural_cursors_equal(&left, &right)? {
                 continue;
             }
