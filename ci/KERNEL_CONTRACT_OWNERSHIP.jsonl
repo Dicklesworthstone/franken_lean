@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":541,"projection_hash":"72f1ed1a714e93322c8bfd591ba6c5ac8298ae88f8533291f16a643fdb7a9076"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":542,"projection_hash":"300c79435af946671bf0d9520a32f0e2985f1f403da95be08aed493f8c261458"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -168,6 +168,7 @@
 {"id":"fln-llg3"}
 {"id":"fln-log-derived-disposition-not-execution-xes2"}
 {"id":"fln-lst4"}
+{"id":"fln-lvdh"}
 {"id":"fln-lyc8"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
