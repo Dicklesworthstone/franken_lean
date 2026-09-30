@@ -138,6 +138,31 @@ pub fn fixture(
     families: usize,
     mutation: Mutation,
 ) -> Fixture {
+    build(false, generic, indexed, higher, families, mutation)
+}
+
+/// The same block as [`fixture`], declared in `Prop`: the pin's recursors for a
+/// mutual predicate eliminate only into `Prop` (motives `Sort 0`, no extra
+/// universe). The parameters stay in `Type`, so generic families have fields
+/// above the result universe, which an inductive predicate permits.
+pub fn proposition_fixture(
+    generic: bool,
+    indexed: bool,
+    higher: bool,
+    families: usize,
+    mutation: Mutation,
+) -> Fixture {
+    build(true, generic, indexed, higher, families, mutation)
+}
+
+fn build(
+    proposition: bool,
+    generic: bool,
+    indexed: bool,
+    higher: bool,
+    families: usize,
+    mutation: Mutation,
+) -> Fixture {
     assert!(families >= 2 && (!indexed || (families == 2 && generic)) && (!higher || generic));
     let names: Vec<_> = (0..families).map(|i| name(&format!("Mutual{i}"))).collect();
     let levels = if generic { vec![name("u")] } else { vec![] };
@@ -146,8 +171,22 @@ pub fn fixture(
     } else {
         Level::one()
     };
+    let family_level = if proposition {
+        Level::zero()
+    } else {
+        result.clone()
+    };
     let motive_level = if generic { name("u_1") } else { name("u") };
-    let mut rec_levels = vec![motive_level.clone()];
+    let motive_sort = if proposition {
+        Expr::sort(Level::zero())
+    } else {
+        Expr::sort(Level::param(motive_level.clone()))
+    };
+    let mut rec_levels = if proposition {
+        vec![]
+    } else {
+        vec![motive_level.clone()]
+    };
     rec_levels.extend_from_slice(&levels);
     let a = B::new("A", Expr::sort(result.clone()));
     let x = B::new("type_argument", a.e());
@@ -188,7 +227,7 @@ pub fn fixture(
         motives.push(
             B::new(
                 &format!("motive{i}"),
-                close(&args, Expr::sort(Level::param(motive_level.clone())), false),
+                close(&args, motive_sort.clone(), false),
             )
             .named(name(&format!("motive_{}", i + 1))),
         );
@@ -348,7 +387,7 @@ pub fn fixture(
         bs.extend_from_slice(&indices[family]);
         types.push(Type {
             name: names[family].clone(),
-            ty: close(&bs, Expr::sort(result.clone()), false),
+            ty: close(&bs, Expr::sort(family_level.clone()), false),
             indices: indices[family].len(),
             ctors: cs
                 .iter()

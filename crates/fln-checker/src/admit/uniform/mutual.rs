@@ -4,7 +4,10 @@
 //! Constructor telescopes determine the ordered motives, minors and recursive
 //! calls. Decoded recursor types and rules are comparison subjects, never the
 //! source of their expected types. No primary-kernel implementation is used.
-//! Nested recursion and proposition-valued mutual families remain nonanswers.
+//! A block in Prop eliminates only into Prop, the pin's elimination level for
+//! every mutual block whose sort can be zero (`elim_only_at_universe_zero`).
+//! A block whose sort is `Sort u`, Prop at some universe and data at others,
+//! and nested recursion (translated first by the nested route) stay nonanswers.
 use super::*;
 use crate::whnf::{WhnfContext, WhnfOutcome, whnf_core_at_with};
 
@@ -30,7 +33,9 @@ struct Block<'a> {
     parameters: Vec<Binder>,
     families: Vec<Family<'a>>,
     minors: Vec<Minor<'a>>,
-    motive_universe: WireName,
+    /// The recursors' extra universe; `None` for a block in Prop, whose
+    /// motives are `Sort 0` and whose recursors take exactly the block's levels.
+    motive_universe: Option<WireName>,
 }
 
 fn mentions_any(
@@ -143,7 +148,10 @@ impl Block<'_> {
             let value = builder.bvar((q - index - 1) as u32);
             domain = builder.apply(domain, value);
         }
-        let sort = builder.sort_parameter(&self.motive_universe);
+        let sort = match &self.motive_universe {
+            Some(universe) => builder.sort_parameter(universe),
+            None => builder.sort_zero(),
+        };
         let mut body = builder.forall("major", BinderStyle::Default, domain, sort);
         for (index, binder) in info.indices.iter().enumerate().rev() {
             let domain = audit.shifted(builder, &binder.domain, family, index)?;
@@ -272,7 +280,7 @@ impl Block<'_> {
             let value = builder.bvar((f - field - 1) as u32);
             body = builder.apply(body, value);
         }
-        let mut levels = vec![self.motive_universe.clone()];
+        let mut levels: Vec<_> = self.motive_universe.iter().cloned().collect();
         levels.extend_from_slice(&self.levels);
         for child in &ctor.children {
             let recursive = &child.recursive;
@@ -499,7 +507,7 @@ pub(super) fn check(
         parameters: Vec::new(),
         families: Vec::new(),
         minors: Vec::new(),
-        motive_universe: checker_atom("_unused_mutual_universe"),
+        motive_universe: None,
     };
     let mut result_sort = None;
     let mut n = 0usize;
@@ -533,7 +541,9 @@ pub(super) fn check(
         if binders > MAX_NONRECURSIVE_FIELDS {
             return Err(field_limit(binders));
         }
-        if !positive_result(declaration, (p + q) as u32) {
+        if !positive_result(declaration, (p + q) as u32)
+            && !proposition_result(declaration, (p + q) as u32)
+        {
             return Err(InductiveVerdict::Deferred(
                 InductiveSupportLimit::ResultUniverse,
             ));
@@ -593,6 +603,12 @@ pub(super) fn check(
         return Err(overflow());
     };
     let result_level = WireLevel::from_parts(sort.levels().to_vec(), *level);
+    // Every family shares this sort (compared above), so the block is either
+    // a proposition or data as a whole.
+    let proposition = normalize(&result_level)
+        .ok()
+        .and_then(|n| explicit_normal_universe(&n))
+        == Some(0);
     let mut staged = environment.clone();
     for family in &block.families {
         staged =
@@ -698,7 +714,9 @@ pub(super) fn check(
                     audit.cancelled,
                 )
                 .map_err(|v| map_member_preamble(name, v))?;
-                if !universe_within(&facts.universe, &result_level, audit)? {
+                // An inductive predicate's fields may live in any universe
+                // (the pin's `is_zero(m_result_level)` exemption).
+                if !proposition && !universe_within(&facts.universe, &result_level, audit)? {
                     if facts.explicit_universe.is_some()
                         && normalize(&result_level)
                             .ok()
@@ -775,10 +793,15 @@ pub(super) fn check(
             .recursor_metadata()
             .ok_or_else(|| recursor_error(&name))?;
         let levels = declaration.level_parameters();
+        let level_policy = if proposition {
+            levels == block.levels.as_slice()
+        } else {
+            levels.len() == block.levels.len() + 1
+                && levels[1..] == block.levels
+                && !block.levels.contains(&levels[0])
+        };
         if declaration.safety() != audit.safety
-            || levels.len() != block.levels.len() + 1
-            || levels[1..] != block.levels
-            || block.levels.contains(&levels[0])
+            || !level_policy
             || rec.mutual() != block.names
             || rec.num_parameters() as usize != p
             || rec.num_indices() as usize != info.indices.len()
@@ -789,10 +812,13 @@ pub(super) fn check(
         {
             return Err(recursor_error(&name));
         }
-        if family == 0 {
-            block.motive_universe = levels[0].clone();
-        } else if block.motive_universe != levels[0] {
-            return Err(recursor_error(&name));
+        // A proposition's recursors have no extra universe (motives are `Sort 0`).
+        if !proposition {
+            if family == 0 {
+                block.motive_universe = Some(levels[0].clone());
+            } else if block.motive_universe.as_ref() != Some(&levels[0]) {
+                return Err(recursor_error(&name));
+            }
         }
         let count = p + block.families.len() + n + info.indices.len() + 1;
         let (binders, _) = peel_binders_at(declaration.type_(), declaration.type_().root(), count)

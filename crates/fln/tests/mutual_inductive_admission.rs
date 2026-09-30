@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 #[path = "../../fln-checker/tests/support/mutual.rs"]
 mod fixtures;
-use fixtures::{Fixture, Mutation, fixture, name};
+use fixtures::{Fixture, Mutation, fixture, name, proposition_fixture};
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::level::Level;
@@ -171,6 +171,35 @@ fn two_seats_admit_mutual_data_and_dependent_indexed_families() {
 fn two_seats_admit_positive_function_children_across_mutual_families() {
     accept(&fixture(true, false, true, 3, Mutation::None));
     accept(&fixture(true, true, true, 2, Mutation::None));
+}
+#[test]
+fn two_seats_admit_mutual_predicates_that_eliminate_only_into_prop() {
+    for f in [
+        proposition_fixture(false, false, false, 2, Mutation::None),
+        proposition_fixture(true, true, false, 2, Mutation::None),
+        proposition_fixture(true, false, true, 3, Mutation::None),
+    ] {
+        accept(&f);
+    }
+}
+#[test]
+fn neither_seat_admits_a_large_eliminator_for_a_mutual_predicate() {
+    let mut f = fixture(true, true, false, 2, Mutation::None);
+    f.types = proposition_fixture(true, true, false, 2, Mutation::None).types;
+    let kernel = fln_kernel::check(&Environment::new(), &candidate(&f), budget());
+    assert!(
+        matches!(kernel, Outcome::Complete(Verdict::Rejected { .. })),
+        "K1: {kernel:?}"
+    );
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    assert!(
+        engine
+            .admit_declaration(candidate(&f), &options, limits())
+            .is_err()
+    );
+    assert_eq!(engine.logical_root(&options), root);
 }
 #[test]
 fn forged_rules_cannot_publish_a_partial_mutual_environment() {

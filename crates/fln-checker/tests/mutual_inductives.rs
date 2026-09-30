@@ -5,7 +5,7 @@
 mod fixtures;
 #[path = "support/safety.rs"]
 mod safety;
-use fixtures::{Fixture, Mutation, fixture};
+use fixtures::{Fixture, Mutation, fixture, proposition_fixture};
 use fln_checker::admit::{
     AdmissionBudget, InductiveRejection, InductiveSupportLimit, InductiveVerdict, admit_inductive,
     admit_inductive_with,
@@ -365,7 +365,15 @@ fn inconsistent_sorts_and_universe_telescopes_cannot_gain_mutual_admission() {
     let mut f = fixture(false, false, false, 2, Mutation::None);
     f.types[1].ty = Expr::sort(Level::succ(Level::one()).unwrap());
     assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+    // A Prop family beside a Type family: the pin requires one sort per block.
     f.types[1].ty = Expr::sort(Level::zero());
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+    // A block in `Sort u` is Prop at u = 0 and data above it; it stays deferred.
+    let mut f = fixture(false, false, false, 2, Mutation::None);
+    f.levels = vec![fixtures::name("u")];
+    for t in &mut f.types {
+        t.ty = Expr::sort(Level::param(fixtures::name("u")));
+    }
     assert!(matches!(
         verdict(&rows(&f)),
         InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
@@ -376,6 +384,51 @@ fn inconsistent_sorts_and_universe_telescopes_cannot_gain_mutual_admission() {
     let mut f = fixture(true, false, false, 2, Mutation::None);
     f.rec_levels[0] = fixtures::name("u");
     assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+}
+
+#[test]
+fn mutual_predicates_eliminate_only_into_prop_with_fields_in_any_universe() {
+    // The generic blocks have fields in `Type` (their parameters' universe),
+    // above the predicates' `Prop`.
+    for (generic, indexed, higher, families, mutation) in [
+        (false, false, false, 2, Mutation::None),
+        (false, false, false, 3, Mutation::None),
+        (true, false, false, 2, Mutation::None),
+        (true, true, false, 2, Mutation::None),
+        (true, false, true, 3, Mutation::None),
+        (true, true, true, 2, Mutation::MultipleChildren),
+    ] {
+        accepts(&proposition_fixture(
+            generic, indexed, higher, families, mutation,
+        ));
+    }
+}
+
+#[test]
+fn a_mutual_predicate_cannot_claim_a_large_eliminator_nor_data_a_small_one() {
+    for (generic, indexed) in [(false, false), (true, true)] {
+        let data = fixture(generic, indexed, false, 2, Mutation::None);
+        let predicate = proposition_fixture(generic, indexed, false, 2, Mutation::None);
+        // Data recursors (an extra universe, motives in `Sort u`) over families in Prop.
+        let mut large = data.clone();
+        large.types = predicate.types.clone();
+        // The predicate's own recursors, declared with one extra, unused universe.
+        let mut widened = predicate.clone();
+        widened.rec_levels.insert(0, fixtures::name("v"));
+        // The predicate's recursors over families in `Type`.
+        let mut small = predicate.clone();
+        small.types = data.types.clone();
+        for (label, f) in [("large", large), ("widened", widened), ("small", small)] {
+            let result = verdict(&rows(&f));
+            assert!(
+                matches!(
+                    result,
+                    InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+                ),
+                "{label} generic={generic}: {result:?}"
+            );
+        }
+    }
 }
 
 #[test]
