@@ -48,6 +48,22 @@ fn monadic_fallback_retains_original_leaves_and_captured_continuation() {
 }
 
 #[test]
+fn tactic_alternatives_outside_do_are_not_failure_branches() {
+    // Only a `do` block has refutable bindings: after a term `have`, `first | a | b`
+    // belongs to the proof parser, as it did before failure branches existed.
+    for source in [
+        "theorem t : 0 = 0 := have n : Nat := 0; by first | exact (show n = 0 from rfl) | rfl",
+        "theorem t : 0 = 0 := have n : Nat := 0\n  by first | rfl | rfl",
+    ] {
+        let parsed =
+            parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+        assert!(nodes(parsed.syntax(), "doPatDecl").is_empty());
+        assert!(nodes(parsed.syntax(), "do").is_empty());
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    }
+}
+
+#[test]
 fn pure_fallback_uses_the_separate_pinned_do_let_else_production() {
     let source = "def f : Nat := do\n  let (Maybe.some x) := value | return 0\n  return x";
     let parsed = parse_definition(source.as_bytes()).unwrap();

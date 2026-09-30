@@ -929,7 +929,11 @@ fn parse_planned(
         }
         return Ok(proof);
     }
-    // Tactic blocks own their pipes; their bounded arguments reenter here.
+    // Tactic blocks own their pipes; their bounded arguments reenter here. A bare
+    // pipe needs the planner only as a refutable do binding's failure branch, so it
+    // counts only in a range that opens a `do`: `have n := 0; by first | a | b`
+    // keeps its tactic alternatives for the proof parser.
+    let opens_do = range.clone().any(|at| term_locals::word(tokens, at, "do"));
     if grammar == DefinitionGrammar::Scalar
         && !is_symbol(tokens, range.start, "by")
         && !is_symbol(tokens, range.start, "calc")
@@ -937,7 +941,7 @@ fn parse_planned(
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
                     || is_symbol(tokens, at, "match")
-                    || is_symbol(tokens, at, "|")
+                    || (opens_do && is_symbol(tokens, at, "|"))
                     || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
                         && is_symbol(tokens, at + 1, "|"))
             }))
