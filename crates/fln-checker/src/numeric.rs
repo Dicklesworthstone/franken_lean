@@ -11,6 +11,9 @@
 
 use std::cmp::Ordering;
 
+mod division;
+use division::div_rem_limbs;
+
 /// The exact exponent ceiling used by the pinned KR-313 reduction table.
 pub const REDUCE_POW_MAX_EXP: u64 = 1 << 24;
 
@@ -608,142 +611,6 @@ fn zeroed(width: usize, control: &mut Control<'_>) -> Result<Vec<u64>, Halt> {
         output.push(0);
     }
     Ok(output)
-}
-
-fn fixed_effective_len(value: &[u64], control: &mut Control<'_>) -> Result<usize, Halt> {
-    let mut length = value.len();
-    while length != 0 {
-        control.step()?;
-        if value[length - 1] != 0 {
-            break;
-        }
-        length -= 1;
-    }
-    Ok(length)
-}
-
-fn compare_fixed(left: &[u64], right: &[u64], control: &mut Control<'_>) -> Result<Ordering, Halt> {
-    let left_len = fixed_effective_len(left, control)?;
-    control.step()?;
-    match left_len.cmp(&right.len()) {
-        Ordering::Equal => {}
-        order => return Ok(order),
-    }
-    for index in (0..left_len).rev() {
-        control.step()?;
-        match left[index].cmp(&right[index]) {
-            Ordering::Equal => {}
-            order => return Ok(order),
-        }
-    }
-    Ok(Ordering::Equal)
-}
-
-fn subtract_fixed(left: &mut [u64], right: &[u64], control: &mut Control<'_>) -> Result<(), Halt> {
-    let mut borrow = false;
-    for (index, left_limb) in left.iter_mut().enumerate() {
-        control.step()?;
-        let right_limb = right.get(index).copied().unwrap_or(0);
-        let (partial, first_borrow) = left_limb.overflowing_sub(right_limb);
-        let (value, second_borrow) = partial.overflowing_sub(u64::from(borrow));
-        *left_limb = value;
-        borrow = first_borrow || second_borrow;
-    }
-    if borrow {
-        Err(Halt::Fault(NatFault::ArithmeticInvariant {
-            task: control.task,
-        }))
-    } else {
-        Ok(())
-    }
-}
-
-fn bit_length(value: &[u64], control: &mut Control<'_>) -> Result<usize, Halt> {
-    if value.is_empty() {
-        return Ok(0);
-    }
-    control.step()?;
-    let high_bits = 64usize - value[value.len() - 1].leading_zeros() as usize;
-    value
-        .len()
-        .checked_sub(1)
-        .and_then(|limbs| limbs.checked_mul(64))
-        .and_then(|bits| bits.checked_add(high_bits))
-        .ok_or({
-            Halt::Stop(NatStop::OutputSizeOverflow {
-                task: control.task,
-                progress: control.progress,
-            })
-        })
-}
-
-fn div_rem_limbs(
-    dividend: &[u64],
-    divisor: &[u64],
-    keep_quotient: bool,
-    control: &mut Control<'_>,
-) -> Result<(Option<Vec<u64>>, Vec<u64>), Halt> {
-    if divisor.is_empty() {
-        let remainder = copy_limbs(dividend, control)?;
-        return Ok((keep_quotient.then(Vec::new), remainder));
-    }
-    if dividend.is_empty() {
-        return Ok((keep_quotient.then(Vec::new), Vec::new()));
-    }
-    match compare_limbs(dividend, divisor, control)? {
-        Ordering::Less => {
-            let remainder = copy_limbs(dividend, control)?;
-            return Ok((keep_quotient.then(Vec::new), remainder));
-        }
-        Ordering::Equal => {
-            let quotient = if keep_quotient {
-                Some(one_limbs(control)?)
-            } else {
-                None
-            };
-            return Ok((quotient, Vec::new()));
-        }
-        Ordering::Greater => {}
-    }
-
-    let bits = bit_length(dividend, control)?;
-    let mut quotient = if keep_quotient {
-        Some(zeroed(dividend.len(), control)?)
-    } else {
-        None
-    };
-    let remainder_width = divisor.len().checked_add(1).ok_or({
-        Halt::Stop(NatStop::OutputSizeOverflow {
-            task: control.task,
-            progress: control.progress,
-        })
-    })?;
-    let mut remainder = zeroed(remainder_width, control)?;
-
-    for bit in (0..bits).rev() {
-        control.step()?;
-        let incoming = (dividend[bit / 64] >> (bit % 64)) & 1;
-        let mut carry = incoming;
-        for limb in &mut remainder {
-            control.step()?;
-            let next = *limb >> 63;
-            *limb = (*limb << 1) | carry;
-            carry = next;
-        }
-        if compare_fixed(&remainder, divisor, control)? != Ordering::Less {
-            subtract_fixed(&mut remainder, divisor, control)?;
-            if let Some(quotient) = &mut quotient {
-                control.step()?;
-                quotient[bit / 64] |= 1u64 << (bit % 64);
-            }
-        }
-    }
-
-    let quotient = match quotient {
-        Some(quotient) => Some(trim(quotient, control)?),
-        None => None,
-    };
-    Ok((quotient, trim(remainder, control)?))
 }
 
 fn gcd_limbs(left: &[u64], right: &[u64], control: &mut Control<'_>) -> Result<Vec<u64>, Halt> {
