@@ -3437,3 +3437,305 @@ fn a_k_gate_conversion_is_not_repeated_for_the_same_pair() {
         "the second cast repeated the gate's conversion: {steps:?} steps"
     );
 }
+
+fn nat(value: u64) -> Expr {
+    use fln_core::expr::{Literal, NatLit};
+    Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+}
+
+fn nat_operation(operation: &str, left: Expr, right: Expr) -> Expr {
+    Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", operation]), vec![]),
+            left,
+        ),
+        right,
+    )
+}
+
+fn nat_lambda(name: &str, body: Expr) -> Expr {
+    Expr::lam(
+        primary_name(name),
+        constant("Nat"),
+        body,
+        BinderInfo::Default,
+    )
+}
+
+/// `step0 b := step1 b`, ..., `step{depth-1} b := b`: `step0 x` unfolds `depth`
+/// definitions to reach `x`.
+fn unfolding_chain(depth: usize) -> Vec<ConstantEntry> {
+    (0..depth)
+        .map(|index| {
+            let body = if index + 1 == depth {
+                Expr::bvar(0).unwrap()
+            } else {
+                Expr::app(
+                    constant(format!("step{}", index + 1)),
+                    Expr::bvar(0).unwrap(),
+                )
+            };
+            definition_entry(
+                format!("step{index}"),
+                vec![],
+                decoded(&nat_lambda("b", body)),
+                ReducibilityHint::Regular(1),
+                DefinitionSafety::Safe,
+            )
+        })
+        .collect()
+}
+
+fn natural(result: &WhnfResult) -> Option<u64> {
+    match result.term.node(result.term.root()) {
+        Some(ExprNode::NatLiteral { limbs_le }) => match limbs_le.as_slice() {
+            [] => Some(0),
+            [value] => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `(fun x => x + x) (step0 5)`: both operands are the one argument, whose
+/// evaluation unfolds the whole chain. Evaluated once and shared, as the pin
+/// shares it through its whnf cache, the chain unfolds once.
+#[test]
+fn a_bound_argument_is_evaluated_once_for_all_its_occurrences() {
+    const DEPTH: usize = 60;
+    let context = definition_context(unfolding_chain(DEPTH));
+    let doubled = nat_lambda(
+        "x",
+        nat_operation("add", Expr::bvar(0).unwrap(), Expr::bvar(0).unwrap()),
+    );
+    let term = Expr::app(doubled, Expr::app(constant("step0"), nat(5)));
+    let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+    assert_eq!(natural(&result), Some(10));
+    assert!(
+        result.delta_reductions < DEPTH as u64 + 8,
+        "{} delta reductions: the shared argument was evaluated for each occurrence",
+        result.delta_reductions
+    );
+}
+
+/// `twice x := use x + use x` with `use b := (step0 b).succ`. The two calls of
+/// `use` are different terms; inside each, `step0 b` is the same node of the
+/// same unfolded body with the same `b`, so its evaluation is shared across
+/// the calls, as the pin's whnf cache finds it structurally.
+#[test]
+fn equal_subterms_of_separate_unfoldings_share_one_evaluation() {
+    const DEPTH: usize = 60;
+    let mut entries = unfolding_chain(DEPTH);
+    let succ = |value| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            value,
+        )
+    };
+    entries.push(definition_entry(
+        "use",
+        vec![],
+        decoded(&nat_lambda(
+            "b",
+            succ(Expr::app(constant("step0"), Expr::bvar(0).unwrap())),
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let call = |argument| Expr::app(constant("use"), argument);
+    entries.push(definition_entry(
+        "twice",
+        vec![],
+        decoded(&nat_lambda(
+            "x",
+            nat_operation(
+                "add",
+                call(Expr::bvar(0).unwrap()),
+                call(Expr::bvar(0).unwrap()),
+            ),
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let term = Expr::app(constant("twice"), nat(5));
+    let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+    assert_eq!(natural(&result), Some(12));
+    assert!(
+        result.delta_reductions < DEPTH as u64 + 12,
+        "{} delta reductions: the second call evaluated `step0 b` again",
+        result.delta_reductions
+    );
+}
+
+/// The same body node under different arguments denotes different terms, and
+/// is never shared: `use 2 + use 3` is `3 + 4`.
+#[test]
+fn one_body_under_different_arguments_is_not_shared() {
+    let mut entries = unfolding_chain(3);
+    let succ = |value| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            value,
+        )
+    };
+    entries.push(definition_entry(
+        "use",
+        vec![],
+        decoded(&nat_lambda(
+            "b",
+            succ(Expr::app(constant("step0"), Expr::bvar(0).unwrap())),
+        )),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let call = |value| Expr::app(constant("use"), nat(value));
+    let term = nat_operation("add", call(2), call(3));
+    let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+    assert_eq!(natural(&result), Some(7));
+}
+
+/// A loose variable of the input that a beta step binds under a new binder is
+/// lifted over it: `(fun x => fun y => x) #0` is `fun y => #1`.
+#[test]
+fn a_bound_value_with_a_loose_variable_is_lifted_under_binders() {
+    let constant_function = Expr::lam(
+        primary_name("x"),
+        constant("A"),
+        Expr::lam(
+            primary_name("y"),
+            constant("A"),
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let term = Expr::app(constant_function, Expr::bvar(0).unwrap());
+    let result = complete(whnf(
+        &decoded(&term),
+        &WhnfContext::default(),
+        WhnfBudget::unlimited(),
+    ));
+    let expected = decoded(&Expr::lam(
+        primary_name("y"),
+        constant("A"),
+        Expr::bvar(1).unwrap(),
+        BinderInfo::Default,
+    ));
+    assert_eq!(
+        frozen(&result.term, result.term.root()),
+        frozen(&expected, expected.root())
+    );
+}
+
+/// One run instantiates one definition at two universe levels, and each use
+/// sees its own: instantiations are shared per universe values
+/// (`Reducer::instantiated`), never per definition alone. The major
+/// `poly.{1,0} Two.ff Prop` unfolds `poly` at `u := 1`; the selected minor
+/// `poly.{0,1}` then unfolds it at `u := 0`.
+#[test]
+fn one_definition_instantiated_at_two_levels_in_one_run_keeps_each_level() {
+    let two = || constant("Two");
+    let with_level = |level: Level| {
+        Expr::lam(
+            primary_name("x"),
+            two(),
+            Expr::lam(
+                primary_name("y"),
+                Expr::sort(level),
+                Expr::bvar(1).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    let mut entries = two_family_entries();
+    entries.push(definition_entry(
+        "poly",
+        vec![checker_name("u"), checker_name("v")],
+        decoded(&with_level(Level::param(primary_name("u")))),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let poly = |u: Level, v: Level| Expr::const_(primary_name("poly"), vec![u, v]);
+    let ff = Expr::const_(Name::from_components(["Two", "ff"]), vec![]);
+    let major = Expr::app(
+        Expr::app(poly(Level::one(), Level::zero()), ff),
+        Expr::sort(Level::zero()),
+    );
+    let minor = poly(Level::zero(), Level::one());
+    let term = two_eliminate(major, minor.clone(), minor);
+    let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+    let term = &result.term;
+    let Some(ExprNode::Lambda { body, .. }) = term.node(term.root()) else {
+        panic!("the selected minor did not reduce to its lambda: {term:?}");
+    };
+    let Some(ExprNode::Lambda { binder_type, .. }) = term.node(*body) else {
+        panic!("the minor's second binder is missing: {term:?}");
+    };
+    let Some(ExprNode::Sort { level }) = term.node(*binder_type) else {
+        panic!("the second binder's type is not a sort: {term:?}");
+    };
+    assert!(
+        matches!(term.level(*level), Some(LevelNode::Zero)),
+        "the minor `poly.{{0,1}}` was read with the major's `u := 1`: {:?}",
+        term.level(*level)
+    );
+}
+
+/// An operation whose operand is not a natural declines once and then takes
+/// the unfolding path, as the pin's `whnf` does when `reduce_nat` returns
+/// none; it is never offered the same arguments again. With no definition of
+/// `Nat.add` to unfold, `Nat.add Opaque 1` is stuck, at once.
+#[test]
+fn a_declined_operation_is_not_offered_again() {
+    let context = definition_context(vec![header_entry(
+        "Opaque",
+        ConstantKind::Axiom,
+        ConstantSafety::Safe,
+    )]);
+    let term = nat_operation("add", constant("Opaque"), nat(1));
+    let budget = WhnfBudget::new(200, 200, TermBudget::unlimited());
+    let result = complete(whnf(&decoded(&term), &context, budget));
+    assert_eq!(
+        frozen(&result.term, result.term.root()),
+        frozen(&decoded(&term), decoded(&term).root())
+    );
+}
+
+/// A shared function position is reduced within its application, never on its
+/// own, and its shared evaluation never records an application's result:
+/// `(fun f => f 7 2 + f 9 4) Nat.mod` offers `Nat.mod 7 2` and `Nat.mod 9 4` to
+/// the arithmetic before any unfolding, as at the pin. Here `Nat.mod` is defined
+/// to return 999, so evaluating the function position alone, which unfolds it,
+/// is visible; and recording `f 7 2` as `f` would answer the second use wrongly.
+#[test]
+fn a_shared_function_position_is_reduced_within_its_application() {
+    let context = definition_context(vec![ConstantEntry::new(
+        checker_qualified(&["Nat", "mod"]),
+        ConstantDeclaration::definition(
+            vec![],
+            decoded(&Expr::sort(Level::zero())),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&nat_lambda("a", nat_lambda("b", nat(999)))),
+                ReducibilityHint::Regular(1),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    )]);
+    let call = |left, right| Expr::app(Expr::app(Expr::bvar(0).unwrap(), nat(left)), nat(right));
+    let apply = Expr::lam(
+        primary_name("f"),
+        constant("F"),
+        nat_operation("add", call(7, 2), call(9, 4)),
+        BinderInfo::Default,
+    );
+    let modulo = Expr::const_(Name::from_components(["Nat", "mod"]), vec![]);
+    let term = Expr::app(apply, modulo);
+    let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+    assert_eq!(natural(&result), Some(2));
+}

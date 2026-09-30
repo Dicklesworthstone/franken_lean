@@ -15,10 +15,8 @@ fn lid(index: usize) -> LevelId {
 }
 
 fn cursor(term: WireExpr) -> Cursor {
-    Cursor {
-        root: term.root(),
-        arena: Arc::new(term),
-    }
+    let root = term.root();
+    Cursor::closed(Arc::new(term), root)
 }
 
 fn complete(result: WhnfOutcome) -> WhnfResult {
@@ -208,10 +206,7 @@ fn composition_shares_exact_nodes_and_levels_but_preserves_distinct_payloads() {
     for pass in 0..2 {
         // Different allocations, even on each cursor, are intentional.
         for index in 0..term.nodes().len() {
-            let node = Cursor {
-                arena: Arc::new(term.clone()),
-                root: id(index),
-            };
+            let node = Cursor::closed(Arc::new(term.clone()), id(index));
             let copied = composer
                 .copy_cursor(&node, index)
                 .unwrap_or_else(|_| panic!("copy"));
@@ -328,10 +323,7 @@ fn composition_shares_exact_nodes_and_levels_but_preserves_distinct_payloads() {
 #[test]
 fn sharing_hits_still_charge_payloads_and_check_cancellation() {
     let term = cursor(all_nodes());
-    let fresh = Cursor {
-        root: term.root,
-        arena: Arc::new((*term.arena).clone()),
-    };
+    let fresh = Cursor::closed(Arc::new((*term.arena).clone()), term.root);
     let mut no_cancel = || false;
     let mut composer = Composer::new(
         TermBudget::unlimited(),

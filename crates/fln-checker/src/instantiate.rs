@@ -193,7 +193,8 @@ struct Instantiator<'a, 'c> {
     values: ReplacementValues<'a>,
     control: Control<'c>,
     levels: Vec<LevelNode>,
-    replacement_maps: Vec<Option<Vec<LevelId>>>,
+    /// Each replacement's copied root, once copied.
+    replacement_maps: Vec<Option<LevelId>>,
 }
 
 impl<'a, 'c> Instantiator<'a, 'c> {
@@ -280,110 +281,76 @@ impl<'a, 'c> Instantiator<'a, 'c> {
             }))
     }
 
+    /// Copy the level a replacement's root denotes into the output, once per
+    /// replacement. Only the root's own subtree is walked: the arena it lives in
+    /// may hold many other levels (a WHNF cursor's shared arena does), and
+    /// copying them all made every instantiation cost that whole arena.
     fn copy_replacement(&mut self, value_index: usize) -> Result<LevelId, Halt> {
+        if let Some(mapped) = self.replacement_maps.get(value_index).copied().flatten() {
+            return Ok(mapped);
+        }
         let root = self.replacement_root(value_index)?;
-        if let Some(mapping) = self
-            .replacement_maps
-            .get(value_index)
-            .and_then(Option::as_ref)
-        {
-            return mapping.get(root.index()).copied().ok_or(Halt::Fault(
-                InstantiationFault::MissingLevel {
-                    input: InstantiationInput::Replacement { index: value_index },
-                    index: root.index(),
-                },
-            ));
-        }
-
+        let nodes = self.replacement_nodes(value_index)?;
         let input = InstantiationInput::Replacement { index: value_index };
-        let source_len = self.replacement_nodes(value_index)?.len();
-        let mut mapping = Vec::new();
-        for index in 0..source_len {
-            self.control.step(index)?;
-            let (plan, units) = {
-                let node = self
-                    .replacement_nodes(value_index)?
-                    .get(index)
-                    .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
-                        input,
-                        index,
-                    }))?;
-                let plan = match node {
-                    LevelNode::Zero => LevelPlan::Ready(LevelNode::Zero),
-                    LevelNode::Succ(child) => LevelPlan::Ready(LevelNode::Succ(Self::prior_level(
-                        &mapping, input, index, *child,
-                    )?)),
-                    LevelNode::Max(left, right) => LevelPlan::Ready(LevelNode::Max(
-                        Self::prior_level(&mapping, input, index, *left)?,
-                        Self::prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::IMax(left, right) => LevelPlan::Ready(LevelNode::IMax(
-                        Self::prior_level(&mapping, input, index, *left)?,
-                        Self::prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::Parameter(_) => LevelPlan::Parameter,
-                    LevelNode::Meta(_) => LevelPlan::Meta,
-                };
-                (plan, level_owned_units(node))
+        let missing = |index| Halt::Fault(InstantiationFault::MissingLevel { input, index });
+        let mut mapping: BTreeMap<usize, LevelId> = BTreeMap::new();
+        let mut work = vec![(root.index(), false)];
+        while let Some((index, built)) = work.pop() {
+            if mapping.contains_key(&index) {
+                continue;
+            }
+            let node = nodes.get(index).ok_or_else(|| missing(index))?;
+            let children = match node {
+                LevelNode::Succ(child) => [Some(*child), None],
+                LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
+                    [Some(*left), Some(*right)]
+                }
+                LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => [None, None],
             };
-            self.control.output(units, index)?;
-            let node = match plan {
-                LevelPlan::Ready(node) => node,
-                LevelPlan::Parameter => {
-                    let LevelNode::Parameter(name) = self
-                        .replacement_nodes(value_index)?
-                        .get(index)
-                        .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
+            if !built {
+                self.control.step(index)?;
+                work.push((index, true));
+                for child in children.into_iter().flatten() {
+                    if child.index() >= index {
+                        return Err(Halt::Fault(InstantiationFault::NonBackwardLevelReference {
                             input,
-                            index,
-                        }))?
-                    else {
-                        return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                            input,
-                            index,
+                            parent: index,
+                            child: child.index(),
                         }));
-                    };
-                    LevelNode::Parameter(name.clone())
+                    }
+                    work.push((child.index(), false));
                 }
-                LevelPlan::Meta => {
-                    let LevelNode::Meta(name) = self
-                        .replacement_nodes(value_index)?
-                        .get(index)
-                        .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
-                            input,
-                            index,
-                        }))?
-                    else {
-                        return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                            input,
-                            index,
-                        }));
-                    };
-                    LevelNode::Meta(name.clone())
-                }
-                LevelPlan::Replacement(_) => {
-                    return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                        input,
-                        index,
-                    }));
-                }
+                continue;
+            }
+            let mapped = |child: &LevelId| {
+                mapping
+                    .get(&child.index())
+                    .copied()
+                    .ok_or_else(|| missing(child.index()))
             };
-            let id = self.push_level(node, index)?;
-            mapping.push(id);
+            let copied = match node {
+                LevelNode::Zero => LevelNode::Zero,
+                LevelNode::Succ(child) => LevelNode::Succ(mapped(child)?),
+                LevelNode::Max(left, right) => LevelNode::Max(mapped(left)?, mapped(right)?),
+                LevelNode::IMax(left, right) => LevelNode::IMax(mapped(left)?, mapped(right)?),
+                LevelNode::Parameter(name) => LevelNode::Parameter(name.clone()),
+                LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
+            };
+            self.control.output(level_owned_units(node), index)?;
+            let id = self.push_level(copied, index)?;
+            mapping.insert(index, id);
         }
 
-        let mapped_root = mapping.get(root.index()).copied().ok_or(Halt::Fault(
-            InstantiationFault::MissingLevel {
-                input,
-                index: root.index(),
-            },
-        ))?;
+        let mapped_root = mapping
+            .get(&root.index())
+            .copied()
+            .ok_or_else(|| missing(root.index()))?;
         let Some(slot) = self.replacement_maps.get_mut(value_index) else {
             return Err(Halt::Fault(InstantiationFault::MissingReplacement {
                 index: value_index,
             }));
         };
-        *slot = Some(mapping);
+        *slot = Some(mapped_root);
         Ok(mapped_root)
     }
 

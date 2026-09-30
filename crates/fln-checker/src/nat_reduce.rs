@@ -1722,6 +1722,68 @@ pub fn reduce_nat_with(
     )
 }
 
+/// The natural number a normalized operand denotes: a literal or `Nat.zero`,
+/// as the pin's `is_nat_lit_ext`. `Err` is a non-canonical literal.
+pub(crate) fn natural_of(node: &ExprNode) -> Result<Option<NatValue>, ()> {
+    match node {
+        ExprNode::NatLiteral { limbs_le } => {
+            if limbs_le.last() == Some(&0) {
+                return Err(());
+            }
+            NatValue::from_limbs_le(limbs_le.clone())
+                .map(Some)
+                .map_err(|_| ())
+        }
+        ExprNode::Constant { name, levels }
+            if levels.is_empty() && text_name(name, "Nat", "zero") =>
+        {
+            Ok(Some(NatValue::zero()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One operation on operands its caller already normalized to naturals: the
+/// WHNF reducer evaluates operands in its own loop and computes here, so the
+/// arithmetic is this module's in both lanes. `Nat.pow` above the pin's
+/// exponent cap is `NotReduced`, and the operation then unfolds.
+pub(crate) fn execute_operation(
+    operation: NatReductionOperation,
+    operands: &[NatValue],
+    budget: NatReductionBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> NatReductionOutcome {
+    let mut control = Control::new(budget, cancelled);
+    let executed = match (operation.arity(), operands) {
+        (1, [value]) => execute_successor(value, &mut control),
+        (2, [left, right]) => execute_binary(operation, left, right, &mut control),
+        _ => Err(Halt::Fault(NatReductionFault::ValueStack { operation })),
+    };
+    let outcome = match executed {
+        Ok(Executed::PowCap(cap)) => Ok(NatReductionOutcome::NotReduced {
+            reason: NatNotReduced::PowExponentAbovePinCap { cap },
+            progress: control.progress,
+        }),
+        Ok(executed) => output_term(executed, operation, &mut control).map(|term| {
+            NatReductionOutcome::Reduced(NatReductionResult {
+                term,
+                operation,
+                progress: control.progress,
+            })
+        }),
+        Err(halt) => Err(halt),
+    };
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(Halt::Refusal { refusal, progress }) => NatReductionOutcome::Refused {
+            refusal: *refusal,
+            progress,
+        },
+        Err(Halt::Stop(stop)) => NatReductionOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => NatReductionOutcome::InternalFault(fault),
+    }
+}
+
 pub(crate) fn reduce_nat_at_with(
     query: NatReductionQuery<'_>,
     budget: NatReductionBudget,

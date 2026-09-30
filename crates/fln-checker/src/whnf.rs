@@ -555,16 +555,371 @@ impl<'a> PreparedContext<'a> {
     }
 }
 
+/// A term under reduction: `root` in `arena`, whose loose bound variables
+/// `0..env.len()` stand for the environment's values, innermost first; a loose
+/// index at or past `env.len()` is the run's own loose variable `index -
+/// env.len()`. Beta and zeta extend the environment instead of rewriting the
+/// body, so a step costs what it changes, not the size of the term. A term is
+/// rebuilt only where it leaves the reducer (`Composer::copy_cursor`).
+///
+/// Cursors are made resolved (`Cursor::resolved`): a root is never a bound
+/// variable its own environment binds, so reading the root node is enough to
+/// classify the term.
+///
+/// A cursor that is an argument or a bound value may carry a `Thunk`, shared by
+/// every copy of it: the first eager evaluation records its weak head normal
+/// form there and every later one resumes from it, as the pin's whnf cache
+/// shares the result for a term that `instantiate` shared by pointer. Only the
+/// evaluation reads it: a term is always rebuilt as written.
 #[derive(Clone)]
 struct Cursor {
     arena: Arc<WireExpr>,
     root: ExprId,
+    env: Env,
+    thunk: Option<Arc<Thunk>>,
+}
+
+impl Cursor {
+    /// A term with no environment: every loose index is the run's own.
+    fn closed(arena: Arc<WireExpr>, root: ExprId) -> Cursor {
+        Cursor {
+            arena,
+            root,
+            env: Env::default(),
+            thunk: None,
+        }
+    }
+
+    /// `root` in `arena` under `env`, with a root bound by `env` replaced by its
+    /// value. Values are stored resolved, so one lookup suffices.
+    fn resolved(arena: Arc<WireExpr>, root: ExprId, env: Env) -> Cursor {
+        if let Some(ExprNode::Bound { index }) = arena.node(root)
+            && let Some(value) = env.get(*index)
+        {
+            return value.clone();
+        }
+        Cursor {
+            arena,
+            root,
+            env,
+            thunk: None,
+        }
+    }
+
+    /// A subterm of this cursor's term, in the same environment.
+    fn child(&self, root: ExprId) -> Cursor {
+        Cursor::resolved(Arc::clone(&self.arena), root, self.env.clone())
+    }
+
+    /// This cursor, sharing one evaluation among its copies when it is a
+    /// computation rather than already a head form.
+    fn shared(mut self) -> Cursor {
+        if self.thunk.is_none()
+            && matches!(
+                self.arena.node(self.root),
+                Some(
+                    ExprNode::Apply { .. }
+                        | ExprNode::Let { .. }
+                        | ExprNode::Projection { .. }
+                        | ExprNode::Metadata { .. }
+                        | ExprNode::Constant { .. }
+                )
+            )
+        {
+            self.thunk = Some(Arc::new(Thunk::default()));
+        }
+        self
+    }
+}
+
+/// A term by pointer structure: a node of an arena, with the identity of each
+/// environment value its loose indices refer to. Two cursors with one key denote
+/// the same term, so they share one evaluation.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct WhnfKey {
+    arena: usize,
+    node: usize,
+    values: Vec<ValueIdentity>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ValueIdentity {
+    /// A shared value: its thunk.
+    Thunk(usize),
+    /// A value with no environment: its node.
+    Closed(usize, usize),
+}
+
+/// A canonical spelling of universe values: equal levels spell the same.
+/// `None` for a spelling too long to be worth a cache key.
+fn level_key(nodes: &[LevelNode], roots: &[LevelId]) -> Option<String> {
+    let mut key = String::new();
+    for root in roots {
+        let mut pending = vec![*root];
+        while let Some(id) = pending.pop() {
+            if key.len() > 1024 {
+                return None;
+            }
+            match nodes.get(id.index())? {
+                LevelNode::Zero => key.push('Z'),
+                LevelNode::Succ(child) => {
+                    key.push('S');
+                    pending.push(*child);
+                }
+                LevelNode::Max(left, right) => {
+                    key.push('M');
+                    pending.push(*right);
+                    pending.push(*left);
+                }
+                LevelNode::IMax(left, right) => {
+                    key.push('I');
+                    pending.push(*right);
+                    pending.push(*left);
+                }
+                node @ (LevelNode::Parameter(name) | LevelNode::Meta(name)) => {
+                    key.push(if matches!(node, LevelNode::Meta(_)) {
+                        '?'
+                    } else {
+                        'P'
+                    });
+                    for part in name.parts() {
+                        match part {
+                            NamePart::Text(text) => {
+                                key.push('"');
+                                key.push_str(&text.len().to_string());
+                                key.push(':');
+                                key.push_str(text);
+                            }
+                            NamePart::Numeric { .. } => key.push_str(&format!("#{part:?}")),
+                        }
+                    }
+                    key.push(';');
+                }
+            }
+        }
+        key.push('|');
+    }
+    Some(key)
+}
+
+/// The weak head normal form of a shared cursor, once evaluated eagerly.
+#[derive(Default)]
+struct Thunk {
+    result: std::sync::OnceLock<Spine>,
+}
+
+impl Drop for Thunk {
+    fn drop(&mut self) {
+        if let Some(spine) = self.result.take() {
+            let mut cells = Vec::new();
+            let mut thunks = Vec::new();
+            spine.release_into(&mut cells, &mut thunks);
+            release(cells, thunks);
+        }
+    }
+}
+
+/// An application kept unbuilt: `head` applied to `args`. Reduction results
+/// stay spines until something needs one term, so a constructor's fields are
+/// never copied just to be taken apart again by the recursor that demanded it.
+#[derive(Clone)]
+struct Spine {
+    head: Cursor,
+    args: VecDeque<Cursor>,
+}
+
+impl Spine {
+    /// Hand this spine's environments and thunks to an iterative release.
+    fn release_into(self, cells: &mut Vec<Arc<EnvCell>>, thunks: &mut Vec<Arc<Thunk>>) {
+        for mut cursor in std::iter::once(self.head).chain(self.args) {
+            cells.extend(cursor.env.0.take());
+            thunks.extend(cursor.thunk.take());
+        }
+    }
+}
+
+/// Release environments and thunks on a heap stack: they nest through each
+/// other as deeply as a computation ran, too deep for the recursive default
+/// drop.
+fn release(mut cells: Vec<Arc<EnvCell>>, mut thunks: Vec<Arc<Thunk>>) {
+    loop {
+        if let Some(cell) = cells.pop() {
+            if let Some(mut cell) = Arc::into_inner(cell) {
+                cells.extend(cell.next.0.take());
+                cells.extend(cell.value.env.0.take());
+                thunks.extend(cell.value.thunk.take());
+            }
+        } else if let Some(thunk) = thunks.pop() {
+            if let Some(mut thunk) = Arc::into_inner(thunk)
+                && let Some(spine) = thunk.result.take()
+            {
+                spine.release_into(&mut cells, &mut thunks);
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+/// A persistent list of the values bound around a cursor's term.
+#[derive(Clone, Default)]
+struct Env(Option<Arc<EnvCell>>);
+
+struct EnvCell {
+    value: Cursor,
+    next: Env,
+    len: u32,
+}
+
+impl Env {
+    fn len(&self) -> u32 {
+        self.0.as_ref().map_or(0, |cell| cell.len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// This environment with `value` bound as index 0.
+    fn push(&self, value: Cursor) -> Env {
+        Env(Some(Arc::new(EnvCell {
+            value,
+            next: self.clone(),
+            len: self.len().saturating_add(1),
+        })))
+    }
+
+    fn get(&self, index: u32) -> Option<&Cursor> {
+        let mut cell = self.0.as_deref()?;
+        for _ in 0..index {
+            cell = cell.next.0.as_deref()?;
+        }
+        Some(&cell.value)
+    }
+
+    /// An identity for memo keys, valid while this environment is alive.
+    fn identity(&self) -> usize {
+        self.0.as_ref().map_or(0, |cell| Arc::as_ptr(cell).addr())
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        release(self.0.take().into_iter().collect(), Vec::new());
+    }
 }
 
 enum ReductionFrame {
     Projection(ProjectionFrame),
     Quotient(quotient::QuotientFrame),
     Recursor(Box<RecursorFrame>),
+    Nat(Box<NatFrame>),
+    /// Record a shared cursor's weak head normal form. It was evaluated with no
+    /// pending arguments, so the result is the whole term.
+    Update {
+        thunk: Arc<Thunk>,
+        /// The evaluation registered under the same key, if another one.
+        keyed: Option<Arc<Thunk>>,
+    },
+}
+
+/// KR-313 at a WHNF head, evaluated in this loop: each operand is normalized
+/// here in turn, as the pin's `reduce_nat` calls `whnf` on it, and the
+/// operation computes once all are naturals. An operand that is not a natural
+/// declines the operation, which then unfolds (`skip_nat`).
+struct NatFrame {
+    operation: crate::nat_reduce::NatReductionOperation,
+    head: Cursor,
+    /// Every argument the operation was applied to; the first `arity` are its
+    /// operands.
+    arguments: VecDeque<Cursor>,
+    values: Vec<crate::numeric::NatValue>,
+    delta_mode: DeltaMode,
+    unfolded_bindings: BTreeSet<usize>,
+    force_string_delta: bool,
+}
+
+/// Per-node facts of one arena, each computed at most once per run and only for
+/// the subterms a check reaches: the loose bound-variable range, the loose
+/// indices below 64 as a mask, and whether a free variable occurs.
+struct ArenaFacts {
+    arena: Arc<WireExpr>,
+    known: Vec<bool>,
+    loose: Vec<u32>,
+    mask: Vec<u64>,
+    free: Vec<bool>,
+}
+
+impl ArenaFacts {
+    fn new(arena: Arc<WireExpr>) -> ArenaFacts {
+        let len = arena.nodes().len();
+        ArenaFacts {
+            arena,
+            known: vec![false; len],
+            loose: vec![0; len],
+            mask: vec![0; len],
+            free: vec![false; len],
+        }
+    }
+
+    /// The facts of `root`, computing those of its subterms not yet known; each
+    /// node computed is one step.
+    fn at(
+        &mut self,
+        root: ExprId,
+        control: &mut Control,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<(u32, u64, bool), Halt> {
+        let missing = |index| Halt::Fault(WhnfFault::MissingExpression { input: 0, index });
+        let mut work = vec![(root.index(), false)];
+        while let Some((index, built)) = work.pop() {
+            if *self.known.get(index).ok_or_else(|| missing(index))? {
+                continue;
+            }
+            let node = self
+                .arena
+                .nodes()
+                .get(index)
+                .ok_or_else(|| missing(index))?;
+            let children = expression_children(node);
+            if !built {
+                control.step(index, cancelled)?;
+                work.push((index, true));
+                for (child, _) in children.into_iter().flatten() {
+                    if child.index() >= index {
+                        return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                            input: 0,
+                            parent: index,
+                            child: child.index(),
+                        }));
+                    }
+                    work.push((child.index(), false));
+                }
+                continue;
+            }
+            let (mut loose, mut mask, mut free) = match node {
+                ExprNode::Bound { index } => (
+                    index.saturating_add(1),
+                    1u64.checked_shl(*index).unwrap_or(0),
+                    false,
+                ),
+                ExprNode::Free { .. } => (0, 0, true),
+                _ => (0, 0, false),
+            };
+            for (child, binders) in children.into_iter().flatten() {
+                let child = child.index();
+                loose = loose.max(self.loose[child].saturating_sub(binders));
+                mask |= self.mask[child].checked_shr(binders).unwrap_or(0);
+                free |= self.free[child];
+            }
+            self.loose[index] = loose;
+            self.mask[index] = mask;
+            self.free[index] = free;
+            self.known[index] = true;
+        }
+        let index = root.index();
+        Ok((self.loose[index], self.mask[index], self.free[index]))
+    }
 }
 
 struct RecursorFrame {
@@ -584,7 +939,7 @@ struct RecursorFrame {
 }
 
 enum RecursorStep {
-    Reduced(Cursor),
+    Reduced(Spine),
     NormalizeMajor {
         frame: Box<RecursorFrame>,
         major: Cursor,
@@ -631,6 +986,21 @@ struct Reducer<'a, 'c> {
     has_auxiliary_work: bool,
     string_progress: StringExpansionProgress,
     force_string_delta: bool,
+    /// A Nat operation at the head just declined: unfold it this once instead
+    /// of offering it again.
+    skip_nat: bool,
+    /// `ArenaFacts` by arena address; each entry holds its arena.
+    facts: std::collections::HashMap<usize, ArenaFacts>,
+    /// Each String literal's shared expansion (`expand_string`).
+    string_expansions: std::collections::HashMap<String, Cursor>,
+    /// Instantiated definition bodies and recursor rules by subject address and
+    /// universe values (`Reducer::instantiated`).
+    bodies: std::collections::HashMap<(usize, String), Arc<WireExpr>>,
+    /// Shared evaluations by pointer structure (`Reducer::keyed`). Each entry
+    /// holds the cursor its key was taken from, which keeps every address in the
+    /// key alive, so an address can never be reused for another term while it
+    /// is a key.
+    keyed_thunks: std::collections::HashMap<WhnfKey, (Cursor, Arc<Thunk>)>,
 }
 
 /// The reported-progress counters when a recursor frame starts normalizing
@@ -700,16 +1070,23 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .saturating_add(progress.owned_units);
     }
 
+    /// The constructor form of a String literal. One shared expansion per
+    /// literal and run: every projection of the literal then reads the same
+    /// evaluated fields, where the pin's whnf cache finds the structurally equal
+    /// expansion.
     fn expand_string(&mut self, value: &str, at: usize) -> Result<Cursor, Halt> {
+        if let Some(expanded) = self.string_expansions.get(value) {
+            return Ok(expanded.clone());
+        }
         let budget = self.remaining_string_budget();
         match expand_string_literal_with(value, budget, &mut self.cancelled) {
             StringExpansionOutcome::Expanded(result) => {
                 self.absorb_string(result.progress);
                 let root = result.term.root();
-                Ok(Cursor {
-                    arena: Arc::new(result.term),
-                    root,
-                })
+                let expanded = Cursor::closed(Arc::new(result.term), root).shared();
+                self.string_expansions
+                    .insert(value.to_owned(), expanded.clone());
+                Ok(expanded)
             }
             StringExpansionOutcome::Inconclusive(stop) => {
                 self.absorb_string(stop.progress());
@@ -764,68 +1141,33 @@ impl<'a, 'c> Reducer<'a, 'c> {
     ) -> Result<Cursor, Halt> {
         let term = self.materialize_wire(term, root, phase)?;
         let root = term.root();
-        Ok(Cursor {
-            arena: Arc::new(term),
-            root,
-        })
+        Ok(Cursor::closed(Arc::new(term), root))
     }
 
-    fn substitute(
-        &mut self,
-        subject: &Cursor,
-        body: ExprId,
-        replacement: &Cursor,
-        phase: WhnfPhase,
-    ) -> Result<Cursor, Halt> {
-        self.control.step(body.index(), self.cancelled)?;
-        let result = substitute_bound_subterms_with(
-            &subject.arena,
-            body,
-            0,
-            &replacement.arena,
-            replacement.root,
-            self.control.budget.materialization,
-            self.cancelled,
-        );
-        let term = self.control.term_halt(phase, result)?;
-        let root = term.root();
-        Ok(Cursor {
-            arena: Arc::new(term),
-            root,
-        })
-    }
-
+    /// The head and arguments of an application spine. A function position
+    /// bound by the environment continues the spine in its value, which may
+    /// live in another arena.
     fn peel_application(&mut self, cursor: &Cursor) -> Result<(Cursor, VecDeque<Cursor>), Halt> {
-        let mut root = cursor.root;
+        let mut head = cursor.clone();
         let mut arguments = VecDeque::new();
         loop {
-            self.control.step(root.index(), self.cancelled)?;
+            self.control.step(head.root.index(), self.cancelled)?;
             let node =
-                cursor
-                    .arena
-                    .node(root)
+                head.arena
+                    .node(head.root)
                     .ok_or(Halt::Fault(WhnfFault::MissingExpression {
                         input: 0,
-                        index: root.index(),
+                        index: head.root.index(),
                     }))?;
             let ExprNode::Apply { function, argument } = node else {
                 break;
             };
-            Self::validate_child(root, *function)?;
-            Self::validate_child(root, *argument)?;
-            arguments.push_front(Cursor {
-                arena: Arc::clone(&cursor.arena),
-                root: *argument,
-            });
-            root = *function;
+            Self::validate_child(head.root, *function)?;
+            Self::validate_child(head.root, *argument)?;
+            arguments.push_front(head.child(*argument).shared());
+            head = head.child(*function);
         }
-        Ok((
-            Cursor {
-                arena: Arc::clone(&cursor.arena),
-                root,
-            },
-            arguments,
-        ))
+        Ok((head, arguments))
     }
 
     fn compose_application<'b, I>(
@@ -856,11 +1198,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 index,
             )?;
         }
-        let term = composer.finish(root);
-        Ok(Cursor {
-            root: term.root(),
-            arena: Arc::new(term),
-        })
+        Ok(composer.finish_cursor(root))
     }
 
     fn compose_projection(
@@ -903,17 +1241,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             0,
             projection.root.index(),
         )?;
-        let term = composer.finish(root);
-        Ok(Cursor {
-            root: term.root(),
-            arena: Arc::new(term),
-        })
+        Ok(composer.finish_cursor(root))
     }
 
     fn projection_field(
         &mut self,
         frame: &ProjectionFrame,
-        scrutinee: &Cursor,
+        scrutinee: &Spine,
     ) -> Result<Option<Cursor>, Halt> {
         let (rule, rule_index, field_index) = {
             let node = self.node(&frame.projection)?;
@@ -956,9 +1290,9 @@ impl<'a, 'c> Reducer<'a, 'c> {
             (rule, rule_index, *index)
         };
 
-        let (head, arguments) = self.peel_application(scrutinee)?;
+        let arguments = &scrutinee.args;
         let constructor_matches = matches!(
-            self.node(&head)?,
+            self.node(&scrutinee.head)?,
             ExprNode::Constant { name, .. } if name == &rule.constructor_name
         );
         if !constructor_matches {
@@ -1010,28 +1344,68 @@ impl<'a, 'c> Reducer<'a, 'c> {
 
         self.control
             .reduction(current.root.index(), self.cancelled)?;
-        let result = instantiate_term_parameters_from_level_roots_with(
+        let body = self.instantiated(
             definition.value(),
             constant.level_parameters(),
-            current.arena.levels(),
+            &current.arena,
+            levels,
+            current.root.index(),
+            true,
+        )?;
+        let root = body.root();
+        Ok(Some(Cursor::closed(body, root)))
+    }
+
+    /// `subject`, an environment-owned term, with its universe `parameters`
+    /// instantiated to the level roots `levels` of `source`. One arena per
+    /// subject and universe values in a run: a definition unfolded again
+    /// yields the same arena, so the shared-evaluation keys (`Reducer::keyed`)
+    /// recognize its subterms. Only a `cacheable` subject is shared: one the
+    /// environment owns, which outlives the run, so its address stays its own.
+    fn instantiated(
+        &mut self,
+        subject: &WireExpr,
+        parameters: &[WireName],
+        source: &WireExpr,
+        levels: &[LevelId],
+        at: usize,
+        cacheable: bool,
+    ) -> Result<Arc<WireExpr>, Halt> {
+        let key = level_key(source.levels(), levels)
+            .filter(|_| cacheable)
+            .map(|spelled| (std::ptr::from_ref(subject).addr(), spelled));
+        if let Some(key) = &key
+            && let Some(term) = self.bodies.get(key)
+        {
+            return Ok(Arc::clone(term));
+        }
+        match instantiate_term_parameters_from_level_roots_with(
+            subject,
+            parameters,
+            source.levels(),
             levels,
             self.control.budget.materialization,
-            self.cancelled,
-        );
-        match result {
-            InstantiationOutcome::Complete(term) => Ok(Some(Cursor {
-                root: term.root(),
-                arena: Arc::new(term),
-            })),
+            &mut *self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(term) => {
+                let term = Arc::new(term);
+                if let Some(key) = key {
+                    if self.bodies.len() >= 1 << 16 {
+                        self.bodies.clear();
+                    }
+                    self.bodies.insert(key, Arc::clone(&term));
+                }
+                Ok(term)
+            }
             InstantiationOutcome::Refused(refusal) => {
                 Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at,
                     refusal,
                 }))
             }
             InstantiationOutcome::Inconclusive(stop) => {
                 Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at,
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
@@ -1039,11 +1413,55 @@ impl<'a, 'c> Reducer<'a, 'c> {
             }
             InstantiationOutcome::InternalFault(fault) => {
                 Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
-                    at: current.root.index(),
+                    at,
                     fault,
                 }))
             }
         }
+    }
+
+    /// The shared evaluation for `cursor`'s key (`WhnfKey`), about to evaluate
+    /// with `thunk`: a whnf cache by pointer structure, as the pin's whnf cache
+    /// finds a term that `instantiate` shared by pointer. A new key registers
+    /// `thunk`. `None` when an environment value the term refers to cannot be
+    /// identified. Keys are taken only for terms being evaluated, so a spine's
+    /// arguments that never are cost nothing here.
+    fn keyed_thunk(
+        &mut self,
+        cursor: &Cursor,
+        thunk: &Arc<Thunk>,
+    ) -> Result<Option<Arc<Thunk>>, Halt> {
+        let (loose, mask, _) = self.fact(&cursor.arena, cursor.root)?;
+        let mut values = Vec::new();
+        for slot in 0..loose {
+            if slot < 64 && mask & (1 << slot) == 0 {
+                continue;
+            }
+            let Some(value) = cursor.env.get(slot) else {
+                return Ok(None);
+            };
+            values.push(match &value.thunk {
+                Some(thunk) => ValueIdentity::Thunk(Arc::as_ptr(thunk).addr()),
+                None if value.env.is_empty() => {
+                    ValueIdentity::Closed(Arc::as_ptr(&value.arena).addr(), value.root.index())
+                }
+                None => return Ok(None),
+            });
+        }
+        let key = WhnfKey {
+            arena: Arc::as_ptr(&cursor.arena).addr(),
+            node: cursor.root.index(),
+            values,
+        };
+        if let Some((_, existing)) = self.keyed_thunks.get(&key) {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        if self.keyed_thunks.len() >= 1 << 20 {
+            self.keyed_thunks.clear();
+        }
+        self.keyed_thunks
+            .insert(key, (cursor.clone(), Arc::clone(thunk)));
+        Ok(Some(Arc::clone(thunk)))
     }
 
     /// Whether the major premise already reduces to a constructor
@@ -1072,6 +1490,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// full WHNF for ordinary recursor majors (`type_checker.cpp`,
     /// `reduce_recursor`). Absorb the sub-run's work into the remaining budget.
     fn whnf_recursor_major(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
+        if !cursor.env.is_empty() {
+            let term = self.close(cursor, WhnfPhase::Iota)?;
+            let root = term.root();
+            return self.whnf_recursor_major(&Cursor::closed(Arc::new(term), root));
+        }
         let context = self.context.source;
         let budget = WhnfBudget::new(
             self.control
@@ -1119,10 +1542,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
     fn reduce_demanded_nat(&mut self, term: WireExpr) -> Result<Cursor, Halt> {
         let at = term.root().index();
         if !is_potential_nat_reduction(&term, term.root()) {
-            return Ok(Cursor {
-                root: term.root(),
-                arena: Arc::new(term),
-            });
+            let root = term.root();
+            return Ok(Cursor::closed(Arc::new(term), root));
         }
         let steps = self
             .control
@@ -1155,19 +1576,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
         match result {
             NatReductionOutcome::Reduced(result) => {
                 self.absorb_demanded_nat(result.progress, at)?;
-                Ok(Cursor {
-                    root: result.term.root(),
-                    arena: Arc::new(result.term),
-                })
+                let root = result.term.root();
+                Ok(Cursor::closed(Arc::new(result.term), root))
             }
             NatReductionOutcome::NotReduced { progress, .. } => {
                 // Work in a failed arithmetic demand is not a changed outer term.
                 self.has_auxiliary_work = true;
                 self.absorb_demanded_nat(progress, at)?;
-                Ok(Cursor {
-                    root: term.root(),
-                    arena: Arc::new(term),
-                })
+                let root = term.root();
+                Ok(Cursor::closed(Arc::new(term), root))
             }
             NatReductionOutcome::Refused {
                 refusal: crate::nat_reduce::NatReductionRefusal::Whnf { refusal, .. },
@@ -1206,12 +1623,51 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
     }
 
-    fn reduce_demanded_nat_cursor(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
-        if !is_potential_nat_reduction(&cursor.arena, cursor.root) {
-            return Ok(cursor.clone());
+    /// A demanded major that is an arithmetic form is computed by the demanded-major
+    /// lane (`reduce_demanded_nat`); any other spine is returned as it is.
+    fn reduce_demanded_nat_spine(&mut self, spine: Spine) -> Result<Spine, Halt> {
+        let potential = match self.node(&spine.head)? {
+            ExprNode::Constant { name, levels } => {
+                levels.is_empty()
+                    && crate::nat_reduce::operation_for_name(name)
+                        .is_some_and(|operation| spine.args.len() == usize::from(operation.arity()))
+            }
+            _ => false,
+        };
+        if !potential {
+            return Ok(spine);
         }
-        let term = self.materialize_wire(&cursor.arena, cursor.root, WhnfPhase::Iota)?;
-        self.reduce_demanded_nat(term)
+        let cursor = self.build_spine(spine)?;
+        let term = if cursor.env.is_empty() {
+            self.materialize_wire(&cursor.arena, cursor.root, WhnfPhase::Iota)?
+        } else {
+            self.close(&cursor, WhnfPhase::Iota)?
+        };
+        let reduced = self.reduce_demanded_nat(term)?;
+        let (head, args) = self.peel_application(&reduced)?;
+        Ok(Spine { head, args })
+    }
+
+    /// One term for a spine: its head, or the head applied to its arguments.
+    fn build_spine(&mut self, spine: Spine) -> Result<Cursor, Halt> {
+        if spine.args.is_empty() {
+            return Ok(spine.head);
+        }
+        self.compose_application(&spine.head, &spine.args)
+    }
+
+    /// A cursor's term with its environment substituted, as one arena.
+    fn close(&mut self, cursor: &Cursor, phase: WhnfPhase) -> Result<WireExpr, Halt> {
+        self.control.step(cursor.root.index(), self.cancelled)?;
+        let mut composer = Composer::new(
+            self.control.budget.materialization,
+            phase,
+            self.control.steps,
+            self.control.reductions,
+            self.cancelled,
+        );
+        let root = composer.copy_cursor(cursor, 0)?;
+        Ok(composer.finish(root))
     }
 
     fn absorb_demanded_nat(
@@ -1263,6 +1719,19 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// `is_def_eq` in `to_cnstr_when_K`. Arenas are acyclic with
     /// backward-only references, so the walk terminates.
     fn structural_cursors_equal(&mut self, left: &Cursor, right: &Cursor) -> Result<bool, Halt> {
+        // The walk reads bound indices as written, so it compares closed terms.
+        if !left.env.is_empty() || !right.env.is_empty() {
+            let mut closed = [left, right].map(|cursor| (cursor.env.is_empty(), cursor.clone()));
+            for (is_closed, cursor) in &mut closed {
+                if !*is_closed {
+                    let term = self.close(cursor, WhnfPhase::Iota)?;
+                    let root = term.root();
+                    *cursor = Cursor::closed(Arc::new(term), root);
+                }
+            }
+            let [(_, left), (_, right)] = closed;
+            return self.structural_cursors_equal(&left, &right);
+        }
         let mut pending = vec![(left.root, right.root)];
         let mut seen = BTreeSet::new();
         while let Some((left_id, right_id)) = pending.pop() {
@@ -1546,16 +2015,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     for (l, r) in [(*lf, *rf), (*la, *ra)] {
                         Self::validate_child(left.root, l)?;
                         Self::validate_child(right.root, r)?;
-                        pending.push((
-                            Cursor {
-                                arena: left.arena.clone(),
-                                root: l,
-                            },
-                            Cursor {
-                                arena: right.arena.clone(),
-                                root: r,
-                            },
-                        ));
+                        pending.push((left.child(l), right.child(r)));
                     }
                 }
                 _ => return Ok(false),
@@ -1648,8 +2108,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 )?;
                 continue;
             }
-            let replacement =
-                self.materialize_wire(&replacement.arena, replacement.root, WhnfPhase::Iota)?;
+            let replacement = if replacement.env.is_empty() {
+                self.materialize_wire(&replacement.arena, replacement.root, WhnfPhase::Iota)?
+            } else {
+                self.close(replacement, WhnfPhase::Iota)?
+            };
             // `needed` originated in a u32, and position is strictly below it.
             let amount = u32::try_from(needed - position - 1).unwrap_or(u32::MAX);
             let replacement = self.control.term_halt(
@@ -1755,10 +2218,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(None);
         };
         let domain = Arc::new(domain);
-        let domain_cursor = Cursor {
-            root: domain.root(),
-            arena: Arc::clone(&domain),
-        };
+        let domain_cursor = Cursor::closed(Arc::clone(&domain), domain.root());
         let (domain_head, domain_args) = self.peel_application(&domain_cursor)?;
         let (inductive_name, inductive_levels) = match self.node(&domain_head)? {
             ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
@@ -1829,10 +2289,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
         else {
             return Ok(None);
         };
-        let result_cursor = Cursor {
-            root: constructor_result.root(),
-            arena: Arc::new(constructor_result),
-        };
+        let result_root = constructor_result.root();
+        let result_cursor = Cursor::closed(Arc::new(constructor_result), result_root);
         // The pin's gate: the constructed constructor's type must be defeq to
         // the major's type. Here: the reconstructed result type must match
         // the spine-derived domain by a sufficient checker-owned conversion,
@@ -1878,11 +2336,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 index,
             )?;
         }
-        let term = composer.finish(root);
-        Ok(Some(Cursor {
-            root: term.root(),
-            arena: Arc::new(term),
-        }))
+        Ok(Some(composer.finish_cursor(root)))
     }
 
     /// KR-316 structure-eta coercion (`to_cnstr_when_structure`): a major of a
@@ -1953,10 +2407,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(None);
         };
         let domain = Arc::new(domain);
-        let domain_cursor = Cursor {
-            root: domain.root(),
-            arena: Arc::clone(&domain),
-        };
+        let domain_cursor = Cursor::closed(Arc::clone(&domain), domain.root());
         let (domain_head, domain_args) = self.peel_application(&domain_cursor)?;
         let (inductive_name, inductive_levels) = match self.node(&domain_head)? {
             ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
@@ -2059,11 +2510,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 )?;
             }
         }
-        let term = composer.finish(root);
-        Ok(Some(Cursor {
-            root: term.root(),
-            arena: Arc::new(term),
-        }))
+        Ok(Some(composer.finish_cursor(root)))
     }
 
     /// Expose one layer of an admitted Nat constructor for a literal major.
@@ -2182,10 +2629,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let term = composer.finish(root);
         Ok(Some((
             succ,
-            VecDeque::from([Cursor {
-                root,
-                arena: Arc::new(term),
-            }]),
+            VecDeque::from([Cursor::closed(Arc::new(term), root)]),
         )))
     }
 
@@ -2209,19 +2653,22 @@ impl<'a, 'c> Reducer<'a, 'c> {
         levels: &[LevelId],
         arguments: &VecDeque<Cursor>,
         major_index: usize,
-        major: &Cursor,
+        major: &Spine,
         prefix: usize,
-    ) -> Result<Option<Cursor>, Halt> {
-        let (constructor_name, major_args) =
-            if let Some(parts) = self.nat_literal_constructor(metadata, major)? {
-                parts
-            } else {
-                let (major_head, major_args) = self.peel_application(major)?;
-                let ExprNode::Constant { name, .. } = self.node(&major_head)? else {
-                    return Ok(None);
-                };
-                (name.clone(), major_args)
+    ) -> Result<Option<Spine>, Halt> {
+        let literal = if major.args.is_empty() {
+            self.nat_literal_constructor(metadata, &major.head)?
+        } else {
+            None
+        };
+        let (constructor_name, major_args) = if let Some(parts) = literal {
+            parts
+        } else {
+            let ExprNode::Constant { name, .. } = self.node(&major.head)? else {
+                return Ok(None);
             };
+            (name.clone(), major.args.clone())
+        };
         let Some(rule) = metadata
             .rules()
             .iter()
@@ -2237,85 +2684,49 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(None);
         }
         self.control.reduction(head.root.index(), self.cancelled)?;
-        let instantiated_rhs = match instantiate_term_parameters_from_level_roots_with(
-            rule.rhs(),
+        // The environment's own rule, whose address is stable for the run, so
+        // its instantiation is shared (`Reducer::instantiated`). `metadata` may
+        // be a frame's copy of it.
+        let source = self.context.source;
+        let stable = match self.node(head)? {
+            ExprNode::Constant { name, .. } => source
+                .constants()
+                .find(name)
+                .and_then(|entry| entry.recursor_metadata())
+                .and_then(|metadata| {
+                    metadata
+                        .rules()
+                        .iter()
+                        .find(|stable| stable.constructor() == &constructor_name)
+                })
+                .map(|stable| stable.rhs()),
+            _ => None,
+        };
+        let instantiated_rhs = self.instantiated(
+            stable.unwrap_or(rule.rhs()),
             level_parameters,
-            head.arena.levels(),
+            &head.arena,
             levels,
-            self.control.budget.materialization,
-            &mut *self.cancelled,
-        ) {
-            InstantiationOutcome::Complete(term) => term,
-            InstantiationOutcome::Refused(refusal) => {
-                return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
-                    at: head.root.index(),
-                    refusal,
-                }));
-            }
-            InstantiationOutcome::Inconclusive(stop) => {
-                return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
-                    at: head.root.index(),
-                    stop,
-                    completed_steps: self.control.steps,
-                    completed_reductions: self.control.reductions,
-                })));
-            }
-            InstantiationOutcome::InternalFault(fault) => {
-                return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
-                    at: head.root.index(),
-                    fault,
-                }));
-            }
-        };
-        let rhs = Cursor {
-            root: instantiated_rhs.root(),
-            arena: Arc::new(instantiated_rhs),
-        };
-        let mut composer = Composer::new(
-            self.control.budget.materialization,
-            WhnfPhase::Iota,
-            self.control.steps,
-            self.control.reductions,
-            &mut *self.cancelled,
-        );
-        let mut root = composer.copy_cursor(&rhs, 0)?;
-        for (index, argument) in arguments.iter().take(prefix).enumerate() {
-            let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
-            root = composer.push_expression(
-                ExprNode::Apply {
-                    function: root,
-                    argument,
-                },
-                1,
-                index,
-            )?;
+            head.root.index(),
+            stable.is_some(),
+        )?;
+        let rhs_root = instantiated_rhs.root();
+        // The rule's right-hand side is applied to the spine's parameters,
+        // motives and minors, the constructor's fields and the trailing
+        // arguments, as pending arguments of the reduction: nothing is copied.
+        let mut pending = VecDeque::new();
+        let spine_arguments = arguments
+            .iter()
+            .take(prefix)
+            .chain(major_args.iter().skip(major_args.len() - field_count))
+            .chain(arguments.iter().skip(major_index.saturating_add(1)));
+        for argument in spine_arguments {
+            self.control.step(argument.root.index(), self.cancelled)?;
+            pending.push_back(argument.clone());
         }
-        for field in major_args.iter().skip(major_args.len() - field_count) {
-            let field = composer.copy_cursor(field, 0)?;
-            root = composer.push_expression(
-                ExprNode::Apply {
-                    function: root,
-                    argument: field,
-                },
-                1,
-                0,
-            )?;
-        }
-        for extra in arguments.iter().skip(major_index.saturating_add(1)) {
-            let extra = composer.copy_cursor(extra, 0)?;
-            root = composer.push_expression(
-                ExprNode::Apply {
-                    function: root,
-                    argument: extra,
-                },
-                1,
-                0,
-            )?;
-        }
-        let term = composer.finish(root);
-        Ok(Some(Cursor {
-            root: term.root(),
-            arena: Arc::new(term),
+        Ok(Some(Spine {
+            head: Cursor::closed(instantiated_rhs, rhs_root),
+            args: pending,
         }))
     }
 
@@ -2382,6 +2793,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .saturating_add(usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX))
             .saturating_add(usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX));
 
+        let (major_head, major_args) = self.peel_application(&major)?;
+        let major_spine = Spine {
+            head: major_head,
+            args: major_args,
+        };
         if let Some(reduced) = self.apply_recursor_rule(
             &metadata,
             &level_parameters,
@@ -2389,7 +2805,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             &levels,
             arguments,
             major_index,
-            &major,
+            &major_spine,
             prefix,
         )? {
             arguments.clear();
@@ -2420,30 +2836,173 @@ impl<'a, 'c> Reducer<'a, 'c> {
     }
 
     /// KR-313 natural literal acceleration in the WHNF loop (type_checker.cpp:689).
-    /// If the head constant is in the pinned Nat operation table and enough
-    /// pending arguments are present, evaluate the arithmetic or comparison
-    /// natively before attempting delta unfolding.
-    fn try_nat_reduction(
+    /// If the head constant is in the pinned Nat operation table, enough
+    /// pending arguments are present and the scope admits the form, its
+    /// operands are normalized in this loop (`NatFrame`) before any delta
+    /// unfolding; the first operand to normalize is returned. Every operation is
+    /// offered, as the pin's `whnf` offers it to `reduce_nat`; `self.head_nat`
+    /// decides which open forms may be. Declined, an operation unfolds into its
+    /// definition's recursion.
+    fn begin_nat(
         &mut self,
         current: &Cursor,
         pending_arguments: &mut VecDeque<Cursor>,
+        frames: &mut Vec<ReductionFrame>,
     ) -> Result<Option<Cursor>, Halt> {
         let (name, levels) = match self.node(current)? {
-            ExprNode::Constant { name, levels } => (name.clone(), levels),
+            ExprNode::Constant { name, levels } => (name, levels),
             _ => return Ok(None),
         };
         if !levels.is_empty() {
             return Ok(None);
         }
-        let Some(operation) = crate::nat_reduce::operation_for_name(&name) else {
+        let Some(operation) = crate::nat_reduce::operation_for_name(name) else {
             return Ok(None);
         };
         let arity = usize::from(operation.arity());
         if pending_arguments.len() < arity {
             return Ok(None);
         }
-        let app = self.compose_application(current, pending_arguments.iter().take(arity))?;
-        let at = app.root.index();
+        if !self.nat_form_closed(current, pending_arguments, arity)? {
+            self.has_auxiliary_work = true;
+            return Ok(None);
+        }
+        let arguments = std::mem::take(pending_arguments);
+        let first = arguments[0].clone();
+        frames.push(ReductionFrame::Nat(Box::new(NatFrame {
+            operation,
+            head: current.clone(),
+            arguments,
+            values: Vec::new(),
+            delta_mode: self.delta_mode,
+            unfolded_bindings: self.unfolded_bindings.clone(),
+            force_string_delta: self.force_string_delta,
+        })));
+        self.delta_mode = DeltaMode::Eager;
+        self.force_string_delta = false;
+        Ok(Some(first))
+    }
+
+    /// Whether the operation with its first `arity` arguments may be reduced in
+    /// `self.head_nat`'s scope: no loose bound variable, and no free variable,
+    /// or for `WhnfHead` only free variables let-bound to closed values
+    /// (nat_reduce's `is_closed_in`). Each subterm is checked once, from cached
+    /// per-arena facts, through the environment values it refers to.
+    fn nat_form_closed(
+        &mut self,
+        head: &Cursor,
+        arguments: &VecDeque<Cursor>,
+        arity: usize,
+    ) -> Result<bool, Halt> {
+        let lets_allowed = match self.head_nat {
+            NatReductionScope::EagerOpenPair => return Ok(true),
+            NatReductionScope::WhnfHead => true,
+            NatReductionScope::ClosedPair | NatReductionScope::DemandedMajor => false,
+        };
+        let mut pending: Vec<Cursor> = std::iter::once(head.clone())
+            .chain(arguments.iter().take(arity).cloned())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        // Environments stay alive while their identities key `seen`.
+        let mut held = Vec::new();
+        while let Some(cursor) = pending.pop() {
+            let key = (
+                Arc::as_ptr(&cursor.arena).addr(),
+                cursor.root.index(),
+                cursor.env.identity(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            self.control.step(cursor.root.index(), self.cancelled)?;
+            let (loose, mask, free) = self.fact(&cursor.arena, cursor.root)?;
+            if loose > cursor.env.len() {
+                return Ok(false);
+            }
+            if free && !(lets_allowed && self.frees_let_bound_closed(&cursor)?) {
+                return Ok(false);
+            }
+            for slot in 0..loose {
+                if slot < 64 && mask & (1 << slot) == 0 {
+                    continue;
+                }
+                if let Some(value) = cursor.env.get(slot) {
+                    pending.push(value.clone());
+                }
+            }
+            held.push(cursor);
+        }
+        Ok(true)
+    }
+
+    /// Whether every free variable of a cursor's own arena subterm is let-bound
+    /// in the context to a closed value. Each binding is followed once.
+    fn frees_let_bound_closed(&mut self, cursor: &Cursor) -> Result<bool, Halt> {
+        let mut followed = BTreeSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![(Arc::clone(&cursor.arena), cursor.root)];
+        while let Some((arena, root)) = pending.pop() {
+            if !self.fact(&arena, root)?.2 {
+                continue;
+            }
+            if !seen.insert((Arc::as_ptr(&arena).addr(), root.index())) {
+                continue;
+            }
+            self.control.step(root.index(), self.cancelled)?;
+            let node = arena
+                .node(root)
+                .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                    input: 0,
+                    index: root.index(),
+                }))?;
+            if let ExprNode::Free { name } = node {
+                let Some(&binding) = self.context.free_bindings.get(name) else {
+                    return Ok(false);
+                };
+                if followed.insert(binding) {
+                    let value = self
+                        .context
+                        .source
+                        .free_bindings
+                        .get(binding)
+                        .map(|binding| Arc::clone(&binding.value))
+                        .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                            input: 0,
+                            index: binding,
+                        }))?;
+                    let value_root = value.root();
+                    if self.fact(&value, value_root)?.0 != 0 {
+                        return Ok(false);
+                    }
+                    pending.push((value, value_root));
+                }
+                continue;
+            }
+            for (child, _) in expression_children(node).into_iter().flatten() {
+                pending.push((Arc::clone(&arena), child));
+            }
+        }
+        Ok(true)
+    }
+
+    /// The loose range, loose mask and free-variable flag of `root` in `arena`.
+    fn fact(&mut self, arena: &Arc<WireExpr>, root: ExprId) -> Result<(u32, u64, bool), Halt> {
+        // A pure cache that keeps its arenas alive: bounded, so a long run does
+        // not retain every arena it ever checked.
+        if self.facts.len() >= 4096 && !self.facts.contains_key(&Arc::as_ptr(arena).addr()) {
+            self.facts.clear();
+        }
+        let facts = self
+            .facts
+            .entry(Arc::as_ptr(arena).addr())
+            .or_insert_with(|| ArenaFacts::new(Arc::clone(arena)));
+        facts.at(root, &mut self.control, &mut *self.cancelled)
+    }
+
+    /// Compute a Nat frame's operation on its natural operands: the result, or
+    /// `None` when the operation declines (`Nat.pow` above the pin's cap).
+    fn execute_nat(&mut self, frame: &NatFrame) -> Result<Option<Cursor>, Halt> {
+        let at = frame.head.root.index();
         let steps = self
             .control
             .budget
@@ -2466,36 +3025,20 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 .with_string(self.remaining_string_budget()),
             NatBudget::new(steps, materialization.max_output_units),
         );
-        // Every operation is offered here, as the pin's `whnf` offers it to
-        // `reduce_nat`; `NatReductionScope::WhnfHead` decides which open
-        // operands may be normalized. Declined, a binary operation would
-        // unfold into its definition's recursion.
-        let result = reduce_nat_at_with(
-            NatReductionQuery::new(
-                &app.arena,
-                app.root,
-                &app.arena,
-                app.root,
-                self.context.source,
-            ),
+        let result = crate::nat_reduce::execute_operation(
+            frame.operation,
+            &frame.values,
             budget,
-            self.head_nat,
             &mut *self.cancelled,
         );
         match result {
             NatReductionOutcome::Reduced(result) => {
                 self.absorb_demanded_nat(result.progress, at)?;
                 self.control.reduction(at, self.cancelled)?;
-                for _ in 0..arity {
-                    pending_arguments.pop_front();
-                }
-                Ok(Some(Cursor {
-                    root: result.term.root(),
-                    arena: Arc::new(result.term),
-                }))
+                let root = result.term.root();
+                Ok(Some(Cursor::closed(Arc::new(result.term), root)))
             }
             NatReductionOutcome::NotReduced { progress, .. } => {
-                self.has_auxiliary_work = true;
                 self.absorb_demanded_nat(progress, at)?;
                 Ok(None)
             }
@@ -2596,21 +3139,57 @@ impl<'a, 'c> Reducer<'a, 'c> {
 
         'normalize: loop {
             self.control.step(current.root.index(), self.cancelled)?;
+            // A shared cursor evaluated eagerly before resumes from its result;
+            // evaluated now, its result is recorded (`ReductionFrame::Update`).
+            // Other modes stop short of a weak head normal form, so they
+            // neither read nor record one. An eager run unfolds whether or not
+            // a String expansion forced it, so a recorded result also discharges
+            // that force. Only a term with no pending arguments is evaluated
+            // on its own: a function position is reduced within its
+            // application, as the pin's `whnf_core` reduces a head without
+            // delta. Evaluated alone, `Nat.mod` unfolds to its recursion, and
+            // `Nat.mod a b` then never reaches the arithmetic its application
+            // is offered.
+            if let Some(thunk) = current.thunk.take()
+                && matches!(self.delta_mode, DeltaMode::Eager)
+                && pending_arguments.is_empty()
+            {
+                // Another term of the same key may already have been evaluated.
+                let keyed = match thunk.result.get() {
+                    Some(_) => None,
+                    None => self
+                        .keyed_thunk(&current, &thunk)?
+                        .filter(|keyed| !Arc::ptr_eq(keyed, &thunk)),
+                };
+                let evaluated = thunk
+                    .result
+                    .get()
+                    .or_else(|| keyed.as_ref().and_then(|keyed| keyed.result.get()))
+                    .cloned();
+                if let Some(value) = evaluated {
+                    let _ = thunk.result.set(value.clone());
+                    self.force_string_delta = false;
+                    let mut arguments = value.args;
+                    arguments.append(&mut pending_arguments);
+                    pending_arguments = arguments;
+                    current = value.head;
+                    continue;
+                }
+                frames.push(ReductionFrame::Update { thunk, keyed });
+            }
             match self.head_action(&current)? {
                 HeadAction::Metadata(expression) => {
                     self.control
                         .reduction(current.root.index(), self.cancelled)?;
-                    current.root = expression;
+                    current = current.child(expression);
                     continue;
                 }
                 HeadAction::Let { value, body } => {
                     self.control
                         .reduction(current.root.index(), self.cancelled)?;
-                    let replacement = Cursor {
-                        arena: Arc::clone(&current.arena),
-                        root: value,
-                    };
-                    current = self.substitute(&current, body, &replacement, WhnfPhase::Zeta)?;
+                    self.control.step(body.index(), self.cancelled)?;
+                    let env = current.env.push(current.child(value).shared());
+                    current = Cursor::resolved(Arc::clone(&current.arena), body, env);
                     continue;
                 }
                 HeadAction::Free(Some(binding)) => {
@@ -2639,10 +3218,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     let term = self
                         .control
                         .term_halt(WhnfPhase::FreeBinding { index: binding }, result)?;
-                    current = Cursor {
-                        root: term.root(),
-                        arena: Arc::new(term),
-                    };
+                    let root = term.root();
+                    current = Cursor::closed(Arc::new(term), root);
                     continue;
                 }
                 HeadAction::Constant => {
@@ -2654,14 +3231,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             DeltaMode::Once => self.delta_reductions == 0,
                         };
                     if matches!(self.delta_mode, DeltaMode::Eager)
-                        && let Some(reduced) =
-                            self.try_nat_reduction(&current, &mut pending_arguments)?
+                        && !std::mem::take(&mut self.skip_nat)
+                        && let Some(first) =
+                            self.begin_nat(&current, &mut pending_arguments, &mut frames)?
                     {
-                        if forced {
-                            self.force_string_delta = false;
-                        }
-                        self.delta_reductions = self.delta_reductions.saturating_add(1);
-                        current = reduced;
+                        current = first;
                         continue;
                     }
                     if may_unfold && let Some(unfolded) = self.unfold_definition(&current)? {
@@ -2697,7 +3271,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     {
                         match step {
                             RecursorStep::Reduced(reduced) => {
-                                current = reduced;
+                                current = reduced.head;
+                                pending_arguments = reduced.args;
                                 continue;
                             }
                             RecursorStep::NormalizeMajor { frame, major } => {
@@ -2722,10 +3297,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         projection: current.clone(),
                         outer_arguments: std::mem::take(&mut pending_arguments),
                     }));
-                    current = Cursor {
-                        arena: Arc::clone(&current.arena),
-                        root: expression,
-                    };
+                    current = current.child(expression).shared();
                     continue;
                 }
                 HeadAction::Stuck => {
@@ -2765,51 +3337,169 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             break;
                         }
                     };
-                    current = self.substitute(&current, body, &argument, WhnfPhase::Beta)?;
+                    Self::validate_child(current.root, body)?;
+                    self.control.step(body.index(), self.cancelled)?;
+                    let env = current.env.push(argument);
+                    current = Cursor::resolved(Arc::clone(&current.arena), body, env);
                 }
                 continue 'normalize;
             }
 
-            if !pending_arguments.is_empty() {
-                current = self.compose_application(&current, &pending_arguments)?;
-                pending_arguments.clear();
+            // `current` applied to the pending arguments is stuck. It stays a
+            // spine for the frame that demanded it; only a term that cannot be
+            // taken apart is built.
+            let stuck = Spine {
+                head: current,
+                args: std::mem::take(&mut pending_arguments),
+            };
+            match self.resume(stuck, &mut frames)? {
+                Resumed::Continue(next) => {
+                    current = next.head;
+                    pending_arguments = next.args;
+                }
+                Resumed::Stuck(stuck) => return self.finish(stuck),
             }
+        }
+    }
 
-            while let Some(frame) = frames.pop() {
-                let frame = match frame {
-                    ReductionFrame::Projection(frame) => frame,
-                    ReductionFrame::Quotient(mut frame) => {
-                        self.delta_mode = frame.delta_mode;
-                        self.unfolded_bindings = frame.unfolded_bindings;
-                        self.force_string_delta = frame.force_string_delta;
-                        if let Some(representative) =
-                            self.quotient_representative(&frame.head, &current)?
-                        {
-                            self.control
-                                .reduction(frame.head.root.index(), self.cancelled)?;
-                            let function = frame.arguments[3].clone();
-                            pending_arguments = frame.arguments.split_off(frame.major + 1);
-                            pending_arguments.push_front(representative);
-                            current = function;
-                            continue 'normalize;
-                        }
-                        // Preserve progress within a blocked major, but do not
-                        // re-enter the same unchanged eliminator in a loop.
-                        frame.arguments[frame.major] = current;
-                        current = self.compose_application(&frame.head, &frame.arguments)?;
-                        continue;
+    /// Hand a stuck term to the frames that demanded it, innermost first. A
+    /// frame that reduces continues normalization; otherwise the term is stuck
+    /// for good. Out of line, as `normalize` is, to keep that loop's frame small.
+    #[inline(never)]
+    fn resume(
+        &mut self,
+        mut stuck: Spine,
+        frames: &mut Vec<ReductionFrame>,
+    ) -> Result<Resumed, Halt> {
+        while let Some(frame) = frames.pop() {
+            let frame = match frame {
+                ReductionFrame::Update { thunk, keyed } => {
+                    let _ = thunk.result.set(stuck.clone());
+                    if let Some(keyed) = keyed {
+                        let _ = keyed.result.set(stuck.clone());
                     }
-                    ReductionFrame::Recursor(mut frame) => {
-                        self.delta_mode = frame.delta_mode;
-                        self.unfolded_bindings = frame.unfolded_bindings;
-                        self.force_string_delta = frame.force_string_delta;
+                    continue;
+                }
+                ReductionFrame::Nat(mut frame) => {
+                    self.delta_mode = frame.delta_mode;
+                    self.unfolded_bindings = frame.unfolded_bindings.clone();
+                    self.force_string_delta = frame.force_string_delta;
+                    let value = if stuck.args.is_empty() {
+                        crate::nat_reduce::natural_of(self.node(&stuck.head)?).map_err(|()| {
+                            Halt::Fault(WhnfFault::NonCanonicalNatLiteral {
+                                at: stuck.head.root.index(),
+                            })
+                        })?
+                    } else {
+                        None
+                    };
+                    if let Some(value) = value {
+                        frame.values.push(value);
+                        let arity = usize::from(frame.operation.arity());
+                        if frame.values.len() < arity {
+                            let next = frame.arguments[frame.values.len()].clone();
+                            self.delta_mode = DeltaMode::Eager;
+                            self.force_string_delta = false;
+                            frames.push(ReductionFrame::Nat(frame));
+                            return Ok(Resumed::Continue(Spine {
+                                head: next,
+                                args: VecDeque::new(),
+                            }));
+                        }
+                        if let Some(result) = self.execute_nat(&frame)? {
+                            self.force_string_delta = false;
+                            self.delta_reductions = self.delta_reductions.saturating_add(1);
+                            let args = frame.arguments.split_off(arity);
+                            return Ok(Resumed::Continue(Spine { head: result, args }));
+                        }
+                    }
+                    // Declined, as when the pin's `reduce_nat` returns none:
+                    // the operation unfolds, on the arguments it was given.
+                    self.skip_nat = true;
+                    self.has_auxiliary_work = true;
+                    return Ok(Resumed::Continue(Spine {
+                        head: frame.head,
+                        args: frame.arguments,
+                    }));
+                }
+                ReductionFrame::Projection(frame) => frame,
+                ReductionFrame::Quotient(mut frame) => {
+                    self.delta_mode = frame.delta_mode;
+                    self.unfolded_bindings = frame.unfolded_bindings;
+                    self.force_string_delta = frame.force_string_delta;
+                    let major = self.build_spine(stuck)?;
+                    if let Some(representative) =
+                        self.quotient_representative(&frame.head, &major)?
+                    {
+                        self.control
+                            .reduction(frame.head.root.index(), self.cancelled)?;
+                        let function = frame.arguments[3].clone();
+                        let mut args = frame.arguments.split_off(frame.major + 1);
+                        args.push_front(representative);
+                        return Ok(Resumed::Continue(Spine {
+                            head: function,
+                            args,
+                        }));
+                    }
+                    // Preserve progress within a blocked major, but do not
+                    // re-enter the same unchanged eliminator in a loop.
+                    frame.arguments[frame.major] = major;
+                    stuck = Spine {
+                        head: frame.head,
+                        args: frame.arguments,
+                    };
+                    continue;
+                }
+                ReductionFrame::Recursor(mut frame) => {
+                    self.delta_mode = frame.delta_mode;
+                    self.unfolded_bindings = frame.unfolded_bindings;
+                    self.force_string_delta = frame.force_string_delta;
 
-                        let reduced_major = self.reduce_demanded_nat_cursor(&current)?;
-                        let original_major = std::mem::replace(
-                            &mut frame.arguments[frame.major_index],
-                            reduced_major.clone(),
-                        );
+                    let reduced_major = self.reduce_demanded_nat_spine(stuck)?;
+                    if let Some(reduced) = self.apply_recursor_rule(
+                        &frame.metadata,
+                        &frame.level_parameters,
+                        &frame.head,
+                        &frame.levels,
+                        &frame.arguments,
+                        frame.major_index,
+                        &reduced_major,
+                        frame.prefix,
+                    )? {
+                        return Ok(Resumed::Continue(reduced));
+                    }
+                    // The K and structure-eta conversions read the major as
+                    // one term, from the spine.
+                    let reduced_major = self.build_spine(reduced_major)?;
+                    let original_major =
+                        std::mem::replace(&mut frame.arguments[frame.major_index], reduced_major);
 
+                    let mut alt_major = None;
+                    if frame.metadata.k() {
+                        if let Some(replacement) = self.recursor_major_to_nullary_constructor(
+                            &frame.level_parameters,
+                            &frame.recursor_type,
+                            &frame.head,
+                            &frame.levels,
+                            &frame.arguments,
+                            frame.major_index,
+                            frame.parameter_count,
+                        )? {
+                            alt_major = Some(replacement);
+                        }
+                    } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
+                        &frame.level_parameters,
+                        &frame.recursor_type,
+                        &frame.head,
+                        &frame.levels,
+                        &frame.arguments,
+                        frame.major_index,
+                    )? {
+                        alt_major = Some(replacement);
+                    }
+
+                    if let Some(alt_major) = alt_major {
+                        let (head, args) = self.peel_application(&alt_major)?;
                         if let Some(reduced) = self.apply_recursor_rule(
                             &frame.metadata,
                             &frame.level_parameters,
@@ -2817,112 +3507,90 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             &frame.levels,
                             &frame.arguments,
                             frame.major_index,
-                            &reduced_major,
+                            &Spine { head, args },
                             frame.prefix,
                         )? {
-                            current = reduced;
-                            continue 'normalize;
+                            return Ok(Resumed::Continue(reduced));
                         }
-
-                        let mut alt_major = None;
-                        if frame.metadata.k() {
-                            if let Some(replacement) = self.recursor_major_to_nullary_constructor(
-                                &frame.level_parameters,
-                                &frame.recursor_type,
-                                &frame.head,
-                                &frame.levels,
-                                &frame.arguments,
-                                frame.major_index,
-                                frame.parameter_count,
-                            )? {
-                                alt_major = Some(replacement);
-                            }
-                        } else if let Some(replacement) = self
-                            .recursor_major_to_structure_constructor(
-                                &frame.level_parameters,
-                                &frame.recursor_type,
-                                &frame.head,
-                                &frame.levels,
-                                &frame.arguments,
-                                frame.major_index,
-                            )?
-                        {
-                            alt_major = Some(replacement);
-                        }
-
-                        if let Some(alt_major) = alt_major
-                            && let Some(reduced) = self.apply_recursor_rule(
-                                &frame.metadata,
-                                &frame.level_parameters,
-                                &frame.head,
-                                &frame.levels,
-                                &frame.arguments,
-                                frame.major_index,
-                                &alt_major,
-                                frame.prefix,
-                            )?
-                        {
-                            current = reduced;
-                            continue 'normalize;
-                        }
-
-                        // No rule fires: the application is stuck, and it is
-                        // returned with the major it had, as the pin's
-                        // `whnf_core` returns `e` when `reduce_recursor`
-                        // fails. The normalized major is not kept in the
-                        // result: it can be far larger than the major it came
-                        // from (`Int32.toBitVec_div` grew 179 nodes into
-                        // 74,901 in one whnf), and every later comparison paid
-                        // for it. Work that needs the major normalizes it
-                        // again, as at the pin. The reductions spent on the
-                        // major changed nothing in the result, so they are not
-                        // reported as progress (the budget still counts them):
-                        // callers read a nonzero count as change, and would
-                        // resubmit the same term forever.
-                        frame.arguments[frame.major_index] = original_major;
-                        let mark = frame.progress;
-                        self.discarded_reductions = mark.discarded_reductions.saturating_add(
-                            self.control.reductions.saturating_sub(mark.reductions),
-                        );
-                        self.discarded_delta_reductions =
-                            mark.discarded_delta_reductions.saturating_add(
-                                self.delta_reductions.saturating_sub(mark.delta_reductions),
-                            );
-                        current = self.compose_application(&frame.head, &frame.arguments)?;
-                        continue;
                     }
-                };
-                if let Some(field) = self.projection_field(&frame, &current)? {
-                    self.control
-                        .reduction(frame.projection.root.index(), self.cancelled)?;
-                    current = field;
-                    pending_arguments = frame.outer_arguments;
-                    continue 'normalize;
-                }
-                current = self.compose_projection(&frame.projection, &current)?;
-                pending_arguments = frame.outer_arguments;
-                if !pending_arguments.is_empty() {
-                    current = self.compose_application(&current, &pending_arguments)?;
-                    pending_arguments.clear();
-                }
-            }
 
-            let term = self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?;
-            return Ok(WhnfResult {
-                term,
-                steps: self.control.steps,
-                reductions: self
-                    .control
-                    .reductions
-                    .saturating_sub(self.discarded_reductions),
-                delta_reductions: self
-                    .delta_reductions
-                    .saturating_sub(self.discarded_delta_reductions),
-                has_auxiliary_work: self.has_auxiliary_work,
-                string_progress: self.string_progress,
-            });
+                    // No rule fires: the application is stuck, and it is
+                    // returned with the major it had, as the pin's
+                    // `whnf_core` returns `e` when `reduce_recursor`
+                    // fails. The normalized major is not kept in the
+                    // result: it can be far larger than the major it came
+                    // from (`Int32.toBitVec_div` grew 179 nodes into
+                    // 74,901 in one whnf), and every later comparison paid
+                    // for it. Work that needs the major normalizes it
+                    // again, as at the pin. The reductions spent on the
+                    // major changed nothing in the result, so they are not
+                    // reported as progress (the budget still counts them):
+                    // callers read a nonzero count as change, and would
+                    // resubmit the same term forever.
+                    frame.arguments[frame.major_index] = original_major;
+                    let mark = frame.progress;
+                    self.discarded_reductions = mark
+                        .discarded_reductions
+                        .saturating_add(self.control.reductions.saturating_sub(mark.reductions));
+                    self.discarded_delta_reductions =
+                        mark.discarded_delta_reductions.saturating_add(
+                            self.delta_reductions.saturating_sub(mark.delta_reductions),
+                        );
+                    stuck = Spine {
+                        head: frame.head,
+                        args: frame.arguments,
+                    };
+                    continue;
+                }
+            };
+            if let Some(field) = self.projection_field(&frame, &stuck)? {
+                self.control
+                    .reduction(frame.projection.root.index(), self.cancelled)?;
+                return Ok(Resumed::Continue(Spine {
+                    head: field,
+                    args: frame.outer_arguments,
+                }));
+            }
+            let expression = self.build_spine(stuck)?;
+            stuck = Spine {
+                head: self.compose_projection(&frame.projection, &expression)?,
+                args: frame.outer_arguments,
+            };
         }
+        Ok(Resumed::Stuck(stuck))
     }
+
+    /// The weak head normal form, built as one arena.
+    #[inline(never)]
+    fn finish(&mut self, stuck: Spine) -> Result<WhnfResult, Halt> {
+        let current = self.build_spine(stuck)?;
+        let term = if current.env.is_empty() {
+            self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?
+        } else {
+            self.close(&current, WhnfPhase::Final)?
+        };
+        Ok(WhnfResult {
+            term,
+            steps: self.control.steps,
+            reductions: self
+                .control
+                .reductions
+                .saturating_sub(self.discarded_reductions),
+            delta_reductions: self
+                .delta_reductions
+                .saturating_sub(self.discarded_delta_reductions),
+            has_auxiliary_work: self.has_auxiliary_work,
+            string_progress: self.string_progress,
+        })
+    }
+}
+
+/// What the frames make of a stuck term.
+enum Resumed {
+    /// A frame reduced: normalize this next.
+    Continue(Spine),
+    /// Every frame is done and the term is stuck.
+    Stuck(Spine),
 }
 
 enum ComposeHalt {
@@ -3016,6 +3684,12 @@ struct Composer<'c> {
     levels: Vec<LevelNode>,
     expressions: Vec<ExprNode>,
     sources: Vec<SourceCopy>,
+    /// `sources` by arena address.
+    source_lookup: std::collections::HashMap<usize, usize>,
+    /// Environment copies, shared by every cursor this composer copies: one
+    /// closure reached from two arguments is copied once.
+    open_contexts: OpenContexts,
+    open_memo: std::collections::HashMap<OpenKey, ExprId>,
     shared_levels: sharing::Interned,
     shared_expressions: sharing::Interned,
 }
@@ -3024,6 +3698,80 @@ struct SourceCopy {
     arena: Arc<WireExpr>,
     levels: Vec<Option<LevelId>>,
     expressions: Vec<Option<ExprId>>,
+    /// Loose bound-variable range of each node reached by an environment copy:
+    /// a node below that many binders is closed there, so its copy is the plain
+    /// one whatever the environment.
+    loose: std::collections::HashMap<usize, u32>,
+}
+
+/// One node of an environment copy: `node` of `context`'s arena, at `depth`
+/// binders inside the copied term, which sits under `shift` further binders.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct OpenKey {
+    context: usize,
+    node: usize,
+    depth: u32,
+    shift: u32,
+}
+
+enum OpenWork {
+    Visit(OpenKey),
+    Build(OpenKey),
+    /// `key` is a bound variable whose value's copy is `value`.
+    Alias {
+        key: OpenKey,
+        value: OpenKey,
+    },
+}
+
+/// The (source, environment) pairs an environment copy has met. Each entry
+/// holds its environment, so an environment's identity stays unique while the
+/// copy runs.
+#[derive(Default)]
+struct OpenContexts {
+    list: Vec<(usize, Env)>,
+    lookup: std::collections::HashMap<(usize, usize), usize>,
+}
+
+impl OpenContexts {
+    fn of(&mut self, source: usize, env: &Env) -> usize {
+        let list = &mut self.list;
+        *self
+            .lookup
+            .entry((source, env.identity()))
+            .or_insert_with(|| {
+                list.push((source, env.clone()));
+                list.len() - 1
+            })
+    }
+}
+
+/// The children of a node, each with the binders it sits under.
+fn expression_children(node: &ExprNode) -> [Option<(ExprId, u32)>; 3] {
+    match node {
+        ExprNode::Apply { function, argument } => {
+            [Some((*function, 0)), Some((*argument, 0)), None]
+        }
+        ExprNode::Lambda {
+            binder_type, body, ..
+        }
+        | ExprNode::Forall {
+            binder_type, body, ..
+        } => [Some((*binder_type, 0)), Some((*body, 1)), None],
+        ExprNode::Let {
+            type_, value, body, ..
+        } => [Some((*type_, 0)), Some((*value, 0)), Some((*body, 1))],
+        ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+            [Some((*expression, 0)), None, None]
+        }
+        ExprNode::Bound { .. }
+        | ExprNode::Free { .. }
+        | ExprNode::Meta { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Constant { .. }
+        | ExprNode::NatLiteral { .. }
+        | ExprNode::StringLiteral(_) => [None, None, None],
+    }
 }
 
 impl<'c> Composer<'c> {
@@ -3042,6 +3790,9 @@ impl<'c> Composer<'c> {
             levels: Vec::new(),
             expressions: Vec::new(),
             sources: Vec::new(),
+            source_lookup: std::collections::HashMap::new(),
+            open_contexts: OpenContexts::default(),
+            open_memo: std::collections::HashMap::new(),
             shared_levels: sharing::Interned::default(),
             shared_expressions: sharing::Interned::default(),
         }
@@ -3173,20 +3924,297 @@ impl<'c> Composer<'c> {
     }
 
     fn source_index(&mut self, arena: &Arc<WireExpr>) -> usize {
-        if let Some(index) = self
-            .sources
-            .iter()
-            .position(|source| Arc::ptr_eq(&source.arena, arena))
-        {
-            return index;
+        // Every source is held in `sources`, so its address stays unique here.
+        let address = Arc::as_ptr(arena).addr();
+        if let Some(index) = self.source_lookup.get(&address) {
+            return *index;
         }
         let index = self.sources.len();
         self.sources.push(SourceCopy {
             arena: Arc::clone(arena),
             levels: vec![None; arena.levels().len()],
             expressions: vec![None; arena.nodes().len()],
+            loose: std::collections::HashMap::new(),
         });
+        self.source_lookup.insert(address, index);
         index
+    }
+
+    /// The loose bound-variable range of `root` in `source`: the least number
+    /// of binders under which it is closed.
+    fn loose_range(&mut self, source: usize, root: ExprId, input: usize) -> Result<u32, Halt> {
+        if let Some(range) = self.sources[source].loose.get(&root.index()) {
+            return Ok(*range);
+        }
+        let arena = Arc::clone(&self.sources[source].arena);
+        let mut work = vec![(root, false)];
+        while let Some((id, built)) = work.pop() {
+            let index = id.index();
+            if self.sources[source].loose.contains_key(&index) {
+                continue;
+            }
+            let node = arena
+                .node(id)
+                .ok_or(Halt::Fault(WhnfFault::MissingExpression { input, index }))?;
+            let children = expression_children(node);
+            if !built {
+                self.control
+                    .step(index)
+                    .map_err(|halt| self.map_halt(halt))?;
+                work.push((id, true));
+                for (child, _) in children.into_iter().flatten() {
+                    if child.index() >= index {
+                        return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                            input,
+                            parent: index,
+                            child: child.index(),
+                        }));
+                    }
+                    work.push((child, false));
+                }
+                continue;
+            }
+            let loose = &self.sources[source].loose;
+            let mut range = match node {
+                ExprNode::Bound { index } => index.saturating_add(1),
+                _ => 0,
+            };
+            for (child, binders) in children.into_iter().flatten() {
+                let child_range = loose.get(&child.index()).copied().unwrap_or(0);
+                range = range.max(child_range.saturating_sub(binders));
+            }
+            self.sources[source].loose.insert(index, range);
+        }
+        Ok(self.sources[source]
+            .loose
+            .get(&root.index())
+            .copied()
+            .unwrap_or(0))
+    }
+
+    /// Copy a cursor's term with its environment substituted. A loose index
+    /// bound by the environment becomes a copy of its value, lifted over the
+    /// binders it now sits under; a loose index past the environment becomes
+    /// the run's own index, below the environment. Work is iterative: values
+    /// nest through their own environments as deeply as a computation ran.
+    fn copy_open(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
+        let mut contexts = std::mem::take(&mut self.open_contexts);
+        let mut memo = std::mem::take(&mut self.open_memo);
+        let copied = self.copy_open_with(cursor, input, &mut contexts, &mut memo);
+        self.open_contexts = contexts;
+        self.open_memo = memo;
+        copied
+    }
+
+    fn copy_open_with(
+        &mut self,
+        cursor: &Cursor,
+        input: usize,
+        contexts: &mut OpenContexts,
+        memo: &mut std::collections::HashMap<OpenKey, ExprId>,
+    ) -> Result<ExprId, Halt> {
+        let root = OpenKey {
+            context: contexts.of(self.source_index(&cursor.arena), &cursor.env),
+            node: cursor.root.index(),
+            depth: 0,
+            shift: 0,
+        };
+        let mut work = vec![OpenWork::Visit(root)];
+        while let Some(item) = work.pop() {
+            match item {
+                OpenWork::Visit(key) => {
+                    if memo.contains_key(&key) {
+                        continue;
+                    }
+                    let (source, env) = contexts.list[key.context].clone();
+                    let id = ExprId::from_index(key.node).ok_or(Halt::Fault(
+                        WhnfFault::MissingExpression {
+                            input,
+                            index: key.node,
+                        },
+                    ))?;
+                    if self.loose_range(source, id, input)? <= key.depth {
+                        // Closed where it sits: the plain copy, shared by every
+                        // environment and depth that reaches it.
+                        let arena = Arc::clone(&self.sources[source].arena);
+                        let copied = self.copy_plain(&Cursor::closed(arena, id), input)?;
+                        memo.insert(key, copied);
+                        continue;
+                    }
+                    self.control
+                        .step(key.node)
+                        .map_err(|halt| self.map_halt(halt))?;
+                    let arena = Arc::clone(&self.sources[source].arena);
+                    let node = arena
+                        .node(id)
+                        .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                            input,
+                            index: key.node,
+                        }))?;
+                    if let ExprNode::Bound { index } = node {
+                        // Not closed here, so the index reaches past `depth`.
+                        let outer = index.saturating_sub(key.depth);
+                        if let Some(value) = env.get(outer) {
+                            let value = OpenKey {
+                                context: contexts.of(self.source_index(&value.arena), &value.env),
+                                node: value.root.index(),
+                                depth: 0,
+                                shift: key.shift.saturating_add(key.depth),
+                            };
+                            work.push(OpenWork::Alias { key, value });
+                            work.push(OpenWork::Visit(value));
+                            continue;
+                        }
+                        let lowered = u64::from(outer) - u64::from(env.len())
+                            + u64::from(key.depth)
+                            + u64::from(key.shift);
+                        let index = u32::try_from(lowered).map_err(|_| {
+                            self.map_halt(ComposeHalt::Stop(TermStop::Resource {
+                                limit: TermLimit::BoundIndex,
+                                allowed: u64::from(u32::MAX),
+                                observed: lowered,
+                                at: key.node,
+                                completed_steps: self.control.steps,
+                            }))
+                        })?;
+                        self.control
+                            .output(1, key.node)
+                            .map_err(|halt| self.map_halt(halt))?;
+                        let copied = self
+                            .push_expression_charged(ExprNode::Bound { index }, key.node, None)
+                            .map_err(|halt| self.map_halt(halt))?;
+                        memo.insert(key, copied);
+                        continue;
+                    }
+                    work.push(OpenWork::Build(key));
+                    for (child, binders) in expression_children(node).into_iter().flatten() {
+                        if child.index() >= key.node {
+                            return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                                input,
+                                parent: key.node,
+                                child: child.index(),
+                            }));
+                        }
+                        work.push(OpenWork::Visit(OpenKey {
+                            node: child.index(),
+                            depth: key.depth.saturating_add(binders),
+                            ..key
+                        }));
+                    }
+                }
+                OpenWork::Alias { key, value } => {
+                    let copied =
+                        *memo
+                            .get(&value)
+                            .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                                input,
+                                index: value.node,
+                            }))?;
+                    memo.insert(key, copied);
+                }
+                OpenWork::Build(key) => {
+                    let source = contexts.list[key.context].0;
+                    let arena = Arc::clone(&self.sources[source].arena);
+                    let node = ExprId::from_index(key.node)
+                        .and_then(|id| arena.node(id))
+                        .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                            input,
+                            index: key.node,
+                        }))?;
+                    self.control
+                        .output(expression_owned_units(node), key.node)
+                        .map_err(|halt| self.map_halt(halt))?;
+                    let child = |child: &ExprId, binders: u32| -> Result<ExprId, Halt> {
+                        memo.get(&OpenKey {
+                            node: child.index(),
+                            depth: key.depth.saturating_add(binders),
+                            ..key
+                        })
+                        .copied()
+                        .ok_or(Halt::Fault(
+                            WhnfFault::MissingExpression {
+                                input,
+                                index: child.index(),
+                            },
+                        ))
+                    };
+                    let mapped = match node {
+                        ExprNode::Apply { function, argument } => ExprNode::Apply {
+                            function: child(function, 0)?,
+                            argument: child(argument, 0)?,
+                        },
+                        ExprNode::Lambda {
+                            binder_name,
+                            binder_type,
+                            body,
+                            style,
+                        } => ExprNode::Lambda {
+                            binder_name: binder_name.clone(),
+                            binder_type: child(binder_type, 0)?,
+                            body: child(body, 1)?,
+                            style: *style,
+                        },
+                        ExprNode::Forall {
+                            binder_name,
+                            binder_type,
+                            body,
+                            style,
+                        } => ExprNode::Forall {
+                            binder_name: binder_name.clone(),
+                            binder_type: child(binder_type, 0)?,
+                            body: child(body, 1)?,
+                            style: *style,
+                        },
+                        ExprNode::Let {
+                            declaration_name,
+                            type_,
+                            value,
+                            body,
+                            non_dependent,
+                        } => ExprNode::Let {
+                            declaration_name: declaration_name.clone(),
+                            type_: child(type_, 0)?,
+                            value: child(value, 0)?,
+                            body: child(body, 1)?,
+                            non_dependent: *non_dependent,
+                        },
+                        ExprNode::Metadata {
+                            entries,
+                            expression,
+                        } => ExprNode::Metadata {
+                            entries: entries.clone(),
+                            expression: child(expression, 0)?,
+                        },
+                        ExprNode::Projection {
+                            structure_name,
+                            index,
+                            expression,
+                        } => ExprNode::Projection {
+                            structure_name: structure_name.clone(),
+                            index: *index,
+                            expression: child(expression, 0)?,
+                        },
+                        // Leaves have no loose index, so they took the plain copy.
+                        _ => {
+                            return Err(Halt::Fault(WhnfFault::MissingExpression {
+                                input,
+                                index: key.node,
+                            }));
+                        }
+                    };
+                    let copied = self
+                        .push_expression_charged(mapped, key.node, None)
+                        .map_err(|halt| self.map_halt(halt))?;
+                    memo.insert(key, copied);
+                }
+            }
+        }
+        memo.get(&root)
+            .copied()
+            .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                input,
+                index: cursor.root.index(),
+            }))
     }
 
     fn copy_level_root(
@@ -3285,7 +4313,16 @@ impl<'c> Composer<'c> {
             }))
     }
 
+    /// Copy a cursor's term into this arena with its environment substituted.
     fn copy_cursor(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
+        if cursor.env.is_empty() {
+            return self.copy_plain(cursor, input);
+        }
+        self.copy_open(cursor, input)
+    }
+
+    /// Copy a subterm as written: loose indices stay as they are.
+    fn copy_plain(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
         let source_index = self.source_index(&cursor.arena);
         let source = Arc::clone(&self.sources[source_index].arena);
         let mut work = vec![(cursor.root, false)];
@@ -3467,6 +4504,12 @@ impl<'c> Composer<'c> {
 
     fn finish(self, root: ExprId) -> WireExpr {
         WireExpr::from_parts(self.expressions, self.levels, root)
+    }
+
+    fn finish_cursor(self, root: ExprId) -> Cursor {
+        let term = self.finish(root);
+        let root = term.root();
+        Cursor::closed(Arc::new(term), root)
     }
 }
 
@@ -3677,6 +4720,11 @@ fn whnf_at_mode_with(
         has_auxiliary_work: false,
         string_progress: StringExpansionProgress::default(),
         force_string_delta: false,
+        skip_nat: false,
+        facts: std::collections::HashMap::new(),
+        string_expansions: std::collections::HashMap::new(),
+        bodies: std::collections::HashMap::new(),
+        keyed_thunks: std::collections::HashMap::new(),
     };
     outcome(reducer.run(term, root))
 }
