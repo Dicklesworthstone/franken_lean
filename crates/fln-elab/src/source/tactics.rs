@@ -229,7 +229,15 @@ impl Context {
         syntax: &'a Syntax,
         expected: Option<Expr>,
     ) -> Result<ProofState<'a>, NatDefinitionElabError> {
-        let target = expected.ok_or_else(|| error(TacticError::ExpectedGoal))?;
+        let mut target = expected.ok_or_else(|| error(TacticError::ExpectedGoal))?;
+        // The pin runs a tactic block only after `synthesizeSyntheticMVars` has
+        // applied default instances, so `have h : 0 = 0 := by rfl` sees `(0 : Nat)`.
+        // This engine starts the block where it is visited, so default the
+        // pending instance goals first when the goal is still open.
+        if target.has_expr_mvar() {
+            self.resolve_instances_with_defaults()?;
+            target = self.instantiate(&target)?;
+        }
         let kind = if syntax.kind() == Some(&parser_kind(&["Term", "byTactic'"])) {
             parser_kind(&["Term", "byTactic'"])
         } else {
