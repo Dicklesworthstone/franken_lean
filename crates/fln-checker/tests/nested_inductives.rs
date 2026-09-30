@@ -3,6 +3,8 @@
 //! `elim_nested_inductive` and restoration produce; none is derived from the
 //! checker's own reconstruction.
 #![forbid(unsafe_code)]
+#[path = "support/safety.rs"]
+mod safety;
 use fln_checker::admit::{AdmissionBudget, InductiveRejection, InductiveVerdict, admit_inductive};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
@@ -772,6 +774,33 @@ fn joined<'a>(prefix: &[&'a Local], extra: &[&'a Local]) -> Vec<&'a Local> {
 
 fn admitted(verdict: &InductiveVerdict) -> bool {
     matches!(verdict, InductiveVerdict::Admitted(_))
+}
+
+#[test]
+fn an_unsafe_nested_family_is_admitted_with_auxiliary_families_of_its_safety() {
+    // The pin's `elim_nested_inductive` gives its auxiliary types the block's own
+    // `is_unsafe` (one `inductive_decl`). Aesop.Tree.Data's unsafe mutual block
+    // reaches its structures' fields this way.
+    for (env, rows) in [f1(""), f2(), f3()] {
+        let rows = safety::unsafe_rows(&rows);
+        let verdict = verdict(&env, &rows);
+        assert!(admitted(&verdict), "{verdict:?}");
+    }
+}
+
+#[test]
+fn a_nested_block_of_mixed_safety_is_rejected() {
+    let (env, rows) = f1("");
+    let rows = safety::unsafe_rows(&rows);
+    for i in 0..rows.len() {
+        let mut mixed = rows.clone();
+        mixed[i] = safety::retag(&mixed[i], ConstantSafety::Safe);
+        let result = verdict(&env, &mixed);
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "row {i}: {result:?}"
+        );
+    }
 }
 
 #[test]

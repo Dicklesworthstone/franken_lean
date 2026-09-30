@@ -8035,8 +8035,18 @@ pub fn admit_inductive_with(
         // Keep the original direct, parameter-free route and its resource
         // behavior; larger families use the same constructor-derived engine
         // as safe families, without the safe-only fixed-name seed routes.
+        // A nested family is judged, like a safe one, as the mutual block the
+        // pin elaborates; its auxiliary families carry the block's safety.
         if metadata.num_nested() != 0 {
-            return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+            return uniform::admit_nested(
+                environment,
+                declarations,
+                inductive,
+                budget,
+                environment_budget,
+                &mut comparison,
+                &mut cancelled,
+            );
         }
         if declaration.level_parameters().is_empty()
             && metadata.mutual() == std::slice::from_ref(name)

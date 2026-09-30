@@ -1300,10 +1300,13 @@ fn check(
                 ),
             )
         } else {
+            // An auxiliary family belongs to the block, as in the pin's
+            // `elim_nested_inductive`, whose one `inductive_decl` carries the
+            // block's `is_unsafe` for its auxiliary types too.
             ConstantDeclaration::inductive(
                 translator.levels.clone(),
                 draft.type_.clone(),
-                ConstantSafety::Safe,
+                translator.audit.safety,
                 InductiveDeclaration::new(
                     p as u32,
                     draft.indices,
@@ -1334,7 +1337,7 @@ fn check(
                     entry.declaration().level_parameters().to_vec(),
                     entry.declaration().safety(),
                 ),
-                None => (translator.levels.clone(), ConstantSafety::Safe),
+                None => (translator.levels.clone(), translator.audit.safety),
             };
             synthetic.push(ConstantEntry::new(
                 name,
