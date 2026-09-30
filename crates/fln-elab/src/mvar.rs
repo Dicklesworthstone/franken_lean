@@ -104,7 +104,24 @@ pub struct MetavarStore {
     assignments: HashMap<MVarId, MetavarAssignment>,
     /// Reverse edges from types, local contexts, assignment values and explicit reads.
     readers: HashMap<MVarId, HashSet<MVarId>>,
+    /// The next index the unifier may use for a fresh local (`_fln_unify_local.N`).
+    unify_locals: FreshLocalCounter,
 }
+
+/// A name generator, like the pin's `ngen`: it only ever advances, and it travels
+/// with every copy of the store, so no unification batch reuses an identity an
+/// earlier batch created and nothing has to walk the store to avoid one. It is not
+/// part of the store's meaning, so two stores that differ only here are equal.
+#[derive(Debug, Clone, Copy, Default)]
+struct FreshLocalCounter(u64);
+
+impl PartialEq for FreshLocalCounter {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FreshLocalCounter {}
 
 /// Expression children, including metadata. One inventory serves substitution
 /// and dependency discovery so a container cannot be transparent to only one.
@@ -149,6 +166,16 @@ impl MetavarStore {
 
     pub fn assignments(&self) -> &HashMap<MVarId, MetavarAssignment> {
         &self.assignments
+    }
+
+    /// The first index the next unification batch may use for a fresh local.
+    pub(crate) fn unify_locals(&self) -> u64 {
+        self.unify_locals.0
+    }
+
+    /// Record how far a batch advanced the fresh-local counter; it never moves back.
+    pub(crate) fn advance_unify_locals(&mut self, next: u64) {
+        self.unify_locals.0 = self.unify_locals.0.max(next);
     }
 
     pub fn get_decl(&self, id: &MVarId) -> Option<&MetavarDecl> {

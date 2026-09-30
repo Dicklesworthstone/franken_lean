@@ -1063,28 +1063,33 @@ impl Engine<'_> {
                 self.reserved.insert(local.clone());
             }
         }
-        // Reserve all pre-existing identities before opening binders. Map
-        // iteration changes neither the resulting set nor the generated names.
+        // Reserve the pre-existing identities a fresh local could meet before
+        // opening binders. Fresh locals are numbered from the store's counter, which
+        // every earlier batch advanced past its own locals, so what remains to avoid
+        // are identities from elsewhere, and only where a fresh local could be
+        // captured: the transaction's context and the local contexts of the
+        // metavariables this batch can reach (an assignment's free variables must be
+        // declared in its metavariable's context). Walking that closure rather than
+        // the whole store keeps a batch proportional to what it can touch.
         let mut roots = Vec::new();
-        for declaration in self.work.mvars.decls().values() {
-            roots.push(declaration.type_.clone());
-            for local in declaration.lctx.decls() {
-                self.reserved.insert(local.id.clone());
-                roots.push(local.type_.clone());
-                roots.extend(local.value.iter().cloned());
-            }
+        for (left, right, _) in equations {
+            roots.push(left.clone());
+            roots.push(right.clone());
         }
-        for assignment in self.work.mvars.assignments().values() {
-            roots.push(assignment.expr.clone());
+        for typing in typings {
+            roots.push(typing.expr.clone());
+            roots.push(typing.expected_type.clone());
+        }
+        for obligation in delayed {
+            roots.push(Expr::mvar(obligation.mvar.clone()));
+            roots.push(obligation.val.clone());
         }
         for local in self.work.lctx.decls() {
             self.reserved.insert(local.id.clone());
             roots.push(local.type_.clone());
             roots.extend(local.value.iter().cloned());
         }
-        for root in roots {
-            self.scan(&root)?;
-        }
+        self.reserve_reachable(roots)?;
         // Revisit assignment-derived typing at most once per generation. A
         // missing Pi/sort at assignment time may become known through a later
         // equation. Rechecking is worklist production, never kernel admission.
@@ -1216,6 +1221,46 @@ impl Engine<'_> {
                 typing.depth,
             )?;
             self.check_prepared_value(&target, prepared)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve every free variable reachable from `roots`, following metavariables
+    /// through their assignments, declared types and local contexts (whose
+    /// identities are reserved too). Every visited node is metered.
+    fn reserve_reachable(&mut self, mut pending: Vec<Expr>) -> Result<(), UnificationError> {
+        // Visited nodes stay alive in `pending` or `kept`, so no address is reused.
+        let mut kept = Vec::new();
+        let mut seen = HashSet::new();
+        let mut reached = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(std::ptr::from_ref(current.node())) {
+                continue;
+            }
+            self.meter.node()?;
+            match current.node() {
+                ExprNode::FVar { id } => {
+                    self.reserved.insert(id.clone());
+                }
+                ExprNode::MVar { id } => {
+                    if reached.insert(id.clone()) {
+                        if let Some(decl) = self.work.mvars.get_decl(id) {
+                            pending.push(decl.type_.clone());
+                            for local in decl.lctx.decls() {
+                                self.meter.node()?;
+                                self.reserved.insert(local.id.clone());
+                                pending.push(local.type_.clone());
+                                pending.extend(local.value.iter().cloned());
+                            }
+                        }
+                        if let Some(assignment) = self.work.mvars.get_assignment(id) {
+                            pending.push(assignment.expr.clone());
+                        }
+                    }
+                }
+                _ => pending.extend(children(&current).into_iter().flatten().cloned()),
+            }
+            kept.push(current);
         }
         Ok(())
     }
@@ -1409,7 +1454,7 @@ impl ElabTxn {
                 cancelled,
             },
             reserved: HashSet::new(),
-            next_local: 0,
+            next_local: self.mvars.unify_locals(),
             assigned: Vec::new(),
             assigned_levels: Vec::new(),
             residuals: Vec::new(),
@@ -1427,6 +1472,7 @@ impl ElabTxn {
         if cancelled() {
             return Err(UnificationError::Cancelled);
         }
+        engine.work.mvars.advance_unify_locals(engine.next_local);
         self.mvars = engine.work.mvars;
         self.universes = engine.work.universes;
         self.constraints = engine.work.constraints;

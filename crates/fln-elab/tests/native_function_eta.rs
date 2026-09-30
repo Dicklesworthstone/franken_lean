@@ -116,6 +116,23 @@ fn eta_synthesizes_a_checked_pattern_assignment() {
 }
 
 #[test]
+fn a_batch_that_opens_a_binder_does_not_walk_unrelated_metavariables() {
+    // A fresh local comes from the store's counter; opening one must not meter
+    // every declaration in the store, or elaboration grows quadratically with the
+    // number of metavariables a command has created.
+    let steps = |unrelated: usize| {
+        let mut tx = txn();
+        let f = local(&mut tx, "f", pi(nat(), nat()));
+        for index in 0..unrelated {
+            hole(&mut tx, &format!("unrelated_{index}"), nat());
+        }
+        let expanded = lam(nat(), Expr::app(f.clone(), bvar(0)));
+        tx.unify(&expanded, &f, budget()).unwrap().unifier_steps
+    };
+    assert_eq!(steps(0), steps(2_000));
+}
+
+#[test]
 fn eta_does_not_capture_an_existing_generated_name() {
     let mut tx = txn();
     let id = FVarId(Name::from_components(["_fln_unify_local", "0"]));
