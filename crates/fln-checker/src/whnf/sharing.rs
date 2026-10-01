@@ -22,8 +22,11 @@ pub(super) struct Interned {
     entries: usize,
 }
 
+/// Candidates are compared exactly, so the hash needs only speed and a fixed
+/// key: `std`'s SipHash here was 6.5 % of a heavy K-cast proof's check
+/// (Std.Tactic.BVDecide ... Circuit.Lemmas, `go_Inv_of_Inv`).
 pub(super) fn fingerprint(node: &impl Hash) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = super::memo::Fingerprinter::default();
     node.hash(&mut hasher);
     hasher.finish()
 }

@@ -111,9 +111,10 @@ impl fmt::Debug for WhnfMemo {
 /// are compared exactly, so it needs speed and a fixed key, not resistance to
 /// chosen inputs; `MAX_BUCKET_ENTRIES` bounds what a collision can cost. Every
 /// lookup hashes its whole input, which `std`'s SipHash made 6 % of a heavy
-/// declaration's check.
+/// declaration's check. The materialization sharing table uses it for the same
+/// reason (`sharing::fingerprint`).
 #[derive(Default)]
-struct Fingerprinter(u64);
+pub(super) struct Fingerprinter(u64);
 
 impl Fingerprinter {
     fn add(&mut self, word: u64) {
