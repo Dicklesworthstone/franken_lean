@@ -23,12 +23,16 @@ pub struct SourceOleanImportLimits {
     pub max_roots: usize,
 }
 impl SourceOleanImportLimits {
+    /// Capture may use as many bytes as the caller allows the artifacts
+    /// themselves, never fewer than 64 MiB. The pinned `Init` closure (601
+    /// modules, 350 MiB of `.olean` parts) captures 300 MiB of extension
+    /// payloads, so a fixed 64 MiB made `import Init` a resource refusal.
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
             metadata: DecodeLimits::default(),
             capture: OleanWalkBudget::default(),
-            max_capture_bytes: 64 * 1024 * 1024,
+            max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
         }
     }

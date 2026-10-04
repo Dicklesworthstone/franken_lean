@@ -629,3 +629,85 @@ fn checked_module_path(
     }
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_olean::region::OleanView;
+
+    /// The capture ceiling check-source gives the importer must hold the
+    /// pinned `Init` closure's extension payloads, or `import Init` is a
+    /// resource refusal that no flag can lift.
+    #[test]
+    fn the_source_import_capture_ceiling_holds_the_pinned_init_closure() {
+        let Some(lib) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| {
+                home.join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+            .filter(|lib| lib.join("Init/Prelude.olean").is_file())
+        else {
+            assert!(
+                std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                "FLN_REQUIRE_REFERENCE is set but the pinned Reference Init is absent"
+            );
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let limits = fln::source_check::modules::imported::SourceOleanImportLimits::new(
+            fln::OleanCheckLimits::new(
+                MAX_OLEAN_BYTES,
+                fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
+            ),
+        );
+        let mut modules = vec![lib.join("Init.olean")];
+        let mut directories = vec![lib.join("Init")];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("pinned Init directory") {
+                let path = entry.expect("pinned Init entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "olean")
+                {
+                    modules.push(path);
+                }
+            }
+        }
+        let mut captured = 0usize;
+        for module in &modules {
+            let exported = std::fs::read(module).expect("pinned .olean");
+            let parts = (
+                std::fs::read(module.with_extension("olean.server")),
+                std::fs::read(module.with_extension("olean.private")),
+            );
+            let blocks = match parts {
+                (Ok(server), Ok(private)) => {
+                    OleanView::parse_with_dependencies(&private, &[&exported, &server])
+                        .and_then(|view| view.extension_payloads(limits.capture, usize::MAX))
+                }
+                _ => OleanView::parse(&exported)
+                    .and_then(|view| view.extension_payloads(limits.capture, usize::MAX)),
+            }
+            .unwrap_or_else(|error| panic!("{}: {error}", module.display()));
+            captured += blocks
+                .iter()
+                .flat_map(|block| &block.entries)
+                .map(Vec::len)
+                .sum::<usize>();
+        }
+        assert!(modules.len() > 500, "found {} Init modules", modules.len());
+        assert!(
+            captured > 64 * 1024 * 1024,
+            "Init captures {captured} bytes; the former fixed 64 MiB ceiling held more"
+        );
+        assert!(
+            captured <= limits.max_capture_bytes,
+            "Init captures {captured} bytes but the ceiling is {}",
+            limits.max_capture_bytes
+        );
+    }
+}
