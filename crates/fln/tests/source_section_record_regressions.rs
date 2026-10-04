@@ -505,21 +505,42 @@ fn checked_source_example_uses_the_public_record_pipeline() {
 fn result_sort_normalization_cannot_discard_invalid_source_annotations() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    for source in [
-        "structure Bad : (Type : Nat) where\n  value : Nat",
-        "structure Bad : (let unused : String := 1; Type) where\n  value : Nat",
-        "variable (A : Type)\nstructure Bad : (Type : Nat) where\n  value : A",
-        "variable (A : Type)\nstructure Bad : (let unused : String := 1; Type) where\n  value : A",
+    // `Type : Nat` reaches K1. `1 : String` is refused while elaborating, as the
+    // pin refuses it (no `OfNat String 1`). Each twin must check.
+    for (source, disposition, twin) in [
+        (
+            "structure Bad : (Type : Nat) where\n  value : Nat",
+            ("kernel-rejection", true, 1),
+            "structure Bad : (Type : Type 1) where\n  value : Nat",
+        ),
+        (
+            "structure Bad : (let unused : String := 1; Type) where\n  value : Nat",
+            ("elaboration", false, 1),
+            "structure Bad : (let unused : String := \"one\"; Type) where\n  value : Nat",
+        ),
+        (
+            "variable (A : Type)\nstructure Bad : (Type : Nat) where\n  value : A",
+            ("kernel-rejection", true, 1),
+            "variable (A : Type)\nstructure Bad : (Type : Type 1) where\n  value : A",
+        ),
+        (
+            "variable (A : Type)\nstructure Bad : (let unused : String := 1; Type) where\n  value : A",
+            ("elaboration", false, 1),
+            "variable (A : Type)\nstructure Bad : (let unused : String := \"one\"; Type) where\n  value : A",
+        ),
     ] {
         let error = base
             .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
             .expect_err("discarding an invalid annotation is not validation");
-        assert_eq!(
-            error.disposition(),
-            ("kernel-rejection", true, 1),
-            "{source}: {error:?}"
-        );
+        assert_eq!(error.disposition(), disposition, "{source}: {error:?}");
         assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            matches!(
+                base.check_source_files(&[twin.as_bytes()], &KVMap::new(), limits()),
+                Ok(Outcome::Complete(_))
+            ),
+            "{twin}"
+        );
     }
     checked(
         &base,

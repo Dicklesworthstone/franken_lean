@@ -137,25 +137,38 @@ fn proposition_valued_matches_build_proofs_for_every_branch() {
 }
 #[test]
 fn all_branches_are_checked_even_when_the_discriminant_is_a_literal() {
-    for text in [
-        "def bad : Nat := match true with | true => 1 | false => \"wrong\"",
-        "def bad : Nat := match true with | true => 1 | false => (1 : String)",
-        "theorem bad : 1 = 2 := match true with | true => by rfl | false => by rfl",
+    // `(1 : String)` is refused while elaborating, as the pin refuses it (no
+    // `OfNat String 1`); the other false branches reach K1. Each twin must check.
+    for (text, refusal, twin) in [
+        (
+            "def bad : Nat := match true with | true => 1 | false => \"wrong\"",
+            ("kernel-rejection", true, 1),
+            "def bad : Nat := match true with | true => 1 | false => 7",
+        ),
+        (
+            "def bad : Nat := match true with | true => 1 | false => (1 : String)",
+            ("elaboration", false, 1),
+            "def bad : Nat := match true with | true => 1 | false => (1 : Nat)",
+        ),
+        (
+            "theorem bad : 1 = 2 := match true with | true => by rfl | false => by rfl",
+            ("kernel-rejection", true, 1),
+            "theorem bad : 1 = 1 := match true with | true => by rfl | false => by rfl",
+        ),
     ] {
         let e = engine();
         let root = e.logical_root(&KVMap::new());
-        let result = e.check_source_files(
-            &[text.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits()),
-        );
-        let error = result.expect_err("every branch must typecheck");
-        assert_eq!(
-            error.disposition(),
-            ("kernel-rejection", true, 1),
-            "{error:?}"
-        );
+        let run = |source: &str| {
+            e.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+        };
+        let error = run(text).expect_err("every branch must typecheck");
+        assert_eq!(error.disposition(), refusal, "{text}: {error:?}");
         assert_eq!(e.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(Outcome::Complete(_))), "{twin}");
     }
 }
 #[test]

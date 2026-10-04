@@ -111,11 +111,13 @@ fn incomplete_or_overlong_nested_proofs_do_not_consume_outer_tactics() {
 }
 
 #[test]
-fn local_fact_values_and_type_annotations_remain_in_the_final_kernel_term() {
+fn local_fact_values_and_type_annotations_are_checked() {
+    // The pin refuses `1 : String` while elaborating (no `OfNat String 1`); the
+    // twin differs only in the value and must check.
     for body in [
-        "have hidden : String := 1; rfl",
-        "let hidden : String := 1; rfl",
-        "have hidden : String := 1; cases n with | zero => rfl | succ k => rfl",
+        "have hidden : String := {}; rfl",
+        "let hidden : String := {}; rfl",
+        "have hidden : String := {}; cases n with | zero => rfl | succ k => rfl",
     ] {
         let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
         let engine = Engine::with_source_seed(limits)
@@ -123,19 +125,25 @@ fn local_fact_values_and_type_annotations_remain_in_the_final_kernel_term() {
             .into_complete()
             .unwrap();
         let root = engine.logical_root(&KVMap::new());
-        let source = format!("theorem bad (n : Nat) : 0 = 0 := by {body}");
-        let error = engine
-            .check_source_files(
-                &[source.as_bytes()],
+        let run = |value: &str| {
+            let body = body.replace("{}", value);
+            engine.check_source_files(
+                &[format!("theorem bad (n : Nat) : 0 = 0 := by {body}").as_bytes()],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits),
             )
-            .unwrap_err();
-        assert!(
-            error.disposition().1,
-            "the original typed value must reach K1: {error:?}"
+        };
+        let error = run("1").unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{body}: {error:?}"
         );
         assert_eq!(engine.logical_root(&KVMap::new()), root);
+        assert!(
+            matches!(run("\"one\""), Ok(fln::Outcome::Complete(_))),
+            "{body}"
+        );
     }
 }
 

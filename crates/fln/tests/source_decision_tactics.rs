@@ -107,28 +107,41 @@ fn missing_decisions_invalid_propositions_and_branch_leaks_refuse() {
     }
 }
 
+/// The pin refuses `(1 : String)` while elaborating (no `OfNat String 1`), in an
+/// unselected branch as in an ignored argument; each twin must check.
 #[test]
-fn unselected_branches_and_ignored_proposition_arguments_reach_k1() {
+fn unselected_branches_and_ignored_proposition_arguments_are_checked() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    for source in [
-        "def bad : Nat := by by_cases h : True; exact 7; exact (1 : String)",
-        "def bad : Nat := by by_cases h : (fun ignored => True) (1 : String); exact 7; exact 9",
+    let root = engine.logical_root(&KVMap::new());
+    let run = |source: &str| {
+        engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+    };
+    for (source, twin) in [
+        (
+            "def bad : Nat := by by_cases h : True; exact 7; exact (1 : String)",
+            "def bad : Nat := by by_cases h : True; exact 7; exact (1 : Nat)",
+        ),
+        (
+            "def bad : Nat := by by_cases h : (fun ignored => True) (1 : String); exact 7; exact 9",
+            "def bad : Nat := by by_cases h : (fun ignored => True) \"one\"; exact 7; exact 9",
+        ),
     ] {
-        let result = engine
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            )
-            .unwrap_err();
-        assert!(
-            result.disposition().1,
-            "expected actual K1 rejection: {result:?}"
+        let result = run(source).unwrap_err();
+        assert_eq!(
+            result.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {result:?}"
         );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(fln::Outcome::Complete(_))), "{twin}");
     }
 }
 
@@ -309,22 +322,37 @@ fn a_reduced_dictionary_does_not_erase_ill_typed_arguments_or_lets() {
         .unwrap()
         .into_complete()
         .unwrap();
-    for source in [
-        "theorem bad : True := by let witness : Decidable True := (fun ignored => Decidable.isTrue True.intro) (1 : String); decide",
-        "theorem bad : True := by have unused : String := 1; decide",
-        "theorem bad : False := of_decide_eq_true (Eq.refl true)",
+    let root = engine.logical_root(&KVMap::new());
+    let run = |source: &str| {
+        engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+    };
+    // The pin refuses each `1 : String` while elaborating (no `OfNat String 1`);
+    // the false decision still reaches K1. Each twin must check.
+    for (source, refusal, twin) in [
+        (
+            "theorem bad : True := by let witness : Decidable True := (fun ignored => Decidable.isTrue True.intro) (1 : String); decide",
+            ("elaboration", false, 1),
+            "theorem bad : True := by let witness : Decidable True := (fun ignored => Decidable.isTrue True.intro) \"one\"; decide",
+        ),
+        (
+            "theorem bad : True := by have unused : String := 1; decide",
+            ("elaboration", false, 1),
+            "theorem bad : True := by have unused : String := \"one\"; decide",
+        ),
+        (
+            "theorem bad : False := of_decide_eq_true (Eq.refl true)",
+            ("kernel-rejection", true, 1),
+            "theorem bad : True := of_decide_eq_true (Eq.refl true)",
+        ),
     ] {
-        let problem = engine
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            )
-            .unwrap_err();
-        assert!(
-            problem.disposition().1,
-            "not a K1 rejection: {source}\n{problem:?}"
-        );
+        let problem = run(source).unwrap_err();
+        assert_eq!(problem.disposition(), refusal, "{source}\n{problem:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(fln::Outcome::Complete(_))), "{twin}");
     }
 }
 

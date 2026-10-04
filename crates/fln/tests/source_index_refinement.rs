@@ -641,32 +641,36 @@ fn source_refinement_does_not_invent_function_injectivity_or_branch_coverage() {
     );
 }
 
+/// The pin refuses `(1 : String)` while elaborating (no `OfNat String 1`). The
+/// index is a wildcard because the pin also refuses `.cons k ..` against `Vec Nat 1`
+/// (`k.succ` is not `1`), and the twin must be a program the pin accepts.
 #[test]
-fn a_discriminant_with_an_ignored_invalid_argument_still_reaches_kernel_checking() {
-    let source = format!(
-        "{VEC}\
-        def ignore (x : String) : Vec Nat 1 := Vec.cons 0 7 Vec.nil\n\
-        def bad : Nat := match ignore (1 : String) with | .cons k x rest => 0"
-    );
+fn a_discriminant_with_an_ignored_invalid_argument_is_still_checked() {
+    let source = |argument: &str| {
+        format!(
+            "{VEC}\
+            def ignore (x : String) : Vec Nat 1 := Vec.cons 0 7 Vec.nil\n\
+            def bad : Nat := match ignore {argument} with | .cons _ x rest => 0"
+        )
+    };
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    let root = engine.logical_root(&KVMap::new());
-    let error = engine
-        .check_source_files(
-            &[source.as_bytes()],
+    let run = |argument: &str| {
+        engine.check_source_files(
+            &[source(argument).as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
         )
+    };
+    let root = engine.logical_root(&KVMap::new());
+    let error = run("(1 : String)")
         .expect_err("discarding the discriminant must not discard its typing obligations");
-    assert_eq!(
-        error.disposition(),
-        ("kernel-rejection", true, 1),
-        "{error:?}"
-    );
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
     assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(run("\"one\""), Ok(fln::Outcome::Complete(_))));
 }
 
 #[test]

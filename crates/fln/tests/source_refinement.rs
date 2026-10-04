@@ -195,30 +195,44 @@ fn refinement_holes_preserve_hidden_hypotheses_and_recursion_restrictions() {
 }
 
 #[test]
-fn irrelevant_ill_typed_arguments_receive_actual_kernel_rejections() {
+fn irrelevant_ill_typed_arguments_are_actually_refused() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
     let root = engine.logical_root(&KVMap::new());
-    for source in [
-        "def ignore (n : Nat) (h : 0 = 0) : 0 = 0 := h\ntheorem bad : 0 = 0 := by refine ignore (1 : String) ?_; rfl",
-        "def identity (n : Nat) : Nat := n\ntheorem bad (n m : Nat) : identity n = n := by refine Eq.refl ?_; exact m",
-    ] {
-        let problem = engine
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            )
-            .unwrap_err();
-        assert!(
-            problem.disposition().1,
-            "expected K1 rejection, got {problem:?}"
-        );
-        assert_eq!(engine.logical_root(&KVMap::new()), root);
-    }
+    let run = |source: &str| {
+        engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+    };
+    // The pin refuses `(1 : String)` while elaborating (no `OfNat String 1`), and
+    // the `Nat` twin must check.
+    let source = "def ignore (n : Nat) (h : 0 = 0) : 0 = 0 := h\ntheorem bad : 0 = 0 := by refine ignore (1 : String) ?_; rfl";
+    let problem = run(source).unwrap_err();
+    assert_eq!(
+        problem.disposition(),
+        ("elaboration", false, 1),
+        "{problem:?}"
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(
+        run(
+            "def ignore (n : Nat) (h : 0 = 0) : 0 = 0 := h\ntheorem bad : 0 = 0 := by refine ignore (1 : Nat) ?_; rfl"
+        ),
+        Ok(fln::Outcome::Complete(_))
+    ));
+    let source = "def identity (n : Nat) : Nat := n\ntheorem bad (n m : Nat) : identity n = n := by refine Eq.refl ?_; exact m";
+    let problem = run(source).unwrap_err();
+    assert_eq!(
+        problem.disposition(),
+        ("kernel-rejection", true, 1),
+        "{problem:?}"
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 
 #[test]

@@ -174,28 +174,41 @@ fn local_let_dependencies_keep_their_values_without_becoming_parameters() {
         "def keep (n : Nat) : Nat := let saved := n; by\n  cases n with\n  | zero => exact saved\n  | succ k => exact saved\ntheorem keep_ok : keep 3 = 3 := by rfl",
     );
 }
+/// A false branch still reaches K1. A `(1 : String)` is refused while
+/// elaborating, as the pin refuses it (no `OfNat String 1`). Each twin differs
+/// only in the offending term and must check.
 #[test]
-fn false_proofs_and_invalid_unused_terms_still_reach_kernel_rejection() {
+fn false_proofs_and_invalid_unused_terms_are_still_refused() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    for source in [
-        "theorem false_proof (n : Nat) : 1 = 2 := by cases n with | zero => rfl | succ k => rfl",
-        "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact (1 : String)",
-        "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact ((fun unused => k) (1 : String))",
-    ] {
-        let error = base
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err("every branch must check");
-        assert_eq!(
-            error.disposition(),
+    let run = |source: &str| {
+        base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+    };
+    for (source, refusal, twin) in [
+        (
+            "theorem false_proof (n : Nat) : 1 = 2 := by cases n with | zero => rfl | succ k => rfl",
             ("kernel-rejection", true, 1),
-            "{source}: {error:?}"
-        );
+            "theorem false_proof (n : Nat) : 1 = 1 := by cases n with | zero => rfl | succ k => rfl",
+        ),
+        (
+            "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact (1 : String)",
+            ("elaboration", false, 1),
+            "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact (1 : Nat)",
+        ),
+        (
+            "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact ((fun unused => k) (1 : String))",
+            ("elaboration", false, 1),
+            "def invalid (n : Nat) : Nat := by cases n with | zero => exact 0 | succ k => exact ((fun unused => k) \"one\")",
+        ),
+    ] {
+        let error = run(source).expect_err("every branch must check");
+        assert_eq!(error.disposition(), refusal, "{source}: {error:?}");
         assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(fln::Outcome::Complete(_))), "{twin}");
     }
 }
 #[test]

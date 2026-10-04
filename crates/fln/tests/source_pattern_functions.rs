@@ -142,22 +142,28 @@ fn pattern_functions_preserve_small_elimination_restrictions() {
     );
 }
 #[test]
-fn an_unused_invalid_pattern_function_still_reaches_the_kernel() {
-    let source = "theorem bad : 0 = 0 := by\n have ignored : Bool -> Nat := fun | true => 1 | false => (1 : String)\n rfl";
+fn an_unused_invalid_pattern_function_is_still_checked() {
+    // The pin refuses `(1 : String)` while elaborating (no `OfNat String 1`).
+    let source = |value: &str| {
+        format!(
+            "theorem bad : 0 = 0 := by\n have ignored : Bool -> Nat := fun | true => 1 | false => {value}\n rfl"
+        )
+    };
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    let error = engine
-        .check_source_files(
-            &[source.as_bytes()],
+    let root = engine.logical_root(&KVMap::new());
+    let run = |value: &str| {
+        engine.check_source_files(
+            &[source(value).as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
         )
-        .unwrap_err();
-    assert!(
-        error.disposition().1,
-        "expected actual checking rejection, got {error:?}"
-    );
+    };
+    let error = run("(1 : String)").unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(run("(1 : Nat)"), Ok(fln::Outcome::Complete(_))));
 }

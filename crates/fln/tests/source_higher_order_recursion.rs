@@ -365,31 +365,37 @@ fn unrelated_functions_do_not_become_structural_children_by_result_type() {
     ));
 }
 
+/// The pin refuses `(1 : String)` while elaborating (no `OfNat String 1`); the
+/// twin passing a string literal must check, so the refusal is the argument's.
 #[test]
-fn discarded_child_argument_annotations_still_receive_kernel_rejection() {
+fn discarded_child_argument_annotations_are_still_checked() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    let source = format!(
-        r#"{TREE}
+    let source = |argument: &str| {
+        format!(
+            r#"{TREE}
         def ignore (s : String) : Nat := 0
         def bad (t : Branching) : Nat := match t with
           | .leaf n => n
-          | .node children => bad (children (ignore (1 : String)))
+          | .node children => bad (children (ignore {argument}))
         "#
-    );
-    let before = engine.logical_root(&KVMap::new());
-    let error = engine
-        .check_source_files(
-            &[source.as_bytes()],
+        )
+    };
+    let run = |argument: &str| {
+        engine.check_source_files(
+            &[source(argument).as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
         )
-        .expect_err("a discarded invalid annotation is still checked");
-    assert!(error.disposition().1, "{error:?}");
+    };
+    let before = engine.logical_root(&KVMap::new());
+    let error = run("(1 : String)").expect_err("a discarded invalid annotation is still checked");
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
     assert_eq!(engine.logical_root(&KVMap::new()), before);
+    assert!(matches!(run("\"one\""), Ok(fln::Outcome::Complete(_))));
 }
 
 #[test]

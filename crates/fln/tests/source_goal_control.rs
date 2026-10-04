@@ -295,28 +295,41 @@ fn nested_controllers_and_grouped_chains_do_not_reenter_the_host_evaluator() {
         .unwrap();
 }
 
+/// The pin refuses `1 : String` while elaborating (no `OfNat String 1`), so the
+/// unused value is refused there too; the well-typed twin must still check, which
+/// pins the refusal on that value rather than on the tactic around it.
 #[test]
-fn invalid_unused_values_in_sequenced_proofs_reach_k1_rejection() {
+fn invalid_unused_values_in_sequenced_proofs_are_refused() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    for body in [
-        "focus (have unused : String := 1; rfl)",
-        "(have unused : String := 1; rfl) <;> rfl",
+    let root = engine.logical_root(&KVMap::new());
+    let run = |body: &str| {
+        engine.check_source_files(
+            &[format!("theorem bad : 0 = 0 := by {body}").as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+    };
+    for (bad, twin) in [
+        (
+            "focus (have unused : String := 1; rfl)",
+            "focus (have unused : String := \"one\"; rfl)",
+        ),
+        (
+            "(have unused : String := 1; rfl) <;> rfl",
+            "(have unused : String := \"one\"; rfl) <;> rfl",
+        ),
     ] {
-        let source = format!("theorem bad : 0 = 0 := by {body}");
-        let rejected = engine
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            )
-            .unwrap_err();
-        assert!(
-            rejected.disposition().1,
-            "expected kernel rejection: {rejected:?}"
+        let rejected = run(bad).unwrap_err();
+        assert_eq!(
+            rejected.disposition(),
+            ("elaboration", false, 1),
+            "{bad}: {rejected:?}"
         );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(fln::Outcome::Complete(_))), "{twin}");
     }
 }

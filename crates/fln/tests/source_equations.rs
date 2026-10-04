@@ -194,23 +194,25 @@ fn resource_stops_leave_equation_prefixes_unpublished_and_reusable() {
 }
 
 #[test]
-fn an_unused_bad_annotation_reaches_the_ordinary_kernel() {
+fn an_unused_bad_annotation_is_still_checked() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    let error = engine
-        .check_source_files(
-            &[b"def bad : Bool -> Nat | true => 0 | false => let unused : String := 1; 0"],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits),
-        )
+    let root = engine.logical_root(&KVMap::new());
+    let run = |source: &[u8]| {
+        engine.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits))
+    };
+    // The pin refuses `1 : String` while elaborating (no `OfNat String 1`).
+    let error = run(b"def bad : Bool -> Nat | true => 0 | false => let unused : String := 1; 0")
         .expect_err("the complete candidate must retain its annotation");
-    assert!(
-        error.disposition().1,
-        "expected authoritative kernel rejection: {error:?}"
-    );
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(
+        run(b"def bad : Bool -> Nat | true => 0 | false => let unused : String := \"one\"; 0"),
+        Ok(fln::Outcome::Complete(_))
+    ));
 }
 
 #[test]

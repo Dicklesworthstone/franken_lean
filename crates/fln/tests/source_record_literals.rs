@@ -208,25 +208,44 @@ fn methods_require_a_receiver_parameter_and_unknown_fields_are_refused() {
 }
 
 #[test]
-fn expression_ascriptions_cannot_disappear_before_kernel_checking() {
+fn expression_ascriptions_cannot_disappear_before_checking() {
     let e = engine();
-    for text in [
-        "def bad : Nat := (1 : String)",
-        "def bad : Nat := let x := (1 : String); 0",
-        "def ignored (x : String) : Nat := 0\ndef bad : Nat := ignored (1 : String)",
-        "def bad : Nat := ((fun x => x) : String -> String) 1",
-    ] {
-        let result = e.check_source_files(
-            &[text.as_bytes()],
+    let root = e.logical_root(&KVMap::new());
+    let run = |source: &str| {
+        e.check_source_files(
+            &[source.as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits()),
-        );
-        let refusal = result.expect_err("a false source ascription must reach rejection");
+        )
+    };
+    // The pin refuses each while elaborating (no `OfNat String 1`); each twin
+    // differs only in the ascribed term and must check.
+    for (text, twin) in [
+        (
+            "def bad : Nat := (1 : String)",
+            "def bad : Nat := (1 : Nat)",
+        ),
+        (
+            "def bad : Nat := let x := (1 : String); 0",
+            "def bad : Nat := let x := \"one\"; 0",
+        ),
+        (
+            "def ignored (x : String) : Nat := 0\ndef bad : Nat := ignored (1 : String)",
+            "def ignored (x : String) : Nat := 0\ndef bad : Nat := ignored \"one\"",
+        ),
+        (
+            "def bad : Nat := ((fun x => x) : String -> String) 1",
+            "def bad : Nat := ((fun x => x) : Nat -> Nat) 1",
+        ),
+    ] {
+        let refusal = run(text).expect_err("a false source ascription must be refused");
         assert_eq!(
             refusal.disposition(),
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "{text}: {refusal:?}"
         );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(Outcome::Complete(_))), "{twin}");
     }
 }
 

@@ -65,25 +65,42 @@ fn nested_record_literals_and_let_defaults_are_elaborated_natively() {
 fn invalid_defaults_are_rejected_even_when_never_used() {
     let e = engine();
     let root = e.logical_root(&KVMap::new());
-    for text in [
-        "structure Bad where\n  value : Nat := \"wrong\"",
-        "structure Bad where\n  carrier : Type\n  value : carrier := 7",
-        "structure Bad where\n  value : Nat := (1 : String)",
-        "structure Bad where\n  value : Nat := let unused := (1 : String); 0",
-    ] {
-        let refusal = e
-            .check_source_files(
-                &[text.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err("invalid default is not optional evidence");
-        assert_eq!(
-            refusal.disposition(),
+    let run = |source: &str| {
+        e.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+    };
+    // A numeral with no `OfNat` instance at its type is refused while
+    // elaborating, as the pin refuses it; the string default reaches K1. Each
+    // twin must check.
+    for (text, disposition, twin) in [
+        (
+            "structure Bad where\n  value : Nat := \"wrong\"",
             ("kernel-rejection", true, 1),
-            "{text}: {refusal:?}"
-        );
+            "structure Bad where\n  value : Nat := 7",
+        ),
+        (
+            "structure Bad where\n  carrier : Type\n  value : carrier := 7",
+            ("elaboration", false, 1),
+            "structure Bad where\n  carrier : Type\n  value : Nat := 7",
+        ),
+        (
+            "structure Bad where\n  value : Nat := (1 : String)",
+            ("elaboration", false, 1),
+            "structure Bad where\n  value : Nat := (1 : Nat)",
+        ),
+        (
+            "structure Bad where\n  value : Nat := let unused := (1 : String); 0",
+            ("elaboration", false, 1),
+            "structure Bad where\n  value : Nat := let unused := \"one\"; 0",
+        ),
+    ] {
+        let refusal = run(text).expect_err("invalid default is not optional evidence");
+        assert_eq!(refusal.disposition(), disposition, "{text}: {refusal:?}");
         assert_eq!(e.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(Outcome::Complete(_))), "{twin}");
     }
 }
 #[test]

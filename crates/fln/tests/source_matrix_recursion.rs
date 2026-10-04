@@ -378,27 +378,41 @@ fn resource_stops_and_invalid_suffixes_do_not_publish_a_prefix() {
 }
 
 #[test]
-fn ignored_discriminants_and_recursive_arguments_keep_actual_k1_obligations() {
-    for source in [
-        "def bad (n : Nat) : Nat := match n, (1 : String) with | .zero, _ => 0 | .succ k, _ => bad k",
-        "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => let alias : String := k; let unused := bad k b; 0",
+fn ignored_discriminants_and_recursive_arguments_keep_their_typing_obligations() {
+    // The pin refuses both while elaborating: `(1 : String)` has no `OfNat
+    // String 1`, and `k : Nat` is not a `String`. The twin is what tells this
+    // refusal from a capability gap: it differs only in the offending term.
+    for (source, twin) in [
+        (
+            "def bad (n : Nat) : Nat := match n, (1 : String) with | .zero, _ => 0 | .succ k, _ => bad k",
+            "def bad (n : Nat) : Nat := match n, \"one\" with | .zero, _ => 0 | .succ k, _ => bad k",
+        ),
+        (
+            "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => let alias : String := k; let unused := bad k b; 0",
+            "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => let alias : Nat := k; let unused := bad k b; 0",
+        ),
     ] {
         let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
         let engine = Engine::with_source_seed(limits)
             .unwrap()
             .into_complete()
             .unwrap();
-        let error = engine
-            .check_source_files(
+        let root = engine.logical_root(&KVMap::new());
+        let run = |source: &str| {
+            engine.check_source_files(
                 &[source.as_bytes()],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits),
             )
-            .unwrap_err();
-        assert!(
-            error.disposition().1,
-            "expected authoritative K1 rejection, not an earlier capability refusal: {source}\n{error:?}"
+        };
+        let error = run(source).unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}\n{error:?}"
         );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+        assert!(matches!(run(twin), Ok(fln::Outcome::Complete(_))), "{twin}");
     }
 }
 
