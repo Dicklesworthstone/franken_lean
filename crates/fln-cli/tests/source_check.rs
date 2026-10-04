@@ -763,8 +763,14 @@ fn installed_binary_checks_constructor_matches_and_refuses_an_invalid_unused_bra
             }
             assert!(output.stderr.is_empty());
         } else {
+            // The pin refuses `(0 : String)` while elaborating (no `OfNat String 0`)
+            // and accepts the same branch at `(0 : Nat)`.
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("\"outcome\":\"elaboration\""),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 }
