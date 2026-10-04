@@ -541,8 +541,8 @@ pub(super) fn check(
         if binders > MAX_NONRECURSIVE_FIELDS {
             return Err(field_limit(binders));
         }
-        if !positive_result(declaration, (p + q) as u32)
-            && !proposition_result(declaration, (p + q) as u32)
+        if !positive_result(declaration.type_(), (p + q) as u32)
+            && !proposition_result(declaration.type_(), (p + q) as u32)
         {
             return Err(InductiveVerdict::Deferred(
                 InductiveSupportLimit::ResultUniverse,

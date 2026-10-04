@@ -5,6 +5,8 @@
 //! must use the original parameters and universes; indices may change. Their
 //! actual index expressions determine every induction hypothesis and recursive
 //! call. Strictly positive function-valued children retain their argument telescopes.
+//! A single family whose written type does not reach its sort is read through
+//! weak head normalization, as the pin reads it; mutual and nested blocks are not.
 //! Nested occurrences under unrelated type constructors remain unsupported.
 mod mutual;
 mod nested;
@@ -17,7 +19,31 @@ use crate::term::{
     TermBudget, TermOutcome, copy_compact_subterm_with, raise_external_bounds_with,
     substitute_bound_with,
 };
+use crate::whnf::{WhnfContext, whnf_at_with};
 use std::collections::BTreeMap;
+
+/// A family's telescope as the pin reads it. `check_inductive_types` takes the
+/// weak head normal form of the declared type before it tests for each binder
+/// and before `ensure_sort` (vendored `inductive.cpp:222`, `:240`, `:245`),
+/// and `mk_rec_infos` reads the motive's index binders through the same
+/// reductions (`:596`, `:606`). A definition can therefore supply indices and
+/// the result sort: Mathlib's `FiniteInter.finiteInterClosure : Set (Set α)`
+/// has one index, exposed by unfolding `Set α := α → Prop`, and
+/// `ObjectProperty.ofObj : ObjectProperty C` one, by unfolding
+/// `ObjectProperty C := C → Prop`.
+enum Telescope {
+    /// `Π binders, Sort l`, rebuilt from the reduced binders with exactly the
+    /// claimed number of binders. Each domain is the reduced binder's own,
+    /// as the pin's locals are (`mk_local_decl_for`).
+    Exposed(WireExpr),
+    /// Reduction completed and reached a sort after a different number of
+    /// binders than the metadata claims.
+    Miscounted,
+    /// Reduction completed at a head that is neither a binder nor a sort.
+    Stuck,
+    /// The independent reducer did not complete: no answer either way.
+    Unreduced,
+}
 
 #[derive(Clone)]
 struct Binder {
@@ -74,10 +100,11 @@ fn size(term: &WireExpr) -> usize {
     term.nodes().len().saturating_add(term.levels().len())
 }
 
-/// A sufficient, independently computed positivity test for the result sort.
+/// A sufficient, independently computed positivity test for the result sort
+/// of the family telescope `term` (a declared type, or the telescope the pin
+/// exposes by reduction, `Audit::reduced_telescope`).
 /// Sort u (which may be Prop) stays on its separate elimination-policy routes.
-pub(super) fn positive_result(declaration: &ConstantDeclaration, count: u32) -> bool {
-    let term = declaration.type_();
+pub(super) fn positive_result(term: &WireExpr, count: u32) -> bool {
     if count as usize > MAX_NONRECURSIVE_FIELDS || size(term) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
         return false;
     }
@@ -105,8 +132,7 @@ pub(super) fn positive_result(declaration: &ConstantDeclaration, count: u32) -> 
 
 /// The generic predicate route is selected only at a definitely zero sort.
 /// Sort u, whose proposition/data status can vary, keeps its existing routes.
-pub(super) fn proposition_result(declaration: &ConstantDeclaration, count: u32) -> bool {
-    let term = declaration.type_();
+pub(super) fn proposition_result(term: &WireExpr, count: u32) -> bool {
     if count as usize > MAX_NONRECURSIVE_FIELDS || size(term) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
         return false;
     }
@@ -524,6 +550,126 @@ impl Audit<'_> {
         }
         builder.finish(root).ok_or_else(overflow)
     }
+
+    /// Read `declaration`'s telescope through weak head normalization, as the
+    /// pin does (see [`Telescope`]): reduce the remaining type, take a binder
+    /// while one is exposed, and stop at a sort. The reduction runs on the
+    /// checker's own reducer in the declaration's checking scope, so delta
+    /// unfolds exactly the definitions the declaration may reference. The
+    /// remaining type keeps the earlier binders as loose bound variables, so
+    /// every reduced domain is already scoped over its predecessors and the
+    /// rebuilt telescope needs no re-abstraction.
+    fn reduced_telescope(
+        &mut self,
+        environment: &ConstantEnvironment,
+        declaration: &ConstantDeclaration,
+        count: usize,
+    ) -> Result<Telescope, InductiveVerdict> {
+        let context = WhnfContext::new(Vec::new(), Vec::new(), environment.clone())
+            .admitting(checking_scope(declaration));
+        let mut binders: Vec<Binder> = Vec::with_capacity(count);
+        let mut remaining = declaration.type_().clone();
+        loop {
+            self.tick()?;
+            let reduced = match whnf_at_with(
+                &remaining,
+                remaining.root(),
+                &context,
+                self.budget.inference.whnf,
+                &mut *self.cancelled,
+            ) {
+                WhnfOutcome::Complete(result) => result.term,
+                WhnfOutcome::Refused(_)
+                | WhnfOutcome::Inconclusive(_)
+                | WhnfOutcome::InternalFault(_) => return Ok(Telescope::Unreduced),
+            };
+            match reduced.node(reduced.root()) {
+                Some(ExprNode::Forall {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                }) => {
+                    // The pin takes every exposed binder (`while (is_pi(type))`).
+                    if binders.len() == count {
+                        return Ok(Telescope::Miscounted);
+                    }
+                    binders.push(Binder {
+                        name: binder_name.clone(),
+                        style: *style,
+                        domain: self.piece(&reduced, *binder_type)?,
+                    });
+                    remaining = self.piece(&reduced, *body)?;
+                }
+                Some(ExprNode::Sort { .. }) => {
+                    if binders.len() != count {
+                        return Ok(Telescope::Miscounted);
+                    }
+                    let mut builder = StructuralTermBuilder::new();
+                    let mut root = self.import(&mut builder, &reduced)?;
+                    for binder in binders.iter().rev() {
+                        let domain = self.import(&mut builder, &binder.domain)?;
+                        root = builder.forall_name(&binder.name, binder.style, domain, root);
+                    }
+                    return self.finish(builder, root).map(Telescope::Exposed);
+                }
+                _ => return Ok(Telescope::Stuck),
+            }
+        }
+    }
+}
+
+/// Whether a single family whose WRITTEN telescope does not reach its result
+/// sort after its parameters and indices is one the uniform route judges once
+/// its telescope is read as the pin reads it (`Telescope`). The result must
+/// pass the same sort gates the written route applies in
+/// `admit_inductive_with`. `false` leaves every other route as it was.
+pub(super) fn routes_by_reduction(
+    environment: &ConstantEnvironment,
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, InductiveVerdict> {
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return Ok(false);
+    };
+    let Some(count) = metadata
+        .num_parameters()
+        .checked_add(metadata.num_indices())
+    else {
+        return Ok(false);
+    };
+    let type_ = declaration.type_();
+    if metadata.mutual() != std::slice::from_ref(inductive.name())
+        || metadata.num_nested() != 0
+        || count as usize > MAX_NONRECURSIVE_FIELDS
+        || size(type_) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS
+        || peel_binders_at(type_, type_.root(), count as usize)
+            .is_some_and(|(_, tail)| is_sort_at(type_, tail))
+    {
+        return Ok(false);
+    }
+    let mut audit = Audit {
+        safety: declaration.safety(),
+        budget,
+        comparison,
+        cancelled,
+    };
+    match audit.reduced_telescope(environment, declaration, count as usize)? {
+        Telescope::Exposed(reduced) => Ok(proposition_result(&reduced, count)
+            || ((metadata.num_parameters() > 0
+                || metadata.num_indices() > 0
+                || metadata.is_reflexive()
+                || !declaration.level_parameters().is_empty())
+                && positive_result(&reduced, count))),
+        // Definitive, unlike a stuck head: a completed reduction that exposes a
+        // binder or a sort agrees with the pin's. The route refuses the claim.
+        Telescope::Miscounted => Ok(true),
+        // A stuck head may be this reducer's incompleteness; no answer here.
+        Telescope::Stuck | Telescope::Unreduced => Ok(false),
+    }
 }
 
 fn application(
@@ -919,13 +1065,30 @@ fn check(
             },
         ));
     }
-    // Reject an impossible claimed telescope rather than treating malformed
-    // parameter metadata as an unsupported unsafe declaration.
-    if peel_binders_at(declaration.type_(), declaration.type_().root(), p + q).is_none() {
-        return Err(constructor_error(name));
-    }
-    if !positive_result(declaration, (p + q) as u32)
-        && !proposition_result(declaration, (p + q) as u32)
+    // The family telescope as the pin reads it (`Telescope`). A written
+    // telescope that reaches its sort after the claimed binders is read as
+    // written; reduction leaves a binder or a sort unchanged.
+    let written = peel_binders_at(declaration.type_(), declaration.type_().root(), p + q);
+    let family_type = match written {
+        Some((_, tail)) if is_sort_at(declaration.type_(), tail) => declaration.type_().clone(),
+        _ => match audit.reduced_telescope(environment, declaration, p + q)? {
+            Telescope::Exposed(reduced) => reduced,
+            // Reject an impossible claimed telescope rather than treating
+            // malformed parameter metadata as an unsupported unsafe
+            // declaration: the completed reduction exposes a different
+            // number of binders, or too few are written and it stops at a
+            // head that is neither a binder nor a sort.
+            Telescope::Miscounted => return Err(constructor_error(name)),
+            Telescope::Stuck if written.is_none() => return Err(constructor_error(name)),
+            Telescope::Stuck | Telescope::Unreduced => {
+                return Err(InductiveVerdict::Deferred(
+                    InductiveSupportLimit::ResultUniverse,
+                ));
+            }
+        },
+    };
+    if !positive_result(&family_type, (p + q) as u32)
+        && !proposition_result(&family_type, (p + q) as u32)
     {
         return Err(InductiveVerdict::Deferred(
             InductiveSupportLimit::ResultUniverse,
@@ -989,7 +1152,7 @@ fn check(
         audit.cancelled,
     )
     .map_err(|v| map_member_preamble(name, v))?;
-    let (parameters, index_tail) = audit.peel(declaration.type_(), p)?;
+    let (parameters, index_tail) = audit.peel(&family_type, p)?;
     let (indices, result_sort) = audit.peel(&index_tail, q)?;
     let Some(ExprNode::Sort { level }) = result_sort.node(result_sort.root()) else {
         return Err(overflow());

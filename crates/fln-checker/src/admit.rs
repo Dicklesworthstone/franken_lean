@@ -8350,12 +8350,12 @@ pub fn admit_inductive_with(
         .num_parameters()
         .checked_add(metadata.num_indices())
         .is_some_and(|count| {
-            uniform::proposition_result(declaration, count)
+            uniform::proposition_result(declaration.type_(), count)
                 || ((metadata.num_parameters() > 0
                     || metadata.num_indices() > 0
                     || metadata.is_reflexive()
                     || !declaration.level_parameters().is_empty())
-                    && uniform::positive_result(declaration, count))
+                    && uniform::positive_result(declaration.type_(), count))
         })
     {
         return uniform::admit(
@@ -8367,6 +8367,30 @@ pub fn admit_inductive_with(
             &mut comparison,
             &mut cancelled,
         );
+    }
+    // The same judgment for a family whose indices or result sort the pin
+    // exposes only by reducing its declared type (`inductive.cpp:222-245`),
+    // e.g. `finiteInterClosure : Set (Set α)` or `ofObj : ObjectProperty C`.
+    match uniform::routes_by_reduction(
+        environment,
+        inductive,
+        budget,
+        &mut comparison,
+        &mut cancelled,
+    ) {
+        Ok(true) => {
+            return uniform::admit(
+                environment,
+                declarations,
+                inductive,
+                budget,
+                environment_budget,
+                &mut comparison,
+                &mut cancelled,
+            );
+        }
+        Ok(false) => {}
+        Err(verdict) => return verdict,
     }
     // Class-shaped blocks: one constructor, zero indices, non-recursive, at
     // least one family universe. Gated here so only plausible members enter
