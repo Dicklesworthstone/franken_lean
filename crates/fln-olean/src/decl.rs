@@ -1607,8 +1607,9 @@ pub fn chain_extra_const_names(
 /// CHAIN LAWS, kept aligned with the product door
 /// (`fln::decode_olean_module_artifacts`): the exported part is audited,
 /// walked, and required to be a module-system module; each companion must carry
-/// the exported part's identity stamp, and is walked and `ModuleData`-decoded.
-/// The private array is then decoded and proven a superset.
+/// the exported part's identity stamp, and is audited in its dependency address
+/// space, walked, and `ModuleData`-decoded. The private array is then decoded
+/// and proven a superset.
 ///
 /// ONE DELIBERATE DIVERGENCE. The product door also runs the full declaration
 /// decoder over the SERVER part and discards the result. This does not, because
@@ -1663,6 +1664,10 @@ pub fn decode_chain_constants_from_parts(
         });
     }
     for view in [&server_view, &private_view] {
+        // The full-surface audit covers every object, including those no root
+        // reaches, against the earlier parts' address ranges; the walk below
+        // covers what is reachable and what it means.
+        view.shared_audit()?;
         view.walk(budget)?;
         // `walk` proves every pointer, string and bignum in the region is
         // sound, but it is generic over the object graph and knows nothing of
