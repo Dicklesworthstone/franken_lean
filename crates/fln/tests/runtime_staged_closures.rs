@@ -186,21 +186,18 @@ fn each_completed_stage_keeps_its_own_strict_work_and_sharing() {
     assert_eq!(steps(0, 0, 10000, &unused), zero);
 }
 
+/// A known staged callback handed to a flat two-argument consumer is executed by
+/// inlining the consumer (14123546), never by casting it to the flat interface.
+/// The second source tells the argument order apart: swapped, it would give 60;
+/// the pin's `#eval` gives 51.
 #[test]
 fn nested_stages_are_not_silently_converted_to_flat_callback_arguments() {
-    let source = "def apply (f : Nat -> Nat -> Nat) : Nat := f 1 2\ndef use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat := (by intro x; let n := x + offset; intro y; exact n + y); apply f\n#eval use 39";
-    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits.kernel))
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    let options = KVMap::new();
-    let root = engine.logical_root(&options);
-    let error = engine
-        .execute_source_definitions(&[source.as_bytes()], &options, limits)
-        .unwrap_err();
-    assert!(
-        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. } if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::FunctionArgumentType { .. })))
+    run(
+        "def apply (f : Nat -> Nat -> Nat) : Nat := f 1 2\ndef use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat := (by intro x; let n := x + offset; intro y; exact n + y); apply f\n#eval use 39",
+        "42",
     );
-    assert_eq!(engine.logical_root(&options), root);
+    run(
+        "def apply (f : Nat -> Nat -> Nat) : Nat := f 1 2\ndef use (offset : Nat) : Nat := let f : Nat -> Nat -> Nat := (by intro x; let n := x * 10 + offset; intro y; exact n + y); apply f\n#eval use 39",
+        "51",
+    );
 }
