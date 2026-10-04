@@ -104,7 +104,9 @@ fn branch_local_variables_and_unchosen_errors_do_not_escape_checking() {
         "def bad : Id PUnit := do unless 7 do Pure.pure (f := Id) PUnit.unit",
         "def bad : Id PUnit := do unless false do break",
         "def bad : Id PUnit := do unless false do continue",
-        "def bad : Id Nat := do { unless false do { return 7 }; return 9 }",
+        // A guarded `return` exits the enclosing block (50e37de4), so the
+        // value after the guard is not the result.
+        "def bad : Id Nat := do { unless false do { return 7 }; return 9 }\ntheorem nine : bad = 9 := by rfl",
         "def bad : Id PUnit := do for h : x in 7 do unless false do (do break)",
         "def bad : Id PUnit := do unless true do { let unused : Bool := 7; Pure.pure (f := Id) PUnit.unit }",
     ] {
@@ -118,6 +120,10 @@ fn branch_local_variables_and_unchosen_errors_do_not_escape_checking() {
     checked(
         &base,
         "def recovery : Id PUnit := do unless false do Pure.pure (f := Id) PUnit.unit",
+    );
+    checked(
+        &base,
+        "def early : Id Nat := do { unless false do { return 7 }; return 9 }\ntheorem seven : early = 7 := by rfl\ndef late : Id Nat := do { unless true do { return 7 }; return 9 }\ntheorem nine : late = 9 := by rfl",
     );
 }
 

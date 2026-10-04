@@ -135,7 +135,9 @@ fn invalid_witnesses_and_missing_dependent_dictionaries_leave_the_engine_unchang
         "def bad : Id PUnit := do for h : x in true do Pure.pure (f := Id) PUnit.unit",
         "def bad : Id PUnit := do for h : x in h do checkWitness 7 x h",
         "def bad : Id PUnit := do for _ : x in 7 do break",
-        "def bad : Id PUnit := do for h : x in 7 do return PUnit.unit",
+        // A loop body's `return` exits the whole block (74d3677e), so claiming
+        // the value after the loop is false.
+        "def r : Id Nat := do { for h : x in 7 do { return 5 }; return 9 }\ntheorem r9 : r = 9 := by rfl",
     ] {
         assert!(
             base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
@@ -147,6 +149,10 @@ fn invalid_witnesses_and_missing_dependent_dictionaries_leave_the_engine_unchang
     checked(
         &base,
         "def recovery : Id PUnit := do for h : x in 7 do checkWitness 7 x h",
+    );
+    checked(
+        &base,
+        "def r : Id Nat := do { for h : x in 7 do { return 5 }; return 9 }\ntheorem r5 : r = 5 := by rfl",
     );
 }
 
