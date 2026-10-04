@@ -195,7 +195,9 @@ jobs:
           # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
           # seventh is the per-frontend diagnostic projection differential. The eighth is
           # the complete CLI/Lake census differential, and the ninth joins the option,
-          # CLI/Lake, and LSP products through fresh real processes. All nine are
+          # CLI/Lake, and LSP products through fresh real processes. The tenth has the
+          # pinned leanchecker and lean consume a FrankenLean-written module that imports
+          # the Reference's Init (the mixed-producer seed, franken_lean-0nz). All ten are
           # compiled PinRig entries. Until this step the nine cited rows
           # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
           # ran no cargo, so the intersection was empty (bead fln-rgha).
@@ -234,6 +236,7 @@ jobs:
             --test cli_lake_census_no_mock_e2e \
             --test public_surface_no_mock_e2e \
             --test g0_4_no_mock_e2e \
+            --test olean_mixed_producer_no_mock_e2e \
             --test diag_render \
             -- --nocapture > "$log" 2>&1
           rc=$?
@@ -260,12 +263,12 @@ jobs:
           fi
           # These two floors answer only whether the command shape collapsed. They do not
           # carry execution evidence; the structured records above do.
-          if (( result_lines < 9 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 9 binaries reported a result" >&2
+          if (( result_lines < 10 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 10 binaries reported a result" >&2
             fail=1
           fi
-          if (( passed < 29 )); then
-            echo "rgha-join: REFUSED - only $passed tests ran (floor 29 after PublicSurface registration); a zero-test cargo success is not a run" >&2
+          if (( passed < 30 )); then
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 30 after mixed-producer registration); a zero-test cargo success is not a run" >&2
             fail=1
           fi
           (( fail )) && exit 2
