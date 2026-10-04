@@ -52,9 +52,11 @@ fn class_parents_are_real_instances_and_preserve_the_child_dictionary() {
 }
 #[test]
 fn inherited_fields_can_type_new_fields_and_defaults() {
+    // A numeral at `carrier` needs `OfNat e.carrier n`, which the pin cannot
+    // synthesize without unfolding `e`; valid source ascribes `Nat`.
     checked(
         &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\nstructure Extended extends Package where\n  extra : carrier\n  again : carrier := value\ndef p : Package := Package.mk Nat 23\ndef e : Extended := { toPackage := p, extra := 41 }\ntheorem original : e.value = 23 := by rfl\ntheorem default_ok : e.again = 23 := by rfl\ntheorem extra_ok : e.extra = 41 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\nstructure Extended extends Package where\n  extra : carrier\n  again : carrier := value\ndef p : Package := Package.mk Nat 23\ndef e : Extended := { toPackage := p, extra := (41 : Nat) }\ntheorem original : e.value = (23 : Nat) := by rfl\ntheorem default_ok : e.again = (23 : Nat) := by rfl\ntheorem extra_ok : e.extra = (41 : Nat) := by rfl",
     );
 }
 #[test]
@@ -95,9 +97,11 @@ fn dependent_parent_values_remain_tied_to_their_actual_carrier() {
         &engine(),
         "structure Package where\n  carrier : Type\n  value : carrier\nstructure Extended extends Package where\n  extra : carrier\ndef good : Extended := { carrier := Nat, value := 23, extra := 41 }",
     );
+    // `good.carrier` is not unfolded by instance search, so numerals there are
+    // ascribed, as valid source must be at the pin.
     checked(
         &base,
-        "theorem flat_ok : good.value = 23 := by rfl\ndef updated : Extended := { good with value := 7 }\ntheorem updated_ok : updated.value = 7 := by rfl",
+        "theorem flat_ok : good.value = (23 : Nat) := by rfl\ndef updated : Extended := { good with value := (7 : Nat) }\ntheorem updated_ok : updated.value = (7 : Nat) := by rfl",
     );
     let before = base.logical_root(&KVMap::new());
     for source in [

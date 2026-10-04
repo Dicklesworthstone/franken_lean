@@ -54,9 +54,11 @@ fn invalid_dependent_carryover_is_a_kernel_rejection_and_is_atomic() {
         "{refusal:?}"
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
+    // `OfNat p.carrier 9` fails at the pin (`p` is not unfolded by instance
+    // search); valid source ascribes the carrier.
     check(
         &base,
-        "def recovered := { p with value := 9 }\ntheorem ok : recovered.value = 9 := by rfl",
+        "def recovered := { p with value := (9 : Nat) }\ntheorem ok : recovered.value = (9 : Nat) := by rfl",
     );
 }
 #[test]
