@@ -121,6 +121,33 @@ fn locals_shadow_namespaces_and_root_escape_changes_the_declaration_namespace() 
     );
     assert!(!result.environment().contains(&n("A.rootValue")));
 }
+/// The pin matches a local only by the name as written, so `_root_.value` is the
+/// global even under a local `value`, while the bare name stays the local.
+#[test]
+fn root_qualified_names_skip_shadowing_locals_and_bare_names_do_not() {
+    let base = engine();
+    let result = checked(
+        &base,
+        "def value : Nat := 1\ndef use (value : Bool) : Nat := _root_.value\ntheorem use_ok : use true = 1 := by rfl",
+    );
+    assert!(result.environment().contains(&n("use_ok")));
+    let shadowed = base
+        .check_source_files(
+            &[b"def value : Nat := 1\ndef use (value : Bool) : Nat := value"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("the bare name is the Bool local");
+    // The pin refuses it while elaborating (type mismatch); either stage is a
+    // refusal of the Bool body, which is the point here.
+    assert!(
+        matches!(
+            shadowed.disposition(),
+            ("kernel-rejection", true, 1) | ("elaboration", false, 1)
+        ) && format!("{shadowed:?}").contains("Bool"),
+        "{shadowed:?}"
+    );
+}
 #[test]
 fn invalid_scopes_and_ambiguous_opens_never_publish_a_prefix() {
     let base = checked(

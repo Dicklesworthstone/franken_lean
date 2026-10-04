@@ -434,7 +434,9 @@ impl Context {
             let resolved = self
                 .resolve_source_name(name)?
                 .unwrap_or_else(|| name.clone());
-            if let Some(local) = self.txn.lctx.find_by_user_name(&resolved) {
+            if !scope::is_root_qualified(name)
+                && let Some(local) = self.txn.lctx.find_by_user_name(&resolved)
+            {
                 return Ok(Typed {
                     value: self
                         .matrix_aliases

@@ -77,6 +77,20 @@ pub fn components(name: &Name) -> Result<Vec<String>, ScopeError> {
     Ok(parts)
 }
 
+/// Whether `name` is written `_root_.…`. Such a name denotes a global: the
+/// pin matches a regular local only by the name as given (`matchLocalDecl?`,
+/// vendored `ResolveName.lean:466`), so `_root_.x` never reaches a local `x`.
+pub(super) fn is_root_qualified(name: &Name) -> bool {
+    if name.is_anonymous() {
+        return false;
+    }
+    let mut first = name.clone();
+    while !first.parent().is_anonymous() {
+        first = first.parent();
+    }
+    first == Name::from_components(["_root_"])
+}
+
 impl SourceScope {
     pub fn declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         let parts = components(name)?;
