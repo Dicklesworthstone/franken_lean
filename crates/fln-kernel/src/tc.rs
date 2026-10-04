@@ -2760,19 +2760,38 @@ impl<'a> TypeChecker<'a> {
                     {
                         break cached;
                     }
-                } else if let Some(cached) =
-                    self.whnf_cache
-                        .get(&current, &self.locals, &self.local_positions)
-                {
-                    // A successful inner projection can expose a field while
-                    // outer projections remain pending. Such a field needs
-                    // full WHNF (including delta), so reuse the separate full
-                    // cache here rather than the core-only cache above.
-                    match self.finish_pending_projs(cached, &mut pending_projs, &mut depth)? {
-                        PendingProj::Done(value) => break value,
-                        PendingProj::Continue(field) => {
-                            current = field;
-                            continue;
+                } else {
+                    // KR-204: a successful inner projection can expose a field
+                    // while outer projections remain pending. That field is the
+                    // next projection's structure, and the pin's non-cheap
+                    // `reduce_proj` (type_checker.cpp:396) takes the full `whnf`
+                    // of every structure, delta included. Only a projection or
+                    // mdata layer goes on to the arms below, which peel it on
+                    // the heap (reusing its full result when one is cached).
+                    // Leaving any other field to the core-only arms applied the
+                    // outer projection to an unreduced definition and stuck:
+                    // `Array.toList (List.foldr._f f init [] PUnit.unit)` under
+                    // a `List.length` recursion (Mathlib `sublists'_singleton`).
+                    let structure = if matches!(
+                        current.node(),
+                        ExprNode::Proj { .. } | ExprNode::MData { .. }
+                    ) {
+                        self.whnf_cache
+                            .get(&current, &self.locals, &self.local_positions)
+                    } else {
+                        Some(self.whnf(&current, depth + 1)?)
+                    };
+                    if let Some(structure) = structure {
+                        match self.finish_pending_projs(
+                            structure,
+                            &mut pending_projs,
+                            &mut depth,
+                        )? {
+                            PendingProj::Done(value) => break value,
+                            PendingProj::Continue(field) => {
+                                current = field;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -8098,6 +8117,100 @@ mod tests {
         assert!(
             cached_steps < uncached_steps,
             "an extracted field under another pending projection must reuse its exact live full-WHNF row ({cached_steps} !< {uncached_steps})"
+        );
+    }
+
+    /// KR-204 under pending projections, at the reducer itself. The pin's
+    /// non-cheap `reduce_proj` takes the full `whnf` of every projection's
+    /// structure, so a field exposed between two projections is delta-reduced
+    /// before the outer one applies; its cheap mode (the defeq pre-pass) takes
+    /// only `whnf_core` and leaves the same nest stuck at the first definition.
+    /// The cheap result must not reach the full cache either.
+    #[test]
+    fn full_whnf_core_delta_reduces_a_field_exposed_under_a_pending_projection() {
+        use fln_env::constants::{AxiomVal, ConstantVal, ConstructorVal, DefinitionVal};
+
+        let name = |s: &str| Name::str(Name::anonymous(), s);
+        let constant = |s: &str| Expr::const_(name(s), Vec::new());
+        let base = |s: &str| ConstantVal {
+            name: name(s),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        };
+        let constructor = |ctor: &str, induct: &str| {
+            ConstantInfo::Ctor(ConstructorVal {
+                base: base(ctor),
+                induct: name(induct),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            })
+        };
+        let definition = |def: &str, value: Expr| {
+            ConstantInfo::Defn(DefinitionVal {
+                base: base(def),
+                value,
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![name(def)],
+            })
+        };
+        let app = |f: &str, a: Expr| Expr::app(constant(f), a);
+        // Non-authoritative fixture metadata: whnf reads only constructor
+        // arities and definition values.
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: base("leaf"),
+                is_unsafe: false,
+            }))
+            .and_then(|env| env.add_decl(constructor("Outer.mk", "Outer")))
+            .and_then(|env| env.add_decl(constructor("Middle.mk", "Middle")))
+            .and_then(|env| env.add_decl(constructor("Inner.mk", "Inner")))
+            .and_then(|env| {
+                env.add_decl(definition("wrapOuter", app("Outer.mk", constant("leaf"))))
+            })
+            .and_then(|env| {
+                env.add_decl(definition(
+                    "wrapMiddle",
+                    app("Middle.mk", constant("wrapOuter")),
+                ))
+            })
+            .expect("fresh fixture names");
+        let nest = Expr::proj(
+            name("Outer"),
+            0,
+            Expr::proj(
+                name("Middle"),
+                0,
+                Expr::proj(name("Inner"), 0, app("Inner.mk", constant("wrapMiddle"))),
+            ),
+        );
+
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let cheap = tc
+            .whnf_core_for_defeq(&nest, 0)
+            .expect("the cheap pass normalizes");
+        assert!(
+            cheap
+                == Expr::proj(
+                    name("Outer"),
+                    0,
+                    Expr::proj(name("Middle"), 0, constant("wrapMiddle"))
+                ),
+            "the cheap mode performs no delta between projections: {}",
+            brief_expr(&cheap, 8)
+        );
+        let full = tc.whnf_core(&nest, 0).expect("the full pass normalizes");
+        assert!(
+            full == constant("leaf"),
+            "the full mode unfolds each exposed field before projecting it: {}",
+            brief_expr(&full, 8)
+        );
+        let mut fresh = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            fresh.whnf(&nest, 0).expect("whnf normalizes") == constant("leaf"),
+            "whnf agrees with the full whnf_core on a fresh checker"
         );
     }
 

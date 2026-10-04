@@ -1061,6 +1061,133 @@ fn kr204_projection_of_a_constructor_reduces_to_the_field() {
     );
 }
 
+/// KR-204 with an outer projection still pending. An inner projection's field
+/// is the next projection's structure, and the pin's non-cheap `reduce_proj`
+/// (vendor/lean4-src/src/kernel/type_checker.cpp:396) takes the full `whnf` of
+/// every structure, delta included. Here each exposed field is a DEFINITION
+/// whose value is a constructor, so the nest reaches `E.b` only by unfolding
+/// between projections. K1 used to unfold only the innermost scrutinee and
+/// applied the outer projection to the unreduced definition, which stuck. As a
+/// recursor major nothing retries that result, so the iota rule never fired.
+/// This is the shape behind the Mathlib rejections of
+/// `List.sublists'_singleton` (`Array.toList` of a `List.foldr._f` field under
+/// a `List.length` recursion) and `Equiv.Perm.signAux_swap_zero_one'`, both
+/// accepted by the pinned kernel.
+#[test]
+fn kr204_a_field_under_a_pending_projection_is_delta_reduced_before_projection() {
+    let env = add_enum_e_axioms(&add_enum_e(&Environment::new()));
+    let e = Expr::const_(n("E"), vec![]);
+    let e_a = Expr::const_(nn("E", "a"), vec![]);
+    let e_b = Expr::const_(nn("E", "b"), vec![]);
+    // Outer := ⟨E⟩, Middle := ⟨Outer⟩, Inner := ⟨Middle⟩.
+    let env = add_structure(&env, "Outer", "Outer.mk", sort1(), std::slice::from_ref(&e));
+    let outer = Expr::const_(n("Outer"), vec![]);
+    let env = add_structure(
+        &env,
+        "Middle",
+        "Middle.mk",
+        sort1(),
+        std::slice::from_ref(&outer),
+    );
+    let middle = Expr::const_(n("Middle"), vec![]);
+    let env = add_structure(
+        &env,
+        "Inner",
+        "Inner.mk",
+        sort1(),
+        std::slice::from_ref(&middle),
+    );
+    let ctor_app = |ctor: &str, field: Expr| Expr::app(Expr::const_(n(ctor), vec![]), field);
+    // wrapOuter : Outer := Outer.mk E.b; wrapMiddle : Middle := Middle.mk wrapOuter.
+    let env = admit(
+        &env,
+        &defn("wrapOuter", outer, ctor_app("Outer.mk", e_b.clone())),
+    );
+    let wrap_outer = Expr::const_(n("wrapOuter"), vec![]);
+    let env = admit(
+        &env,
+        &defn(
+            "wrapMiddle",
+            middle,
+            ctor_app("Middle.mk", wrap_outer.clone()),
+        ),
+    );
+    let wrap_middle = Expr::const_(n("wrapMiddle"), vec![]);
+
+    // One pending layer: `(Middle.mk wrapOuter).0.0` exposes `wrapOuter`
+    // under `.0`. Two: `(Inner.mk wrapMiddle).0.0.0` exposes `wrapMiddle`,
+    // then `wrapOuter`, each under a further pending projection.
+    let one_pending = Expr::proj(
+        n("Outer"),
+        0,
+        Expr::proj(n("Middle"), 0, ctor_app("Middle.mk", wrap_outer)),
+    );
+    let two_pending = Expr::proj(
+        n("Outer"),
+        0,
+        Expr::proj(
+            n("Middle"),
+            0,
+            Expr::proj(n("Inner"), 0, ctor_app("Inner.mk", wrap_middle)),
+        ),
+    );
+
+    // `select x := E.rec (fun _ => E) E.a E.b x`, which is `E.b` exactly when
+    // its major reduces to `E.b`.
+    let select = |major: Expr| {
+        let mut app = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+        for arg in [
+            Expr::lam(n("_"), e.clone(), e.clone(), BinderInfo::Default),
+            e_a.clone(),
+            e_b.clone(),
+            major,
+        ] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let m_of = |arg: Expr| Expr::app(Expr::const_(n("M"), vec![]), arg);
+    let ca = Expr::const_(n("ca"), vec![]);
+    let cb = Expr::const_(n("cb"), vec![]);
+
+    for (label, major) in [("one pending", one_pending), ("two pending", two_pending)] {
+        assert!(
+            check_def_eq(&env, &[], &select(major.clone()), &e_b, Budget::DEFAULT).is_accepted(),
+            "{label}: the recursor major reduces to E.b, so iota fires"
+        );
+        assert_eq!(
+            reject_class(&check_def_eq(
+                &env,
+                &[],
+                &select(major.clone()),
+                &e_a,
+                Budget::DEFAULT
+            )),
+            Some(RejectClass::NotDefEq),
+            "{label}: the reduced major is E.b, never E.a"
+        );
+        // Declaration level, the Mathlib failure class: `cb : M E.b` checks
+        // against the declared `M (select major)` only through that iota.
+        let verdict = check(
+            &env,
+            &defn("viaPending", m_of(select(major.clone())), cb.clone()),
+            Budget::DEFAULT,
+        );
+        assert!(verdict.is_accepted(), "{label}: {verdict:?}");
+        // The false equation at the other minor stays rejected.
+        let wrong = check(
+            &env,
+            &defn("viaPendingWrong", m_of(select(major)), ca.clone()),
+            Budget::DEFAULT,
+        );
+        assert_eq!(
+            reject_class(&wrong),
+            Some(RejectClass::DefinitionTypeMismatch),
+            "{label}: `ca : M E.a` must not check against `M E.b` — {wrong:?}"
+        );
+    }
+}
+
 #[test]
 fn kr202_over_applied_lambda_beta_reduces_and_reapplies() {
     // ((fun (x : Sort 1) => x) A) is `A` after beta; applied to an extra arg the
