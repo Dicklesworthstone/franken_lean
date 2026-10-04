@@ -66,8 +66,8 @@ fn sort_coercions_elaborate_bundled_type_annotations() {
   carrier : Type
 instance bundled : CoeSort Bundle Type := CoeSort.mk (fun b => b.carrier)
 def numbers : Bundle := Bundle.mk Nat
-def number : numbers := 7
-theorem works : number = 7 := by rfl"#,
+def number : numbers := (7 : Nat)
+theorem works : number = (7 : Nat) := by rfl"#,
     );
 }
 
