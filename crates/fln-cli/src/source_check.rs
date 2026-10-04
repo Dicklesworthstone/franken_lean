@@ -106,7 +106,8 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
     // Imports read bounded local snapshots; no global streams or cwd are changed.
     let worker = std::thread::Builder::new()
         .name("fln-source-check".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        // Imports are admitted on this thread under the `.olean` depth budget.
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
             let loaded = match imports::load(&paths, sources, total, max_bytes) {
                 Ok(loaded) => loaded,
@@ -122,6 +123,9 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
                     Err(imports::Failure::new(class, &error.to_string(), authority, exit))
                 }
             };
+            if let Err(error) = loaded.preflight() {
+                return failed(error.class, &error.detail, error.authority, json, error.exit);
+            }
             let (engine, olean_base) = match loaded.base_engine(seed) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),

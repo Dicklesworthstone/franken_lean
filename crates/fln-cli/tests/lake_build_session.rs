@@ -215,3 +215,28 @@ fn changing_external_roots_replaces_the_bound_import_world_without_name_leakage(
     failure(package.build(&["+Lib.First:olean", "+Lib.Second:olean"], Some(&search)));
     assert_eq!(package.artifact("Lib.Second"), before);
 }
+
+/// A module that cannot parse is refused before its implicit `Init` import is
+/// resolved or admitted (bead `fln-parse-before-imports-j8p6`). With an empty
+/// search path the refusal is the parse error; a parseable module still reaches
+/// the import, so the preflight cannot be skipping the import step.
+#[test]
+fn an_unparseable_module_is_refused_before_its_imports_are_resolved() {
+    let package = Package::new("Demo");
+    package.write("Demo/Basic.lean", "this is not lean @@@ garbage\n");
+    let garbage = package.build(&["+Demo.Basic:olean"], None);
+    let stderr = String::from_utf8_lossy(&garbage.stderr).into_owned();
+    failure(garbage);
+    assert!(stderr.contains("parse refused source"), "{stderr}");
+    assert!(!stderr.contains("is neither a source file"), "{stderr}");
+
+    package.write("Demo/Basic.lean", "def answer : Nat := 6 * 7\n");
+    let parseable = package.build(&["+Demo.Basic:olean"], None);
+    let stderr = String::from_utf8_lossy(&parseable.stderr).into_owned();
+    failure(parseable);
+    assert!(
+        stderr.contains("import `Init` is neither a source file"),
+        "{stderr}"
+    );
+    assert!(!package.output_dir().exists());
+}

@@ -46,9 +46,11 @@ pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 
 /// Native stack provided to the kernel worker used by both source front doors.
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
-/// Stack (and so kernel depth budget) for every `check-olean` thread: the
-/// single artifact, the strict module set, and the frontier's coordinator and
-/// workers. Stdlib proofs nest deeper than a source run's 2 MiB allows:
+/// Stack (and so kernel depth budget) for every thread that admits `.olean`
+/// declarations: `check-olean`'s single artifact, strict module set, and
+/// frontier coordinator and workers, and the `.olean` import closures that
+/// `check-source` and `lake build` admit before checking source. Stdlib proofs
+/// nest deeper than a source run's 2 MiB allows:
 /// `Init.Data.Char.Ordinal` stopped at depth 1,588 against 1,587 in the S9
 /// frontier, while the per-declaration probe with a 64 MiB budget admits all
 /// 91 of its declarations.

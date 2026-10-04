@@ -85,58 +85,72 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        if let Some(members) = fln_parse::command_scope::mutual::parse(source)
-            .map_err(DefinitionFrontendError::Parse)
-            .map_err(EngineExecutionError::Frontend)?
-        {
-            let candidate = if members.len() == 1 {
-                fln_elab::source::scope::elaborate_inductive(
-                    &members[0],
-                    self.environment(),
-                    limits.kernel,
-                    fln_elab::records::RecordBudget::default(),
-                    scope,
-                )
-            } else {
-                fln_elab::source::scope::elaborate_mutual_inductives(
-                    &members,
-                    self.environment(),
-                    limits.kernel,
-                    fln_elab::records::RecordBudget::default(),
-                    scope,
-                )
+        let parsed = match parse_scoped_command(source)? {
+            ScopedCommandSyntax::Mutual(members) => {
+                return self.admit_scoped_inductives(&members, options, limits, scope);
             }
-            .map_err(DefinitionFrontendError::Elaborate)
-            .map_err(EngineExecutionError::Frontend)?;
-            return self
-                .admit_declarations(&[candidate], options, limits)
-                .map_err(EngineExecutionError::from);
+            ScopedCommandSyntax::Example(parsed) => {
+                return Ok(
+                    match self
+                        .check_parsed_source_command_in_scope(parsed, options, limits, 0, scope)?
+                    {
+                        Outcome::Complete(_) => {
+                            let root = self.logical_root(options);
+                            Outcome::Complete(DeclarationBatchAdmission {
+                                engine: self.clone(),
+                                base_logical_root: root,
+                                result_logical_root: root,
+                                admissions: Vec::new(),
+                            })
+                        }
+                        Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                    },
+                );
+            }
+            ScopedCommandSyntax::Definition(parsed) => parsed,
+        };
+        self.admit_scoped_definition(source, parsed, options, limits, scope)
+    }
+
+    fn admit_scoped_inductives(
+        &self,
+        members: &[fln_syntax::tree::Syntax],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let candidate = if members.len() == 1 {
+            fln_elab::source::scope::elaborate_inductive(
+                &members[0],
+                self.environment(),
+                limits.kernel,
+                fln_elab::records::RecordBudget::default(),
+                scope,
+            )
+        } else {
+            fln_elab::source::scope::elaborate_mutual_inductives(
+                members,
+                self.environment(),
+                limits.kernel,
+                fln_elab::records::RecordBudget::default(),
+                scope,
+            )
         }
-        let parsed = fln_parse::parse_definition(source)
-            .map_err(DefinitionFrontendError::Parse)
-            .map_err(EngineExecutionError::Frontend)?;
-        if fln_elab::source::scope::is_example(parsed.syntax()) {
-            let parsed = fln_parse::parse_source_command(source)
-                .map_err(DefinitionFrontendError::Parse)
-                .map_err(EngineExecutionError::Frontend)?;
-            return Ok(
-                match self
-                    .check_parsed_source_command_in_scope(parsed, options, limits, 0, scope)?
-                {
-                    Outcome::Complete(_) => {
-                        let root = self.logical_root(options);
-                        Outcome::Complete(DeclarationBatchAdmission {
-                            engine: self.clone(),
-                            base_logical_root: root,
-                            result_logical_root: root,
-                            admissions: Vec::new(),
-                        })
-                    }
-                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-                },
-            );
-        }
+        .map_err(DefinitionFrontendError::Elaborate)
+        .map_err(EngineExecutionError::Frontend)?;
+        self.admit_declarations(&[candidate], options, limits)
+            .map_err(EngineExecutionError::from)
+    }
+
+    fn admit_scoped_definition(
+        &self,
+        source: &[u8],
+        parsed: fln_parse::ParsedDefinition,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         if fln_elab::source::is_inductive(parsed.syntax()) {
             let candidate = fln_elab::source::scope::elaborate_inductive(
                 parsed.syntax(),
@@ -307,4 +321,39 @@ impl Engine {
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         })
     }
+}
+
+/// The syntax of one command on the checked source path.
+pub(crate) enum ScopedCommandSyntax {
+    /// A complete `mutual` group (or a lone inductive inside one).
+    Mutual(Vec<fln_syntax::tree::Syntax>),
+    /// An `example`, checked and discarded.
+    Example(fln_parse::ParsedSourceCommand),
+    /// Every other declaration command.
+    Definition(fln_parse::ParsedDefinition),
+}
+
+/// Parse one command exactly as [`Engine::admit_source_command_in_scope`] does,
+/// consulting the parsers in the same order. Every parser here reads only the
+/// command's bytes, which is what lets [`crate::source_check::preflight_source_files`]
+/// run this before any environment exists.
+pub(crate) fn parse_scoped_command(
+    source: &[u8],
+) -> Result<ScopedCommandSyntax, EngineExecutionError> {
+    if let Some(members) = fln_parse::command_scope::mutual::parse(source)
+        .map_err(DefinitionFrontendError::Parse)
+        .map_err(EngineExecutionError::Frontend)?
+    {
+        return Ok(ScopedCommandSyntax::Mutual(members));
+    }
+    let parsed = fln_parse::parse_definition(source)
+        .map_err(DefinitionFrontendError::Parse)
+        .map_err(EngineExecutionError::Frontend)?;
+    if fln_elab::source::scope::is_example(parsed.syntax()) {
+        let parsed = fln_parse::parse_source_command(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        return Ok(ScopedCommandSyntax::Example(parsed));
+    }
+    Ok(ScopedCommandSyntax::Definition(parsed))
 }

@@ -115,7 +115,7 @@ impl Loaded {
             .collect();
         let limits = fln::OleanCheckLimits::new(
             MAX_OLEAN_BYTES,
-            fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+            fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
         );
         let checked = fln::Engine::from_environment(fln::Environment::new())
             .import_olean_modules_for_source(
@@ -159,6 +159,39 @@ impl Loaded {
                 authority: false,
                 exit: 4,
             }),
+        }
+    }
+
+    /// Refuse unparseable source before any import is admitted, with the error
+    /// [`Self::check`] would report (`fln::source_check::preflight_source_files`).
+    pub(super) fn preflight(&self) -> Result<(), Failure> {
+        match &self.inputs {
+            Inputs::Files(sources) => {
+                let inputs: Vec<_> = sources.iter().map(Vec::as_slice).collect();
+                fln::source_check::preflight_source_files(&inputs).map_err(|error| {
+                    let (class, authority, exit) = error.disposition();
+                    Failure {
+                        class,
+                        authority,
+                        exit,
+                        detail: error.to_string(),
+                    }
+                })
+            }
+            Inputs::Modules { names, sources } => {
+                for (name, source) in names.iter().zip(sources) {
+                    fln::source_check::preflight_source_module(name, source).map_err(|error| {
+                        let (class, authority, exit) = error.disposition();
+                        Failure {
+                            class,
+                            authority,
+                            exit,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                }
+                Ok(())
+            }
         }
     }
 

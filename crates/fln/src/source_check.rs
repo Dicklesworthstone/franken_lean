@@ -203,16 +203,7 @@ impl Engine {
         let mut final_scope = fln_elab::source::scope::SourceScope::default();
         for (file, source) in sources.iter().enumerate() {
             let mut scopes = scopes::Scopes::new(engine.environment());
-            let commands = fln_parse::command_scope::partition(source).map_err(|error| {
-                SourceCheckError::Command {
-                    file,
-                    command: count,
-                    offset: error.primary_offset().map_or(0, |at| at.0),
-                    error: Box::new(EngineExecutionError::Frontend(
-                        DefinitionFrontendError::Parse(error),
-                    )),
-                }
-            })?;
+            let commands = partition_commands(source, file, count)?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
                 return Err(SourceCheckError::Limit {
                     resource: "commands",
@@ -220,18 +211,7 @@ impl Engine {
                 });
             }
             for (start, command) in commands {
-                let control = fln_parse::command_scope::parse(command).map_err(|error| {
-                    SourceCheckError::Command {
-                        file,
-                        command: count,
-                        offset: start
-                            .0
-                            .saturating_add(error.primary_offset().map_or(0, |at| at.0)),
-                        error: Box::new(EngineExecutionError::Frontend(
-                            DefinitionFrontendError::Parse(error),
-                        )),
-                    }
-                })?;
+                let control = parse_control_command(command, start, file, count)?;
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
@@ -333,14 +313,7 @@ impl Engine {
                         limits.admission,
                         &scopes.current,
                     )
-                    .map_err(|error| SourceCheckError::Command {
-                        file,
-                        command: count,
-                        offset: start
-                            .0
-                            .saturating_add(error.primary_source_offset().map_or(0, |at| at.0)),
-                        error: Box::new(error),
-                    })?;
+                    .map_err(|error| command_error(file, count, start, error))?;
                 let admitted = match result {
                     Outcome::Complete(admitted) => admitted,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -371,5 +344,116 @@ impl Engine {
             base_logical_root,
             scope: final_scope,
         }))
+    }
+}
+
+/// Refuse a source batch that no environment could make parseable, before any
+/// environment exists.
+///
+/// Runs every parser [`Engine::check_source_files`] runs, in the same order
+/// and with the same error construction, and skips only elaboration. Each of
+/// those parsers reads nothing but the command's bytes, so a refusal here is
+/// the refusal the checked path reaches, with the same error. Success proves
+/// nothing about elaboration. The checked path elaborates as it goes, so when
+/// an earlier command fails elaboration and a later one fails to parse, it
+/// reports the elaboration failure while this reports the parse failure;
+/// either way the batch is refused.
+///
+/// Front doors call this before admitting an import closure, so malformed
+/// source is refused before any `.olean` is read or checked.
+pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError> {
+    let mut count = 0;
+    for (file, source) in sources.iter().enumerate() {
+        for (start, command) in partition_commands(source, file, count)? {
+            match parse_control_command(command, start, file, count)? {
+                Some(fln_parse::command_scope::ScopeCommand::Trivia) => continue,
+                Some(_) => {}
+                None => {
+                    crate::source_records::parse_scoped_command(command)
+                        .map_err(|error| command_error(file, count, start, error))?;
+                }
+            }
+            count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// [`preflight_source_files`] for one source module, reporting header and body
+/// failures, and body positions relative to the whole module, exactly as
+/// [`Engine::check_source_modules`] does.
+pub fn preflight_source_module(
+    module: &Name,
+    source: &[u8],
+) -> Result<(), modules::SourceModuleCheckError> {
+    let header = modules::parse_source_header(source).map_err(|error| {
+        modules::SourceModuleCheckError::Header {
+            module: module.clone(),
+            error,
+        }
+    })?;
+    let body = &source[header.body_start.0..];
+    if body.is_empty() {
+        return Ok(());
+    }
+    preflight_source_files(&[body]).map_err(|mut error| {
+        if let SourceCheckError::Scope { offset, .. } | SourceCheckError::Command { offset, .. } =
+            &mut error
+        {
+            *offset = offset.saturating_add(header.body_start.0);
+        }
+        modules::SourceModuleCheckError::Source {
+            module: module.clone(),
+            error,
+        }
+    })
+}
+
+fn partition_commands(
+    source: &[u8],
+    file: usize,
+    count: usize,
+) -> Result<Vec<(fln_parse::BytePos, &[u8])>, SourceCheckError> {
+    fln_parse::command_scope::partition(source).map_err(|error| SourceCheckError::Command {
+        file,
+        command: count,
+        offset: error.primary_offset().map_or(0, |at| at.0),
+        error: Box::new(EngineExecutionError::Frontend(
+            DefinitionFrontendError::Parse(error),
+        )),
+    })
+}
+
+fn parse_control_command(
+    command: &[u8],
+    start: fln_parse::BytePos,
+    file: usize,
+    count: usize,
+) -> Result<Option<fln_parse::command_scope::ScopeCommand>, SourceCheckError> {
+    fln_parse::command_scope::parse(command).map_err(|error| SourceCheckError::Command {
+        file,
+        command: count,
+        offset: start
+            .0
+            .saturating_add(error.primary_offset().map_or(0, |at| at.0)),
+        error: Box::new(EngineExecutionError::Frontend(
+            DefinitionFrontendError::Parse(error),
+        )),
+    })
+}
+
+fn command_error(
+    file: usize,
+    count: usize,
+    start: fln_parse::BytePos,
+    error: EngineExecutionError,
+) -> SourceCheckError {
+    SourceCheckError::Command {
+        file,
+        command: count,
+        offset: start
+            .0
+            .saturating_add(error.primary_source_offset().map_or(0, |at| at.0)),
+        error: Box::new(error),
     }
 }

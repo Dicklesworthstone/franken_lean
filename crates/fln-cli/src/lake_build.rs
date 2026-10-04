@@ -330,6 +330,18 @@ fn compile(
         SOURCE_RUN_KERNEL_STACK_BYTES,
     ));
     let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
+    // Refuse unparseable source before any import closure is admitted; that
+    // admission is the expensive step, and a parse refusal needs no environment.
+    for (name, module) in modules {
+        fln::source_check::preflight_source_module(name, &module.source).map_err(|error| {
+            let (class, authority, _) = error.disposition();
+            Failure {
+                class,
+                detail: error.to_string(),
+                authority,
+            }
+        })?;
+    }
     let mut artifact_bytes = 0usize;
     for entry in entries {
         let mut closure = BTreeSet::new();
@@ -586,7 +598,8 @@ fn build(
 pub(super) fn run(directory: PathBuf, targets: Vec<String>, json: bool) -> MultiplexerOutput {
     let worker = std::thread::Builder::new()
         .name("fln-lake-build".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        // Imports are admitted on this thread under the `.olean` depth budget.
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || build(directory, targets, json));
     match worker {
         Ok(worker) => match worker.join() {
