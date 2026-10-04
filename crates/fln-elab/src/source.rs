@@ -167,6 +167,20 @@ struct SourceEquation {
     policy: EquationPolicy,
 }
 
+/// What a non-final flush saw when it last stopped without progress. The
+/// solver is deterministic, so a later flush over the same equations, under the
+/// same metavariable and universe assignments and in the same local context,
+/// defers in exactly the same way; replaying it only spends heartbeats. The
+/// assignments are compared, not counted, since one can be replaced in place.
+/// Rollback restores this with the rest of the context.
+#[derive(Clone)]
+struct StalledFlush {
+    mvar_assignments: std::collections::HashMap<MVarId, crate::mvar::MetavarAssignment>,
+    universe_assignments: std::collections::HashMap<LMVarId, Level>,
+    lctx: crate::lctx::LocalContext,
+    equations: Vec<((Expr, Expr), EquationPolicy)>,
+}
+
 impl SourceEquation {
     fn inference(left: Expr, right: Expr) -> Self {
         Self {
@@ -209,6 +223,7 @@ struct Context {
     kernel: Budget,
     next: u64,
     equations: Vec<SourceEquation>,
+    stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
     level_params: Vec<Name>,
     explicit_levels: usize,
@@ -240,6 +255,7 @@ impl Context {
             kernel,
             next: 0,
             equations: Vec::new(),
+            stalled_flush: None,
             instance_goals: Vec::new(),
             level_params: Vec::new(),
             explicit_levels: 0,
@@ -617,6 +633,9 @@ impl Context {
     }
 
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
+        if !final_pass && self.flush_is_stalled() {
+            return Ok(());
+        }
         loop {
             if self.equations.is_empty() {
                 return Ok(());
@@ -703,10 +722,40 @@ impl Context {
                         deferred,
                     ))))
                 } else {
+                    self.stalled_flush = Some(StalledFlush {
+                        mvar_assignments: self.txn.mvars.assignments().clone(),
+                        universe_assignments: self.txn.universes.assignments().clone(),
+                        lctx: self.txn.lctx.clone(),
+                        equations: self
+                            .equations
+                            .iter()
+                            .map(|equation| (equation.sides.clone(), equation.policy))
+                            .collect(),
+                    });
                     Ok(())
                 };
             }
         }
+    }
+
+    /// Whether the pending equations are exactly those a previous non-final
+    /// flush left deferred, with no assignment and no local-context change
+    /// since. Each replay re-runs the joint batch and every individual retry,
+    /// so without this a stuck equation is re-solved after every later
+    /// constraint and drains the transaction's heartbeats.
+    fn flush_is_stalled(&self) -> bool {
+        let Some(stalled) = &self.stalled_flush else {
+            return false;
+        };
+        stalled.equations.len() == self.equations.len()
+            && &stalled.mvar_assignments == self.txn.mvars.assignments()
+            && &stalled.universe_assignments == self.txn.universes.assignments()
+            && stalled.lctx == self.txn.lctx
+            && stalled
+                .equations
+                .iter()
+                .zip(&self.equations)
+                .all(|(seen, now)| seen.0 == now.sides && seen.1 == now.policy)
     }
 
     fn insert_implicits(
