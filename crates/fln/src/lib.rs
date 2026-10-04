@@ -730,12 +730,12 @@ pub fn olean_module_imports(
 /// The private part supplies the authoritative constant array used by Lean's
 /// `import all` path, including definition bodies and private equation-compiler
 /// auxiliaries. The server and private regions are parsed in their original
-/// compacted address spaces, walked through their dependency-aware object
-/// graphs, and declaration-decoded before any result is returned. The shared
-/// runtime's full-surface auditor is single-region, so it audits the exported
-/// part only; extending that auditor across dependency regions remains a
-/// separate integrity obligation. This function does not resolve imports or
-/// admit any declaration into an [`Engine`].
+/// compacted address spaces, given the shared runtime's full-surface audit in
+/// that same address space (every object, reachable or not, with pointers
+/// allowed to land in the earlier parts), walked through their
+/// dependency-aware object graphs, and declaration-decoded before any result
+/// is returned. This function does not resolve imports or admit any
+/// declaration into an [`Engine`].
 pub fn decode_olean_module_artifacts(
     artifact: &[u8],
     server_artifact: &[u8],
@@ -786,6 +786,12 @@ pub fn decode_olean_module_artifacts(
         return Err(OleanDecodeError::CompanionHeaderMismatch { part: server_part });
     }
     server_view
+        .shared_audit()
+        .map_err(|error| OleanDecodeError::CompanionRegion {
+            part: server_part,
+            error,
+        })?;
+    server_view
         .walk(limits.graph)
         .map_err(|error| OleanDecodeError::CompanionRegion {
             part: server_part,
@@ -814,6 +820,12 @@ pub fn decode_olean_module_artifacts(
     if !same_identity(&private_view.header) {
         return Err(OleanDecodeError::CompanionHeaderMismatch { part: private_part });
     }
+    private_view
+        .shared_audit()
+        .map_err(|error| OleanDecodeError::CompanionRegion {
+            part: private_part,
+            error,
+        })?;
     let walk =
         private_view
             .walk(limits.graph)

@@ -245,6 +245,160 @@ fn opaque_capture_refuses_foreign_interior_forward_and_overlapping_regions() {
     ));
 }
 
+/// The full-surface audit for one part of a multi-region image (a module-system
+/// `.olean.server`/`.olean.private`): the pointer-range law widens to the named
+/// predecessors and NOTHING else does. Ported from FoggyForge's unlanded
+/// `5ef97779`, adapted to the existing fault vocabulary.
+#[test]
+fn audit_with_dependencies_widens_only_the_pointer_range_law() {
+    use fln_rt::region::{RegionDependency, audit, audit_with_dependencies};
+    let _g = lock();
+    let earlier = compact(&Obj::mk_string("shared earlier leaf"), BASE_B).unwrap();
+    let earlier_root = u64::from_le_bytes(earlier[..8].try_into().unwrap());
+    let earlier_dependency = RegionDependency {
+        base: BASE_B,
+        len: earlier.len(),
+    };
+    let plain = compact(&Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]), BASE_A).unwrap();
+    let mut later = plain.clone();
+    later[16..24].copy_from_slice(&earlier_root.to_le_bytes());
+
+    // The single-region audit must refuse the cross-region child — otherwise the
+    // dependency-aware entry would be widening nothing.
+    assert!(matches!(
+        audit(&later, BASE_A),
+        Err(RegionFault::PtrOutOfBounds { offset: 16, .. })
+    ));
+    let report = audit_with_dependencies(&later, BASE_A, &[earlier_dependency])
+        .expect("a child in the named predecessor is in bounds");
+    assert_eq!(report, audit(&plain, BASE_A).unwrap());
+
+    // No dependencies is exactly `audit`, on a graph exercising every category.
+    let every_category = compact(&sample_graph(), BASE_A).unwrap();
+    assert_eq!(
+        audit_with_dependencies(&every_category, BASE_A, &[]),
+        audit(&every_category, BASE_A)
+    );
+
+    // A dependency admits pointers into ITS payload only, still word-aligned.
+    for (pointer, misaligned) in [
+        (earlier_root + 2, true),
+        (BASE_B + earlier.len() as u64, false),
+        (BASE_B - 8, false),
+        (BASE_A + 0x10000, false),
+    ] {
+        let mut corrupt = later.clone();
+        corrupt[16..24].copy_from_slice(&pointer.to_le_bytes());
+        let outcome = audit_with_dependencies(&corrupt, BASE_A, &[earlier_dependency]);
+        if misaligned {
+            assert_eq!(
+                outcome,
+                Err(RegionFault::MisalignedPtr {
+                    offset: 16,
+                    ptr: pointer
+                })
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                Err(RegionFault::PtrOutOfBounds {
+                    offset: 16,
+                    ptr: pointer
+                }),
+                "child {pointer:#x} lies outside every named region"
+            );
+        }
+    }
+
+    // The dependency list is input: validated with the current region's own faults.
+    for (dependency, expected) in [
+        (
+            RegionDependency {
+                base: BASE_B + 4,
+                len: earlier.len(),
+            },
+            RegionFault::MisalignedBase { base: BASE_B + 4 },
+        ),
+        (
+            RegionDependency {
+                base: BASE_B,
+                len: earlier.len() - 1,
+            },
+            RegionFault::RaggedPayload {
+                len: earlier.len() - 1,
+            },
+        ),
+        (
+            RegionDependency {
+                base: BASE_B,
+                len: 0,
+            },
+            RegionFault::RaggedPayload { len: 0 },
+        ),
+        (
+            RegionDependency {
+                base: BASE_A,
+                len: 8,
+            },
+            RegionFault::BuildShape {
+                reason: "dependency region address ranges overlap",
+            },
+        ),
+        (
+            RegionDependency {
+                base: u64::MAX - 7,
+                len: 16,
+            },
+            RegionFault::BuildShape {
+                reason: "dependency region address range overflows",
+            },
+        ),
+    ] {
+        assert_eq!(
+            audit_with_dependencies(&later, BASE_A, &[dependency]),
+            Err(expected),
+            "{dependency:?}"
+        );
+    }
+    let overlapping = RegionDependency {
+        base: BASE_B + 8,
+        len: earlier.len(),
+    };
+    assert_eq!(
+        audit_with_dependencies(&later, BASE_A, &[earlier_dependency, overlapping]),
+        Err(RegionFault::BuildShape {
+            reason: "dependency region address ranges overlap"
+        })
+    );
+    // Supplied order is not an observable: two disjoint predecessors in either order.
+    let unrelated = compact(&Obj::mk_string("unrelated"), BASE_B + 0x10000).unwrap();
+    let unrelated_dependency = RegionDependency {
+        base: BASE_B + 0x10000,
+        len: unrelated.len(),
+    };
+    assert_eq!(
+        audit_with_dependencies(&later, BASE_A, &[earlier_dependency, unrelated_dependency]),
+        Ok(report)
+    );
+    assert_eq!(
+        audit_with_dependencies(&later, BASE_A, &[unrelated_dependency, earlier_dependency]),
+        Ok(report)
+    );
+
+    // Object-local laws do not widen: an mpz limb pointer aimed into a named
+    // predecessor is still refused.
+    let mut mpz = compact(&Obj::mk_mpz(&[3, 5], false), BASE_A).unwrap();
+    let mpz_root = u64::from_le_bytes(mpz[..8].try_into().unwrap());
+    let mpz_offset = usize::try_from(mpz_root - BASE_A).unwrap();
+    audit_with_dependencies(&mpz, BASE_A, &[earlier_dependency])
+        .expect("the uncorrupted mpz audits");
+    mpz[mpz_offset + 16..mpz_offset + 24].copy_from_slice(&earlier_root.to_le_bytes());
+    assert_eq!(
+        audit_with_dependencies(&mpz, BASE_A, &[earlier_dependency]),
+        Err(RegionFault::MpzIntegrity { offset: mpz_offset })
+    );
+}
+
 #[test]
 fn opaque_subgraph_capture_excludes_unreachable_objects_and_refuses_bad_roots() {
     use fln_rt::region::SubgraphCapture;

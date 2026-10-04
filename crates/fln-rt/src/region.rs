@@ -648,6 +648,83 @@ fn checked_rel(buf: &[u8], field: usize, from: u64, len: usize) -> RResult<Optio
     Ok(Some(rel))
 }
 
+/// [`checked_rel`] widened for [`audit_with_dependencies`]: a pointer inside
+/// the current payload is judged by [`checked_rel`] unchanged (so an empty
+/// dependency list is exactly [`audit`]'s law), and only a pointer outside it
+/// may instead land, word-aligned, inside one predecessor's payload.
+fn checked_rel_with_dependencies(
+    buf: &[u8],
+    field: usize,
+    base: u64,
+    len: usize,
+    dependencies: &[RegionDependency],
+) -> RResult<()> {
+    let v = read_u64(buf, field);
+    if dependencies.is_empty() || is_scalar_word(v) || v.wrapping_sub(base) < len as u64 {
+        return checked_rel(buf, field, base, len).map(|_| ());
+    }
+    for dependency in dependencies {
+        let rel = v.wrapping_sub(dependency.base);
+        if rel < dependency.len as u64 {
+            if !rel.is_multiple_of(8) {
+                return Err(RegionFault::MisalignedPtr {
+                    offset: field,
+                    ptr: v,
+                });
+            }
+            return Ok(());
+        }
+    }
+    Err(RegionFault::PtrOutOfBounds {
+        offset: field,
+        ptr: v,
+    })
+}
+
+/// The dependency-list law of [`audit_with_dependencies`]: every predecessor
+/// payload is word-aligned and non-empty, and no two address ranges — the
+/// predecessors' and the current payload's — overlap, so a stored pointer can
+/// resolve into at most one region.
+fn validate_dependencies(base: u64, len: usize, dependencies: &[RegionDependency]) -> RResult<()> {
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    let mut ranges = Vec::with_capacity(dependencies.len() + 1);
+    for dependency in dependencies {
+        if !dependency.base.is_multiple_of(8) {
+            return Err(RegionFault::MisalignedBase {
+                base: dependency.base,
+            });
+        }
+        if dependency.len == 0 || !dependency.len.is_multiple_of(8) {
+            return Err(RegionFault::RaggedPayload {
+                len: dependency.len,
+            });
+        }
+        let end =
+            dependency
+                .base
+                .checked_add(dependency.len as u64)
+                .ok_or(RegionFault::BuildShape {
+                    reason: "dependency region address range overflows",
+                })?;
+        ranges.push((dependency.base, end));
+    }
+    let end = base
+        .checked_add(len as u64)
+        .ok_or(RegionFault::BuildShape {
+            reason: "region address range overflows",
+        })?;
+    ranges.push((base, end));
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(RegionFault::BuildShape {
+            reason: "dependency region address ranges overlap",
+        });
+    }
+    Ok(())
+}
+
 /// The mpz limb-pointer law shared by [`relocate`], [`audit`], and
 /// [`materialize`]: the pin's compactor copies live limbs immediately
 /// after the object and rewrites the one pointer to that address. A
@@ -736,18 +813,58 @@ pub fn relocate(buf: &mut [u8], from: u64, to: u64) -> RResult<RegionReport> {
 /// §6.4 shared-code-path law). `base` is the payload's current pointer
 /// base; the report's `pointers_fixed` is always 0.
 pub fn audit(buf: &[u8], base: u64) -> RResult<RegionReport> {
+    audit_with_dependencies(buf, base, &[])
+}
+
+/// One earlier compacted region that a payload's stored pointers may name.
+///
+/// `base` is the absolute address of the dependency's payload (its root word,
+/// not its file header) and `len` is the payload's byte length — the same pair
+/// [`audit`] takes for the current region. The Reference writes a module-system
+/// chain's `.olean.server` against the exported `.olean` region and
+/// `.olean.private` against both, so their ordinary object pointers keep the
+/// earlier regions' compacted addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionDependency {
+    pub base: u64,
+    pub len: usize,
+}
+
+/// [`audit`] for one part of a multi-region image: the identical linear walk
+/// and every object-local law over the current payload, where an ordinary
+/// stored pointer may also resolve into one of `dependencies`.
+///
+/// Only the pointer-range law widens. A pointer into the current payload is
+/// judged exactly as [`audit`] judges it; a pointer into a dependency must be
+/// word-aligned relative to that dependency's base; anything else is
+/// [`RegionFault::PtrOutOfBounds`]. Mpz limb pointers are object-local and
+/// never resolve into a dependency. The dependencies themselves are not walked
+/// here — each is audited as its own current region, against its own
+/// predecessors.
+///
+/// The dependency list is input, so it is validated rather than trusted: a
+/// misaligned base or ragged length is refused with the same faults [`audit`]
+/// uses for the current region, and address ranges that overlap one another or
+/// the current payload are refused as a build shape, mirroring
+/// [`SubgraphCapture::from_regions`]. Supplied order is not an observable.
+pub fn audit_with_dependencies(
+    buf: &[u8],
+    base: u64,
+    dependencies: &[RegionDependency],
+) -> RResult<RegionReport> {
     if !buf.len().is_multiple_of(8) {
         return Err(RegionFault::RaggedPayload { len: buf.len() });
     }
     need(buf, 0, 8)?;
     let len = buf.len();
-    checked_rel(buf, 0, base, len)?;
+    validate_dependencies(base, len, dependencies)?;
+    checked_rel_with_dependencies(buf, 0, base, len, dependencies)?;
     let mut offset = 8usize;
     let mut objects = 0u64;
     while offset < len {
         let step = walk_step(buf, offset)?;
         for field in step.ptr_fields {
-            checked_rel(buf, field, base, len)?;
+            checked_rel_with_dependencies(buf, field, base, len, dependencies)?;
         }
         if let Some(field) = step.limb_ptr {
             checked_limb_rel(buf, field, base, offset, step.size)?;
