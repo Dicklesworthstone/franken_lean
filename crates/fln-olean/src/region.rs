@@ -613,11 +613,17 @@ impl<'a> OleanView<'a> {
     }
 
     /// Full-surface integrity audit through the SHARED region engine
-    /// (`fln_rt::region::audit`): every object in the payload — reachable or
-    /// not — checked against the category laws at the stored base, read-only.
-    /// [`walk`](Self::walk) remains the reachability/module-policy check;
-    /// this is the §6.4 single-code-path integrity authority the runtime's
-    /// own loader enforces.
+    /// (`fln_rt::region::audit_with_dependencies`): every object in the
+    /// payload — reachable or not — checked against the category laws at the
+    /// stored base, read-only. [`walk`](Self::walk) remains the
+    /// reachability/module-policy check; this is the §6.4 single-code-path
+    /// integrity authority the runtime's own loader enforces.
+    ///
+    /// A view built by [`parse_with_dependencies`](Self::parse_with_dependencies)
+    /// is audited in that same address space: ordinary pointers may land in an
+    /// earlier part's payload, every other law is unchanged. A standalone view
+    /// has no dependencies, which is exactly `fln_rt::region::audit`. The
+    /// earlier parts are not re-audited here; each is audited as its own view.
     pub fn shared_audit(&self) -> RResult<fln_rt::region::RegionReport> {
         let payload_offset = self.payload_offset as u64;
         let payload = self.read_bytes(payload_offset, self.payload_len as u64)?;
@@ -626,7 +632,16 @@ impl<'a> OleanView<'a> {
                 base_addr: self.header.base_addr,
             },
         )?;
-        fln_rt::region::audit(payload, base).map_err(|fault| {
+        let mut dependencies = Vec::with_capacity(self.dependencies.len());
+        for region in &self.dependencies {
+            let (start, _end) =
+                Self::address_range(region.base_addr, region.payload_offset, region.payload_len)?;
+            dependencies.push(fln_rt::region::RegionDependency {
+                base: start,
+                len: region.payload_len,
+            });
+        }
+        fln_rt::region::audit_with_dependencies(payload, base, &dependencies).map_err(|fault| {
             shared_fault(
                 fault,
                 payload_offset,
@@ -1764,6 +1779,53 @@ mod dependency_address_dispatch_tests {
         sidecar_view
             .walk(WalkBudget::default())
             .expect("reachable walk");
+    }
+
+    /// The shared full-surface audit of a sidecar runs in the sidecar's real
+    /// dependency address space: a stored pointer into the public region is in
+    /// bounds there and only there, and nothing else about the law moves.
+    #[test]
+    fn sidecar_shared_audit_resolves_pointers_in_the_dependency_address_space() {
+        let public_base = format::REGION_ALIGN as u64;
+        let sidecar_base = public_base * 2;
+        let public = empty_module(public_base);
+        let public_view = OleanView::parse(&public).expect("public");
+        let public_root = public_view.root_ptr().expect("public root word");
+        let mut sidecar = empty_module(sidecar_base);
+        let root_word = OleanView::parse(&sidecar).expect("sidecar").payload_offset;
+        sidecar[root_word..root_word + 8].copy_from_slice(&public_root.to_le_bytes());
+
+        assert!(
+            matches!(
+                OleanView::parse(&sidecar).unwrap().shared_audit(),
+                Err(RegionError::PtrOutOfBounds { ptr, .. }) if ptr == public_root
+            ),
+            "standalone, the sidecar's pointer into the public region is out of bounds"
+        );
+        let chained = OleanView::parse_with_dependencies(&sidecar, &[&public]).expect("sidecar");
+        let report = chained
+            .shared_audit()
+            .expect("in the dependency address space the same pointer is in bounds");
+        assert_eq!(report.root, public_root);
+        public_view
+            .shared_audit()
+            .expect("the dependency itself still audits standalone");
+
+        let past_public = public_view
+            .header
+            .base_addr
+            .checked_add((public_view.payload_offset + public_view.payload_len) as u64)
+            .unwrap();
+        sidecar[root_word..root_word + 8].copy_from_slice(&past_public.to_le_bytes());
+        assert!(
+            matches!(
+                OleanView::parse_with_dependencies(&sidecar, &[&public])
+                    .unwrap()
+                    .shared_audit(),
+                Err(RegionError::PtrOutOfBounds { ptr, .. }) if ptr == past_public
+            ),
+            "one word past the dependency payload is still out of bounds"
+        );
     }
 
     #[test]
