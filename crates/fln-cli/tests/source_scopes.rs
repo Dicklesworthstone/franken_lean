@@ -56,15 +56,15 @@ fn installed_cli_checks_scoped_polymorphic_recursion_without_execution() {
 #[test]
 fn invalid_scope_suffixes_emit_no_success_or_artifacts() {
     for (source, outcome, authority) in [
-        ("def prefix := 7\nnamespace A\nend B", "input", false),
+        ("def pfx := 7\nnamespace A\nend B", "input", false),
         // After restoring the root scope, preserve the existing K1 diagnostic
         // reconstruction for an unknown constant, rather than relabeling it.
         (
-            "namespace A\ndef value := 7\nend A\nsection\nopen A\ndef prefix := value\nend\ndef bad := value",
+            "namespace A\ndef value := 7\nend A\nsection\nopen A\ndef pfx := value\nend\ndef bad := value",
             "kernel-rejection",
             true,
         ),
-        ("def prefix := 7\nopen Missing", "input", false),
+        ("def pfx := 7\nopen Missing", "input", false),
     ] {
         let path = file(source);
         let before = std::fs::read(&path).unwrap();

@@ -168,7 +168,7 @@ fn indexed_recursion_tracks_each_childs_distinct_multiple_indices() {
         "inductive Path (A : Type) : A -> A -> Type where
   | refl (a : A) : Path A a a
   | step (a b c : A) (left : Path A a b) (right : Path A b c) : Path A a c
-def weight {A : Type} (from to : A) (path : Path A from to) : Nat := match path with
+def weight {A : Type} (src to : A) (path : Path A src to) : Nat := match path with
   | .refl a => 1
   | .step a b c left right => weight a b left + weight b c right
 def sample : Path Nat 7 7 := Path.step 7 7 7 (Path.refl 7) (Path.refl 7)
@@ -331,7 +331,7 @@ fn nondecreasing_and_escaping_calls_are_failure_atomic_even_when_unused() {
 #[test]
 fn lexical_self_name_shadowing_stays_nonrecursive() {
     check(
-        "def same (same : Nat) : Nat := same\ndef local : Nat := let local := 3; local\ntheorem ok : same local = 3 := by rfl",
+        "def same (same : Nat) : Nat := same\ndef loc : Nat := let loc := 3; loc\ntheorem ok : same loc = 3 := by rfl",
     );
 }
 #[test]
@@ -352,7 +352,7 @@ fn changing_accumulators_are_generalized_in_the_induction_motive() {
 #[test]
 fn changing_trailing_types_and_values_preserve_dependent_telescope_order() {
     check(
-        "def repeat (n : Nat) {A : Type} (step : A -> A) (acc : A) : A := match n with | .zero => acc | .succ k => repeat k step (step acc)\ntheorem ok : repeat 3 (fun x => x + 2) 1 = 7 := by rfl",
+        "def repeatN (n : Nat) {A : Type} (step : A -> A) (acc : A) : A := match n with | .zero => acc | .succ k => repeatN k step (step acc)\ntheorem ok : repeatN 3 (fun x => x + 2) 1 = 7 := by rfl",
     );
     check(
         "def switch (n : Nat) (A : Type) (x : A) : Nat := match n with | .zero => 0 | .succ k => switch k Nat 5 + 1\ntheorem ok : switch 4 String \"initial\" = 4 := by rfl",

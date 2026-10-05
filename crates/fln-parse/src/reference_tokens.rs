@@ -88,100 +88,21 @@ const fn witness(file: &'static str, snippet: &'static str) -> AllowanceWitness 
 /// renamed its witness must go, and when a word's last witness goes the word must go: the set
 /// only shrinks.
 pub const SEED_IDENTIFIER_ALLOWANCE: &[(&str, &[AllowanceWitness])] = &[
+    // Each remaining user is the keyword test in `command_scope.rs`, which asserts that these two
+    // words still lex as names inside a declaration. Every test program and example that used a
+    // listed word as an incidental name was renamed (fln-ffce); the other ten words left with them.
     (
         "end",
         &[witness(
-            "examples/native_index_refinement.lean",
-            "| cons j y end =>",
-        )],
-    ),
-    (
-        "exists",
-        &[
-            witness(
-                "crates/fln/tests/source_construction.rs",
-                "theorem exists : Witness (fun n => n = 7)",
-            ),
-            witness(
-                "crates/fln/tests/source_refinement.rs",
-                "theorem exists : Witness (fun n => n = 7)",
-            ),
-        ],
-    ),
-    (
-        "from",
-        &[witness(
-            "crates/fln/tests/source_recursion.rs",
-            "def weight {A : Type} (from to : A)",
-        )],
-    ),
-    (
-        "local",
-        &[witness(
-            "examples/native_tactic_repetition.lean",
-            "theorem local (n : Nat)",
-        )],
-    ),
-    (
-        "opaque",
-        &[witness(
-            "crates/fln-elab/tests/source_term_assertions.rs",
-            "theorem opaque : 0 = 0",
-        )],
-    ),
-    (
-        "open",
-        &[witness(
-            "crates/fln-cli/src/lib.rs",
-            "def open (value : String) : String := value",
-        )],
-    ),
-    (
-        "partial",
-        &[
-            witness(
-                "crates/fln/tests/runtime_mutual_recursion.rs",
-                "def partial (t : Tree)",
-            ),
-            witness(
-                "crates/fln/tests/source_named_arguments.rs",
-                "theorem partial : (three 1)",
-            ),
-        ],
-    ),
-    (
-        "postfix",
-        &[witness(
-            "crates/fln/tests/source_record_literals.rs",
-            "theorem postfix : (factory).value = 0",
-        )],
-    ),
-    (
-        "prefix",
-        &[witness(
-            "examples/native_closure_data.lean",
-            "(prefix : String)",
-        )],
-    ),
-    (
-        "repeat",
-        &[witness(
-            "examples/native_recursion.lean",
-            "def repeat (n : Nat)",
-        )],
-    ),
-    (
-        "scoped",
-        &[witness(
-            "examples/native_decidable_cases.lean",
-            "theorem scoped (p q : Prop)",
+            "crates/fln-parse/src/command_scope.rs",
+            "def choose (end : Nat) : Nat :=",
         )],
     ),
     (
         "universe",
         &[witness(
-            "examples/native_default_simp.lean",
-            "theorem universe (A : Type)",
+            "crates/fln-parse/src/command_scope.rs",
+            "«open» universe : Nat",
         )],
     ),
 ];

@@ -156,7 +156,8 @@ fn have_is_opaque_to_reflexivity_but_let_is_reducible() {
         "{:?}",
         good.outcome
     );
-    let source = "theorem opaque : 0 = 0 := have n : Nat := 0; have h : n = 0 := (by rfl); rfl";
+    let source =
+        "theorem opaqueLemma : 0 = 0 := have n : Nat := 0; have h : n = 0 := (by rfl); rfl";
     fln_parse::parse_definition(source.as_bytes()).expect("well-formed opacity regression");
     let bad = check_definition_source(source.as_bytes(), &env, budget());
     assert!(bad.is_err(), "opaque local unfolded during elaboration");

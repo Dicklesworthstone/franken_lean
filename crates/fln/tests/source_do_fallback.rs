@@ -132,13 +132,13 @@ fn fallback_locals_shadow_only_their_own_branch_and_nested_returns_do_not_escape
     checked(
         &engine(),
         r#"
-def scoped (x : Nat) (value : Maybe Nat) : Id Nat := do
+def scopedCase (x : Nat) (value : Maybe Nat) : Id Nat := do
   let Maybe.some x ← value |
     let y ← (do { return (x + 1) })
     return y
   return x
-theorem failedScope : scoped 40 Maybe.none = 41 := by rfl
-theorem successScope : scoped 40 (Maybe.some 42) = 42 := by rfl
+theorem failedScope : scopedCase 40 Maybe.none = 41 := by rfl
+theorem successScope : scopedCase 40 (Maybe.some 42) = 42 := by rfl
 def nestedFailure (first second : Maybe Nat) : Id Nat := do
   let Maybe.some x ← first |
     let Maybe.some y ← second | return 0

@@ -82,11 +82,11 @@ fn proof_binders_in_conditional_branches_cannot_capture_the_shared_suffix() {
     checked(
         &state_engine(),
         r#"
-def scoped (h : Nat) : State PUnit := do
+def scopedCase (h : Nat) : State PUnit := do
   for x in items do
     if h : x = 1 then continue else mark x
     mark h
-theorem outerBinder : (scoped 9 0).state = 209 := by rfl
+theorem outerBinder : (scopedCase 9 0).state = 209 := by rfl
 "#,
     );
 }

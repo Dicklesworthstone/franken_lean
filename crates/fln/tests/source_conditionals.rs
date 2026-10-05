@@ -56,13 +56,13 @@ fn conditional_and_match_plans_share_nested_scopes() {
 #[test]
 fn conditionals_are_higher_order_arguments_and_local_values() {
     check(
-        "def apply (f : Nat -> Nat) (n : Nat) : Nat := f n\n def f (b : Bool) : Nat := apply (if b then fun x => x + 1 else fun y => y + 2) 8\n theorem t : f false = 10 := by rfl\n def local : Nat := by\n let n := if true then 7 else 8\n exact n\n theorem u : local = 7 := by rfl",
+        "def apply (f : Nat -> Nat) (n : Nat) : Nat := f n\n def f (b : Bool) : Nat := apply (if b then fun x => x + 1 else fun y => y + 2) 8\n theorem t : f false = 10 := by rfl\n def loc : Nat := by\n let n := if true then 7 else 8\n exact n\n theorem u : loc = 7 := by rfl",
     );
 }
 #[test]
 fn branches_can_use_let_telescopes_and_nested_proofs() {
     check(
-        "def local (b : Bool) : Nat := if b then let x := 5; x + 1 else let y := 7; y + 1\n theorem t : local false = 8 := by rfl\n theorem proof (b : Bool) : 0 = 0 := if b then by rfl else by rfl",
+        "def loc (b : Bool) : Nat := if b then let x := 5; x + 1 else let y := 7; y + 1\n theorem t : loc false = 8 := by rfl\n theorem proof (b : Bool) : 0 = 0 := if b then by rfl else by rfl",
     );
 }
 #[test]
@@ -72,7 +72,7 @@ fn all_branches_and_conditions_keep_type_obligations() {
         "def bad : Nat := if (1 : Bool) then 7 else 8",
         "def bad : Nat := if true then 1 else let unused : String := 1; 0",
         "theorem bad : 0 = 1 := if true then by rfl else by rfl",
-        "def bad (b : Bool) : Nat := if b then let local := 5; local else local",
+        "def bad (b : Bool) : Nat := if b then let loc := 5; loc else loc",
         "def bad (n : Nat) : Nat := if true then 0 else bad n",
     ] {
         reject(source);
@@ -128,7 +128,7 @@ fn named_proposition_branches_receive_opposite_checked_evidence() {
           if h : p then h else by contradiction
         def shadow (h : Nat) (p : Prop) [Decidable p] : Nat :=
           (if h : p then 1 else 2) + h
-        theorem scoped : shadow 3 True = 4 := by rfl
+        theorem scopedCase : shadow 3 True = 4 := by rfl
     "#,
     );
 }

@@ -212,7 +212,7 @@ fn parenthesized_tactics_preserve_sequential_proof_state() {
 #[test]
 fn sequenced_parenthesized_bodies_own_their_local_facts() {
     check(&format!(
-        "{BOTH}theorem paired (P : Prop) (p : P) : Both P P := by\n  constructor <;> (have local := p; exact local)"
+        "{BOTH}theorem paired (P : Prop) (p : P) : Both P P := by\n  constructor <;> (have loc := p; exact loc)"
     ));
     reject(&format!(
         "{BOTH}theorem bad (P : Prop) (p : P) : Both P P := by\n  constructor\n  (have secret := p; exact secret) <;> rfl\n  exact secret"

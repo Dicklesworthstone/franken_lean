@@ -40,7 +40,7 @@ fn introduced_locals_and_rule_lists_have_correct_closure_scopes() {
         "theorem both (P : Nat -> Nat -> Prop) (x y z : Nat) (h : x = y) (k : y = z) (hx : P x x) (hy : P x x) : P z z := by rewrite [h, k] at hx hy; exact hy",
     );
     check(
-        "theorem local (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by have p := hx; rw [h] at p; exact p",
+        "theorem loc (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by have p := hx; rw [h] at p; exact p",
     );
 }
 #[test]

@@ -14,7 +14,7 @@ def second (xs : Vec Nat 2) : Nat := by
   cases xs with
   | cons k x rest =>
     cases rest with
-    | cons j y end => exact y
+    | cons j y last => exact y
 
 theorem head_ok : head 1 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 7 := by rfl
 theorem tail_ok : tail 1 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = Vec.cons 0 9 Vec.nil := by rfl

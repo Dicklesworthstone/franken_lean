@@ -473,7 +473,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean",
-    "examples/native_closure_data.lean",
     "examples/native_constrained_matching.lean",
     "examples/native_constrained_recursion.lean",
     "examples/native_constructor_equalities.lean",
@@ -523,5 +522,4 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_section_records.lean",
     "examples/native_simp_hypotheses.lean",
     "examples/native_simpa.lean",
-    "examples/native_tactic_repetition.lean",
 ];

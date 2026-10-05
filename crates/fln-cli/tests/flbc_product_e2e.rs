@@ -1174,7 +1174,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported dependent source batch");
     std::fs::write(
         &string_source,
-        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := copy prefix ++ \"β\"; output\n"
+        "def copy (value : String) := value\ndef pfx := copy \"artifact\\n\"\ndef message := let output : String := copy pfx ++ \"β\"; output\n"
             .as_bytes(),
     )
     .expect("write supported String source");
@@ -1195,7 +1195,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
             .as_bytes(),
     )
     .expect("write supported Bool comparison source");
-    std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")
+    std::fs::write(&bad_source, b"def opened (x : Nat) : Nat := x\n")
         .expect("write non-closed source");
 
     let failed = run_fln(&[

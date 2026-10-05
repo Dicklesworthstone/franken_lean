@@ -58,7 +58,7 @@ fn dependent_holes_schedule_type_and_witness_before_consumers() {
         "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by refine Package.mk ?_ ?_; exact Nat; exact 7\ntheorem checked : package.value = 7 := by rfl",
     );
     check(
-        "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem exists : Witness (fun n => n = 7) := by refine Witness.intro ?w ?p; exact 7; rfl",
+        "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by refine Witness.intro ?w ?p; exact 7; rfl",
     );
 }
 #[test]
@@ -67,7 +67,7 @@ fn refinement_composes_with_intro_constructor_and_nested_local_proofs() {
         "{BOTH} theorem nested (P Q : Prop) : P -> Q -> Both P (Both Q P) := by intro p q; refine Both.intro p ?_; constructor; exact q; exact p"
     ));
     check(&format!(
-        "{BOTH} theorem local (P : Prop) (p : P) : Both P P := by\n have h : Both P P := by\n  refine Both.intro ?_ ?_\n  exact p\n  exact p\n exact h"
+        "{BOTH} theorem loc (P : Prop) (p : P) : Both P P := by\n have h : Both P P := by\n  refine Both.intro ?_ ?_\n  exact p\n  exact p\n exact h"
     ));
 }
 #[test]

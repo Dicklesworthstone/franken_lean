@@ -238,7 +238,7 @@ fn preexisting_semi_output_filters_candidates() {
 fn local_instances_still_precede_global_output_candidates() {
     let env = fixture(Some("outParam"));
     let value = accepted(
-        "def localWins [local : Transfer Nat Other] : Transfer Nat Other := explicitProbe Other 0",
+        "def localWins [loc : Transfer Nat Other] : Transfer Nat Other := explicitProbe Other 0",
         &env,
     );
     assert!(!has_constant(&value.value, "high"));

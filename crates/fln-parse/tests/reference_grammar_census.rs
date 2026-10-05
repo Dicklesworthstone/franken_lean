@@ -295,8 +295,9 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
 /// verbatim. Frozen fixture, captured by running `lean <file>` with the toolchain `SUITE.lock`
 /// pins (v4.32.0, commit `8c9756b2`) on 2026-10-05; there is no update mode. The hand-written
 /// table parsed all five (each keyword was an identifier there); the derived table refuses each
-/// at the token the Reference names, except a word in the seed allowance (`exists`, `from`),
-/// which is a declared divergence until it leaves. The escaped spelling the Reference accepts parses.
+/// at the token the Reference names, except a word in the seed allowance, which is a declared
+/// divergence until it leaves (`exists` and `from` left it with fln-ffce). The escaped spelling
+/// the Reference accepts parses.
 const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def at : Nat := 1",
@@ -390,10 +391,7 @@ fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
     // Set equality: growing the allowance means editing this list too, in review. A member whose
     // listed uses have all been renamed fails below until it is removed here and from the
     // constant, so the set only shrinks.
-    const PERMITTED: [&str; 12] = [
-        "end", "exists", "from", "local", "opaque", "open", "partial", "postfix", "prefix",
-        "repeat", "scoped", "universe",
-    ];
+    const PERMITTED: [&str; 2] = ["end", "universe"];
     let members: Vec<&str> = SEED_IDENTIFIER_ALLOWANCE
         .iter()
         .map(|(word, _)| *word)

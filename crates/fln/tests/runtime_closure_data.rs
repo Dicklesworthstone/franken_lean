@@ -73,7 +73,7 @@ fn field_interfaces_remain_distinct_after_canonicalization() {
 #[test]
 fn field_closures_capture_owned_strings_callbacks_and_nested_data() {
     run(
-        "structure Handler where\n  run : String -> Nat\ndef capture (prefix : String) (f : Nat -> Nat) : Handler := { run := fun s => f (String.length (prefix ++ s)) }\n#eval (capture \"hello\" (Nat.add 34)).run \"abc\"",
+        "structure Handler where\n  run : String -> Nat\ndef capture (pfx : String) (f : Nat -> Nat) : Handler := { run := fun s => f (String.length (pfx ++ s)) }\n#eval (capture \"hello\" (Nat.add 34)).run \"abc\"",
         "42",
     );
     run(

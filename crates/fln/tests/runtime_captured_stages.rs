@@ -42,7 +42,7 @@ fn computed_closures_return_captured_callback_stages() {
 #[test]
 fn captured_stages_retain_owned_string_environments() {
     run(
-        "def use (prefix : String) : Nat := let f : String -> Nat -> Nat -> Nat := (by intro suffix; let text := prefix ++ suffix; intro n; let base := n + String.length text; intro k; exact base + k); let g := f \"abc\"; let keep : Nat -> Nat -> Nat -> Nat := (by let marker := String.length prefix; exact fun ignored => g); let h := keep 0; let k := h 30; k 8\n#eval use \"x\"",
+        "def use (pfx : String) : Nat := let f : String -> Nat -> Nat -> Nat := (by intro suffix; let text := pfx ++ suffix; intro n; let base := n + String.length text; intro k; exact base + k); let g := f \"abc\"; let keep : Nat -> Nat -> Nat -> Nat := (by let marker := String.length pfx; exact fun ignored => g); let h := keep 0; let k := h 30; k 8\n#eval use \"x\"",
         "42",
     );
 }

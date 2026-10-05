@@ -63,7 +63,7 @@ fn static_types_across_multiple_strict_stages_rebase_captured_values() {
 #[test]
 fn owned_initializers_are_captured_without_crossing_the_type_telescope() {
     run(
-        "def make (prefix : String) : (A : Type) -> A -> Nat -> Nat := by let text := prefix ++ \"abc\"; intro A x n; exact n + String.length text\n#eval let saved : Nat -> Nat := make \"x\" String \"ignored\"; saved 17 + saved 17",
+        "def make (pfx : String) : (A : Type) -> A -> Nat -> Nat := by let text := pfx ++ \"abc\"; intro A x n; exact n + String.length text\n#eval let saved : Nat -> Nat := make \"x\" String \"ignored\"; saved 17 + saved 17",
         "42",
     );
 }
@@ -153,7 +153,7 @@ fn returned_local_polymorphic_callbacks_execute_at_distinct_types() {
         "6",
     );
     run(
-        "def make (prefix : String) : (A : Type) -> A -> Nat := let saved : (A : Type) -> A -> Nat := (by let text := prefix ++ \"abc\"; intro A x; exact String.length text); saved\n#eval make \"x\" Nat 42",
+        "def make (pfx : String) : (A : Type) -> A -> Nat := let saved : (A : Type) -> A -> Nat := (by let text := pfx ++ \"abc\"; intro A x; exact String.length text); saved\n#eval make \"x\" Nat 42",
         "4",
     );
 }

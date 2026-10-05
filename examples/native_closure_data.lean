@@ -8,8 +8,8 @@ def jobs : List (Handler Nat) :=
 def runJobs (initial : Nat) (handlers : List (Handler Nat)) : Nat :=
   List.foldl (fun (n : Nat) (h : Handler Nat) => h.run n) initial handlers
 
-def prefixer (prefix : String) : Handler String :=
-  { run := fun text => prefix ++ text }
+def prefixer (pfx : String) : Handler String :=
+  { run := fun text => pfx ++ text }
 
 def choose (b : Bool) : Nat -> Nat :=
   if b then (fun n => n + 2) else (fun n => n + 3)

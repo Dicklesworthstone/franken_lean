@@ -55,8 +55,8 @@ fn try_restores_partial_introductions_and_local_definitions() {
         "theorem t (P : Prop) : P -> P := by\n try (intro lost; fail)\n intro retained\n exact retained",
     );
     reject("theorem t (P : Prop) : P -> P := by\n try (intro lost; fail)\n exact lost");
-    check("theorem t (P : Prop) (p : P) : P := by\n try (have local := p; fail)\n exact p");
-    reject("theorem t (P : Prop) (p : P) : P := by\n try (have local := p; fail)\n exact local");
+    check("theorem t (P : Prop) (p : P) : P := by\n try (have loc := p; fail)\n exact p");
+    reject("theorem t (P : Prop) (p : P) : P := by\n try (have loc := p; fail)\n exact loc");
 }
 #[test]
 fn failed_alternatives_undo_dependent_carrier_assignments() {

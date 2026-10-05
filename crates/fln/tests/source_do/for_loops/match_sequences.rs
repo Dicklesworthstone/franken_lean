@@ -109,7 +109,7 @@ fn arm_locals_and_discriminant_proofs_cannot_capture_the_suffix() {
     checked(
         &state_engine(),
         r#"
-def scoped (h : Nat) (flag : Bool) : State Nat := do
+def scopedCase (h : Nat) (flag : Bool) : State Nat := do
   match h : flag with
   | true =>
     let h := 1
@@ -118,8 +118,8 @@ def scoped (h : Nat) (flag : Bool) : State Nat := do
     mark 2
   mark h
   return h
-theorem outerLocal : (scoped 9 true 0).state = 109 := by rfl
-theorem outerValue : (scoped 9 true 0).value = 9 := by rfl
+theorem outerLocal : (scopedCase 9 true 0).state = 109 := by rfl
+theorem outerValue : (scopedCase 9 true 0).value = 9 := by rfl
 def nestedDo : State Nat := do
   match true with
   | true =>

@@ -28,7 +28,7 @@ fn local_recursors_capture_outer_values_and_compute_without_global_helpers() {
     let base = engine();
     let result = checked(
         &base,
-        "def repeat (base n : Nat) : Nat := let rec loop (k : Nat) : Nat := match k with | .zero => base | .succ j => loop j + 1; loop n\ntheorem computes : repeat 10 5 = 15 := by rfl",
+        "def repeatN (base n : Nat) : Nat := let rec loop (k : Nat) : Nat := match k with | .zero => base | .succ j => loop j + 1; loop n\ntheorem computes : repeatN 10 5 = 15 := by rfl",
     );
     assert!(
         !result
@@ -67,7 +67,7 @@ fn local_recursive_names_shadow_outer_locals_and_globals_only_in_the_value() {
 fn captured_functions_and_implicit_local_parameters_preserve_scope() {
     checked(
         &engine(),
-        "def repeat {A : Type} (step : A -> A) (seed : A) (n : Nat) : A := let rec loop {B : Type} (f : B -> B) (zero : B) (k : Nat) : B := match k with | .zero => zero | .succ j => f (loop f zero j); loop step seed n\ntheorem computes : repeat (fun n : Nat => n + 2) 1 3 = 7 := by rfl",
+        "def repeatN {A : Type} (step : A -> A) (seed : A) (n : Nat) : A := let rec loop {B : Type} (f : B -> B) (zero : B) (k : Nat) : B := match k with | .zero => zero | .succ j => f (loop f zero j); loop step seed n\ntheorem computes : repeatN (fun n : Nat => n + 2) 1 3 = 7 := by rfl",
     );
 }
 
@@ -279,11 +279,11 @@ fn recursive_local_programs_execute_on_the_native_vm() {
 #[test]
 fn recursive_local_programs_capture_owned_strings_and_functions() {
     execute(
-        "def repeat (suffix : String) (n : Nat) : Nat :=\n  let rec go (k : Nat) : String :=\n    match k with\n    | .zero => suffix\n    | .succ j => go j ++ suffix\n  String.length (go n)\n#eval repeat \"abc\" 3",
+        "def repeatN (suffix : String) (n : Nat) : Nat :=\n  let rec go (k : Nat) : String :=\n    match k with\n    | .zero => suffix\n    | .succ j => go j ++ suffix\n  String.length (go n)\n#eval repeatN \"abc\" 3",
         "12",
     );
     execute(
-        "def repeat (step : Nat -> Nat) (seed n : Nat) : Nat := let rec go (k : Nat) : Nat := match k with | .zero => seed | .succ j => step (go j); go n\n#eval repeat (fun n : Nat => n + 2) 2 20",
+        "def repeatN (step : Nat -> Nat) (seed n : Nat) : Nat := let rec go (k : Nat) : Nat := match k with | .zero => seed | .succ j => step (go j); go n\n#eval repeatN (fun n : Nat => n + 2) 2 20",
         "42",
     );
 }

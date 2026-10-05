@@ -57,7 +57,7 @@ fn dependent_record_fields_are_solved_before_their_consumers() {
 #[test]
 fn existential_witness_and_proof_are_both_checked() {
     check(
-        "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem exists : Witness (fun n => n = 7) := by constructor; exact 7; rfl",
+        "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by constructor; exact 7; rfl",
     );
     reject(
         "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem bad : Witness (fun n => n = 7) := by constructor; exact 8; rfl",
@@ -153,7 +153,7 @@ fn nullary_constructors_and_index_inference_do_not_leave_spurious_goals() {
 #[test]
 fn local_shadowing_cannot_impersonate_admitted_constructors() {
     check(&format!(
-        "{LOGIC} theorem local (P Q : Prop) (p : P) (q : Q) (intro : Nat) : Both P Q := by constructor; exact p; exact q"
+        "{LOGIC} theorem loc (P Q : Prop) (p : P) (q : Q) (intro : Nat) : Both P Q := by constructor; exact p; exact q"
     ));
 }
 #[test]

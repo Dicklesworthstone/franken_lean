@@ -117,7 +117,7 @@ fn proposition_evidence_and_branch_locals_do_not_capture_the_shared_suffix() {
     checked(
         &state_engine(),
         r#"
-def scoped (h : Nat) : State PUnit := do
+def scopedCase (h : Nat) : State PUnit := do
   for x in items do
     if h : x = 1 then
       let y := x
@@ -127,7 +127,7 @@ def scoped (h : Nat) : State PUnit := do
       let h := 7
       mark h
     mark h
-theorem scopeTrace : (scoped 9 0).state = 10709 := by rfl
+theorem scopeTrace : (scopedCase 9 0).state = 10709 := by rfl
 "#,
     );
 }

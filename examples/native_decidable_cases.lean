@@ -15,7 +15,7 @@ def flag (p : Prop) [Decidable p] : Nat := by
 theorem flag_yes : flag True = 7 := by rfl
 theorem flag_no : flag False = 9 := by rfl
 
-theorem scoped (p q : Prop) [Decidable p] [Decidable q] (saved : p) : p := by
+theorem scopedCase (p q : Prop) [Decidable p] [Decidable q] (saved : p) : p := by
   by_cases h : q
   · by_cases hp : p <;> exact saved
   · exact saved

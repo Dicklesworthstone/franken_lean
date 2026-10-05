@@ -15762,7 +15762,7 @@ mod tests {
 
         let mut failed_publications = 0;
         let refused = execute_source_bytes_with_publisher(
-            vec![b"def open (value : String) : String := value".to_vec()],
+            vec![b"def opened (value : String) : String := value".to_vec()],
             None,
             SourcePublication::Flbc {
                 path: PathBuf::from("open.flbc"),
@@ -15822,7 +15822,7 @@ mod tests {
         let failed_batch = execute_source_bytes_with_publisher(
             vec![
                 b"def earlier : Nat := 11".to_vec(),
-                b"def open (x : Nat) : Nat := x".to_vec(),
+                b"def opened (x : Nat) : Nat := x".to_vec(),
             ],
             None,
             SourcePublication::Flbc {
@@ -16085,7 +16085,7 @@ mod tests {
 
         let mut failed_publications = 0;
         let failed = execute_source_bytes_with_publisher(
-            vec![b"def open (x : Nat) : Nat := x".to_vec()],
+            vec![b"def opened (x : Nat) : Nat := x".to_vec()],
             None,
             SourcePublication::Flbc {
                 path: PathBuf::from("not-published.flbc"),
@@ -16417,7 +16417,7 @@ mod tests {
             .expect("the source seed answers completely");
         let outcome = engine
             .execute_source_commands_with_checks(
-                b"def prefix : Nat := 7\n#check prefix",
+                b"def pfx : Nat := 7\n#check pfx",
                 &fln::KVMap::new(),
                 fln::EngineExecutionLimits::new(kernel),
             )
@@ -16442,7 +16442,7 @@ mod tests {
         assert!(output.stderr.starts_with("lean: program-panic: "));
         assert!(output.stderr.contains("source command 0 panicked"));
         assert!(output.stderr.contains("planted prefix panic"));
-        assert!(!output.stderr.contains("prefix : Nat"));
+        assert!(!output.stderr.contains("pfx : Nat"));
     }
 
     #[test]

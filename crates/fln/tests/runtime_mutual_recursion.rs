@@ -126,7 +126,7 @@ fn different_peer_arities_and_partial_accumulator_closures_preserve_scope() {
     );
     run(
         &format!(
-            "{DATA}def partial (t : Tree) : Nat -> Nat := @Tree.rec {motives} {minors} t\n#eval let f : Nat -> Nat := partial (Tree.node (Forest.cons (Tree.leaf 40) Forest.nil)); f 2"
+            "{DATA}def partialSum (t : Tree) : Nat -> Nat := @Tree.rec {motives} {minors} t\n#eval let f : Nat -> Nat := partialSum (Tree.node (Forest.cons (Tree.leaf 40) Forest.nil)); f 2"
         ),
         "42",
     );

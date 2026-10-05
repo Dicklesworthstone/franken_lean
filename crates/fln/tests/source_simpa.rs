@@ -43,7 +43,7 @@ fn simpa_normalizes_both_sides_and_completes_with_explicit_or_local_evidence() {
       theorem supplied (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
           (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
         simpa only [hf, hg] using p
-      theorem local (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
+      theorem loc (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
           (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
         simpa only [hf, hg]
       theorem wildcard (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)

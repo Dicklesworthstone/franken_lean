@@ -45,7 +45,7 @@ fn subst_rebuilds_dependent_data_and_proof_telescopes() {
 fn substitution_preserves_introduced_scopes_and_nested_branches() {
     check("theorem introduced (x y : Nat) : x = y -> y = x := by\n  intro h\n  subst h\n  rfl");
     check(
-        "theorem scoped (b : Bool) (x y : Nat) (h : x = y) : x = y := by\n  cases b with\n  | false =>\n    subst h\n    rfl\n  | true => exact h",
+        "theorem scopedCase (b : Bool) (x y : Nat) (h : x = y) : x = y := by\n  cases b with\n  | false =>\n    subst h\n    rfl\n  | true => exact h",
     );
 }
 #[test]
@@ -309,7 +309,7 @@ fn proof_irrelevance_never_becomes_constructor_data_injectivity() {
 #[test]
 fn constructor_tactics_preserve_source_obligations_and_branch_isolation() {
     check(
-        "theorem scoped (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  cases b with\n  | false =>\n    injection h with child\n    exact child\n  | true =>\n    injection h with other\n    exact other",
+        "theorem scopedCase (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  cases b with\n  | false =>\n    injection h with child\n    exact child\n  | true =>\n    injection h with other\n    exact other",
     );
     let base = engine();
     for source in [

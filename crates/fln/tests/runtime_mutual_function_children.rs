@@ -74,14 +74,14 @@ fn sibling_callback_domains_indices_and_accumulators_can_differ() {
     let data = r#"mutual
 inductive Tree : Nat -> Type where
   | leaf (n : Nat) (value : Nat) : Tree n
-  | node (prefix : String) (child : (b : Bool) -> (s : String) -> Forest b (prefix ++ s)) : Tree 0
+  | node (pfx : String) (child : (b : Bool) -> (s : String) -> Forest b (pfx ++ s)) : Tree 0
 inductive Forest : Bool -> String -> Type where
   | leaf (b : Bool) (s : String) (value : Nat) : Forest b s
   | node (b : Bool) (s : String) (offset : Nat) (child : (n : Nat) -> Tree (offset + n)) : Forest b s
 end
 "#;
     let motives = "(fun (n : Nat) (t : Tree n) => Nat -> Nat) (fun (b : Bool) (s : String) (f : Forest b s) => Nat -> Nat -> Nat)";
-    let minors = "(fun n value acc => value + acc + captured) (fun prefix child ih acc => ih true \"k\" acc 3) (fun b s value acc extra => value + acc + extra) (fun b s offset child ih acc extra => ih 20 (acc + extra + String.length s))";
+    let minors = "(fun n value acc => value + acc + captured) (fun pfx child ih acc => ih true \"k\" acc 3) (fun b s value acc extra => value + acc + extra) (fun b s offset child ih acc extra => ih 20 (acc + extra + String.length s))";
     let value = "Tree.node \"ok\" (fun b s => Forest.node b (\"ok\" ++ s) 10 (fun n => Tree.leaf (10 + n) n))";
     run(
         &format!(

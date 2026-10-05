@@ -67,7 +67,7 @@ fn distinct_interleaved_types_and_owned_values_do_not_alias() {
         "42",
     );
     execute(
-        "def suffix (prefix : String) {A : Type} (ignored : A) (tail : String) : String := prefix ++ tail\n#eval String.length (@suffix \"abc\" Nat 7 \"def\")",
+        "def suffix (pfx : String) {A : Type} (ignored : A) (tail : String) : String := pfx ++ tail\n#eval String.length (@suffix \"abc\" Nat 7 \"def\")",
         "6",
     );
 }

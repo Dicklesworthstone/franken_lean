@@ -244,8 +244,8 @@ fn local_decision_values_and_nested_proof_scopes_are_preserved() {
           let witness : Decidable p := Decidable.isTrue hp
           decide
         theorem nested : Not False := by
-          have local : Not False := by decide
-          first | (have hidden : False := by decide; exact hidden) | exact local
+          have loc : Not False := by decide
+          first | (have hidden : False := by decide; exact hidden) | exact loc
         inductive Both (P Q : Prop) : Prop where | intro (left : P) (right : Q)
         theorem parallel : Both True (Not False) := by constructor <;> decide
         theorem independent : Both True True := by

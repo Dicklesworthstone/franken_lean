@@ -1134,7 +1134,7 @@ mod sequencing_tests {
             "theorem t : 0 = 0 := by\n  all_goals constructor <;> (have h := p; exact h)",
             "theorem t : 0 = 0 := by\n  cases b with\n  | false => constructor <;> rfl\n  | true => constructor <;> rfl",
             "theorem t : 0 = 0 := by ((constructor; rfl); rfl)",
-            "theorem t : 0 = 0 := by\n  have local : P := by\n    constructor <;> rfl\n  exact local",
+            "theorem t : 0 = 0 := by\n  have loc : P := by\n    constructor <;> rfl\n  exact loc",
         ] {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());

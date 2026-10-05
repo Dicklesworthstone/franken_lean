@@ -112,7 +112,7 @@ fn nested_calls_share_expected_types_without_sharing_fresh_holes() {
 }
 #[test]
 fn inferred_let_binders_receive_the_instantiated_dependent_result() {
-    let result = accepted("def local : Nat := let x := polyId 9; polyId x", &env());
+    let result = accepted("def loc : Nat := let x := polyId 9; polyId x", &env());
     let ExprNode::LetE { type_, .. } = result.value.node() else {
         panic!("let expected");
     };

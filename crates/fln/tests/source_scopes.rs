@@ -117,7 +117,7 @@ fn namespaced_class_registrations_and_explicit_universe_applications_compute() {
 fn locals_shadow_namespaces_and_root_escape_changes_the_declaration_namespace() {
     let result = checked(
         &engine(),
-        "namespace A\ndef x : Nat := 7\ndef local (x : Nat) : Nat := x\ndef _root_.rootValue : Nat := A.x\nend A\ntheorem local_ok : A.local 23 = 23 := by rfl\ntheorem root_ok : rootValue = 7 := by rfl",
+        "namespace A\ndef x : Nat := 7\ndef loc (x : Nat) : Nat := x\ndef _root_.rootValue : Nat := A.x\nend A\ntheorem local_ok : A.loc 23 = 23 := by rfl\ntheorem root_ok : rootValue = 7 := by rfl",
     );
     assert!(!result.environment().contains(&n("A.rootValue")));
 }
@@ -156,15 +156,15 @@ fn invalid_scopes_and_ambiguous_opens_never_publish_a_prefix() {
     );
     let root = base.logical_root(&KVMap::new());
     for source in [
-        "def prefix := 1\nend",
-        "def prefix := 1\nnamespace A\nend B",
-        "def prefix := 1\nnamespace A\nend",
-        "def prefix := 1\nsection\nend A",
-        "def prefix := 1\nopen Missing",
-        "def prefix := 1\nopen A B\ndef bad := value",
-        "def prefix := 1\nuniverse u u",
-        "def prefix := 1\nsection\nuniverse u\nend\ndef bad := Type u",
-        "def prefix := 1\nopen A in",
+        "def pfx := 1\nend",
+        "def pfx := 1\nnamespace A\nend B",
+        "def pfx := 1\nnamespace A\nend",
+        "def pfx := 1\nsection\nend A",
+        "def pfx := 1\nopen Missing",
+        "def pfx := 1\nopen A B\ndef bad := value",
+        "def pfx := 1\nuniverse u u",
+        "def pfx := 1\nsection\nuniverse u\nend\ndef bad := Type u",
+        "def pfx := 1\nopen A in",
     ] {
         assert!(
             base.check_source_files(

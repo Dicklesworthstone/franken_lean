@@ -109,7 +109,7 @@ fn partial_callbacks_keep_runtime_captures_strict_and_shared() {
         "partial closure duplicated its capture: {shared} vs {duplicated}"
     );
     run(
-        "def capture (prefix : String) : Nat := let f : String -> String := String.append prefix; String.length (f \"a\") + String.length (f \"b\")\n#eval capture \"abc\"",
+        "def capture (pfx : String) : Nat := let f : String -> String := String.append pfx; String.length (f \"a\") + String.length (f \"b\")\n#eval capture \"abc\"",
         "8",
     );
 }

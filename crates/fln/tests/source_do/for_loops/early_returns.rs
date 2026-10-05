@@ -62,16 +62,16 @@ fn branch_locals_and_proposition_witnesses_cannot_capture_the_shared_suffix() {
     checked(
         &state_engine(),
         r#"
-def scoped (h x : Nat) (flag : Bool) : State Nat := do
+def scopedCase (h x : Nat) (flag : Bool) : State Nat := do
   if h : flag = true then
     let x := 1
     mark x
     return 7
   mark x
   return h
-theorem earlyScope : (scoped 9 2 true 0).state = 1 := by rfl
-theorem normalScope : (scoped 9 2 false 0).state = 2 := by rfl
-theorem outerName : (scoped 9 2 false 0).value = 9 := by rfl
+theorem earlyScope : (scopedCase 9 2 true 0).state = 1 := by rfl
+theorem normalScope : (scopedCase 9 2 false 0).state = 2 := by rfl
+theorem outerName : (scopedCase 9 2 false 0).value = 9 := by rfl
 "#,
     );
 }

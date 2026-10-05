@@ -68,7 +68,7 @@ fn a_staged_closure_can_be_saturated_in_one_application() {
 #[test]
 fn staged_owned_values_survive_collection_storage_and_recursive_consumers() {
     run(
-        "structure Handler where run : Nat -> Nat\ndef use (prefix : String) : Nat := let f : String -> Nat -> Nat := (fun s => by let text := prefix ++ s; exact fun n => n + String.length text); let h := Handler.mk (f \"abc\"); List.foldl Nat.add 0 (List.map h.run [17, 17])\n#eval use \"x\"",
+        "structure Handler where run : Nat -> Nat\ndef use (pfx : String) : Nat := let f : String -> Nat -> Nat := (fun s => by let text := pfx ++ s; exact fun n => n + String.length text); let h := Handler.mk (f \"abc\"); List.foldl Nat.add 0 (List.map h.run [17, 17])\n#eval use \"x\"",
         "42",
     );
 }
@@ -167,7 +167,7 @@ fn every_stage_of_a_four_stage_closure_can_be_partially_applied() {
 #[test]
 fn nested_stages_keep_owned_strings_records_and_returned_payloads_alive() {
     run(
-        "structure Box where value : Nat\ndef use (prefix : String) : Nat := let f : String -> Nat -> Nat -> Box := (by intro suffix; let text := prefix ++ suffix; intro n; let box := Box.mk (n + String.length text); intro k; exact Box.mk (box.value + k)); let g := f \"abcd\"; let h := g 30; let a := h 3; let b := h 4; a.value + b.value\n#eval use \"x\"",
+        "structure Box where value : Nat\ndef use (pfx : String) : Nat := let f : String -> Nat -> Nat -> Box := (by intro suffix; let text := pfx ++ suffix; intro n; let box := Box.mk (n + String.length text); intro k; exact Box.mk (box.value + k)); let g := f \"abcd\"; let h := g 30; let a := h 3; let b := h 4; a.value + b.value\n#eval use \"x\"",
         "77",
     );
 }

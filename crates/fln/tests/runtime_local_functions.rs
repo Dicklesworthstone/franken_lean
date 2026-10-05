@@ -44,7 +44,7 @@ fn nested_helpers_capture_other_closures_and_owned_strings() {
         "42",
     );
     execute(
-        "def outer (prefix : String) (flag : Bool) : Nat := let message (s : String) : String := prefix ++ s; let choose (b : Bool) : Nat := if b then String.length (message \"x\") else String.length (message \"yz\"); choose flag + choose false\n#eval outer \"abc\" true",
+        "def outer (pfx : String) (flag : Bool) : Nat := let message (s : String) : String := pfx ++ s; let choose (b : Bool) : Nat := if b then String.length (message \"x\") else String.length (message \"yz\"); choose flag + choose false\n#eval outer \"abc\" true",
         "9",
     );
 }
@@ -88,7 +88,7 @@ fn local_higher_order_calls_type_literal_callbacks_in_their_original_context() {
         "42",
     );
     execute(
-        "def run (prefix : String) (h : 0 = 0) : Nat := let apply (f : String -> String) (s : String) : String := f s; String.length (apply (fun s => prefix ++ s) \"answer\")\n#eval run \"ok\" (by rfl)",
+        "def run (pfx : String) (h : 0 = 0) : Nat := let apply (f : String -> String) (s : String) : String := f s; String.length (apply (fun s => pfx ++ s) \"answer\")\n#eval run \"ok\" (by rfl)",
         "8",
     );
 }

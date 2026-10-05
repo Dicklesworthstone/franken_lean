@@ -47,7 +47,7 @@ fn named_implicit_types_support_polymorphism_and_explicit_application() {
         theorem named : ident (A := Nat) (x := 7) = 7 := by rfl\n\
         theorem inferred : ident (x := 7) = 7 := by rfl\n\
         theorem explicit : @ident (x := 7) Nat = 7 := by rfl\n\
-        theorem universe : ident.{1} (x := 7) (A := Nat) = 7 := by rfl\n\
+        theorem univ : ident.{1} (x := 7) (A := Nat) = 7 := by rfl\n\
         theorem generic.{u} (A : Sort u) (x : A) : ident (x := x) (A := A) = x := by rfl",
     );
 }
@@ -106,7 +106,7 @@ fn labels_preserve_quoted_names_and_partial_function_heads() {
         "def weird («a.b» «end» : Nat) : Nat := Nat.add «a.b» «end»\n\
         theorem quoted : weird («end» := 2) («a.b» := 40) = 42 := by rfl\n\
         def three (x y z : Nat) : Nat := Nat.add (Nat.add x y) z\n\
-        theorem partial : (three 1) (z := 3) (y := 2) = 6 := by rfl",
+        theorem partialSum : (three 1) (z := 3) (y := 2) = 6 := by rfl",
     );
 }
 

@@ -138,7 +138,7 @@ fn ill_typed_callbacks_cannot_reach_execution() {
 #[test]
 fn recursive_functions_carry_typed_callback_arguments() {
     execute(
-        "def repeat (n : Nat) (f : Nat -> Nat) (x : Nat) : Nat := match n with | .zero => x | .succ k => f (repeat k f x)\n#eval let inc (x : Nat) : Nat := x + 1; repeat 42 inc 0",
+        "def repeatN (n : Nat) (f : Nat -> Nat) (x : Nat) : Nat := match n with | .zero => x | .succ k => f (repeatN k f x)\n#eval let inc (x : Nat) : Nat := x + 1; repeatN 42 inc 0",
         "42",
     );
 }

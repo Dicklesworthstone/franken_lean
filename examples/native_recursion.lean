@@ -15,9 +15,9 @@ def treeSum (tree : Tree) : Nat := match tree with
   | .leaf value => value
   | .fork left right => treeSum left + treeSum right
 
-def repeat (n : Nat) {A : Type} (step : A -> A) (acc : A) : A := match n with
+def repeatN (n : Nat) {A : Type} (step : A -> A) (acc : A) : A := match n with
   | .zero => acc
-  | .succ k => repeat k step (step acc)
+  | .succ k => repeatN k step (step acc)
 
 def add (n : Nat) (m : Nat) : Nat := match n with
   | .zero => m
@@ -30,7 +30,7 @@ def checkedSteps (n : Nat) (h : n = n) : Nat := match n with
 theorem sum_ok : sumTo 4 = 10 := by rfl
 theorem acc_ok : sumAcc 4 7 = 17 := by rfl
 theorem tree_ok : treeSum (Tree.fork (Tree.leaf 3) (Tree.fork (Tree.leaf 7) (Tree.leaf 11))) = 21 := by rfl
-theorem generic_ok : repeat 3 (fun x => x + 2) 1 = 7 := by rfl
+theorem generic_ok : repeatN 3 (fun x => x + 2) 1 = 7 := by rfl
 theorem partial_ok : add 3 5 = 8 := by rfl
 theorem dependent_ok : checkedSteps 4 rfl = 4 := by rfl
 

@@ -6,7 +6,7 @@ def wrap.{u} {A : Sort u} (x : A) : A := x
 
 theorem nested (n : Nat) : wrap (wrap n) = n := by simp
 
-theorem universe (A : Type) : wrap A = A := by simp []
+theorem univ (A : Type) : wrap A = A := by simp []
 
 end Wrapper
 

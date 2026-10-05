@@ -44,7 +44,7 @@ theorem shared (P : Prop) (p : P) : Both P P := by
   refine Both.intro ?same ?same
   repeat exact p
 
-theorem local (n : Nat) : n = n := by
+theorem loc (n : Nat) : n = n := by
   have same : n = n := by
     repeat (first | fail | rfl)
   exact same

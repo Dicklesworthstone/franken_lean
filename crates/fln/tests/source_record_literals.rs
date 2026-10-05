@@ -272,7 +272,7 @@ fn field_receivers_insert_instances_and_preserve_ambient_selection() {
             &base,
             &format!(
                 "theorem global : {receiver} = 0 := by rfl\n\
-                 theorem local (i : Inhabited Nat) : {receiver} = default := by rfl"
+                 theorem loc (i : Inhabited Nat) : {receiver} = default := by rfl"
             ),
         );
     }
@@ -317,7 +317,7 @@ fn field_receiver_insertion_preserves_the_explicit_class_value() {
          instance selected : Choice Nat := { value := 11 }\n\
          def factory [Inhabited Nat] : Choice Nat := { value := default }\n\
          theorem dotted : factory.value = 0 := by rfl\n\
-         theorem postfix : (factory).value = 0 := by rfl\n\
+         theorem postfixLemma : (factory).value = 0 := by rfl\n\
          theorem global : Choice.value = 11 := by rfl",
     );
 }

@@ -66,7 +66,7 @@ fn fixed_captures_and_local_helpers_survive_recursive_branch_lifting() {
 #[test]
 fn owned_strings_and_boolean_results_execute_recursively() {
     execute(
-        "def copies (prefix : String) (n : Nat) : String := match n with | .zero => prefix | .succ k => copies prefix k ++ prefix\n#eval String.length (copies \"ab\" 5)",
+        "def copies (pfx : String) (n : Nat) : String := match n with | .zero => pfx | .succ k => copies pfx k ++ pfx\n#eval String.length (copies \"ab\" 5)",
         "12",
     );
     execute(
