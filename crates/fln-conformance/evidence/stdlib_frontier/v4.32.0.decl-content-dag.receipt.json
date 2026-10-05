@@ -1,0 +1,117 @@
+{
+ "bead": "fln-merkle-decl-digest-80ni",
+ "companion_to": "v4.32.0.receipt.json, which is unchanged and stays bound to its own binary (fln at a8d0032f)",
+ "why": "the first stdlib frontier on the Merkle DeclContent digest (tag decl-content-dag/1); every declaration digest and logical root changed format, so this run is retained beside the old receipt rather than replacing it",
+ "command": "fln check-olean --continue --jobs 16 --progress --json --max-bytes 17179869184 ~/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean",
+ "limits": "ulimit -v 104857600 (KiB: 100 GiB)",
+ "scheduling": "launched at nice 19 so the concurrent S22 run was not disturbed; this host's ananicy-cpp re-applied nice -4 to it, so it was reniced to 19 again by hand a few seconds in. Wall time is specific to this host and its load and is not a throughput figure",
+ "binary": {
+  "sha256": "cce11ee6b65f204dfee96dc2dfc92c850c72ada2d497422b9f91e99b2a8c09e8",
+  "build_command": "cargo build --locked --release -p fln-cli --bin fln",
+  "source_commit": "82854f4f",
+  "source_tree": "29cbc2d6299d15d58492d38d29fd4f42e51e49e8",
+  "note": "built from a local commit with this exact tree that differed from 82854f4f only in its message; an unchanged tree rebuilt to the same bytes",
+  "profile": "release",
+  "target": "fln-cli bin fln"
+ },
+ "identity": {
+  "schema": "fln.identity/1",
+  "version": "0.0.0",
+  "productRoot": "sound",
+  "modes": [
+   "faithful",
+   "sound",
+   "frontier"
+  ],
+  "reference": {
+   "tag": "v4.32.0",
+   "commit": "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+  },
+  "corpus": {
+   "tag": "v4.32.0",
+   "commit": "81a5d257c8e410db227a6665ed08f64fea08e997"
+  },
+  "rustChannel": "nightly-2026-08-31"
+ },
+ "host": {
+  "uname": "Linux sensedemobox 7.0.0-30-generic #30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026 x86_64 GNU/Linux",
+  "cpus": 64,
+  "memory_at_launch": [
+   "251",
+   "176"
+  ],
+  "captured_utc": "0cabb35f"
+ },
+ "exit": "exit=0 elapsed=3359s",
+ "peak_rss_gib": 19.2,
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "complete",
+  "authority": true,
+  "trust": "recheck",
+  "modules": 2433,
+  "accepted": 2433,
+  "failed": 0,
+  "inconclusive": 0,
+  "internalFault": 0,
+  "blocked": 0,
+  "acceptedDeclarations": 215136
+ },
+ "comparison_with_the_retained_receipt": {
+  "per_module": "identical verdict, declaration count, detail and blockedBy for all 2433 modules, in the same order",
+  "stdlib_frontier_ratchet": "receipt 2433/2433 accepted, now 2433/2433 accepted; verdict: no coverage drop (exit 0)"
+ },
+ "slowest_modules": [
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Expr",
+   "elapsedMs": 815562,
+   "declarations": 61
+  },
+  {
+   "module": "Init.Data.Array.Extract",
+   "elapsedMs": 437403,
+   "declarations": 123
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Operations.Udiv",
+   "elapsedMs": 419261,
+   "declarations": 27
+  },
+  {
+   "module": "Init.Data.BitVec.Lemmas",
+   "elapsedMs": 402624,
+   "declarations": 2040
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Expr",
+   "elapsedMs": 387271,
+   "declarations": 258
+  },
+  {
+   "module": "Init.Data.Vector.Extract",
+   "elapsedMs": 363973,
+   "declarations": 69
+  },
+  {
+   "module": "Std.Data.DHashMap.Lemmas",
+   "elapsedMs": 347085,
+   "declarations": 1100
+  },
+  {
+   "module": "Std.Data.DTreeMap.Internal.Balancing",
+   "elapsedMs": 230360,
+   "declarations": 369
+  },
+  {
+   "module": "Std.Data.DTreeMap.Lemmas",
+   "elapsedMs": 228331,
+   "declarations": 1419
+  },
+  {
+   "module": "Init.Data.BitVec.Bitblast",
+   "elapsedMs": 191247,
+   "declarations": 795
+  }
+ ],
+ "result_file": "v4.32.0.decl-content-dag.json (the run's --json, verbatim)"
+}
