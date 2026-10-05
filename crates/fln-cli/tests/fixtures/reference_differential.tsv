@@ -33,9 +33,9 @@ examples/native_constrained_matching.lean	reject	reject	n/a	agree	fixed by z8j.1
 examples/native_constrained_recursion.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 6: Type mismatch (a named variable at a promoted parameter; was fln-defect, franken_lean-z8j.1.6)
 examples/native_constructor_equalities.lean	reject	accept	n/a	fln-defect	Reference 7: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
 examples/native_constructor_equality.lean	reject	accept	n/a	fln-defect	Reference 9: No goals to be solved | tactic goal-management divergence (franken_lean-z8j.1.6.1)
-examples/native_constructor_tactics.lean	reject	check-only	n/a	fln-defect	Reference 21: numerals are data in Lean, but the expected type is a proposition | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_constructor_tactics.lean	reject	accept	n/a	fln-defect	Reference 21: numerals are data in Lean, but the expected type is a proposition | tactic goal-management divergence (franken_lean-z8j.1.6.1); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.1
 examples/native_context_generalization.lean	accept	accept	match	agree	agrees again: generalize defaults its numeral like the pin (fln-ffce; had regressed with 75c8f103)
-examples/native_decidable_cases.lean	reject	check-only	n/a	fln-defect	Reference 18: unexpected token 'scoped'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_decidable_cases.lean	reject	accept	n/a	fln-defect	Reference 18: unexpected token 'scoped'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.2
 examples/native_decision_proofs.lean	reject	accept	n/a	missing-prelude	Reference 2: `not_false` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_decisions.lean	accept	accept	match	agree	
 examples/native_default_simp.lean	reject	check-only	n/a	fln-defect	Reference 9: unexpected token 'universe'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
@@ -52,7 +52,7 @@ examples/native_floats.lean	accept	accept	match	agree
 examples/native_function_child_runtime.lean	accept	accept	match	agree	
 examples/native_function_children.lean	reject	accept	n/a	fln-defect	Reference 24: code generator does not support recursor `Accessible.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
 examples/native_global_stages.lean	accept	accept	match	agree	
-examples/native_goal_control.lean	reject	check-only	n/a	fln-defect	Reference 39: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_goal_control.lean	reject	accept	n/a	fln-defect	Reference 39: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
 examples/native_ground_projections.lean	accept	accept	match	agree	
 examples/native_heterogeneous_equality.lean	reject	accept	n/a	fln-defect	Reference 22: Tactic `subst` failed: did not find equation for eliminating 'h' | tactic goal-management divergence (franken_lean-z8j.1.6.1)
 examples/native_hypothesis_rewriting.lean	accept	accept	match	agree	
@@ -72,7 +72,7 @@ examples/native_instances.lean	accept	accept	match	agree
 examples/native_interleaved_specialization.lean	reject	accept	n/a	missing-prelude	Reference 2: `Pure` has already been declared | the seed has no Prelude `Pure`, so the redeclaration is accepted; landed without a row after the 09-23 freeze (fln-ew20)
 examples/native_literal_patterns.lean	accept	accept	match	agree	
 examples/native_local_helpers.lean	accept	accept	match	agree	
-examples/native_local_proofs.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_local_proofs.lean	accept	accept	match	agree	agrees since fln-lvdh: its Type-field record compiles in the drop-in door
 examples/native_local_recursion.lean	accept	accept	match	agree	
 examples/native_local_templates.lean	accept	accept	match	agree	
 examples/native_logical_rewriting.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
@@ -102,10 +102,10 @@ examples/native_quotients.lean	accept	check-only	n/a	unsupported	drop-in lean re
 examples/native_record_defaults.lean	accept	accept	match	agree	
 examples/native_record_runtime.lean	accept	accept	match	agree	
 examples/native_record_values.lean	reject	check-only	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
-examples/native_records.lean	reject	check-only	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_records.lean	reject	accept	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
 examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 18: unexpected token 'repeat'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
 examples/native_recursive_data.lean	accept	accept	match	agree	
-examples/native_refinement.lean	reject	check-only	n/a	fln-defect	Reference 26: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_refinement.lean	reject	accept	n/a	fln-defect	Reference 26: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
 examples/native_scoped_instances.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_scopes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
@@ -118,7 +118,7 @@ examples/native_singleton_inference.lean	accept	accept	match	agree
 examples/native_staged_callbacks.lean	accept	accept	match	agree	
 examples/native_structural_selection.lean	accept	accept	match	agree	
 examples/native_tactic_alternatives.lean	accept	accept	match	agree	valid Lean since binders named with the reserved keywords `local`/`scoped` were renamed and the Type-field record became an `example` (fln-lvdh); the old "both reject" was an unrelated elaboration failure
-examples/native_tactic_repetition.lean	reject	check-only	n/a	fln-defect	Reference 47: unexpected token 'local'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2)
+examples/native_tactic_repetition.lean	reject	accept	n/a	fln-defect	Reference 47: unexpected token 'local'; expected identifier | reserved keyword accepted as identifier (franken_lean-z8j.1.6.2); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.2
 examples/native_tactic_sequencing.lean	accept	accept	match	agree	
 examples/native_term_binders.lean	accept	accept	match	agree	
 examples/native_variants.lean	accept	accept	match	agree	

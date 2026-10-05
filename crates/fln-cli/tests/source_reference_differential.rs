@@ -500,7 +500,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_induction_specialization.lean",
     "examples/native_instance_attributes.lean",
     "examples/native_interleaved_specialization.lean",
-    "examples/native_local_proofs.lean",
     "examples/native_logical_rewriting.lean",
     "examples/native_matrix_recursion.lean",
     "examples/native_mutual_data.lean",
