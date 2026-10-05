@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":555,"projection_hash":"71d52dbc2ee732812d1ce513ae42c112c63bf1a10f5c0dd0a85ea3460bfbf6c5"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":556,"projection_hash":"67fdf037e24ed87ea8fbe7ed265c46426e9138935303a70ccc32b154d84fa074"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -90,6 +90,7 @@
 {"id":"fln-census-empty-referent-no-mock-krb0"}
 {"id":"fln-census-out-of-git-2ya9"}
 {"id":"fln-checker-exhaustion-roots-1mr1"}
+{"id":"fln-checker-free-binding-cycle-false-reject-u1vk"}
 {"id":"fln-checker-mathlib-shapes-qne9"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
