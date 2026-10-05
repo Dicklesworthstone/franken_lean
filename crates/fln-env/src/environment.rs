@@ -16,7 +16,7 @@ use fln_core::expr::Expr;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
-use fln_hash::canon::{CanonWriter, Canonical};
+use fln_hash::canon::{CanonHasher, CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
 
@@ -507,7 +507,7 @@ pub fn preflight_declaration_rows(
         // the fact cannot describe a different encoding. Running it costs one pass over a
         // declaration whose structure the row families have not yet bounded, which is why
         // the byte dimension is checked LAST in the frozen order — see `ORDER`.
-        canonical_bytes: usize_to_u64(Environment::decl_content_bytes(info).len()),
+        canonical_bytes: usize_to_u64(Environment::decl_content_len(info)),
         expressions: 0,
         expr_nodes: 0,
         expanded_weight: 0,
@@ -1362,8 +1362,20 @@ impl Environment {
     /// deterministic projection the logical root aggregates. Byte-level olean parity
     /// is the codec's business; this digest is FrankenLean's own identity.
     #[forbid(clippy::as_conversions)]
+    /// Hashed as it is encoded: a heavily shared expression's tree encoding can
+    /// run to gigabytes, and materializing it made one declaration's digest a
+    /// multi-gigabyte allocation (bead fln-frontier-oom-abort-w9dx).
     pub fn decl_content_digest(info: &ConstantInfo) -> Digest {
-        hash(Domain::DeclContent, &Environment::decl_content_bytes(info))
+        let mut w = CanonHasher::new(Domain::DeclContent);
+        Environment::write_decl_content(info, &mut w);
+        w.finish()
+    }
+
+    /// The length of [`Self::decl_content_bytes`], counted without storing them.
+    fn decl_content_len(info: &ConstantInfo) -> usize {
+        let mut w = CanonWriter::counting();
+        Environment::write_decl_content(info, &mut w);
+        w.written()
     }
 
     /// The canonical `Domain::DeclContent` byte stream for one constant.
@@ -1371,20 +1383,27 @@ impl Environment {
     /// One encoder, so the digest and the canonical-byte usage fact cannot diverge — a
     /// measured byte count taken from a second implementation would be a fact about the
     /// wrong bytes (bead `franken_lean-j8h`).
+    #[cfg(test)]
     fn decl_content_bytes(info: &ConstantInfo) -> Vec<u8> {
         let mut w = CanonWriter::new();
+        Environment::write_decl_content(info, &mut w);
+        w.into_bytes()
+    }
+
+    /// The one encoder behind the digest, the length and the stored bytes.
+    fn write_decl_content(info: &ConstantInfo, w: &mut CanonWriter) {
         w.str(info.kind_name());
-        info.name().write_body(&mut w);
+        info.name().write_body(w);
         let base = info.constant_val();
         w.u64(usize_to_u64(base.level_params.len()));
         for p in &base.level_params {
-            p.write_body(&mut w);
+            p.write_body(w);
         }
-        base.type_.write_body(&mut w);
+        base.type_.write_body(w);
         match info {
             ConstantInfo::Axiom(v) => w.bool(v.is_unsafe),
             ConstantInfo::Defn(v) => {
-                v.value.write_body(&mut w);
+                v.value.write_body(w);
                 match v.hints {
                     ReducibilityHints::Opaque => w.u8(0),
                     ReducibilityHints::Abbrev => w.u8(1),
@@ -1394,16 +1413,16 @@ impl Environment {
                     }
                 }
                 w.u8(definition_safety_tag(v.safety));
-                write_mutual_membership(&mut w, &v.all);
+                write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Thm(v) => {
-                v.value.write_body(&mut w);
-                write_mutual_membership(&mut w, &v.all);
+                v.value.write_body(w);
+                write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Opaque(v) => {
-                v.value.write_body(&mut w);
+                v.value.write_body(w);
                 w.bool(v.is_unsafe);
-                write_mutual_membership(&mut w, &v.all);
+                write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Quot(v) => w.u8(quot_kind_tag(v.kind)),
             ConstantInfo::Induct(v) => {
@@ -1415,16 +1434,16 @@ impl Environment {
                 w.bool(v.is_reflexive);
                 w.u64(usize_to_u64(v.ctors.len()));
                 for n in &v.ctors {
-                    n.write_body(&mut w);
+                    n.write_body(w);
                 }
                 // The mutual-inductive block is part of the declaration's content
                 // (as it is for `Defn`/`Thm`): two inductives identical except for
                 // their block grouping are distinct declarations and must not share
                 // a content digest.
-                write_mutual_membership(&mut w, &v.all);
+                write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Ctor(v) => {
-                v.induct.write_body(&mut w);
+                v.induct.write_body(w);
                 w.u32(v.cidx);
                 w.u32(v.num_params);
                 w.u32(v.num_fields);
@@ -1439,15 +1458,14 @@ impl Environment {
                 w.bool(v.is_unsafe);
                 w.u64(usize_to_u64(v.rules.len()));
                 for rule in &v.rules {
-                    rule.ctor.write_body(&mut w);
+                    rule.ctor.write_body(w);
                     w.u32(rule.nfields);
-                    rule.rhs.write_body(&mut w);
+                    rule.rhs.write_body(w);
                 }
                 // The mutual block is content here too (mirrors `Defn`/`Thm`).
-                write_mutual_membership(&mut w, &v.all);
+                write_mutual_membership(w, &v.all);
             }
         }
-        w.into_bytes()
     }
 
     /// The logical root of this commit: declarations + extension deltas + options —
@@ -4349,6 +4367,40 @@ mod tests {
     /// asserts that directly against every all-bearing variant rather than trusting the
     /// refactor — a byte count taken from a second implementation would be a fact about
     /// the wrong bytes, which is the failure mode the shared encoder exists to remove.
+    /// A heavily shared value: its tree encoding is megabytes from a few dozen
+    /// nodes, as in the Std BVDecide circuit lemmas whose digests made 8-64 GiB
+    /// allocations. The streamed digest and the counted length must be those of
+    /// the stored encoding.
+    #[test]
+    fn a_shared_value_is_digested_and_measured_without_storing_its_tree() {
+        let mut value = Expr::const_(n("leaf"), vec![]);
+        for _ in 0..20 {
+            value = Expr::app(value.clone(), value);
+        }
+        let info = ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("shared"),
+                level_params: vec![],
+                type_: Expr::sort(Level::zero()),
+            },
+            value,
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![n("shared")],
+        });
+        let bytes = Environment::decl_content_bytes(&info);
+        assert!(
+            bytes.len() > 16 * fln_hash::canon::HASH_CHUNK,
+            "the tree encoding must span many hashing chunks, was {}",
+            bytes.len()
+        );
+        assert_eq!(Environment::decl_content_len(&info), bytes.len());
+        assert_eq!(
+            Environment::decl_content_digest(&info),
+            hash(Domain::DeclContent, &bytes)
+        );
+    }
+
     #[test]
     fn the_canonical_byte_fact_measures_the_stream_the_digest_is_taken_over() {
         for kind in AllBearingKind::ALL {
