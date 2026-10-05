@@ -3566,7 +3566,27 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     self.delta_mode = frame.delta_mode;
                     self.unfolded_bindings = frame.unfolded_bindings;
                     self.force_string_delta = frame.force_string_delta;
-                    let major = self.build_spine(stuck)?;
+                    // A major whose normal form is the major exactly is that
+                    // cursor: reuse it instead of rebuilding it, charging the
+                    // step the rebuild would (one to compose its spine, if it has
+                    // arguments), as a projection's unchanged structure is
+                    // reused below. Rebuilt, it put a fresh arena into the
+                    // eliminator's arguments, so even a quotient that reduced
+                    // nothing was copied twice, the major and then the whole
+                    // application: 224.7 s of the checker's time on
+                    // `LinearMap.rTensor_tensor` (bead
+                    // `fln-checker-associator-time-y8wc`, comment 3156).
+                    let original = &frame.arguments[frame.major];
+                    let major = if original.env.is_empty()
+                        && Self::spine_is(&stuck, &original.arena, original.root)?
+                    {
+                        if !stuck.args.is_empty() {
+                            self.control.step(stuck.head.root.index(), self.cancelled)?;
+                        }
+                        original.clone()
+                    } else {
+                        self.build_spine(stuck)?
+                    };
                     if let Some(representative) =
                         self.quotient_representative(&frame.head, &major)?
                     {

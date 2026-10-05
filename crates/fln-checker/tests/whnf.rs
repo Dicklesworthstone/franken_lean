@@ -6,7 +6,8 @@ use fln_checker::defeq::{DefEqBudget, DefEqOutcome, DefEqStop, def_eq};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, InductiveDeclaration, RecursorDeclaration, RecursorRule, ReducibilityHint,
+    EnvironmentOutcome, InductiveDeclaration, QuotientKind, RecursorDeclaration, RecursorRule,
+    ReducibilityHint,
 };
 use fln_checker::instantiate::InstantiationRefusal;
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
@@ -3929,4 +3930,133 @@ fn a_projection_of_a_stuck_structure_is_not_rebuilt() {
     );
     // Steps as the rebuild charged them: 8,013 either way.
     assert_eq!(result.steps, 8_013);
+}
+
+fn dotted_name(parts: &[&str]) -> Name {
+    parts
+        .iter()
+        .fold(Name::anonymous(), |name, part| Name::str(name, *part))
+}
+
+/// `Quot`, `Quot.mk`, `Quot.lift` and `Quot.ind`, registered with their kinds and
+/// universe arities. WHNF's quotient rule (KR-955) reads nothing else of them, so
+/// their types are placeholders.
+fn quotient_context() -> WhnfContext {
+    let entry = |suffix: Option<&str>, kind: QuotientKind, arity: usize| {
+        let name = dotted_name(&[&["Quot"][..], suffix.as_slice()].concat());
+        let name = match decode_name(&name.to_canonical_bytes(), DecodeBudget::unlimited()) {
+            DecodeOutcome::Complete(Ok(value)) => value,
+            other => panic!("primary-produced name did not decode: {other:?}"),
+        };
+        let levels = ["u", "v"][..arity]
+            .iter()
+            .map(|u| checker_name(*u))
+            .collect();
+        ConstantEntry::new(
+            name,
+            ConstantDeclaration::quotient(levels, decoded(&Expr::sort(Level::zero())), kind),
+        )
+    };
+    definition_context(vec![
+        entry(None, QuotientKind::Type, 1),
+        entry(Some("mk"), QuotientKind::Constructor, 1),
+        entry(Some("lift"), QuotientKind::Lift, 2),
+        entry(Some("ind"), QuotientKind::Induction, 1),
+    ])
+}
+
+fn quotient_free(label: &str) -> Expr {
+    Expr::fvar(FVarId(primary_name(label)))
+}
+
+/// `@Quot.lift.{u, v} α r β f h major`.
+fn quot_lift(major: Expr) -> Expr {
+    let levels = vec![
+        Level::param(primary_name("u")),
+        Level::param(primary_name("v")),
+    ];
+    let head = Expr::const_(dotted_name(&["Quot", "lift"]), levels);
+    let applied = ["α", "r", "β", "f", "h"]
+        .into_iter()
+        .fold(head, |function, label| {
+            Expr::app(function, quotient_free(label))
+        });
+    Expr::app(applied, major)
+}
+
+/// `@Quot.mk.{u} α r value`.
+fn quot_mk(value: Expr) -> Expr {
+    let head = Expr::const_(
+        dotted_name(&["Quot", "mk"]),
+        vec![Level::param(primary_name("u"))],
+    );
+    let applied = Expr::app(Expr::app(head, quotient_free("α")), quotient_free("r"));
+    Expr::app(applied, value)
+}
+
+/// A stuck quotient eliminator whose major did not change is the input: neither
+/// the major nor the application around it is rebuilt (bead
+/// `fln-checker-associator-time-y8wc`, comment 3156). Rebuilt, each stuck
+/// `Quot.lift` over a free tensor was copied twice, 224.7 s of the checker's
+/// time on `LinearMap.rTensor_tensor`.
+#[test]
+fn a_stuck_quotient_eliminator_with_an_unchanged_major_is_not_rebuilt() {
+    const DEPTH: usize = 4_000;
+    let tower = (0..DEPTH).fold(quotient_free("x"), |inner, _| {
+        Expr::app(quotient_free("g"), inner)
+    });
+    let stuck = decoded(&quot_lift(tower));
+    let (outcome, polls) = polled_whnf(&stuck, &quotient_context(), WhnfBudget::unlimited());
+    let result = complete(outcome);
+    let nodes = u64::try_from(stuck.nodes().len()).expect("small");
+    assert_eq!(
+        result.term, stuck,
+        "nothing reduces, so the result is the input"
+    );
+    assert_eq!(result.reductions, 0);
+    assert!(
+        polls < 6 * nodes,
+        "{polls} polls for a {nodes}-node quotient eliminator that did not change: it was \
+         rebuilt"
+    );
+    // Measured on 8,013 nodes: 24,054 polls; rebuilding the major and then the
+    // whole application polled 72,116. Steps as the rebuild charged them, so no
+    // caller's budget sees a change: 8,024 either way.
+    assert_eq!(result.steps, 8_024);
+}
+
+/// The controls: a major that changed still goes through the rebuild, so a
+/// `Quot.mk` it exposes still fires the quotient rule, and progress inside a
+/// major that stays stuck is still kept.
+#[test]
+fn a_quotient_eliminator_whose_major_changed_still_reduces_or_keeps_its_progress() {
+    let identity = Expr::lam(
+        primary_name("y"),
+        quotient_free("α"),
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let applied_f = |argument: Expr| Expr::app(quotient_free("f"), argument);
+
+    // A literal `Quot.mk` major reduces, as it always did.
+    let direct = decoded(&quot_lift(quot_mk(quotient_free("a"))));
+    let result = complete(whnf(&direct, &quotient_context(), WhnfBudget::unlimited()));
+    assert_eq!(result.term, decoded(&applied_f(quotient_free("a"))));
+
+    // A major that only beta-reduces to `Quot.mk` changed, and still reduces.
+    let hidden = decoded(&quot_lift(Expr::app(
+        identity.clone(),
+        quot_mk(quotient_free("a")),
+    )));
+    let result = complete(whnf(&hidden, &quotient_context(), WhnfBudget::unlimited()));
+    assert_eq!(result.term, decoded(&applied_f(quotient_free("a"))));
+
+    // A major that changed but stays stuck keeps its reduced form.
+    let progressed = decoded(&quot_lift(Expr::app(identity, quotient_free("q"))));
+    let result = complete(whnf(
+        &progressed,
+        &quotient_context(),
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(result.term, decoded(&quot_lift(quotient_free("q"))));
 }
