@@ -309,6 +309,15 @@ jobs:
           FLN_REQUIRE_REFERENCE=1 cargo test --locked -p fln-cli \
             --test source_reference_differential --no-fail-fast
 
+      - name: measure ordinary Lean against the pinned Reference (fln-ordinary-lean-probe-g03u)
+        shell: bash
+        run: |
+          # Measuring, not gating: prints one line per probe program and the
+          # acceptance triple into this log. It fails only when FrankenLean's
+          # `lean` accepts a program the Reference rejects, or on a broken scan.
+          FLN_REQUIRE_REFERENCE=1 cargo test --locked -p fln-cli \
+            --test ordinary_lean_probe --no-fail-fast -- --nocapture
+
       - name: run the certificate-format independent-checker lane
         shell: bash
         run: |
