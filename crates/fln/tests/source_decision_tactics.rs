@@ -413,15 +413,26 @@ fn pinned_lib() -> Option<PathBuf> {
     lib
 }
 
-/// The pinned `Init.Tactics` and its import closure, dependency first, admitted
-/// through the council with their instance journals activated.
-fn import_init_tactics(lib: &Path) -> Engine {
-    const CLOSURE: [&str; 4] = ["Init.Prelude", "Init.Coe", "Init.Notation", "Init.Tactics"];
-    let names: Vec<Name> = CLOSURE
+/// `Init.Tactics` and its import closure, dependency first.
+const INIT_TACTICS: &[&str] = &["Init.Prelude", "Init.Coe", "Init.Notation", "Init.Tactics"];
+/// `Init.Core` and its import closure, dependency first.
+const INIT_CORE: &[&str] = &[
+    "Init.Prelude",
+    "Init.Coe",
+    "Init.Notation",
+    "Init.Tactics",
+    "Init.SizeOf",
+    "Init.Core",
+];
+
+/// A pinned import closure (its last module the root), admitted through the
+/// council with its instance journals activated.
+fn import_pinned(lib: &Path, closure: &[&str]) -> Engine {
+    let names: Vec<Name> = closure
         .iter()
         .map(|module| Name::from_components(module.split('.')))
         .collect();
-    let parts: Vec<[Vec<u8>; 3]> = CLOSURE
+    let parts: Vec<[Vec<u8>; 3]> = closure
         .iter()
         .map(|module| {
             let base = module
@@ -452,12 +463,12 @@ fn import_init_tactics(lib: &Path) -> Engine {
     ));
     match Engine::from_environment(Environment::new()).import_olean_modules_for_source(
         &inputs,
-        &[names[3].clone()],
+        &[names.last().expect("a nonempty closure").clone()],
         &KVMap::new(),
         limits,
     ) {
         Ok(Outcome::Complete(imported)) => imported.engine,
-        other => panic!("the pinned Init.Tactics closure passes the council: {other:?}"),
+        other => panic!("the pinned closure passes the council: {other:?}"),
     }
 }
 
@@ -478,7 +489,7 @@ fn decide_evaluates_the_pins_decidable_decide_against_the_real_prelude() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let engine = import_init_tactics(&lib);
+            let engine = import_pinned(&lib, INIT_TACTICS);
             let limits =
                 SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
             let positive = engine.check_source_files(&[POSITIVE.as_bytes()], &KVMap::new(), limits);
@@ -494,6 +505,41 @@ fn decide_evaluates_the_pins_decidable_decide_against_the_real_prelude() {
                 "{NEGATIVE} must be refused as a false decision: {rendered}"
             );
             assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}
+
+/// Against the pinned `Init.Core`, instance selection for `Decidable (2 + 2 =
+/// 4)` reaches `instDecidableEqNat` within the default budget. Its 39 newer
+/// `Decidable` instances each fail one strict match; each used to cost a
+/// second, delta-retried inference equation, 14k-45k heartbeats apiece, and
+/// the search ran out of heartbeats first. The pin, with `prelude` and
+/// `import Init.Core`, exits 0 on both declarations.
+#[test]
+fn decidable_selection_against_the_real_init_core_fits_the_default_budget() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let engine = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            for source in [
+                "theorem one : 2 + 2 = 4 := by decide",
+                "def inst : Decidable (2 + 2 = 4) := inferInstance",
+            ] {
+                let checked =
+                    engine.check_source_files(&[source.as_bytes()], &KVMap::new(), limits);
+                assert!(
+                    matches!(checked, Ok(Outcome::Complete(_))),
+                    "{source} must be admitted within the default budget: {checked:?}"
+                );
+            }
         })
         .expect("spawn the checking thread")
         .join()

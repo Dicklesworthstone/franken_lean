@@ -575,7 +575,19 @@ impl Context {
             }
             subgoals = ordered;
         }
-        self.constrain(&term.type_, target)?;
+        // An ordinary candidate is matched once, by the strict selection
+        // equation below: the pin's resolution makes a single `isDefEq` of the
+        // goal against the instance type at `instances` transparency (vendored
+        // Lean/Meta/SynthInstance.lean `tryResolve`, :356; configured at :879).
+        // A second, ordinary inference equation here was retried at
+        // safe-definition transparency for every candidate that failed, so the
+        // goal was re-normalized once per candidate. Against the pinned
+        // Init.Core, `Decidable (2 + 2 = 4)` spent 14k-45k heartbeats on each of
+        // 39 inapplicable `Decidable` instances and exhausted the budget before
+        // reaching `instDecidableEqNat`.
+        if default_application {
+            self.constrain(&term.type_, target)?;
+        }
         // The pin applies an explicitly registered default with ordinary
         // isDefEqGuarded transparency (SyntheticMVars.synthesizeUsingDefaultInstance),
         // then synthesizes its prerequisites using ordinary instance search.
