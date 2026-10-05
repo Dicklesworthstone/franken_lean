@@ -89,8 +89,8 @@
 //! `gii` requires this crate to bring "its OWN decoder over Grimoire canonical
 //! wire objects". The graph enforces that by prohibiting `fln-olean` — but
 //! `fln-hash` is *permitted*, and `fln-hash::canon` carries
-//! `impl Canonical for Expr` (`canon.rs:1210`) whose trait supplies
-//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:699-728`). A
+//! `impl Canonical for Expr` (`canon.rs:1304`) whose trait supplies
+//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:793-822`). A
 //! checker can therefore read canonical bytes, call `Expr::from_canonical_bytes`,
 //! and share the decode path with the rest of the workspace **while satisfying
 //! every prohibition structure-guard currently enforces**. The "own decoder"
@@ -156,7 +156,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:544`, where
+//! matrix row was corrected for once already (`witness.rs:585`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -188,7 +188,7 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1116`). It is planted three ways:
+//!   (`tools/structure-guard/src/checks.rs:1117`). It is planted three ways:
 //!   `seeded.rs:1322` proves the baseline clean, `seeded.rs:1332`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
@@ -321,11 +321,11 @@
 //! cite crates/fln-kernel/src/tc.rs:2001 :: e.loose_bvar_range() <= k
 //! cite crates/fln-kernel/src/tc.rs:5503 :: !e.has_fvar() || active == 0
 //! cite crates/fln-kernel/src/tc.rs:5698 :: if !e.has_fvar() {
-//! cite crates/fln-hash/src/canon.rs:1210 :: impl Canonical for Expr
-//! cite crates/fln-hash/src/canon.rs:699 :: pub trait Canonical: Sized
+//! cite crates/fln-hash/src/canon.rs:1304 :: impl Canonical for Expr
+//! cite crates/fln-hash/src/canon.rs:793 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:544 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1116 :: code: "FLN-STRUCT-037"
+//! cite crates/fln-conformance/src/witness.rs:585 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite tools/structure-guard/src/checks.rs:1117 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1332 :: fn every_semantic_item_is_refused_inside_fln_checker
 //! cite tools/structure-guard/tests/seeded.rs:1367 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
