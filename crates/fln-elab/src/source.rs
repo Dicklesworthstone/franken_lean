@@ -11,6 +11,7 @@ mod calc;
 mod coercions;
 mod collections;
 mod do_notation;
+mod eliminator;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
@@ -68,6 +69,9 @@ pub enum SourceInferenceError {
     /// `expandCoe`-unfolded coercion; the native coercion search does not
     /// produce that term, so this is refused rather than approximated.
     OperatorCoercion,
+    /// The pin's eliminator elaboration (`elabAsElim`) could not finish; the
+    /// text is the pin's own message after "failed to elaborate eliminator, ".
+    Eliminator(&'static str),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     SimpSet(scope::simp::SimpSetError),
@@ -128,6 +132,7 @@ impl std::fmt::Display for SourceInferenceError {
                 f,
                 "operator elaboration needs a coercion to the tree's maximal type, and expanded coercion insertion is not implemented"
             ),
+            Self::Eliminator(reason) => write!(f, "failed to elaborate eliminator, {reason}"),
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -269,6 +274,9 @@ struct Context {
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
     recursion: Option<recursion::Recursion>,
+    // Eliminator applications waiting for their expected type (`elabAsElim`'s
+    // postponement), resumed after default instances run.
+    postponed_eliminators: Vec<eliminator::PostponedEliminator>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -316,6 +324,7 @@ impl Context {
             protected_declaration: None,
             refinements: Vec::new(),
             recursion: None,
+            postponed_eliminators: Vec::new(),
         }
     }
 
@@ -1894,7 +1903,17 @@ impl Context {
                         }
                         Task::Function(arguments, expected, explicit) => {
                             let function = values.pop().expect("function task follows its visit");
-                            if application::has_named(arguments) {
+                            if let Some(info) =
+                                self.eliminator_info(&function, arguments, explicit)?
+                            {
+                                let term = self.eliminator_application(
+                                    function,
+                                    arguments,
+                                    info,
+                                    expected.clone(),
+                                )?;
+                                values.push(self.finish_explicit_term(term, expected.as_ref())?);
+                            } else if application::has_named(arguments) {
                                 tasks.push(Task::NamedNext(self.start_named_application(
                                     function, arguments, expected, explicit,
                                 )?));
@@ -2502,6 +2521,7 @@ impl Context {
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
         self.resolve_instances(true)?;
+        self.resume_postponed_eliminators(true)?;
         self.flush(true)?;
         let value = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
@@ -2745,6 +2765,7 @@ fn definition_in_context_named(
     // rescue a stuck header instance. An explicit result also closes ordinary
     // header holes; inferred results may still constrain ordinary parameters.
     context.resolve_instances(true)?;
+    context.resume_postponed_eliminators(true)?;
     if let Some(expected) = &expected {
         context.flush(true)?;
         let mut types = Vec::with_capacity(parameters.len() + 1);
@@ -2824,6 +2845,7 @@ fn definition_in_context_named(
     // Section variables are fixed during recursion, not recursive arguments.
     // Only after body elaboration are their used dependencies prepended.
     context.resolve_instances(true)?;
+    context.resume_postponed_eliminators(true)?;
     context.flush(true)?;
     let section_parameters = if let Some(selected) = theorem_section_parameters {
         selected
