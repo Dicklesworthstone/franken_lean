@@ -1,0 +1,144 @@
+name: Checker free-binding reuse (u1vk)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/patches/fln-free-binding-reuse-u1vk.patch
+      - .github/workflows/fln-free-binding-reuse-u1vk.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-free-binding-reuse-u1vk
+  cancel-in-progress: false
+
+jobs:
+  validate-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the source and install the repository Rust pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fln-u1vk-evidence"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/fln-u1vk-target-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/fln-u1vk-evidence/base.txt"
+          test "$(git hash-object crates/fln-checker/src/whnf.rs)" = 79d80c6e5bf599a246c2a50d6d8befd174b7dc2c
+          git apply --check .github/patches/fln-free-binding-reuse-u1vk.patch
+          rustup show active-toolchain 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/toolchain.txt"
+          rustc -Vv 2>&1 | tee -a "$RUNNER_TEMP/fln-u1vk-evidence/toolchain.txt"
+
+      - name: Reproduce the original false refusal with the new Rust regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --include=crates/fln-checker/tests/free_binding_reuse.rs .github/patches/fln-free-binding-reuse-u1vk.patch
+          set +e
+          cargo test --locked -p fln-checker --test free_binding_reuse identity_may_be_unfolded_again_after_beta -- --exact 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/baseline.txt"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -eq 101
+          grep -F 'test identity_may_be_unfolded_again_after_beta ... FAILED' "$RUNNER_TEMP/fln-u1vk-evidence/baseline.txt"
+          grep -F 'FreeBindingCycle' "$RUNNER_TEMP/fln-u1vk-evidence/baseline.txt"
+          grep -F '0 passed; 1 failed;' "$RUNNER_TEMP/fln-u1vk-evidence/baseline.txt"
+
+      - name: Apply only the reviewed source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --exclude=crates/fln-checker/tests/free_binding_reuse.rs .github/patches/fln-free-binding-reuse-u1vk.patch
+          rustfmt --edition 2024 crates/fln-checker/src/whnf/free_bindings.rs crates/fln-checker/tests/free_binding_reuse.rs
+          rustfmt --edition 2024 --check crates/fln-checker/src/whnf/free_bindings.rs crates/fln-checker/tests/free_binding_reuse.rs
+          git add crates/fln-checker/src/whnf.rs crates/fln-checker/src/whnf/free_bindings.rs crates/fln-checker/tests/free_binding_reuse.rs
+          git diff --cached --check
+          git diff --cached --binary > "$RUNNER_TEMP/fln-u1vk-evidence/source.patch"
+          git write-tree > "$RUNNER_TEMP/fln-u1vk-evidence/tested-tree.txt"
+
+      - name: Run all sixteen Rust regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-checker --test free_binding_reuse 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/regressions.txt"
+          grep -F '16 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/fln-u1vk-evidence/regressions.txt"
+
+      - name: Run the checker package tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-checker 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/checker-tests.txt"
+
+      - name: Check the checker with Clippy and compile the workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln-checker --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/clippy.txt"
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/workspace-check.txt"
+
+      - name: Export exact tested source blobs for a leased direct-to-main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          paths = [
+              'crates/fln-checker/src/whnf.rs',
+              'crates/fln-checker/src/whnf/free_bindings.rs',
+              'crates/fln-checker/tests/free_binding_reuse.rs',
+          ]
+          staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          if sorted(staged) != sorted(paths):
+              raise SystemExit(f'unexpected staged paths: {staged!r}')
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          rows = []
+          for path in paths:
+              data = Path(path).read_bytes()
+              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              response = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', '--input', '-'],
+                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                  text=True, capture_output=True, check=True,
+              )
+              actual = json.loads(response.stdout)['sha']
+              if actual != expected:
+                  raise SystemExit(f'blob identity mismatch for {path}')
+              rows.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': actual})
+          receipt = {
+              'base_commit': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'tested_tree': subprocess.check_output(['git', 'write-tree'], text=True).strip(),
+              'tree_elements': rows,
+              'rust_regressions': 16,
+              'pinned_mathlib_replay': 'not_run',
+          }
+          encoded = json.dumps(receipt, indent=2) + '\n'
+          (Path(os.environ['RUNNER_TEMP']) / 'fln-u1vk-evidence' / 'tested-blobs.json').write_text(encoded)
+          print(encoded)
+          PY
+
+      - name: Retain source identity and command logs, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fln-u1vk-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fln-u1vk-evidence
+          if-no-files-found: error
+          retention-days: 14
