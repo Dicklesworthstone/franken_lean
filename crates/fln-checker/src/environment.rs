@@ -526,9 +526,9 @@ impl ConstantDeclaration {
         self.delta_body_in(DefinitionSafety::Safe)
     }
 
-    /// The body delta reduction may unfold while checking a declaration of
+    /// The body lazy delta may unfold while checking a declaration of
     /// safety `scope`: exactly the definitions such a declaration may reference
-    /// (KR-973). A safe declaration unfolds safe definitions, a partial one
+    /// (KR-973). WHNF also unfolds theorems ([`Self::unfold_value_in`]). A safe declaration unfolds safe definitions, a partial one
     /// partial definitions as well, and an unsafe one any definition. The pin's
     /// `is_delta` has no safety gate at all; its reference rule is what keeps a
     /// non-safe body out of a safe declaration. Refusing delta everywhere only
@@ -545,6 +545,32 @@ impl ConstantDeclaration {
             _ => scope == DefinitionSafety::Unsafe,
         };
         referable.then_some(body)
+    }
+
+    /// The value WHNF's delta step substitutes for this constant in a
+    /// declaration of safety `scope`: a [`Self::delta_body_in`] definition's,
+    /// or a theorem's. Authority, the vendored pin: `is_delta` admits what
+    /// `constant_info::has_value()` admits, `is_theorem() || is_definition()`
+    /// (`src/kernel/declaration.h:466`), and `inductive_reduce_rec` takes a
+    /// major's full `whnf` (`src/kernel/type_checker.cpp:359`), so a recursor
+    /// over a theorem application iota-reduces once the theorem unfolds:
+    /// `And.rec` into `Rat` over `Rat.instEncodable._proof_1` stayed stuck here
+    /// and its declaration deferred (bead fln-4o0g). Every theorem is safe, as
+    /// at the pin ([`Self::theorem`]), so any scope may unfold one. Opaques stay
+    /// folded: `is_delta` leaves `allow_opaque` false.
+    ///
+    /// Lazy delta still selects only definitions: the pin decides a pair of
+    /// proofs by `is_def_eq_proof_irrel` before `lazy_delta_reduction`
+    /// (`type_checker.cpp:1117`), so a theorem head never reaches its height
+    /// comparison, and this checker's untyped lane defers a proof pair to the
+    /// typed lane instead. (Consistent with K1, franken_lean-d17i.)
+    pub fn unfold_value_in(&self, scope: DefinitionSafety) -> Option<&WireExpr> {
+        match self.body.as_ref()? {
+            ConstantBody::Theorem { value, .. } => Some(value),
+            ConstantBody::Definition(_) | ConstantBody::Opaque { .. } => {
+                self.delta_body_in(scope).map(DefinitionBody::value)
+            }
+        }
     }
 
     pub fn is_delta_unfoldable(&self) -> bool {

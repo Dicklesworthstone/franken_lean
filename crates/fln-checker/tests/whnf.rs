@@ -1752,6 +1752,100 @@ fn defeq_unfolds_only_the_demanded_recursor_major_with_global_reduction_budget()
     }
 }
 
+/// fln-4o0g: a recursor whose major is a THEOREM application iota-reduces, as at
+/// the pin, where `is_delta` admits `has_value()` = `is_theorem() ||
+/// is_definition()` and `inductive_reduce_rec` takes the major's full `whnf`.
+/// On Mathlib, `And.rec` into `Rat` over `Rat.instEncodable._proof_1` stayed
+/// stuck here and `Rat.instEncodable._proof_3` deferred. An opaque with the same
+/// value stays folded (`allow_opaque` is false at `is_delta`), and neither one is
+/// a lazy-delta candidate.
+#[test]
+fn a_theorem_major_unfolds_so_iota_fires_while_an_opaque_major_stays_stuck() {
+    let tt = || Expr::const_(Name::from_components(["Two", "tt"]), Vec::new());
+    let two = || decoded(&Expr::const_(primary_name("Two"), Vec::new()));
+    let mut entries = two_family_entries();
+    entries.push(ConstantEntry::new(
+        checker_name("tt_theorem"),
+        ConstantDeclaration::theorem(Vec::new(), two(), decoded(&tt()), Vec::new()),
+    ));
+    entries.push(ConstantEntry::new(
+        checker_name("tt_opaque"),
+        ConstantDeclaration::opaque(
+            Vec::new(),
+            two(),
+            ConstantSafety::Safe,
+            decoded(&tt()),
+            Vec::new(),
+        ),
+    ));
+    let context = definition_context(entries);
+    let theorem = context
+        .constants()
+        .find(&checker_name("tt_theorem"))
+        .expect("the theorem is addressable");
+    assert!(
+        theorem.delta_body_in(DefinitionSafety::Safe).is_none(),
+        "a theorem never takes a lazy-delta height"
+    );
+    let application = |major| {
+        decoded(&Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::const_(
+                            Name::from_components(["Two", "rec"]),
+                            vec![Level::param(primary_name("v"))],
+                        ),
+                        constant("MotiveStub"),
+                    ),
+                    constant("MinorTt"),
+                ),
+                constant("MinorFf"),
+            ),
+            major,
+        ))
+    };
+    let expected = decoded(&constant("MinorTt"));
+
+    let reduced = complete(whnf(
+        &application(constant("tt_theorem")),
+        &context,
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(
+        root_constant_name(&reduced.term),
+        root_constant_name(&expected),
+        "Two.rec … tt_theorem must unfold the theorem and fire the tt rule"
+    );
+    let converted = def_eq(
+        &application(constant("tt_theorem")),
+        &expected,
+        &context,
+        DefEqBudget::unlimited(),
+    );
+    assert!(
+        matches!(converted, DefEqOutcome::Equal(_)),
+        "conversion over a theorem major must decide: {converted:?}"
+    );
+
+    let folded = complete(whnf(
+        &application(constant("tt_opaque")),
+        &context,
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(folded.reductions, 0, "no rule fires on an opaque major");
+    let deferred = def_eq(
+        &application(constant("tt_opaque")),
+        &expected,
+        &context,
+        DefEqBudget::unlimited(),
+    );
+    assert!(
+        matches!(deferred, DefEqOutcome::Deferred { .. }),
+        "an opaque major cannot select a constructor rule: {deferred:?}"
+    );
+}
+
 #[test]
 fn k_corner_reduces_a_stuck_same_endpoints_major() {
     let context = definition_context(eqs_family_entries());

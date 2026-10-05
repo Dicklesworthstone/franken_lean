@@ -247,6 +247,8 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
     assert_eq!(theorem.safety(), ConstantSafety::Safe);
     assert_eq!(theorem.body_value(), Some(&leaf(7)));
     assert!(theorem.definition_body().is_none());
+    // Not a lazy-delta candidate: the pin decides proofs by proof irrelevance
+    // before lazy delta. WHNF does unfold it (`unfold_value_in`, below).
     assert!(!theorem.is_delta_unfoldable());
 
     let opaque = environment
@@ -257,6 +259,31 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
     assert_eq!(opaque.body_value(), Some(&leaf(9)));
     assert!(opaque.definition_body().is_none());
     assert!(!opaque.is_delta_unfoldable());
+
+    // WHNF's delta step (`unfold_value_in`, fln-4o0g) also unfolds a theorem in
+    // every scope, as the pin's `is_delta` does; definitions keep their KR-973
+    // scopes and an opaque never unfolds.
+    let scopes = [
+        DefinitionSafety::Safe,
+        DefinitionSafety::Partial,
+        DefinitionSafety::Unsafe,
+    ];
+    for (declaration, unfolds_in, value) in [
+        (abbrev, [true, true, true], leaf(1)),
+        (partial, [false, true, true], leaf(3)),
+        (regular, [false, false, true], leaf(5)),
+        (theorem, [true, true, true], leaf(7)),
+        (opaque, [false, false, false], leaf(9)),
+    ] {
+        for (scope, unfolds) in scopes.into_iter().zip(unfolds_in) {
+            assert_eq!(
+                declaration.unfold_value_in(scope),
+                unfolds.then_some(&value),
+                "{:?} in scope {scope:?}",
+                declaration.kind()
+            );
+        }
+    }
 
     for (index, (name, kind)) in header_kinds.iter().enumerate() {
         let header = environment
@@ -279,6 +306,7 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
         assert!(header.definition_body().is_none());
         assert!(header.body_value().is_none());
         assert!(header.delta_body().is_none());
+        assert!(header.unfold_value_in(DefinitionSafety::Unsafe).is_none());
     }
 }
 

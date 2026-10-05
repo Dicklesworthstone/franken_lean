@@ -184,12 +184,21 @@ impl WhnfContext {
         self.scope
     }
 
-    /// The body delta may unfold for `constant` in this context.
+    /// The body lazy delta may unfold for `constant` in this context.
     pub(crate) fn delta_body<'a>(
         &self,
         constant: &'a ConstantDeclaration,
     ) -> Option<&'a DefinitionBody> {
         constant.delta_body_in(self.scope)
+    }
+
+    /// The value WHNF's delta step substitutes for `constant` in this context
+    /// (`ConstantDeclaration::unfold_value_in`): a definition's or a theorem's.
+    pub(crate) fn unfold_value<'a>(
+        &self,
+        constant: &'a ConstantDeclaration,
+    ) -> Option<&'a WireExpr> {
+        constant.unfold_value_in(self.scope)
     }
 
     pub fn free_bindings(&self) -> &[FreeBinding] {
@@ -1379,7 +1388,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let Some(constant) = self.context.source.constants().find(name) else {
             return Ok(None);
         };
-        let Some(definition) = self.context.source.delta_body(constant) else {
+        let Some(value) = self.context.source.unfold_value(constant) else {
             return Ok(None);
         };
         if constant.level_parameters().len() != levels.len() {
@@ -1395,7 +1404,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         self.control
             .reduction(current.root.index(), self.cancelled)?;
         let body = self.instantiated(
-            definition.value(),
+            value,
             constant.level_parameters(),
             &current.arena,
             levels,
