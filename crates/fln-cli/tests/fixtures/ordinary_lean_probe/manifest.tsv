@@ -1,0 +1,36 @@
+# Ordinary-Lean acceptance probe (bead fln-ordinary-lean-probe-g03u). Measuring, never gating the seed dialect.
+# Set A: the 2026-09-27 reality-check programs. Set B: the 2026-10-04 ones (both `#check` lines share b05).
+# Columns 3-5 are the pinned Reference `lean <file>` run from this directory: exit code, stdout, stderr,
+# escaped with \\ \n \t \r. They were recorded from the pin, never written by hand, and
+# crates/fln-cli/tests/ordinary_lean_probe.rs refuses any row the live pin no longer reproduces.
+# file	set	reference_exit	reference_stdout	reference_stderr
+a01_theorem_rfl.lean	A	0		
+a02_decide.lean	A	0		
+a03_list_length.lean	A	0	3\n	
+a04_structure.lean	A	0	3\n	
+a05_add_comm.lean	A	0		
+a06_induction.lean	A	0		
+a07_io_main.lean	A	0	x = 5\n	
+a08_notation.lean	A	0	42\n	
+a09_omega.lean	A	0		
+a10_simp.lean	A	0		
+a11_typeclass_fold.lean	A	0	6\n	
+a12_inductive_tree.lean	A	0	3\n	
+a13_string_length.lean	A	0	10\n	
+a14_def_chain.lean	A	0	43\n	
+a15_reject_type_mismatch.lean	A	1	a15_reject_type_mismatch.lean:1:17: error: Type mismatch\n  "not a nat"\nhas type\n  String\nbut is expected to have type\n  Nat\n	
+a16_reject_false_rfl.lean	A	1	a16_reject_false_rfl.lean:1:0: error: Not a definitional equality: the left-hand side\n  2 + 2\nis not definitionally equal to the right-hand side\n  5\na16_reject_false_rfl.lean:1:29: error: Type mismatch\n  rfl\nhas type\n  ?m.16 = ?m.16\nbut is expected to have type\n  2 + 2 = 5\n	
+b01_option.lean	B	0	some 5\n	
+b02_deriving_repr.lean	B	0	{ x := 3 }\n	
+b03_for_loop.lean	B	0	45\n	
+b04_where.lean	B	0	9\n	
+b05_check.lean	B	0	Nat.succ (n : Nat) : Nat\n@List.map : {α : Type u_1} → {β : Type u_2} → (α → β) → List α → List β\n	
+b06_class_instance.lean	B	0	9\n	
+b07_array.lean	B	0	4\n	
+b08_simp_add_zero.lean	B	0		
+b09_exists.lean	B	0		
+b10_and_intro.lean	B	0		
+b11_list_map.lean	B	0	[2, 4, 6]\n	
+b12_namespace.lean	B	0	7\n	
+b13_fib.lean	B	0	610\n	
+b14_reject_unknown_identifier.lean	B	1	b14_reject_unknown_identifier.lean:1:15: error(lean.unknownIdentifier): Unknown identifier `doesNotExist`\n	
