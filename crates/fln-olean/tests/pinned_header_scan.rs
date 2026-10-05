@@ -186,3 +186,82 @@ fn every_pinned_constant_decodes_under_the_shape_laws() {
     );
     assert_eq!(modules, 2433);
 }
+
+/// The three laws of bead `fln-fur.1` (pinned header identity, the full-surface
+/// audit's capacity law, the payload-tag law of the declaration decoder) over every
+/// part under the roots named in `FLN_OLEAN_SCAN_ROOTS`, e.g. a Mathlib corpus and
+/// its packages' `lib/lean` directories. Ignored, and skipped when the variable is
+/// unset. Every refusal is printed with its file, part and reason.
+#[test]
+#[ignore]
+fn every_part_under_the_scan_roots_passes_the_three_laws() {
+    use fln_olean::decl::DeclDecoder;
+    use fln_olean::region::{OleanView, WalkBudget};
+    let Some(roots) = std::env::var_os("FLN_OLEAN_SCAN_ROOTS") else {
+        eprintln!("SKIP: FLN_OLEAN_SCAN_ROOTS is unset");
+        return;
+    };
+    let mut found = Vec::new();
+    for root in std::env::split_paths(&roots) {
+        parts(&root, &mut found);
+    }
+    let (mut modules, mut audited, mut objects, mut constants) = (0usize, 0usize, 0u64, 0usize);
+    let mut refused = Vec::new();
+    for path in found
+        .iter()
+        .filter(|path| path.to_string_lossy().ends_with(".olean"))
+    {
+        modules += 1;
+        let mut chain = vec![std::fs::read(path).unwrap()];
+        for suffix in ["olean.server", "olean.private"] {
+            let companion = path.with_extension(suffix);
+            if companion.is_file() {
+                chain.push(std::fs::read(companion).unwrap());
+            }
+        }
+        for (index, part) in chain.iter().enumerate() {
+            if let Err(mismatch) = check_pinned_header(part) {
+                refused.push(format!(
+                    "{} part {index}: header: {mismatch}",
+                    path.display()
+                ));
+                continue;
+            }
+            let earlier: Vec<&[u8]> = chain[..index].iter().map(Vec::as_slice).collect();
+            match OleanView::parse_with_dependencies(part, &earlier)
+                .and_then(|view| view.shared_audit())
+            {
+                Ok(report) => {
+                    audited += 1;
+                    objects += report.objects;
+                }
+                Err(error) => {
+                    refused.push(format!("{} part {index}: audit: {error}", path.display()));
+                }
+            }
+        }
+        let last = chain.len() - 1;
+        let earlier: Vec<&[u8]> = chain[..last].iter().map(Vec::as_slice).collect();
+        match OleanView::parse_with_dependencies(&chain[last], &earlier)
+            .map_err(|error| error.to_string())
+            .and_then(|view| {
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_module_constants()
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(decoded) => constants += decoded.len(),
+            Err(error) => refused.push(format!("{} decode: {error}", path.display())),
+        }
+    }
+    let parts_total = found.len();
+    eprintln!(
+        "scanned {modules} modules, {parts_total} parts: {audited} audited ({objects} objects), {constants} constants decoded, {} refused",
+        refused.len()
+    );
+    assert!(
+        refused.is_empty(),
+        "{} refused: {refused:#?}",
+        refused.len()
+    );
+    assert_eq!(audited, parts_total);
+}
