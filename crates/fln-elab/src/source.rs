@@ -291,6 +291,10 @@ struct Context {
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
+    // The declaration whose body is being elaborated (`definition_body`), so that field
+    // notation naming it (`l.size` inside `T.size`) is recognized as a recursive reference
+    // before the recursion context exists, as a direct `T.size l` already is.
+    defining: Option<Name>,
     recursion: Option<recursion::Recursion>,
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
@@ -341,6 +345,7 @@ impl Context {
             protected_cache: crate::protected_names::ProtectedCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
+            defining: None,
             recursion: None,
             postponed_eliminators: Vec::new(),
         }

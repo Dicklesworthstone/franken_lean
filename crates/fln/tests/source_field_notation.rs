@@ -133,6 +133,37 @@ fn invalid_receivers_do_not_select_later_parameters_or_publish_a_prefix() {
     check("theorem repaired : (41).succ = 42 := by rfl");
 }
 
+/// Inside `T.size`'s own body, `l.size` is a recursive call: the pin finds the declaration
+/// being defined in the local context before it searches the environment
+/// (`LValResolution.localRec`). This is the stage-2 target I04 (bead
+/// `franken_lean-z8j.1.10`) with `by rfl` for its term-mode `rfl`; the pin accepts both.
+#[test]
+fn field_notation_inside_a_recursive_definition_is_a_recursive_call() {
+    check(
+        "inductive T where\n  | leaf\n  | node (l r : T)\n\
+         def T.size : T → Nat\n  | .leaf => 1\n  | .node l r => l.size + r.size + 1\n\
+         theorem t : (T.node .leaf .leaf).size = 3 := by rfl",
+    );
+}
+
+/// The recursive-call reading applies to the declaration's own name only, and only through
+/// structural recursion. The pin refuses both of these: `l.foo` with "Invalid field `foo`:
+/// The environment does not contain `T.foo`", and a self-reference that is not structural with
+/// "fail to show termination for T.size".
+#[test]
+fn field_notation_reaches_only_the_declaration_itself_and_only_structurally() {
+    for source in [
+        "inductive T where\n  | leaf\n  | node (l r : T)\n\
+         def T.size : T → Nat\n  | .leaf => 1\n  | .node l r => l.foo + 1",
+        "inductive T where\n  | leaf\n  | node (l r : T)\n\
+         def T.size (t : T) : Nat := t.size",
+    ] {
+        let result = engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+        let error = result.expect_err(source);
+        assert_eq!(error.disposition().0, "elaboration", "{source}\n{error}");
+    }
+}
+
 #[test]
 fn methods_execute_through_the_same_compiler_and_vm() {
     let source = b"def bump (xs : List Nat) : List Nat := xs.map (fun n => n + 1)\n#eval (([1, 2, 3]).map (fun n => n + 1)).foldr (fun n acc => n + acc) 0\n#eval (\"hello\").length";

@@ -313,6 +313,29 @@ impl Context {
                 }
             }
             let method = base.append_core(field);
+            // `l.size` inside `T.size`'s own body is a recursive call: after a structure
+            // field and before the environment, the pin searches the local context for the
+            // declaration being defined (`LValResolution.localRec`,
+            // `Lean/Elab/App.lean:1557`).
+            if let Some(recursion) = &self.recursion
+                && recursion.name == method
+            {
+                return Ok(FieldResolution::Method {
+                    function: recursion.reference.clone(),
+                    receiver,
+                    base,
+                });
+            }
+            // Before the recursion context exists, a reference to the declaration being
+            // defined is reported as the unknown constant it still is, exactly as a direct
+            // `T.size l` is: `definition_body` retries such a failure with the structural
+            // recursion context, where the branch above resolves it.
+            if self.recursion.is_none()
+                && self.defining.as_ref() == Some(&method)
+                && !self.txn.env.contains(&method)
+            {
+                return Err(failure(SourceInferenceError::UnknownConstant(method)));
+            }
             // An alias owns its method namespace. Only a failed lookup
             // unfolds one definition, so intermediate aliases are not skipped
             // in favor of a field on the final underlying structure.

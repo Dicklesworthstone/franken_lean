@@ -143,6 +143,7 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        self.defining = Some(name.clone());
         let snapshot = self.clone();
         match self.term(syntax, expected.clone()) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
