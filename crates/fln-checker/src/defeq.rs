@@ -2096,6 +2096,35 @@ fn lazy_delta_heights(
     )?;
     let left_delta = left_height.is_some() && !left_projection;
     let right_delta = right_height.is_some() && !right_projection;
+    // Both sides unfold at the same height next. The pin's
+    // `lazy_delta_reduction_step` asks `quick_is_def_eq` of the pair each step
+    // leaves (vendored type_checker.cpp:954-958), and that first asks its
+    // equivalence manager, which falls back to structural equality
+    // (type_checker.cpp:759-761, equiv_manager.cpp:56-115): two identical terms
+    // are equal and are not unfolded further. Without this, identical terms
+    // unfold in lockstep through every layer of both copies whenever the
+    // same-head argument comparison does not apply (a head that is not
+    // regular). In `Equiv.isDomain` (Mathlib.Algebra.Ring.TransferInstance) the
+    // instance diamond puts identical copies of `Equiv.mul e …`, `HMul.hMul …`
+    // and the `Semiring` parent projections on both sides; unfolding them in
+    // lockstep spent 14,168,443 comparisons and the whole materialization
+    // budget. Metadata is transparent here as it is to conversion, and no index
+    // is shifted, so this is reflexivity and nothing more: the pair is done,
+    // and `None` with nothing pushed drops it.
+    if left_delta
+        && right_delta
+        && left_height == right_height
+        && eta_structurally_equal(
+            left_reference,
+            right_reference,
+            0,
+            TermSources::new(left, right, generated),
+            control,
+            cancelled,
+        )?
+    {
+        return Ok(None);
+    }
     let projection_side = match (left_delta, right_delta) {
         (true, false) if right_projection => DefEqSide::Right,
         (false, true) if left_projection => DefEqSide::Left,

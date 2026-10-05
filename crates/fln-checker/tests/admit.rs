@@ -18,8 +18,12 @@ mod propositions;
 
 #[path = "admit/function_eta.rs"]
 mod function_eta;
+#[path = "admit/identical_unfolding.rs"]
+mod identical_unfolding;
 #[path = "admit/indexed.rs"]
 mod indexed;
+#[path = "admit/k_gate_lazy_conversion.rs"]
+mod k_gate_lazy_conversion;
 #[path = "admit/k_like.rs"]
 mod k_like;
 #[path = "admit/quotient_computation.rs"]

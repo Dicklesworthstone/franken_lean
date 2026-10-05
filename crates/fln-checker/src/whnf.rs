@@ -27,11 +27,12 @@ use memo::WhnfMemo;
 const K_GATE_CONVERSION_WORK: u64 = 100_000;
 
 /// Steps and reductions one side's normalization may spend in the KR-317 gate's
-/// structural comparison (`Reducer::k_constructor_types_equal`). Running out is
-/// a gate miss that falls through to the gate's conversion, never a stop of the
-/// reduction that asked: normalizing an open index such as `n - 57344` unfolds
-/// `Nat.sub` into 57,344 levels of recursion, where the conversion compares the
-/// two sides lazily, as the pin's `is_def_eq` does.
+/// eager walk (`Reducer::k_constructor_types_equal`). Running out is a gate
+/// miss, never a stop of the reduction that asked: normalizing an open index
+/// such as `n - 57344` unfolds `Nat.sub` into 57,344 levels of recursion. The
+/// bound is per side, so it does not bound a walk whose layers are each cheap;
+/// that is why the walk runs only after the gate's conversion, which compares
+/// the two sides lazily, as the pin's `is_def_eq` does, has not decided.
 const K_GATE_NORMALIZATION_WORK: u64 = 10 * K_GATE_CONVERSION_WORK;
 
 thread_local! {
@@ -1937,7 +1938,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
     }
 
     /// The KR-317 gate by the checker's own conversion, for what the structural
-    /// comparison cannot tell. The pin gates K on full `is_def_eq`
+    /// comparison cannot tell; it runs before the eager walk of
+    /// `k_constructor_types_equal`. The pin gates K on full `is_def_eq`
     /// (`to_cnstr_when_K`, inductive.h:31). A cast along `hcast : w * (idx + 1)
     /// = w * idx + w` (Std.Tactic.BVDecide ... Operations.Cpop) has indices that
     /// are equal only by unfolding `Nat.mul` on a successor. Missing the gate
@@ -2023,8 +2025,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(equal)
     }
 
-    /// A sufficient conversion gate for KR-317. Compare demanded application
-    /// arguments after checker-owned WHNF instead of requiring identical syntax.
+    /// A sufficient conversion gate for KR-317, tried last: only when the lazy
+    /// conversion of `k_constructor_types_convert` has not decided. Compare
+    /// demanded application arguments after checker-owned WHNF instead of
+    /// requiring identical syntax.
     /// This permits equal types computed by recursors/projections without making
     /// a cast across distinct types disappear. No proof irrelevance is assumed.
     /// Binder bodies stay on the structural path: reducing them here would need
@@ -2357,16 +2361,33 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let result_root = constructor_result.root();
         let result_cursor = Cursor::closed(Arc::new(constructor_result), result_root);
         // The pin's gate: the constructed constructor's type must be defeq to
-        // the major's type. Here: the reconstructed result type must match
-        // the spine-derived domain by a sufficient checker-owned conversion,
-        // structural first and the full conversion when that cannot tell.
-        if !self.k_constructor_types_equal(&domain_cursor, &result_cursor)?
-            && !self.k_constructor_types_convert(
+        // the major's type (`if (!is_def_eq(app_type, new_type)) return e;`,
+        // vendored inductive.h:48). Here: the reconstructed result type must
+        // match the spine-derived domain, structurally first; then by this
+        // checker's conversion, which is lazy as the pin's `is_def_eq` is: it
+        // unfolds by definitional height and, at a shared regular head, compares
+        // the arguments before unfolding it (`lazy_delta_reduction_step`,
+        // vendored type_checker.cpp:930-951); and only when that cannot tell, by
+        // the eager walk of `k_constructor_types_equal`, a sufficient check of
+        // this checker's own for what its untyped conversion defers.
+        //
+        // The eager walk must not come first. It normalizes both sides with
+        // full delta and splits the weak heads it reaches, so on
+        // `Nat.add (f x) N` against `Nat.add x N` it peels one successor of the
+        // literal per layer and meets `f x` against `x` only after N layers;
+        // each layer is cheap, so no per-side bound stops it. In
+        // `Char.toUpper_eq_of_isLower` the major's type compares
+        // `c.val + ('A'.val - 'a'.val)` with `c.val + 4294967264`: the walk spent
+        // the whole 100,000,000-step budget, where the conversion passes the gate
+        // in about 4,000 steps.
+        let gate_passes = self.structural_cursors_equal(&domain_cursor, &result_cursor)?
+            || self.k_constructor_types_convert(
                 &domain_cursor.arena,
                 &result_cursor.arena,
                 current.root.index(),
             )?
-        {
+            || self.k_constructor_types_equal(&domain_cursor, &result_cursor)?;
+        if !gate_passes {
             return Ok(None);
         }
         // Build the nullary constructor applied to the domain's parameters.
