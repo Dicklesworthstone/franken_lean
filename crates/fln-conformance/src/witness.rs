@@ -428,9 +428,11 @@ const SITES_README_PG5_NO_REFERENCE_IN_CI: [ClaimSite; 1] = [site(
 ///
 /// Corrected 2026-08-02 (bead `franken_lean-4snn`): this note said TWO sub-claims were
 /// `Supported`, counting `leanchecker` as a foreign-kernel witness. The lane
-/// (`scripts/tribunal/leanchecker_witness.sh`) exists, but no CI step executes it:
-/// `scripts/check.sh` only shellchecks and hashes it, and `leanchecker` runs only from
-/// `#[ignore]`d on-demand tests (bead `franken_lean-z8j.1.17`). Even when run it
+/// (`scripts/tribunal/leanchecker_witness.sh`) is not run by `scripts/check.sh`, which
+/// hashes and lints it; it is run by the weekly contract-drift workflow, where the pin is
+/// installed, and one real run's receipt is retained under
+/// `crates/fln-conformance/evidence/leanchecker_witness/` (bead `franken_lean-z8j.1.17`).
+/// Even when run it
 /// re-executes the pinned Reference kernel and is therefore `ReferenceKernelOracle`, not an
 /// independent implementation. The closed `fln-hfch` verification-manifest row records that
 /// authority boundary. Calling the lane a foreign witness hid the missing independent opinion.
@@ -598,8 +600,9 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
                    empty councils, general declaration/module/corpus execution is not wired, \
                    and the planned WASM and policy-driven release-closure lanes are absent. The \
                    Reference-kernel-oracle lane (scripts/tribunal/leanchecker_witness.sh) \
-                   exists but no CI step executes it: scripts/check.sh only shellchecks and \
-                   hashes it (franken_lean-z8j.1.17). Even when run it re-executes the \
+                   is run by the weekly contract-drift workflow, not by scripts/check.sh, and \
+                   one real run's receipt is retained (franken_lean-z8j.1.17). Even when run \
+                   it re-executes the \
                    Reference implementation and therefore does NOT satisfy the \
                    foreign-independent-witness half. The authority classification \
                    is recorded by the fln-hfch verification-manifest row. Corrected 2026-07-25 \

@@ -97,8 +97,9 @@
 //! `scripts/tribunal/leanchecker_witness.sh`, which emits
 //! `"verdict":"accepted"` / `"rejected"` per module with an anti-rubber-stamp
 //! discriminate lane — is a job for a layer that is allowed to do I/O. (That
-//! script is shellchecked and hashed by `scripts/check.sh` but executed by no
-//! CI step today; bead `franken_lean-z8j.1.17`.) [`SeatVerdict`] is shaped to accept exactly that
+//! script is shellchecked and hashed by `scripts/check.sh`, which does not run
+//! it. It is run by the weekly contract-drift workflow, where the pin is
+//! installed; bead `franken_lean-z8j.1.17`.) [`SeatVerdict`] is shaped to accept exactly that
 //! vocabulary, including its third case: the witness that did not run.
 //!
 //! # What this does NOT claim
