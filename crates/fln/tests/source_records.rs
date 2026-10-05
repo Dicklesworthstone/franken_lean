@@ -1,7 +1,7 @@
 //! Source-defined records/classes exercise the production checking pipeline.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
-use fln_core::expr::ExprNode;
+use fln_core::expr::{BinderInfo, ExprNode};
 use fln_elab::instances::InstanceRegistry;
 use fln_kernel::Declaration;
 
@@ -74,6 +74,93 @@ fn source_classes_feed_registered_global_and_local_instance_search() {
         result.result_logical_root,
         result.engine.logical_root(&KVMap::new())
     );
+}
+
+// Signatures observed with lean v4.32.0, `prelude; import Init.Prelude`,
+// `#check @<projection>`. See Lean/Meta/Structure.lean mkProjections and
+// Lean/Expr.lean inferImplicit: an instance receiver does not by itself make
+// the class parameters inferable; an explicit structure receiver does.
+#[test]
+fn projection_parameter_binders_follow_the_pinned_signatures() {
+    use BinderInfo::{Default as E, Implicit as I, InstImplicit as C};
+    let result = check(
+        &engine(),
+        "class C (n : Nat) where\n  val : Nat\n\
+         class Dep (A : Type) where\n  val : A\n\
+         class Out (A : outParam Type) where\n  val : Nat\n\
+         class Inst (A : Type) [d : Dep A] where\n  val : Nat\n\
+         structure S (n : Nat) where\n  val : Nat\n\
+         structure SI (A : Type) [d : Dep A] where\n  val : Nat\n\
+         class Chain (n : Nat) where\n  ty : Type\n  val : ty\n\
+         class Methods (A : Type) where\n  hidden : {x : A} -> Nat\n  visible : (x : A) -> Nat\n\
+         class Semi (A : semiOutParam Type) where\n  val : Nat",
+    );
+    for (name, expected) in [
+        ("C.val", vec![E, C]),
+        ("Dep.val", vec![I, C]),
+        ("Out.val", vec![I, C]),
+        ("Inst.val", vec![E, I, C]),
+        ("S.val", vec![I, E]),
+        ("SI.val", vec![I, C, E]),
+        ("Chain.ty", vec![E, C]),
+        ("Chain.val", vec![I, C]),
+        ("Methods.hidden", vec![E, C, I]),
+        ("Methods.visible", vec![I, C, E]),
+        ("Semi.val", vec![E, C]),
+    ] {
+        let info = result.engine.environment().find(&n(name)).unwrap();
+        let mut ty = &info.constant_val().type_;
+        let mut actual = Vec::new();
+        while let ExprNode::ForallE {
+            binder_info, body, ..
+        } = ty.node()
+        {
+            actual.push(*binder_info);
+            ty = body;
+        }
+        assert_eq!(actual, expected, "{name}: {:?}", info.constant_val().type_);
+    }
+    let fln_env::constants::ConstantInfo::Defn(projection) =
+        result.engine.environment().find(&n("Dep.val")).unwrap()
+    else {
+        panic!("projection must be a definition");
+    };
+    // `#print Dep.val` at the pin: type {A}, value `fun A [self] => self.1`.
+    assert!(matches!(
+        projection.value.node(),
+        ExprNode::Lam {
+            binder_info: BinderInfo::Default,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn explicit_class_index_selects_the_right_dictionary_and_checks_its_value() {
+    let result = check(
+        &engine(),
+        "class C (n : Nat) where\n  val : Nat\n\
+         instance instC1 : C 1 := C.mk 5\n\
+         instance instC2 : C 2 := C.mk 9\n\
+         def t : Nat := C.val 1\n\
+         theorem first : t = 5 := by rfl\n\
+         theorem second : C.val 2 = 9 := by rfl",
+    );
+    assert_eq!(result.theorems, 2);
+    for text in [
+        "def missing : Nat := C.val 3",
+        "theorem wrong : C.val 2 = 5 := by rfl",
+    ] {
+        let error = result
+            .engine
+            .check_source_files(
+                &[text.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{text}: {error}");
+    }
 }
 
 #[test]

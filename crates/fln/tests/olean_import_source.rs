@@ -143,3 +143,33 @@ fn source_importing_the_real_prelude_checks_against_council_admitted_declaration
         ));
     });
 }
+
+#[test]
+fn class_projection_index_works_over_the_real_prelude() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    on_a_big_stack(move || {
+        let prelude = admit_modules(&lib, &["Init.Prelude"]);
+        // fln-vpfi: accepted by the v4.32.0 oracle. This must work with the
+        // imported Nat/OfNat/instance metadata, not only the source seed.
+        let source = "prelude\nimport Init.Prelude\n\
+            class C (n : Nat) where\n  val : Nat\n\
+            instance instC1 : C 1 := C.mk 5\n\
+            def t : Nat := C.val 1\n\
+            theorem value : Eq t 5 := Eq.refl t";
+        let checked = check(&prelude, source)
+            .unwrap()
+            .into_complete()
+            .expect("class projection with an explicit index must pass the council");
+        assert_eq!(checked.checked.theorems, 1);
+        assert!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .contains(&Name::from_components(["t"]))
+        );
+    });
+}
