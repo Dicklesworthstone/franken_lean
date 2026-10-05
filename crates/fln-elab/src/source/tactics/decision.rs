@@ -26,7 +26,7 @@ impl Context {
         self.require_resolved(std::slice::from_ref(&proposition))?;
         let dictionary = self.decision_dictionary(&proposition)?;
         let computation = apps(
-            constant("decide", vec![]),
+            self.decide_constant(),
             [proposition.clone(), dictionary.clone()],
         );
         if !self.decision_computes_true(computation)? {
@@ -44,6 +44,22 @@ impl Context {
         // In particular the actual dictionary and its arguments are retained;
         // successful tactic conversion is not an admission certificate.
         self.close_proof_goal(goal, value)
+    }
+
+    /// The Boolean decision the tactic evaluates. The pin builds it with `mkDecide`,
+    /// whose head is `Decidable.decide` (vendored Lean/Meta/AppBuilder.lean:589-590); a
+    /// plain `decide` exists there only as an `export` alias, which is no
+    /// constant at all. The frozen seed dialect has no `Decidable.decide` and
+    /// names the same function `decide`, so the seed spelling is used only where
+    /// the pin's constant is absent; it goes when the seed is retired
+    /// (franken_lean-z8j.1.8).
+    fn decide_constant(&self) -> Expr {
+        let pinned = Name::from_components(["Decidable", "decide"]);
+        if self.txn.env.contains(&pinned) {
+            Expr::const_(pinned, vec![])
+        } else {
+            constant("decide", vec![])
+        }
     }
 
     /// Recover the universe telescope of a closed conversion query, including

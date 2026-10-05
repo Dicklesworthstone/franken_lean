@@ -1,6 +1,11 @@
 //! Decision-driven proof control must retain evidence and every branch.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::source_check::modules::imported::SourceOleanImportLimits;
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
+    OleanModuleInput, Outcome, SourceCheckLimits,
+};
+use std::path::{Path, PathBuf};
 
 fn check(source: &str) {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
@@ -388,4 +393,109 @@ fn decide_resource_exhaustion_is_not_optional_tactic_failure() {
         .unwrap()
         .into_complete()
         .unwrap();
+}
+
+const STACK: usize = 256 * 1024 * 1024;
+
+fn pinned_lib() -> Option<PathBuf> {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+            })
+        })
+        .filter(|lib| lib.is_dir());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "FLN_REQUIRE_REFERENCE is set but the pinned Reference lib/lean is absent"
+    );
+    lib
+}
+
+/// The pinned `Init.Tactics` and its import closure, dependency first, admitted
+/// through the council with their instance journals activated.
+fn import_init_tactics(lib: &Path) -> Engine {
+    const CLOSURE: [&str; 4] = ["Init.Prelude", "Init.Coe", "Init.Notation", "Init.Tactics"];
+    let names: Vec<Name> = CLOSURE
+        .iter()
+        .map(|module| Name::from_components(module.split('.')))
+        .collect();
+    let parts: Vec<[Vec<u8>; 3]> = CLOSURE
+        .iter()
+        .map(|module| {
+            let base = module
+                .split('.')
+                .fold(lib.to_path_buf(), |path, part| path.join(part))
+                .with_extension("olean");
+            let read = |path: PathBuf| std::fs::read(&path).expect("pinned olean part");
+            [
+                read(base.clone()),
+                read(base.with_extension("olean.server")),
+                read(base.with_extension("olean.private")),
+            ]
+        })
+        .collect();
+    let inputs: Vec<OleanModuleInput<'_>> = names
+        .iter()
+        .zip(&parts)
+        .map(|(name, [exported, server, private])| OleanModuleInput {
+            name,
+            artifact: exported,
+            server_artifact: Some(server),
+            private_artifact: Some(private),
+        })
+        .collect();
+    let limits = SourceOleanImportLimits::new(OleanCheckLimits::new(
+        256 * 1024 * 1024,
+        Budget::for_stack_bytes(STACK),
+    ));
+    match Engine::from_environment(Environment::new()).import_olean_modules_for_source(
+        &inputs,
+        &[names[3].clone()],
+        &KVMap::new(),
+        limits,
+    ) {
+        Ok(Outcome::Complete(imported)) => imported.engine,
+        other => panic!("the pinned Init.Tactics closure passes the council: {other:?}"),
+    }
+}
+
+/// Against the pinned `Init.Tactics`, `decide` evaluates the pin's
+/// `Decidable.decide` (vendored `Lean/Meta/AppBuilder.lean` `mkDecide`). There
+/// `decide` alone is an `export` alias, not a constant, and evaluating it
+/// refused every true proposition as "did not reduce". The pin, with `prelude`
+/// and `import Init.Tactics`: `POSITIVE` exits 0; `NEGATIVE` exits 1,
+/// "Tactic `decide` proved that the proposition 2 + 2 = 5 is false".
+#[test]
+fn decide_evaluates_the_pins_decidable_decide_against_the_real_prelude() {
+    const POSITIVE: &str = "theorem one : 2 + 2 = 4 := by decide";
+    const NEGATIVE: &str = "theorem one : 2 + 2 = 5 := by decide";
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let engine = import_init_tactics(&lib);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let positive = engine.check_source_files(&[POSITIVE.as_bytes()], &KVMap::new(), limits);
+            assert!(
+                matches!(positive, Ok(Outcome::Complete(_))),
+                "{POSITIVE} must be admitted: {positive:?}"
+            );
+            let before = engine.logical_root(&KVMap::new());
+            let negative = engine.check_source_files(&[NEGATIVE.as_bytes()], &KVMap::new(), limits);
+            let rendered = format!("{negative:?}");
+            assert!(
+                negative.is_err() && rendered.contains("DecisionNotTrue"),
+                "{NEGATIVE} must be refused as a false decision: {rendered}"
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
 }
