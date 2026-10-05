@@ -18678,11 +18678,12 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
 /// (bead `franken_lean-p6x1`).
 ///
 /// **The decision this encodes, priced.** PG-5 asks for {1, 8, 32} per commit. The corpus
-/// lane costs 1,926,656 ms — 32.1 minutes — measured, on a 64-way host, and CI installs no
-/// Reference toolchain at all (`.github/workflows/ci.yml` says Reference-drift detection
-/// "belongs in a scheduled job that actually installs the toolchain"; no such job exists).
-/// So per-commit is not available, and the honest instrument is a waiver rather than a
-/// cadence nobody dispatches.
+/// lane costs 1,926,656 ms — 32.1 minutes — measured, on a 64-way host. The per-push
+/// `.github/workflows/ci.yml` installs no Reference toolchain; the only workflow that does is
+/// the weekly `.github/workflows/contract-drift.yml`, and a weekly window is not per-commit
+/// coverage. So per-commit is not available, and the honest instrument is a waiver rather
+/// than a cadence nobody dispatches. (Corrected 2026-10-05: this said no job installs the
+/// toolchain at all, which `contract-drift.yml` disproves.)
 ///
 /// **Why the expiry is a correspondence and not a date.** A waiver whose expiry nothing
 /// checks is the recurring defect in a compliance costume. Three candidate triggers were
