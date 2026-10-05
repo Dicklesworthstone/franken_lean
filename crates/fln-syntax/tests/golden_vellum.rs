@@ -132,7 +132,12 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// them, stayed green). Fourteen sit in immutable bead comments and are declared here. The
 /// receipt field is mutable evidence and should be repaired by its owner; when it is, its row
 /// goes stale and must leave this list. Cite a commit only after it is pushed, by its main sha.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 203;
+///
+/// **203 -> 202: the receipt row left.** The 80ni stdlib receipt's producer read the local
+/// build sha (line 6 of its host capture) where the launch time (line 5) belongs. Re-run from
+/// the run's retained artifacts with that index corrected, the receipt differs in that one field
+/// alone, now `2026-10-05T10:53:54Z`, and nothing else in the tree cites the sha.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 202;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -143,7 +148,6 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0ba0e-191",
     "0bfde-75b",
     "0c297-df4",
-    "0cabb-35f",
     "0d37e-f7e",
     "0ef65-091",
     "0effc-5b2",
