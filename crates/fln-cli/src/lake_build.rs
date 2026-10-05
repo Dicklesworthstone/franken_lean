@@ -319,6 +319,7 @@ fn compile(
     root: &Path,
     entries: &[Name],
     modules: &BTreeMap<Name, Module>,
+    jobs: std::num::NonZeroUsize,
 ) -> Result<Compilation, Failure> {
     let mut artifacts = BTreeMap::new();
     let mut elaborated_modules = 0usize;
@@ -367,7 +368,7 @@ fn compile(
         // The exact ordered external roots bind this invocation's immutable
         // import snapshot. Disk outputs never become checked cache entries.
         if active.as_ref().is_none_or(|(roots, _)| roots != &external) {
-            let base = source_check::load_build_base(&external, root).map_err(
+            let base = source_check::load_build_base(&external, root, jobs).map_err(
                 |(class, detail, authority)| Failure {
                     class,
                     detail,
@@ -557,6 +558,7 @@ fn build(
     directory: PathBuf,
     targets: Vec<String>,
     json: bool,
+    jobs: std::num::NonZeroUsize,
 ) -> Result<MultiplexerOutput, Failure> {
     let root = directory
         .canonicalize()
@@ -568,7 +570,7 @@ fn build(
         artifacts,
         elaborated_modules,
         reused_modules,
-    } = compile(&root, &entries, &modules)?;
+    } = compile(&root, &entries, &modules, jobs)?;
     let paths = publish(
         &root,
         &root.join(&config.build_dir).join("lib/lean"),
@@ -595,12 +597,19 @@ fn build(
     Ok(MultiplexerOutput::success(output))
 }
 
-pub(super) fn run(directory: PathBuf, targets: Vec<String>, json: bool) -> MultiplexerOutput {
+/// `jobs` external `.olean` closure modules are checked at once; the build does
+/// not depend on it.
+pub(super) fn run(
+    directory: PathBuf,
+    targets: Vec<String>,
+    json: bool,
+    jobs: std::num::NonZeroUsize,
+) -> MultiplexerOutput {
     let worker = std::thread::Builder::new()
         .name("fln-lake-build".to_owned())
         // Imports are admitted on this thread under the `.olean` depth budget.
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
-        .spawn(move || build(directory, targets, json));
+        .spawn(move || build(directory, targets, json, jobs));
     match worker {
         Ok(worker) => match worker.join() {
             Ok(Ok(output)) => output,

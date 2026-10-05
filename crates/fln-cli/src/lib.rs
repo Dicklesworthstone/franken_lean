@@ -56,6 +56,69 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 /// 91 of its declarations.
 const OLEAN_CHECK_KERNEL_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Most `.olean` closure modules `check-source` and `lake build` check at once when
+/// no `--jobs` is given. The import is identical at every count, so the default
+/// only trades wall time against a shared host: each worker holds one module's
+/// council and a 64 MiB stack, and a closure's width, not the core count, bounds
+/// the useful parallelism.
+const DEFAULT_IMPORT_JOBS_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
+/// The `--jobs` the source front doors use when none is given: the available
+/// parallelism, at most [`DEFAULT_IMPORT_JOBS_CAP`].
+fn default_import_jobs() -> std::num::NonZeroUsize {
+    std::thread::available_parallelism().map_or(std::num::NonZeroUsize::MIN, |available| {
+        available.min(DEFAULT_IMPORT_JOBS_CAP)
+    })
+}
+
+/// A `--jobs` value: one positive thread count.
+fn parse_jobs_count(value: &std::ffi::OsStr) -> Result<std::num::NonZeroUsize, UsageError> {
+    value
+        .to_str()
+        .and_then(|text| text.parse::<std::num::NonZeroUsize>().ok())
+        .ok_or_else(|| UsageError("--jobs takes a positive thread count".to_owned()))
+}
+
+/// Remove `--jobs N` / `--jobs=N` from a front door's arguments, which otherwise
+/// keep their order. Options end at `--`.
+fn take_jobs_option(
+    arguments: Vec<OsString>,
+) -> Result<(Vec<OsString>, Option<std::num::NonZeroUsize>), UsageError> {
+    let mut jobs = None;
+    let mut kept = Vec::with_capacity(arguments.len());
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            kept.push(argument);
+            continue;
+        }
+        let value =
+            if options && argument == "--jobs" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--jobs requires a following thread count".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--jobs="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        let Some(value) = value else {
+            kept.push(argument);
+            continue;
+        };
+        if jobs.is_some() {
+            return Err(UsageError("--jobs may be supplied at most once".to_owned()));
+        }
+        jobs = Some(parse_jobs_count(&value)?);
+    }
+    Ok((kept, jobs))
+}
+
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
@@ -103,12 +166,15 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
-    "  fln check-source [--json] [--max-bytes BYTES] PATH...\n",
+    "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
     "    LEAN_PATH (else the pinned toolchain's lib/lean) and its whole closure is\n",
     "    admitted by K1 and the independent checker first (trust: recheck).\n",
-    "    Implicit `import Init` is not loaded.\n",
+    "    Implicit `import Init` is not loaded. --jobs N checks up to N closure\n",
+    "    modules at once (default: available cores, at most 8); the result does\n",
+    "    not depend on N, and --jobs 1 checks them one by one. `lake build`\n",
+    "    takes the same --jobs for the imports it admits.\n",
     "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--constants] [--max-bytes BYTES] PATH\n",
@@ -327,6 +393,9 @@ enum MultiplexerCommand {
         paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        /// `.olean` closure modules checked at once; `None` takes
+        /// [`default_import_jobs`].
+        jobs: Option<std::num::NonZeroUsize>,
     },
     Help,
     Version,
@@ -849,12 +918,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             if jobs.is_some() {
                 return Err(UsageError("--jobs may be supplied at most once".to_owned()));
             }
-            jobs = Some(
-                value
-                    .to_str()
-                    .and_then(|text| text.parse::<std::num::NonZeroUsize>().ok())
-                    .ok_or_else(|| UsageError("--jobs takes a positive thread count".to_owned()))?,
-            );
+            jobs = Some(parse_jobs_count(&value)?);
             continue;
         }
         let selected = if options && argument == "--receipts" {
@@ -12492,7 +12556,13 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             paths,
             max_bytes,
             json,
-        }) => source_check::run(paths, max_bytes, json),
+            jobs,
+        }) => source_check::run(
+            paths,
+            max_bytes,
+            json,
+            jobs.unwrap_or_else(default_import_jobs),
+        ),
         Ok(MultiplexerCommand::SourceRun {
             paths,
             max_bytes,
@@ -12981,6 +13051,8 @@ const LAKE_HELP_BUILD: &str = concat!(
     "Source is bounded to 1 MiB and 256 modules; artifacts to 64 MiB.\n",
     "Builds always recheck. Default leanArts, executable facets, custom build\n",
     "settings and distinct external-import scopes remain unavailable.\n",
+    "--jobs N checks up to N external modules at once (default: available\n",
+    "cores, at most 8); the build does not depend on N.\n",
 );
 
 const LAKE_HELP_QUERY: &str = concat!(
@@ -13021,9 +13093,38 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut command_args: Vec<String> = Vec::new();
     let mut is_json = false;
     let mut ignored_options = Vec::new();
+    // `lake build --jobs N`: external `.olean` closure modules checked at once.
+    let mut jobs: Option<std::num::NonZeroUsize> = None;
 
     while let Some(arg) = iter.next() {
         let s = arg.to_string_lossy();
+        let jobs_value = if s == "--jobs" {
+            let Some(value) = iter.next() else {
+                return lake_operation_failure(
+                    "fln.lake-build/2",
+                    "--jobs requires a following thread count",
+                    false,
+                    is_json,
+                );
+            };
+            Some(value)
+        } else {
+            s.strip_prefix("--jobs=").map(OsString::from)
+        };
+        if let Some(value) = jobs_value {
+            let parsed = if jobs.is_some() {
+                Err(UsageError("--jobs may be supplied at most once".to_owned()))
+            } else {
+                parse_jobs_count(&value)
+            };
+            match parsed {
+                Ok(count) => jobs = Some(count),
+                Err(UsageError(detail)) => {
+                    return lake_operation_failure("fln.lake-build/2", &detail, false, is_json);
+                }
+            }
+            continue;
+        }
         if s == "--help" || s == "-h" {
             return MultiplexerOutput::success(LAKE_USAGE.to_owned());
         }
@@ -13120,7 +13221,12 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 );
             }
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            lake_build::run(target_dir, command_args, is_json)
+            lake_build::run(
+                target_dir,
+                command_args,
+                is_json,
+                jobs.unwrap_or_else(default_import_jobs),
+            )
         }
         "clean" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));

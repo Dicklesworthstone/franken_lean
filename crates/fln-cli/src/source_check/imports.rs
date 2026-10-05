@@ -92,10 +92,13 @@ pub(super) struct Loaded {
 }
 impl Loaded {
     /// The base engine source is checked against: the council-admitted
-    /// `.olean` closure when the source imports one, else `seed()`.
+    /// `.olean` closure when the source imports one, else `seed()`. `jobs`
+    /// closure modules are checked at once, each worker on a stack of the
+    /// `.olean` kernel depth budget; the result does not depend on it.
     pub(super) fn base_engine(
         &self,
         seed: impl FnOnce() -> Result<fln::Engine, Failure>,
+        jobs: std::num::NonZeroUsize,
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
         if self.oleans.is_empty() {
             return seed().map(|engine| (engine, None));
@@ -124,6 +127,10 @@ impl Loaded {
                 &fln::KVMap::new(),
                 fln::source_check::modules::imported::SourceOleanImportLimits {
                     max_roots: MAX_IMPORTS,
+                    jobs: fln::OleanFrontierJobs {
+                        threads: jobs,
+                        worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
+                    },
                     ..fln::source_check::modules::imported::SourceOleanImportLimits::new(limits)
                 },
             )
@@ -533,6 +540,7 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
 pub(super) fn load_build_base(
     roots: &[Name],
     source_root: &Path,
+    jobs: std::num::NonZeroUsize,
 ) -> Result<Option<SourceOleanImport>, Failure> {
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
@@ -541,7 +549,10 @@ pub(super) fn load_build_base(
         olean_roots: roots.to_vec(),
     };
     loaded
-        .base_engine(|| Ok(fln::Engine::from_environment(fln::Environment::new())))
+        .base_engine(
+            || Ok(fln::Engine::from_environment(fln::Environment::new())),
+            jobs,
+        )
         .map(|(_, base)| base.map(|base| base.receipt))
 }
 

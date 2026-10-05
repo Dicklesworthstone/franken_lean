@@ -1090,6 +1090,9 @@ struct FrontierJob {
     artifact: DecodedOlean,
     imports: Vec<std::sync::Arc<FrontierAccepted>>,
     closure: Vec<std::sync::Arc<FrontierAccepted>>,
+    /// Keep what [`Engine::check_olean_modules_scheduled`] reassembles the serial
+    /// result from; the frontier itself keeps only verdicts.
+    retain: bool,
 }
 
 struct FrontierDone {
@@ -1097,6 +1100,95 @@ struct FrontierDone {
     verdict: OleanModuleVerdict,
     accepted: Option<FrontierAccepted>,
     elapsed: std::time::Duration,
+    /// Present only for a [`FrontierJob::retain`] job that completed or failed.
+    retained: Option<FrontierRetained>,
+}
+
+/// A retaining frontier job's own record: the decoded artifact and checker rows of
+/// a module whose check completed, or the exact error its check returned, which the
+/// frontier's verdict reclassifies.
+enum FrontierRetained {
+    Checked {
+        decoded: Box<DecodedOlean>,
+        declarations: Vec<OleanCheckedDeclaration>,
+    },
+    Failed(OleanCheckError),
+}
+
+/// One module of a scheduled set whose check completed, with what the serial result
+/// keeps of it.
+struct ScheduledOleanModule {
+    module: std::sync::Arc<FrontierAccepted>,
+    decoded: DecodedOlean,
+    declarations: Vec<OleanCheckedDeclaration>,
+}
+
+/// The rows the serial planner gives a module checked after `before`, the
+/// environment of every module ahead of it in the serial order, built from the
+/// agreements the module's own check against its closure issued. Names the serial
+/// planner finds present carry the grounds it records for them; a repeat it would
+/// recheck under a scratch name carries the agreement issued for this module's copy.
+fn serial_olean_rows(
+    before: &Environment,
+    decoded: &DecodedOlean,
+    own: Vec<OleanCheckedDeclaration>,
+    limits: OleanCheckLimits,
+) -> Result<Vec<OleanCheckedDeclaration>, OleanCheckError> {
+    let plan = plan_olean_declarations(before, &decoded.constants, limits)?;
+    let agreements: BTreeMap<Name, CheckerAgreement> =
+        own.into_iter().map(|row| (row.name, row.checker)).collect();
+    let agreement = |name: &Name| {
+        agreements
+            .get(name)
+            .copied()
+            .ok_or(OleanCheckError::InternalInvariant {
+                detail: "a serial row has no agreement from its module's own check",
+            })
+    };
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(decoded.constants.len())
+        .map_err(|_| OleanCheckError::AllocationFailure {
+            resource: ".olean reassembled declaration records",
+            requested: decoded.constants.len(),
+        })?;
+    for unit_index in &plan.order {
+        let Some(unit) = plan.units.get(*unit_index) else {
+            return Err(OleanCheckError::InternalInvariant {
+                detail: "planned declaration unit is outside the unit table",
+            });
+        };
+        for name in &unit.names {
+            rows.push(OleanCheckedDeclaration {
+                name: name.clone(),
+                checker: agreement(name)?,
+            });
+        }
+    }
+    for (name, checker) in plan.already_present {
+        rows.push(OleanCheckedDeclaration { name, checker });
+    }
+    for repeat in plan.subsumed {
+        let name = repeat.name().clone();
+        let checker = match repeat {
+            ConstantInfo::Thm(_) => agreement(&name)?,
+            ConstantInfo::Axiom(_) => CheckerAgreement {
+                schema: "fln-checker/v1",
+                ground: CheckerAdmissionGround::AxiomPreamble,
+            },
+            _ => {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "only theorems and axioms can subsume an admitted repeat",
+                });
+            }
+        };
+        rows.push(OleanCheckedDeclaration { name, checker });
+    }
+    if rows.len() != decoded.constants.len() {
+        return Err(OleanCheckError::InternalInvariant {
+            detail: "reassembled declaration count differs from the decoded declaration table",
+        });
+    }
+    Ok(rows)
 }
 
 /// Add one admitted constant to an import closure under the serial planner's
@@ -3460,6 +3552,7 @@ impl Engine {
                         artifact,
                         imports,
                         closure,
+                        retain: false,
                     };
                     if threads == 1 {
                         // Serial: finish this module before deciding anything else,
@@ -3532,6 +3625,431 @@ impl Engine {
         Ok(OleanFrontier { engine, rows })
     }
 
+    /// [`Engine::check_olean_modules`] over `jobs.threads` modules at once, returning
+    /// what the serial door returns.
+    ///
+    /// The set is decoded, refused and ordered by the serial door's own planner, so
+    /// every whole-set refusal is the serial one. Each module then goes through the
+    /// frontier's per-module council ([`Engine::check_olean_frontier_scheduled`])
+    /// against exactly its own import closure, and the serial result is reassembled
+    /// in the serial order: one environment merged from what each module admitted,
+    /// each module's two logical roots over that cumulative environment, its checker
+    /// rows, and the retained checker projection of every admitted declaration. A
+    /// module that repeats a name which an earlier module outside its closure
+    /// declared is re-planned against the cumulative environment, so its rows split
+    /// as the serial planner splits them.
+    ///
+    /// The serial door stops at the first module of that order whose check does not
+    /// complete, and so does this one: it returns that module's error, non-answer or
+    /// fault. Once a module has stopped no later module is dispatched; earlier ones
+    /// still finish, since one of them may be the first to stop.
+    ///
+    /// One thread, or a base engine whose environment is not empty, takes the serial
+    /// door itself: over a nonempty base the serial projection also holds the base
+    /// constants each review covered, which the per-module projections do not
+    /// reproduce. `cancellation` is sampled whenever a module is decided; a running
+    /// council is not interrupted, and a set whose answer is already fixed is
+    /// returned rather than discarded.
+    pub fn check_olean_modules_scheduled(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        if jobs.threads.get() == 1 || !self.environment.is_empty() {
+            return self.check_olean_modules(modules, options, limits);
+        }
+        let ordered = self.decode_olean_module_set(modules, limits)?;
+        let bound_base = (self.environment == Environment::new()
+            || self
+                .imported_environment
+                .as_ref()
+                .is_some_and(|snapshot| snapshot == &self.environment))
+            && modules
+                .iter()
+                .all(|module| !self.imported_modules.contains(module.name));
+        let names: Vec<Name> = ordered.iter().map(|(name, _)| name.clone()).collect();
+        let scheduled =
+            match self.schedule_olean_module_set(ordered, options, limits, jobs, cancellation)? {
+                Outcome::Complete(scheduled) => scheduled,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        self.reassemble_olean_module_set(names, scheduled, bound_base, options, limits)
+            .map(Outcome::Complete)
+    }
+
+    /// Check a decoded set, in the serial door's order, over `jobs.threads` workers,
+    /// each module against its own import closure, keeping what the serial result
+    /// is reassembled from. The answer is the serial one: the first module of the
+    /// order whose check did not complete decides it.
+    fn schedule_olean_module_set(
+        &self,
+        ordered: Vec<(Name, DecodedOlean)>,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Vec<ScheduledOleanModule>>, OleanCheckError> {
+        let count = ordered.len();
+        let positions: BTreeMap<Name, usize> = ordered
+            .iter()
+            .enumerate()
+            .map(|(position, (name, _))| (name.clone(), position))
+            .collect();
+        let mut names = Vec::with_capacity(count);
+        let mut artifacts = Vec::with_capacity(count);
+        let mut dependencies: Vec<BTreeSet<usize>> = Vec::with_capacity(count);
+        // Each module's transitive import closure, itself included.
+        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> = Vec::with_capacity(count);
+        for (position, (name, artifact)) in ordered.into_iter().enumerate() {
+            let mut imports = BTreeSet::new();
+            let mut closure = BTreeSet::new();
+            for import in &artifact.module.imports {
+                let Some(&dependency) = positions
+                    .get(&import.module)
+                    .filter(|dependency| **dependency < position)
+                else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "a serially ordered module imports a module that is not before it",
+                    });
+                };
+                imports.insert(dependency);
+                closure.extend(closures[dependency].iter().copied());
+            }
+            closure.insert(position);
+            names.push(name);
+            artifacts.push(Some(artifact));
+            dependencies.push(imports);
+            closures.push(std::sync::Arc::new(closure));
+        }
+
+        let threads = jobs.threads.get();
+        let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
+        let mut retained: Vec<Option<(DecodedOlean, Vec<OleanCheckedDeclaration>)>> =
+            (0..count).map(|_| None).collect();
+        let mut decided = vec![false; count];
+        let mut running = vec![false; count];
+        // The first position whose check did not complete, and how it ended.
+        let mut stop_at = count;
+        let mut stopped: Option<(OleanModuleVerdict, Option<FrontierRetained>)> = None;
+        let mut cancelled = false;
+        let base = self;
+        let check = |job: FrontierJob| base.frontier_check_module(job, options, limits);
+        std::thread::scope(|scope| -> Result<(), OleanCheckError> {
+            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierJob>();
+            let (done_sender, done_receiver) = std::sync::mpsc::channel::<FrontierDone>();
+            let job_receiver = std::sync::Arc::new(std::sync::Mutex::new(job_receiver));
+            for worker in 0..threads {
+                let job_receiver = std::sync::Arc::clone(&job_receiver);
+                let done_sender = done_sender.clone();
+                let check = &check;
+                std::thread::Builder::new()
+                    .name(format!("fln-olean-set-{worker}"))
+                    .stack_size(jobs.worker_stack_bytes)
+                    .spawn_scoped(scope, move || {
+                        loop {
+                            let next = match job_receiver.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(job) = next else { return };
+                            if done_sender.send(check(job)).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .map_err(|_| OleanCheckError::InternalInvariant {
+                        detail: "could not start a module-set worker thread",
+                    })?;
+            }
+            drop(done_sender);
+
+            let mut in_flight = 0_usize;
+            loop {
+                cancelled = cancelled || cancellation.is_some_and(CancellationProbe::is_cancelled);
+                // Dispatch in serial order, never past the first stopped module: a
+                // module is ready once every import it names has been accepted.
+                if !cancelled {
+                    for index in 0..stop_at {
+                        if in_flight >= threads {
+                            break;
+                        }
+                        if decided[index]
+                            || running[index]
+                            || !dependencies[index]
+                                .iter()
+                                .all(|dependency| accepted[*dependency].is_some())
+                        {
+                            continue;
+                        }
+                        let Some(artifact) = artifacts[index].take() else {
+                            return Err(OleanCheckError::InternalInvariant {
+                                detail: "a ready module-set member has no decoded artifact",
+                            });
+                        };
+                        let imports = dependencies[index]
+                            .iter()
+                            .filter_map(|dependency| accepted[*dependency].clone())
+                            .collect();
+                        let mut closure: Vec<_> = closures[index]
+                            .iter()
+                            .filter(|member| **member != index)
+                            .filter_map(|member| accepted[*member].clone())
+                            .collect();
+                        closure.sort_by_key(|module| module.position);
+                        running[index] = true;
+                        in_flight += 1;
+                        let job = FrontierJob {
+                            index,
+                            position: index,
+                            name: names[index].clone(),
+                            closure_members: std::sync::Arc::clone(&closures[index]),
+                            artifact,
+                            imports,
+                            closure,
+                            retain: true,
+                        };
+                        if job_sender.send(job).is_err() {
+                            return Err(OleanCheckError::InternalInvariant {
+                                detail: "every module-set worker thread has stopped",
+                            });
+                        }
+                    }
+                }
+                if in_flight == 0 {
+                    if cancelled || decided[..stop_at].iter().all(|done| *done) {
+                        break;
+                    }
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "the module-set schedule stalled with modules undecided",
+                    });
+                }
+                let done =
+                    done_receiver
+                        .recv()
+                        .map_err(|_| OleanCheckError::InternalInvariant {
+                            detail: "every module-set worker thread has stopped",
+                        })?;
+                in_flight -= 1;
+                let FrontierDone {
+                    index,
+                    verdict,
+                    accepted: module,
+                    retained: kept,
+                    ..
+                } = done;
+                running[index] = false;
+                decided[index] = true;
+                match (module, kept) {
+                    (
+                        Some(module),
+                        Some(FrontierRetained::Checked {
+                            decoded,
+                            declarations,
+                        }),
+                    ) => {
+                        accepted[index] = Some(std::sync::Arc::new(module));
+                        retained[index] = Some((*decoded, declarations));
+                    }
+                    (Some(_), _) => {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "an accepted module-set member kept no checked record",
+                        });
+                    }
+                    (None, kept) => {
+                        if index < stop_at {
+                            stop_at = index;
+                            stopped = Some((verdict, kept));
+                        }
+                    }
+                }
+            }
+            drop(job_sender);
+            Ok(())
+        })?;
+
+        if !decided[..stop_at].iter().all(|done| *done) {
+            // Cancelled before the answer was fixed.
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "olean-modules/scheduled",
+            )));
+        }
+        if let Some((verdict, kept)) = stopped {
+            return match (kept, verdict) {
+                (Some(FrontierRetained::Failed(error)), _) => Err(error),
+                (_, OleanModuleVerdict::Inconclusive(reason)) => Ok(Outcome::Inconclusive(reason)),
+                (_, OleanModuleVerdict::InternalFault(fault)) => Ok(Outcome::InternalFault(fault)),
+                _ => Err(OleanCheckError::InternalInvariant {
+                    detail: "a stopped module-set member kept neither its error nor its non-answer",
+                }),
+            };
+        }
+        let mut scheduled = Vec::with_capacity(count);
+        for (module, kept) in accepted.into_iter().zip(retained) {
+            let (Some(module), Some((decoded, declarations))) = (module, kept) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "a decided module-set member lost its checked record",
+                });
+            };
+            scheduled.push(ScheduledOleanModule {
+                module,
+                decoded,
+                declarations,
+            });
+        }
+        Ok(Outcome::Complete(scheduled))
+    }
+
+    /// The serial door's [`CheckedOleanSet`] from modules each checked against its
+    /// own closure, visited in the serial order. The environment, roots, rows and
+    /// retained checker projection are those of admitting the modules one after
+    /// another into this (empty) engine.
+    fn reassemble_olean_module_set(
+        &self,
+        names: Vec<Name>,
+        scheduled: Vec<ScheduledOleanModule>,
+        bound_base: bool,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<CheckedOleanSet, OleanCheckError> {
+        let invariant = |detail| OleanCheckError::InternalInvariant { detail };
+        let base_logical_root = self.logical_root(options);
+        let mut environment = self.environment.clone();
+        let mut root = base_logical_root;
+        let mut admitted_any = false;
+        let mut candidates = Vec::new();
+        let mut checked_modules = Vec::new();
+        checked_modules
+            .try_reserve_exact(scheduled.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean checked module records",
+                requested: scheduled.len(),
+            })?;
+        for (name, scheduled) in names.into_iter().zip(scheduled) {
+            let ScheduledOleanModule {
+                module,
+                decoded,
+                declarations,
+            } = scheduled;
+            let module_base_root = root;
+            // A constant the serial environment already holds, while this module's
+            // closure did not (or held another copy), is planned differently there.
+            let own: BTreeSet<&Name> = module
+                .admitted
+                .iter()
+                .map(|entry| entry.declaration().name())
+                .collect();
+            let repeats = decoded.constants.iter().any(|info| {
+                environment.entry(info.name()).is_some_and(|present| {
+                    own.contains(info.name())
+                        || module
+                            .engine
+                            .environment
+                            .entry(info.name())
+                            .is_none_or(|copy| copy.digest() != present.digest())
+                })
+            });
+            let declarations = if repeats {
+                serial_olean_rows(&environment, &decoded, declarations, limits)?
+            } else {
+                declarations
+            };
+            let mut added = Vec::new();
+            for entry in &module.admitted {
+                let name = entry.declaration().name();
+                if environment.contains(name) {
+                    environment = merge_frontier_entry(environment, entry)?;
+                } else {
+                    environment = environment
+                        .with_entry(entry.clone())
+                        .map_err(|_| invariant("an absent admitted constant could not be added"))?;
+                    added.push(name.clone());
+                }
+            }
+            if !added.is_empty() {
+                admitted_any = true;
+                root = environment.logical_root(options);
+                let projection = module.engine.checker_environment.as_ref().ok_or_else(|| {
+                    invariant("a module that admitted constants retains no checker projection")
+                })?;
+                for name in added {
+                    let wire = decode_checker_name(&name, limits.admission.checker.decode)
+                        .map_err(|_| invariant("an admitted constant has no checker name"))?;
+                    let declaration = projection.find(&wire).ok_or_else(|| {
+                        invariant("an admitted constant is missing from its checker projection")
+                    })?;
+                    candidates.push(CheckerConstantEntry::new(wire, declaration.clone()));
+                }
+            }
+            checked_modules.push(CheckedOleanModule {
+                name,
+                decoded,
+                base_logical_root: module_base_root,
+                result_logical_root: root,
+                declarations,
+            });
+        }
+
+        // Serially, every admission extends the retained projection with its own
+        // candidate; over an empty base nothing else is ever covered.
+        let checker_environment = if admitted_any {
+            let mut projection = self.checker_environment.clone().unwrap_or_default();
+            for entry in candidates {
+                projection = match projection.extend(entry, limits.admission.checker.environment) {
+                    CheckerEnvironmentOutcome::Complete { environment, .. } => environment,
+                    _ => {
+                        return Err(invariant(
+                            "the admitted checker entries could not be reassembled",
+                        ));
+                    }
+                };
+            }
+            Some(projection)
+        } else {
+            self.checker_environment.clone()
+        };
+        let mut imported = (*self.imported_modules).clone();
+        imported.extend(checked_modules.iter().map(|module| module.name.clone()));
+        let mut dependencies = (*self.imported_module_dependencies).clone();
+        for module in &checked_modules {
+            dependencies.insert(
+                module.name.clone(),
+                module
+                    .decoded
+                    .module
+                    .imports
+                    .iter()
+                    .map(|import| import.module.clone())
+                    .collect(),
+            );
+        }
+        let imported_environment = bound_base.then(|| environment.clone());
+        let engine = Engine {
+            environment,
+            checker_environment,
+            imported_modules: std::sync::Arc::new(imported),
+            imported_environment,
+            imported_module_dependencies: std::sync::Arc::new(dependencies),
+            epoch: self.epoch.clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options: if admitted_any {
+                options.clone()
+            } else {
+                self.options.clone()
+            },
+        };
+        Ok(CheckedOleanSet {
+            engine,
+            base_logical_root,
+            result_logical_root: root,
+            modules: checked_modules,
+        })
+    }
+
     /// Check one frontier module against its import closure's environment.
     fn frontier_check_module(
         &self,
@@ -3541,15 +4059,23 @@ impl Engine {
     ) -> FrontierDone {
         let started = std::time::Instant::now();
         let index = job.index;
-        let finish = |verdict, accepted| FrontierDone {
+        let retain = job.retain;
+        let finish = |verdict: OleanModuleVerdict,
+                      accepted: Option<FrontierAccepted>,
+                      retained: Option<FrontierRetained>| FrontierDone {
             index,
             verdict,
             accepted,
             elapsed: started.elapsed(),
+            retained,
+        };
+        let failed = |error: OleanCheckError| {
+            let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
+            finish(frontier_error_verdict(error), None, retained)
         };
         let engine = match self.frontier_closure_engine(&job) {
             Ok(engine) => engine,
-            Err(error) => return finish(frontier_error_verdict(error), None),
+            Err(error) => return failed(error),
         };
         let start = engine.environment.clone();
         match engine.check_decoded_olean_unrooted(job.artifact, options, limits) {
@@ -3566,6 +4092,10 @@ impl Engine {
                 let mut imported = (*engine.imported_modules).clone();
                 imported.insert(job.name.clone());
                 engine.imported_modules = std::sync::Arc::new(imported);
+                let retained = retain.then(|| FrontierRetained::Checked {
+                    decoded: Box::new(checked.decoded),
+                    declarations: checked.declarations,
+                });
                 finish(
                     OleanModuleVerdict::Accepted { declarations },
                     Some(FrontierAccepted {
@@ -3576,15 +4106,16 @@ impl Engine {
                         admitted,
                         closure: job.closure_members,
                     }),
+                    retained,
                 )
             }
             Ok(Outcome::Inconclusive(reason)) => {
-                finish(OleanModuleVerdict::Inconclusive(reason), None)
+                finish(OleanModuleVerdict::Inconclusive(reason), None, None)
             }
             Ok(Outcome::InternalFault(fault)) => {
-                finish(OleanModuleVerdict::InternalFault(fault), None)
+                finish(OleanModuleVerdict::InternalFault(fault), None, None)
             }
-            Err(error) => finish(frontier_error_verdict(error), None),
+            Err(error) => failed(error),
         }
     }
 
@@ -8684,6 +9215,92 @@ impl From<EngineAdmissionError> for EngineExecutionError {
     }
 }
 
+/// Every field of two engines, one assertion each so a failure names the field.
+/// Environments are compared by value, never printed: a closure's is too large.
+#[cfg(test)]
+pub(crate) fn assert_engines_identical(left: &Engine, right: &Engine, what: &str) {
+    assert!(
+        left.environment == right.environment,
+        "{what}: environments differ ({} vs {} constants)",
+        left.environment.len(),
+        right.environment.len()
+    );
+    assert!(
+        left.checker_environment == right.checker_environment,
+        "{what}: retained checker projections differ ({:?} vs {:?} constants)",
+        left.checker_environment
+            .as_ref()
+            .map(CheckerConstantEnvironment::len),
+        right
+            .checker_environment
+            .as_ref()
+            .map(CheckerConstantEnvironment::len)
+    );
+    assert_eq!(
+        left.imported_modules, right.imported_modules,
+        "{what}: imported modules"
+    );
+    assert!(
+        left.imported_environment == right.imported_environment,
+        "{what}: imported environment snapshots differ"
+    );
+    assert_eq!(
+        left.imported_module_dependencies, right.imported_module_dependencies,
+        "{what}: import edges"
+    );
+    assert_eq!(left.epoch, right.epoch, "{what}: epoch");
+    assert_eq!(left.mode, right.mode, "{what}: mode");
+    assert_eq!(
+        left.reproducibility, right.reproducibility,
+        "{what}: reproducibility"
+    );
+    assert_eq!(left.options, right.options, "{what}: options");
+}
+
+/// Two checked `.olean` sets, field by field and module by module.
+#[cfg(test)]
+pub(crate) fn assert_checked_sets_identical(
+    left: &CheckedOleanSet,
+    right: &CheckedOleanSet,
+    what: &str,
+) {
+    assert_engines_identical(&left.engine, &right.engine, what);
+    assert_eq!(
+        left.base_logical_root, right.base_logical_root,
+        "{what}: base root"
+    );
+    assert_eq!(
+        left.result_logical_root, right.result_logical_root,
+        "{what}: result root"
+    );
+    let names = |set: &CheckedOleanSet| -> Vec<Name> {
+        set.modules
+            .iter()
+            .map(|module| module.name.clone())
+            .collect()
+    };
+    assert_eq!(names(left), names(right), "{what}: module order");
+    for (left, right) in left.modules.iter().zip(&right.modules) {
+        let module = left.name.to_display_string();
+        assert!(
+            left.decoded == right.decoded,
+            "{what}: {module}: decoded artifact"
+        );
+        assert_eq!(
+            left.base_logical_root, right.base_logical_root,
+            "{what}: {module}: base root"
+        );
+        assert_eq!(
+            left.result_logical_root, right.result_logical_root,
+            "{what}: {module}: result root"
+        );
+        assert_eq!(
+            left.declarations, right.declarations,
+            "{what}: {module}: checker rows"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -10547,6 +11164,377 @@ mod tests {
         assert!(matches!(
             engine.check_olean_modules(&cycle, &KVMap::new(), exhausted),
             Err(OleanCheckError::TotalBytesLimit { .. })
+        ));
+    }
+
+    fn fixture_name(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    fn fixture_constant(text: &str) -> Expr {
+        Expr::const_(fixture_name(text), Vec::new())
+    }
+
+    fn fixture_imports(names: &[&str]) -> Vec<OleanModuleImport> {
+        names
+            .iter()
+            .map(|text| OleanModuleImport {
+                module: fixture_name(text),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            })
+            .collect()
+    }
+
+    fn fixture_axiom(text: &str, type_: Expr) -> ConstantInfo {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: fixture_name(text),
+                level_params: Vec::new(),
+                type_,
+            },
+            is_unsafe: false,
+        })
+    }
+
+    /// A theorem of `Fixture.P`.
+    fn fixture_theorem(text: &str, value: Expr) -> ConstantInfo {
+        ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: fixture_name(text),
+                level_params: Vec::new(),
+                type_: fixture_constant("Fixture.P"),
+            },
+            value,
+            all: Vec::new(),
+        })
+    }
+
+    /// A closed set shaped so the scheduled door must reassemble serial rows:
+    /// siblings `B`, `C` and `E` import only `A`, so each checks its own copy of a
+    /// name the serial door meets after an earlier sibling's (`t` identical, `s` the
+    /// same statement with another proof, the axiom `q` identical), and `D` imports
+    /// `B` and `C` and repeats `t` inside its own closure.
+    fn sibling_repeat_module_set() -> Vec<(Name, Vec<u8>)> {
+        let witness = || fixture_constant("Fixture.p");
+        let detour = Expr::app(
+            Expr::lam(
+                fixture_name("h"),
+                fixture_constant("Fixture.P"),
+                Expr::bvar(0).expect("test bound variable is in range"),
+                BinderInfo::Default,
+            ),
+            witness(),
+        );
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        vec![
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[
+                    fixture_theorem("Fixture.t", witness()),
+                    fixture_theorem("Fixture.s", witness()),
+                ],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[
+                    fixture_theorem("Fixture.t", witness()),
+                    fixture_theorem("Fixture.s", detour),
+                    fixture_axiom("Fixture.q", fixture_constant("Fixture.P")),
+                ],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.D",
+                &[
+                    fixture_theorem("Fixture.t", witness()),
+                    fixture_theorem("Fixture.u", fixture_constant("Fixture.s")),
+                ],
+                &["Fixture.B", "Fixture.C"],
+            ),
+            module(
+                "Fixture.E",
+                &[fixture_axiom("Fixture.q", fixture_constant("Fixture.P"))],
+                &["Fixture.A"],
+            ),
+        ]
+    }
+
+    fn fixture_inputs(set: &[(Name, Vec<u8>)]) -> Vec<OleanModuleInput<'_>> {
+        // Reversed, so input order and the serial order disagree.
+        set.iter()
+            .rev()
+            .map(|(name, artifact)| OleanModuleInput {
+                name,
+                artifact,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect()
+    }
+
+    fn fixture_jobs(threads: usize) -> super::OleanFrontierJobs {
+        super::OleanFrontierJobs {
+            threads: std::num::NonZeroUsize::new(threads).expect("a positive thread count"),
+            worker_stack_bytes: 2 * 1024 * 1024,
+        }
+    }
+
+    /// The scheduled door's answer is the serial door's, value for value.
+    fn assert_same_set_answer(
+        serial: &Result<Outcome<super::CheckedOleanSet>, OleanCheckError>,
+        scheduled: &Result<Outcome<super::CheckedOleanSet>, OleanCheckError>,
+        what: &str,
+    ) {
+        match (serial, scheduled) {
+            (Ok(Outcome::Complete(serial)), Ok(Outcome::Complete(scheduled))) => {
+                super::assert_checked_sets_identical(serial, scheduled, what);
+            }
+            (Ok(Outcome::Inconclusive(serial)), Ok(Outcome::Inconclusive(scheduled))) => {
+                assert_eq!(serial, scheduled, "{what}");
+            }
+            (Ok(Outcome::InternalFault(serial)), Ok(Outcome::InternalFault(scheduled))) => {
+                assert_eq!(serial, scheduled, "{what}");
+            }
+            (Err(serial), Err(scheduled)) => assert_eq!(serial, scheduled, "{what}"),
+            (serial, scheduled) => {
+                let kind = |answer: &Result<Outcome<super::CheckedOleanSet>, OleanCheckError>| {
+                    match answer {
+                        Ok(Outcome::Complete(_)) => "complete".to_owned(),
+                        Ok(Outcome::Inconclusive(reason)) => format!("inconclusive {reason:?}"),
+                        Ok(Outcome::InternalFault(fault)) => format!("internal fault {fault:?}"),
+                        Err(error) => format!("error {error:?}"),
+                    }
+                };
+                panic!(
+                    "{what}: serial and scheduled answers differ in kind: {} vs {}",
+                    kind(serial),
+                    kind(scheduled)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_module_set_reassembles_the_serial_result_across_sibling_repeats() {
+        let set = sibling_repeat_module_set();
+        let inputs = fixture_inputs(&set);
+        let limits = OleanCheckLimits::new(
+            set.iter().map(|(_, artifact)| artifact.len()).sum(),
+            test_budget(),
+        );
+        let engine = Engine::from_environment(Environment::new());
+        let serial = engine.check_olean_modules(&inputs, &KVMap::new(), limits);
+        let Ok(Outcome::Complete(checked)) = &serial else {
+            panic!("the fixture set must complete serially: {serial:?}");
+        };
+        // The serial planner must meet `C`'s and `E`'s copies after earlier ones,
+        // or this fixture exercises nothing a closure-only check would miss.
+        let rows = |module: &str| -> Vec<String> {
+            checked
+                .modules
+                .iter()
+                .find(|checked| checked.name == fixture_name(module))
+                .expect("fixture module")
+                .declarations
+                .iter()
+                .map(|row| row.name.to_display_string())
+                .collect()
+        };
+        assert_eq!(rows("Fixture.C"), ["Fixture.q", "Fixture.t", "Fixture.s"]);
+        assert_eq!(rows("Fixture.E"), ["Fixture.q"]);
+        let last = checked.modules.last().expect("five modules");
+        assert_eq!(last.name, fixture_name("Fixture.E"));
+        assert_eq!(last.base_logical_root, last.result_logical_root);
+        for threads in [1, 2, 3, 5] {
+            let scheduled = engine.check_olean_modules_scheduled(
+                &inputs,
+                &KVMap::new(),
+                limits,
+                fixture_jobs(threads),
+                None,
+            );
+            assert_same_set_answer(&serial, &scheduled, &format!("{threads} threads"));
+        }
+    }
+
+    /// Cancelled once some modules are decided, the scheduled door dispatches no
+    /// more, lets the running councils finish, and answers inconclusive; never
+    /// cancelled, it completes.
+    #[test]
+    fn scheduled_module_set_stops_dispatching_once_cancelled() {
+        /// Cancelled from the `after`-th sample on.
+        struct CancelAfter {
+            samples: std::sync::atomic::AtomicUsize,
+            after: usize,
+        }
+        impl super::CancellationProbe for CancelAfter {
+            fn is_cancelled(&self) -> bool {
+                self.samples
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= self.after
+            }
+        }
+        let set = sibling_repeat_module_set();
+        let inputs = fixture_inputs(&set);
+        let limits = OleanCheckLimits::new(
+            set.iter().map(|(_, artifact)| artifact.len()).sum(),
+            test_budget(),
+        );
+        let engine = Engine::from_environment(Environment::new());
+        let run = |after: usize| {
+            let probe = CancelAfter {
+                samples: std::sync::atomic::AtomicUsize::new(0),
+                after,
+            };
+            let answer = engine.check_olean_modules_scheduled(
+                &inputs,
+                &KVMap::new(),
+                limits,
+                fixture_jobs(2),
+                Some(&probe),
+            );
+            (answer, probe.samples.into_inner())
+        };
+        for after in [0, 1] {
+            let (answer, _) = run(after);
+            assert!(
+                matches!(
+                    &answer,
+                    Ok(Outcome::Inconclusive(reason))
+                        if *reason == super::Inconclusive::cancelled("olean-modules/scheduled")
+                ),
+                "cancelled after {after} samples: {answer:?}"
+            );
+        }
+        let (answer, samples) = run(usize::MAX);
+        assert!(matches!(answer, Ok(Outcome::Complete(_))), "{answer:?}");
+        // One sample before the first dispatch and one per decided module.
+        assert_eq!(samples, set.len() + 1);
+    }
+
+    /// Whatever stops the serial door (a rejection, a council with no answer, an
+    /// exhausted kernel, a missing or malformed member) stops the scheduled door
+    /// with the same value, decided by the first module of the serial order, not by
+    /// whichever finished first.
+    #[test]
+    fn scheduled_module_set_stops_where_the_serial_door_stops() {
+        let mut set = sibling_repeat_module_set();
+        // `F` first admits 400 axioms and then offers `Fixture.P` itself as a proof
+        // of `Fixture.P`, which the kernel rejects; `G` cites a constant nobody
+        // declares, which planning refuses before any kernel work. The serial order
+        // reaches `F` first, while `G`, just as ready, stops long before `F` does.
+        let mut slow: Vec<ConstantInfo> = (0..400)
+            .map(|index| fixture_axiom(&format!("Fixture.a{index}"), fixture_constant("Fixture.P")))
+            .collect();
+        slow.push(fixture_theorem(
+            "Fixture.bad1",
+            fixture_constant("Fixture.P"),
+        ));
+        let refused = [fixture_theorem(
+            "Fixture.bad2",
+            fixture_constant("Fixture.nowhere"),
+        )];
+        for (module, constants) in [("Fixture.F", slow.as_slice()), ("Fixture.G", &refused)] {
+            set.push((
+                fixture_name(module),
+                olean_with_imports(constants, &fixture_imports(&["Fixture.A"])),
+            ));
+        }
+        let engine = Engine::from_environment(Environment::new());
+        let limits = OleanCheckLimits::new(
+            set.iter().map(|(_, artifact)| artifact.len()).sum(),
+            test_budget(),
+        );
+        let same = |inputs: &[OleanModuleInput<'_>], limits: OleanCheckLimits, what: &str| {
+            let serial = engine.check_olean_modules(inputs, &KVMap::new(), limits);
+            for threads in [2, 3, 7] {
+                let scheduled = engine.check_olean_modules_scheduled(
+                    inputs,
+                    &KVMap::new(),
+                    limits,
+                    fixture_jobs(threads),
+                    None,
+                );
+                assert_same_set_answer(&serial, &scheduled, &format!("{what}, {threads} threads"));
+            }
+            serial
+        };
+
+        let inputs = fixture_inputs(&set);
+        match same(&inputs, limits, "rejection") {
+            Err(OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                error,
+                ..
+            })) => assert!(
+                matches!(*error, EngineAdmissionError::KernelRejected { .. }),
+                "the serial door stops at the kernel's rejection of `F`: {error:?}"
+            ),
+            other => panic!("the rejecting set must be refused at `F`: {other:?}"),
+        }
+        // On its own, `G` is refused differently, so the value above names `F`.
+        let only_g: Vec<_> = inputs
+            .iter()
+            .copied()
+            .filter(|input| *input.name != fixture_name("Fixture.F"))
+            .collect();
+        assert!(matches!(
+            same(&only_g, limits, "planning refusal"),
+            Err(OleanCheckError::MissingConstants { .. })
+        ));
+
+        // A council whose checker cannot retain anything has no answer. The serial
+        // door returns that error; the frontier would call it inconclusive.
+        let mut silent = limits;
+        silent.admission.checker.environment.max_steps = 0;
+        match same(&inputs, silent, "silent checker") {
+            Err(OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                error,
+                ..
+            })) => assert!(
+                matches!(*error, EngineAdmissionError::CouncilNoAnswer { .. }),
+                "{error:?}"
+            ),
+            other => panic!("a silent checker must leave the council without an answer: {other:?}"),
+        }
+
+        let mut starved = limits;
+        starved.admission.kernel.steps = 0;
+        assert!(matches!(
+            same(&inputs, starved, "starved kernel"),
+            Ok(Outcome::Inconclusive(_))
+        ));
+
+        let without_a: Vec<_> = inputs
+            .iter()
+            .copied()
+            .filter(|input| *input.name != fixture_name("Fixture.A"))
+            .collect();
+        assert!(matches!(
+            same(&without_a, limits, "missing member"),
+            Err(OleanCheckError::MissingModuleImports { .. })
+        ));
+
+        let mut malformed = set.clone();
+        malformed[2].1[0] ^= u8::MAX;
+        assert!(matches!(
+            same(&fixture_inputs(&malformed), limits, "malformed member"),
+            Err(OleanCheckError::ModuleDecode { .. })
         ));
     }
 

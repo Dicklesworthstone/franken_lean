@@ -304,3 +304,59 @@ fn symlinked_sources_and_output_directories_are_refused() {
     assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("symlink"));
     assert!(!outside.0.join("Lib/Top.olean").exists());
 }
+
+/// `lake build --jobs N` admits the external `.olean` closure N modules at a time
+/// and builds the same report and the same artifact bytes at every N. The
+/// consumer's closure holds two siblings that import only `Lib.Base`.
+#[test]
+fn external_imports_build_identically_at_one_and_several_jobs() {
+    let library =
+        Package::new("name = \"checked\"\n[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\n");
+    library.write("Lib/Base.lean", BASE);
+    library.write(
+        "Lib/Left.lean",
+        "prelude\nimport Lib.Base\ndef Lib.left (A : Type) (a : A) : A := Lib.identity A a\n",
+    );
+    library.write(
+        "Lib/Right.lean",
+        "prelude\nimport Lib.Base\ntheorem Lib.right (P : Prop) (h : P) : P := h\n",
+    );
+    success(&library.build(&["+Lib.Left:olean", "+Lib.Right:olean"]));
+    let built = |jobs: &str| {
+        let consumer = Package::new("name = \"consumer\"\n[[lean_lib]]\nname = \"Consumer\"\n");
+        consumer.write(
+            "Consumer.lean",
+            "prelude\nimport Lib.Left\nimport Lib.Right\ndef Consumer.value (A : Type) (a : A) : A := Lib.left A a\ntheorem Consumer.proof (P : Prop) (h : P) : P := Lib.right P h\n",
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&consumer.0)
+            .args(["--json", "build", "--jobs", jobs, "+Consumer:olean"])
+            .env("LEAN_PATH", library.0.join(".lake/build/lib/lean"))
+            .output()
+            .unwrap();
+        let report = success(&output).replace(&consumer.0.display().to_string(), "<package>");
+        (
+            report,
+            std::fs::read(consumer.artifact("Consumer")).unwrap(),
+        )
+    };
+    let serial = built("1");
+    assert!(serial.0.contains("\"modules_built\":1"), "{}", serial.0);
+    for jobs in ["2", "5"] {
+        assert_eq!(built(jobs), serial, "--jobs {jobs}");
+    }
+
+    let refused = failure(
+        &Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&library.0)
+            .args(["--json", "build", "--jobs", "0", "+Lib.Left:olean"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        refused.contains("--jobs takes a positive thread count"),
+        "{refused}"
+    );
+}

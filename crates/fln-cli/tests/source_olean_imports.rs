@@ -156,3 +156,127 @@ fn unparseable_source_is_refused_before_its_init_closure_is_admitted() {
     assert!(stderr.contains("\"outcome\":\"input\""), "{stderr}");
     assert!(stderr.contains("parse refused source"), "{stderr}");
 }
+
+fn check_source_with(
+    jobs: &str,
+    entry: &std::path::Path,
+    lean_path: Option<&std::path::Path>,
+) -> (Option<i32>, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+    command
+        .args(["check-source", "--json", "--jobs", jobs])
+        .arg(entry);
+    if let Some(lean_path) = lean_path {
+        command.env("LEAN_PATH", lean_path);
+    }
+    let output = command.output().expect("run fln check-source");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+    )
+}
+
+/// `--jobs` changes how many closure modules the council checks at once, never
+/// the report: the closure of `siblings` holds two modules that import only
+/// `Init.Coe`, so they are checked side by side above one job. Equal bytes here
+/// show the parallel import matches the serial one on this closure; they do not
+/// prove schedule independence in general.
+#[test]
+fn the_report_is_byte_identical_at_one_and_several_jobs() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let serial = check_source_with("1", &fixture("siblings"), None);
+    assert_eq!(serial.0, Some(0), "{serial:?}");
+    assert!(
+        serial
+            .1
+            .contains("\"oleanImports\":{\"trust\":\"recheck\",\"modules\":7,"),
+        "{serial:?}"
+    );
+    for jobs in ["3", "8"] {
+        assert_eq!(
+            check_source_with(jobs, &fixture("siblings"), None),
+            serial,
+            "--jobs {jobs}"
+        );
+    }
+}
+
+/// A closure member that does not decode is refused with the same report at any
+/// `--jobs`. Its exported part is intact, so the closure still loads and the
+/// refusal comes from the council's own decoding.
+#[test]
+fn a_corrupted_closure_member_is_refused_identically_at_one_and_several_jobs() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let pinned = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME names the pinned toolchain's home")
+        .join(".elan/toolchains")
+        .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+        .join("lib/lean");
+    let search = std::env::temp_dir().join(format!("fln-corrupted-closure-{}", std::process::id()));
+    for module in [
+        "Init/Prelude",
+        "Init/Coe",
+        "Init/Notation",
+        "Init/Tactics",
+        "Init/Data/Cast",
+        "Init/Data/Option/Coe",
+        "Init/Data/Zero",
+    ] {
+        for extension in ["olean", "olean.server", "olean.private"] {
+            let from = pinned.join(format!("{module}.{extension}"));
+            let to = search.join(format!("{module}.{extension}"));
+            std::fs::create_dir_all(to.parent().expect("a module directory"))
+                .expect("create the search path");
+            std::fs::copy(&from, &to)
+                .unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
+        }
+    }
+    let private = search.join("Init/Coe.olean.private");
+    let mut bytes = std::fs::read(&private).expect("read the private part");
+    bytes[0] ^= u8::MAX;
+    std::fs::write(&private, bytes).expect("corrupt the private part");
+
+    let serial = check_source_with("1", &fixture("siblings"), Some(&search));
+    let parallel = check_source_with("3", &fixture("siblings"), Some(&search));
+    std::fs::remove_dir_all(&search).expect("remove the copied search path");
+    assert_eq!(serial.0, Some(1), "{serial:?}");
+    assert!(serial.1.is_empty(), "{serial:?}");
+    assert!(serial.2.contains("Init.Coe"), "{serial:?}");
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn jobs_takes_one_positive_count() {
+    let entry = fixture("prelude");
+    for (arguments, message) in [
+        (vec!["--jobs", "0"], "--jobs takes a positive thread count"),
+        (
+            vec!["--jobs", "two"],
+            "--jobs takes a positive thread count",
+        ),
+        (vec!["--jobs=-1"], "--jobs takes a positive thread count"),
+        (vec!["--jobs"], "--jobs requires a following thread count"),
+        (
+            vec!["--jobs=2", "--jobs", "3"],
+            "--jobs may be supplied at most once",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.arg("check-source").args(&arguments);
+        if arguments != ["--jobs"] {
+            command.arg(&entry);
+        }
+        let output = command.output().expect("run fln check-source");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+    }
+}

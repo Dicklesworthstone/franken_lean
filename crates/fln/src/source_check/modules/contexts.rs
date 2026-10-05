@@ -85,6 +85,39 @@ impl ImportContexts {
         }
     }
 
+    /// Two captures, field by field: each retained engine and, per module, its
+    /// imports, exact checked entries, availability and metadata snapshots.
+    #[cfg(test)]
+    pub(super) fn assert_identical(&self, other: &Self, what: &str) {
+        crate::assert_engines_identical(&self.origin, &other.origin, &format!("{what}: origin"));
+        crate::assert_engines_identical(
+            &self.declarations,
+            &other.declarations,
+            &format!("{what}: declarations"),
+        );
+        crate::assert_engines_identical(
+            &self.complete,
+            &other.complete,
+            &format!("{what}: complete"),
+        );
+        assert_eq!(
+            self.modules.keys().collect::<Vec<_>>(),
+            other.modules.keys().collect::<Vec<_>>(),
+            "{what}: modules"
+        );
+        for ((name, left), right) in self.modules.iter().zip(other.modules.values()) {
+            let module = name.to_display_string();
+            assert_eq!(left.imports, right.imports, "{what}: {module}: imports");
+            assert!(left.entries == right.entries, "{what}: {module}: entries");
+            assert_eq!(
+                left.unavailable, right.unavailable,
+                "{what}: {module}: availability"
+            );
+            assert!(left.before == right.before, "{what}: {module}: before");
+            assert!(left.after == right.after, "{what}: {module}: after");
+        }
+    }
+
     /// One heap DFS handles both kinds of import, so a local registration
     /// between two external imports stays between them. Shared imports run once.
     pub(super) fn order(

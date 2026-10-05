@@ -21,12 +21,18 @@ pub struct SourceOleanImportLimits {
     /// Aggregate captured bytes, including uninterpreted extensions.
     pub max_capture_bytes: usize,
     pub max_roots: usize,
+    /// How many closure modules the council checks at once. The import is the
+    /// same at every count ([`Engine::check_olean_modules_scheduled`]); only its
+    /// wall time depends on it.
+    pub jobs: OleanFrontierJobs,
 }
 impl SourceOleanImportLimits {
     /// Capture may use as many bytes as the caller allows the artifacts
     /// themselves, never fewer than 64 MiB. The pinned `Init` closure (601
     /// modules, 350 MiB of `.olean` parts) captures 300 MiB of extension
     /// payloads, so a fixed 64 MiB made `import Init` a resource refusal.
+    /// Modules are checked one at a time on the calling thread unless the
+    /// caller sets `jobs`.
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
@@ -34,6 +40,7 @@ impl SourceOleanImportLimits {
             capture: OleanWalkBudget::default(),
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
+            jobs: OleanFrontierJobs::SERIAL,
         }
     }
 }
@@ -174,7 +181,9 @@ impl Engine {
     }
 
     /// Checks cancellation before the council, between capture/replay steps and
-    /// before publication. The existing bounded council is not interrupted mid-call.
+    /// before publication, and, when [`Engine::check_olean_modules_scheduled`]
+    /// schedules the council (`limits.jobs` above one, empty base), also as each
+    /// closure module is decided. A module's council is not interrupted mid-call.
     pub fn import_olean_modules_for_source_with_cancel(
         &self,
         modules: &[OleanModuleInput<'_>],
@@ -198,7 +207,13 @@ impl Engine {
         }
         cancelled!("source-olean/before-council");
         let checked = match self
-            .check_olean_modules(modules, options, limits.check)
+            .check_olean_modules_scheduled(
+                modules,
+                options,
+                limits.check,
+                limits.jobs,
+                cancellation,
+            )
             .map_err(|e| SourceOleanImportError::Check(Box::new(e)))?
         {
             Outcome::Complete(checked) => checked,
@@ -488,4 +503,247 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
         ));
     }
     Ok(order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    /// The `.olean` kernel depth budget's stack, as `check-source` gives it.
+    const STACK: usize = 64 * 1024 * 1024;
+
+    fn n(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    fn pinned_lib() -> Option<std::path::PathBuf> {
+        let lib = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| {
+                home.join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
+                    .join("lib/lean")
+            })
+            .filter(|lib| lib.join("Init/Prelude.olean").is_file());
+        assert!(
+            lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned Reference lib/lean is absent"
+        );
+        lib
+    }
+
+    /// Each module of `roots`' closure with its exported, server and private
+    /// parts, in discovery order, read as data from the pinned toolchain.
+    fn closure(lib: &std::path::Path, roots: &[&str]) -> Vec<(Name, [Vec<u8>; 3])> {
+        let mut pending: Vec<Name> = roots.iter().map(|root| n(root)).collect();
+        let mut seen = BTreeSet::new();
+        let mut loaded = Vec::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let base = lib.join(name.to_display_string().replace('.', "/"));
+            let parts = ["olean", "olean.server", "olean.private"]
+                .map(|extension| std::fs::read(base.with_extension(extension)).unwrap_or_default());
+            assert!(!parts[0].is_empty(), "{} has no .olean", base.display());
+            let imports = olean_module_imports(&parts[0], OleanDecodeLimits::new(parts[0].len()))
+                .expect("a pinned module's imports decode");
+            pending.extend(imports);
+            loaded.push((name, parts));
+        }
+        loaded
+    }
+
+    fn inputs(closure: &[(Name, [Vec<u8>; 3])]) -> Vec<OleanModuleInput<'_>> {
+        closure
+            .iter()
+            .map(|(name, [exported, server, private])| OleanModuleInput {
+                name,
+                artifact: exported,
+                server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+            })
+            .collect()
+    }
+
+    fn limits(threads: usize) -> SourceOleanImportLimits {
+        SourceOleanImportLimits {
+            jobs: OleanFrontierJobs {
+                threads: NonZeroUsize::new(threads).expect("a positive thread count"),
+                worker_stack_bytes: STACK,
+            },
+            ..SourceOleanImportLimits::new(OleanCheckLimits::new(
+                1 << 30,
+                Budget::for_stack_bytes(STACK),
+            ))
+        }
+    }
+
+    fn import(
+        inputs: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        limits: SourceOleanImportLimits,
+    ) -> Result<Outcome<SourceOleanImport>> {
+        Engine::from_environment(Environment::new()).import_olean_modules_for_source(
+            inputs,
+            roots,
+            &KVMap::new(),
+            limits,
+        )
+    }
+
+    /// Run on a stack the `.olean` kernel budget is calibrated for, as the
+    /// front doors do.
+    fn on_import_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn_scoped(scope, body)
+                .expect("spawn the import thread")
+                .join()
+                .expect("the import thread does not panic")
+        })
+    }
+
+    /// The receipt the parallel council produces is the serial one: the same
+    /// checked set (engine, roots, module rows with their artifacts and per-module
+    /// roots), the same metadata reports and replayed engine, the same retained
+    /// import contexts, and the same answer when source is checked against it.
+    /// Equality on this closure is evidence for this closure, not a proof of
+    /// schedule independence in general.
+    #[test]
+    fn a_real_closure_imports_identically_at_one_and_several_jobs() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        // Siblings `Init.Data.Cast` and `Init.Data.Option.Coe` import only
+        // `Init.Coe`, so two modules are checked side by side.
+        let roots = ["Init.Data.Cast", "Init.Data.Option.Coe", "Init.Data.Zero"];
+        let closure = closure(&lib, &roots);
+        assert_eq!(closure.len(), 7, "the closure this test was sized for");
+        let inputs = inputs(&closure);
+        let roots: Vec<Name> = roots.iter().map(|root| n(root)).collect();
+        on_import_stack(|| {
+            let serial = import(&inputs, &roots, limits(1))
+                .expect("the pinned closure imports")
+                .into_complete()
+                .expect("the pinned closure imports completely");
+            let parallel = import(&inputs, &roots, limits(3))
+                .expect("the pinned closure imports")
+                .into_complete()
+                .expect("the pinned closure imports completely");
+            crate::assert_checked_sets_identical(&serial.checked, &parallel.checked, "checked set");
+            crate::assert_engines_identical(&serial.engine, &parallel.engine, "metadata engine");
+            assert_eq!(serial.result_logical_root, parallel.result_logical_root);
+            assert_eq!(serial.modules, parallel.modules, "metadata reports");
+            serial
+                .contexts
+                .assert_identical(&parallel.contexts, "import contexts");
+            assert!(
+                serial.modules.iter().any(|report| report.instances > 0),
+                "the closure carries instance metadata"
+            );
+
+            let main = n("Main");
+            let source =
+                b"prelude\nimport Init.Data.Cast\ntheorem keep (P : Prop) (h : P) : P := h\n";
+            let check = |receipt: &SourceOleanImport| {
+                receipt
+                    .check_source_modules(
+                        &[SourceModuleInput {
+                            name: &main,
+                            source,
+                        }],
+                        &main,
+                        &KVMap::new(),
+                        super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+                        )),
+                        None,
+                    )
+                    .expect("source checks against the receipt")
+                    .into_complete()
+                    .expect("source checks completely")
+            };
+            let (serial, parallel) = (check(&serial), check(&parallel));
+            assert_eq!(
+                serial.checked.base_logical_root,
+                parallel.checked.base_logical_root
+            );
+            assert_eq!(
+                serial.checked.result_logical_root,
+                parallel.checked.result_logical_root
+            );
+            crate::assert_engines_identical(
+                &serial.checked.engine,
+                &parallel.checked.engine,
+                "source result",
+            );
+        });
+    }
+
+    /// A refused or exhausted closure is refused the same way at any job count.
+    #[test]
+    fn a_broken_real_closure_is_refused_identically_at_one_and_several_jobs() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let roots = ["Init.Data.Cast", "Init.Data.Option.Coe", "Init.Data.Zero"];
+        let mut closure = closure(&lib, &roots);
+        let roots: Vec<Name> = roots.iter().map(|root| n(root)).collect();
+        let roots = roots.as_slice();
+        let refusal = |inputs: &[OleanModuleInput<'_>],
+                       limits: &dyn Fn(usize) -> SourceOleanImportLimits| {
+            let answers: Vec<OleanCheckError> = [1, 3]
+                .into_iter()
+                .map(|threads| {
+                    let limits = limits(threads);
+                    match on_import_stack(move || import(inputs, roots, limits)) {
+                        Err(SourceOleanImportError::Check(error)) => *error,
+                        other => {
+                            panic!("{threads} threads: expected a council refusal, got {other:?}")
+                        }
+                    }
+                })
+                .collect();
+            assert_eq!(answers[0], answers[1]);
+            answers[0].clone()
+        };
+
+        // A member missing from the set.
+        let without_coe: Vec<_> = inputs(&closure)
+            .into_iter()
+            .filter(|input| *input.name != n("Init.Coe"))
+            .collect();
+        assert!(matches!(
+            refusal(&without_coe, &limits),
+            OleanCheckError::MissingModuleImports { .. }
+        ));
+
+        // A planning budget the first module exceeds: the serial door's error,
+        // which the frontier would report as a resource non-answer instead.
+        let tight = |threads: usize| {
+            let mut tight = limits(threads);
+            tight.check.max_declarations = 100;
+            tight
+        };
+        assert!(matches!(
+            refusal(&inputs(&closure), &tight),
+            OleanCheckError::DeclarationLimit { limit: 100, .. }
+        ));
+
+        // A corrupted member.
+        let coe = closure
+            .iter()
+            .position(|(name, _)| *name == n("Init.Coe"))
+            .expect("Init.Coe is in the closure");
+        closure[coe].1[0][0] ^= u8::MAX;
+        assert!(matches!(
+            refusal(&inputs(&closure), &limits),
+            OleanCheckError::ModuleDecode { .. }
+        ));
+    }
 }

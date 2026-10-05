@@ -7,12 +7,14 @@ pub(super) mod lsp;
 pub(super) fn load_build_base(
     roots: &[fln::Name],
     source_root: &Path,
+    jobs: std::num::NonZeroUsize,
 ) -> Result<Option<SourceOleanImport>, (&'static str, String, bool)> {
-    imports::load_build_base(roots, source_root)
+    imports::load_build_base(roots, source_root, jobs)
         .map_err(|error| (error.class, error.detail, error.authority))
 }
 
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let (arguments, jobs) = take_jobs_option(arguments)?;
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.
     let mut json = false;
     let mut bytes = false;
@@ -53,6 +55,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         paths,
         max_bytes,
         json,
+        jobs,
     })
 }
 
@@ -80,7 +83,12 @@ fn failed(class: &str, detail: &str, authority: bool, json: bool, exit: u8) -> M
     MultiplexerOutput::failure(stderr, exit)
 }
 
-pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> MultiplexerOutput {
+pub(super) fn run(
+    paths: Vec<PathBuf>,
+    max_bytes: usize,
+    json: bool,
+    jobs: std::num::NonZeroUsize,
+) -> MultiplexerOutput {
     if paths.len() > 4096 {
         return failed("resource", "source file count exceeds 4096", false, json, 3);
     }
@@ -126,7 +134,7 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
             if let Err(error) = loaded.preflight() {
                 return failed(error.class, &error.detail, error.authority, json, error.exit);
             }
-            let (engine, olean_base) = match loaded.base_engine(seed) {
+            let (engine, olean_base) = match loaded.base_engine(seed, jobs) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
