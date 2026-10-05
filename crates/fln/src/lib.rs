@@ -777,6 +777,29 @@ pub enum OleanRebuildError {
         part: OleanModulePart,
         missing: OleanModulePart,
     },
+    /// `part`'s fixed header is not the pinned toolchain's: its `flags`,
+    /// `githash` or `lean_version` differ (bead `fln-fur.1`). A standalone
+    /// artifact is named [`OleanModulePart::Exported`]. The rebuild re-derives
+    /// these fields from their parsed values, so without this a forged header
+    /// rebuilds byte-identically and is reported as verified.
+    HeaderNotPinned {
+        part: OleanModulePart,
+        mismatch: fln_olean::pin::HeaderPinMismatch,
+    },
+}
+
+/// Refuse a part the pinned toolchain did not write before re-deriving it, in
+/// the order every pinned decode door uses: the envelope first, so a malformed
+/// file is still refused as itself, then the header. `region` maps an envelope
+/// refusal to the caller's error shape.
+fn require_pinned_rebuild_header(
+    bytes: &[u8],
+    part: OleanModulePart,
+    region: impl FnOnce(OleanRegionError) -> OleanRebuildError,
+) -> Result<(), OleanRebuildError> {
+    OleanView::parse(bytes).map_err(region)?;
+    fln_olean::pin::check_pinned_header(bytes)
+        .map_err(|mismatch| OleanRebuildError::HeaderNotPinned { part, mismatch })
 }
 
 impl fmt::Display for OleanRebuildError {
@@ -792,6 +815,9 @@ impl fmt::Display for OleanRebuildError {
                 "{part} cannot be rebuilt without its predecessor {missing}, the part \
                  it was compacted after"
             ),
+            Self::HeaderNotPinned { part, mismatch } => {
+                write!(f, "incompatible {part} header: {mismatch}")
+            }
         }
     }
 }
@@ -835,6 +861,9 @@ impl From<OleanRegionError> for OleanRebuildError {
 /// The artifact must be a standalone region. A module-system companion
 /// (`.olean.server`, `.olean.private`) points into the parts written before
 /// it and is refused here; rebuild it with [`rebuild_olean_module_artifacts`].
+///
+/// A header the pinned toolchain did not write is refused as
+/// [`OleanRebuildError::HeaderNotPinned`] before anything is rebuilt.
 pub fn rebuild_olean_artifact(
     artifact: &[u8],
     max_bytes: usize,
@@ -845,6 +874,11 @@ pub fn rebuild_olean_artifact(
             limit: max_bytes,
         });
     }
+    require_pinned_rebuild_header(
+        artifact,
+        OleanModulePart::Exported,
+        OleanRebuildError::Region,
+    )?;
     fln_olean::rebuild::rebuild(artifact).map_err(OleanRebuildError::from)
 }
 
@@ -884,7 +918,9 @@ pub struct OleanPartRebuild {
 /// the part it came from, and the first refusal in load order stops the
 /// rebuild. Like [`rebuild_olean_artifact`], this is not fresh emission, does
 /// not resolve imports or kernel-check declarations, and does not establish
-/// that the parts came from one build.
+/// that the parts came from one build. Every part's header is held to the pin
+/// before that part is rebuilt, and a refusal names the part
+/// ([`OleanRebuildError::HeaderNotPinned`]).
 pub fn rebuild_olean_module_artifacts(
     parts: OleanModuleParts<'_>,
     max_bytes: usize,
@@ -921,6 +957,10 @@ pub fn rebuild_olean_module_artifacts(
     let mut loaded: Vec<&[u8]> = Vec::with_capacity(supplied.len());
     let mut rebuilt = Vec::with_capacity(supplied.len());
     for (part, bytes) in supplied {
+        require_pinned_rebuild_header(bytes, part, |error| OleanRebuildError::PartRegion {
+            part,
+            error,
+        })?;
         let (part_bytes, report) = fln_olean::rebuild::rebuild_with_dependencies(bytes, &loaded)
             .map_err(|error| OleanRebuildError::PartRegion { part, error })?;
         rebuilt.push(OleanPartRebuild {
@@ -12355,6 +12395,109 @@ mod tests {
             }
         );
         assert!(!refusal.is_resource_exhaustion());
+    }
+
+    /// Both rebuild doors hold every part's header to the pin (bead
+    /// `fln-fur.1`). The rebuild re-derives the header from its parsed fields,
+    /// so the codec alone reproduces a forged one byte for byte: the door's
+    /// check is the only thing standing between the forgery and a verified
+    /// rebuild, and each cell shows that first.
+    #[test]
+    fn public_olean_rebuild_doors_refuse_a_header_the_pin_did_not_write() {
+        use super::{OleanModulePart, OleanModuleParts, rebuild_olean_module_artifacts};
+        let offset = |name: &str| {
+            fln_olean::format::OLEAN_HEADER_FIELDS
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.offset)
+                .expect("a generated header field")
+        };
+        // `(field, offset, byte)`: flags cleared, Lean `5.32.0`, another commit.
+        let forgeries = [
+            ("flags", offset("flags"), 0x00),
+            ("lean_version", offset("lean_version"), b'5'),
+            ("githash", offset("githash"), b'9'),
+        ];
+        let forge = |bytes: &[u8], at: usize, byte: u8| {
+            let mut forged = bytes.to_vec();
+            assert_ne!(forged[at], byte, "the edit must change a byte");
+            forged[at] = byte;
+            forged
+        };
+        let refused_as = |refusal: &OleanRebuildError, part: OleanModulePart, field: &str| {
+            matches!(
+                refusal,
+                OleanRebuildError::HeaderNotPinned { part: refused, mismatch }
+                    if *refused == part && mismatch.field == field
+            ) && refusal.to_string().starts_with(&format!(
+                "incompatible {part} header: header field `{field}`"
+            )) && !refusal.is_resource_exhaustion()
+        };
+
+        let standalone = olean_fixture("Init.BinderNameHint.olean");
+        for (field, at, byte) in forgeries {
+            let forged = forge(&standalone, at, byte);
+            let (codec, _) = fln_olean::rebuild::rebuild(&forged).expect("the codec rebuilds it");
+            assert!(codec == forged, "{field}: the codec reproduces the forgery");
+            let refusal = rebuild_olean_artifact(&forged, forged.len()).expect_err(field);
+            assert!(
+                refused_as(&refusal, OleanModulePart::Exported, field),
+                "{field}: {refusal:?}"
+            );
+        }
+        // The envelope still answers first: a forged header behind a bad magic
+        // is refused as the bad magic.
+        let mut both = forge(&standalone, offset("githash"), b'9');
+        both[0] ^= u8::MAX;
+        assert!(matches!(
+            rebuild_olean_artifact(&both, both.len()),
+            Err(OleanRebuildError::Region(OleanRegionError::BadMagic))
+        ));
+
+        let chain = pinned_prelude_chain();
+        let total = chain.iter().map(Vec::len).sum();
+        let rebuild = |parts: &[Vec<u8>; 3]| {
+            rebuild_olean_module_artifacts(
+                OleanModuleParts {
+                    exported: &parts[0],
+                    server: Some(&parts[1]),
+                    private: Some(&parts[2]),
+                },
+                total,
+            )
+        };
+        assert!(
+            rebuild(&chain).is_ok(),
+            "the unforged pinned chain rebuilds"
+        );
+        for (index, part) in OleanModulePart::LOAD_ORDER.into_iter().enumerate() {
+            for (field, at, byte) in forgeries {
+                let mut parts = chain.clone();
+                parts[index] = forge(&chain[index], at, byte);
+                let loaded: Vec<&[u8]> = parts[..index].iter().map(Vec::as_slice).collect();
+                let (codec, _) =
+                    fln_olean::rebuild::rebuild_with_dependencies(&parts[index], &loaded)
+                        .expect("the codec rebuilds the forged part");
+                assert!(
+                    codec == parts[index],
+                    "{part} {field}: the codec reproduces it"
+                );
+                let refusal = rebuild(&parts).expect_err("a forged part is refused");
+                assert!(
+                    refused_as(&refusal, part, field),
+                    "{part} {field}: {refusal:?}"
+                );
+            }
+        }
+        // Load order decides: an earlier part's forgery is the one reported.
+        let mut parts = chain;
+        parts[2] = forge(&parts[2], offset("flags"), 0x00);
+        parts[1] = forge(&parts[1], offset("githash"), b'9');
+        let refusal = rebuild(&parts).expect_err("two forged parts");
+        assert!(
+            refused_as(&refusal, OleanModulePart::Server, "githash"),
+            "{refusal:?}"
+        );
     }
 
     fn nat_type() -> Expr {

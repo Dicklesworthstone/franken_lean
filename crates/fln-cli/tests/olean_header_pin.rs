@@ -1,6 +1,7 @@
 //! An `.olean` part whose fixed header is not the pinned toolchain's is refused by
 //! every installed door that claims a pinned artifact (bead `fln-fur.1`): `fln
-//! check-olean`, `fln olean inspect` and `.olean` imports. The pinned loader
+//! check-olean`, `fln olean inspect`, `fln olean verify-rebuild` (one file, and
+//! every part of a module-system chain) and `.olean` imports. The pinned loader
 //! refuses such a file as an "incompatible header" (module.cpp:488-497).
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
@@ -99,6 +100,11 @@ fn every_door_refuses_a_header_the_pin_did_not_write_and_names_the_field() {
     let inspected = fln(&scratch, &["olean", "inspect", path], None);
     assert!(inspected.status.success());
     assert!(String::from_utf8_lossy(&inspected.stdout).contains("pinned .olean audit: complete"));
+    let rebuilt = fln(&scratch, &["olean", "verify-rebuild", path], None);
+    assert!(rebuilt.status.success(), "{rebuilt:?}");
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("pinned .olean rebuild audit: complete")
+    );
     scratch.write(
         "consumer/Use.lean",
         "prelude\nimport Ext.A\ntheorem Use.again (P : Prop) (h : P) : P := Ext.A P h\n",
@@ -127,6 +133,10 @@ fn every_door_refuses_a_header_the_pin_did_not_write_and_names_the_field() {
             (
                 "olean inspect",
                 fln(&scratch, &["olean", "inspect", path], None),
+            ),
+            (
+                "olean verify-rebuild",
+                fln(&scratch, &["olean", "verify-rebuild", path], None),
             ),
             ("import", import(&directory)),
         ] {
@@ -186,5 +196,114 @@ fn a_companion_part_the_pin_did_not_write_is_refused_by_name() {
                 && error.contains("header field `githash`"),
             "{suffix}: {error}"
         );
+    }
+}
+
+/// `olean verify-rebuild` over a module-system chain holds every part's header to
+/// the pin, naming the part, whichever part PATH names. The committed `Init/Prelude`
+/// chain is the pin's own bytes (held by `cli_personalities_and_verbs`'s
+/// `olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude`), so this needs no
+/// installed Reference. The rebuild re-derives a header from its parsed fields, so a
+/// forged `flags`, `lean_version` or `githash` used to verify as complete.
+#[test]
+fn verify_rebuild_holds_every_part_of_a_chain_to_the_pin() {
+    const PARTS: [&str; 3] = [".olean", ".olean.server", ".olean.private"];
+    let fixtures =
+        fln_core::checked_workspace_root!().join("crates/fln-conformance/fixtures/tag_attributes");
+    let chain = PARTS.map(|part| {
+        let suffix = part.strip_prefix(".olean").unwrap();
+        std::fs::read(fixtures.join(format!("prelude.olean{suffix}"))).unwrap()
+    });
+    let scratch = Scratch::new();
+    let write_chain = |directory: &str, parts: &[Vec<u8>; 3]| -> [PathBuf; 3] {
+        std::array::from_fn(|index| {
+            let suffix = PARTS[index].strip_prefix(".olean").unwrap();
+            scratch.write(&format!("{directory}/Prelude.olean{suffix}"), &parts[index])
+        })
+    };
+    let verify = |path: &Path, json: bool| {
+        let mut arguments = vec!["olean", "verify-rebuild"];
+        if json {
+            arguments.push("--json");
+        }
+        arguments.push(path.to_str().unwrap());
+        fln(&scratch, &arguments, None)
+    };
+
+    let pinned = write_chain("pinned", &chain);
+    for path in &pinned {
+        let output = verify(path, false);
+        assert!(output.status.success(), "{}: {output:?}", path.display());
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("pinned .olean rebuild audit: complete")
+        );
+    }
+
+    for (index, part) in PARTS.into_iter().enumerate() {
+        for (case, field, offset, byte) in FORGERIES {
+            let mut parts = chain.clone();
+            assert_ne!(
+                parts[index][offset], byte,
+                "{case}: the edit must change a byte"
+            );
+            parts[index][offset] = byte;
+            let paths = write_chain(&format!("forged{part}-{offset}"), &parts);
+            // Human, from the forged part itself; robot, from the exported part.
+            let human = verify(&paths[index], false);
+            let robot = verify(&paths[0], true);
+            for (form, output) in [("human", &human), ("robot", &robot)] {
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{part} {case} {form}: {output:?}"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout).contains("audit: complete"),
+                    "{part} {case} {form}: {output:?}"
+                );
+            }
+            let human = String::from_utf8_lossy(&human.stderr);
+            assert!(
+                human.starts_with(&format!(
+                    "fln olean verify-rebuild: header: incompatible {part} header: \
+                     header field `{field}`"
+                )),
+                "{part} {case}: {human}"
+            );
+            let robot = String::from_utf8_lossy(&robot.stderr);
+            assert!(
+                robot.contains("\"class\":\"header\"")
+                    && robot.contains(&format!("\"part\":\"{part}\""))
+                    && robot.contains(&format!("header field `{field}`")),
+                "{part} {case}: {robot}"
+            );
+        }
+
+        // The format `version` byte (offset 5) is the envelope's, not the pin
+        // check's: the pin writes 2 and the pinned loader also accepts 3. Either
+        // other value is still refused, naming the part, before anything verifies.
+        for byte in [3, 4] {
+            let mut parts = chain.clone();
+            assert_eq!(parts[index][5], 2, "the pin writes format version 2");
+            parts[index][5] = byte;
+            let paths = write_chain(&format!("version{part}-{byte}"), &parts);
+            let output = verify(&paths[index], false);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{part} version {byte}: {output:?}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{part} version {byte}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).starts_with(&format!(
+                    "fln olean verify-rebuild: rebuild: {part} rebuild: "
+                )),
+                "{part} version {byte}: {output:?}"
+            );
+        }
     }
 }

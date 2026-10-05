@@ -231,7 +231,8 @@ const USAGE: &str = concat!(
     "bounded structural changes in module metadata and declarations. It does\n",
     "not resolve imports, kernel-check either side, or convert olean-next.\n",
     "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
-    "semantics and requires byte identity with no codec findings. If PATH is a\n",
+    "semantics and requires byte identity with no codec findings. Each part's\n",
+    "header must carry the pinned flags, lean_version and githash. If PATH is a\n",
     "module-system part (X.olean with X.olean.server or X.olean.private beside\n",
     "it, or either companion itself), every present part of that chain is\n",
     "rebuilt in load order against the parts loaded before it and reported per\n",
@@ -3820,6 +3821,7 @@ fn olean_rebuild_error_class(error: &fln::OleanRebuildError) -> (&'static str, u
         _ if error.is_resource_exhaustion() => ("resource", 3),
         fln::OleanRebuildError::ArtifactTooLarge { .. } => ("resource", 3),
         fln::OleanRebuildError::MissingPredecessor { .. } => ("missing-predecessor", 1),
+        fln::OleanRebuildError::HeaderNotPinned { .. } => ("header", 1),
         fln::OleanRebuildError::Region(_) | fln::OleanRebuildError::PartRegion { .. } => {
             ("rebuild", 1)
         }
@@ -4042,7 +4044,8 @@ fn verify_olean_rebuild_chain(
         Err(error) => {
             let (class, exit_code) = olean_rebuild_error_class(&error);
             let part = match &error {
-                fln::OleanRebuildError::PartRegion { part, .. } => Some(*part),
+                fln::OleanRebuildError::PartRegion { part, .. }
+                | fln::OleanRebuildError::HeaderNotPinned { part, .. } => Some(*part),
                 fln::OleanRebuildError::MissingPredecessor { missing, .. } => Some(*missing),
                 fln::OleanRebuildError::ArtifactTooLarge { .. }
                 | fln::OleanRebuildError::Region(_) => None,
