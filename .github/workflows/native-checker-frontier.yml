@@ -12,9 +12,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/checker-cycle-target
-      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -23,6 +20,8 @@ jobs:
         shell: python
         env:
           GH_TOKEN: ${{ github.token }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/checker-cycle-target
+          CARGO_BUILD_JOBS: 2
         run: |
           import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request
           sha = '1576bf8a2ce55bac015cb27e47d1c20f366f92dc'
