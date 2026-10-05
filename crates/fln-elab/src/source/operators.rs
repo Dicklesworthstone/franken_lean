@@ -285,9 +285,7 @@ impl Context {
         if class.is_anonymous() {
             return Ok(true);
         }
-        Ok(crate::instances::InstanceRegistry::read(&self.txn.env)
-            .map_err(registry_error)?
-            .is_class(&class))
+        Ok(self.instance_registry()?.is_class(&class))
     }
 
     /// `toTree.go` for a root `binop%`/`unop%`/`rightact%` term, or both

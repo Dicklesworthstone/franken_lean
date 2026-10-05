@@ -157,6 +157,12 @@ fn validate_order(
     Ok(())
 }
 
+/// The imported-instance journal's content identity, if the journal exists.
+pub(super) fn journal_digest(env: &Environment) -> Option<[u8; 32]> {
+    env.extension(&name())
+        .map(|extension| extension.content_digest().0)
+}
+
 pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError> {
     let Some(extension) = env.extension(&name()) else {
         return Ok(Metadata::default());

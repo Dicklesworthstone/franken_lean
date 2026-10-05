@@ -3,7 +3,6 @@
 //! parent fields enter the record telescope. No declaration is admitted here.
 use super::*;
 mod coercions;
-use crate::instances::InstanceRegistry;
 use crate::records::RecordError;
 use crate::records::inheritance::{RecordParent, RecordParents};
 use fln_core::name::LeafView;
@@ -76,8 +75,7 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         }
         let registry = RecordParents::read(&self.txn.env).map_err(record_error)?;
-        let classes = InstanceRegistry::read(&self.txn.env)
-            .map_err(|e| failure(SourceInferenceError::InstanceRegistry(e)))?;
+        let classes = self.instance_registry()?;
         let mut parent_names = HashSet::new();
         for (index, row) in rows.iter().enumerate() {
             self.tick()?;

@@ -251,6 +251,9 @@ struct Context {
     inaccessible_columns: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
+    // The instance registry, re-read only when it can have changed: every
+    // numeric literal, operator and coercion asks it.
+    registry_cache: crate::instances::RegistryCache,
     refinements: Vec<tactics::RefinementFrame>,
     recursion: Option<recursion::Recursion>,
 }
@@ -294,6 +297,7 @@ impl Context {
             matrix_rows: std::collections::HashSet::new(),
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
+            registry_cache: crate::instances::RegistryCache::default(),
             refinements: Vec::new(),
             recursion: None,
         }

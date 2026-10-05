@@ -403,6 +403,49 @@ fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, InstanceRe
         .map_err(|_| InstanceRegistryError::Malformed)
 }
 
+/// One elaboration's view of the instance registry. [`InstanceRegistry::read`]
+/// re-parses and re-validates every journal row and every imported instance. The
+/// elaborator asks it on each numeric literal, operator and coercion, so under an
+/// imported closure every such query paid for every imported instance (fln-uyuz's
+/// profile of the implicit-Init import). The registry is re-read only when what
+/// `read` reads can have changed: its journal, the imported-instance journal, or
+/// the constants it validates against (by count, which moves with every command
+/// and every rollback). A failed read is never kept.
+#[derive(Clone, Default)]
+pub(crate) struct RegistryCache {
+    last: std::cell::RefCell<Option<(RegistryKey, std::sync::Arc<InstanceRegistry>)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RegistryKey {
+    rows: Option<[u8; 32]>,
+    imported: Option<[u8; 32]>,
+    constants: usize,
+}
+
+impl RegistryCache {
+    pub(crate) fn read(
+        &self,
+        env: &Environment,
+    ) -> Result<std::sync::Arc<InstanceRegistry>, InstanceRegistryError> {
+        let key = RegistryKey {
+            rows: env
+                .extension(&extension_name())
+                .map(|extension| extension.content_digest().0),
+            imported: imported::journal_digest(env),
+            constants: env.len(),
+        };
+        if let Some((cached, registry)) = self.last.borrow().as_ref()
+            && *cached == key
+        {
+            return Ok(std::sync::Arc::clone(registry));
+        }
+        let registry = std::sync::Arc::new(InstanceRegistry::read(env)?);
+        *self.last.borrow_mut() = Some((key, std::sync::Arc::clone(&registry)));
+        Ok(registry)
+    }
+}
+
 pub fn register_class(
     env: &Environment,
     class: &Name,
@@ -643,6 +686,48 @@ mod tests {
             InstanceRegistry::read(&env),
             Err(InstanceRegistryError::Malformed)
         );
+    }
+    #[test]
+    fn a_cached_registry_is_reread_exactly_when_what_it_reads_changes() {
+        use fln_core::level::Level;
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        let axiom = |name: &str| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components([name]),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            })
+        };
+        let class = Name::from_components(["C"]);
+        let base = Environment::new().add_decl(axiom("C")).unwrap();
+        let cache = RegistryCache::default();
+        let before = cache.read(&base).unwrap();
+        assert!(!before.is_class(&class));
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &cache.read(&base).unwrap()),
+            "an unchanged environment is not re-read"
+        );
+        // A new journal row, with no new constant, is seen.
+        let registered = register_class(&base, &class).unwrap();
+        assert_eq!(registered.len(), base.len());
+        let after = cache.read(&registered).unwrap();
+        assert!(after.is_class(&class));
+        // The environment before the row (a rollback) is answered as it was.
+        assert!(!cache.read(&base).unwrap().is_class(&class));
+        // A new constant re-reads too, and every answer is a fresh read's.
+        let grown = registered.add_decl(axiom("D")).unwrap();
+        let again = cache.read(&grown).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&after, &again));
+        assert_eq!(*again, InstanceRegistry::read(&grown).unwrap());
+        // A failed read is not kept: a malformed journal stays an error.
+        let broken = registered
+            .push_extension_entry(&extension_name(), b"FLNINST\x02".to_vec())
+            .unwrap();
+        assert!(cache.read(&broken).is_err());
+        assert!(cache.read(&broken).is_err());
     }
     #[test]
     fn empty_or_unadmitted_registrations_cannot_supply_instances() {

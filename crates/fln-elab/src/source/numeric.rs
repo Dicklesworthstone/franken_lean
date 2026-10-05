@@ -49,8 +49,8 @@ fn decode_scientific(spelling: &str) -> Result<(Expr, bool, Expr), NatDefinition
 
 impl Context {
     pub(super) fn has_numeric_class(&self, class: &str) -> Result<bool, NatDefinitionElabError> {
-        Ok(crate::instances::InstanceRegistry::read(&self.txn.env)
-            .map_err(instances::registry_error)?
+        Ok(self
+            .instance_registry()?
             .is_class(&Name::from_components([class])))
     }
 

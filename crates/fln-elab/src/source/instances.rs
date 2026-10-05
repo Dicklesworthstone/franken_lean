@@ -147,6 +147,18 @@ struct Frame {
 pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabError {
     failure(SourceInferenceError::InstanceRegistry(error))
 }
+
+impl Context {
+    /// The current environment's instance registry, read once per change of
+    /// what it reads ([`crate::instances::RegistryCache`]).
+    pub(super) fn instance_registry(
+        &self,
+    ) -> Result<std::sync::Arc<InstanceRegistry>, NatDefinitionElabError> {
+        self.registry_cache
+            .read(&self.txn.env)
+            .map_err(registry_error)
+    }
+}
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
     let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error else {
         return false;

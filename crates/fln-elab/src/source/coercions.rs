@@ -26,9 +26,7 @@ impl Context {
         if !self.txn.env.contains(&name) {
             return Ok(false);
         }
-        Ok(InstanceRegistry::read(&self.txn.env)
-            .map_err(registry_error)?
-            .is_class(&name))
+        Ok(self.instance_registry()?.is_class(&name))
     }
 
     /// Probe one isolated equation without publishing a failed assignment or

@@ -10,8 +10,7 @@ impl Context {
         parents: &[RecordParent],
         budget: RecordBudget,
     ) -> Result<Vec<DefinitionVal>, NatDefinitionElabError> {
-        let registry = InstanceRegistry::read(&self.txn.env)
-            .map_err(|e| failure(SourceInferenceError::InstanceRegistry(e)))?;
+        let registry = self.instance_registry()?;
         let mut output = Vec::new();
         let mut builder = Builder {
             remaining: budget.max_nodes,
