@@ -72,7 +72,11 @@ if CARGO_TARGET_DIR="$BUILD_TARGET" cargo test --offline -q -p fln-unsafe-abi >"
 else
     fail unit_suite "\"artifact\":\"unit.log\""
 fi
-if CARGO_TARGET_DIR="$BUILD_TARGET" cargo run --offline -q -p structure-guard >"$ART_DIR/guard.log" 2>&1; then
+# --bin: the package also builds fln-agent-anchor and fln-frontier-guard, and a bare
+# `cargo run -p structure-guard` refuses to choose ("could not determine which binary to
+# run"), which failed this lane, and bignum_vectors' C4 gauntlet with it, in
+# contract-drift run 37312172140.
+if CARGO_TARGET_DIR="$BUILD_TARGET" cargo run --offline -q -p structure-guard --bin structure-guard >"$ART_DIR/guard.log" 2>&1; then
     emit structure_guard passed "\"artifact\":\"guard.log\""
 else
     fail structure_guard "\"artifact\":\"guard.log\""

@@ -86,6 +86,43 @@ jobs:
           printf 'ELAN_HOME=%s\n' "$ELAN_HOME" >> "$GITHUB_ENV"
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
 
+      # The G0-4 and diagnostic-projection lanes require `rg`, which the hosted
+      # ubuntu-24.04 image does not ship. Both died at their preflight in run
+      # 37312172140 ("setup failure: rg is required"). Pinned like elan: one release
+      # asset, its SHA-256 equal to the digest ripgrep publishes beside it.
+      - name: install pinned ripgrep
+        shell: bash
+        run: |
+          tool_root="$RUNNER_TEMP/ripgrep-bin"
+          archive="$RUNNER_TEMP/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz"
+          mkdir "$tool_root"
+          python3 -I -S - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import urllib.request
+
+          url = (
+              "https://github.com/BurntSushi/ripgrep/releases/download/"
+              "14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz"
+          )
+          expected = "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e"
+          limit = 16 * 1024 * 1024
+          with urllib.request.urlopen(url, timeout=60) as response:
+              payload = response.read(limit + 1)
+          if len(payload) > limit:
+              raise SystemExit(f"ripgrep archive exceeds {limit} bytes")
+          actual = hashlib.sha256(payload).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"ripgrep archive digest mismatch: {actual} != {expected}")
+          pathlib.Path(sys.argv[1]).write_bytes(payload)
+          print(f"ripgrep archive SHA-256: {actual}")
+          PY
+          tar -xzf "$archive" -C "$tool_root" --strip-components=1 \
+            ripgrep-14.1.1-x86_64-unknown-linux-musl/rg
+          "$tool_root/rg" --version | grep -F 'ripgrep 14.1.1'
+          printf '%s\n' "$tool_root" >> "$GITHUB_PATH"
+
       - name: read the Reference tag from SUITE.lock
         id: reference
         shell: bash
@@ -457,10 +494,18 @@ jobs:
           # actual script in the pin-bearing workflow and retain its committed fln.e2e/2
           # admission child. The outer fln.e2e/1 journal is legacy compatibility evidence;
           # the independently validated child is the authoritative receipt.
+          #
+          # Its supervised admission replay runs the whole kernel_replay binary, which
+          # took 3,522 s on this runner in run 37312172140's suites step. The lane's
+          # default 30-minute supervisor (FLN_E2E_TIMEOUT_MS) cut that replay off as
+          # inconclusive/timeout in the same run, before it could answer. The budget is
+          # raised to 90 minutes, and the lane records it in its evidence
+          # (budgets.step_timeout_ms). A timeout is still an inconclusive non-answer.
           step_root="target/e2e/contract-drift-kernel-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir "$step_root"
           FLN_E2E_ART_ROOT="$PWD/$step_root" \
             FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            FLN_E2E_TIMEOUT_MS=5400000 \
             ./scripts/e2e/kernel_replay.sh
           mapfile -d '' -t bundles < <(
             find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
@@ -608,8 +653,10 @@ jobs:
           # The suites' output also goes to the job log, as it runs. Run 37286836414
           # spent three hours here with it all in $log, and the job's timeout destroyed
           # the only record of which cell was running. cargo's own status is taken
-          # from PIPESTATUS, not tee's.
-          cargo test --locked -p fln-conformance \
+          # from PIPESTATUS, not tee's. --no-fail-fast: in run 37312172140 one red
+          # kernel_replay cell stopped cargo, so five of the ten binaries never ran
+          # and the rig join could not be decided.
+          cargo test --locked --no-fail-fast -p fln-conformance \
             --test kernel_replay \
             --test pin_option_defaults \
             --test ext_observable_capture \

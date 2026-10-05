@@ -4171,6 +4171,9 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
             limit
         }) if bytes == total_bytes && limit == total_bytes - 1
     ));
+    // Byte 40 is the first `githash` byte. Since the header pin (26a58548, bead
+    // fln-fur.1) the server part is refused there, before the identity comparison
+    // that used to answer CompanionHeaderMismatch: by its own name, naming the field.
     let mut wrong_server = server.clone();
     wrong_server[40] ^= 1;
     assert!(matches!(
@@ -4180,9 +4183,10 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
             &private,
             fln::OleanDecodeLimits::new(total_bytes),
         ),
-        Err(fln::OleanDecodeError::CompanionHeaderMismatch {
-            part: fln::OleanCompanionPart::Server,
-        })
+        Err(fln::OleanDecodeError::HeaderNotPinned {
+            part: Some(fln::OleanCompanionPart::Server),
+            mismatch,
+        }) if mismatch.field == "githash"
     ));
     assert!(
         private_infos.len() > public_infos.len(),

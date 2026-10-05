@@ -485,7 +485,7 @@ if [ "$full" = 1 ]; then
 else
   "$root/scripts/extract/gen_extern_census.sh" --validate
 fi
-cargo run --locked -q -p structure-guard -- --root "$root" --robot
+cargo run --locked -q -p structure-guard --bin structure-guard -- --root "$root" --robot
 '
 
 # As above, these positional parameters belong to the isolated child shell.

@@ -1755,8 +1755,9 @@ run_stage epoch-lab-test cargo test --locked \
 run_stage epoch-lab-live-verify cargo run --locked \
   --manifest-path tribunal/epoch-lab/Cargo.toml -- verify v4.32.0
 if [ "$CENSUS_AVAILABILITY" = available ]; then
-  run_stage structure-guard cargo run -q --locked -p structure-guard -- \
-    --root "$REPO" --robot
+  # --bin: the package has three binaries, and a bare `cargo run -p` refuses to choose.
+  run_stage structure-guard cargo run -q --locked -p structure-guard \
+    --bin structure-guard -- --root "$REPO" --robot
 else
   run_stage structure-guard "${PYTHON[@]}" "$EVIDENCE" \
     exec-structure-guard-census-inconclusive --root "$REPO" \
