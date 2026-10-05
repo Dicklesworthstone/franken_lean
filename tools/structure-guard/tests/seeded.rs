@@ -1915,6 +1915,90 @@ fn a_disabled_checker_reading_guard_is_refused() {
     );
 }
 
+/// The guard body's last statement, where a late plant goes.
+const READING_GUARD_TAIL: &str = "            .join(\"; \"),\n    );\n}";
+
+/// THE RUNTIME SKIPS, the run-time form of `#[ignore]`: the test still compiles and
+/// `cargo test` still reports it passed, having measured nothing. Each is planted as
+/// the body's first statement and again as its last. The first is FlintMarten's
+/// verification plant (`z8j.1.14`, comment 3140), which the rule passed before.
+#[test]
+fn a_checker_reading_guard_that_can_skip_its_scan_at_run_time_is_refused() {
+    for (tag, skip) in [
+        (
+            "flint-fast",
+            "if std::env::var_os(\"FLN_FAST\").is_none() { return; }",
+        ),
+        (
+            "env-var",
+            "if std::env::var(\"FLN_SKIP\").is_ok() { return; }",
+        ),
+        (
+            "option-env",
+            "if option_env!(\"FLN_SKIP\").is_some() { return; }",
+        ),
+        ("bare-return", "return;"),
+        ("exit", "std::process::exit(0);"),
+    ] {
+        for (place, guard) in [
+            (
+                "early",
+                plant(
+                    CHECKER_READING_GUARD_FIXTURE,
+                    READING_GUARD_HEAD,
+                    &format!("{READING_GUARD_HEAD}\n    {skip}"),
+                ),
+            ),
+            (
+                "late",
+                plant(
+                    CHECKER_READING_GUARD_FIXTURE,
+                    READING_GUARD_TAIL,
+                    &READING_GUARD_TAIL.replacen("\n}", &format!("\n    {skip}\n}}"), 1),
+                ),
+            ),
+        ] {
+            let found = with_reading_guard(&format!("reading-guard-skip-{tag}-{place}"), &guard);
+            assert!(
+                found
+                    .iter()
+                    .any(|finding| finding.contains("can end it before the scan")),
+                "{skip} planted {place} in the guard body must be refused: {found:?}"
+            );
+        }
+    }
+
+    // The same text outside the guard function is not the guard's business: a
+    // helper elsewhere in the file may read the environment.
+    let found = with_reading_guard(
+        "reading-guard-skip-outside-body",
+        &format!(
+            "{CHECKER_READING_GUARD_FIXTURE}\nfn unrelated() -> bool {{ std::env::var_os(\"X\").is_some() }}\n"
+        ),
+    );
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// THE NEEDLES BELONG TO THE GUARD FUNCTION. Moving the reader needle into a helper
+/// leaves it in the file but takes it out of the measurement that must assert it.
+#[test]
+fn a_reading_guard_needle_moved_out_of_the_guard_function_is_refused() {
+    let needle = "(\"fln_checker\", \"fln_checker::olean::read_constants\"),";
+    let moved = plant(CHECKER_READING_GUARD_FIXTURE, needle, "");
+    let found = with_reading_guard(
+        "reading-guard-needle-in-helper",
+        &format!(
+            "{moved}\nfn helper() -> &'static str {{ \"fln_checker::olean::read_constants\" }}\n"
+        ),
+    );
+    assert!(
+        found.iter().any(|finding| {
+            finding.contains("guard function no longer names `fln_checker::olean::read_constants`")
+        }),
+        "a needle outside the guard function must be refused: {found:?}"
+    );
+}
+
 /// THE DECOYS. A guard renamed with its old name left in a comment, a needle moved
 /// into a comment, a test pointed at another binary, and a probe rooted elsewhere
 /// all still mention the read path somewhere; none of them measures it.

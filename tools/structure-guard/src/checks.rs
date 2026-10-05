@@ -1375,6 +1375,21 @@ const CHECKER_READING_GUARD_NAMES: [&str; 3] = [
     "fln_checker::olean::read_constants",
 ];
 
+/// Identifiers the guard function's body may not contain: a `return` ends it before
+/// the scan, an environment read is the condition such a skip is written on (the
+/// repository's usual `FLN_FAST` shape), and `exit` ends the test process with the
+/// status the caller chooses. `env!`, which names the probe at compile time, is not
+/// among them.
+const CHECKER_READING_GUARD_SKIPS: [&str; 7] = [
+    "return",
+    "var",
+    "var_os",
+    "vars",
+    "vars_os",
+    "option_env",
+    "exit",
+];
+
 /// FLN-STRUCT-042 — the independent checker's reading-path guard is missing,
 /// cannot run, or no longer measures the read path (bead `franken_lean-z8j.1.14`).
 ///
@@ -1389,10 +1404,15 @@ const CHECKER_READING_GUARD_NAMES: [&str; 3] = [
 /// * the test file exists, and its guard function is a `#[test]` with no other
 ///   attribute but `doc`, so no `ignore`, `should_panic`, `cfg` or `cfg_attr`;
 /// * the file has no inner `cfg` or `cfg_attr`, which could compile it out whole;
-/// * the test names the probe, the read path's root and the reader as code;
+/// * the guard function's own body names the probe, the read path's root and the
+///   reader as code;
+/// * that body has no `return`, no environment read (`var`, `var_os`, `vars`,
+///   `vars_os`, `option_env!`) and no `exit`: the runtime forms of `#[ignore]`;
 /// * the probe refers to `fln::independent_reading` as code.
 ///
-/// Comments do not count for any of these. The manifest cannot switch the test off
+/// Comments do not count for any of these. What stays outside a lexical rule: a
+/// skip routed through a helper function, where the body's code is wrapped in a
+/// condition the helper computes, reads as ordinary control flow. The manifest cannot switch the test off
 /// unseen either: `manifest::parse` refuses `[[test]]` tables and `autotests`.
 /// The rule applies wherever `fln-checker` exists, the crate whose independent
 /// reading the guard measures.
@@ -1463,14 +1483,31 @@ fn audit_checker_reading_guard(root: &Path, findings: &mut Vec<Finding>) {
                     ),
                 );
             }
-            let literals = ledger::string_literals(&text);
-            for name in CHECKER_READING_GUARD_NAMES {
-                if !literals.iter().any(|literal| literal == name) {
+            for body in ledger::fn_bodies(&text, CHECKER_READING_GUARD_FN) {
+                let literals = ledger::string_literals(body);
+                for name in CHECKER_READING_GUARD_NAMES {
+                    if !literals.iter().any(|literal| literal == name) {
+                        refuse(
+                            CHECKER_READING_GUARD,
+                            format!(
+                                "the guard function no longer names `{name}` in code, so it \
+                                 may measure another binary or pass on an empty scan"
+                            ),
+                        );
+                    }
+                }
+                let skips = ledger::identifier_sites(body, &CHECKER_READING_GUARD_SKIPS);
+                if !skips.is_empty() {
                     refuse(
                         CHECKER_READING_GUARD,
                         format!(
-                            "the guard no longer names `{name}` in code, so it may measure \
-                             another binary or pass on an empty scan"
+                            "`{CHECKER_READING_GUARD_FN}` uses {}, which can end it before the \
+                             scan and pass with nothing measured; the guard runs unconditionally",
+                            skips
+                                .iter()
+                                .map(|site| format!("`{}`", site.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     );
                 }

@@ -767,6 +767,33 @@ pub fn inner_attribute_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// For each definition of a function named `name`, the source of its body, braces
+/// included. A definition whose body never closes yields the rest of the file.
+pub fn fn_bodies<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let lexemes = rust_lexemes(text);
+    let mut bodies = Vec::new();
+    for at in 1..lexemes.len() {
+        if lexemes[at].text != name || lexemes[at - 1].text != "fn" {
+            continue;
+        }
+        // The body opens at the first `{` at the definition's own depth; a `{` is
+        // recorded at the depth outside it and its closing `}` at the depth inside.
+        let depth = lexemes[at].delimiter_depth;
+        let Some(open) = (at..lexemes.len())
+            .find(|&index| lexemes[index].text == "{" && lexemes[index].delimiter_depth == depth)
+        else {
+            continue;
+        };
+        let close = (open + 1..lexemes.len())
+            .find(|&index| {
+                lexemes[index].text == "}" && lexemes[index].delimiter_depth == depth + 1
+            })
+            .map_or(text.len(), |index| lexemes[index].offset + 1);
+        bodies.push(&text[lexemes[open].offset..close]);
+    }
+    bodies
+}
+
 /// For each definition of a function named `name`, the names of the outer
 /// attributes written on it, in source order (`#[cfg_attr(..)]` is `cfg_attr`).
 /// Doc comments are comments, not attributes, and are not listed.
