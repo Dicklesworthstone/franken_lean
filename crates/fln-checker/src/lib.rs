@@ -89,8 +89,8 @@
 //! `gii` requires this crate to bring "its OWN decoder over Grimoire canonical
 //! wire objects". The graph enforces that by prohibiting `fln-olean` — but
 //! `fln-hash` is *permitted*, and `fln-hash::canon` carries
-//! `impl Canonical for Expr` (`canon.rs:1210`) whose trait supplies
-//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:699-728`). A
+//! `impl Canonical for Expr` (`canon.rs:1304`) whose trait supplies
+//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:793-822`). A
 //! checker can therefore read canonical bytes, call `Expr::from_canonical_bytes`,
 //! and share the decode path with the rest of the workspace **while satisfying
 //! every prohibition structure-guard currently enforces**. The "own decoder"
@@ -156,7 +156,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:544`, where
+//! matrix row was corrected for once already (`witness.rs:585`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -188,7 +188,7 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1116`). It is planted three ways:
+//!   (`tools/structure-guard/src/checks.rs:1117`). It is planted three ways:
 //!   `seeded.rs:1322` proves the baseline clean, `seeded.rs:1332`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
@@ -234,6 +234,41 @@
 //!
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
+//!
+//! ## The `.olean` input path (bead `franken_lean-z8j.1.14`)
+//!
+//! Everything above guards *this crate*. The decoder sharing that bead measured
+//! happened outside it: `fln` re-encoded the `fln-core` terms `fln-olean` had
+//! decoded and handed them here, so every `.olean` declaration both seats judged
+//! had passed through one decoder, and a misread binder, level, literal or index
+//! reached both identically. The crate boundary was intact and the checker was
+//! still not independent of the decode.
+//!
+//! * **The checker reads the artifact itself.** [`olean`] goes from a chain's bytes
+//!   to this crate's own terms, written from the pinned Reference (`compact.cpp`'s
+//!   framing, `lean.h`'s object layout, and `Declaration.lean`, `Expr.lean`,
+//!   `Level.lean` and `KVMap.lean` for the structures). [`reading`] identifies one
+//!   declaration's reading modulo term sharing, since two decoders legitimately
+//!   share subterms differently. The checker seat (`fln`'s
+//!   `review_with_independent_checker`) compares each declaration it is asked to
+//!   judge with its own reading and **disagrees** on any difference; an artifact
+//!   it cannot read leaves it with no answer, never an agreement.
+//! * **WALKED, by the linker.** `fln-conformance`'s `checker_reader_closure` test
+//!   reads every function the linker keeps reachable from `fln::independent_reading`,
+//!   the whole input path, and refuses anything outside this crate, `fln_hash`'s
+//!   hashing and that one facade function. Planting the old shared decode inside
+//!   it is refused, naming 162 `fln-core`, `fln-olean`, `fln-rt` and `fln-env`
+//!   functions. Text cannot establish "transitively calls"; a call graph can.
+//! * **What is still shared, stated so nobody infers more.** The seat still
+//!   *judges* the primary's projection, not its own entry: the two are checked
+//!   equal first, so the judged term is the one it read up to a collision of a
+//!   256-bit digest. Constants the checker's environment projects for a
+//!   declaration's dependencies come from the primary's values too; each was
+//!   compared when its own module was admitted by a council, and a closure loaded
+//!   into an engine without one was never compared. Source declarations have no
+//!   artifact and still cross in the wire format. And none of this touches the
+//!   *algorithmic* independence of §8.3b and §8.3c — which judgments the checker
+//!   must not copy from K1 — which remains open in that bead's scope.
 //!
 //! ## Semantic registry — every name above, bound to the rule that refuses it
 //!
@@ -321,11 +356,11 @@
 //! cite crates/fln-kernel/src/tc.rs:2001 :: e.loose_bvar_range() <= k
 //! cite crates/fln-kernel/src/tc.rs:5503 :: !e.has_fvar() || active == 0
 //! cite crates/fln-kernel/src/tc.rs:5698 :: if !e.has_fvar() {
-//! cite crates/fln-hash/src/canon.rs:1210 :: impl Canonical for Expr
-//! cite crates/fln-hash/src/canon.rs:699 :: pub trait Canonical: Sized
+//! cite crates/fln-hash/src/canon.rs:1304 :: impl Canonical for Expr
+//! cite crates/fln-hash/src/canon.rs:793 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:544 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1116 :: code: "FLN-STRUCT-037"
+//! cite crates/fln-conformance/src/witness.rs:585 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite tools/structure-guard/src/checks.rs:1117 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1332 :: fn every_semantic_item_is_refused_inside_fln_checker
 //! cite tools/structure-guard/tests/seeded.rs:1367 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
@@ -366,7 +401,9 @@ pub mod infer;
 pub mod instantiate;
 pub mod nat_reduce;
 pub mod numeric;
+pub mod olean;
 pub mod policy;
+pub mod reading;
 pub mod string_reduce;
 pub mod term;
 pub mod universe;

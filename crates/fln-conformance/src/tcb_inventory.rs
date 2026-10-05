@@ -842,10 +842,13 @@ pub struct Inventory {
     pub non_rust_symbols: usize,
 }
 
-/// The crates whose functions the inventory lists. Derived, not hand-kept: every crate of
-/// this workspace is named `fln_*`, so whatever the linker keeps from any of them is counted.
+/// The crates whose functions the inventory lists. Derived, not hand-kept: every product
+/// crate of this workspace is named `fln` or `fln_*`, so whatever the linker keeps from any of
+/// them is counted. The facade crate `fln` itself was once left out by a `fln_` prefix test;
+/// `fln_kernel::check` cannot reach it, but the checker-reader probe roots there (bead
+/// `franken_lean-z8j.1.14`), and a classifier blind to it would hide the facade's functions.
 pub fn is_workspace_crate(crate_name: &str) -> bool {
-    crate_name.starts_with("fln_")
+    crate_name == "fln" || crate_name.starts_with("fln_")
 }
 
 impl Inventory {

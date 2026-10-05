@@ -7,7 +7,7 @@
 
 use fln_hash::canon::{SCHEMA_EXPR, SCHEMA_LEVEL, SCHEMA_NAME, SchemaId};
 
-const MAX_LEVEL_DEPTH: u32 = 16_777_215;
+pub(crate) const MAX_LEVEL_DEPTH: u32 = 16_777_215;
 // The packed covenant stores `index + 1` in 20 bits, so the largest index is
 // one below the largest representable span.
 pub(crate) const MAX_BVAR_INDEX: u32 = (1 << 20) - 2;

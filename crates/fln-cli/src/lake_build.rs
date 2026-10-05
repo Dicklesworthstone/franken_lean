@@ -725,7 +725,8 @@ fn record_snapshot(
         let source = source_path(name, libraries)
             .map_err(|failure| failure.detail)?
             .ok_or("a built module has no library owner")?;
-        let mut artifact = source_import_relative_path(name).map_err(|failure| failure.to_string())?;
+        let mut artifact =
+            source_import_relative_path(name).map_err(|failure| failure.to_string())?;
         artifact.set_extension("olean");
         for import in &module.imports {
             if !modules.contains_key(import) {

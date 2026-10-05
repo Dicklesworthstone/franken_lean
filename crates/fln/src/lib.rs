@@ -504,9 +504,189 @@ pub struct DecodedOlean {
     pub walk: OleanWalkReport,
     pub module: OleanModuleData,
     pub constants: Vec<ConstantInfo>,
+    /// The independent checker's own reading of the same bytes (bead
+    /// `franken_lean-z8j.1.14`): what the checker seat compares every declaration
+    /// it is asked to judge against.
+    pub independent: IndependentReading,
     /// Whether the authoritative module-system server and private parts were
     /// loaded in addition to the exported public part.
     pub companion_parts_loaded: bool,
+}
+
+/// The independent checker's own reading of an artifact (bead
+/// `franken_lean-z8j.1.14`), made by `fln_checker::olean` from the bytes, never from
+/// `fln-olean`'s decoded values: each constant's name and reading digest in table
+/// order, or why the checker could not read the artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndependentReading {
+    Read(Vec<(CheckerName, fln_hash::domain::Digest)>),
+    Unread(String),
+}
+
+/// The checker's reading of `parts` (`[X.olean]`, or the module-system chain
+/// `[X.olean, X.olean.server, X.olean.private]`), from their bytes alone.
+///
+/// This is the whole of the checker's `.olean` input path, and it is public so the
+/// linker can measure that: `fln-conformance`'s `checker-reader-probe` references
+/// nothing else, and its test refuses any `fln-core`, `fln-olean`, `fln-env`,
+/// `fln-rt` or `fln-kernel` function the linker keeps reachable from here.
+pub fn independent_reading(parts: &[&[u8]], limits: OleanDecodeLimits) -> IndependentReading {
+    match fln_checker::olean::read_constants(parts, limits.declarations.max_objects) {
+        Ok(reading) => IndependentReading::Read(
+            reading
+                .constants
+                .iter()
+                .map(|constant| (constant.name().clone(), constant.reading_digest()))
+                .collect(),
+        ),
+        Err(error) => IndependentReading::Unread(error.to_string()),
+    }
+}
+
+/// The checker's own reading of one artifact, by name, as its seat consults it.
+struct ArtifactReadings(std::collections::HashMap<CheckerName, fln_hash::domain::Digest>);
+
+/// Why the checker seat will not vouch for a declaration as the artifact's.
+enum ReadingObjection {
+    /// Its reading of the artifact says something else: one decoder is wrong, and
+    /// a council must not agree on either reading.
+    Differs(String),
+    /// The declaration under review could not be projected for comparison.
+    Unprojected(String),
+}
+
+impl ReadingObjection {
+    fn review(&self) -> CheckerReview {
+        match self {
+            Self::Differs(detail) => CheckerReview::from_seat(
+                SeatVerdict::Disagrees {
+                    detail: detail.clone(),
+                },
+                None,
+                None,
+            ),
+            Self::Unprojected(reason) => CheckerReview::no_answer(reason.clone()),
+        }
+    }
+}
+
+fn checker_name_text(name: &CheckerName) -> String {
+    let parts: Vec<String> = name
+        .parts()
+        .iter()
+        .map(|part| match part {
+            fln_checker::wire::NamePart::Text(text) => text.clone(),
+            fln_checker::wire::NamePart::Numeric { value, .. } => value.to_string(),
+        })
+        .collect();
+    parts.join(".")
+}
+
+impl ArtifactReadings {
+    /// Index a reading, or say why there is none to consult. An artifact the
+    /// checker could not read, or that names one constant twice, gives it no
+    /// independent answer about any of its declarations.
+    fn new(reading: &IndependentReading) -> Result<Self, String> {
+        let entries = match reading {
+            IndependentReading::Read(entries) => entries,
+            IndependentReading::Unread(reason) => {
+                return Err(format!(
+                    "fln-checker could not read the .olean itself: {reason}"
+                ));
+            }
+        };
+        let mut readings = std::collections::HashMap::new();
+        readings
+            .try_reserve(entries.len())
+            .map_err(|_| format!("could not reserve {} checker readings", entries.len()))?;
+        for (name, digest) in entries {
+            if readings.insert(name.clone(), *digest).is_some() {
+                return Err(format!(
+                    "fln-checker read `{}` twice in one .olean",
+                    checker_name_text(name)
+                ));
+            }
+        }
+        Ok(Self(readings))
+    }
+
+    /// The objection to judging `candidate` as the artifact's declaration of its name.
+    fn objection_to(&self, candidate: &CheckerConstantEntry) -> Option<ReadingObjection> {
+        let name = checker_name_text(candidate.name());
+        match self.0.get(candidate.name()) {
+            Some(digest) if *digest == candidate.reading_digest() => None,
+            Some(_) => Some(ReadingObjection::Differs(format!(
+                "fln-checker's own reading of the .olean declares `{name}` differently from the \
+                 declaration under review"
+            ))),
+            None => Some(ReadingObjection::Differs(format!(
+                "fln-checker's own reading of the .olean declares no `{name}`"
+            ))),
+        }
+    }
+
+    /// [`Self::objection_to`] for a primary-decoded constant.
+    fn objection(
+        &self,
+        info: &ConstantInfo,
+        budget: CheckerDecodeBudget,
+    ) -> Option<ReadingObjection> {
+        match checker_entry(info, budget) {
+            Ok(candidate) => self.objection_to(&candidate),
+            Err(detail) => Some(ReadingObjection::Unprojected(format!(
+                "projection of `{}` into fln-checker failed: {detail}",
+                info.name().to_display_string()
+            ))),
+        }
+    }
+}
+
+/// A reading objection to a declaration no council reviews: a difference refuses
+/// the module as a seat's disagreement would, and a failed projection leaves it
+/// without an independent answer.
+fn unreviewed_reading_refusal<T>(
+    name: &Name,
+    objection: ReadingObjection,
+) -> Result<Outcome<T>, OleanCheckError> {
+    match objection {
+        ReadingObjection::Differs(detail) => Err(OleanCheckError::IndependentReadingDiffers {
+            name: name.clone(),
+            detail,
+        }),
+        ReadingObjection::Unprojected(reason) => Ok(Outcome::Inconclusive(
+            Inconclusive::dependency_unavailable(reason),
+        )),
+    }
+}
+
+/// What the checker seat compares the declaration under review against (bead
+/// `franken_lean-z8j.1.14`).
+#[derive(Clone, Copy)]
+enum ReadingCheck<'a> {
+    /// A source declaration: no artifact was read, so there is nothing to compare.
+    Unread,
+    /// An `.olean` declaration: every candidate must be the artifact's declaration
+    /// of its name in the checker's own reading.
+    Artifact(&'a ArtifactReadings),
+    /// Already compared by the caller, as the artifact states the declaration: a
+    /// subsumed repeat is renamed before its council sees it.
+    Settled(Option<&'a ReadingObjection>),
+}
+
+/// The seat's review when a candidate is not what its own reading says, else
+/// `None` and the seat goes on to judge.
+fn reading_review(
+    candidates: &[CheckerConstantEntry],
+    reading: ReadingCheck<'_>,
+) -> Option<CheckerReview> {
+    match reading {
+        ReadingCheck::Unread => None,
+        ReadingCheck::Settled(objection) => objection.map(ReadingObjection::review),
+        ReadingCheck::Artifact(readings) => candidates
+            .iter()
+            .find_map(|candidate| readings.objection_to(candidate))
+            .map(|objection| objection.review()),
+    }
 }
 
 /// One non-public compacted region in a module-system `.olean` chain.
@@ -894,6 +1074,7 @@ pub fn decode_olean_artifact(
         walk,
         module,
         constants,
+        independent: independent_reading(&[artifact], limits),
         companion_parts_loaded: false,
     })
 }
@@ -1065,6 +1246,7 @@ pub fn decode_olean_module_artifacts(
         walk,
         module,
         constants,
+        independent: independent_reading(&[artifact, server_artifact, private_artifact], limits),
         companion_parts_loaded: true,
     })
 }
@@ -1748,6 +1930,16 @@ pub enum OleanCheckError {
     DependencyCycle {
         declarations: Vec<Name>,
     },
+    /// The independent checker's own reading of the artifact differs from the
+    /// primary decode for a declaration no council reviews: one already present,
+    /// or an axiom repeat, each reported checked because the primary decode
+    /// equals one already admitted (bead `franken_lean-z8j.1.14`). One of the two
+    /// decoders is wrong, so the module is not checked; it is the same objection
+    /// a council seat raises for a declaration it does review.
+    IndependentReadingDiffers {
+        name: Name,
+        detail: String,
+    },
     Admission(EngineAdmissionError),
 }
 
@@ -1880,6 +2072,11 @@ impl fmt::Display for OleanCheckError {
                 formatter,
                 "cannot reconstruct declaration units for dependency cycle: {}",
                 display_names(declarations)
+            ),
+            Self::IndependentReadingDiffers { name, detail } => write!(
+                formatter,
+                "the independent checker's reading of `{}` is not the primary decode's: {detail}",
+                name.to_display_string()
             ),
             Self::Admission(error) => error.fmt(formatter),
         }
@@ -4862,13 +5059,49 @@ impl Engine {
         limits: OleanCheckLimits,
     ) -> Result<Outcome<UnrootedOlean>, OleanCheckError> {
         let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
+        // The checker seat judges each declaration against its own reading of the
+        // artifact (bead `franken_lean-z8j.1.14`); without one it has no
+        // independent answer about any of them.
+        let readings = match ArtifactReadings::new(&decoded.independent) {
+            Ok(readings) => readings,
+            Err(reason) => {
+                return Ok(Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                    reason,
+                )));
+            }
+        };
+        // A constant already present is reported checked because the primary
+        // decode equals one admitted earlier, and no council reviews it.
+        if !plan.already_present.is_empty() {
+            let by_name: BTreeMap<&Name, &ConstantInfo> = decoded
+                .constants
+                .iter()
+                .map(|info| (info.name(), info))
+                .collect();
+            for (name, _) in &plan.already_present {
+                let Some(info) = by_name.get(name) else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "an already-present declaration is not in the decoded table",
+                    });
+                };
+                if let Some(objection) = readings.objection(info, limits.admission.checker.decode) {
+                    return unreviewed_reading_refusal(name, objection);
+                }
+            }
+        }
+        let reading = ReadingCheck::Artifact(&readings);
         if plan.order.is_empty() {
             let mut checked: Vec<OleanCheckedDeclaration> = plan
                 .already_present
                 .into_iter()
                 .map(|(name, checker)| OleanCheckedDeclaration { name, checker })
                 .collect();
-            match self.recheck_subsumed_repeats(plan.subsumed, options, limits.admission)? {
+            match self.recheck_subsumed_repeats(
+                plan.subsumed,
+                options,
+                limits.admission,
+                reading,
+            )? {
                 Outcome::Complete(rechecked) => checked.extend(rechecked),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -4897,7 +5130,7 @@ impl Engine {
             declarations.push(unit.declaration.clone());
         }
         let (engine, checkers) = match self
-            .admit_declarations_unrooted(&declarations, options, limits.admission)
+            .admit_declarations_unrooted(&declarations, options, limits.admission, reading)
             .map_err(OleanCheckError::Admission)?
         {
             Outcome::Complete(admitted) => admitted,
@@ -4932,7 +5165,7 @@ impl Engine {
         for (name, checker) in plan.already_present {
             checked.push(OleanCheckedDeclaration { name, checker });
         }
-        match engine.recheck_subsumed_repeats(plan.subsumed, options, limits.admission)? {
+        match engine.recheck_subsumed_repeats(plan.subsumed, options, limits.admission, reading)? {
             Outcome::Complete(rechecked) => checked.extend(rechecked),
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -4957,15 +5190,27 @@ impl Engine {
     /// the successor is discarded: the published environment keeps the first
     /// copy. An axiom repeat has no body, and its statement is equal up to
     /// binder names and binder info to one already checked.
+    ///
+    /// Each repeat is compared with the checker's own reading as the artifact
+    /// states it, before any renaming: a theorem's council then carries that
+    /// comparison, and an axiom repeat, which no council reviews, is refused on a
+    /// difference here.
     fn recheck_subsumed_repeats(
         &self,
         repeats: Vec<ConstantInfo>,
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
     ) -> Result<Outcome<Vec<OleanCheckedDeclaration>>, OleanCheckError> {
         let mut checked = Vec::new();
         for repeat in repeats {
             let name = repeat.name().clone();
+            let objection = match reading {
+                ReadingCheck::Artifact(readings) => {
+                    readings.objection(&repeat, limits.checker.decode)
+                }
+                ReadingCheck::Unread | ReadingCheck::Settled(_) => None,
+            };
             let checker = match repeat {
                 ConstantInfo::Thm(mut theorem) => {
                     let mut scratch = Name::str(name.clone(), "_fln_subsumed_repeat");
@@ -4981,8 +5226,17 @@ impl Engine {
                             *member = scratch.clone();
                         }
                     }
+                    let reading = match reading {
+                        ReadingCheck::Artifact(_) => ReadingCheck::Settled(objection.as_ref()),
+                        other => other,
+                    };
                     match self
-                        .admit_declaration_unrooted(Declaration::Thm(theorem), options, limits)
+                        .admit_declaration_unrooted(
+                            Declaration::Thm(theorem),
+                            options,
+                            limits,
+                            reading,
+                        )
                         .map_err(OleanCheckError::Admission)?
                     {
                         Outcome::Complete(admission) => admission.checker,
@@ -4990,10 +5244,15 @@ impl Engine {
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
                 }
-                ConstantInfo::Axiom(_) => CheckerAgreement {
-                    schema: "fln-checker/v1",
-                    ground: CheckerAdmissionGround::AxiomPreamble,
-                },
+                ConstantInfo::Axiom(_) => {
+                    if let Some(objection) = objection {
+                        return unreviewed_reading_refusal(&name, objection);
+                    }
+                    CheckerAgreement {
+                        schema: "fln-checker/v1",
+                        ground: CheckerAdmissionGround::AxiomPreamble,
+                    }
+                }
                 _ => {
                     return Err(OleanCheckError::InternalInvariant {
                         detail: "only theorems and axioms can subsume an admitted repeat",
@@ -5025,7 +5284,12 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
-        let admitted = match self.admit_declaration_unrooted(declaration, options, limits)? {
+        let admitted = match self.admit_declaration_unrooted(
+            declaration,
+            options,
+            limits,
+            ReadingCheck::Unread,
+        )? {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -5046,11 +5310,16 @@ impl Engine {
     /// pass over the whole environment (every constant's name encoded and sorted),
     /// about 0.8 s at Mathlib's 133K constants; the `.olean` check admits a module
     /// one declaration at a time and reads neither, so it pays for them nowhere.
+    ///
+    /// `reading` is what the checker seat compares the declaration against: an
+    /// `.olean` declaration must be the one the checker itself read from the
+    /// artifact (bead `franken_lean-z8j.1.14`).
     fn admit_declaration_unrooted(
         &self,
         declaration: Declaration,
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
     ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
         if !matches!(
             declaration,
@@ -5072,6 +5341,7 @@ impl Engine {
             self.checker_environment.as_ref(),
             &declaration,
             limits.checker,
+            reading,
         );
         let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
             Outcome::Complete(admitted) => admitted,
@@ -5169,6 +5439,7 @@ impl Engine {
         declarations: &[Declaration],
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
     ) -> Result<Outcome<(Engine, Vec<CheckerAgreement>)>, EngineAdmissionError> {
         if declarations.is_empty() {
             return Err(EngineAdmissionError::EmptyBatch);
@@ -5182,17 +5453,18 @@ impl Engine {
             })?;
         let mut engine = self.clone();
         for (index, declaration) in declarations.iter().cloned().enumerate() {
-            let admitted = match engine.admit_declaration_unrooted(declaration, options, limits) {
-                Ok(Outcome::Complete(admitted)) => admitted,
-                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
-                Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
-                Err(error) => {
-                    return Err(EngineAdmissionError::BatchDeclaration {
-                        index,
-                        error: Box::new(error),
-                    });
-                }
-            };
+            let admitted =
+                match engine.admit_declaration_unrooted(declaration, options, limits, reading) {
+                    Ok(Outcome::Complete(admitted)) => admitted,
+                    Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                    Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+                    Err(error) => {
+                        return Err(EngineAdmissionError::BatchDeclaration {
+                            index,
+                            error: Box::new(error),
+                        });
+                    }
+                };
             engine = admitted.engine;
             checkers.push(admitted.checker);
         }
@@ -7527,6 +7799,7 @@ fn review_mutual_with_independent_checker(
     retained_environment: Option<&CheckerConstantEnvironment>,
     definitions: &[DefinitionVal],
     limits: CheckerExecutionLimits,
+    reading: ReadingCheck<'_>,
 ) -> CheckerReview {
     let mut candidates = Vec::new();
     if candidates.try_reserve_exact(definitions.len()).is_err() {
@@ -7544,6 +7817,9 @@ fn review_mutual_with_independent_checker(
                 ));
             }
         }
+    }
+    if let Some(review) = reading_review(&candidates, reading) {
+        return review;
     }
 
     let roots: Vec<&Expr> = definitions
@@ -7625,6 +7901,7 @@ fn review_quotient_with_independent_checker(
     retained_environment: Option<&CheckerConstantEnvironment>,
     declarations: &[QuotVal],
     limits: CheckerExecutionLimits,
+    reading: ReadingCheck<'_>,
 ) -> CheckerReview {
     let mut candidates = Vec::new();
     if candidates.try_reserve_exact(declarations.len()).is_err() {
@@ -7642,6 +7919,9 @@ fn review_quotient_with_independent_checker(
                 ));
             }
         }
+    }
+    if let Some(review) = reading_review(&candidates, reading) {
+        return review;
     }
 
     let roots: Vec<&Expr> = declarations
@@ -7713,6 +7993,7 @@ fn review_inductive_with_independent_checker(
     retained_environment: Option<&CheckerConstantEnvironment>,
     block: &fln_kernel::InductiveBlock,
     limits: CheckerExecutionLimits,
+    reading: ReadingCheck<'_>,
 ) -> CheckerReview {
     let member_count = block
         .types
@@ -7754,6 +8035,9 @@ fn review_inductive_with_independent_checker(
                 ));
             }
         }
+    }
+    if let Some(review) = reading_review(&candidates, reading) {
+        return review;
     }
 
     let mut roots: Vec<&Expr> = block
@@ -7852,6 +8136,7 @@ fn review_with_independent_checker(
     retained_environment: Option<&CheckerConstantEnvironment>,
     declaration: &Declaration,
     limits: CheckerExecutionLimits,
+    reading: ReadingCheck<'_>,
 ) -> CheckerReview {
     if let Declaration::Mutual(definitions) = declaration {
         return review_mutual_with_independent_checker(
@@ -7859,6 +8144,7 @@ fn review_with_independent_checker(
             retained_environment,
             definitions,
             limits,
+            reading,
         );
     }
     if let Declaration::Quotient(declarations) = declaration {
@@ -7867,6 +8153,7 @@ fn review_with_independent_checker(
             retained_environment,
             declarations,
             limits,
+            reading,
         );
     }
     if let Declaration::Inductive(block) = declaration {
@@ -7875,6 +8162,7 @@ fn review_with_independent_checker(
             retained_environment,
             block,
             limits,
+            reading,
         );
     }
 
@@ -7906,6 +8194,9 @@ fn review_with_independent_checker(
             ));
         }
     };
+    if let Some(review) = reading_review(std::slice::from_ref(&candidate), reading) {
+        return review;
+    }
     let roots: Vec<&Expr> = match declaration {
         Declaration::Axiom(axiom) => vec![&axiom.base.type_],
         Declaration::Defn(definition) => vec![&definition.base.type_, &definition.value],
@@ -9788,8 +10079,8 @@ mod tests {
         Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
-        ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
-        ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceCommandOutput,
+        ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, ReadingCheck, RecursorRule,
+        RecursorVal, ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceCommandOutput,
         SourceModuleInput, TheoremVal, VmExecutionLimits, closed_vm_value, decode_olean_artifact,
         execute_flbc_artifact, execute_golem_with_options, fresh_generated_command_name,
         project_lsp_diagnostics, rebuild_olean_artifact, source_scalar_constructor_binding,
@@ -9892,6 +10183,14 @@ mod tests {
     }
 
     fn olean_with_imports(constants: &[ConstantInfo], imports: &[OleanModuleImport]) -> Vec<u8> {
+        framed_olean(constants, imports, super::OLEAN_ACCEPTED_VERSIONS[0])
+    }
+
+    fn framed_olean(
+        constants: &[ConstantInfo],
+        imports: &[OleanModuleImport],
+        version: u8,
+    ) -> Vec<u8> {
         let lean_version = super::OLEAN_PIN_TAG
             .strip_prefix('v')
             .expect("the extracted pin tag carries its v prefix");
@@ -9903,7 +10202,7 @@ mod tests {
                 extra_const_names: &[],
             },
             super::OleanWriteHeader {
-                version: super::OLEAN_ACCEPTED_VERSIONS[0],
+                version,
                 flags: 1,
                 lean_version,
                 githash: super::OLEAN_PIN_COMMIT,
@@ -10695,6 +10994,354 @@ mod tests {
         assert!(checked.declarations.iter().all(|declaration| {
             declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
         }));
+    }
+
+    /// `Fixture.P : Prop` and `Fixture.self : ∀ (h : P), P := fun h => h`. The binder's
+    /// style plays no part in typing, so a reading that flips it is still a declaration
+    /// both seats accept: only comparing the two readings can see the flip (bead
+    /// `franken_lean-z8j.1.14`).
+    fn binder_declarations(style: BinderInfo) -> Vec<ConstantInfo> {
+        let proposition = Name::from_components(["Fixture", "P"]);
+        let theorem = Name::from_components(["Fixture", "self"]);
+        let p = Expr::const_(proposition.clone(), Vec::new());
+        let h = Name::from_components(["h"]);
+        vec![
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: proposition,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+            ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: theorem.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(h.clone(), p.clone(), p.clone(), style),
+                },
+                value: Expr::lam(
+                    h,
+                    p,
+                    Expr::bvar(0).expect("index 0 is in range"),
+                    BinderInfo::Default,
+                ),
+                all: vec![theorem],
+            }),
+        ]
+    }
+
+    fn council_halt(error: &OleanCheckError) -> String {
+        let leaf = match error {
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                error, ..
+            }) => error.as_ref(),
+            OleanCheckError::Admission(error) => error,
+            other => panic!("expected a council halt, got {other:?}"),
+        };
+        match leaf {
+            EngineAdmissionError::CouncilHalted { summary } => summary.clone(),
+            other => panic!("expected a council halt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_checker_reads_every_fixture_as_the_primary_decodes_it() {
+        let budget = super::CheckerExecutionLimits::default().decode;
+        let mut artifacts: Vec<(String, Vec<u8>)> = [
+            "Init.BinderNameHint.olean",
+            "Init.SizeOfLemmas.olean",
+            "Init.olean",
+        ]
+        .into_iter()
+        .map(|name| (name.to_owned(), olean_fixture(name)))
+        .collect();
+        for (name, constants) in [
+            ("standalone", standalone_declarations()),
+            ("mutual", mutual_olean_declarations()),
+            ("binder", binder_declarations(BinderInfo::InstImplicit)),
+        ] {
+            artifacts.push((name.to_owned(), standalone_olean(&constants)));
+            for &version in super::OLEAN_ACCEPTED_VERSIONS {
+                artifacts.push((
+                    format!("{name} v{version}"),
+                    framed_olean(&constants, &[], version),
+                ));
+            }
+        }
+        let mut compared = 0;
+        for (name, bytes) in &artifacts {
+            let decoded = decode_olean_artifact(bytes, OleanDecodeLimits::new(bytes.len()))
+                .unwrap_or_else(|error| panic!("{name}: the primary decodes: {error}"));
+            let readings = super::ArtifactReadings::new(&decoded.independent)
+                .unwrap_or_else(|reason| panic!("{name}: {reason}"));
+            assert_eq!(readings.0.len(), decoded.constants.len(), "{name}");
+            for info in &decoded.constants {
+                if let Some(
+                    super::ReadingObjection::Differs(detail)
+                    | super::ReadingObjection::Unprojected(detail),
+                ) = readings.objection(info, budget)
+                {
+                    panic!("{name}: {detail}");
+                }
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 0,
+            "a comparison over no declaration proves nothing"
+        );
+    }
+
+    /// The decoder differential of bead `franken_lean-z8j.1.14`: every declaration of every
+    /// module under the roots, decoded by `fln-olean` (what K1 judges) and read by the
+    /// checker from the bytes, compared exactly as the council's checker seat compares them.
+    /// Roots: `FLN_READING_DIFF_ROOTS` (`:`-separated `lib/lean` directories), else the
+    /// pinned toolchain's. Prints a receipt; refuses on any difference or unread module.
+    #[test]
+    #[ignore = "walks a whole library; run in release with --ignored"]
+    fn every_declaration_under_the_roots_reads_the_same_to_both_decoders() {
+        use fln_hash::domain::{Domain, DomainHasher};
+        use std::path::{Path, PathBuf};
+
+        fn oleans(dir: &Path, out: &mut Vec<PathBuf>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .unwrap_or_else(|error| panic!("cannot list {}: {error}", dir.display()))
+                .map(|entry| entry.expect("a directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    oleans(&path, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "olean")
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let roots: Vec<PathBuf> = match std::env::var("FLN_READING_DIFF_ROOTS") {
+            Ok(roots) => roots.split(':').map(PathBuf::from).collect(),
+            Err(_) => vec![
+                PathBuf::from(std::env::var("HOME").expect("HOME"))
+                    .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean"),
+            ],
+        };
+        let mut modules = Vec::new();
+        for root in &roots {
+            oleans(root, &mut modules);
+        }
+        assert!(!modules.is_empty(), "no .olean under {roots:?}");
+
+        let budget = super::CheckerExecutionLimits::default().decode;
+        let started = std::time::Instant::now();
+        let mut reading_time = std::time::Duration::ZERO;
+        let mut decode_time = std::time::Duration::ZERO;
+        let mut receipt = DomainHasher::new(Domain::CacheKey);
+        receipt.update(b"fln.reading-differential/1\0");
+        let (mut parts, mut constants, mut agree) = (0_usize, 0_usize, 0_usize);
+        let mut refused: Vec<String> = Vec::new();
+        for path in &modules {
+            let exported = std::fs::read(path).expect("readable part");
+            let server_path = path.with_extension("olean.server");
+            let private_path = path.with_extension("olean.private");
+            let chain: Vec<Vec<u8>> = if server_path.is_file() && private_path.is_file() {
+                vec![
+                    exported,
+                    std::fs::read(&server_path).expect("readable part"),
+                    std::fs::read(&private_path).expect("readable part"),
+                ]
+            } else {
+                vec![exported]
+            };
+            parts += chain.len();
+            let total: usize = chain.iter().map(Vec::len).sum();
+            let limits = OleanDecodeLimits::new(total);
+            let timed = std::time::Instant::now();
+            let decoded = match chain.as_slice() {
+                [only] => decode_olean_artifact(only, limits),
+                [exported, server, private] => {
+                    super::decode_olean_module_artifacts(exported, server, private, limits)
+                }
+                _ => unreachable!("one part or three"),
+            }
+            .unwrap_or_else(|error| panic!("{}: the primary decodes: {error}", path.display()));
+            decode_time += timed.elapsed();
+            let slices: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+            let timed = std::time::Instant::now();
+            let again = super::independent_reading(&slices, limits);
+            reading_time += timed.elapsed();
+            assert_eq!(
+                again, decoded.independent,
+                "the checker's reading is deterministic"
+            );
+
+            let label = path.display().to_string();
+            receipt.update(&(label.len() as u64).to_le_bytes());
+            receipt.update(label.as_bytes());
+            let readings = match super::ArtifactReadings::new(&decoded.independent) {
+                Ok(readings) => readings,
+                Err(reason) => {
+                    refused.push(format!("{label}: {reason}"));
+                    continue;
+                }
+            };
+            if let super::IndependentReading::Read(entries) = &decoded.independent {
+                for (_, digest) in entries {
+                    receipt.update(&digest.0);
+                }
+            }
+            for info in &decoded.constants {
+                constants += 1;
+                match readings.objection(info, budget) {
+                    None => agree += 1,
+                    Some(
+                        super::ReadingObjection::Differs(detail)
+                        | super::ReadingObjection::Unprojected(detail),
+                    ) => refused.push(format!("{label}: {detail}")),
+                }
+            }
+        }
+        println!(
+            "reading-differential: roots {roots:?}; modules {}; parts {parts}; constants \
+             {constants}; identical {agree}; refused {}; reading-set digest {}; elapsed {:.1}s; \
+             decode with the reading {:.1}s, the checker's reading alone {:.1}s",
+            modules.len(),
+            refused.len(),
+            receipt
+                .finalize()
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            started.elapsed().as_secs_f64(),
+            decode_time.as_secs_f64(),
+            reading_time.as_secs_f64(),
+        );
+        assert!(
+            refused.is_empty(),
+            "{} declaration(s) or module(s) read differently:\n  {}",
+            refused.len(),
+            refused
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+        assert_eq!(agree, constants);
+    }
+
+    #[test]
+    fn a_planted_primary_misreading_of_a_binder_is_a_council_disagreement() {
+        let written = binder_declarations(BinderInfo::Default);
+        let bytes = standalone_olean(&written);
+        let limits = OleanCheckLimits::new(bytes.len(), test_budget());
+        let options = KVMap::new();
+        let engine = Engine::from_environment(Environment::new());
+
+        // Control, end to end from the bytes: the two readings agree and the council
+        // admits. A defect in either decoder's binder reading fails here.
+        let checked = engine.check_olean_artifact(&bytes, &options, limits);
+        let Ok(Outcome::Complete(admitted)) = checked else {
+            panic!("the faithful artifact must be admitted: {checked:?}");
+        };
+        let decoded = admitted.decoded.clone();
+        assert_eq!(
+            decoded.constants, written,
+            "the primary reads what was written"
+        );
+
+        // The planted defect: the primary decodes the binder as implicit.
+        let misread = binder_declarations(BinderInfo::Implicit);
+        let mut planted = decoded.clone();
+        planted.constants = misread.clone();
+        let refusal = engine
+            .check_decoded_olean(planted, &options, limits)
+            .expect_err("a misread declaration must not be admitted");
+        let summary = council_halt(&refusal);
+        assert!(
+            summary.contains("fln-checker's own reading") && summary.contains("Fixture.self"),
+            "the halt must be the checker's reading objection: {summary}"
+        );
+
+        // Where nothing caught it before: judged on the primary's reading alone, as both
+        // seats were, the misread declaration is accepted by K1 and the checker alike.
+        let declarations: Vec<Declaration> = misread
+            .iter()
+            .map(|info| super::checked_olean_declaration(info).expect("a plain declaration"))
+            .collect();
+        assert!(
+            matches!(
+                engine.admit_declarations_unrooted(
+                    &declarations,
+                    &options,
+                    limits.admission,
+                    ReadingCheck::Unread,
+                ),
+                Ok(Outcome::Complete(_))
+            ),
+            "without the comparison both seats agree on the misreading"
+        );
+
+        // The other direction: the checker's reading is the one that differs.
+        let mut checker_misread = decoded.clone();
+        checker_misread.independent =
+            super::independent_reading(&[&standalone_olean(&misread)], limits.decode);
+        let refusal = engine
+            .check_decoded_olean(checker_misread, &options, limits)
+            .expect_err("readings that differ in either direction are not admitted");
+        assert!(council_halt(&refusal).contains("Fixture.self"));
+
+        // An artifact the checker could not read leaves it without an answer.
+        let mut unread = decoded.clone();
+        unread.independent = super::IndependentReading::Unread("planted".to_owned());
+        assert!(matches!(
+            engine.check_decoded_olean(unread, &options, limits),
+            Ok(Outcome::Inconclusive(_))
+        ));
+
+        // A declaration no council reviews. Checked again, the module's constants are all
+        // already present; a primary that misread a different binder as the admitted one
+        // would report the module checked, and the checker's reading refuses it.
+        let true_repeat = standalone_olean(&binder_declarations(BinderInfo::StrictImplicit));
+        let mut present = decode_olean_artifact(&true_repeat, limits.decode).expect("decodes");
+        present.constants = written.clone();
+        match admitted
+            .engine
+            .check_decoded_olean(present, &options, limits)
+        {
+            Err(OleanCheckError::IndependentReadingDiffers { name, .. }) => {
+                assert_eq!(name.to_display_string(), "Fixture.self");
+            }
+            other => panic!("an unreviewed misreading must be refused: {other:?}"),
+        }
+        assert!(matches!(
+            admitted
+                .engine
+                .check_decoded_olean(decoded.clone(), &options, limits),
+            Ok(Outcome::Complete(_))
+        ));
+
+        // A subsumed theorem repeat is renamed before its council; its reading is
+        // compared as the artifact states it. The true repeat (strict implicit) rechecks;
+        // the same bytes misread as implicit halt the repeat's council.
+        let repeat = decode_olean_artifact(&true_repeat, limits.decode).expect("decodes");
+        assert!(matches!(
+            admitted
+                .engine
+                .check_decoded_olean(repeat.clone(), &options, limits),
+            Ok(Outcome::Complete(_))
+        ));
+        let mut misread_repeat = repeat;
+        misread_repeat.constants = misread;
+        let refusal = admitted
+            .engine
+            .check_decoded_olean(misread_repeat, &options, limits)
+            .expect_err("a misread repeat must not be counted as checked");
+        assert!(council_halt(&refusal).contains("Fixture.self"));
     }
 
     #[test]
@@ -12978,7 +13625,7 @@ mod tests {
         assert_eq!(plan.subsumed.len(), 1);
 
         let rechecked = match engine
-            .recheck_subsumed_repeats(plan.subsumed, &options, limits)
+            .recheck_subsumed_repeats(plan.subsumed, &options, limits, ReadingCheck::Unread)
             .expect("a well-typed repeat body rechecks")
         {
             Outcome::Complete(rechecked) => Some(rechecked),
@@ -13004,7 +13651,7 @@ mod tests {
                 .expect("the statement still subsumes");
         assert!(
             engine
-                .recheck_subsumed_repeats(bad.subsumed, &options, limits)
+                .recheck_subsumed_repeats(bad.subsumed, &options, limits, ReadingCheck::Unread)
                 .is_err(),
             "an ill-typed repeat body must not be counted as checked"
         );
