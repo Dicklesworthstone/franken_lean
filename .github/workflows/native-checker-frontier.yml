@@ -9,89 +9,119 @@ permissions:
 jobs:
   validated-source-objects:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: write
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/checker-cycle-target
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Transfer exact locally tested objects without modifying a branch
+      - name: Stage the exact regression input
         shell: python
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
-          def request(path, data=None):
-              req = urllib.request.Request(api + path, data=None if data is None else json.dumps(data).encode(), headers={
-                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                  'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def digest(data):
-              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          after = {
-              'crates/fln-checker/src/admit.rs': '0b4b2132cbd58ed6f198d3fe84eb3df6adfcfc31',
-              'crates/fln-checker/src/admit/uniform.rs': '1e773ad9b2a5f1ef1deefe3c61950ff10ee26569',
-              'crates/fln-checker/src/admit/uniform/mutual.rs': 'a37200d99908c380bd6aa417a990836e999e57de',
-              'crates/fln-checker/src/admit/uniform/nested.rs': '2894085d7a48777089319aad6f598d8aec917596',
-              'crates/fln-checker/tests/admit.rs': 'a0770033cc53e20a554e9f0bd8c737ce7b63179a',
-              'crates/fln-checker/tests/admit/higher_order.rs': 'd56c678bf344d5f6485c91467dc678189e9f5273',
-              'crates/fln-checker/tests/mutual_inductives.rs': '7fa7655b7187ff5544a80bfe005cae969262f84f',
-              'crates/fln-checker/tests/nested_inductives.rs': '03a21c571ec1c08d5263edcea2fadad517e544f3',
-              'crates/fln-checker/tests/support/mutual.rs': '94b03c2838f8ff5d5651d12a7cb4da7bad154c66',
-              'crates/fln-checker/tests/support/unsafe_inductives.rs': '00d453b33429f689d3bcd0099c5fbab5b1d46091',
-              'crates/fln/tests/mutual_inductive_admission.rs': '82eea7a3b3350ff9ba0ac2e9d8ac6b20698d4f81',
-              'crates/fln-cli/src/lib.rs': 'af942f91c0fb68f1db53600c0fca2c2f3aa472d1',
-              'crates/fln-cli/tests/cli_personalities_and_verbs.rs': '1689a163d99ca125daa713750bb4edd664e4c279',
-              'crates/fln/src/lib.rs': '197cc2c2061ba8c73a91d4f79afdeb289285d26c',
-              'crates/fln/tests/olean_frontier.rs': '9270085f6aecb465e5f520807cb370dac41dd02d',
-              'crates/fln/tests/olean_frontier_namespaces.rs': '4b90f9be403d34ee03192287d0f53b091496c315',
-              'crates/fln/tests/support/frontier.rs': '470069c3d80a1dd825e910aec2811a7c64b60a36',
-          }
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-source-objects'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          path = pathlib.Path('crates/fln-checker/src/whnf.rs')
+          data = path.read_bytes()
+          digest = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          assert digest == '79d80c6e5bf599a246c2a50d6d8befd174b7dc2c', 'source changed; reconcile before staging'
+          sha = '7172e83f1a247afef4cd3934f4ad0bd2db9badfc'
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              blob = json.load(response)
+          assert blob['encoding'] == 'base64'
+          data = base64.b64decode(blob['content'])
+          assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == sha
+          target = pathlib.Path('crates/fln-checker/tests/free_binding_reuse.rs')
+          with target.open('xb') as output:
+              output.write(data)
+      - name: Install the repository's pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Reproduce the original fault, then verify the repair
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-cycle-evidence'
           root.mkdir()
-          before = {p: digest(pathlib.Path(p).read_bytes()) if pathlib.Path(p).exists() else None for p in after}
-          patches = [
-              ('fb772a4557ed6a40a19422c13e30367afa430503', '1415418ba23839d2f25e87099eb7a38fc35757fe7aa0a95d50cd2b129381e626'),
-              ('c4c79f0b98a6700633c19631e405b622a632a405', '6171d5d6db82f789c212b0bfba7b1426cb012542554278b9268041845b825786'),
-              ('97e6a1c33ceb70f8e61e988bb768d359f20b5bf1', 'c4eda59629725240199df1cf25c9206bd436977ba89c3c71ff31488e601bb195'),
-              ('e11c8ea194edc84bc2dd97a9883672da14b28798', 'a639e314d81738827ff17ef7169cd0227fd0ac6efce5a2ea80385959380bb78c'),
-              ('984ba78f5bef2942bc9230b4e7c187b2157a4976', 'e140a65f9082d0fb0f04dd085ecefa0b675104c50853a9b436c3dd21ef349e1f'),
+          test = 'crates/fln-checker/tests/free_binding_reuse.rs'
+          subprocess.run(['rustfmt', '--edition', '2024', test], check=True)
+          command = ['cargo', 'test', '--locked', '-p', 'fln-checker', '--test', 'free_binding_reuse',
+              'repeated_identity_binding_after_beta_is_not_a_cycle', '--', '--exact']
+          baseline = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          (root / 'baseline.log').write_text(baseline.stdout)
+          print(baseline.stdout, flush=True)
+          assert baseline.returncode != 0 and 'running 1 test' in baseline.stdout and 'FreeBindingCycle' in baseline.stdout, 'baseline did not reproduce the named defect'
+          path = pathlib.Path('crates/fln-checker/src/whnf.rs')
+          source = path.read_text()
+          anchor = '''            if !pending_arguments.is_empty()
+                          && matches!(self.node(&current)?, ExprNode::Lambda { .. })
+                      {
+                          self.control
+                              .reduction(current.root.index(), self.cancelled)?;'''
+          # Preserve the exact source indentation rather than YAML indentation.
+          anchor = '\n'.join(line[10:] if index else line for index, line in enumerate(anchor.splitlines()))
+          assert source.count(anchor) == 1, 'beta anchor is not unique'
+          insertion = '''
+                          // This is a new reduction problem, not another edge of the
+                          // free-alias chain. For example f (f x), with f := fun x => x,
+                          // legitimately unfolds f again after consuming its argument.
+                          // Alias-only cycles remain guarded; recursive beta computation
+                          // is bounded by the ordinary reduction budget and cancellation.
+                          self.unfolded_bindings.clear();'''
+          insertion = '\n'.join(line[10:] if index else line for index, line in enumerate(insertion.splitlines()))
+          path.write_text(source.replace(anchor, anchor + insertion))
+          commands = [
+              ['cargo', 'fmt', '--package', 'fln-checker', '--', '--check'],
+              ['cargo', 'test', '--locked', '-p', 'fln-checker'],
+              ['cargo', 'clippy', '--locked', '-p', 'fln-checker', '--all-targets', '--', '-D', 'warnings'],
+              ['git', 'diff', '--check'],
           ]
-          for index, (sha, checksum) in enumerate(patches):
-              data = request('/git/blobs/' + sha)
-              assert data['encoding'] == 'base64'
-              patch = base64.b64decode(data['content'])
-              assert hashlib.sha256(patch).hexdigest() == checksum
-              text = patch.decode()
-              paths = [line.split(' b/', 1)[1] for line in text.splitlines() if line.startswith('diff --git a/')]
-              assert set(paths).issubset(after) and len(paths) == len(set(paths))
-              assert '\ndeleted file mode ' not in text
-              file = root / ('implementation-' + str(index) + '.patch')
-              file.write_bytes(patch)
-              subprocess.run(['git', 'apply', '--index', '--whitespace=error', str(file)], check=True)
-          assert sorted(subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], text=True).splitlines()) == sorted(after)
-          subprocess.run(['git', 'diff', '--check'], check=True)
+          for index, command in enumerate(commands):
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (root / ('check-' + str(index) + '.log')).write_text(result.stdout)
+              print('COMMAND ' + json.dumps(command) + '\n' + result.stdout, flush=True)
+              assert result.returncode == 0, command
+          (root / 'validation.json').write_text(json.dumps({'base': os.environ['GITHUB_SHA'],
+              'baseline_reproduced': True, 'commands': commands, 'corpus_replay': 'not_run'}, indent=2))
+      - name: Publish validated source objects without modifying a branch
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-cycle-evidence'
+          validation = json.loads((root / 'validation.json').read_text())
+          paths = ['crates/fln-checker/src/whnf.rs', 'crates/fln-checker/tests/free_binding_reuse.rs']
           blobs = {}
-          for path, expected in after.items():
+          for path in paths:
               data = pathlib.Path(path).read_bytes()
-              assert digest(data) == expected, path
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
+                  data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected
+              blobs[path] = expected
               target = root / 'source' / path
               target.parent.mkdir(parents=True, exist_ok=True)
               target.write_bytes(data)
-              result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-              assert result['sha'] == expected
-              blobs[path] = expected
-          receipt = {'base': os.environ['GITHUB_SHA'], 'before': before, 'blobs': blobs, 'published_branch': False,
-              'validation': 'Exact local pinned-Rust source: 754 checker tests; 10 council tests; 3 namespace tests; 20 CLI tests; strict changed-target Clippy. This job verifies bytes only.'}
+          receipt = {**validation, 'blobs': blobs, 'published_branch': False}
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
-          print(json.dumps(receipt, indent=2), flush=True)
+          print('VALIDATED_CHECKER_SOURCE_OBJECTS ' + json.dumps(receipt), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: checker-source-objects-${{ github.sha }}
-          path: ${{ runner.temp }}/checker-source-objects
-          retention-days: 2
+          name: checker-cycle-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-cycle-evidence
+          retention-days: 7
           if-no-files-found: error
