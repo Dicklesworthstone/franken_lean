@@ -152,6 +152,97 @@ impl Builder {
         Ok(body)
     }
 
+    /// The pin's mkProjections resets constructor parameter annotations before
+    /// inferring each projection separately. Only outParam (not semiOutParam)
+    /// retains the constructor's implicit annotation. Class dictionary parameters
+    /// become ordinary implicits so selection happens through the self instance.
+    fn projection_parameters(parameters: &[LocalDecl], is_class: bool) -> Vec<LocalDecl> {
+        parameters
+            .iter()
+            .map(|local| {
+                let mut local = local.clone();
+                let out_param = matches!(local.type_.node(), ExprNode::App { f, .. }
+                    if matches!(f.node(), ExprNode::Const { name, .. }
+                        if name.parent().is_anonymous()
+                            && matches!(name.leaf_view(), LeafView::Str("outParam"))));
+                local.binder_info = match local.binder_info {
+                    BinderInfo::InstImplicit if !is_class => BinderInfo::InstImplicit,
+                    BinderInfo::InstImplicit => BinderInfo::Implicit,
+                    BinderInfo::Default if out_param => BinderInfo::Implicit,
+                    info if out_param => info,
+                    _ => BinderInfo::Default,
+                };
+                local
+            })
+            .collect()
+    }
+
+    /// Whether a parameter can be recovered from an explicit argument or the
+    /// result, including transitively through implicit arguments. This is the
+    /// pin's hasLooseBVarInExplicitDomain with considerRange=true, walked with
+    /// an explicit stack and the record budget instead of host recursion.
+    fn inferable_parameter(&mut self, body: &Expr) -> Result<bool, RecordError> {
+        let mut work = vec![(body, 0u32)];
+        let mut seen = HashSet::new();
+        while let Some((term, index)) = work.pop() {
+            self.tick()?;
+            if !seen.insert((term.allocation_identity(), index)) {
+                continue;
+            }
+            match term.node() {
+                ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } => {
+                    if binder_type.has_loose_bvar(index) {
+                        if *binder_info == BinderInfo::Default {
+                            return Ok(true);
+                        }
+                        work.push((body, 0));
+                    }
+                    work.push((
+                        body,
+                        index.checked_add(1).ok_or(RecordError::ResourceLimit)?,
+                    ));
+                }
+                _ if term.has_loose_bvar(index) => return Ok(true),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    fn infer_projection_type(&mut self, type_: Expr, count: usize) -> Result<Expr, RecordError> {
+        let mut parameters = Vec::with_capacity(count);
+        let mut result = type_;
+        for _ in 0..count {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = result.node()
+            else {
+                return Err(RecordError::InvalidTelescope);
+            };
+            parameters.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            result = body.clone();
+        }
+        // Inner annotations must be inferred first: they decide whether an
+        // outer parameter occurs in an explicit, rather than implicit, domain.
+        for (name, domain, mut info) in parameters.into_iter().rev() {
+            self.tick()?;
+            if info == BinderInfo::Default && self.inferable_parameter(&result)? {
+                info = BinderInfo::Implicit;
+            }
+            result = Expr::forall_e(name, domain, result, info);
+        }
+        Ok(result)
+    }
+
     /// Match the kernel's consumeTypeAnnotations rule on generated telescope
     /// locals. Keep source class/constructor annotations intact: instance search
     /// reads them from the class declaration, not from its eliminator.
@@ -224,8 +315,9 @@ pub(crate) fn app(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr
 }
 
 /// Generate one block followed by its projections, in field order. Parameters
-/// become implicit constructor/projection arguments; class projections additionally
-/// take an instance-implicit receiver. Source inheritance/defaults are separate
+/// become implicit constructor arguments; projection parameters are inferred from
+/// each field's type and receiver. Class projections take an instance-implicit
+/// receiver. Source inheritance/defaults are separate
 /// elaboration features, not silently simulated by this builder.
 pub fn record_declarations(
     spec: &RecordSpec,
@@ -393,6 +485,7 @@ pub fn record_declarations(
             BinderInfo::Default
         },
     );
+    let projection_parameters = Builder::projection_parameters(&spec.parameters, spec.is_class);
     for (index, field) in spec.fields.iter().enumerate() {
         builder.tick()?;
         let mut domain = field.type_.clone();
@@ -411,10 +504,13 @@ pub fn record_declarations(
                 .map_err(|_| RecordError::InvalidTelescope)?;
         }
         let type_ = builder.close(std::slice::from_ref(&receiver), domain, false, false)?;
-        let type_ = builder.close(&spec.parameters, type_, false, true)?;
+        let type_ = builder.close(&projection_parameters, type_, false, false)?;
+        let type_ = builder.infer_projection_type(type_, projection_parameters.len())?;
         let value = Expr::proj(spec.name.clone(), index as u64, fv(&receiver));
         let value = builder.close(std::slice::from_ref(&receiver), value, true, false)?;
-        let value = builder.close(&spec.parameters, value, true, true)?;
+        // mkProjections' lambda uses the reset local telescope; inferImplicit
+        // changes the declaration type only, not the value's binder metadata.
+        let value = builder.close(&projection_parameters, value, true, false)?;
         let name = spec.name.append_core(&field.user_name);
         declarations.push(Declaration::Defn(DefinitionVal {
             base: ConstantVal {
@@ -531,5 +627,26 @@ mod annotation_tests {
             BinderInfo::Default,
         );
         assert_eq!(unwrap(nested.clone(), 100).unwrap(), nested);
+    }
+
+    #[test]
+    fn projection_inference_charges_implicit_telescope_traversal() {
+        let mut body = Expr::bvar(256).unwrap();
+        for _ in 0..256 {
+            body = Expr::forall_e(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                body,
+                BinderInfo::Implicit,
+            );
+        }
+        assert_eq!(
+            Builder { remaining: 32 }.inferable_parameter(&body),
+            Err(RecordError::ResourceLimit)
+        );
+        assert_eq!(
+            Builder { remaining: 257 }.inferable_parameter(&body),
+            Ok(true)
+        );
     }
 }
