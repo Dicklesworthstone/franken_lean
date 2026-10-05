@@ -23,6 +23,22 @@ The evidence matrix and Beads tracker remain authoritative where they carry stro
 
 ---
 
+## Measured state, 2026-10-05
+
+Collected for bead `franken_lean-z8j.1.19`. Rows marked **re-run** were executed for this table; the others cite the record they come from. Every row names its commit or record, and a later commit can move any number, so re-run the command before citing one.
+
+| What | Result | Reproduce |
+|---|---|---|
+| Ordinary Lean with the implicit `Init`, through the drop-in `lean` (**re-run**) | Accepts **3 of the 27** probe programs the pinned Reference accepts (3 of 14 in set A, 0 of 13 in set B), all 3 with identical output. Accepts none of the 3 programs the Reference rejects. Verdicts agree on 6 of 30. Measured at `c44489a9` and again at `49b53289`. | `cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`. Needs the pinned Reference; `FLN_REQUIRE_REFERENCE=1` makes its absence fail. |
+| Reference differential over the repository's own Lean sources | 114 files. The Reference rejects 44 of them, and FrankenLean accepts **43** of those 44: 30 through the drop-in `lean` and 13 more through `fln check-source` only. Every divergence carries a class and an owning bead. | The ledger `crates/fln-cli/tests/fixtures/reference_differential.tsv`, checked against the pin by `cargo test -p fln-cli --test source_reference_differential`. |
+| `lake build +Module:olean` (**re-run** at `49b53289`) | No placeholder `.olean` is written. Garbage source exits 1 naming the module and a byte position. Every emitted `.olean` decodes, and a content change rebuilds even with its mtime restored. A no-op rebuild and an mtime-only touch both re-elaborate every module (`modules_cached: 0`), so modules are not reused by content hash; `franken_lean-z8j.1.1` stays open on that criterion. `907bfdc0`, which landed after this measurement, reuses verified external import closures (`--import-posture`), not source modules. | `franken_lean-z8j.1.1` comment 3053; [NATIVE_LAKE.md](docs/NATIVE_LAKE.md). |
+| `fln build explain` (**re-run** at `49b53289`) | The fabricated rebuild decisions are gone, but after a body edit it still exits 5 and names no changed input or hash; `franken_lean-z8j.1.2` stays open. | `franken_lean-z8j.1.2` comment 3054. |
+| Mathlib-scale `.olean` council frontier | S19 (binary from `cd2813af`) accepted 4,928 of 11,083 modules, including every standard-library module it decided, and then aborted on memory. S20 (binary from `d9269bef`) aborted after 9,462 s on a failed 8 GiB allocation at about 138 GiB RSS, with 5,712 of 11,083 progress rows and no `--json` report (`fln-frontier-oom-abort-w9dx`). S20 also recorded a council disagreement: K1 accepts `CategoryTheory.Discrete.opposite`, the independent checker rejects it, and the pin accepts it (`fln-checker-free-binding-cycle-false-reject-u1vk`). | `fln check-olean --continue --jobs 24 --progress --json` over the toolchain `lib/lean`, Mathlib and its 7 package builds; run records on bead `fln-r0yh`. |
+| CI (**re-run**) | `ci.yml` has no successful run in GitHub's history. `product-gate.yml` last passed on 2026-09-25, at `fbe57852`. `contract-drift.yml`, the weekly lane and the only workflow that installs the Reference pin, has no successful run either; its latest finished run, on 2026-09-28, failed. | `gh run list --workflow <file> --status success --limit 1` |
+| FrankenSuite (**re-run**) | Admitted by operator decision on 2026-09-27; none is linked. `Cargo.lock` holds 33 packages, all workspace members, with no `source =` entry. | `grep -c 'source = ' Cargo.lock` prints 0. |
+
+---
+
 ## Current frontier summary
 
 ### Crucible / independent checker
@@ -73,7 +89,7 @@ Implemented:
 
 **Observed verification:** Actions run `34275569958`, job `102227616119`, checked source `69e410cd3fda268d4ee445764f6f7df74e5cfade` after rustfmt and published those exact formatted code changes as `00a571d4b19a71ed05c8adb1c3306bcd862246f2`. Package check, package tests and package Clippy with warnings denied all exited zero. The tests reported **103 passed, zero failed, zero ignored**: 69 library tests, 24 native-unification integration tests, 4 scheduler tests and 6 tower-transaction tests. This includes the 35 store/transaction regressions from the preceding implementation increment, which previously lacked execution evidence. `cargo check --locked --workspace --all-targets` also exited zero. Artifact `10075828185` retains the command logs, formatting patch and published commit identity.
 
-**Verification scope:** Linux x86-64, `nightly-2026-08-31`, rustc `90850177249efe0321573c569aec5d12b257f8d6`, selected from `rust-toolchain.toml`. The existing global preflight still has a conflicting `SUITE.lock` Rust pin (`nightly-2026-07-13`); the functional run does not claim that governed pin-consistency gate passed. The full workspace test suite, full-workspace Clippy, all-workspace formatting, UBS and a new real-Prelude council run are not claimed by this package-level observation.
+**Verification scope:** Linux x86-64, `nightly-2026-08-31`, rustc `90850177249efe0321573c569aec5d12b257f8d6`, selected from `rust-toolchain.toml`. At the time of that run the global preflight had a conflicting `SUITE.lock` Rust pin (`nightly-2026-07-13`), and the functional run does not claim that governed pin-consistency gate passed. `SUITE.lock` now pins `nightly-2026-08-31`, matching `rust-toolchain.toml`. The full workspace test suite, full-workspace Clippy, all-workspace formatting, UBS and a new real-Prelude council run are not claimed by this package-level observation.
 
 **Still incomplete:** general source elaboration does not yet route arbitrary Lean holes, implicit arguments, tactics or instance search through this solver. The full upstream approximation ladder, general flex-flex solving, complete universe normalization/solving, polymorphic delta, full recursor/quotient/proof-irrelevance conversion and oracle-trace parity remain open. The bounded source/tactic integration described below now uses these APIs; general upstream elaboration remains incomplete. The independent-checker's recursive indexed-inductive frontier is a separate open task; this solver does not bypass it or constitute kernel admission.
 
@@ -164,7 +180,8 @@ Landed:
   - `initialize` returns an object;
   - `shutdown` returns `null`;
   - `waitForDiagnostics` returns an object, `RequestCancelled`, or `RequestFailed`;
-  - plain goals, term goals, hover, completion, and definition return the current no-information `null` result;
+  - plain goals and hover return `null`, a typed goal or hover result, or `InvalidParams`, `RequestFailed` or `RequestCancelled`;
+  - term goals, completion, and definition must return the no-information `null` result. The installed front doors now answer completion and definition (below), so this contract lags them;
   - unsupported Lean RPC calls return `RequestFailed`;
   - unknown methods return `MethodNotFound`.
 - Method-derived result and error counts must reconcile exactly with the server transcript's validated totals, and every matched response must belong to one method contract class.
@@ -184,11 +201,11 @@ Landed:
 #### Still incomplete
 
 - Parser errors have real UTF-16 positions. Most bounded-source type failures are kernel rejections rather than `NatDefinitionElabError` values, and neither path carries an offending *token* position — but they now carry a **command-level** position: `EngineExecutionError::BatchCommand` gained an `at` offset that the source command loops populate, so a kernel or elaboration failure lands on the failing command's line rather than the file head (`c6190ee3`, tested by `kernel_rejection_reports_the_command_line_not_the_file_head`). Token-level (offending sub-expression) positions remain a larger follow-on.
-- Method-response schema v1 is an outer contract. It does not validate the complete initialize capability object or useful semantic payloads for goals, hover, completion, or definition. Successful diagnostic waits are object-valued rather than bound to a deeper inner schema.
+- Method-response schema v1 is an outer contract. It does not validate the complete initialize capability object. For goals and hover it checks the result's JSON shape, not its content, and for completion and definition it accepts only `null`. Successful diagnostic waits are object-valued rather than bound to a deeper inner schema.
 - Independent `CLIENT` and `SERVER` recordings still have no shared order. The new `TIMELINE` profile supplies recorder-defined event order, not wall-clock time, duration, scheduler execution, transport flush completion, or active CPU-work intervals.
 - No production recorder yet emits and identity-binds the interleaved event format. Fixture or caller-generated timelines must not be promoted to live-daemon evidence by implication.
 - Timeline schema v1 does not yet bind a particular `didOpen`, `didChange`, or `didSave` to its progress, terminal publication, diagnostic clearing, and completion episode. Complete document-to-progress-to-publication causality remains open.
-- Plain goals and term goals are not cursor-aware. Hover, completion, and definition still return no-information responses.
+- Both installed front doors (`fln serve-lsp` and `lean --server`) answer plain goals and hover from the native source elaborator at the cursor (2026-09-21, `8c0fb54d` and `f6a00138`), definition navigation (2026-09-26, `e845bbbd`) and checked global-name completion (2026-09-27, `46e05cf3`); see [NATIVE_EDITOR_QUERIES.md](docs/NATIVE_EDITOR_QUERIES.md). Each covers only syntax the native parser supports. `$/lean/plainTermGoal` still returns `null`.
 - Lean RPC sessions are not implemented. RPC calls fail visibly; keepAlive and release do not fabricate a session.
 - Retained source is session-local input state, not a declaration-granular shared elaboration and import environment.
 - The server remains synchronous and does not implement asupersync regions, active elaboration cancellation, shared immutable import heaps, stable diagnostic identities, crash isolation, or full unmodified `vscode-lean4` parity.
@@ -227,7 +244,7 @@ The new native unifier makes **expected-type propagation and source/tactic-gener
 5. **Add a production timeline recorder with identity.** Bind executable, Git tree, epoch, producer semantics, final daemon state, first divergence, and the exact outer stream; do not synthesize order from independent recordings.
 6. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
 7. **Deepen method-result contracts deliberately.** Bind the exact initialize capability object and exact diagnostic-wait success payload before claiming those inner semantics.
-8. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
+8. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Goals, hover, definition and completion are answered; term goals and RPC sessions remain. Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
 9. **Promote retained text into real declaration and import state deliberately.** The latest-text cache supports truthful Full-sync lifecycle semantics; it is not dependency-aware incremental elaboration.
 10. **Keep JSON-RPC decoding narrow but structural.** Extend typed extraction deliberately; never reintroduce substring routing or unbounded generic decoding.
 11. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin or artifact identity, and outcome class.
