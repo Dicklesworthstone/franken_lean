@@ -130,15 +130,9 @@ theorem counted : depth (P := fun n => Bool) Nat.succ 6 true t 4 = 5 := by rfl
     );
 }
 
-/// `e` depends on the input and is generalized by the match; `h`, before the
-/// input, is passed `rfl` rather than itself, so the pin's fixed prefix stops
-/// before it and it varies with the recursion.
+/// The unchanged earlier proof stays fixed; the later dependent proof varies.
 #[test]
 fn a_dependent_argument_after_the_input_is_generalized_and_one_before_it_stays_fixed() {
-    // The pin also accepts `depth rfl rest rfl`: its fixed prefix is only what
-    // every recursive call passes unchanged, and it generalizes the rest. Here
-    // an argument before the input that changes is refused as ChangedParameter,
-    // even over Nat (bead fln-structural-fixed-prefix-bcvq), so this passes `h`.
     check(&format!(
         r#"{LOOP}
 def depth (h : 7 = 7) (x : Loop 7) (e : x = x) : Nat := match x with
@@ -147,6 +141,33 @@ def depth (h : 7 = 7) (x : Loop 7) (e : x = x) : Nat := match x with
 theorem counted : depth rfl (Loop.step 7 (Loop.base 7)) rfl = 8 := by rfl
 "#
     ));
+}
+
+#[test]
+fn changed_earlier_proofs_are_generalized_for_promoted_indices() {
+    check(&format!(
+        r#"{LOOP}
+def depth (h : 7 = 7) (x : Loop 7) (e : x = x) : Nat := match x with
+  | .base _ => 7
+  | .step _ rest => depth rfl rest rfl + 1
+theorem counted : depth rfl (Loop.step 7 (Loop.base 7)) rfl = 8 := by rfl
+"#
+    ));
+}
+
+#[test]
+fn changed_earlier_proofs_are_generalized_with_a_changing_index() {
+    check(
+        r#"
+inductive Chain : Nat -> Type where
+  | nil : Chain 0
+  | step (n : Nat) (child : Chain n) : Chain (Nat.succ n)
+def depth (h : 7 = 7) (n : Nat) (x : Chain n) : Nat := match x with
+  | .nil => 7
+  | .step k rest => depth rfl k rest + 1
+theorem counted : depth rfl 1 (Chain.step 0 Chain.nil) = 8 := by rfl
+"#,
+    );
 }
 
 #[test]

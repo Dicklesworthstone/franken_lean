@@ -2,6 +2,7 @@
 //! Structural `let rec` uses the declaration recursor compiler, on the same
 //! heap worklist as nonrecursive lets. No generated global or axiom is used.
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub(super) struct Binding<'a> {
@@ -25,6 +26,7 @@ pub(super) struct Build<'a> {
     saved: LocalContext,
     outer_recursion: Option<recursion::Recursion>,
     marker: Option<FVarId>,
+    generalized_parameters: HashSet<usize>,
 }
 
 /// Like tactic choices, structural candidates live on the driver's flat stack.
@@ -34,8 +36,9 @@ pub(super) struct Build<'a> {
 pub(super) struct Checkpoint<'a> {
     context: Box<Context>,
     build: Build<'a>,
-    candidates: Vec<Option<usize>>,
+    candidates: Vec<Option<(usize, usize)>>,
     next: usize,
+    generalized_parameters: HashSet<usize>,
     pub tasks: usize,
     pub values: usize,
 }
@@ -76,7 +79,7 @@ impl<'a> Checkpoint<'a> {
         let mut candidates = vec![None];
         let body = original(context, build.binding.value)?;
         match context.recursion_columns(&build.parameters, body) {
-            Ok(columns) => candidates.extend(columns.into_iter().map(|(column, _)| Some(column))),
+            Ok(columns) => candidates.extend(columns.into_iter().map(Some)),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
                 recursion::RecursionError::RootMatchRequired,
             ))) => {}
@@ -87,6 +90,7 @@ impl<'a> Checkpoint<'a> {
             build,
             candidates,
             next: 0,
+            generalized_parameters: HashSet::new(),
             tasks,
             values,
         })
@@ -96,15 +100,36 @@ impl<'a> Checkpoint<'a> {
         self.next += 1;
         let mut build = self.build.clone();
         build.checkpoint = Some(index);
-        (build, candidate)
+        build.generalized_parameters = self.generalized_parameters.clone();
+        (build, candidate.map(|(column, _)| column))
     }
     pub fn restore(&self, context: &mut Context) {
         let spent = context.txn.budget.heartbeats_consumed;
         *context = (*self.context).clone();
         context.txn.budget.heartbeats_consumed = spent;
     }
-    pub fn retry(&self) -> bool {
-        self.next < self.candidates.len()
+    pub fn retry(&mut self, problem: &NatDefinitionElabError) -> bool {
+        if let NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+            recursion::RecursionError::GeneralizeParameter { owner, position },
+        )) = problem
+        {
+            if let Some(Some((_, decreasing))) = self
+                .next
+                .checked_sub(1)
+                .and_then(|index| self.candidates.get(index))
+                && owner == &self.build.parameters[*decreasing].id
+                && position < decreasing
+                && self.generalized_parameters.insert(*position)
+            {
+                // Rebuild the same candidate with a strictly larger mask.
+                // A request for an enclosing function must propagate to it.
+                self.next -= 1;
+                return true;
+            }
+            return false;
+        }
+        self.generalized_parameters.clear();
+        retryable(problem) && self.next < self.candidates.len()
     }
 }
 
@@ -147,6 +172,7 @@ impl Context {
             saved,
             outer_recursion: None,
             marker: None,
+            generalized_parameters: HashSet::new(),
         })
     }
 
@@ -181,6 +207,10 @@ impl Context {
                 column,
                 &matched,
             )?;
+            self.recursion
+                .as_mut()
+                .expect("local structural candidate")
+                .generalized_parameters = build.generalized_parameters.clone();
             self.recursion
                 .as_ref()
                 .expect("local structural candidate")
@@ -338,6 +368,7 @@ mod tests {
             saved: LocalContext::new(),
             outer_recursion: None,
             marker: None,
+            generalized_parameters: HashSet::new(),
         };
         let checkpoint = Checkpoint::new(&mut context, build, 3, 7).unwrap();
         let initial_next = context.next;

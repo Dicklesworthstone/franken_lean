@@ -56,6 +56,96 @@ fn local_recursive_accumulators_vary_and_completed_functions_can_escape() {
 }
 
 #[test]
+fn structural_calls_generalize_an_unmatched_earlier_accumulator() {
+    checked(
+        &engine(),
+        "def front (a n : Nat) : Nat := match n with | .zero => a | .succ k => front (a + 1) k\ntheorem computes : front 10 32 = 42 := by rfl",
+    );
+}
+
+#[test]
+fn local_structural_calls_generalize_an_unmatched_earlier_accumulator() {
+    checked(
+        &engine(),
+        "def result : Nat := let rec go (a n : Nat) : Nat := match n with | .zero => a | .succ k => go (a + 1) k; go 10 32\ntheorem computes : result = 42 := by rfl",
+    );
+}
+
+#[test]
+fn structural_generalization_propagates_through_dependent_parameter_domains() {
+    checked(
+        &engine(),
+        "def front (a : Nat) (h : a = a) (n : Nat) : Nat := match n with | .zero => a | .succ k => front (a + 1) rfl k\ntheorem computes : front 10 rfl 32 = 42 := by rfl",
+    );
+}
+
+#[test]
+fn structural_generalization_accumulates_parameters_discovered_in_different_branches() {
+    checked(
+        &engine(),
+        "inductive Path where | stop : Path | left (rest : Path) : Path | right (rest : Path) : Path\ndef count (a b : Nat) (p : Path) : Nat := match p with | .stop => a + b | .left rest => count (a + 1) b rest | .right rest => count a (b + 2) rest\ntheorem computes : count 10 20 (Path.left (Path.right Path.stop)) = 33 := by rfl",
+    );
+}
+
+#[test]
+fn nested_local_generalization_preserves_owners_and_tactic_choices() {
+    checked(
+        &engine(),
+        "def result : Nat := by first | exact (let rec go (a n : Nat) : Nat := match n with | .zero => a | .succ k => let rec inner (b m : Nat) : Nat := match m with | .zero => b | .succ j => inner (b + 1) j; go (inner a 1) k; go 10 32) | exact 0\ntheorem computes : result = 42 := by rfl",
+    );
+}
+
+#[test]
+fn outer_recursive_calls_inside_local_helpers_keep_their_owner() {
+    checked(
+        &engine(),
+        "def front (a n : Nat) : Nat := match n with | .zero => a | .succ k => let rec inner (a n : Nat) : Nat := match n with | .zero => front (a + 1) k | .succ j => inner a j; inner a 1\ntheorem computes : front 10 3 = 13 := by rfl",
+    );
+}
+
+#[test]
+fn ordinary_tactic_failure_after_generalization_still_tries_the_next_alternative() {
+    checked(
+        &engine(),
+        "def result : Nat := by first | exact (let rec go (a n : Nat) : Nat := match n with | .zero => a | .succ k => go (a + 1) k; true) | exact 42\ntheorem computes : result = 42 := by rfl",
+    );
+}
+
+#[test]
+fn generalized_earlier_accumulators_execute_on_golem() {
+    execute(
+        "def front (a n : Nat) : Nat := match n with | .zero => a | .succ k => front (a + 1) k\n#eval front 10 32",
+        "42",
+    );
+    execute(
+        "def result : Nat := let rec go (a n : Nat) : Nat := match n with | .zero => a | .succ k => go (a + 1) k; go 10 32\n#eval result",
+        "42",
+    );
+}
+
+#[test]
+fn changed_earlier_arguments_do_not_hide_nondecreasing_calls() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad (a n : Nat) : Nat := match n with | .zero => a | .succ k => bad (a + 1) n",
+        "def bad (a n : Nat) : Nat := match n with | .zero => a | .succ k => bad ((fun ignored : Nat => a + 1) (bad a n)) k",
+        "def bad : Nat := let rec go (a n : Nat) : Nat := match n with | .zero => a | .succ k => go (a + 1) n; go 0 3",
+    ] {
+        let problem = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        assert_eq!(problem.disposition().2, 1, "{problem:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    checked(&base, "def recovered : Nat := 42");
+}
+
+#[test]
 fn local_recursive_names_shadow_outer_locals_and_globals_only_in_the_value() {
     checked(
         &engine(),
@@ -218,6 +308,36 @@ fn local_candidate_resource_stops_are_not_tactic_success() {
         result => panic!("resource stop swallowed: {result:?}"),
     }
     assert_eq!(base.logical_root(&KVMap::new()), root);
+    checked(&base, source);
+}
+
+#[test]
+fn generalization_resource_stops_do_not_select_a_successful_tactic_fallback() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let source = "def result : Nat := by first | exact (let rec go (a b n : Nat) : Nat := match n with | .zero => a + b | .succ k => go (a + 1) (b + 2) k; go 10 20 4) | exact 0\ntheorem computes : result = 42 := by rfl";
+    let mut stopped = 0;
+    for steps in [100, 1_000, 10_000] {
+        let mut low = SourceCheckLimits::new(limits());
+        low.admission.kernel = low.admission.kernel.narrowed(steps, 256);
+        match base.check_source_files(&[source.as_bytes()], &KVMap::new(), low) {
+            Ok(fln::Outcome::Inconclusive(_)) => stopped += 1,
+            Err(error) => {
+                assert!(
+                    matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+                    "steps={steps}: {error:?}"
+                );
+                stopped += 1;
+            }
+            Ok(fln::Outcome::Complete(_)) => {}
+            result => panic!("steps={steps}: {result:?}"),
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert!(
+        stopped > 0,
+        "the bounded controls must actually exhaust work"
+    );
     checked(&base, source);
 }
 

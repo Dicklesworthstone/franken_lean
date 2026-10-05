@@ -2295,7 +2295,7 @@ impl Context {
                                 values.truncate(checkpoint.values);
                                 checkpoint.restore(self);
                                 self.tick()?;
-                                if local_functions::retryable(&problem) && checkpoint.retry() {
+                                if checkpoint.retry(&problem) {
                                     let (build, column) = checkpoint.begin(attempts.len());
                                     attempts.push(Attempt::LocalFunction(checkpoint));
                                     tasks.push(Task::LocalFunctionStart(build, column));
@@ -2307,6 +2307,18 @@ impl Context {
                                 values.truncate(checkpoint.values);
                                 checkpoint.restore(self);
                                 self.tick()?;
+                                // Motive discovery belongs to the enclosing
+                                // recursion driver, not a tactic alternative.
+                                if matches!(
+                                    &problem,
+                                    NatDefinitionElabError::Inference(
+                                        SourceInferenceError::Recursion(
+                                            recursion::RecursionError::GeneralizeParameter { .. }
+                                        )
+                                    )
+                                ) {
+                                    continue;
+                                }
                                 if checkpoint.retry() {
                                     let proof = checkpoint.begin(self, attempts.len())?;
                                     attempts.push(Attempt::Proof(checkpoint));
