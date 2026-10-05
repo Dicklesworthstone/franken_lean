@@ -1,5 +1,6 @@
 //! Integration tests for new fln multiplexer verbs (diff, goals, doctor, serve-mcp,
-//! replay, cache, build explain) and toolchain personalities (leanc, lake).
+//! replay, cache, build explain, olean verify-rebuild over module-system chains) and
+//! toolchain personalities (leanc, lake).
 #![forbid(unsafe_code)]
 
 use std::process::Command;
@@ -1055,4 +1056,435 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
         String::from_utf8_lossy(&explain_faithful.stderr).contains("provenance is unavailable")
     );
     assert!(!pkg_dir.join(".lake").exists());
+}
+
+// ---- olean verify-rebuild over module-system chains ------------------------
+
+/// The parts of a module image, in load order, as `fln` names them.
+const CHAIN_PARTS: [&str; 3] = [".olean", ".olean.server", ".olean.private"];
+
+/// One part of the committed `prelude.olean` chain. Its three files are the
+/// pinned v4.32.0 stdlib's `Init/Prelude.olean`, `.olean.server` and
+/// `.olean.private`, byte for byte (held against the installed pin by
+/// `olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude`), so these
+/// cells run on real Reference output without needing the pin installed.
+fn prelude_chain_part(part: &str) -> std::path::PathBuf {
+    let suffix = part.strip_prefix(".olean").expect("a module part suffix");
+    fln_core::checked_workspace_root!()
+        .join("crates/fln-conformance/fixtures/tag_attributes")
+        .join(format!("prelude.olean{suffix}"))
+}
+
+/// Copy the chain's `parts` into `dir` under the module stem `Prelude`.
+fn copy_prelude_chain(dir: &std::path::Path, parts: &[&str]) {
+    for part in parts {
+        let suffix = part.strip_prefix(".olean").expect("a module part suffix");
+        std::fs::copy(
+            prelude_chain_part(part),
+            dir.join(format!("Prelude.olean{suffix}")),
+        )
+        .expect("copy a pinned chain part");
+    }
+}
+
+/// Run `fln olean verify-rebuild` with `args`.
+fn verify_rebuild_run(args: &[&std::ffi::OsStr]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["olean", "verify-rebuild"])
+        .args(args)
+        .output()
+        .expect("run fln olean verify-rebuild");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+    )
+}
+
+/// The robot row of `part`, from its opening brace to the next row or the end.
+fn chain_row<'a>(robot: &'a str, part: &str) -> &'a str {
+    let anchor = format!("{{\"part\":\"{part}\",");
+    let start = robot
+        .find(&anchor)
+        .unwrap_or_else(|| panic!("no {part} row in {robot}"));
+    let rest = &robot[start + anchor.len()..];
+    &rest[..rest.find("{\"part\":").unwrap_or(rest.len())]
+}
+
+/// The unsigned integer member `key` of a robot row.
+fn row_u64(row: &str, key: &str) -> u64 {
+    let needle = format!("\"{key}\":");
+    let at = row
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no {key} in {row}"))
+        + needle.len();
+    row[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} is not an unsigned integer in {row}"))
+}
+
+/// A real module-system chain verifies end to end through the binary, from
+/// whichever part PATH names: every part rebuilt byte-identically, reported
+/// per part in load order, with the companions really crossing into their
+/// predecessors. Before the chain door, the two companion PATHs were refused
+/// as `PtrOutOfBounds` and the exported PATH reported one part.
+#[test]
+fn olean_verify_rebuild_verifies_a_real_module_chain_from_any_part() {
+    let sizes = CHAIN_PARTS.map(|part| {
+        std::fs::metadata(prelude_chain_part(part))
+            .expect("pinned chain part")
+            .len()
+    });
+    let mut robots = Vec::new();
+    for part in CHAIN_PARTS {
+        let path = prelude_chain_part(part);
+        let (code, robot, stderr) = verify_rebuild_run(&["--json".as_ref(), path.as_os_str()]);
+        assert_eq!(code, Some(0), "{part}: {robot}{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        assert!(
+            robot.starts_with(
+                "{\"schema\":\"fln.olean-rebuild-chain/1\",\"outcome\":\"complete\",\"parts\":3,"
+            ),
+            "{robot}"
+        );
+        assert_eq!(
+            row_u64(&robot[..robot.find("\"rows\":").expect("rows")], "bytes"),
+            sizes.iter().sum::<u64>(),
+            "the chain total is every part's bytes"
+        );
+        let mut previous = 0;
+        for (index, name) in CHAIN_PARTS.iter().enumerate() {
+            let at = robot
+                .find(&format!("{{\"part\":\"{name}\","))
+                .unwrap_or_else(|| panic!("no {name} row in {robot}"));
+            assert!(at > previous, "rows are in load order: {robot}");
+            previous = at;
+            let row = chain_row(&robot, name);
+            assert!(row.contains("\"byteIdentity\":true"), "{row}");
+            assert!(row.contains("\"findings\":0"), "{row}");
+            assert_eq!(row_u64(row, "bytes"), sizes[index], "{name} bytes");
+            assert!(row_u64(row, "objects") > 0, "{row}");
+            // Anti-vacuity: the exported part is standalone and each companion
+            // really holds pointers into the parts before it, so the
+            // cross-part rebuild is what was measured.
+            let crossing = row_u64(row, "dependencyPointers");
+            if index == 0 {
+                assert_eq!(crossing, 0, "{row}");
+            } else {
+                assert!(
+                    crossing > 0,
+                    "{name} never crossed into a predecessor: {row}"
+                );
+            }
+        }
+        robots.push(robot);
+    }
+    assert!(
+        robots.iter().all(|robot| *robot == robots[0]),
+        "every part of one chain yields the same report"
+    );
+
+    let server = prelude_chain_part(".olean.server");
+    let (code, human, stderr) = verify_rebuild_run(&[server.as_os_str()]);
+    assert_eq!(code, Some(0), "{human}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(human.starts_with(
+        "pinned .olean rebuild audit: complete\n\
+         module-system chain: 3 parts (.olean, .olean.server, .olean.private), \
+         each rebuilt against the parts loaded before it\n"
+    ));
+    assert!(human.contains(&format!("bytes: {}\n", sizes.iter().sum::<u64>())));
+    assert!(human.contains("byte identity: exact\n"));
+    assert!(human.contains("findings: 0\n"));
+    for (part, size) in CHAIN_PARTS.iter().zip(sizes) {
+        assert!(
+            human.contains(&format!("part {part}: {size} bytes, byte identity exact, ")),
+            "{human}"
+        );
+    }
+}
+
+/// A one-byte corruption planted in a companion is refused typed and named:
+/// the refusal is that part's, never another's. The private-part plant lands
+/// in a pointer word that crosses into the exported part, which the bytes
+/// themselves are checked to confirm before planting. The uncorrupted copy in
+/// the same layout is the control.
+#[test]
+fn olean_verify_rebuild_names_the_corrupted_companion() {
+    let control = TempDir::new("rebuild-control");
+    copy_prelude_chain(&control.0, &CHAIN_PARTS);
+    let (code, robot, stderr) = verify_rebuild_run(&[
+        "--json".as_ref(),
+        control.0.join("Prelude.olean").as_os_str(),
+    ]);
+    assert_eq!(
+        code,
+        Some(0),
+        "the unplanted copy verifies: {robot}{stderr}"
+    );
+
+    let header = fln_olean::format::OLEAN_HEADER_SIZE;
+    let base_field = fln_olean::format::OLEAN_HEADER_FIELDS
+        .iter()
+        .find(|field| field.name == "base_addr")
+        .expect("generated base_addr field");
+    let word = |bytes: &[u8], at: usize| {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("an 8-byte word"))
+    };
+    let exported = std::fs::read(prelude_chain_part(".olean")).expect("exported part");
+    let exported_base = word(&exported, base_field.offset);
+    let mut private = std::fs::read(prelude_chain_part(".olean.private")).expect("private part");
+    // The first object after the root slot is a persistent constructor with
+    // at least one field, and that field points into the exported part.
+    let object = header + 8;
+    let object_header = word(&private, object);
+    let packed = (object_header >> 32) as u32;
+    assert_eq!(object_header & 0xffff_ffff, 0, "a persistent header");
+    assert!(
+        (packed >> 24) as u8 <= fln_rt::abi::TAG_MAX_CTOR_TAG,
+        "a constructor"
+    );
+    assert!((packed >> 16) & 0xff >= 1, "with a field");
+    let field = object + 8;
+    let pointer = word(&private, field);
+    assert_eq!(pointer & 7, 0, "an aligned pointer word");
+    assert!(
+        (exported_base..exported_base + exported.len() as u64).contains(&pointer),
+        "the field crosses into the exported part: {pointer:#x}"
+    );
+    private[field] ^= 0x04;
+
+    let planted = TempDir::new("rebuild-private-flip");
+    copy_prelude_chain(&planted.0, &[".olean", ".olean.server"]);
+    std::fs::write(planted.0.join("Prelude.olean.private"), &private).expect("plant");
+    for part in CHAIN_PARTS {
+        let suffix = part.strip_prefix(".olean").expect("suffix");
+        let path = planted.0.join(format!("Prelude.olean{suffix}"));
+        let (code, stdout, robot) = verify_rebuild_run(&["--json".as_ref(), path.as_os_str()]);
+        assert_eq!(code, Some(1), "{stdout}{robot}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            robot.starts_with(
+                "{\"schema\":\"fln.olean-rebuild-chain/1\",\"outcome\":\"error\",\
+                 \"class\":\"rebuild\",\"part\":\".olean.private\","
+            ),
+            "{robot}"
+        );
+        assert!(robot.contains("not 8-byte aligned"), "{robot}");
+    }
+    let (code, stdout, human) = verify_rebuild_run(&[planted.0.join("Prelude.olean").as_os_str()]);
+    assert_eq!(code, Some(1), "{stdout}{human}");
+    assert!(
+        human.starts_with("fln olean verify-rebuild: rebuild: .olean.private rebuild: pointer "),
+        "{human}"
+    );
+
+    // A plant in the server part moves the attribution with it, and the
+    // intact private part behind it is not blamed.
+    let original_server = std::fs::read(prelude_chain_part(".olean.server")).expect("server part");
+    let mut server = original_server.clone();
+    server[0] ^= u8::MAX;
+    let planted = TempDir::new("rebuild-server-flip");
+    copy_prelude_chain(&planted.0, &[".olean", ".olean.private"]);
+    std::fs::write(planted.0.join("Prelude.olean.server"), &server).expect("plant");
+    let path = planted.0.join("Prelude.olean.private");
+    let (code, stdout, robot) = verify_rebuild_run(&["--json".as_ref(), path.as_os_str()]);
+    assert_eq!(code, Some(1), "{stdout}{robot}");
+    assert!(
+        robot.contains("\"class\":\"rebuild\",\"part\":\".olean.server\","),
+        "{robot}"
+    );
+    assert!(robot.contains("bad magic"), "{robot}");
+
+    // A nonzero byte in a companion's inter-object padding parses cleanly and
+    // copies through, so only the rebuild's padding audit sees it: a typed
+    // `finding` naming that part. The first server object is a string whose
+    // payload ends short of the next 8-byte boundary, checked before planting.
+    let mut server = original_server;
+    let string = header + 8;
+    assert_eq!(
+        (word(&server, string) >> 56) as u8,
+        fln_rt::abi::TAG_STRING,
+        "a string object"
+    );
+    let capacity = usize::try_from(word(&server, string + 16)).expect("capacity");
+    let pad = string + 32 + capacity;
+    assert!(
+        !pad.is_multiple_of(8) && server[pad] == 0,
+        "zero padding follows the string"
+    );
+    server[pad] = 0x5a;
+    let planted = TempDir::new("rebuild-server-padding");
+    copy_prelude_chain(&planted.0, &[".olean", ".olean.private"]);
+    std::fs::write(planted.0.join("Prelude.olean.server"), &server).expect("plant");
+    let path = planted.0.join("Prelude.olean");
+    let (code, stdout, robot) = verify_rebuild_run(&["--json".as_ref(), path.as_os_str()]);
+    assert_eq!(code, Some(1), "{stdout}{robot}");
+    assert!(
+        robot.contains("\"class\":\"finding\",\"part\":\".olean.server\","),
+        "{robot}"
+    );
+    assert!(robot.contains("nonzero padding: 1 of"), "{robot}");
+}
+
+/// A part whose predecessor is absent is refused typed, naming the absent
+/// part, from every PATH in the chain. Absent TRAILING parts are not a gap:
+/// what remains is a load-order prefix, verified as such.
+#[test]
+fn olean_verify_rebuild_refuses_a_part_without_its_predecessor() {
+    let no_exported = TempDir::new("rebuild-no-exported");
+    copy_prelude_chain(&no_exported.0, &[".olean.server", ".olean.private"]);
+    let no_server = TempDir::new("rebuild-no-server");
+    copy_prelude_chain(&no_server.0, &[".olean", ".olean.private"]);
+    for (dir, paths, missing) in [
+        (&no_exported, [".olean.server", ".olean.private"], ".olean"),
+        (&no_server, [".olean", ".olean.private"], ".olean.server"),
+    ] {
+        for part in paths {
+            let suffix = part.strip_prefix(".olean").expect("suffix");
+            let path = dir.0.join(format!("Prelude.olean{suffix}"));
+            let (code, stdout, robot) = verify_rebuild_run(&["--json".as_ref(), path.as_os_str()]);
+            assert_eq!(code, Some(1), "{part}: {stdout}{robot}");
+            assert!(stdout.is_empty(), "{stdout}");
+            assert!(
+                robot.starts_with(&format!(
+                    "{{\"schema\":\"fln.olean-rebuild-chain/1\",\"outcome\":\"error\",\
+                     \"class\":\"missing-predecessor\",\"part\":\"{missing}\","
+                )),
+                "{part}: {robot}"
+            );
+            let absent = dir.0.join(format!(
+                "Prelude.olean{}",
+                missing.strip_prefix(".olean").expect("suffix")
+            ));
+            assert!(
+                robot.contains(&format!("{} is absent", absent.display())),
+                "{robot}"
+            );
+        }
+    }
+    let (code, stdout, human) =
+        verify_rebuild_run(&[no_exported.0.join("Prelude.olean.server").as_os_str()]);
+    assert_eq!(code, Some(1), "{stdout}{human}");
+    assert!(
+        human.starts_with(
+            "fln olean verify-rebuild: missing-predecessor: .olean.server cannot be \
+             rebuilt without its predecessor .olean"
+        ),
+        "{human}"
+    );
+
+    let prefix = TempDir::new("rebuild-prefix");
+    copy_prelude_chain(&prefix.0, &[".olean", ".olean.server"]);
+    let (code, robot, stderr) = verify_rebuild_run(&[
+        "--json".as_ref(),
+        prefix.0.join("Prelude.olean.server").as_os_str(),
+    ]);
+    assert_eq!(code, Some(0), "{robot}{stderr}");
+    assert!(
+        robot.contains("\"outcome\":\"complete\",\"parts\":2,"),
+        "{robot}"
+    );
+    assert!(robot.contains("{\"part\":\".olean.server\","), "{robot}");
+    assert!(!robot.contains(".olean.private"), "{robot}");
+}
+
+/// `--max-bytes` bounds the chain's parts together, exactly: the sum is
+/// admitted, one byte less is a typed resource stop naming the part that
+/// crossed it, and a bound below PATH alone stops on PATH.
+#[test]
+fn olean_verify_rebuild_bounds_the_whole_chain() {
+    let total: u64 = CHAIN_PARTS
+        .iter()
+        .map(|part| {
+            std::fs::metadata(prelude_chain_part(part))
+                .expect("pinned chain part")
+                .len()
+        })
+        .sum();
+    let exported = prelude_chain_part(".olean");
+    let at_bound = total.to_string();
+    let (code, robot, stderr) = verify_rebuild_run(&[
+        "--json".as_ref(),
+        "--max-bytes".as_ref(),
+        at_bound.as_ref(),
+        exported.as_os_str(),
+    ]);
+    assert_eq!(code, Some(0), "{robot}{stderr}");
+    assert!(
+        robot.contains("\"outcome\":\"complete\",\"parts\":3,"),
+        "{robot}"
+    );
+
+    let below = (total - 1).to_string();
+    let (code, stdout, robot) = verify_rebuild_run(&[
+        "--json".as_ref(),
+        "--max-bytes".as_ref(),
+        below.as_ref(),
+        exported.as_os_str(),
+    ]);
+    assert_eq!(code, Some(3), "{stdout}{robot}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        robot.contains("\"class\":\"resource\",\"part\":\".olean.private\","),
+        "{robot}"
+    );
+    assert!(
+        robot.contains(&format!("module chain's {below}-byte input limit")),
+        "{robot}"
+    );
+
+    let (code, stdout, robot) = verify_rebuild_run(&[
+        "--json".as_ref(),
+        "--max-bytes".as_ref(),
+        "100".as_ref(),
+        prelude_chain_part(".olean.server").as_os_str(),
+    ]);
+    assert_eq!(code, Some(3), "{stdout}{robot}");
+    assert!(
+        robot.contains("\"class\":\"resource\",\"part\":\".olean.server\","),
+        "{robot}"
+    );
+}
+
+/// The committed chain the cells above use is the installed pin's
+/// `Init/Prelude` chain, and the installed pin's own files verify in place.
+/// Typed skip without the pin; `FLN_REQUIRE_REFERENCE` turns the skip into a
+/// failure.
+#[test]
+fn olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude() {
+    let library = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| {
+            home.join(".elan/toolchains")
+                .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                .join("lib/lean/Init")
+        })
+        .filter(|init| init.join("Prelude.olean.private").is_file());
+    let Some(init) = library else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned Reference Init/Prelude chain is absent"
+        );
+        eprintln!("SKIP: pinned Reference Init/Prelude chain not installed");
+        return;
+    };
+    for part in CHAIN_PARTS {
+        let suffix = part.strip_prefix(".olean").expect("suffix");
+        assert!(
+            std::fs::read(prelude_chain_part(part)).expect("fixture part")
+                == std::fs::read(init.join(format!("Prelude.olean{suffix}"))).expect("pin part"),
+            "the committed {part} is the pinned Init/Prelude{part}"
+        );
+    }
+    let in_place = init.join("BinderNameHint.olean.private");
+    let (code, robot, stderr) = verify_rebuild_run(&["--json".as_ref(), in_place.as_os_str()]);
+    assert_eq!(code, Some(0), "{robot}{stderr}");
+    assert!(
+        robot.contains("\"outcome\":\"complete\",\"parts\":3,"),
+        "{robot}"
+    );
 }

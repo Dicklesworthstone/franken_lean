@@ -122,6 +122,10 @@ fn take_jobs_option(
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
+/// `olean verify-rebuild` over a module-system chain: the standalone shape's
+/// totals plus a `rows` array of per-part results, and a `part` member on
+/// every refusal. A standalone image keeps [`OLEAN_REBUILD_SCHEMA`] unchanged.
+const OLEAN_REBUILD_CHAIN_SCHEMA: &str = "fln.olean-rebuild-chain/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const VERIFY_CAPSULE_SCHEMA: &str = "fln.verify-capsule/2";
@@ -225,8 +229,13 @@ const USAGE: &str = concat!(
     "bounded structural changes in module metadata and declarations. It does\n",
     "not resolve imports, kernel-check either side, or convert olean-next.\n",
     "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
-    "semantics and requires byte identity with no codec findings. It is not\n",
-    "fresh emission and does not kernel-check declarations.\n",
+    "semantics and requires byte identity with no codec findings. If PATH is a\n",
+    "module-system part (X.olean with X.olean.server or X.olean.private beside\n",
+    "it, or either companion itself), every present part of that chain is\n",
+    "rebuilt in load order against the parts loaded before it and reported per\n",
+    "part; a part whose predecessor is absent is refused, and --max-bytes bounds\n",
+    "the parts together. It is not fresh emission, does not kernel-check\n",
+    "declarations, and does not establish that the parts came from one build.\n",
     "`ilean inspect` budget-decodes one pinned-format .ilean and canonical-\n",
     "reencodes it, reporting byte identity and bounded aggregate counts. It\n",
     "does not resolve modules, read source, or establish LSP compatibility.\n",
@@ -3674,17 +3683,21 @@ fn diff_olean(left: &Path, right: &Path, max_bytes: usize, json: bool) -> Multip
     diff_olean_bytes(&left_bytes, &right_bytes, max_bytes, json)
 }
 
+/// The declared-content copy classes the report's `copiedContentBytes` sums.
+fn copied_content_bytes(report: &fln::OleanRebuildReport) -> Option<u64> {
+    report
+        .copied_string_bytes
+        .checked_add(report.copied_sarray_bytes)?
+        .checked_add(report.copied_ctor_tail_bytes)?
+        .checked_add(report.copied_mpz_limb_bytes)
+}
+
 fn render_olean_rebuild_success(
     bytes: usize,
     report: &fln::OleanRebuildReport,
     json: bool,
 ) -> MultiplexerOutput {
-    let Some(copied_content_bytes) = report
-        .copied_string_bytes
-        .checked_add(report.copied_sarray_bytes)
-        .and_then(|total| total.checked_add(report.copied_ctor_tail_bytes))
-        .and_then(|total| total.checked_add(report.copied_mpz_limb_bytes))
-    else {
+    let Some(copied_content_bytes) = copied_content_bytes(report) else {
         return olean_rebuild_failure(
             "internal-fault",
             "rebuild report content-byte accounting overflowed",
@@ -3742,15 +3755,47 @@ fn olean_rebuild_failure(
     json: bool,
     exit_code: u8,
 ) -> MultiplexerOutput {
+    render_olean_rebuild_failure(OLEAN_REBUILD_SCHEMA, None, class, detail, json, exit_code)
+}
+
+/// A refusal over a module-system chain. `part` names the part the refusal is
+/// about: the one that failed, or for `missing-predecessor` the absent one.
+fn olean_rebuild_chain_failure(
+    class: &'static str,
+    part: Option<fln::OleanModulePart>,
+    detail: &str,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
+    let part = part.map_or_else(|| "null".to_owned(), |part| json_string(&part.to_string()));
+    render_olean_rebuild_failure(
+        OLEAN_REBUILD_CHAIN_SCHEMA,
+        Some(&part),
+        class,
+        detail,
+        json,
+        exit_code,
+    )
+}
+
+fn render_olean_rebuild_failure(
+    schema: &str,
+    part_json: Option<&str>,
+    class: &'static str,
+    detail: &str,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
     let detail = BoundedText::new(detail.to_owned());
     let stderr = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":\"error\",\"class\":{},",
+                "{{\"schema\":{},\"outcome\":\"error\",\"class\":{},{}",
                 "\"detail\":{},\"detailTruncated\":{}}}\n"
             ),
-            json_string(OLEAN_REBUILD_SCHEMA),
+            json_string(schema),
             json_string(class),
+            part_json.map_or_else(String::new, |part| format!("\"part\":{part},")),
             json_string(detail.text()),
             detail.truncated(),
         )
@@ -3770,12 +3815,12 @@ fn olean_rebuild_failure(
 
 fn olean_rebuild_error_class(error: &fln::OleanRebuildError) -> (&'static str, u8) {
     match error {
-        fln::OleanRebuildError::ArtifactTooLarge { .. }
-        | fln::OleanRebuildError::Region(
-            fln::OleanRegionError::BudgetExhausted { .. }
-            | fln::OleanRegionError::PayloadBudgetExhausted { .. },
-        ) => ("resource", 3),
-        fln::OleanRebuildError::Region(_) => ("rebuild", 1),
+        _ if error.is_resource_exhaustion() => ("resource", 3),
+        fln::OleanRebuildError::ArtifactTooLarge { .. } => ("resource", 3),
+        fln::OleanRebuildError::MissingPredecessor { .. } => ("missing-predecessor", 1),
+        fln::OleanRebuildError::Region(_) | fln::OleanRebuildError::PartRegion { .. } => {
+            ("rebuild", 1)
+        }
     }
 }
 
@@ -3820,7 +3865,420 @@ fn verify_olean_rebuild_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> Mul
     render_olean_rebuild_success(bytes.len(), &report, json)
 }
 
+/// PATH's module image, resolved from file names before anything is read.
+struct OleanChainPaths {
+    /// The part PATH itself names.
+    named: fln::OleanModulePart,
+    /// Every part in load order: its path, and whether anything exists there.
+    /// The named part counts as present; reading it reports otherwise.
+    parts: [(fln::OleanModulePart, PathBuf, bool); 3],
+}
+
+/// Resolve PATH to its module image. `X.olean.server` and `X.olean.private`
+/// name companions of `X.olean`, following the Reference's file naming
+/// (`OLeanLevel.adjustFileName`); any other PATH names an exported part. An
+/// exported PATH with neither companion beside it is a standalone image and
+/// resolves to `None`, so the single-file door stays exactly as it was.
+fn olean_chain_paths(path: &Path) -> Option<OleanChainPaths> {
+    let file_name = path
+        .file_name()
+        .map(std::ffi::OsStr::as_encoded_bytes)
+        .unwrap_or_default();
+    let named = if file_name.ends_with(b".olean.server") {
+        fln::OleanModulePart::Server
+    } else if file_name.ends_with(b".olean.private") {
+        fln::OleanModulePart::Private
+    } else {
+        fln::OleanModulePart::Exported
+    };
+    let exported = if named == fln::OleanModulePart::Exported {
+        path.to_path_buf()
+    } else {
+        // `X.olean.server` -> `X.olean`: drop exactly the companion suffix.
+        path.with_extension("")
+    };
+    let parts = fln::OleanModulePart::LOAD_ORDER.map(|part| {
+        if part == named {
+            return (part, path.to_path_buf(), true);
+        }
+        let mut candidate = exported.clone().into_os_string();
+        candidate.push(part.file_suffix());
+        let candidate = PathBuf::from(candidate);
+        // Anything at the path, even an unreadable or non-regular entry, puts
+        // the part in the chain, where reading it refuses typed.
+        let present = !matches!(
+            std::fs::symlink_metadata(&candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        (part, candidate, present)
+    });
+    let companion_present = parts
+        .iter()
+        .any(|(part, _, present)| *part != fln::OleanModulePart::Exported && *present);
+    (named != fln::OleanModulePart::Exported || companion_present)
+        .then_some(OleanChainPaths { named, parts })
+}
+
+/// Verify every present part of a module-system chain in load order, each
+/// against the parts the Reference loads before it.
+fn verify_olean_rebuild_chain(
+    chain: &OleanChainPaths,
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let failure = |class, part, detail: &str, exit_code| {
+        olean_rebuild_chain_failure(class, Some(part), detail, json, exit_code)
+    };
+    // PATH is read first, exactly as the single-file door reads it, so an
+    // unreadable PATH is reported as itself rather than as a missing part.
+    let mut named_bytes = None;
+    for (part, path, _) in &chain.parts {
+        if *part != chain.named {
+            continue;
+        }
+        match read_bounded(path, max_bytes, ".olean artifact chain") {
+            Ok(bytes) => named_bytes = Some(bytes),
+            Err(error) => {
+                return failure(error.class(), *part, &error.to_string(), error.exit_code());
+            }
+        }
+    }
+    // A present part whose predecessor is absent cannot be rebuilt: it holds
+    // pointers into that predecessor. Absent trailing parts leave a load-order
+    // prefix, which the Reference also loads.
+    let mut gap: Option<(fln::OleanModulePart, &Path)> = None;
+    for (part, path, present) in &chain.parts {
+        match (present, gap) {
+            (false, None) => gap = Some((*part, path)),
+            (true, Some((missing, missing_path))) => {
+                let error = fln::OleanRebuildError::MissingPredecessor {
+                    part: *part,
+                    missing,
+                };
+                let (class, exit_code) = olean_rebuild_error_class(&error);
+                return failure(
+                    class,
+                    missing,
+                    &format!("{error}: {} is absent", missing_path.display()),
+                    exit_code,
+                );
+            }
+            _ => {}
+        }
+    }
+    // `--max-bytes` bounds the parts together.
+    let mut total = named_bytes.as_ref().map_or(0, Vec::len);
+    let mut supplied: Vec<(fln::OleanModulePart, Vec<u8>)> = Vec::with_capacity(3);
+    for (part, path, present) in &chain.parts {
+        if !present {
+            continue;
+        }
+        let bytes = if *part == chain.named {
+            // Already counted in `total` when it was read.
+            named_bytes.take()
+        } else {
+            let remaining = max_bytes.saturating_sub(total);
+            match read_optional_olean_companion(path, remaining) {
+                Ok(bytes) => {
+                    if let Some(bytes) = &bytes {
+                        total = total.saturating_add(bytes.len());
+                    }
+                    bytes
+                }
+                Err(BoundedReadFailure::TooLarge { observed, .. }) => {
+                    return failure(
+                        "resource",
+                        *part,
+                        &format!(
+                            "{part} exceeds the module chain's {max_bytes}-byte input limit: \
+                             {total} bytes were already read from other parts, leaving \
+                             {remaining}, and {observed} bytes were read from {}",
+                            path.display()
+                        ),
+                        3,
+                    );
+                }
+                Err(error) => {
+                    return failure(error.class(), *part, &error.to_string(), error.exit_code());
+                }
+            }
+        };
+        let Some(bytes) = bytes else {
+            return failure(
+                "input",
+                *part,
+                &format!(
+                    "could not read .olean artifact chain: {} disappeared before it was read",
+                    path.display()
+                ),
+                1,
+            );
+        };
+        supplied.push((*part, bytes));
+    }
+    let part_bytes = |wanted: fln::OleanModulePart| {
+        supplied
+            .iter()
+            .find(|(part, _)| *part == wanted)
+            .map(|(_, bytes)| bytes.as_slice())
+    };
+    let Some(exported) = part_bytes(fln::OleanModulePart::Exported) else {
+        return failure(
+            "internal-fault",
+            fln::OleanModulePart::Exported,
+            "the resolved module chain has no exported part",
+            4,
+        );
+    };
+    let parts = fln::OleanModuleParts {
+        exported,
+        server: part_bytes(fln::OleanModulePart::Server),
+        private: part_bytes(fln::OleanModulePart::Private),
+    };
+    let rebuilt = match fln::rebuild_olean_module_artifacts(parts, max_bytes) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            let (class, exit_code) = olean_rebuild_error_class(&error);
+            let part = match &error {
+                fln::OleanRebuildError::PartRegion { part, .. } => Some(*part),
+                fln::OleanRebuildError::MissingPredecessor { missing, .. } => Some(*missing),
+                fln::OleanRebuildError::ArtifactTooLarge { .. }
+                | fln::OleanRebuildError::Region(_) => None,
+            };
+            return olean_rebuild_chain_failure(class, part, &error.to_string(), json, exit_code);
+        }
+    };
+    if rebuilt.len() != supplied.len()
+        || rebuilt
+            .iter()
+            .zip(&supplied)
+            .any(|(rebuilt, (part, _))| rebuilt.part != *part)
+    {
+        return olean_rebuild_chain_failure(
+            "internal-fault",
+            None,
+            "the chain rebuild did not answer once per supplied part, in load order",
+            json,
+            4,
+        );
+    }
+    if let Some((class, part, detail)) = olean_chain_refusal(&supplied, &rebuilt) {
+        return failure(class, part, &detail, 1);
+    }
+    render_olean_rebuild_chain_success(&rebuilt, json)
+}
+
+/// The first divergence or codec finding in load order, or `None` when every
+/// rebuilt part is byte-identical to its input with no finding. `rebuilt` must
+/// answer `supplied` part for part.
+fn olean_chain_refusal(
+    supplied: &[(fln::OleanModulePart, Vec<u8>)],
+    rebuilt: &[fln::OleanPartRebuild],
+) -> Option<(&'static str, fln::OleanModulePart, String)> {
+    for (rebuilt, (part, original)) in rebuilt.iter().zip(supplied) {
+        if let Some(offset) = first_byte_difference(original, &rebuilt.bytes) {
+            return Some((
+                "divergence",
+                *part,
+                format!(
+                    "{part} re-derived bytes first differ at byte {offset}; input has {} bytes \
+                     and rebuild has {} bytes",
+                    original.len(),
+                    rebuilt.bytes.len()
+                ),
+            ));
+        }
+        if let Some(first) = rebuilt.report.findings.first() {
+            return Some((
+                "finding",
+                *part,
+                format!(
+                    "{part} rebuild reported {} codec finding(s); first: {first}",
+                    rebuilt.report.findings.len()
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// One part's rebuild accounting, or the sum over a verified chain's parts.
+struct OleanChainTotals {
+    bytes: usize,
+    objects: usize,
+    rederived_bytes: u64,
+    copied_content_bytes: u64,
+    padding_bytes: u64,
+    nonzero_padding_bytes: u64,
+    slack_bytes: u64,
+    dependency_pointers: u64,
+}
+
+impl OleanChainTotals {
+    fn of_part(rebuilt: &fln::OleanPartRebuild) -> Option<Self> {
+        let report = &rebuilt.report;
+        Some(Self {
+            bytes: rebuilt.bytes.len(),
+            objects: report.objects,
+            rederived_bytes: report.rederived_bytes,
+            copied_content_bytes: copied_content_bytes(report)?,
+            padding_bytes: report.padding_bytes,
+            nonzero_padding_bytes: report.nonzero_padding_bytes,
+            slack_bytes: report.slack_bytes,
+            dependency_pointers: report.dependency_pointers,
+        })
+    }
+
+    fn checked_add(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            bytes: self.bytes.checked_add(other.bytes)?,
+            objects: self.objects.checked_add(other.objects)?,
+            rederived_bytes: self.rederived_bytes.checked_add(other.rederived_bytes)?,
+            copied_content_bytes: self
+                .copied_content_bytes
+                .checked_add(other.copied_content_bytes)?,
+            padding_bytes: self.padding_bytes.checked_add(other.padding_bytes)?,
+            nonzero_padding_bytes: self
+                .nonzero_padding_bytes
+                .checked_add(other.nonzero_padding_bytes)?,
+            slack_bytes: self.slack_bytes.checked_add(other.slack_bytes)?,
+            dependency_pointers: self
+                .dependency_pointers
+                .checked_add(other.dependency_pointers)?,
+        })
+    }
+
+    fn json_members(&self) -> String {
+        format!(
+            concat!(
+                "\"bytes\":{},\"byteIdentity\":true,\"objects\":{},",
+                "\"accounting\":{{\"rederivedBytes\":{},\"copiedContentBytes\":{},",
+                "\"paddingBytes\":{},\"nonzeroPaddingBytes\":{},\"slackBytes\":{},",
+                "\"dependencyPointers\":{}}},\"findings\":0"
+            ),
+            self.bytes,
+            self.objects,
+            self.rederived_bytes,
+            self.copied_content_bytes,
+            self.padding_bytes,
+            self.nonzero_padding_bytes,
+            self.slack_bytes,
+            self.dependency_pointers,
+        )
+    }
+}
+
+fn render_olean_rebuild_chain_success(
+    rebuilt: &[fln::OleanPartRebuild],
+    json: bool,
+) -> MultiplexerOutput {
+    let mut rows = Vec::with_capacity(rebuilt.len());
+    let mut total = OleanChainTotals {
+        bytes: 0,
+        objects: 0,
+        rederived_bytes: 0,
+        copied_content_bytes: 0,
+        padding_bytes: 0,
+        nonzero_padding_bytes: 0,
+        slack_bytes: 0,
+        dependency_pointers: 0,
+    };
+    for part in rebuilt {
+        let Some(row) = OleanChainTotals::of_part(part) else {
+            return olean_rebuild_chain_failure(
+                "internal-fault",
+                Some(part.part),
+                "rebuild report content-byte accounting overflowed",
+                json,
+                4,
+            );
+        };
+        let Some(sum) = total.checked_add(&row) else {
+            return olean_rebuild_chain_failure(
+                "internal-fault",
+                Some(part.part),
+                "module chain rebuild accounting overflowed",
+                json,
+                4,
+            );
+        };
+        total = sum;
+        rows.push((part.part, row));
+    }
+    let names = rows
+        .iter()
+        .map(|(part, _)| part.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stdout = if json {
+        let rows = rows
+            .iter()
+            .map(|(part, row)| {
+                format!(
+                    "{{\"part\":{},{}}}",
+                    json_string(&part.to_string()),
+                    row.json_members()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"schema\":{},\"outcome\":\"complete\",\"parts\":{},{},\"rows\":[{}]}}\n",
+            json_string(OLEAN_REBUILD_CHAIN_SCHEMA),
+            rebuilt.len(),
+            total.json_members(),
+            rows,
+        )
+    } else {
+        let mut text = format!(
+            concat!(
+                "pinned .olean rebuild audit: complete\n",
+                "module-system chain: {} parts ({}), each rebuilt against the parts loaded before it\n",
+                "bytes: {}\n",
+                "byte identity: exact\n",
+                "objects: {}\n",
+                "re-derived bytes: {}\n",
+                "declared content bytes: {}\n",
+                "padding bytes: {} ({} nonzero)\n",
+                "capacity slack bytes: {}\n",
+                "dependency pointers: {}\n",
+                "findings: 0\n"
+            ),
+            rebuilt.len(),
+            names,
+            total.bytes,
+            total.objects,
+            total.rederived_bytes,
+            total.copied_content_bytes,
+            total.padding_bytes,
+            total.nonzero_padding_bytes,
+            total.slack_bytes,
+            total.dependency_pointers,
+        );
+        for (part, row) in &rows {
+            text.push_str(&format!(
+                "part {part}: {} bytes, byte identity exact, {} objects, {} re-derived, \
+                 {} declared content, {} padding ({} nonzero), {} slack, \
+                 {} dependency pointers, 0 findings\n",
+                row.bytes,
+                row.objects,
+                row.rederived_bytes,
+                row.copied_content_bytes,
+                row.padding_bytes,
+                row.nonzero_padding_bytes,
+                row.slack_bytes,
+                row.dependency_pointers,
+            ));
+        }
+        text
+    };
+    MultiplexerOutput::success(stdout)
+}
+
 fn verify_olean_rebuild(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    if let Some(chain) = olean_chain_paths(path) {
+        return verify_olean_rebuild_chain(&chain, max_bytes, json);
+    }
     let bytes = match read_bounded(path, max_bytes, ".olean artifact") {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -14738,6 +15196,59 @@ mod tests {
         assert!(exhausted.stdout.is_empty());
         assert!(exhausted.stderr.contains("\"class\":\"resource\""));
         assert!(exhausted.stderr.contains("\"detailTruncated\":false"));
+    }
+
+    /// The chain verdict's divergence and finding branches. A correct rebuild
+    /// never diverges on real input, because every byte it re-derives is a
+    /// function of parsed semantics; only a rebuild defect reaches these
+    /// branches. So the cells perturb a real rebuild of the committed pinned
+    /// `Init/Prelude` chain, standing in for that defect.
+    #[test]
+    fn olean_chain_verdict_names_the_first_refusing_part_in_load_order() {
+        let supplied: Vec<(fln::OleanModulePart, Vec<u8>)> = fln::OleanModulePart::LOAD_ORDER
+            .into_iter()
+            .map(|part| {
+                let path = repository_path(&format!(
+                    "crates/fln-conformance/fixtures/tag_attributes/prelude{part}"
+                ));
+                (part, std::fs::read(&path).expect("pinned chain part"))
+            })
+            .collect();
+        let rebuilt = fln::rebuild_olean_module_artifacts(
+            fln::OleanModuleParts {
+                exported: &supplied[0].1,
+                server: Some(&supplied[1].1),
+                private: Some(&supplied[2].1),
+            },
+            usize::MAX,
+        )
+        .expect("the pinned chain rebuilds");
+        assert_eq!(super::olean_chain_refusal(&supplied, &rebuilt), None);
+
+        let mut diverged = rebuilt.clone();
+        diverged[1].bytes[200] ^= 1;
+        let (class, part, detail) =
+            super::olean_chain_refusal(&supplied, &diverged).expect("a divergence");
+        assert_eq!((class, part), ("divergence", fln::OleanModulePart::Server));
+        assert!(
+            detail.starts_with(".olean.server re-derived bytes first differ at byte 200;"),
+            "{detail}"
+        );
+
+        let mut found = rebuilt.clone();
+        found[2].report.findings.push("planted finding".to_owned());
+        let (class, part, detail) =
+            super::olean_chain_refusal(&supplied, &found).expect("a finding");
+        assert_eq!((class, part), ("finding", fln::OleanModulePart::Private));
+        assert!(detail.ends_with("first: planted finding"), "{detail}");
+
+        // Load order decides: an earlier part's finding outranks a later
+        // part's divergence.
+        let mut both = rebuilt;
+        both[2].bytes[200] ^= 1;
+        both[1].report.findings.push("planted finding".to_owned());
+        let (class, part, _) = super::olean_chain_refusal(&supplied, &both).expect("a refusal");
+        assert_eq!((class, part), ("finding", fln::OleanModulePart::Server));
     }
 
     #[test]
