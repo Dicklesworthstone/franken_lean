@@ -9,6 +9,7 @@
 //! stuck. Nat literal majors are exposed one constructor layer at a time;
 //! string literal majors and native extensions remain outside this layer.
 
+mod free_bindings;
 mod memo;
 mod quotient;
 mod sharing;
@@ -1029,6 +1030,8 @@ struct Reducer<'a, 'c> {
     control: Control,
     cancelled: &'c mut dyn FnMut() -> bool,
     unfolded_bindings: BTreeSet<usize>,
+    /// Fully checked dependency subgraphs in this immutable context.
+    acyclic_bindings: BTreeSet<usize>,
     delta_mode: DeltaMode,
     /// Which open operands a Nat operation at the head may normalize.
     head_nat: NatReductionScope,
@@ -3329,7 +3332,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }
                 HeadAction::Free(Some(binding)) => {
                     if !self.unfolded_bindings.insert(binding) {
-                        return Err(Halt::Refusal(WhnfRefusal::FreeBindingCycle { binding }));
+                        // Reuse after beta or projection is not itself a cycle.
+                        self.validate_free_binding_dependencies(binding)?;
                     }
                     self.control
                         .reduction(current.root.index(), self.cancelled)?;
@@ -4880,6 +4884,7 @@ fn whnf_at_mode_with(
         control,
         cancelled,
         unfolded_bindings: BTreeSet::new(),
+        acyclic_bindings: BTreeSet::new(),
         delta_mode,
         head_nat,
         delta_reductions: 0,
