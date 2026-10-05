@@ -460,6 +460,24 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          laws it applies are the two pin lanes above plus the header pin, each with its \
          per-commit planted case, and no coverage row may cite this function as a CI run",
     ),
+    (
+        "crates/fln/src/lib.rs",
+        "every_declaration_under_the_roots_reads_the_same_to_both_decoders",
+        "an on-demand whole-library lane (bead franken_lean-z8j.1.14): it reads every \
+         declaration of every module under FLN_READING_DIFF_ROOTS, else the pinned \
+         toolchain's lib/lean, through both fln-olean and the checker's own reader. Its \
+         recorded runs (79b5e477): pinned stdlib 215,136/215,136 identical, and Mathlib plus \
+         packages 587,010/587,010. It needs the pin or a provisioned corpus and walks gigabytes, \
+         so it never runs per push. Run it with `cargo test --release -p fln --lib -- \
+         --ignored every_declaration_under_the_roots_reads_the_same_to_both_decoders`. What \
+         holds the comparison per commit is planted, not the pin: \
+         `the_checker_reads_every_fixture_as_the_primary_decodes_it` compares both readings \
+         over every fixture shape and framing, and \
+         `a_planted_primary_misreading_of_a_binder_is_a_council_disagreement` shows a \
+         misreading reaches the council as a disagreement. Nothing per commit re-reads the \
+         pin's own modules through both readers, and no coverage row may cite this function \
+         as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -516,7 +534,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// Declared from their own docstrings and commit measurements as on-demand lanes, each
 /// with the planted per-commit case that holds its law and the statement that nothing per
 /// commit re-reads the pin itself. One commit, three entries, one ceiling move.
-const IGNORED_PRODUCER_CEILING: usize = 17;
+///
+/// 17 -> 18 for `crates/fln/src/lib.rs`'s decoder differential (bead
+/// `franken_lean-z8j.1.14`): `79b5e477` landed it `#[ignore]`d and undeclared, which reddened
+/// this suite from 2026-10-05. Declared from its docstring and that commit's measurement as an
+/// on-demand lane, with the two planted per-commit cells that hold the comparison.
+const IGNORED_PRODUCER_CEILING: usize = 18;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1879,7 +1902,7 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=7 rows=7 citations=8 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=8 rows=13 citations=14 all-rows-declared=true
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.
@@ -1887,6 +1910,11 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `surfaces` rose 6 -> 7 with the declaration of the three `fln-fur.1` scans in
     // crates/fln-olean/tests/pinned_header_scan.rs (2026-10-05). `rows` and `citations` are
     // unmoved: no terminal row cites that surface.
+    //
+    // `surfaces` rose 7 -> 8 with the declaration of `franken_lean-z8j.1.14`'s decoder
+    // differential in crates/fln/src/lib.rs (2026-10-05). `rows` rose 7 -> 13 and `citations`
+    // 8 -> 14 with it: six terminal rows cite crates/fln/src/lib.rs at file granularity. All
+    // six were already in FILE_GRANULAR_EVIDENCE_ALLOWANCE, so `all-rows-declared` holds.
     //
     // `rows` and `citations` fell 10 -> 7 and 11 -> 8 when `fln-7odd`, `fln-corpus-thread-matrix-93te`
     // and `fln-kx3y` were migrated off file-granular citations; `surfaces` is unmoved because
