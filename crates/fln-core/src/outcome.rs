@@ -194,6 +194,10 @@ pub enum InconclusiveCause {
     /// governed file, an incomplete traversal, a source that changed underfoot. The
     /// scan is not clean; it is unfinished.
     AuthorityIncomplete { what: BoundedText },
+    /// The input uses a construct this implementation cannot judge yet: a payload the
+    /// decoder does not interpret, or a declaration shape the checker facade cannot
+    /// rebuild. A limit of the tool, never evidence that the input is wrong.
+    Unsupported { construct: BoundedText },
 }
 
 /// An operation that did not complete, with the cause and the diagnostic vocabulary
@@ -303,6 +307,16 @@ impl Inconclusive {
         Inconclusive {
             cause: InconclusiveCause::AuthorityIncomplete {
                 what: BoundedText::new(what),
+            },
+            diagnostic: None,
+            progress: None,
+        }
+    }
+
+    pub fn unsupported(construct: impl Into<String>) -> Inconclusive {
+        Inconclusive {
+            cause: InconclusiveCause::Unsupported {
+                construct: BoundedText::new(construct),
             },
             diagnostic: None,
             progress: None,
@@ -683,6 +697,12 @@ mod tests {
         assert!(matches!(
             unavailable.cause,
             InconclusiveCause::DependencyUnavailable { .. }
+        ));
+
+        let unsupported = Inconclusive::unsupported("Name.num mpz");
+        assert!(matches!(
+            unsupported.cause,
+            InconclusiveCause::Unsupported { .. }
         ));
 
         let incomplete = Inconclusive::authority_incomplete("crates/x/src/y.rs unreadable");

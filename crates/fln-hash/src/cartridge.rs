@@ -1327,7 +1327,8 @@ impl CartridgeArchiveV1 {
                                 WarmCacheStateV1::ResourceLimited
                             }
                             InconclusiveCause::DependencyUnavailable { .. }
-                            | InconclusiveCause::AuthorityIncomplete { .. } => {
+                            | InconclusiveCause::AuthorityIncomplete { .. }
+                            | InconclusiveCause::Unsupported { .. } => {
                                 WarmCacheStateV1::InternalFault
                             }
                         },
@@ -1342,9 +1343,8 @@ impl CartridgeArchiveV1 {
                         WarmCacheStateV1::ResourceLimited
                     }
                     InconclusiveCause::DependencyUnavailable { .. }
-                    | InconclusiveCause::AuthorityIncomplete { .. } => {
-                        WarmCacheStateV1::InternalFault
-                    }
+                    | InconclusiveCause::AuthorityIncomplete { .. }
+                    | InconclusiveCause::Unsupported { .. } => WarmCacheStateV1::InternalFault,
                 },
                 Outcome::InternalFault(_) => WarmCacheStateV1::InternalFault,
             };

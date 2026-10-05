@@ -158,6 +158,7 @@ fn render(i: usize, outcome: &Outcome<Verdict>) -> String {
                 InconclusiveCause::Cancelled { .. } => "cancelled".to_string(),
                 InconclusiveCause::DependencyUnavailable { .. } => "dependency".to_string(),
                 InconclusiveCause::AuthorityIncomplete { .. } => "authority".to_string(),
+                InconclusiveCause::Unsupported { .. } => "unsupported".to_string(),
             };
             format!("{i} inconclusive {cause}")
         }

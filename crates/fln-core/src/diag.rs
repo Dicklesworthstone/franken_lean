@@ -1024,6 +1024,7 @@ fn structured_inconclusive(inconclusive: &crate::outcome::Inconclusive) -> Struc
             ("dependency_unavailable", what.clone())
         }
         InconclusiveCause::AuthorityIncomplete { what } => ("authority_incomplete", what.clone()),
+        InconclusiveCause::Unsupported { construct } => ("unsupported", construct.clone()),
     };
     StructuredInconclusive {
         cause_class,
