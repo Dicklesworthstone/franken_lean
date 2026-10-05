@@ -321,12 +321,31 @@ impl std::fmt::Display for CanonError {
 /// learns "too large" without first materialising the whole encoding: a term
 /// whose tree encoding is hundreds of megabytes costs at most `limit` bytes.
 /// The bytes written below the limit are identical to the unbounded encoding.
+///
+/// A hashing writer ([`CanonHasher`]) and a counting writer
+/// ([`CanonWriter::counting`]) store no encoding at all: the first feeds its
+/// bytes to a domain hasher in [`HASH_CHUNK`] pieces, the second only counts
+/// them. A tree encoding of a heavily shared expression can run to gigabytes;
+/// its digest and its length then cost a bounded buffer, not the encoding.
 #[derive(Debug)]
 pub struct CanonWriter {
     buf: Vec<u8>,
     limit: usize,
     overflowed: bool,
+    /// Bytes accepted so far, in every mode.
+    written: usize,
+    sink: Sink,
 }
+
+#[derive(Debug)]
+enum Sink {
+    Store,
+    Hash(Box<crate::domain::DomainHasher>),
+    Count,
+}
+
+/// Bytes a hashing writer buffers before handing them to its hasher.
+pub const HASH_CHUNK: usize = 64 * 1024;
 
 impl Default for CanonWriter {
     fn default() -> CanonWriter {
@@ -334,6 +353,8 @@ impl Default for CanonWriter {
             buf: Vec::new(),
             limit: usize::MAX,
             overflowed: false,
+            written: 0,
+            sink: Sink::Store,
         }
     }
 }
@@ -357,16 +378,42 @@ impl CanonWriter {
         self.overflowed
     }
 
+    /// A writer that keeps only the length of what it is given.
+    pub fn counting() -> CanonWriter {
+        CanonWriter {
+            sink: Sink::Count,
+            ..CanonWriter::default()
+        }
+    }
+
+    /// Bytes accepted so far: the encoding's length, in every mode.
+    pub fn written(&self) -> usize {
+        self.written
+    }
+
+    /// The stored encoding. A hashing or counting writer stores none, so this is
+    /// empty or a buffered tail for those; read their digest or length instead.
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
 
     fn put(&mut self, v: &[u8]) {
-        if self.overflowed || v.len() > self.limit - self.buf.len() {
+        if self.overflowed || v.len() > self.limit - self.written {
             self.overflowed = true;
             return;
         }
-        self.buf.extend_from_slice(v);
+        self.written += v.len();
+        match &mut self.sink {
+            Sink::Store => self.buf.extend_from_slice(v),
+            Sink::Count => {}
+            Sink::Hash(hasher) => {
+                self.buf.extend_from_slice(v);
+                if self.buf.len() >= HASH_CHUNK {
+                    hasher.update(&self.buf);
+                    self.buf.clear();
+                }
+            }
+        }
     }
 
     pub fn u8(&mut self, v: u8) {
@@ -407,6 +454,53 @@ impl CanonWriter {
     pub fn schema(&mut self, id: SchemaId) {
         self.str(id.name);
         self.u16(id.version);
+    }
+}
+
+/// A canonical writer whose encoding is hashed as it is written: its digest is
+/// `hash(domain, bytes)` of the whole encoding, while it holds at most about
+/// [`HASH_CHUNK`] bytes. Write through it as through a [`CanonWriter`].
+#[derive(Debug)]
+pub struct CanonHasher {
+    writer: CanonWriter,
+    domain: crate::domain::Domain,
+}
+
+impl CanonHasher {
+    pub fn new(domain: crate::domain::Domain) -> CanonHasher {
+        CanonHasher {
+            writer: CanonWriter {
+                sink: Sink::Hash(Box::new(crate::domain::DomainHasher::new(domain))),
+                ..CanonWriter::default()
+            },
+            domain,
+        }
+    }
+
+    /// The digest of everything written, equal to `hash(domain, bytes)`.
+    pub fn finish(self) -> crate::domain::Digest {
+        let CanonWriter { buf, sink, .. } = self.writer;
+        match sink {
+            Sink::Hash(mut hasher) => {
+                hasher.update(&buf);
+                hasher.finalize()
+            }
+            // Never constructed so; a writer that kept its bytes hashes them whole.
+            Sink::Store | Sink::Count => crate::domain::hash(self.domain, &buf),
+        }
+    }
+}
+
+impl std::ops::Deref for CanonHasher {
+    type Target = CanonWriter;
+    fn deref(&self) -> &CanonWriter {
+        &self.writer
+    }
+}
+
+impl std::ops::DerefMut for CanonHasher {
+    fn deref_mut(&mut self) -> &mut CanonWriter {
+        &mut self.writer
     }
 }
 
@@ -3962,5 +4056,39 @@ mod tests {
         let mut unbounded = CanonWriter::new();
         unbounded.u64(u64::MAX);
         assert!(!unbounded.overflowed());
+    }
+
+    #[test]
+    fn a_hashing_writer_digests_the_stored_encoding_within_one_chunk() {
+        use crate::domain::{Domain, hash};
+        let write = |w: &mut CanonWriter| {
+            for i in 0..(10 * HASH_CHUNK / 7) {
+                w.str("chunk");
+                w.u16(u16::try_from(i % 65_536).unwrap_or(0));
+            }
+        };
+        let mut stored = CanonWriter::new();
+        write(&mut stored);
+        let mut counted = CanonWriter::counting();
+        write(&mut counted);
+        let mut hashed = CanonHasher::new(Domain::DeclContent);
+        write(&mut hashed);
+        let bytes = stored.into_bytes();
+        assert!(
+            bytes.len() > 9 * HASH_CHUNK,
+            "the stream must span many chunks"
+        );
+        assert!(
+            hashed.writer.buf.capacity() <= 2 * HASH_CHUNK,
+            "a hashing writer held {} bytes",
+            hashed.writer.buf.capacity()
+        );
+        assert_eq!(counted.written(), bytes.len());
+        assert_eq!(hashed.written(), bytes.len());
+        assert_eq!(hashed.finish(), hash(Domain::DeclContent, &bytes));
+        // A different stream is a different digest, not a constant.
+        let mut other = CanonHasher::new(Domain::DeclContent);
+        other.str("chunk");
+        assert_ne!(other.finish(), hash(Domain::DeclContent, &bytes));
     }
 }

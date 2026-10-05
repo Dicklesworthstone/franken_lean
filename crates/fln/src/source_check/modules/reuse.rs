@@ -352,17 +352,18 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
     let digit = |c: u8| match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
         _ => None,
     };
-    text.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some((digit(pair[0])? << 4) | digit(pair[1])?))
+    let (pairs, odd) = text.as_bytes().as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|&[high, low]| Some((digit(high)? << 4) | digit(low)?))
         .collect()
 }
 
@@ -715,7 +716,7 @@ pub enum ImportPostureRequest<'a> {
 /// A reused closure, or why its record was refused.
 #[derive(Debug)]
 pub enum ImportReuse {
-    Reused(SourceOleanImport),
+    Reused(Box<SourceOleanImport>),
     Refused(ImportReuseRefusal),
 }
 
@@ -795,7 +796,7 @@ impl Engine {
                 )? {
                     Outcome::Complete(ImportReuse::Reused(import)) => {
                         return Ok(Outcome::Complete((
-                            import,
+                            *import,
                             ImportPostureReport {
                                 posture: ImportPosture::ReuseVerified,
                                 admission: ImportAdmission::Reused,
@@ -907,7 +908,7 @@ impl Engine {
                 },
             )));
         }
-        Ok(Outcome::Complete(ImportReuse::Reused(import)))
+        Ok(Outcome::Complete(ImportReuse::Reused(Box::new(import))))
     }
 
     /// **THE D6 CARVE-OUT.** The only production code outside `fln-kernel` that places a

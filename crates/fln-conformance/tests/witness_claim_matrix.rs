@@ -113,10 +113,11 @@ fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
 
     assert_eq!(report.rows(), CLAIM_MATRIX.len(), "every row was decided");
     assert_eq!(
-        report.enforced, 3,
-        "three repairs are protected: the fln-olean header (86035037), the README install \
-         one-liner (a368ea0b), and the README bench-apparatus inventory \
-         (fln-bench-apparatus-empty-referent-bkw6)"
+        report.enforced, 9,
+        "nine repairs are protected: the fln-olean header (86035037), the README install \
+         one-liner (a368ea0b), the README bench-apparatus inventory \
+         (fln-bench-apparatus-empty-referent-bkw6), and six README sentences corrected by \
+         franken_lean-z8j.1.19"
     );
     assert_eq!(
         report.supported, 1,
@@ -259,7 +260,16 @@ fn the_matrix_states_what_it_does_not_govern() {
 
 #[test]
 fn a_repaired_overclaim_coming_back_is_caught() {
-    for id in ["OLEAN-WRITE-CRATE-HEADER", "INSTALL-ONELINER-RUNNABLE"] {
+    for id in [
+        "OLEAN-WRITE-CRATE-HEADER",
+        "INSTALL-ONELINER-RUNNABLE",
+        "README-DROP-IN-TODAY",
+        "README-COMPARISON-TABLE-PRESENT-TENSE",
+        "README-TRUST-BULLETS-PRESENT-TENSE",
+        "README-LEANC-LIVE-TODAY",
+        "README-SUITE-LINKED",
+        "README-PG5-NO-REFERENCE-IN-CI",
+    ] {
         let target = row(id);
         assert_eq!(target.enforcement, Enforcement::Enforced);
         let site = target.sites.first().expect("enforced rows have a site");

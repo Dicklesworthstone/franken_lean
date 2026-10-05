@@ -35,7 +35,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fln-u1vk-evidence"
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/fln-u1vk-target-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           git rev-parse HEAD | tee "$RUNNER_TEMP/fln-u1vk-evidence/base.txt"
-          test "$(git hash-object crates/fln-checker/src/whnf.rs)" = 79d80c6e5bf599a246c2a50d6d8befd174b7dc2c
+          test "$(git hash-object crates/fln-checker/src/whnf.rs)" = 3ea988eb79da556f3cede8a5bfb50f0d53343010
           git apply --check .github/patches/fln-free-binding-reuse-u1vk.patch
           rustup show active-toolchain 2>&1 | tee "$RUNNER_TEMP/fln-u1vk-evidence/toolchain.txt"
           rustc -Vv 2>&1 | tee -a "$RUNNER_TEMP/fln-u1vk-evidence/toolchain.txt"

@@ -248,12 +248,18 @@ fn a_changed_olean_byte_or_another_checker_forces_readmission() {
     install(&original);
 
     // Another checker identity: the same program with bytes appended.
-    let mut other_bytes = std::fs::read(&fln).unwrap();
-    other_bytes.extend_from_slice(b"\0fln-uyuz another checker identity\0");
-    let other = scratch.write("bin/fln-other", &other_bytes);
-    let mut permissions = std::fs::metadata(&fln).unwrap().permissions();
-    permissions.set_readonly(false);
-    std::fs::set_permissions(&other, permissions).unwrap();
+    // `fs::copy` carries the executable bits; the appended bytes change only the identity.
+    let other = scratch.0.join("bin/fln-other");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::copy(&fln, &other).unwrap();
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&other)
+            .unwrap(),
+        b"\0fln-uyuz another checker identity\0",
+    )
+    .unwrap();
     let elsewhere = run(&other).stdout();
     assert_eq!(member(&elsewhere, "record"), Some("absent"), "{elsewhere}");
     assert_eq!(

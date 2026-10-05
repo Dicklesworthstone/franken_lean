@@ -6,6 +6,8 @@ Historical synthesis: project inception on **2026-07-21** through the September 
 
 No GitHub Release is implied by this history. Representative commits are navigation aids, not substitutes for the Beads graph, generated contracts, real-artifact receipts, or governed release evidence.
 
+**Coverage gap, recorded 2026-10-05 (bead `franken_lean-z8j.1.19`).** No entry below covers anything after 2026-09-08. At `1c17da46`, `git rev-list --count --after=2026-09-08T23:59:59-04:00 main` counts 1,126 commits on `main` that this file does not describe. They include `.olean` emission from `lake build`, the native editor goal, hover, definition and completion queries, and the Reference differential and ordinary-Lean probes. Until the catch-up lands, [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the record of current state.
+
 ---
 
 ## Native proof automation — 2026-09-08 (America/New_York)

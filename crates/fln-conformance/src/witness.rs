@@ -250,7 +250,7 @@ pub struct ConceptCensus {
 /// What this matrix does and does not govern. Data, not a doc comment, so it is printable at
 /// failure time.
 pub const GOVERNED_SCOPE: &str = "\
-Eighteen rows over five documents (README.md, AGENTS.md, \
+Twenty-four rows over five documents (README.md, AGENTS.md, \
 COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, crates/fln-olean/src/lib.rs, \
 ci/PARITY_LEDGER.txt) plus \
 three concept censuses over README.md, AGENTS.md and \
@@ -262,7 +262,7 @@ class as one that overstates. NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
 claim in these documents is unwatched. Every row now cites at least one checkable fact \
-(nineteen citations over eighteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+(twenty-five citations over twenty-four rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
 only rot someone anticipated well enough to cite, and it protects one clause of a \
 multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
 cited, and it is not the clause its state depends on. Both rows that actually rotted on \
@@ -379,6 +379,45 @@ const SITES_BENCH_APPARATUS: [ClaimSite; 1] = [site(
     "Every gate has a bench binary, a committed baseline, a variance budget, and a flame \
      artifact on regression",
 )];
+// The README sentences bead franken_lean-z8j.1.19 corrected on 2026-10-05. Each site is the
+// exact text that was removed, so these rows fail if it comes back.
+const SITES_README_DROP_IN_TODAY: [ClaimSite; 1] = [site(
+    README,
+    "# It's a drop-in: your project, your editor, your lakefile, unchanged.",
+)];
+const SITES_README_COMPARISON_TABLE: [ClaimSite; 4] = [
+    site(
+        README,
+        "| Runs mathlib's tactics | ✓ unmodified, on our VM |",
+    ),
+    site(
+        README,
+        "| `.olean` write / ABI / LSP | ✓ / ✓ / ✓ (byte-compatible) |",
+    ),
+    site(
+        README,
+        "| Deterministic parallel elaboration | ✓ invariant, tested per commit |",
+    ),
+    site(
+        README,
+        "| Proof certificates / transparency log | ✓ by default |",
+    ),
+];
+const SITES_README_TRUST_BULLETS: [ClaimSite; 2] = [
+    site(README, "- **Consensus with receipts.** Two kernel engines"),
+    site(README, "- **The WASM Judge.** The certified engine"),
+];
+const SITES_README_LEANC_LIVE: [ClaimSite; 1] = [site(
+    README,
+    "and the `leanc` toolchain personality are implemented and tested against real pinned \
+     artifacts",
+)];
+const SITES_README_SUITE_LINKED: [ClaimSite; 1] =
+    [site(README, "(linked by operator decision, 2026-09-27)")];
+const SITES_README_PG5_NO_REFERENCE_IN_CI: [ClaimSite; 1] = [site(
+    README,
+    "(32.1 min/run; CI installs no Reference toolchain)",
+)];
 
 /// **The claim matrix.**
 ///
@@ -395,7 +434,7 @@ const SITES_BENCH_APPARATUS: [ClaimSite; 1] = [site(
 /// re-executes the pinned Reference kernel and is therefore `ReferenceKernelOracle`, not an
 /// independent implementation. The closed `fln-hfch` verification-manifest row records that
 /// authority boundary. Calling the lane a foreign witness hid the missing independent opinion.
-pub const CLAIM_MATRIX: [ClaimRow; 18] = [
+pub const CLAIM_MATRIX: [ClaimRow; 24] = [
     // ---- the term itself, before any row that uses it -------------------------------
     ClaimRow {
         id: "PARITY-LEDGER-L2-MEANS-TWO-THINGS",
@@ -618,7 +657,7 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_DOCS_CI,
         claim_type: ClaimType::Invariant,
         state: ClaimState::Targeted,
-        evidence: "This module is the enforcing slice and governs seventeen rows over five \
+        evidence: "This module is the enforcing slice and governs twenty-four rows over five \
                    documents plus three censuses. The claim as written implies coverage of all \
                    documentation, which is not true and is why GOVERNED_SCOPE exists. Promote \
                    only when franken_lean-n8hw delivers the full matrix.",
@@ -750,6 +789,89 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    unused, which is the right order to build one in.",
         enforcement: Enforcement::Enforced,
     },
+    // ---- README true-up, bead franken_lean-z8j.1.19 (2026-10-05) ----------------------
+    ClaimRow {
+        id: "README-DROP-IN-TODAY",
+        sites: &SITES_README_DROP_IN_TODAY,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). The quick example's \
+                   comment said the drop-in already works unchanged on your project, editor \
+                   and lakefile. Measured at 49b53289 by the checked-in ordinary-Lean probe \
+                   (crates/fln-cli/tests/ordinary_lean_probe.rs): the drop-in `lean` accepts 3 \
+                   of the 27 programs the pinned Reference accepts. The comment now says the \
+                   drop-in is the 1.0 target and points at Live today.",
+        enforcement: Enforcement::Enforced,
+    },
+    ClaimRow {
+        id: "README-COMPARISON-TABLE-PRESENT-TENSE",
+        sites: &SITES_README_COMPARISON_TABLE,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). Four cells of the How it \
+                   compares table gave the 1.0 target as a bare tick: mathlib tactics on our \
+                   VM, byte-compatible .olean write/ABI/LSP, deterministic parallel \
+                   elaboration, and certificates with a transparency log by default. No \
+                   mathlib tactic has run on Golem; .olean emission is pinned-format and not \
+                   claimed byte-identical to the Reference's; no front door uses fln-elab's \
+                   deterministic scheduler; receipts are opt-in and there is no transparency \
+                   log. The column header now labels the target, and each cell states today's \
+                   state after it. All four sites must stay absent.",
+        enforcement: Enforcement::Enforced,
+    },
+    ClaimRow {
+        id: "README-TRUST-BULLETS-PRESENT-TENSE",
+        sites: &SITES_README_TRUST_BULLETS,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). Two bullets under \
+                   Determinism, trust & verification described a council of two kernel \
+                   engines with foreign witnesses and a Merkle transparency log, and a WASM \
+                   Judge, as current. Today there is one kernel engine (K1) plus the \
+                   independent checker, no foreign witness on the council and no transparency \
+                   log (see B3-DUAL-ENGINE), and no workflow or script builds a WASM artifact. \
+                   Each bullet now opens with a 1.0-target note.",
+        enforcement: Enforcement::Enforced,
+    },
+    ClaimRow {
+        id: "README-LEANC-LIVE-TODAY",
+        sites: &SITES_README_LEANC_LIVE,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). Live today listed the \
+                   `leanc` personality as implemented and tested against real pinned \
+                   artifacts. It drives the host C compiler with the pin's flags, and all four \
+                   of its platform link lines in crates/fln-cli/src/lib.rs name the \
+                   Reference's runtime libraries (-lleancpp -lLean -lInit -lleanrt), which \
+                   FrankenLean does not build. The paragraph now says so.",
+        enforcement: Enforcement::Enforced,
+    },
+    ClaimRow {
+        id: "README-SUITE-LINKED",
+        sites: &SITES_README_SUITE_LINKED,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). The Dependencies row said \
+                   the FrankenSuite was linked by operator decision on 2026-09-27. The decision \
+                   admitted it; nothing links it. Cargo.lock holds 33 packages, all workspace \
+                   members, with no external source entry (the same fact SUITE-INTEGRATION \
+                   cites). AGENTS.md still says the suite was linked; that copy is not governed \
+                   by this row.",
+        enforcement: Enforcement::Enforced,
+    },
+    ClaimRow {
+        id: "README-PG5-NO-REFERENCE-IN-CI",
+        sites: &SITES_README_PG5_NO_REFERENCE_IN_CI,
+        claim_type: ClaimType::Invariant,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). The PG-5 row justified \
+                   its waiver partly by saying CI installs no Reference toolchain. The weekly \
+                   .github/workflows/contract-drift.yml lane installs the pin with elan, as \
+                   AGENTS.md already records. The waiver now rests on cost alone: a weekly \
+                   window is not per-commit coverage. The doc comment on the expiry test in \
+                   crates/fln-conformance/tests/kernel_replay.rs still repeats the old reason.",
+        enforcement: Enforcement::Enforced,
+    },
 ];
 
 const CENSUS_DOCS: [&str; 3] = [README, AGENTS, PLAN];
@@ -813,7 +935,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 25] = [
     // How many rows depend on the disputed definition. The sites pin the two definitions;
     // this pins the population, and it fires the moment ANY row's level moves — which is
     // exactly when "85 of 94, and zero under the plan's reading" stops being true.
@@ -923,7 +1045,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
             count: 1,
         },
     ),
-    // This row's evidence says the matrix governs seventeen rows, so the citation tracks the
+    // This row's evidence says the matrix governs twenty-four rows, so the citation tracks the
     // row count — but it must live in a DIFFERENT file than the needle describes. Citing
     // `witness.rs` for a literal inside `witness.rs` counts the citation itself: the first
     // attempt used `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the
@@ -991,6 +1113,59 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
         Citation::OccursExactly {
             path: "README.md",
             needle: "0 bench targets, 0 committed baselines and 0 flame artifacts",
+            count: 1,
+        },
+    ),
+    // The six README rows from franken_lean-z8j.1.19. Where the corrected sentence rests on a
+    // tree fact, the citation pins that fact; otherwise it pins the replacement disclosure, so
+    // deleting the correction fails as loudly as restoring the overclaim.
+    (
+        "README-DROP-IN-TODAY",
+        Citation::OccursExactly {
+            path: "README.md",
+            needle: "accepts 3 of the 27 probe programs the pinned Reference accepts",
+            count: 1,
+        },
+    ),
+    (
+        "README-COMPARISON-TABLE-PRESENT-TENSE",
+        Citation::OccursExactly {
+            path: "README.md",
+            needle: "(1.0 target; today's state in [IMPLEMENTATION_STATUS](IMPLEMENTATION_STATUS.md))",
+            count: 1,
+        },
+    ),
+    (
+        "README-TRUST-BULLETS-PRESENT-TENSE",
+        Citation::OccursExactly {
+            path: "README.md",
+            needle: "(1.0 target. No WASM artifact is built today.)",
+            count: 1,
+        },
+    ),
+    // Fires when the link lines change, which is when the README's leanc sentence needs a
+    // human: FrankenLean building its own runtime would make it stale in the good direction.
+    (
+        "README-LEANC-LIVE-TODAY",
+        Citation::OccursExactly {
+            path: "crates/fln-cli/src/lib.rs",
+            needle: "-lleancpp",
+            count: 4,
+        },
+    ),
+    (
+        "README-SUITE-LINKED",
+        Citation::OccursExactly {
+            path: "Cargo.lock",
+            needle: "source = ",
+            count: 0,
+        },
+    ),
+    (
+        "README-PG5-NO-REFERENCE-IN-CI",
+        Citation::OccursExactly {
+            path: ".github/workflows/contract-drift.yml",
+            needle: "elan toolchain install \"leanprover/lean4:$PIN_TAG\"",
             count: 1,
         },
     ),
