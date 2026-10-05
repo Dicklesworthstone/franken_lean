@@ -322,6 +322,25 @@ fn a_fixed_or_computed_index_is_refused_as_the_pin_refuses_it() {
 }
 
 #[test]
+fn a_proposition_eliminates_only_into_prop_even_at_a_variable_index() {
+    // The two `Holds 0` and `HasData A 0` programs above now stop at the index
+    // check, before elimination is reached. With a variable index they reach it:
+    // a proof eliminates into a proof, and a data payload cannot be extracted
+    // from a proof. Pin: the first is accepted; the second is "Type mismatch when
+    // assigning motive". FrankenLean refuses the second at the kernel instead (the
+    // motive lands in `Sort 1` where `HasData.rec` allows only `Sort 0`).
+    check(
+        "inductive Holds : Nat -> Prop where\n  | base : Holds 0\n  | step (n : Nat) (previous : Holds n) : Holds (n + 1)\n\
+         theorem duplicate (n : Nat) (h : Holds n) : Holds n := by\n  induction h with\n  | base => exact Holds.base\n  | step n previous ih => exact Holds.step n ih",
+    );
+    reject(
+        "inductive HasData (A : Type) : Nat -> Prop where\n  | base (a : A) : HasData A 0\n  | step (n : Nat) (previous : HasData A n) : HasData A (n + 1)\n\
+         def extract (A : Type) (n : Nat) (h : HasData A n) : A := by\n  induction h with\n  | base a => exact a\n  | step n previous ih => exact ih",
+        Some("TypeMismatch"),
+    );
+}
+
+#[test]
 fn a_repeated_index_is_refused_as_the_pin_refuses_it() {
     // Pin: "Invalid target: Target (or one of its indices) occurs more than once".
     reject(
