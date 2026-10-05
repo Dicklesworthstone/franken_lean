@@ -262,7 +262,7 @@ class as one that overstates. NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
 claim in these documents is unwatched. Every row now cites at least one checkable fact \
-(twenty-five citations over twenty-four rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+(twenty-seven citations over twenty-four rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
 only rot someone anticipated well enough to cite, and it protects one clause of a \
 multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
 cited, and it is not the clause its state depends on. Both rows that actually rotted on \
@@ -693,10 +693,27 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
         sites: &SITES_OLEAN_README,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Targeted,
-        evidence: "fln-olean is read-only: decl.rs decode_expr is its only Expr-facing entry \
-                   point and no encoder exists in the crate or anywhere in the workspace. \
-                   Blocks FL-INV-04 codec fidelity and the mixed-producer codec rig. \
-                   Capability record on bead franken_lean-oh1j.",
+        evidence: "RE-MEASURED 2026-10-05; this row said fln-olean was read-only with no \
+                   encoder anywhere, which stopped being true. It writes: write.rs \
+                   encode_module builds fresh ModuleData images (expression regions, module \
+                   roots, data-only extensions via extension_write.rs), and `lake build \
+                   +Module:olean` emits checked modules through it \
+                   (crates/fln/src/source_check/modules/artifacts.rs). The pinned leanchecker \
+                   and lean load one fresh FrankenLean-written module that imports the \
+                   Reference's Init and reject an ill-typed twin \
+                   (olean_mixed_producer_no_mock_e2e, run with the pin in contract-drift.yml). \
+                   rebuild.rs re-derives Reference-built images byte-identically, and since \
+                   8a010366 (franken_lean-etj.1) also the .olean.server and .olean.private \
+                   companions against their predecessors (every_shipped_stdlib_olean_rebuilds_\
+                   byte_identical: 2,433 stdlib images at the pin, all 4,862 companions). What \
+                   the README's `byte-compatible write' still overstates: rebuild re-derives a \
+                   Reference image, which is not fresh emission, and no test compares a fresh \
+                   FrankenLean-written module with the Reference's own output for the same \
+                   source. fln-olean's header lists byte-identical fresh emission, closure-\
+                   bearing v3 regions and module-system companion emission as not \
+                   implemented. Those gaps are named under franken_lean-0nz, which is closed; \
+                   franken_lean-z8j.1.20 lists it among closed beads whose criteria were not \
+                   met. (The old pointer, franken_lean-oh1j, is the interning bead.)",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -706,8 +723,11 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
         state: ClaimState::Targeted,
         evidence: "REPAIRED by commit 86035037 (bead fln-olean-doc-self-contradiction-myri). \
                    The header asserted read AND write on line 1 and deferred writing on line \
-                   6, naming no bead. It now leads with the read-only reality and cites \
-                   franken_lean-oh1j for the absent writer.",
+                   6, naming no bead. Since then fln-olean gained a fresh writer, and the \
+                   header now states what it reads and writes and lists what fresh emission \
+                   does not do (byte-identity with the Reference's own output among it). \
+                   Corrected 2026-10-05: this said the header leads with read-only reality \
+                   and cites franken_lean-oh1j for an absent writer.",
         enforcement: Enforcement::Enforced,
     },
     ClaimRow {
@@ -935,7 +955,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 25] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
     // How many rows depend on the disputed definition. The sites pin the two definitions;
     // this pins the population, and it fires the moment ANY row's level moves — which is
     // exactly when "85 of 94, and zero under the plan's reading" stops being true.
@@ -1072,11 +1092,31 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 25] = [
             count: 1,
         },
     ),
+    // The fresh writer and the companion rebuild this row's evidence now rests on, and the
+    // header's disclosure that fresh emission is not byte-identical. The last fires when
+    // someone implements (or deletes the disclosure of) the thing the README overstates,
+    // which is the moment this Acknowledged row needs a human.
+    (
+        "OLEAN-WRITE-README",
+        Citation::OccursExactly {
+            path: "crates/fln-olean/src/write.rs",
+            needle: "pub fn encode_module(",
+            count: 1,
+        },
+    ),
+    (
+        "OLEAN-WRITE-README",
+        Citation::OccursExactly {
+            path: "crates/fln-olean/src/rebuild.rs",
+            needle: "pub fn rebuild_with_dependencies(",
+            count: 1,
+        },
+    ),
     (
         "OLEAN-WRITE-README",
         Citation::OccursExactly {
             path: "crates/fln-olean/src/lib.rs",
-            needle: "Today this crate reads",
+            needle: "emission against Reference-built fresh modules",
             count: 1,
         },
     ),
