@@ -602,38 +602,110 @@ impl fmt::Display for OleanDecodeError {
 impl std::error::Error for OleanDecodeError {}
 
 impl OleanDecodeError {
-    /// Whether this refusal is solely an explicit byte/object budget rather
-    /// than malformed input or a companion-chain identity failure.
+    /// Whether this refusal is solely an explicit byte/object budget, or the host
+    /// refusing a decode reservation, rather than malformed input or a
+    /// companion-chain identity failure.
+    ///
+    /// A host refusal was reported as a decode `Budget` until fln-s97y gave it its
+    /// own variant; it stays in this class so the CLI's non-answer exit is unchanged.
     pub const fn is_resource_exhaustion(&self) -> bool {
-        matches!(
-            self,
-            Self::ArtifactTooLarge { .. }
-                | Self::Region(
-                    OleanRegionError::BudgetExhausted { .. }
-                        | OleanRegionError::PayloadBudgetExhausted { .. }
-                )
-                | Self::Declaration(OleanDeclarationError::Budget { .. })
-                | Self::Declaration(OleanDeclarationError::Region(
-                    OleanRegionError::BudgetExhausted { .. }
-                        | OleanRegionError::PayloadBudgetExhausted { .. }
-                ))
-                | Self::CompanionRegion {
-                    error: OleanRegionError::BudgetExhausted { .. }
-                        | OleanRegionError::PayloadBudgetExhausted { .. },
-                    ..
-                }
-                | Self::CompanionDeclaration {
-                    error: OleanDeclarationError::Budget { .. },
-                    ..
-                }
-                | Self::CompanionDeclaration {
-                    error: OleanDeclarationError::Region(
+        self.is_host_allocation_refusal()
+            || matches!(
+                self,
+                Self::ArtifactTooLarge { .. }
+                    | Self::Region(
                         OleanRegionError::BudgetExhausted { .. }
                             | OleanRegionError::PayloadBudgetExhausted { .. }
-                    ),
+                    )
+                    | Self::Declaration(OleanDeclarationError::Budget { .. })
+                    | Self::Declaration(OleanDeclarationError::Region(
+                        OleanRegionError::BudgetExhausted { .. }
+                            | OleanRegionError::PayloadBudgetExhausted { .. }
+                    ))
+                    | Self::CompanionRegion {
+                        error: OleanRegionError::BudgetExhausted { .. }
+                            | OleanRegionError::PayloadBudgetExhausted { .. },
+                        ..
+                    }
+                    | Self::Declaration(OleanDeclarationError::ChainTooLarge { .. })
+                    | Self::CompanionDeclaration {
+                        error: OleanDeclarationError::Budget { .. }
+                            | OleanDeclarationError::ChainTooLarge { .. },
+                        ..
+                    }
+                    | Self::CompanionDeclaration {
+                        error: OleanDeclarationError::Region(
+                            OleanRegionError::BudgetExhausted { .. }
+                                | OleanRegionError::PayloadBudgetExhausted { .. }
+                        ),
+                        ..
+                    }
+            )
+    }
+
+    /// Whether the host refused a reservation the decoder needed: a non-answer
+    /// about this host, never a property of the input.
+    pub const fn is_host_allocation_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Declaration(OleanDeclarationError::AllocationRefused { .. })
+                | Self::CompanionDeclaration {
+                    error: OleanDeclarationError::AllocationRefused { .. },
                     ..
                 }
         )
+    }
+
+    /// The allowance this decode stop exceeded and what had been spent, when it is an
+    /// explicit byte or object budget whose own numbers show it was exceeded
+    /// (bead fln-s97y). The frontier reports such a stop as a typed resource
+    /// exhaustion instead of a failed module. `None` for every other refusal, and
+    /// for a budget error whose numbers do not show an overrun: a stop that cannot
+    /// show its allowance is not reported as one.
+    pub fn resource_usage(&self) -> Option<fln_core::outcome::ResourceUsage> {
+        use fln_core::diag::{ResourceReason, StructuralUnit};
+        let to_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        let usage = |unit, allowed: u64, observed: u64| fln_core::outcome::ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit },
+            allowed,
+            observed,
+        };
+        let region = |error: &OleanRegionError| match error {
+            OleanRegionError::BudgetExhausted { visited, budget } => {
+                Some(usage(StructuralUnit::ProducedNodes, *budget, *visited))
+            }
+            OleanRegionError::PayloadBudgetExhausted { required, budget } => Some(usage(
+                StructuralUnit::InputBytes,
+                to_u64(*budget),
+                to_u64(*required),
+            )),
+            _ => None,
+        };
+        let declaration = |error: &OleanDeclarationError| match error {
+            OleanDeclarationError::Budget { visited, budget } => {
+                Some(usage(StructuralUnit::ProducedNodes, *budget, *visited))
+            }
+            OleanDeclarationError::ChainTooLarge { bytes, limit } => Some(usage(
+                StructuralUnit::InputBytes,
+                to_u64(*limit),
+                to_u64(*bytes),
+            )),
+            OleanDeclarationError::Region(error) => region(error),
+            _ => None,
+        };
+        let usage = match self {
+            Self::ArtifactTooLarge { bytes, limit } => Some(usage(
+                StructuralUnit::InputBytes,
+                to_u64(*limit),
+                to_u64(*bytes),
+            )),
+            Self::Region(error) | Self::CompanionRegion { error, .. } => region(error),
+            Self::Declaration(error) | Self::CompanionDeclaration { error, .. } => {
+                declaration(error)
+            }
+            _ => None,
+        };
+        usage.filter(fln_core::outcome::ResourceUsage::is_genuine_exhaustion)
     }
 }
 
@@ -1203,6 +1275,22 @@ fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
             OleanModuleVerdict::Inconclusive(Inconclusive::dependency_unavailable(format!(
                 "host memory: {error}"
             )))
+        }
+        // A decode stop is a non-answer when the decoder ran out of an explicit
+        // allowance or the host refused it memory (fln-s97y). Malformed input and
+        // identity failures stay `Failed`.
+        OleanCheckError::Decode(decode) | OleanCheckError::ModuleDecode { error: decode, .. }
+            if decode.is_host_allocation_refusal() =>
+        {
+            OleanModuleVerdict::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                "host memory: {error}"
+            )))
+        }
+        OleanCheckError::Decode(decode) | OleanCheckError::ModuleDecode { error: decode, .. } => {
+            match decode.resource_usage() {
+                Some(usage) => OleanModuleVerdict::Inconclusive(Inconclusive::resource(usage)),
+                None => OleanModuleVerdict::Failed(error),
+            }
         }
         OleanCheckError::InternalInvariant { .. } => fault(error.to_string()),
         _ => OleanModuleVerdict::Failed(error),
@@ -12038,12 +12126,78 @@ mod tests {
 
         let mut limits = OleanDecodeLimits::new(bytes.len());
         limits.declarations = OleanWalkBudget { max_objects: 5 };
-        assert!(matches!(
-            decode_olean_artifact(&bytes, limits),
-            Err(OleanDecodeError::Declaration(
-                OleanDeclarationError::Budget { .. }
-            ))
-        ));
+        let stop =
+            decode_olean_artifact(&bytes, limits).expect_err("five objects cannot decode it");
+        assert_eq!(
+            stop,
+            OleanDecodeError::Declaration(OleanDeclarationError::Budget {
+                visited: 6,
+                budget: 5
+            }),
+            "the stop reports the allowance it exceeded (fln-s97y)"
+        );
+        let usage = stop
+            .resource_usage()
+            .expect("an explicit budget stop has a usage");
+        assert_eq!((usage.allowed, usage.observed), (5, 6));
+        assert!(usage.is_genuine_exhaustion());
+    }
+
+    /// The real frontier over a real pinned module (the checked-in C3 fixture), with a
+    /// planted decode budget: the row is a typed resource exhaustion carrying the
+    /// allowance, never `failed` (fln-s97y). With the decode budget restored, the same
+    /// module is `failed` for a genuine reason (the fixture is a module-system part whose
+    /// `.olean.server` and `.olean.private` are not supplied), so the planted row's verdict
+    /// comes from the budget and nothing else.
+    #[test]
+    fn a_planted_decode_budget_stop_is_an_inconclusive_frontier_row_with_its_allowance() {
+        use fln_core::diag::{ResourceReason, StructuralUnit};
+        use fln_core::outcome::{Inconclusive, InconclusiveCause};
+
+        let bytes = olean_fixture("Init.SizeOfLemmas.olean");
+        let name = Name::from_components(["Init", "SizeOfLemmas"]);
+        let inputs = [OleanModuleInput {
+            name: &name,
+            artifact: &bytes,
+            server_artifact: None,
+            private_artifact: None,
+        }];
+        let engine = Engine::from_environment(Environment::new());
+        let run = |limits: OleanCheckLimits| {
+            let frontier = engine
+                .check_olean_frontier(&inputs, &KVMap::new(), limits)
+                .expect("a one-module set is a frontier, not a whole-set refusal");
+            assert_eq!(frontier.rows.len(), 1);
+            frontier.rows.into_iter().next().expect("one row").verdict
+        };
+
+        let mut planted = OleanCheckLimits::new(bytes.len(), test_budget());
+        planted.decode.declarations = OleanWalkBudget { max_objects: 5 };
+        let verdict = run(planted);
+        match &verdict {
+            super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::ResourceExhausted { usage },
+                ..
+            }) => {
+                assert_eq!(
+                    usage.reason,
+                    ResourceReason::StructuralBudget {
+                        unit: StructuralUnit::ProducedNodes
+                    }
+                );
+                assert_eq!((usage.allowed, usage.observed), (5, 6), "{usage:?}");
+            }
+            other => panic!("a decode budget stop must be inconclusive, got {other:?}"),
+        }
+
+        let control = run(OleanCheckLimits::new(bytes.len(), test_budget()));
+        assert!(
+            matches!(
+                control,
+                super::OleanModuleVerdict::Failed(OleanCheckError::MissingCompanionParts { .. })
+            ),
+            "with the budget restored the module fails for its missing companion parts, got {control:?}"
+        );
     }
 
     #[test]
@@ -17387,6 +17541,146 @@ mod tests {
             assert!(
                 matches!(verdict, super::OleanModuleVerdict::InternalFault(_)),
                 "our own accounting failing is an internal fault, got {verdict:?}"
+            );
+        }
+    }
+
+    /// fln-s97y's residue: a decode stop against an explicit allowance is a typed
+    /// resource exhaustion carrying that allowance, a host refusal is a host-memory
+    /// non-answer, and malformed input still fails. A stop whose numbers do not show an
+    /// overrun is not promoted to an exhaustion it cannot demonstrate.
+    #[test]
+    fn frontier_rows_type_decode_budget_stops_with_their_allowance() {
+        use fln_core::diag::{ResourceReason, StructuralUnit};
+        use fln_core::outcome::{Inconclusive, InconclusiveCause};
+
+        let module = Name::from_components(["Planted"]);
+        let in_module = |error: OleanDecodeError| OleanCheckError::ModuleDecode {
+            module: module.clone(),
+            error,
+        };
+        let budget_cases = [
+            (
+                OleanCheckError::Decode(OleanDecodeError::Declaration(
+                    OleanDeclarationError::Budget {
+                        visited: 6,
+                        budget: 5,
+                    },
+                )),
+                StructuralUnit::ProducedNodes,
+                5,
+                6,
+            ),
+            (
+                in_module(OleanDecodeError::Region(
+                    OleanRegionError::BudgetExhausted {
+                        visited: 11,
+                        budget: 10,
+                    },
+                )),
+                StructuralUnit::ProducedNodes,
+                10,
+                11,
+            ),
+            (
+                in_module(OleanDecodeError::CompanionRegion {
+                    part: super::OleanCompanionPart::Server,
+                    error: OleanRegionError::PayloadBudgetExhausted {
+                        required: 300,
+                        budget: 256,
+                    },
+                }),
+                StructuralUnit::InputBytes,
+                256,
+                300,
+            ),
+            (
+                in_module(OleanDecodeError::CompanionDeclaration {
+                    part: super::OleanCompanionPart::Private,
+                    error: OleanDeclarationError::Budget {
+                        visited: 9,
+                        budget: 8,
+                    },
+                }),
+                StructuralUnit::ProducedNodes,
+                8,
+                9,
+            ),
+            (
+                in_module(OleanDecodeError::ArtifactTooLarge {
+                    bytes: 2048,
+                    limit: 1024,
+                }),
+                StructuralUnit::InputBytes,
+                1024,
+                2048,
+            ),
+            (
+                in_module(OleanDecodeError::Declaration(
+                    OleanDeclarationError::ChainTooLarge {
+                        bytes: 4096,
+                        limit: 4000,
+                    },
+                )),
+                StructuralUnit::InputBytes,
+                4000,
+                4096,
+            ),
+        ];
+        for (error, unit, allowed, observed) in budget_cases {
+            let verdict = super::frontier_error_verdict(error);
+            match &verdict {
+                super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::ResourceExhausted { usage },
+                    ..
+                }) => {
+                    assert_eq!(usage.reason, ResourceReason::StructuralBudget { unit });
+                    assert_eq!((usage.allowed, usage.observed), (allowed, observed));
+                    assert!(usage.is_genuine_exhaustion());
+                }
+                other => panic!("a decode budget stop must carry its allowance, got {other:?}"),
+            }
+        }
+
+        let refused = super::frontier_error_verdict(in_module(OleanDecodeError::Declaration(
+            OleanDeclarationError::AllocationRefused { requested: 7 },
+        )));
+        assert!(
+            matches!(
+                &refused,
+                super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::DependencyUnavailable { what },
+                    ..
+                }) if what.text().starts_with("host memory: ")
+            ),
+            "a refused decode reservation is a host non-answer, got {refused:?}"
+        );
+
+        for error in [
+            in_module(OleanDecodeError::Region(OleanRegionError::BadMagic)),
+            in_module(OleanDecodeError::Declaration(
+                OleanDeclarationError::Shape {
+                    offset: 64,
+                    what: "planted shape",
+                },
+            )),
+            OleanCheckError::Decode(OleanDecodeError::UnexpectedCompanionParts),
+            // Numbers that do not show an overrun: never promoted to an exhaustion.
+            in_module(OleanDecodeError::ArtifactTooLarge {
+                bytes: 1024,
+                limit: 1024,
+            }),
+            in_module(OleanDecodeError::Declaration(
+                OleanDeclarationError::Budget {
+                    visited: 5,
+                    budget: 5,
+                },
+            )),
+        ] {
+            let verdict = super::frontier_error_verdict(error);
+            assert!(
+                matches!(verdict, super::OleanModuleVerdict::Failed(_)),
+                "malformed input, or a stop that cannot show its overrun, stays failed, got {verdict:?}"
             );
         }
     }

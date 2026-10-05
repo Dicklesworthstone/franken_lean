@@ -16826,4 +16826,46 @@ mod tests {
                 .contains("refusing to overwrite existing receipt set")
         );
     }
+
+    /// fln-s97y, as the CLI renders it: the real frontier over a real pinned module
+    /// (the checked-in C3 fixture) with a planted decode budget gives an `inconclusive`
+    /// row naming the allowance and the overrun, a non-answer exit of 3, and no
+    /// `failed` count.
+    #[test]
+    fn a_decode_budget_stop_renders_as_inconclusive_with_its_allowance() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+        let bytes = std::fs::read(&fixture).expect("the C3 fixture is checked in");
+        let name = fln::Name::from_components(["Init", "SizeOfLemmas"]);
+        let inputs = [fln::OleanModuleInput {
+            name: &name,
+            artifact: &bytes,
+            server_artifact: None,
+            private_artifact: None,
+        }];
+        let mut limits = fln::OleanCheckLimits::new(
+            bytes.len(),
+            fln::Budget::for_stack_bytes(super::OLEAN_CHECK_KERNEL_STACK_BYTES),
+        );
+        limits.decode.declarations = fln::OleanWalkBudget { max_objects: 5 };
+        let frontier = fln::Engine::from_environment(fln::Environment::new())
+            .check_olean_frontier(&inputs, &fln::KVMap::new(), limits)
+            .expect("a one-module set is a frontier");
+
+        let row = super::frontier_row_fields(&frontier.rows[0]);
+        assert_eq!(row.verdict, "inconclusive", "{}", row.detail.text());
+        assert!(
+            row.detail.text().contains("allowed: 5") && row.detail.text().contains("observed: 6"),
+            "the row must name the allowance and the overrun: {}",
+            row.detail.text()
+        );
+
+        let rendered = super::render_check_olean_frontier(&frontier, true);
+        assert_eq!(rendered.exit_code, 3, "{}", rendered.stdout);
+        assert!(
+            rendered.stdout.contains("\"failed\":0,\"inconclusive\":1,"),
+            "{}",
+            rendered.stdout
+        );
+    }
 }

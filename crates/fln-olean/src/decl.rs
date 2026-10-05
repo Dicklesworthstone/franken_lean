@@ -63,9 +63,17 @@ pub enum DeclError {
         offset: u64,
         what: &'static str,
     },
-    /// Decode budget exhausted (hostile or runaway graph).
+    /// Decode budget exhausted (hostile or runaway graph): `visited` objects were
+    /// charged against an allowance of `budget` (bead fln-s97y: a stop must report the
+    /// allowance it exceeded, or no one can tell it from a refusal).
     Budget {
         visited: u64,
+        budget: u64,
+    },
+    /// The host refused to reserve `requested` entries while decoding. A non-answer
+    /// about this host, not a budget the caller set and not a refusal of the input.
+    AllocationRefused {
+        requested: u64,
     },
     /// A module-system chain's `.olean.private` part does not contain a
     /// declaration the exported part does.
@@ -128,7 +136,13 @@ impl std::fmt::Display for DeclError {
             DeclError::Unsupported { offset, what } => {
                 write!(f, "unsupported at {offset}: {what}")
             }
-            DeclError::Budget { visited } => write!(f, "decode budget exhausted at {visited}"),
+            DeclError::Budget { visited, budget } => {
+                write!(f, "decode budget exhausted at {visited} (budget {budget})")
+            }
+            DeclError::AllocationRefused { requested } => write!(
+                f,
+                "the host refused to reserve {requested} entries while decoding"
+            ),
             DeclError::ChainPartMismatch { part } => write!(
                 f,
                 "companion {} does not carry the exported part's identity stamp, so these \
@@ -197,6 +211,7 @@ impl<'a> DeclDecoder<'a> {
         if self.visited > self.budget {
             return Err(DeclError::Budget {
                 visited: self.visited,
+                budget: self.budget,
             });
         }
         Ok(())
@@ -1587,8 +1602,8 @@ pub fn chain_extra_const_names(
     let mut union = Vec::new();
     union
         .try_reserve_exact(exported_names.len())
-        .map_err(|_| DeclError::Budget {
-            visited: exported_names.len() as u64,
+        .map_err(|_| DeclError::AllocationRefused {
+            requested: exported_names.len() as u64,
         })?;
     for name in exported_names.into_iter().chain(private_names) {
         if seen.insert(name.clone()) {
@@ -1741,8 +1756,8 @@ pub fn decode_chain_constants_with_origin(
     let mut origins = Vec::new();
     origins
         .try_reserve_exact(private_constants.len())
-        .map_err(|_| DeclError::Budget {
-            visited: private_constants.len() as u64,
+        .map_err(|_| DeclError::AllocationRefused {
+            requested: private_constants.len() as u64,
         })?;
     for info in &private_constants {
         origins.push(if exported_names.contains(info.name()) {
@@ -1757,8 +1772,8 @@ pub fn decode_chain_constants_with_origin(
     let mut strengthened = Vec::new();
     strengthened
         .try_reserve_exact(private_constants.len())
-        .map_err(|_| DeclError::Budget {
-            visited: private_constants.len() as u64,
+        .map_err(|_| DeclError::AllocationRefused {
+            requested: private_constants.len() as u64,
         })?;
     for info in &private_constants {
         strengthened.push(
