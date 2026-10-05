@@ -210,10 +210,44 @@ impl Engine {
                     limit: limits.max_commands,
                 });
             }
-            for (start, command) in commands {
+            // A work list rather than a plain loop: `open A in <command>` expands in place to
+            // the pin's `section open A <command> end`, whose scope steps are not commands of
+            // their own (they neither count nor run elaboration).
+            let mut queue: std::collections::VecDeque<SourceStep<'_>> =
+                commands.into_iter().map(SourceStep::Command).collect();
+            while let Some(step) = queue.pop_front() {
+                let (start, command) = match step {
+                    SourceStep::Command(command) => command,
+                    SourceStep::Scope(start, transition) => {
+                        scopes
+                            .check_limits(&transition)
+                            .map_err(|(resource, limit)| SourceCheckError::Limit {
+                                resource,
+                                limit,
+                            })?;
+                        scopes
+                            .transition(transition, engine.environment())
+                            .map_err(|error| error.into_source(file, count, start.0))?;
+                        continue;
+                    }
+                };
                 let control = parse_control_command(command, start, file, count)?;
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
+                        continue;
+                    }
+                    if let fln_parse::command_scope::ScopeCommand::OpenIn {
+                        names,
+                        scoped,
+                        body,
+                    } = control
+                    {
+                        for step in open_in_steps(start, command, names, scoped, body)
+                            .into_iter()
+                            .rev()
+                        {
+                            queue.push_front(step);
+                        }
                         continue;
                     }
                     if let fln_parse::command_scope::ScopeCommand::Variable(syntax) = control {
@@ -364,16 +398,26 @@ impl Engine {
 pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError> {
     let mut count = 0;
     for (file, source) in sources.iter().enumerate() {
-        for (start, command) in partition_commands(source, file, count)? {
-            match parse_control_command(command, start, file, count)? {
-                Some(fln_parse::command_scope::ScopeCommand::Trivia) => continue,
-                Some(_) => {}
-                None => {
-                    crate::source_records::parse_scoped_command(command)
-                        .map_err(|error| command_error(file, count, start, error))?;
+        for (mut start, mut command) in partition_commands(source, file, count)? {
+            // `open A in <command>`: the inner command is parsed as the checked path parses
+            // it, at its own offset; the open itself is one command with it.
+            loop {
+                match parse_control_command(command, start, file, count)? {
+                    Some(fln_parse::command_scope::ScopeCommand::Trivia) => {}
+                    Some(fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }) => {
+                        start = fln_parse::BytePos(start.0 + body);
+                        command = &command[body..];
+                        continue;
+                    }
+                    Some(_) => count += 1,
+                    None => {
+                        crate::source_records::parse_scoped_command(command)
+                            .map_err(|error| command_error(file, count, start, error))?;
+                        count += 1;
+                    }
                 }
+                break;
             }
-            count += 1;
         }
     }
     Ok(())
@@ -407,6 +451,36 @@ pub fn preflight_source_module(
             error,
         }
     })
+}
+
+/// One unit of a source file's command loop: a command's own bytes at its offset, or a scope
+/// transition that an enclosing command implies.
+enum SourceStep<'source> {
+    Command((fln_parse::BytePos, &'source [u8])),
+    Scope(fln_parse::BytePos, fln_parse::command_scope::ScopeCommand),
+}
+
+/// `open A in <command>` as the pin's `Command.in` macro elaborates it: `section`, `open A`,
+/// the command, `end`. The command keeps its true offset in the file.
+fn open_in_steps<'source>(
+    start: fln_parse::BytePos,
+    command: &'source [u8],
+    names: Vec<Name>,
+    scoped: bool,
+    body: usize,
+) -> [SourceStep<'source>; 4] {
+    use fln_parse::command_scope::ScopeCommand;
+    let open = if scoped {
+        ScopeCommand::OpenScoped(names)
+    } else {
+        ScopeCommand::Open(names)
+    };
+    [
+        SourceStep::Scope(start, ScopeCommand::Section(None)),
+        SourceStep::Scope(start, open),
+        SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
+        SourceStep::Scope(start, ScopeCommand::End(None)),
+    ]
 }
 
 fn partition_commands(

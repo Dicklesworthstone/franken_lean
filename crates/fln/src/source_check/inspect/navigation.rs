@@ -124,13 +124,25 @@ impl SourceModuleSession {
                     .checked_add(1)
                     .filter(|n| *n <= limits.max_commands)
                     .ok_or_else(|| limit("definition commands", limits.max_commands))?;
-                let base = header.body_start.0 + start.0;
-                let control = fln_parse::command_scope::parse(command).map_err(|error| {
-                    SourceModuleCheckError::Header {
-                        module: module.clone(),
-                        error: error.with_original_offset(fln_parse::BytePos(base)),
+                let mut base = header.body_start.0 + start.0;
+                let mut command: &[u8] = command;
+                // `open A in <command>`: the open changes no declaration's absolute name, so
+                // navigation reads the inner command at its own offset.
+                let control = loop {
+                    let control = fln_parse::command_scope::parse(command).map_err(|error| {
+                        SourceModuleCheckError::Header {
+                            module: module.clone(),
+                            error: error.with_original_offset(fln_parse::BytePos(base)),
+                        }
+                    })?;
+                    match control {
+                        Some(ScopeCommand::OpenIn { body, .. }) => {
+                            base += body;
+                            command = &command[body..];
+                        }
+                        other => break other,
                     }
-                })?;
+                };
                 if let Some(control) = control {
                     if matches!(
                         control,

@@ -223,7 +223,6 @@ mod tests {
             "@[simp high] def x := 0",
             "@[local simp] def x := 0",
             "@[simp ↓] def x := 0",
-            "@[simp] unsafe def x := 0",
             "@[simp] instance value : Inhabited Nat := Inhabited.mk 0",
             "@[simp] inductive T where | mk",
             "@[simp]",
@@ -234,6 +233,22 @@ mod tests {
         let commands = partition(source).unwrap();
         assert_eq!(commands.len(), 2);
         assert!(parse_definition(commands[1].1).is_err());
+
+        // A modifier after the attribute is parsed into its own `declModifiers` slot
+        // (`unsafe` is slot 5) rather than dropped; elaboration still refuses it.
+        let parsed = parse_definition("@[simp] unsafe def x := 0".as_bytes()).unwrap();
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("a declaration node");
+        };
+        let Syntax::Node {
+            args: modifiers, ..
+        } = &args[0]
+        else {
+            panic!("declModifiers");
+        };
+        assert!(matches!(&modifiers[5], Syntax::Node { args, .. }
+            if matches!(args.as_slice(), [Syntax::Node { kind, .. }]
+                if kind == &parser_kind(&["Command", "unsafe"]))));
     }
 
     #[test]

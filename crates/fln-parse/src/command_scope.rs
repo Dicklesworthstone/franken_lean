@@ -4,6 +4,7 @@ use super::*;
 pub mod attributes;
 pub mod imports;
 pub mod instances;
+pub mod modifiers;
 pub mod mutual;
 pub mod variables;
 
@@ -20,6 +21,14 @@ pub enum ScopeCommand {
     Omit(Vec<Name>),
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
+    /// `open A B in <command>` (`Lean.Parser.Command.in`): the pin's macro elaborates it as
+    /// `section open A B <command> end`. `body` is the byte offset, within this command's own
+    /// source, where the inner command starts.
+    OpenIn {
+        names: Vec<Name>,
+        scoped: bool,
+        body: usize,
+    },
     Trivia,
 }
 
@@ -83,7 +92,8 @@ fn declaration(s: &str) -> bool {
 }
 
 /// Recognize complete scope commands, including comments and escaped identifiers.
-/// Unsupported `open ... in` and selective opens are never ignored.
+/// `open A in <command>` is recognized with its body; selective opens (`open A (x)`,
+/// `hiding`, `renaming`) are never ignored.
 pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -119,6 +129,20 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let mut names = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(if scoped { 2 } else { 1 }) {
         let TokenKind::Ident(name) = &token.kind else {
+            // `open A B in <command>`: everything after `in` is one more command.
+            if keyword == "open"
+                && !names.is_empty()
+                && matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "in")
+            {
+                let Some(body) = tokens.get(index + 1) else {
+                    return Err(bad(index + 1));
+                };
+                return Ok(Some(ScopeCommand::OpenIn {
+                    names,
+                    scoped,
+                    body: view.to_original(body.extent.start()).0,
+                }));
+            }
             return Err(bad(index));
         };
         names.push(name.clone());
@@ -161,6 +185,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     };
     let mut declaration_column = None;
     let mut attribute_prefix = false;
+    // The column of the attribute or modifier that opened the current declaration, so its
+    // body's layout block is measured from the command's first token, not its keyword.
+    let mut prefix_column = None;
+    // `open A in <command>` is one command: after an `open`'s `in`, the next command that
+    // starts belongs to it.
+    let mut current_open = false;
+    let mut open_in = false;
     let mut mutual_until = 0;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
@@ -171,7 +202,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 // A mutual group is one admission unit. In particular its end
                 // cannot close the surrounding namespace or section, and no
                 // member may be published before the entire group is checked.
-                starts.push(view.to_original(token.extent.start()).0);
+                if !open_in {
+                    starts.push(view.to_original(token.extent.start()).0);
+                }
+                open_in = false;
+                current_open = false;
                 mutual_until = mutual::block_end(&view, &tokens, index)? + 1;
                 declaration_column = None;
                 attribute_prefix = false;
@@ -182,13 +217,30 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
             let scope_start = control(symbol) && command_line;
-            let inline_start = symbol == "@[" && command_line;
-            if depth == 0 && (scope_start || declaration(symbol) || inline_start) {
-                if !(attribute_prefix && declaration(symbol)) {
-                    starts.push(view.to_original(token.extent.start()).0);
+            // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
+            // …) precede the declaration keyword in one command (`declModifiers`).
+            let prefix = symbol == "@[" || modifiers::is_modifier(symbol);
+            let inline_start = prefix && command_line;
+            let continues_prefix = attribute_prefix && (declaration(symbol) || prefix);
+            if depth == 0 && current_open && symbol == "in" {
+                open_in = true;
+                current_open = false;
+                continue;
+            }
+            if depth == 0
+                && (scope_start || declaration(symbol) || inline_start || continues_prefix)
+            {
+                if !continues_prefix {
+                    if !open_in {
+                        starts.push(view.to_original(token.extent.start()).0);
+                    }
+                    open_in = false;
+                    current_open = scope_start && symbol == "open";
+                    prefix_column = inline_start.then(|| column(token));
                 }
-                attribute_prefix = inline_start;
-                declaration_column = declaration(symbol).then(|| column(token));
+                attribute_prefix = inline_start || (continues_prefix && !declaration(symbol));
+                declaration_column = declaration(symbol)
+                    .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
             }
             match symbol.as_str() {
                 "(" | "[" | "@[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
@@ -285,6 +337,60 @@ mod tests {
         }
         assert_eq!(parse(b"def value := 3").unwrap(), None);
     }
+    /// `open A in <command>` (`Lean.Parser.Command.in`) is one command whose body is the next
+    /// command; the pin's macro elaborates it as `section open A <command> end`.
+    #[test]
+    fn open_in_is_one_command_with_its_body() {
+        let source = "open A B in\ndef x := 1";
+        assert_eq!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::OpenIn {
+                names: vec![Name::from_components(["A"]), Name::from_components(["B"])],
+                scoped: false,
+                body: source.find("def").unwrap(),
+            })
+        );
+        let source = "open scoped A in def x := 1";
+        assert!(matches!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::OpenIn { scoped: true, body, .. }) if body == source.find("def").unwrap()
+        ));
+
+        // The body belongs to the open; the command after it does not.
+        let file = "namespace N\nopen A in\ndef x := 1\ndef y := 2\nend N";
+        let commands = partition(file.as_bytes()).unwrap();
+        let texts: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "namespace N\n",
+                "open A in\ndef x := 1\n",
+                "def y := 2\n",
+                "end N"
+            ]
+        );
+
+        // Nested opens are one command; each level's body is the rest.
+        let file = "open A in\nopen B in\ndef x := 1\ndef y := 2";
+        let commands = partition(file.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 2);
+        let Some(ScopeCommand::OpenIn { body, .. }) = parse(commands[0].1).unwrap() else {
+            panic!("open-in");
+        };
+        let inner = &commands[0].1[body..];
+        assert!(matches!(
+            parse(inner).unwrap(),
+            Some(ScopeCommand::OpenIn { body, .. }) if parse_definition(&inner[body..]).is_ok()
+        ));
+
+        // An `in` inside a later declaration does not reach back to an earlier open.
+        let file = "open A\ndef f := Id.run do\n  for x in [1] do pure ()\n  pure 0\ndef g := 1";
+        assert_eq!(partition(file.as_bytes()).unwrap().len(), 3);
+    }
+
     #[test]
     fn universe_commas_and_escaped_command_names_are_not_command_boundaries() {
         let commands = partition(

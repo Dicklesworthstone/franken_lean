@@ -1907,6 +1907,32 @@ pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionPar
 /// declaration identity before K1 admission, then the ordinary compiler and
 /// Golem path execute the checked artifact. Checking retains the same source
 /// term span but neither compiles nor executes it.
+/// A modifier-led declaration command (`private def …`), as [`parse_source_command`] returns
+/// it: an `example` is checked in a discarded successor, anything else is a named declaration.
+/// Out of line so its temporaries never live in [`parse_source_command`]'s frame (small host
+/// stacks; see `deep_quantifier_bodies_use_heap_frames`).
+#[inline(never)]
+fn source_declaration(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
+    let parsed = parse_definition(source)?;
+    let is_example = matches!(
+        &parsed.syntax,
+        Syntax::Node { args, .. }
+            if matches!(args.get(1), Some(Syntax::Node { kind, .. })
+                if kind == &parser_kind(&["Command", "example"]))
+    );
+    Ok(ParsedSourceCommand {
+        kind: if is_example {
+            SourceCommandKind::Example
+        } else {
+            SourceCommandKind::Definition
+        },
+        source_view: parsed.source_view,
+        syntax: parsed.syntax,
+        epilogue: parsed.epilogue,
+        query_term: None,
+    })
+}
+
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -1999,6 +2025,8 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     query_term: Some(query_term),
                 })
             }
+            // `private`, `protected`, `noncomputable`, … lead a declaration (`declModifiers`).
+            _ if command_scope::modifiers::leads(&view, token) => source_declaration(source),
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
                 Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: view.to_original(token.extent.start()),
@@ -2158,6 +2186,54 @@ fn bounded_binder_syntax(
     Ok(parameters)
 }
 
+/// The attributes and modifiers before a declaration keyword: where the attributes end, and
+/// where the declaration keyword must be. Out of line so its temporaries stay out of the declaration
+/// parser's frame (small host stacks; see `deep_quantifier_bodies_use_heap_frames`).
+#[inline(never)]
+fn declaration_prefix(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    grammar: DefinitionGrammar,
+) -> Result<(usize, usize), NatDefinitionParseError> {
+    if grammar != DefinitionGrammar::Scalar {
+        return Ok((0, 0));
+    }
+    let attributes_end = command_scope::attributes::inline_end(view, tokens)?;
+    Ok((
+        attributes_end,
+        command_scope::modifiers::scan(view, tokens, attributes_end).end(),
+    ))
+}
+
+/// The declaration's `declModifiers` node: the attributes before `attributes_end` and the
+/// modifier slots from there to `declaration_start`. Out of line for the same reason as
+/// [`declaration_prefix`].
+#[inline(never)]
+fn declaration_modifiers(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    attributes_end: usize,
+    declaration_start: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut parts = vec![null_node(Vec::new()); 7];
+    if attributes_end != 0 {
+        parts[1] = command_scope::attributes::inline_syntax(leaves, tokens, attributes_end)?;
+    }
+    if declaration_start != attributes_end {
+        command_scope::modifiers::scan(view, tokens, attributes_end).fill(
+            view,
+            leaves,
+            tokens,
+            &mut parts[2..],
+        )?;
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Command", "declModifiers"]),
+        parts,
+    ))
+}
+
 fn parse_definition_with_grammar(
     source: &[u8],
     grammar: DefinitionGrammar,
@@ -2198,11 +2274,7 @@ fn parse_definition_with_grammar(
         return records::parse(view, tokens);
     }
 
-    let declaration_start = if grammar == DefinitionGrammar::Scalar {
-        command_scope::attributes::inline_end(&view, &tokens)?
-    } else {
-        0
-    };
+    let (attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
     if !matches!(
         tokens.get(declaration_start).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance"))
@@ -2217,7 +2289,7 @@ fn parse_definition_with_grammar(
     let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
     let is_example =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "example");
-    if declaration_start != 0 && is_instance {
+    if attributes_end != 0 && is_instance {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
             expected: NatDefinitionExpectation::DefinitionKeyword,
@@ -2247,7 +2319,15 @@ fn parse_definition_with_grammar(
         None
     };
     let name_index = cursor;
-    if !is_example
+    // `instance` takes an optional `declId` (`Lean.Parser.Command.instance`): without one the
+    // elaborator generates the pin's name from the type.
+    let named = !is_example
+        && !(is_instance
+            && !matches!(
+                tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ));
+    if named
         && !matches!(
             tokens.get(cursor).map(|t| &t.kind),
             Some(TokenKind::Ident(_))
@@ -2258,8 +2338,8 @@ fn parse_definition_with_grammar(
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
-    cursor += usize::from(!is_example);
-    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar && !is_example {
+    cursor += usize::from(named);
+    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar && named {
         levels::declaration_suffix(&view, &tokens, cursor)?
     } else {
         (None, cursor)
@@ -2320,13 +2400,9 @@ fn parse_definition_with_grammar(
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(declaration_start)?;
 
-    let mut modifier_parts = vec![null_node(Vec::new()); 7];
-    if declaration_start != 0 {
-        modifier_parts[1] =
-            command_scope::attributes::inline_syntax(&leaves, &tokens, declaration_start)?;
-    }
-    let modifiers = Syntax::node(parser_kind(&["Command", "declModifiers"]), modifier_parts);
-    let declaration_id = if is_example {
+    let modifiers =
+        declaration_modifiers(&view, &leaves, &tokens, attributes_end, declaration_start)?;
+    let declaration_id = if !named {
         None
     } else {
         Some(Syntax::node(
@@ -2438,7 +2514,7 @@ fn parse_definition_with_grammar(
                 ),
                 definition_keyword,
                 priority,
-                null_node(vec![declaration_id.expect("named instance")]),
+                null_node(declaration_id.into_iter().collect()),
                 optional_signature,
                 declaration_value,
             ],

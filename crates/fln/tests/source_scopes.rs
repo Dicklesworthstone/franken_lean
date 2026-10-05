@@ -271,3 +271,64 @@ fn scope_exhaustion_is_a_typed_non_rejection_and_does_not_publish() {
     assert!(!base.environment().contains(&n("neverPublished")));
     checked(&base, "def recovered := 7");
 }
+
+/// `open A in <command>` is the pin's `section open A <command> end` (`Lean.Parser.Command.in`
+/// and its macro): the open reaches exactly the one command, then the scope is restored. The
+/// pinned `lean` accepts the first file and rejects the second at the second use of `x`
+/// (`Unknown identifier \`x\``), captured 2026-10-05.
+#[test]
+fn open_in_reaches_exactly_its_one_command() {
+    let result = checked(
+        &engine(),
+        "namespace A\ndef x : Nat := 1\nend A\nopen A in\ndef y : Nat := x\nopen A in\nopen Nat in\ndef z : Nat := succ x\ntheorem w : z = y + 1 := by rfl",
+    );
+    assert!(result.environment().contains(&n("y")));
+    assert!(result.environment().contains(&n("z")));
+    // The open ended with its command: a later bare `x` is unknown again.
+    assert!(
+        engine()
+            .check_source_files(
+                &[b"namespace A\ndef x : Nat := 1\nend A\nopen A in def y : Nat := x\ndef w : Nat := x"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err()
+    );
+    // One command for the pin, one here: `open A in def …` is not two.
+    let checked_files = engine()
+        .check_source_files(
+            &[b"namespace A\ndef x : Nat := 1\nend A\nopen A in\ndef y : Nat := x"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked_files.commands, 4);
+}
+
+/// Declaration modifiers and nameless instances now parse to the pin's trees
+/// (`crates/fln-parse/tests/reference_command_trees.rs`), but their semantics are not
+/// implemented: each is refused by the elaborator as syntax it does not support, a typed,
+/// non-authoritative refusal, never admitted with the modifier dropped or under an invented
+/// name. The pin accepts every one of these files.
+#[test]
+fn parsed_modifiers_and_nameless_instances_are_refused_until_elaborated() {
+    for source in [
+        "namespace Foo\nprotected def bar : Nat := 1\nend Foo",
+        "private def a : Nat := 1",
+        "noncomputable def b : Nat := 2",
+        "instance : Inhabited Nat := Inhabited.mk 0",
+    ] {
+        let error = engine()
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        let (class, authority, _) = error.disposition();
+        assert_eq!((class, authority), ("input", false), "{source}: {error}");
+        assert!(error.to_string().contains("elaboration refused source"), "{source}: {error}");
+    }
+}

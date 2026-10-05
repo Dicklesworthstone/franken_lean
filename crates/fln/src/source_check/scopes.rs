@@ -209,6 +209,9 @@ impl Scopes {
             ScopeCommand::Simp(_) => {
                 return Err("simp attributes require an environment transition".into());
             }
+            ScopeCommand::OpenIn { .. } => {
+                return Err("`open … in` is expanded by the command loop, never applied".into());
+            }
             ScopeCommand::Namespace(name) | ScopeCommand::Section(Some(name)) => {
                 // Each structural component is its own scope at the Reference.
                 // This permits `namespace A.B; end B; ...; end A`.
