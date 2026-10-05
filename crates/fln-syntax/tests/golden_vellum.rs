@@ -122,7 +122,17 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// checker-exhaustion commit in two bead comments (fln-r0yh, fln-checker-exhaustion-roots-1mr1)
 /// by the sha it had before `git rebase origin/main`; the commit landed on main under its rebased
 /// sha, and the local pre-rebase object remains. Cite a commit only after it is pushed.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 188;
+///
+/// **188 -> 203 is the same lesson at scale: fifteen local-only shas, cited before any of them
+/// was pushed.** On 2026-10-05 several panes (this one included) wrote bead comments citing
+/// their own commits by the sha they had in a linked worktree before a squash, rebase or
+/// cherry-pick, and one evidence receipt's `captured_utc` field carries the sha of an unpushed
+/// local squash instead of a timestamp. The committed tracker carried all of them, and this
+/// guard went red in every clone that holds those local objects (a fresh clone, which lacks
+/// them, stayed green). Fourteen sit in immutable bead comments and are declared here. The
+/// receipt field is mutable evidence and should be repaired by its owner; when it is, its row
+/// goes stale and must leave this list. Cite a commit only after it is pushed, by its main sha.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 203;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -133,6 +143,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0ba0e-191",
     "0bfde-75b",
     "0c297-df4",
+    "0cabb-35f",
     "0d37e-f7e",
     "0ef65-091",
     "0effc-5b2",
@@ -185,11 +196,13 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "3ceb3-711",
     "40558-4bb",
     "4349a-c28",
+    "45fc1-f55",
     "46186-f6",
     "46186-f67",
     "4747c-803",
     "4ad44-02",
     "4c406-1a",
+    "4cd2c-7ca",
     "50d92-55b",
     "50f65-ba4",
     "52c3b-bb",
@@ -207,6 +220,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "61774-1b5",
     "65a20-263",
     "66e56-721",
+    "67e1e-6f7",
     "6960d-068",
     "6aa24-bbd",
     "6b61d-76",
@@ -219,8 +233,11 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "74aed-94a",
     "768a3-6c4",
     "76d2e-1ed",
+    "77fa0-3f9",
     "7882e-312",
     "7a493-32a",
+    "7a50c-1ed",
+    "7a50c-1ed81-3ddba-6858d-16f70-95e69-ed382-82e22",
     "7b788-f7d",
     "7c240-e9b",
     "7e07d-6d",
@@ -229,6 +246,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "8549b-010",
     "86035-037",
     "8773d-2d0",
+    "8859e-37d4d-8708f-e672c-9661d-c53d0-42d9f-b1d92",
     "894fd-ffc",
     "8bca8-3aa",
     "8d31a-d5d",
@@ -239,6 +257,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "94f56-38d",
     "97c33-34",
     "99291-ba6",
+    "9b936-427",
     "a1a69-aabb4-c3038-17c2b-7053c-95e36-c4987-2cc8e",
     "a21ac-783",
     "a368e-a0b",
@@ -247,6 +266,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "a873e-73c",
     "a90fa-dad",
     "aa5d3-44",
+    "ab1e1-2e5",
     "ad2aa-8e1",
     "ad82f-b45",
     "ae906-30b",
@@ -264,6 +284,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "bae6d-014",
     "bb561-892",
     "bb665-b0b",
+    "bbdf1-633",
     "be14e-e9",
     "be14e-e9b",
     "bf693-bb2",
@@ -274,6 +295,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "c4b13-364",
     "c500d-385",
     "c500d-3850a-62465-6c81f-e9601-d2cc2-4ccba-18990",
+    "c52a7-96d",
     "c584e-470db-a1e49-a12ee-17a53-cec9d-87bbc-e14a5",
     "c821d-9c",
     "cc8d7-469",
@@ -290,6 +312,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "d98ed-115c3-f7ffb-ccc01-b1edd-a044e-70a8f-ba09b",
     "dc4e8-1e6",
     "dd447-7bf",
+    "de018-31d",
     "df2c9-75d",
     "e14fe-98",
     "e14fe-98b",
@@ -310,6 +333,8 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "f4860-03f17-73a0d-950c0-e28f3-34ff2-e00a4-8b4a9",
     "f4c22-a2d",
     "f4db9-1f6b8-90785-2e03a-988ea-0d8ca-bf5cb-812c6",
+    "f63e7-ee1",
+    "f9bd0-f73",
     "fbe5d-be4",
     "fce6c-58c",
 ];
