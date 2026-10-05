@@ -4,9 +4,9 @@
 //! Only calls on an immediate recursive constructor field, fully applied when
 //! function-valued, may replace that marker.
 //! The entire body must be the selected match: an induction hypothesis for an
-//! inner subexpression cannot stand for the whole function. Fixed arguments must
-//! be the original locals or their domain-checked eta expansions, not arbitrary
-//! terms that conversion could erase.
+//! inner subexpression cannot stand for the whole function. Arguments retained
+//! as fixed must be the original locals or their domain-checked eta expansions;
+//! changed arguments are generalized without conversion erasing their contents.
 use super::*;
 mod constrained;
 mod matrix;
@@ -20,6 +20,12 @@ pub enum RecursionError {
     ExplicitParameterRequired,
     NotDecreasing,
     ChangedParameter,
+    /// Internal request to rebuild this candidate's motive. The header local
+    /// identifies its owner across nested local-function/proof checkpoints.
+    GeneralizeParameter {
+        owner: FVarId,
+        position: usize,
+    },
     ChangedIndex,
     PartialApplication,
 }
@@ -37,6 +43,7 @@ impl std::fmt::Display for RecursionError {
                 "recursive call is not on an immediate recursive constructor field"
             }
             Self::ChangedParameter => "recursive call changes a fixed parameter",
+            Self::GeneralizeParameter { .. } => "recursive parameter requires generalization",
             Self::ChangedIndex => "recursive call indices do not match its structural child's type",
             Self::PartialApplication => {
                 "recursive function escapes without its structural argument"
@@ -61,6 +68,7 @@ pub(super) struct Recursion {
     /// Other explicitly matched inputs may vary, even before the decreasing
     /// parameter. Actual uniform family parameters remain fixed.
     matched_parameters: HashSet<usize>,
+    pub(super) generalized_parameters: HashSet<usize>,
     pub(super) pending: bool,
     pub(super) matrix: bool,
     matrix_hypotheses: Vec<(Name, Name)>,
@@ -126,6 +134,8 @@ impl Context {
     /// Retry only an actual unresolved self-reference. Candidate selection is
     /// source-ordered and transactional. Failed candidates retain spent work,
     /// but no assignments, generated identities, local facts or matrix state.
+    /// Changed earlier arguments expand a candidate's generalization mask;
+    /// strict growth bounds these retries by the size of its header telescope.
     pub(super) fn definition_body(
         &mut self,
         name: &Name,
@@ -148,39 +158,56 @@ impl Context {
         let columns = self.recursion_columns(parameters, syntax)?;
         let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
         let mut first_error = None;
-        for (column, _) in columns {
-            let spent = self.txn.budget.heartbeats_consumed;
-            *self = snapshot.clone();
-            self.txn.budget.heartbeats_consumed = spent;
-            let result = self
-                .prepare_recursion(
-                    name,
-                    parameters,
-                    syntax,
-                    expected.as_ref(),
-                    column,
-                    &matched,
-                )
-                .and_then(|()| self.term(syntax, expected.clone()));
-            match result {
-                Ok(value) => return Ok(value),
-                Err(
-                    problem @ NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
-                        RecursionError::NotDecreasing
-                        | RecursionError::ChangedParameter
-                        | RecursionError::ChangedIndex
-                        | RecursionError::RootMatchRequired
-                        | RecursionError::ExplicitParameterRequired
-                        | RecursionError::PartialApplication,
-                    )),
-                ) => {
-                    first_error.get_or_insert(problem);
-                }
-                Err(problem) => {
-                    let spent = self.txn.budget.heartbeats_consumed;
-                    *self = snapshot;
-                    self.txn.budget.heartbeats_consumed = spent;
-                    return Err(problem);
+        for (column, decreasing) in columns {
+            let mut generalized = HashSet::new();
+            loop {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot.clone();
+                self.txn.budget.heartbeats_consumed = spent;
+                let result = self
+                    .prepare_recursion(
+                        name,
+                        parameters,
+                        syntax,
+                        expected.as_ref(),
+                        column,
+                        &matched,
+                    )
+                    .and_then(|()| {
+                        self.recursion
+                            .as_mut()
+                            .expect("prepared structural candidate")
+                            .generalized_parameters = generalized.clone();
+                        self.term(syntax, expected.clone())
+                    });
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                        RecursionError::GeneralizeParameter { owner, position },
+                    ))) if owner == parameters[decreasing].id
+                        && position < decreasing
+                        && generalized.insert(position) => {}
+                    Err(
+                        problem @ NatDefinitionElabError::Inference(
+                            SourceInferenceError::Recursion(
+                                RecursionError::NotDecreasing
+                                | RecursionError::ChangedParameter
+                                | RecursionError::ChangedIndex
+                                | RecursionError::RootMatchRequired
+                                | RecursionError::ExplicitParameterRequired
+                                | RecursionError::PartialApplication,
+                            ),
+                        ),
+                    ) => {
+                        first_error.get_or_insert(problem);
+                        break;
+                    }
+                    Err(problem) => {
+                        let spent = self.txn.budget.heartbeats_consumed;
+                        *self = snapshot;
+                        self.txn.budget.heartbeats_consumed = spent;
+                        return Err(problem);
+                    }
                 }
             }
         }
@@ -191,8 +218,9 @@ impl Context {
     }
 
     /// A structural candidate must be an actual explicit header parameter, not
-    /// a computed expression. Each input identity is tried at most once. The
-    /// pattern matrix still checks every source discriminant and every row.
+    /// a computed expression. Each input identity is enumerated once; motive
+    /// discovery can retry it with more generalized parameters. The pattern
+    /// matrix still checks every source discriminant and every row.
     pub(super) fn recursion_columns(
         &mut self,
         parameters: &[LocalDecl],
@@ -329,6 +357,7 @@ impl Context {
             decreasing,
             column,
             matched_parameters: matched.iter().copied().collect(),
+            generalized_parameters: HashSet::new(),
             pending: true,
             matrix: false,
             matrix_hypotheses: Vec::new(),
@@ -391,6 +420,7 @@ impl Context {
             if position != recursion.decreasing
                 && !positions.contains(&position)
                 && (position > recursion.decreasing
+                    || recursion.generalized_parameters.contains(&position)
                     || (recursion.matched_parameters.contains(&position)
                         && !uniform.contains(&local.id))
                     || !self.elimination_reads(&local.type_)?.is_disjoint(&removed))
@@ -749,7 +779,10 @@ impl Context {
                                 && !recursion.varying.contains(&position)
                                 && !self.fixed_recursive_argument(argument, parameter)?
                             {
-                                return Err(error(RecursionError::ChangedParameter));
+                                return Err(error(RecursionError::GeneralizeParameter {
+                                    owner: recursion.parameters[recursion.decreasing].id.clone(),
+                                    position,
+                                }));
                             }
                         }
                         let mut selected = None;

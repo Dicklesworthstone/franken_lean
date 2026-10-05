@@ -92,7 +92,7 @@ fn three_dependent_indices_and_higher_order_parameters_keep_telescope_order() {
 }
 
 #[test]
-fn exact_eta_expansions_of_fixed_functions_are_safe_but_not_general_conversion() {
+fn fixed_eta_and_varying_function_arguments_are_checked_without_erasing_contents() {
     check(
         "def unary (f : Nat -> Nat) (n : Nat) : Nat := match n with
           | .zero => f 0
@@ -101,16 +101,26 @@ fn exact_eta_expansions_of_fixed_functions_are_safe_but_not_general_conversion()
           | .zero => f 1 2
           | .succ k => binary (fun x y => f x y) k
         theorem one : unary (fun x => x + 7) 3 = 7 := by rfl
-        theorem two : binary (fun x y => x + y) 3 = 3 := by rfl",
+        theorem two : binary (fun x y => x + y) 3 = 3 := by rfl
+        def changeConst (f : Nat -> Nat) (n : Nat) : Nat := match n with
+          | .zero => f 1
+          | .succ k => changeConst (fun x => f 0) k
+        def changeCompose (f : Nat -> Nat) (n : Nat) : Nat := match n with
+          | .zero => f 1
+          | .succ k => changeCompose (fun x => f (f x)) k
+        theorem changed_const : changeConst (fun x => x + 7) 3 = 7 := by rfl
+        theorem changed_compose : changeCompose (fun x => x + 1) 3 = 9 := by rfl",
     );
     let base = engine();
     let root = base.logical_root(&KVMap::new());
     for argument in [
-        "fun x => f 0",
-        "fun x => f (f x)",
         "fun x => let bad : String := 0; f x",
         "fun x => (f x : String)",
+        // Retain the native conservative refusal of a hidden self-call even
+        // where the pin can erase the unused let. The following live use is
+        // nondecreasing under both toolchains.
         "fun x => let hidden := bad f n; f x",
+        "fun x => f (bad f n)",
     ] {
         let source = format!(
             "def bad (f : Nat -> Nat) (n : Nat) : Nat := match n with | .zero => 0 | .succ k => bad ({argument}) k"
