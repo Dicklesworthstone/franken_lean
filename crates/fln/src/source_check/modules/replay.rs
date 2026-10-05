@@ -75,8 +75,14 @@ impl Export {
                     ));
                 }
                 // Equality is the exact payload prefix, never a digest-only claim.
+                // One allocation is one payload, and none of its bytes are read:
+                // an imported prefix the module left alone costs work, not bytes,
+                // so a large closure (`import Init`) is not charged twice its size.
                 for (old, new) in prior.entries().zip(state.entries()) {
                     meter.work(1)?;
+                    if Arc::ptr_eq(&old.payload, &new.payload) {
+                        continue;
+                    }
                     meter.bytes(old.payload.len())?;
                     meter.bytes(new.payload.len())?;
                     if old != new {

@@ -331,6 +331,48 @@ fn an_import_only_entry_uses_no_phantom_command_budget() {
 }
 
 #[test]
+fn imported_metadata_a_module_leaves_alone_is_not_charged_as_examined_bytes() {
+    // The base carries imported metadata, as an `import Init` closure does.
+    let base = engine()
+        .check_source_files(
+            &[b"instance seven : Inhabited Nat := Inhabited.mk 7".as_slice()],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let imported: usize = base
+        .environment()
+        .extensions()
+        .map(|(_, state)| state.entries().map(|e| e.payload.len()).sum::<usize>())
+        .sum();
+    assert!(imported > 0, "the base must carry imported metadata");
+    let mut none = limits();
+    none.max_extension_bytes = 0;
+    check_with(
+        &base,
+        &[("Main", "theorem keep (P : Prop) (h : P) : P := h")],
+        none,
+    )
+    .unwrap_or_else(|error| panic!("{imported} untouched imported bytes were charged: {error:?}"))
+    .into_complete()
+    .unwrap();
+    // Metadata the module writes is still read, and still charged.
+    assert_eq!(
+        check_with(
+            &base,
+            &[("Main", "instance eight : Inhabited Nat := Inhabited.mk 8")],
+            none
+        )
+        .unwrap_err()
+        .disposition(),
+        ("resource", false, 3)
+    );
+}
+
+#[test]
 fn extension_budgets_and_mid_replay_cancellation_retain_the_original_engine() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
