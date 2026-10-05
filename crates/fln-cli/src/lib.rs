@@ -166,11 +166,15 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
-    "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] PATH...\n",
+    "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
     "    LEAN_PATH (else the pinned toolchain's lib/lean) and its whole closure is\n",
-    "    admitted by K1 and the independent checker first (trust: recheck).\n",
+    "    admitted by K1 and the independent checker first (trust: recheck), or,\n",
+    "    under the default --import-posture reuse-verified, rebuilt from this\n",
+    "    binary's earlier admission of the identical bytes and re-proved by\n",
+    "    logical root (records in FLN_IMPORT_REUSE_DIR, else the user cache).\n",
+    "    Every report names the posture; check-olean always rechecks.\n",
     "    Implicit `import Init` is not loaded. --jobs N checks up to N closure\n",
     "    modules at once (default: available cores, at most 8); the result does\n",
     "    not depend on N, and --jobs 1 checks them one by one. `lake build`\n",
@@ -396,6 +400,8 @@ enum MultiplexerCommand {
         /// `.olean` closure modules checked at once; `None` takes
         /// [`default_import_jobs`].
         jobs: Option<std::num::NonZeroUsize>,
+        /// How the imported `.olean` closure is obtained (bead `fln-uyuz`).
+        import_posture: fln::source_check::modules::reuse::ImportPosture,
     },
     Help,
     Version,
@@ -5462,7 +5468,7 @@ fn render_check_olean_success(
     let stdout = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",",
                 "\"scope\":\"decoded-declarations\",\"artifactBytes\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
@@ -7572,7 +7578,7 @@ fn render_check_olean_set_success(
     let stdout = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",",
                 "\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},",
                 "\"modulesChecked\":{},\"importsResolved\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
@@ -8554,7 +8560,7 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
     let output = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":{},\"authority\":true,\"modules\":{},",
+                "{{\"schema\":{},\"outcome\":{},\"authority\":true,\"trust\":\"recheck\",\"modules\":{},",
                 "\"accepted\":{},\"failed\":{},\"inconclusive\":{},\"internalFault\":{},",
                 "\"blocked\":{},\"acceptedDeclarations\":{},\"rows\":[{}]}}\n"
             ),
@@ -12557,11 +12563,13 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
             jobs,
+            import_posture,
         }) => source_check::run(
             paths,
             max_bytes,
             json,
             jobs.unwrap_or_else(default_import_jobs),
+            import_posture,
         ),
         Ok(MultiplexerCommand::SourceRun {
             paths,
@@ -13028,7 +13036,10 @@ const LAKE_USAGE: &str = concat!(
     "See `lake help <command>` for more information on a specific command.\n",
     "\nFrankenLean builds checked +Module:olean facets from declared TOML libraries.\n",
     "Default library, executable and other facets remain unavailable.\n",
-    "Builds recheck source and imports; no persistent cache is consulted.\n",
+    "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
+    "a record of this binary's earlier admission of the identical .olean bytes\n",
+    "is rebuilt and re-proved by logical root; --import-posture recheck admits\n",
+    "them again. No built output is ever reused from disk.\n",
     "`check-build` only checks default-target presence in TOML configuration.\n",
 );
 
@@ -13045,11 +13056,13 @@ const LAKE_HELP_BUILD: &str = concat!(
     "See `lake help <command>` for more information on a specific command.\n",
     "\nFrankenLean supports +Module:olean for modules owned by a TOML lean_lib.\n",
     "Local source imports are built first; external imports (including implicit\n",
-    "Init) are read from LEAN_PATH or the pinned toolchain and rechecked by K1\n",
-    "and the independent checker. Outputs are in buildDir/lib/lean.\n",
+    "Init) are read from LEAN_PATH or the pinned toolchain and admitted by K1\n",
+    "and the independent checker, or under the default --import-posture\n",
+    "reuse-verified rebuilt from this binary's earlier admission of the same\n",
+    "bytes and re-proved by logical root. Outputs are in buildDir/lib/lean.\n",
     "All selected sources must check and encode before any output is replaced.\n",
     "Source is bounded to 1 MiB and 256 modules; artifacts to 64 MiB.\n",
-    "Builds always recheck. Default leanArts, executable facets, custom build\n",
+    "Source always rechecks. Default leanArts, executable facets, custom build\n",
     "settings and distinct external-import scopes remain unavailable.\n",
     "--jobs N checks up to N external modules at once (default: available\n",
     "cores, at most 8); the build does not depend on N.\n",
@@ -13087,6 +13100,14 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     if arguments.is_empty() {
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     }
+    // `lake build --import-posture P` (bead `fln-uyuz`); `reuse-verified` by default.
+    let json_requested = arguments.iter().any(|arg| arg == "--json" || arg == "-J");
+    let (arguments, import_posture) = match source_check::take_import_posture_option(arguments) {
+        Ok(taken) => taken,
+        Err(UsageError(detail)) => {
+            return lake_operation_failure("fln.lake-build/2", &detail, false, json_requested);
+        }
+    };
     let mut dir: Option<PathBuf> = None;
     let mut iter = arguments.into_iter();
     let mut command: Option<String> = None;
@@ -13226,6 +13247,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 command_args,
                 is_json,
                 jobs.unwrap_or_else(default_import_jobs),
+                import_posture,
             )
         }
         "clean" => {

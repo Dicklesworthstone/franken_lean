@@ -1237,7 +1237,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
                 .windows(2)
                 .filter(|lines| {
                     lines[0].trim()
-                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,","##
+                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",","##
                         && lines[1].trim()
                             == r##""\"scope\":\"decoded-declarations\",\"artifactBytes\":{},","##
                 })
@@ -1246,7 +1246,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
                 .windows(2)
                 .filter(|lines| {
                     lines[0].trim()
-                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,","##
+                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",","##
                         && lines[1].trim()
                             == r##""\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},","##
                 })

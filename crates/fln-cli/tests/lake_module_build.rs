@@ -123,13 +123,16 @@ fn builds_real_module_closure_and_downstream_source_imports_it() {
     ])
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["check-source", "--json"])
+        .args(["check-source", "--json", "--import-posture", "recheck"])
         .arg(client.0.join("Use.lean"))
         .env("LEAN_PATH", search)
         .output()
         .unwrap();
     let report = success(&out);
-    assert!(report.contains("\"trust\":\"recheck\""), "{report}");
+    assert!(
+        report.contains("\"trust\":\"recheck\",\"admission\":\"council\""),
+        "{report}"
+    );
 }
 
 #[test]

@@ -15,7 +15,9 @@ fn fixture(case: &str) -> PathBuf {
 
 fn check_source(case: &str) -> (i32, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["check-source", "--json"])
+        // Council admission is this suite's subject, so the posture is pinned;
+        // `source_import_reuse.rs` covers `reuse-verified`.
+        .args(["check-source", "--json", "--import-posture", "recheck"])
         .arg(fixture(case))
         .output()
         .expect("run fln check-source");
@@ -65,7 +67,7 @@ fn a_real_prelude_import_is_council_admitted_and_journaled() {
     );
     assert!(
         stdout.contains(
-            "\"oleanImports\":{\"trust\":\"recheck\",\"modules\":1,\"declarations\":2314}"
+            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":1,\"declarations\":2314}"
         ),
         "{stdout}"
     );
@@ -164,7 +166,14 @@ fn check_source_with(
 ) -> (Option<i32>, String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
     command
-        .args(["check-source", "--json", "--jobs", jobs])
+        .args([
+            "check-source",
+            "--json",
+            "--import-posture",
+            "recheck",
+            "--jobs",
+            jobs,
+        ])
         .arg(entry);
     if let Some(lean_path) = lean_path {
         command.env("LEAN_PATH", lean_path);
@@ -191,9 +200,9 @@ fn the_report_is_byte_identical_at_one_and_several_jobs() {
     let serial = check_source_with("1", &fixture("siblings"), None);
     assert_eq!(serial.0, Some(0), "{serial:?}");
     assert!(
-        serial
-            .1
-            .contains("\"oleanImports\":{\"trust\":\"recheck\",\"modules\":7,"),
+        serial.1.contains(
+            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":7,"
+        ),
         "{serial:?}"
     );
     for jobs in ["3", "8"] {

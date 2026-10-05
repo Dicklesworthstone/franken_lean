@@ -1,6 +1,7 @@
 //! User-facing source proof checking. No compiler or VM is entered.
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImport;
+use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 mod imports;
 pub(super) mod lsp;
 
@@ -8,13 +9,63 @@ pub(super) fn load_build_base(
     roots: &[fln::Name],
     source_root: &Path,
     jobs: std::num::NonZeroUsize,
-) -> Result<Option<SourceOleanImport>, (&'static str, String, bool)> {
-    imports::load_build_base(roots, source_root, jobs)
+    posture: ImportPosture,
+) -> Result<Option<(SourceOleanImport, ImportPostureReport)>, (&'static str, String, bool)> {
+    imports::load_build_base(roots, source_root, jobs, posture)
         .map_err(|error| (error.class, error.detail, error.authority))
+}
+
+pub(crate) use imports::{posture_json, posture_sentence};
+
+/// Remove `--import-posture P` / `--import-posture=P` from an interactive front
+/// door's arguments, which otherwise keep their order. Options end at `--`. The
+/// interactive doors default to `reuse-verified` (bead `fln-uyuz`); `check-olean`
+/// accepts no posture at all, so G1 evidence is always `recheck`.
+pub(super) fn take_import_posture_option(
+    arguments: Vec<OsString>,
+) -> Result<(Vec<OsString>, ImportPosture), UsageError> {
+    let mut posture = None;
+    let mut kept = Vec::with_capacity(arguments.len());
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            kept.push(argument);
+            continue;
+        }
+        let value = if options && argument == "--import-posture" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--import-posture requires `recheck` or `reuse-verified`".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--import-posture="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        let Some(value) = value else {
+            kept.push(argument);
+            continue;
+        };
+        if posture.is_some() {
+            return Err(UsageError(
+                "--import-posture may be supplied at most once".to_owned(),
+            ));
+        }
+        let text = value
+            .to_str()
+            .ok_or_else(|| UsageError("--import-posture is not UTF-8".to_owned()))?;
+        posture = Some(ImportPosture::parse(text).map_err(UsageError)?);
+    }
+    Ok((kept, posture.unwrap_or(ImportPosture::ReuseVerified)))
 }
 
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let (arguments, jobs) = take_jobs_option(arguments)?;
+    let (arguments, import_posture) = take_import_posture_option(arguments)?;
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.
     let mut json = false;
     let mut bytes = false;
@@ -56,6 +107,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         max_bytes,
         json,
         jobs,
+        import_posture,
     })
 }
 
@@ -88,6 +140,7 @@ pub(super) fn run(
     max_bytes: usize,
     json: bool,
     jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
 ) -> MultiplexerOutput {
     if paths.len() > 4096 {
         return failed("resource", "source file count exceeds 4096", false, json, 3);
@@ -134,7 +187,7 @@ pub(super) fn run(
             if let Err(error) = loaded.preflight() {
                 return failed(error.class, &error.detail, error.authority, json, error.exit);
             }
-            let (engine, olean_base) = match loaded.base_engine(seed, jobs) {
+            let (engine, olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
@@ -153,7 +206,7 @@ pub(super) fn run(
                     json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
                 let base = olean_base.as_ref().map_or(String::new(), |base| {
-                    format!(" against {} imported .olean modules ({} declarations, each admitted by K1 and the independent checker)", base.modules, base.declarations)
+                    format!(" against {} imported .olean modules ({} declarations, {})", base.modules, base.declarations, posture_sentence(&base.report))
                 });
                 format!("Checked {} source commands ({} theorems) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };

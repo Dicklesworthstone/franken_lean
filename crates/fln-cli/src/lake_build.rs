@@ -1,6 +1,7 @@
 //! Checked TOML package module builds. Only the Reference's `+Module:olean`
 //! facet is complete here; library defaults also require other Lean artifacts.
 use super::*;
+use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession, parse_source_header,
 };
@@ -313,6 +314,8 @@ struct Compilation {
     artifacts: BTreeMap<Name, Vec<u8>>,
     elaborated_modules: usize,
     reused_modules: usize,
+    /// One per external `.olean` closure obtained, in the order obtained.
+    imports: Vec<ImportPostureReport>,
 }
 
 fn compile(
@@ -320,8 +323,10 @@ fn compile(
     entries: &[Name],
     modules: &BTreeMap<Name, Module>,
     jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
 ) -> Result<Compilation, Failure> {
     let mut artifacts = BTreeMap::new();
+    let mut imports = Vec::new();
     let mut elaborated_modules = 0usize;
     let mut reused_modules = 0usize;
     // Retain only one external world, never one large engine per target. Target
@@ -368,7 +373,7 @@ fn compile(
         // The exact ordered external roots bind this invocation's immutable
         // import snapshot. Disk outputs never become checked cache entries.
         if active.as_ref().is_none_or(|(roots, _)| roots != &external) {
-            let base = source_check::load_build_base(&external, root, jobs).map_err(
+            let base = source_check::load_build_base(&external, root, jobs, posture).map_err(
                 |(class, detail, authority)| Failure {
                     class,
                     detail,
@@ -376,12 +381,15 @@ fn compile(
                 },
             )?;
             let session = match base {
-                Some(base) => SourceModuleSession::from_imports(
-                    base,
-                    fln::KVMap::new(),
-                    limits,
-                    SourceModuleCacheLimits::default(),
-                ),
+                Some((base, report)) => {
+                    imports.push(report);
+                    SourceModuleSession::from_imports(
+                        base,
+                        fln::KVMap::new(),
+                        limits,
+                        SourceModuleCacheLimits::default(),
+                    )
+                }
                 None => SourceModuleSession::new(
                     fln::Engine::from_environment(fln::Environment::new()),
                     fln::KVMap::new(),
@@ -455,6 +463,7 @@ fn compile(
         artifacts,
         elaborated_modules,
         reused_modules,
+        imports,
     })
 }
 
@@ -559,6 +568,7 @@ fn build(
     targets: Vec<String>,
     json: bool,
     jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
 ) -> Result<MultiplexerOutput, Failure> {
     let root = directory
         .canonicalize()
@@ -570,7 +580,8 @@ fn build(
         artifacts,
         elaborated_modules,
         reused_modules,
-    } = compile(&root, &entries, &modules, jobs)?;
+        imports,
+    } = compile(&root, &entries, &modules, jobs, posture)?;
     let paths = publish(
         &root,
         &root.join(&config.build_dir).join("lib/lean"),
@@ -582,14 +593,24 @@ fn build(
             .map(|path| json_string(&path.display().to_string()))
             .collect::<Vec<_>>()
             .join(",");
+        let imports = imports
+            .iter()
+            .map(|report| format!("{{{}}}", source_check::posture_json(report)))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":0,\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\"}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":0,\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]}}\n",
             json_string(&config.name),
-            artifacts.len()
+            artifacts.len(),
+            json_string(posture.as_str()),
         )
     } else {
+        let imports = imports
+            .iter()
+            .map(|report| format!(" Imports: {}.", source_check::posture_sentence(report)))
+            .collect::<String>();
         format!(
-            "Built {} checked .olean modules for {} (0 disk cached; {reused_modules} module checks reused).\n",
+            "Built {} checked .olean modules for {} (0 disk cached; {reused_modules} module checks reused).{imports}\n",
             artifacts.len(),
             config.name
         )
@@ -604,12 +625,13 @@ pub(super) fn run(
     targets: Vec<String>,
     json: bool,
     jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
 ) -> MultiplexerOutput {
     let worker = std::thread::Builder::new()
         .name("fln-lake-build".to_owned())
         // Imports are admitted on this thread under the `.olean` depth budget.
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
-        .spawn(move || build(directory, targets, json, jobs));
+        .spawn(move || build(directory, targets, json, jobs, posture));
     match worker {
         Ok(worker) => match worker.join() {
             Ok(Ok(output)) => output,

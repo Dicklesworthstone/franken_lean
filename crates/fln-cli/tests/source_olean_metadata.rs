@@ -130,7 +130,14 @@ impl Project {
     }
     fn run(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_fln"))
-            .args(["check-source", "--json", "Main.lean"])
+            // Council admission is this suite's subject, so the posture is pinned.
+            .args([
+                "check-source",
+                "--json",
+                "--import-posture",
+                "recheck",
+                "Main.lean",
+            ])
             .current_dir(&self.0)
             .env("LEAN_PATH", self.0.join("objects"))
             .output()
@@ -201,7 +208,7 @@ fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
         assert!(report.contains("\"executed\":false"), "{report}");
         assert!(
             report.contains(
-                "\"oleanImports\":{\"trust\":\"recheck\",\"modules\":3,\"declarations\":6}"
+                "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":3,\"declarations\":6}"
             ),
             "{report}"
         );

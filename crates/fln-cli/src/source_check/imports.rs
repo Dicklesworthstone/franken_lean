@@ -5,12 +5,16 @@
 //! An import with no source file under the root is looked up as an `.olean`
 //! on the search path (`LEAN_PATH`, else the pinned toolchain's `lib/lean`).
 //! Its closure is read as data and admitted through K1 and the independent
-//! checker before any source is checked: the `recheck` trust level. Nothing
-//! from an `.olean` enters the environment unchecked.
+//! checker before any source is checked: the `recheck` trust level. Under the
+//! `reuse-verified` posture (bead `fln-uyuz`) an earlier admission of the
+//! identical bytes by this binary is rebuilt and re-proved by logical root
+//! instead ([`fln::source_check::modules::reuse`]); every output names which.
 use super::*;
 pub(super) mod editor;
 mod metadata;
+mod reuse;
 use fln::source_check::modules::imported::SourceOleanImport;
+use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{LeafView, Name, Outcome, SourceFileCheck, SourceModuleInput};
 use std::collections::BTreeMap;
@@ -34,6 +38,8 @@ pub(super) struct OleanBase {
     declaration_root: fln::LogicalRoot,
     metadata: Vec<fln::source_check::modules::imported::SourceMetadataReport>,
     receipt: SourceOleanImport,
+    /// The posture this closure was obtained under, and what it did.
+    pub(super) report: ImportPostureReport,
 }
 
 pub(super) struct Failure {
@@ -99,6 +105,7 @@ impl Loaded {
         &self,
         seed: impl FnOnce() -> Result<fln::Engine, Failure>,
         jobs: std::num::NonZeroUsize,
+        posture: ImportPosture,
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
         if self.oleans.is_empty() {
             return seed().map(|engine| (engine, None));
@@ -120,8 +127,9 @@ impl Loaded {
             MAX_OLEAN_BYTES,
             fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
         );
+        let resolved = reuse::Resolved::new(posture);
         let checked = fln::Engine::from_environment(fln::Environment::new())
-            .import_olean_modules_for_source(
+            .import_olean_modules_with_posture(
                 &inputs,
                 &self.olean_roots,
                 &fln::KVMap::new(),
@@ -133,10 +141,12 @@ impl Loaded {
                     },
                     ..fln::source_check::modules::imported::SourceOleanImportLimits::new(limits)
                 },
+                resolved.request(),
+                None,
             )
             .map_err(metadata::failure)?;
         match checked {
-            Outcome::Complete(checked) => {
+            Outcome::Complete((checked, report)) => {
                 let declarations = checked
                     .checked
                     .modules
@@ -151,6 +161,7 @@ impl Loaded {
                         declaration_root: checked.checked.result_logical_root,
                         metadata: checked.modules.clone(),
                         receipt: checked,
+                        report,
                     }),
                 ))
             }
@@ -535,13 +546,14 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
     Ok(loaded)
 }
 
-/// Builds use the same bounded import loader and dual-checker admission as
-/// source checking, but never substitute a synthetic seed for missing imports.
+/// Builds use the same bounded import loader, posture and dual-checker admission
+/// as source checking, but never substitute a synthetic seed for missing imports.
 pub(super) fn load_build_base(
     roots: &[Name],
     source_root: &Path,
     jobs: std::num::NonZeroUsize,
-) -> Result<Option<SourceOleanImport>, Failure> {
+    posture: ImportPosture,
+) -> Result<Option<(SourceOleanImport, ImportPostureReport)>, Failure> {
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
@@ -552,8 +564,19 @@ pub(super) fn load_build_base(
         .base_engine(
             || Ok(fln::Engine::from_environment(fln::Environment::new())),
             jobs,
+            posture,
         )
-        .map(|(_, base)| base.map(|base| base.receipt))
+        .map(|(_, base)| base.map(|base| (base.receipt, base.report)))
+}
+
+/// The posture fields of an import report, for the Lake build report.
+pub(crate) fn posture_json(report: &ImportPostureReport) -> String {
+    reuse::json_fields(report)
+}
+
+/// One human sentence naming the posture an import was obtained under.
+pub(crate) fn posture_sentence(report: &ImportPostureReport) -> String {
+    reuse::sentence(report)
 }
 
 fn validate_component(component: &str) -> Result<(), Failure> {

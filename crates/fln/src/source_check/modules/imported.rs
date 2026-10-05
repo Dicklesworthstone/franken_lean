@@ -220,6 +220,30 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        self.activate_source_metadata(checked, modules, roots, options, limits, cancellation)
+    }
+
+    /// Activate the native class, instance and default-instance journals of a
+    /// checked closure, in the roots' import order. Both import postures end
+    /// here: `recheck` with the set the council just admitted, `reuse-verified`
+    /// ([`super::reuse`]) with the set it rebuilt and proved identical by root.
+    /// Metadata grants no declaration authority either way.
+    pub(super) fn activate_source_metadata(
+        &self,
+        checked: CheckedOleanSet,
+        modules: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceOleanImport>> {
+        macro_rules! cancelled {
+            ($at:literal) => {
+                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled($at)));
+                }
+            };
+        }
         let order = replay_order(&checked, roots)?;
         let inputs: BTreeMap<_, _> = modules.iter().map(|m| (m.name, m)).collect();
         let selected = [
@@ -506,18 +530,18 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::num::NonZeroUsize;
 
     /// The `.olean` kernel depth budget's stack, as `check-source` gives it.
     const STACK: usize = 64 * 1024 * 1024;
 
-    fn n(text: &str) -> Name {
+    pub(in crate::source_check::modules) fn n(text: &str) -> Name {
         Name::from_components(text.split('.'))
     }
 
-    fn pinned_lib() -> Option<std::path::PathBuf> {
+    pub(in crate::source_check::modules) fn pinned_lib() -> Option<std::path::PathBuf> {
         let lib = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .map(|home| {
@@ -535,7 +559,10 @@ mod tests {
 
     /// Each module of `roots`' closure with its exported, server and private
     /// parts, in discovery order, read as data from the pinned toolchain.
-    fn closure(lib: &std::path::Path, roots: &[&str]) -> Vec<(Name, [Vec<u8>; 3])> {
+    pub(in crate::source_check::modules) fn closure(
+        lib: &std::path::Path,
+        roots: &[&str],
+    ) -> Vec<(Name, [Vec<u8>; 3])> {
         let mut pending: Vec<Name> = roots.iter().map(|root| n(root)).collect();
         let mut seen = BTreeSet::new();
         let mut loaded = Vec::new();
@@ -555,7 +582,9 @@ mod tests {
         loaded
     }
 
-    fn inputs(closure: &[(Name, [Vec<u8>; 3])]) -> Vec<OleanModuleInput<'_>> {
+    pub(in crate::source_check::modules) fn inputs(
+        closure: &[(Name, [Vec<u8>; 3])],
+    ) -> Vec<OleanModuleInput<'_>> {
         closure
             .iter()
             .map(|(name, [exported, server, private])| OleanModuleInput {
@@ -567,7 +596,7 @@ mod tests {
             .collect()
     }
 
-    fn limits(threads: usize) -> SourceOleanImportLimits {
+    pub(in crate::source_check::modules) fn limits(threads: usize) -> SourceOleanImportLimits {
         SourceOleanImportLimits {
             jobs: OleanFrontierJobs {
                 threads: NonZeroUsize::new(threads).expect("a positive thread count"),
@@ -595,7 +624,9 @@ mod tests {
 
     /// Run on a stack the `.olean` kernel budget is calibrated for, as the
     /// front doors do.
-    fn on_import_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+    pub(in crate::source_check::modules) fn on_import_stack<T: Send>(
+        body: impl FnOnce() -> T + Send,
+    ) -> T {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(STACK)

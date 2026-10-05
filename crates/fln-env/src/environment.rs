@@ -1186,7 +1186,10 @@ impl Environment {
     /// but it does not require that anything CHECKED the declaration — so under D6
     /// ("nothing but the kernel may admit a constant") the only legitimate production
     /// callers are in `fln-kernel`, and today there are exactly two:
-    /// `fln-kernel/src/admit.rs` and `fln-kernel/src/capability.rs`.
+    /// `fln-kernel/src/admit.rs` and `fln-kernel/src/capability.rs`. D6 has one named
+    /// carve-out beside them (bead `fln-uyuz`): `fln/src/source_check/modules/reuse.rs`
+    /// rebuilds an `.olean` closure the council admitted earlier and keeps it only if
+    /// it reaches every logical root that admission reached.
     ///
     /// That restriction cannot be expressed in this signature. `fln-env` is rank 4 and
     /// `fln-kernel` sits above it, so a kernel-bound capability type can never appear

@@ -56,7 +56,8 @@ impl OleanBase {
             uninterpreted += module.uninterpreted.len();
         }
         format!(
-            ",\"oleanImports\":{{\"trust\":\"recheck\",\"modules\":{},\"declarations\":{}}},\"declarationLogicalRoot\":{},\"oleanMetadata\":{{\"classes\":{classes},\"instances\":{instances},\"defaultInstances\":{defaults},\"scopedInstances\":{scoped},\"uninterpretedExtensions\":{uninterpreted}}}",
+            ",\"oleanImports\":{{{},\"modules\":{},\"declarations\":{}}},\"declarationLogicalRoot\":{},\"oleanMetadata\":{{\"classes\":{classes},\"instances\":{instances},\"defaultInstances\":{defaults},\"scopedInstances\":{scoped},\"uninterpretedExtensions\":{uninterpreted}}}",
+            super::reuse::json_fields(&self.report),
             self.modules,
             self.declarations,
             json_string(&self.declaration_root.to_string()),

@@ -63,9 +63,10 @@
 //!   called from production source in a crate that depends on fln-env. Allowlist is
 //!   empty: a first production caller is the violation (bead `franken_lean-oof9`).
 //! * `FLN-STRUCT-039` `Environment::plan_add_decl` is reachable outside the two
-//!   reviewed fln-kernel call sites. D6 reserves admission to the kernel, and no
-//!   type-level guarantee is available at this boundary because fln-env sits BELOW
-//!   fln-kernel and cannot name it (bead `franken_lean-oof9`).
+//!   reviewed fln-kernel call sites and D6's single named carve-out, the
+//!   `reuse-verified` import rebuild (bead `fln-uyuz`). D6 reserves admission to the
+//!   kernel, and no type-level guarantee is available at this boundary because fln-env
+//!   sits BELOW fln-kernel and cannot name it (bead `franken_lean-oof9`).
 //! * `FLN-STRUCT-040` an unsafe boundary crate's root neither enables
 //!   `clippy::undocumented_unsafe_blocks` nor declares, with a bead, that it has not.
 //!   D3 requires a SAFETY note at every unsafe site; that lint decides it and nothing
@@ -1131,11 +1132,19 @@ fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &
 /// recorded positions moved (`admit.rs` 3032 -> 3035, `capability.rs` 182 -> 201). An
 /// allowlist keyed on positions would have gone stale without anything being wrong.
 ///
-/// Two entries is the point. It is small enough to review by eye, and a third file
-/// appearing is a loud failure rather than a quiet spread of the raw surface.
-const PLANNED_ADMISSION_ALLOWLIST: [&str; 2] = [
+/// Two kernel entries is the point. It is small enough to review by eye, and any other
+/// file appearing is a loud failure rather than a quiet spread of the raw surface.
+///
+/// The third entry is D6's single named exception, decided on bead `fln-uyuz` (route 1):
+/// the `reuse-verified` import posture, which rebuilds an `.olean` closure that this
+/// binary's council admitted earlier from the identical bytes, and keeps it only if it
+/// reaches every logical root that admission reached. It is the only non-kernel file,
+/// one function in it calls the method, and `recheck` doors (`check-olean`, its
+/// frontier and receipts) never reach it. A fourth entry is a new decision.
+const PLANNED_ADMISSION_ALLOWLIST: [&str; 3] = [
     "crates/fln-kernel/src/admit.rs",
     "crates/fln-kernel/src/capability.rs",
+    "crates/fln/src/source_check/modules/reuse.rs",
 ];
 
 /// Keep declaration admission unreachable outside the kernel, not merely unused
@@ -1196,8 +1205,8 @@ fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &
             path: format!("{source_rel}:{}", site.line),
             detail: format!(
                 "`Environment::plan_add_decl` is reachable outside the two reviewed \
-                 kernel call sites{}. The allowlist is {} and a third entry is a \
-                 decision, not an edit.",
+                 kernel call sites and D6's one named carve-out{}. The allowlist is {} \
+                 and a fourth entry is a decision, not an edit.",
                 unresolved_suffix(site.arity),
                 PLANNED_ADMISSION_ALLOWLIST.join(", ")
             ),

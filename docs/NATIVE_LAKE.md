@@ -51,14 +51,33 @@ LEAN_PATH="$PWD/.lake/build/lib/lean" fln check-source consumer/Use.lean
 ```
 
 External imports are read from `LEAN_PATH`, or the pinned toolchain's `lib/lean`
-when that variable does not supply a search path. Their entire `.olean` closure
-is admitted again by both checkers. Every source file without `prelude` requires
+when that variable does not supply a search path. How their `.olean` closure
+reaches the environment is the import posture (bead `fln-uyuz`), and every
+report names it per closure (`import_posture`, and `imports[]` with `trust`,
+`admission`, `closureKey`, `record`, `recordWrite`):
+
+- `--import-posture reuse-verified`, the default here and for `fln check-source`.
+  The closure is keyed by one digest over every byte of every imported part, the
+  import roots, the options and the running binary's own bytes. If this binary
+  admitted those exact bytes before, its record is read back, the closure is
+  rebuilt from the bytes, and it is used only if it reaches every logical root
+  that admission reached (each module's, the declarations', and the result after
+  metadata); otherwise both checkers admit it and the admission is recorded.
+  Records live in `FLN_IMPORT_REUSE_DIR`, else `$XDG_CACHE_HOME/fln/import-reuse`,
+  else `~/.cache/fln/import-reuse`. A record is a cache over a council admission,
+  as trustworthy as the store it sits in; this is D6's single named carve-out.
+- `--import-posture recheck` admits the whole closure again with both checkers
+  and never reads or writes a record. `fln check-olean`, its `--continue` frontier
+  and its receipts take no posture at all: G1 evidence is always `recheck`.
+- `trust-producer` (plan §7.2) is refused as not implemented.
+
+Every source file without `prelude` requires
 the real `Init` import; absence or rejection of that dependency fails the build.
 External dependencies can be inherited through local source imports. Builds
 whose source modules require different external environments currently refuse
 instead of exposing an unrelated sibling's imports.
 
-Builds always recheck the current input bytes. Existing output files, their
+Builds always recheck the current source bytes. Existing output files, their
 timestamps, and old placeholder contents never authorize a cache hit. A source
 edit with its old mtime restored still rebuilds. The JSON report uses
 `fln.lake-build/2`, identifies the `olean` facet, lists the emitted paths, and
