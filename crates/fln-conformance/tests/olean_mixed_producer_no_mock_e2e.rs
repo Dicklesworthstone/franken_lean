@@ -17,7 +17,8 @@
 //! the opposite direction of the matrix, or byte identity against a separately
 //! elaborated Reference module. Those remain owned by `franken_lean-0nz`.
 //!
-//! Provenance: ported from FoggyForge's unlanded `69689619` / `c9455a9f`
+//! Provenance: ported from FoggyForge's unlanded "conformance: seed fresh olean
+//! mixed-producer path" and "test(olean): reclaim artifact fixture roots"
 //! (archived at tag `archive/foggyforge/kernel-corpus-fixes-20260730`),
 //! adapted to the current scratch fence and pin-rig registry.
 

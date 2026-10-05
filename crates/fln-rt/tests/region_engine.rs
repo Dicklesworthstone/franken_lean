@@ -248,7 +248,9 @@ fn opaque_capture_refuses_foreign_interior_forward_and_overlapping_regions() {
 /// The full-surface audit for one part of a multi-region image (a module-system
 /// `.olean.server`/`.olean.private`): the pointer-range law widens to the named
 /// predecessors and NOTHING else does. Ported from FoggyForge's unlanded
-/// `5ef97779`, adapted to the existing fault vocabulary.
+/// "feat(olean): mmap persistent part chains" (archived at tag
+/// `archive/foggyforge/kernel-corpus-fixes-20260730`), adapted to the existing
+/// fault vocabulary.
 #[test]
 fn audit_with_dependencies_widens_only_the_pointer_range_law() {
     use fln_rt::region::{RegionDependency, audit, audit_with_dependencies};
