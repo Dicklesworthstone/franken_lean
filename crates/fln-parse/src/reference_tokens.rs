@@ -128,7 +128,10 @@ impl fmt::Display for CensusError {
                 "{found} builtin tokens is below the floor of {MIN_BUILTIN_TOKENS}"
             ),
             Self::OpenClosure { module, import } => {
-                write!(f, "module {module} imports {import}, which the census lacks")
+                write!(
+                    f,
+                    "module {module} imports {import}, which the census lacks"
+                )
             }
         }
     }
@@ -160,7 +163,11 @@ fn module_name(text: &str) -> Option<Name> {
     Some(Name::from_components(text.split('.')))
 }
 
-fn declared(counts: &BTreeMap<String, usize>, what: &'static str, found: usize) -> Result<(), CensusError> {
+fn declared(
+    counts: &BTreeMap<String, usize>,
+    what: &'static str,
+    found: usize,
+) -> Result<(), CensusError> {
     match counts.get(what) {
         Some(&n) if n == found => Ok(()),
         Some(&n) => Err(CensusError::CountMismatch {
@@ -216,7 +223,9 @@ impl TokenCensus {
                         return Err(malformed("a builtin-token row has three fields"));
                     };
                     if !introducers.starts_with("introducers=") || !is_token(token) {
-                        return Err(malformed("a builtin-token row names a token and its introducers"));
+                        return Err(malformed(
+                            "a builtin-token row names a token and its introducers",
+                        ));
                     }
                     if !builtin.insert((*token).to_string()) {
                         return Err(CensusError::Duplicate {
@@ -341,7 +350,11 @@ impl TokenCensus {
     /// of the reflexive-transitive closure of its imports, where a file without `prelude` also
     /// imports `Init`. A module the census does not describe is refused, never skipped: its
     /// tokens are unknown, and a table missing them would silently relex the file.
-    pub fn tokens_for(&self, prelude: bool, imports: &[Name]) -> Result<BTreeSet<String>, UnknownModule> {
+    pub fn tokens_for(
+        &self,
+        prelude: bool,
+        imports: &[Name],
+    ) -> Result<BTreeSet<String>, UnknownModule> {
         let mut roots: Vec<Name> = imports.to_vec();
         if !prelude {
             roots.push(Name::from_components(["Init"]));
@@ -363,7 +376,8 @@ impl TokenCensus {
 
     /// [`Self::tokens_for`] as a lexer table.
     pub fn table_for(&self, prelude: bool, imports: &[Name]) -> Result<TokenTable, UnknownModule> {
-        self.tokens_for(prelude, imports).map(TokenTable::from_tokens)
+        self.tokens_for(prelude, imports)
+            .map(TokenTable::from_tokens)
     }
 
     /// The table the module-header parser lexes against.
@@ -382,7 +396,9 @@ pub fn reference_census() -> &'static TokenCensus {
     static CENSUS: OnceLock<TokenCensus> = OnceLock::new();
     CENSUS.get_or_init(|| match TokenCensus::parse(GRAMMAR_CENSUS) {
         Ok(census) => census,
-        Err(error) => panic!("invariant: contracts/REFERENCE_GRAMMAR_CENSUS.txt is unusable: {error}"),
+        Err(error) => {
+            panic!("invariant: contracts/REFERENCE_GRAMMAR_CENSUS.txt is unusable: {error}")
+        }
     })
 }
 

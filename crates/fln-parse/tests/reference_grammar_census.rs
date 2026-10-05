@@ -57,7 +57,9 @@ fn module(name: &str) -> Name {
 #[test]
 fn the_production_table_is_exactly_the_census_table_for_an_ordinary_file() {
     let census = reference_census();
-    let derived = census.tokens_for(false, &[]).expect("Init is in the census");
+    let derived = census
+        .tokens_for(false, &[])
+        .expect("Init is in the census");
     let scope: BTreeSet<String> = implicit_init_table()
         .tokens()
         .into_iter()
@@ -75,18 +77,25 @@ fn the_production_table_is_exactly_the_census_table_for_an_ordinary_file() {
         .collect();
     let mut expected = derived.clone();
     for (word, _) in SEED_IDENTIFIER_ALLOWANCE {
-        assert!(expected.remove(*word), "allowance member {word} is not a token at the pin");
+        assert!(
+            expected.remove(*word),
+            "allowance member {word} is not a token at the pin"
+        );
     }
     assert_eq!(production, expected);
     for token in census.builtin_tokens() {
         assert!(
             production.contains(token)
-                || SEED_IDENTIFIER_ALLOWANCE.iter().any(|(word, _)| word == &token),
+                || SEED_IDENTIFIER_ALLOWANCE
+                    .iter()
+                    .any(|(word, _)| word == &token),
             "builtin token {token} missing"
         );
     }
     // The measured symptoms (2026-10-04): builtin and Init tokens the hand table refused.
-    for token in ["⟨", "⟩", "$", "▸", "⋯", "≤", "≥", ">", "≠", "×", "∃", "<|", "|>", "∘", "&&", "||", "sorry"] {
+    for token in [
+        "⟨", "⟩", "$", "▸", "⋯", "≤", "≥", ">", "≠", "×", "∃", "<|", "|>", "∘", "&&", "||", "sorry",
+    ] {
         assert!(production.contains(token), "{token} is a token at the pin");
     }
     // The hand table carried a token the pin does not have.
@@ -102,7 +111,10 @@ fn the_closure_rule_reproduces_every_table_the_oracle_measured() {
     let census = reference_census();
     let checks: Vec<(String, usize)> = rows(GRAMMAR_CENSUS, "closure-check")
         .map(|fields| {
-            assert_eq!(fields[3], "agrees", "the extractor only publishes agreeing closures");
+            assert_eq!(
+                fields[3], "agrees",
+                "the extractor only publishes agreeing closures"
+            );
             let size = fields[2]
                 .strip_prefix("tokens=")
                 .expect("tokens=")
@@ -111,7 +123,10 @@ fn the_closure_rule_reproduces_every_table_the_oracle_measured() {
             (fields[1].to_string(), size)
         })
         .collect();
-    assert!(checks.len() >= 6, "the oracle measured at least six closures: {checks:?}");
+    assert!(
+        checks.len() >= 6,
+        "the oracle measured at least six closures: {checks:?}"
+    );
     for (root, size) in &checks {
         // `importModules #[root]` has no implicit Init, so it is the `prelude` closure.
         let tokens = census
@@ -173,7 +188,10 @@ fn removing_a_census_row_makes_its_token_refuse() {
     // Only that token moved.
     let mut expected: BTreeSet<&str> = real_table.tokens().into_iter().collect();
     expected.remove("⟨");
-    assert_eq!(mutant_table.tokens().into_iter().collect::<BTreeSet<_>>(), expected);
+    assert_eq!(
+        mutant_table.tokens().into_iter().collect::<BTreeSet<_>>(),
+        expected
+    );
 
     // Dropping the row but not its count is a truncated census: refused, never a smaller table.
     let truncated: String = GRAMMAR_CENSUS
@@ -247,19 +265,29 @@ fn the_header_and_the_body_use_the_pins_two_tables() {
 
 #[test]
 fn production_lexes_the_tokens_the_hand_table_refused() {
-    // Before: `lexical analysis reported 1 diagnostic(s)` at the `⟨`. Now the bytes lex, and
-    // what remains is the seed grammar's own typed refusal, which says nothing about validity.
-    for source in [
-        "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩",
-        "def p : Nat × Nat := (1, 2)",
-        "theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega",
+    // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
+    // what remains is the seed grammar's own typed refusal at that same token, which says
+    // nothing about validity: the seed grammar has no anonymous constructor, `×` or `≤`, and
+    // adding them is a grammar feature the seed-dialect freeze forbids (fln-ew20).
+    for (source, token) in [
+        (
+            "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩",
+            "⟨",
+        ),
+        ("def p : Nat × Nat := (1, 2)", "×"),
+        (
+            "theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega",
+            "≤",
+        ),
     ] {
-        match parse_source_command(source.as_bytes()) {
-            Err(NatDefinitionParseError::Lexical { diagnostics }) => {
-                panic!("{source}: still refused lexically: {diagnostics:?}")
-            }
-            Ok(_) | Err(_) => {}
-        }
+        let at = BytePos(source.find(token).expect("the token is in the source"));
+        assert!(
+            matches!(
+                parse_source_command(source.as_bytes()),
+                Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if refused == at
+            ),
+            "{source}: the grammar, not the lexer, refuses at {token}"
+        );
     }
 }
 
@@ -269,7 +297,10 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
 /// table parsed all five (each keyword was an identifier there); the derived table refuses each
 /// at the token the Reference names. The escaped spelling the Reference accepts parses.
 const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
-    ("def at : Nat := 1", "1:3: error: unexpected token 'at'; expected identifier"),
+    (
+        "def at : Nat := 1",
+        "1:3: error: unexpected token 'at'; expected identifier",
+    ),
     (
         "def f (from : Nat) : Nat := from",
         "1:7: error: unexpected token 'from'; expected '_' or identifier",
@@ -302,15 +333,24 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
             .nth(1)
             .and_then(|column| column.parse().ok())
             .expect("line:column");
-        let at = column + source[column..].find(token).expect("token after the column");
+        let at = column
+            + source[column..]
+                .find(token)
+                .expect("token after the column");
         match parse_definition(source.as_bytes()) {
             Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) => {
-                assert_eq!(refused, BytePos(at), "{source}: refused at the Reference's token");
+                assert_eq!(
+                    refused,
+                    BytePos(at),
+                    "{source}: refused at the Reference's token"
+                );
             }
             other => panic!("{source}: the Reference refuses ({reference}), got {other:?}"),
         }
         assert!(
-            !SEED_IDENTIFIER_ALLOWANCE.iter().any(|(word, _)| word == &token),
+            !SEED_IDENTIFIER_ALLOWANCE
+                .iter()
+                .any(|(word, _)| word == &token),
             "{token} is reserved in production"
         );
         // Escaped, the same word is an identifier and the Reference accepts the program.
@@ -328,8 +368,15 @@ fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
     // Pinned to these six. Growing the set (any other word, or a duplicate) fails here;
     // removing a member once its example is repaired is allowed and needs no edit to this list.
     const PERMITTED: [&str; 6] = ["end", "local", "prefix", "repeat", "scoped", "universe"];
-    let members: BTreeSet<&str> = SEED_IDENTIFIER_ALLOWANCE.iter().map(|(word, _)| *word).collect();
-    assert_eq!(members.len(), SEED_IDENTIFIER_ALLOWANCE.len(), "no duplicate members");
+    let members: BTreeSet<&str> = SEED_IDENTIFIER_ALLOWANCE
+        .iter()
+        .map(|(word, _)| *word)
+        .collect();
+    assert_eq!(
+        members.len(),
+        SEED_IDENTIFIER_ALLOWANCE.len(),
+        "no duplicate members"
+    );
     for word in &members {
         assert!(
             PERMITTED.contains(word),
@@ -345,7 +392,10 @@ fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
             "{word} is no longer a token at the pin"
         );
         // Production still reads it as an identifier.
-        assert!(matches!(lex_one(production_table(), word), Ok(TokenKind::Ident(_))));
+        assert!(matches!(
+            lex_one(production_table(), word),
+            Ok(TokenKind::Ident(_))
+        ));
         // The named file still uses it as a name; once the file is repaired the row must go.
         let text = std::fs::read_to_string(root.join(file)).expect("the named example exists");
         let used = text.match_indices(word).any(|(at, _)| {
@@ -354,7 +404,10 @@ fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
             !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '«')
                 && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '»')
         });
-        assert!(used, "{file} no longer uses `{word}`: drop it from the allowance");
+        assert!(
+            used,
+            "{file} no longer uses `{word}`: drop it from the allowance"
+        );
     }
 }
 
@@ -370,13 +423,24 @@ fn every_kind_init_and_std_use_is_registered_and_every_replay_was_faithful() {
         "every Init/Std module is replayed exactly once"
     );
     assert_eq!(count(KIND_USE, "files"), files.len());
-    assert!(files.len() >= 1000, "a broken scan, not a small stdlib: {}", files.len());
+    assert!(
+        files.len() >= 1000,
+        "a broken scan, not a small stdlib: {}",
+        files.len()
+    );
 
     // Every replay was faithful: zero errors, no fault, and real work done.
     let mut commands = 0;
     for (module, fields) in &files {
-        assert_eq!(fields.len(), 6, "{module}: a faulted replay has no counts: {fields:?}");
-        assert_eq!(fields[4], "errors=0", "{module}: the Reference's own replay must be clean");
+        assert_eq!(
+            fields.len(),
+            6,
+            "{module}: a faulted replay has no counts: {fields:?}"
+        );
+        assert_eq!(
+            fields[4], "errors=0",
+            "{module}: the Reference's own replay must be clean"
+        );
         commands += fields[3]
             .strip_prefix("commands=")
             .and_then(|n| n.parse::<usize>().ok())
@@ -400,12 +464,18 @@ fn every_kind_init_and_std_use_is_registered_and_every_replay_was_faithful() {
     }
     let mut categories: BTreeSet<&str> = rows(GRAMMAR_CENSUS, "category").map(|f| f[1]).collect();
     categories.extend(rows(GRAMMAR_CENSUS, "module-category").map(|f| f[2]));
-    assert!(registered.len() >= 2000 && categories.len() >= 10, "a broken scan");
+    assert!(
+        registered.len() >= 2000 && categories.len() >= 10,
+        "a broken scan"
+    );
 
     let mut used = BTreeSet::new();
     let mut unknown: BTreeMap<&str, &str> = BTreeMap::new();
     for fields in rows(KIND_USE, "uses") {
-        assert!(files.contains_key(fields[1]), "a uses row for an unreplayed module");
+        assert!(
+            files.contains_key(fields[1]),
+            "a uses row for an unreplayed module"
+        );
         for kind in fields[2].split(' ').filter(|kind| !kind.is_empty()) {
             used.insert(kind);
             let pseudo = kind
@@ -437,7 +507,10 @@ fn every_kind_init_and_std_use_is_registered_and_every_replay_was_faithful() {
         remainder,
         "kinds Init/Std use that the grammar census does not register (kind -> first user): {unknown:?}"
     );
-    assert!(!used.contains("missing"), "no replayed command contains a parse hole");
+    assert!(
+        !used.contains("missing"),
+        "no replayed command contains a parse hole"
+    );
 
     // The syntax-extension commands are counted per kind and listed per file.
     let listed = rows(KIND_USE, "syntax-command").count();
@@ -454,10 +527,19 @@ fn the_builtin_registration_census_names_kinds_categories_and_precedences() {
     let parsers: Vec<Vec<&str>> = rows(GRAMMAR_CENSUS, "builtin-parser").collect();
     assert_eq!(parsers.len(), count(GRAMMAR_CENSUS, "builtin-parsers"));
     let categories: BTreeMap<&str, usize> = rows(GRAMMAR_CENSUS, "category")
-        .map(|f| (f[1], f[4].strip_prefix("parsers=").and_then(|n| n.parse().ok()).expect("parsers=")))
+        .map(|f| {
+            (
+                f[1],
+                f[4].strip_prefix("parsers=")
+                    .and_then(|n| n.parse().ok())
+                    .expect("parsers="),
+            )
+        })
         .collect();
     assert_eq!(categories.values().sum::<usize>(), parsers.len());
-    for category in ["term", "command", "tactic", "level", "prio", "prec", "attr", "doElem"] {
+    for category in [
+        "term", "command", "tactic", "level", "prio", "prec", "attr", "doElem",
+    ] {
         assert!(categories.contains_key(category), "category {category}");
     }
     let anonymous = parsers
@@ -477,7 +559,10 @@ fn the_builtin_registration_census_names_kinds_categories_and_precedences() {
         .iter()
         .find(|f| f[2] == "Lean.Parser.Term.app")
         .expect("application");
-    assert_eq!((app[3], app[5], app[6]), ("trailing", "prec=1022", "lhs-prec=1024"));
+    assert_eq!(
+        (app[3], app[5], app[6]),
+        ("trailing", "prec=1022", "lhs-prec=1024")
+    );
 
     let keyed: BTreeSet<&str> = rows(GRAMMAR_CENSUS, "registration").map(|f| f[1]).collect();
     for attribute in [

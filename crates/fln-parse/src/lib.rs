@@ -1851,7 +1851,8 @@ fn bounded_term_frames(
             _ => {
                 // A do element classified as `break`/`continue` (tokens at the pin) puts its
                 // own keyword on its empty frame as the one leaf `item` requires.
-                if grammar == DefinitionGrammar::Scalar && push_jump_keyword(leaves, &mut frames, index)
+                if grammar == DefinitionGrammar::Scalar
+                    && push_jump_keyword(leaves, &mut frames, index)
                 {
                     continue;
                 }
