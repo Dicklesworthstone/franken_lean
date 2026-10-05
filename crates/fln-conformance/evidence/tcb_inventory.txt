@@ -1,0 +1,680 @@
+# The TCB inventory (bead franken_lean-z8j.1.17): every function of the workspace's own
+# crates that the linker keeps reachable from fln_kernel::check, measured from the
+# crates/fln-conformance tcb-probe binary. Do not edit by hand; regenerate with
+#   FLN_TCB_INVENTORY_WRITE=1 cargo test -p fln-conformance --test tcb_inventory
+# which rewrites this file from a fresh measurement and keeps the `budget` line.
+# The test re-measures on every run and fails if this file disagrees in either
+# direction. Limits are in crates/fln-conformance/src/tcb_inventory.rs.
+# `budget` is declared by hand, not measured: the ceiling on functions outside
+# fln_kernel that check may reach, the trusted code the 12 KLOC line covenant on
+# crates/fln-kernel/src does not count. Raising it is a reviewed decision.
+schema fln.tcb-inventory/1
+root fln_kernel::check
+crate fln_bignum items=85 symbols=95
+crate fln_core items=164 symbols=181
+crate fln_env items=84 symbols=131
+crate fln_hash items=52 symbols=52
+crate fln_kernel items=276 symbols=523
+total items=661 adjacent-items=385 toolchain-symbols=5050 non-rust-symbols=11
+budget adjacent-items<=400
+item fln_bignum <fln_bignum::nat::BigNat as core::clone::Clone>::clone
+item fln_bignum <fln_bignum::nat::BigNat as core::cmp::Ord>::cmp
+item fln_bignum <fln_bignum::nat::BigNat as core::cmp::PartialOrd>::partial_cmp
+item fln_bignum <fln_bignum::nat::BigNat>::add
+item fln_bignum <fln_bignum::nat::BigNat>::as_view
+item fln_bignum <fln_bignum::nat::BigNat>::beq
+item fln_bignum <fln_bignum::nat::BigNat>::bit_length
+item fln_bignum <fln_bignum::nat::BigNat>::ble
+item fln_bignum <fln_bignum::nat::BigNat>::checked_pow
+item fln_bignum <fln_bignum::nat::BigNat>::checked_shl
+item fln_bignum <fln_bignum::nat::BigNat>::div
+item fln_bignum <fln_bignum::nat::BigNat>::div_rem
+item fln_bignum <fln_bignum::nat::BigNat>::from_limbs_le
+item fln_bignum <fln_bignum::nat::BigNat>::from_u64
+item fln_bignum <fln_bignum::nat::BigNat>::gcd
+item fln_bignum <fln_bignum::nat::BigNat>::is_zero
+item fln_bignum <fln_bignum::nat::BigNat>::land
+item fln_bignum <fln_bignum::nat::BigNat>::limbs_le
+item fln_bignum <fln_bignum::nat::BigNat>::lor
+item fln_bignum <fln_bignum::nat::BigNat>::lxor
+item fln_bignum <fln_bignum::nat::BigNat>::mul
+item fln_bignum <fln_bignum::nat::BigNat>::mul_small
+item fln_bignum <fln_bignum::nat::BigNat>::rem
+item fln_bignum <fln_bignum::nat::BigNat>::shl
+item fln_bignum <fln_bignum::nat::BigNat>::shr
+item fln_bignum <fln_bignum::nat::BigNat>::sub
+item fln_bignum <fln_bignum::nat::BigNat>::to_u64
+item fln_bignum <fln_bignum::nat::BigNat>::zero
+item fln_bignum <fln_bignum::nat::BigNatView>::beq
+item fln_bignum <fln_bignum::nat::BigNatView>::ble
+item fln_bignum <fln_bignum::nat::BigNatView>::checked_shl
+item fln_bignum <fln_bignum::nat::BigNatView>::from_limbs_le
+item fln_bignum <fln_bignum::nat::BigNatView>::gcd
+item fln_bignum <fln_bignum::nat::BigNatView>::land
+item fln_bignum <fln_bignum::nat::BigNatView>::limbs_le
+item fln_bignum <fln_bignum::nat::BigNatView>::lor
+item fln_bignum <fln_bignum::nat::BigNatView>::lxor
+item fln_bignum <fln_bignum::nat::BigNatView>::shr
+item fln_bignum <fln_bignum::nat::MulAlgorithm as core::cmp::PartialEq>::eq
+item fln_bignum <fln_bignum::nat::SignedLimbs as core::clone::Clone>::clone
+item fln_bignum <fln_bignum::nat::SignedLimbs>::add
+item fln_bignum <fln_bignum::nat::SignedLimbs>::div_exact_small
+item fln_bignum <fln_bignum::nat::SignedLimbs>::from_limbs
+item fln_bignum <fln_bignum::nat::SignedLimbs>::from_magnitude
+item fln_bignum <fln_bignum::nat::SignedLimbs>::into_nonnegative
+item fln_bignum <fln_bignum::nat::SignedLimbs>::mul
+item fln_bignum <fln_bignum::nat::SignedLimbs>::mul_small
+item fln_bignum <fln_bignum::nat::SignedLimbs>::negated
+item fln_bignum <fln_bignum::nat::SignedLimbs>::normalized
+item fln_bignum <fln_bignum::nat::SignedLimbs>::sub
+item fln_bignum fln_bignum::interop::bignat_from_literal
+item fln_bignum fln_bignum::interop::literal_from_bignat
+item fln_bignum fln_bignum::nat::add_limbs
+item fln_bignum fln_bignum::nat::add_shifted_limbs
+item fln_bignum fln_bignum::nat::binary_gcd_limbs
+item fln_bignum fln_bignum::nat::bit_length_limbs
+item fln_bignum fln_bignum::nat::checked_pow_limbs
+item fln_bignum fln_bignum::nat::checked_shl_limbs
+item fln_bignum fln_bignum::nat::cmp_limbs
+item fln_bignum fln_bignum::nat::div_rem_limbs
+item fln_bignum fln_bignum::nat::div_rem_single_limb
+item fln_bignum fln_bignum::nat::eval_toom_at_minus_one
+item fln_bignum fln_bignum::nat::eval_toom_at_one
+item fln_bignum fln_bignum::nat::eval_toom_at_two
+item fln_bignum fln_bignum::nat::karatsuba_mul_balanced
+item fln_bignum fln_bignum::nat::karatsuba_mul_limbs
+item fln_bignum fln_bignum::nat::knuth_div_rem_limbs
+item fln_bignum fln_bignum::nat::land_limbs
+item fln_bignum fln_bignum::nat::lor_limbs
+item fln_bignum fln_bignum::nat::lxor_limbs
+item fln_bignum fln_bignum::nat::mul_algorithm
+item fln_bignum fln_bignum::nat::mul_limbs
+item fln_bignum fln_bignum::nat::normalize
+item fln_bignum fln_bignum::nat::normalized_len
+item fln_bignum fln_bignum::nat::normalized_slice
+item fln_bignum fln_bignum::nat::schoolbook_mul_limbs
+item fln_bignum fln_bignum::nat::shift_left_bits
+item fln_bignum fln_bignum::nat::shift_right_bits
+item fln_bignum fln_bignum::nat::shr_limbs
+item fln_bignum fln_bignum::nat::split_three
+item fln_bignum fln_bignum::nat::sub_in_place
+item fln_bignum fln_bignum::nat::sub_limbs
+item fln_bignum fln_bignum::nat::toom3_mul_balanced
+item fln_bignum fln_bignum::nat::toom3_mul_limbs
+item fln_bignum fln_bignum::nat::trailing_zero_bits_limbs
+item fln_core <fln_core::diag::ErrorValue as core::fmt::Debug>::fmt
+item fln_core <fln_core::diag::ResourceReason as core::fmt::Debug>::fmt
+item fln_core <fln_core::diag::StructuralUnit as core::fmt::Debug>::fmt
+item fln_core <fln_core::diag::StructuralUnit>::as_str
+item fln_core <fln_core::expr::BinderInfo as core::clone::Clone>::clone
+item fln_core <fln_core::expr::BinderInfo as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::BinderInfo as core::fmt::Debug>::fmt
+item fln_core <fln_core::expr::BinderInfo>::to_u64
+item fln_core <fln_core::expr::Expr as core::clone::Clone>::clone
+item fln_core <fln_core::expr::Expr as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::Expr as core::ops::drop::Drop>::drop
+item fln_core <fln_core::expr::Expr>::abstract_fvar
+item fln_core <fln_core::expr::Expr>::allocation_identity
+item fln_core <fln_core::expr::Expr>::app
+item fln_core <fln_core::expr::Expr>::binder_data
+item fln_core <fln_core::expr::Expr>::bvar
+item fln_core <fln_core::expr::Expr>::const_
+item fln_core <fln_core::expr::Expr>::data
+item fln_core <fln_core::expr::Expr>::forall_e
+item fln_core <fln_core::expr::Expr>::fvar
+item fln_core <fln_core::expr::Expr>::has_expr_mvar
+item fln_core <fln_core::expr::Expr>::has_fvar
+item fln_core <fln_core::expr::Expr>::has_level_mvar
+item fln_core <fln_core::expr::Expr>::has_level_param
+item fln_core <fln_core::expr::Expr>::has_loose_bvar
+item fln_core <fln_core::expr::Expr>::has_loose_bvars
+item fln_core <fln_core::expr::Expr>::lam
+item fln_core <fln_core::expr::Expr>::let_e
+item fln_core <fln_core::expr::Expr>::lift_loose
+item fln_core <fln_core::expr::Expr>::lit
+item fln_core <fln_core::expr::Expr>::loose_bvar_range
+item fln_core <fln_core::expr::Expr>::mdata
+item fln_core <fln_core::expr::Expr>::node
+item fln_core <fln_core::expr::Expr>::node_arc
+item fln_core <fln_core::expr::Expr>::proj
+item fln_core <fln_core::expr::Expr>::sort
+item fln_core <fln_core::expr::Expr>::subst_loose
+item fln_core <fln_core::expr::Expr>::take_node_for_drop
+item fln_core <fln_core::expr::Expr>::with
+item fln_core <fln_core::expr::ExprData as core::clone::Clone>::clone
+item fln_core <fln_core::expr::ExprData as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::ExprData>::approx_depth
+item fln_core <fln_core::expr::ExprData>::approx_depth_u32
+item fln_core <fln_core::expr::ExprData>::has_expr_mvar
+item fln_core <fln_core::expr::ExprData>::has_fvar
+item fln_core <fln_core::expr::ExprData>::has_level_mvar
+item fln_core <fln_core::expr::ExprData>::has_level_param
+item fln_core <fln_core::expr::ExprData>::hash
+item fln_core <fln_core::expr::ExprData>::loose_bvar_range
+item fln_core <fln_core::expr::ExprData>::pack
+item fln_core <fln_core::expr::ExprData>::pack_app
+item fln_core <fln_core::expr::FVarId as core::clone::Clone>::clone
+item fln_core <fln_core::expr::FVarId as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::FVarId as core::hash::Hash>::hash
+item fln_core <fln_core::expr::FVarId>::hash
+item fln_core <fln_core::expr::Literal as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::Literal>::hash
+item fln_core <fln_core::expr::MVarId as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::NatLit as core::cmp::PartialEq>::eq
+item fln_core <fln_core::expr::NatLit>::from_limbs_le
+item fln_core <fln_core::expr::NatLit>::from_u64
+item fln_core <fln_core::expr::NatLit>::hash
+item fln_core <fln_core::expr::NatLit>::limbs_le
+item fln_core <fln_core::expr::NatLit>::to_u64
+item fln_core <fln_core::expr::TooManyBoundVars as core::fmt::Debug>::fmt
+item fln_core <fln_core::level::LMVarId as core::cmp::PartialEq>::eq
+item fln_core <fln_core::level::Level as core::clone::Clone>::clone
+item fln_core <fln_core::level::Level as core::cmp::PartialEq>::eq
+item fln_core <fln_core::level::Level as core::hash::Hash>::hash
+item fln_core <fln_core::level::Level as core::ops::drop::Drop>::drop
+item fln_core <fln_core::level::Level>::acc_max
+item fln_core <fln_core::level::Level>::add_offset
+item fln_core <fln_core::level::Level>::append_normed_max_args
+item fln_core <fln_core::level::Level>::ctor_rank
+item fln_core <fln_core::level::Level>::finish_max_normalize
+item fln_core <fln_core::level::Level>::get_level_offset
+item fln_core <fln_core::level::Level>::get_offset
+item fln_core <fln_core::level::Level>::has_mvar
+item fln_core <fln_core::level::Level>::has_param
+item fln_core <fln_core::level::Level>::hash
+item fln_core <fln_core::level::Level>::imax
+item fln_core <fln_core::level::Level>::is_already_normalized_cheap
+item fln_core <fln_core::level::Level>::is_equiv
+item fln_core <fln_core::level::Level>::is_explicit
+item fln_core <fln_core::level::Level>::is_explicit_subsumed
+item fln_core <fln_core::level::Level>::is_geq
+item fln_core <fln_core::level::Level>::is_geq::offset_k
+item fln_core <fln_core::level::Level>::is_geq::push_k
+item fln_core <fln_core::level::Level>::is_never_zero
+item fln_core <fln_core::level::Level>::is_not_zero
+item fln_core <fln_core::level::Level>::is_zero
+item fln_core <fln_core::level::Level>::lookup_norm
+item fln_core <fln_core::level::Level>::max
+item fln_core <fln_core::level::Level>::mk_imax_aux
+item fln_core <fln_core::level::Level>::mk_max_aux
+item fln_core <fln_core::level::Level>::node
+item fln_core <fln_core::level::Level>::node_arc
+item fln_core <fln_core::level::Level>::norm_lt
+item fln_core <fln_core::level::Level>::norm_lt_aux
+item fln_core <fln_core::level::Level>::normalize
+item fln_core <fln_core::level::Level>::normalize_fixpoint
+item fln_core <fln_core::level::Level>::one
+item fln_core <fln_core::level::Level>::param
+item fln_core <fln_core::level::Level>::raw_max_leaves
+item fln_core <fln_core::level::Level>::skip_explicit
+item fln_core <fln_core::level::Level>::subsumes
+item fln_core <fln_core::level::Level>::succ
+item fln_core <fln_core::level::Level>::take_node_for_drop
+item fln_core <fln_core::level::Level>::try_kernel_imax
+item fln_core <fln_core::level::Level>::try_smart_max
+item fln_core <fln_core::level::Level>::view
+item fln_core <fln_core::level::Level>::zero
+item fln_core <fln_core::level::LevelData as core::clone::Clone>::clone
+item fln_core <fln_core::level::LevelData as core::cmp::PartialEq>::eq
+item fln_core <fln_core::level::LevelData>::depth
+item fln_core <fln_core::level::LevelData>::has_mvar
+item fln_core <fln_core::level::LevelData>::has_param
+item fln_core <fln_core::level::LevelData>::hash
+item fln_core <fln_core::level::LevelData>::pack
+item fln_core <fln_core::level::LevelTooDeep as core::fmt::Debug>::fmt
+item fln_core <fln_core::name::Name as core::clone::Clone>::clone
+item fln_core <fln_core::name::Name as core::cmp::Ord>::cmp
+item fln_core <fln_core::name::Name as core::cmp::PartialEq>::eq
+item fln_core <fln_core::name::Name as core::cmp::PartialOrd>::partial_cmp
+item fln_core <fln_core::name::Name as core::fmt::Debug>::fmt
+item fln_core <fln_core::name::Name as core::hash::Hash>::hash
+item fln_core <fln_core::name::Name as core::ops::drop::Drop>::drop
+item fln_core <fln_core::name::Name>::anonymous
+item fln_core <fln_core::name::Name>::component_overflowed
+item fln_core <fln_core::name::Name>::hash
+item fln_core <fln_core::name::Name>::is_anonymous
+item fln_core <fln_core::name::Name>::leaf_view
+item fln_core <fln_core::name::Name>::num
+item fln_core <fln_core::name::Name>::parent
+item fln_core <fln_core::name::Name>::str
+item fln_core <fln_core::name::Name>::to_display_string
+item fln_core <fln_core::name::Repr as core::clone::Clone>::clone
+item fln_core <fln_core::options::DataValue as core::clone::Clone>::clone
+item fln_core <fln_core::options::DataValue as core::cmp::PartialEq>::eq
+item fln_core <fln_core::options::KVMap as core::clone::Clone>::clone
+item fln_core <fln_core::options::KVMap as core::cmp::PartialEq>::eq
+item fln_core <fln_core::options::KVMap>::entries
+item fln_core <fln_core::options::SyntaxHandle as core::clone::Clone>::clone
+item fln_core <fln_core::options::SyntaxHandle as core::cmp::PartialEq>::eq
+item fln_core <fln_core::outcome::BoundedText as core::fmt::Debug>::fmt
+item fln_core <fln_core::outcome::BoundedText>::new
+item fln_core <fln_core::outcome::Inconclusive as core::fmt::Debug>::fmt
+item fln_core <fln_core::outcome::Inconclusive>::authority_incomplete
+item fln_core <fln_core::outcome::Inconclusive>::cancelled
+item fln_core <fln_core::outcome::Inconclusive>::resource
+item fln_core <fln_core::outcome::Inconclusive>::with_progress
+item fln_core <fln_core::outcome::InconclusiveCause as core::fmt::Debug>::fmt
+item fln_core <fln_core::outcome::InternalFault as core::fmt::Debug>::fmt
+item fln_core <fln_core::outcome::InternalFault>::new
+item fln_core <fln_core::outcome::Outcome>::complete
+item fln_core <fln_core::outcome::Outcome>::map_complete
+item fln_core <fln_core::outcome::Outcome>::non_answer_for
+item fln_core <fln_core::outcome::ResourceUsage as core::fmt::Debug>::fmt
+item fln_core <fln_core::outcome::ResourceUsage>::is_genuine_exhaustion
+item fln_core fln_core::expr::lifted_child
+item fln_core fln_core::expr::list_level_hash
+item fln_core fln_core::lean_hash::mix_hash
+item fln_core fln_core::lean_hash::murmur_hash_64a
+item fln_core fln_core::lean_hash::string_hash
+item fln_env <fln_core::name::Name as fln_env::pmap::PKey>::key_hash
+item fln_env <fln_env::constants::AxiomVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::ConstantInfo as core::clone::Clone>::clone
+item fln_env <fln_env::constants::ConstantInfo>::constant_val
+item fln_env <fln_env::constants::ConstantInfo>::kind_name
+item fln_env <fln_env::constants::ConstantInfo>::name
+item fln_env <fln_env::constants::ConstantVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::ConstructorVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::DefinitionSafety as core::clone::Clone>::clone
+item fln_env <fln_env::constants::DefinitionSafety as core::cmp::PartialEq>::eq
+item fln_env <fln_env::constants::DefinitionVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::InductiveVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::OpaqueVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::QuotKind as core::clone::Clone>::clone
+item fln_env <fln_env::constants::QuotKind as core::cmp::PartialEq>::eq
+item fln_env <fln_env::constants::QuotVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::RecursorRule as core::clone::Clone>::clone
+item fln_env <fln_env::constants::RecursorVal as core::clone::Clone>::clone
+item fln_env <fln_env::constants::ReducibilityHints as core::clone::Clone>::clone
+item fln_env <fln_env::constants::TheoremVal as core::clone::Clone>::clone
+item fln_env <fln_env::environment::DeclarationBudget>::get
+item fln_env <fln_env::environment::DeclarationCheckpoint as core::fmt::Display>::fmt
+item fln_env <fln_env::environment::DeclarationDimension>::as_str
+item fln_env <fln_env::environment::DeclarationDimension>::unit
+item fln_env <fln_env::environment::DeclarationUsage>::get
+item fln_env <fln_env::environment::Environment as core::clone::Clone>::clone
+item fln_env <fln_env::environment::Environment>::contains
+item fln_env <fln_env::environment::Environment>::decl_content_digest
+item fln_env <fln_env::environment::Environment>::decl_content_len
+item fln_env <fln_env::environment::Environment>::find
+item fln_env <fln_env::environment::Environment>::plan_add_decl
+item fln_env <fln_env::environment::Environment>::write_decl_content
+item fln_env <fln_env::environment::PreparedDeclarationAdmission>::commit
+item fln_env <fln_env::environment::PreparedDeclarationAdmission>::is_valid_for
+item fln_env <fln_env::pmap::CollisionBucket>::expanded_weight
+item fln_env <fln_env::pmap::CollisionBucket>::get
+item fln_env <fln_env::pmap::CollisionBucket>::insert
+item fln_env <fln_env::pmap::CollisionBucket>::insertion_shape
+item fln_env <fln_env::pmap::CollisionBucket>::len
+item fln_env <fln_env::pmap::CollisionBucket>::singleton
+item fln_env <fln_env::pmap::CollisionBucket>::tier
+item fln_env <fln_env::pmap::CollisionEntry as core::clone::Clone>::clone
+item fln_env <fln_env::pmap::CollisionResource>::as_str
+item fln_env <fln_env::pmap::CollisionResource>::unit
+item fln_env <fln_env::pmap::MutationFacts as core::default::Default>::default
+item fln_env <fln_env::pmap::PMap as core::clone::Clone>::clone
+item fln_env <fln_env::pmap::PMap>::contains_key
+item fln_env <fln_env::pmap::PMap>::get
+item fln_env <fln_env::pmap::PMap>::insert
+item fln_env <fln_env::pmap::PMap>::insert_profiled_internal
+item fln_env <fln_env::pmap::PMap>::insertion_preflight
+item fln_env <fln_env::pmap::PMap>::is_same_structure
+item fln_env <fln_env::pmap::PMap>::try_insert_with_budget
+item fln_env <fln_env::terms::WeightBudget>::new
+item fln_env fln_env::environment::add_expression_usage
+item fln_env fln_env::environment::declaration_expressions
+item fln_env fln_env::environment::declaration_mutual_members
+item fln_env fln_env::environment::definition_safety_tag
+item fln_env fln_env::environment::preflight_declaration
+item fln_env fln_env::environment::preflight_declaration_expressions
+item fln_env fln_env::environment::preflight_declaration_rows
+item fln_env fln_env::environment::quot_kind_tag
+item fln_env fln_env::environment::usize_to_u64
+item fln_env fln_env::environment::write_mutual_membership
+item fln_env fln_env::pmap::chunk
+item fln_env fln_env::pmap::collision_balance
+item fln_env fln_env::pmap::collision_find
+item fln_env fln_env::pmap::collision_find_unprofiled
+item fln_env fln_env::pmap::collision_height
+item fln_env fln_env::pmap::collision_insert_node
+item fln_env fln_env::pmap::collision_len
+item fln_env fln_env::pmap::collision_node
+item fln_env fln_env::pmap::collision_stop
+item fln_env fln_env::pmap::collision_tree_fresh_node_bound
+item fln_env fln_env::pmap::collision_tree_from_sorted
+item fln_env fln_env::pmap::collision_tree_max_height
+item fln_env fln_env::pmap::collision_weight
+item fln_env fln_env::pmap::insert_rec
+item fln_env fln_env::pmap::split_leaf
+item fln_env fln_env::pmap::usize_as_u128
+item fln_env fln_env::terms::children
+item fln_env fln_env::terms::exhausted
+item fln_env fln_env::terms::expanded_weight
+item fln_env fln_env::terms::node_key
+item fln_hash <fln_core::expr::Expr as fln_hash::canon::Canonical>::write_body
+item fln_hash <fln_core::level::Level as fln_hash::canon::Canonical>::write_body
+item fln_hash <fln_core::name::Name as fln_hash::canon::Canonical>::write_body
+item fln_hash <fln_core::name::Name as fln_hash::canon::NameLeafExt>::leaf
+item fln_hash <fln_core::options::KVMap as fln_hash::canon::Canonical>::write_body
+item fln_hash <fln_hash::blake3::ChunkState>::len
+item fln_hash <fln_hash::blake3::ChunkState>::new
+item fln_hash <fln_hash::blake3::ChunkState>::output
+item fln_hash <fln_hash::blake3::ChunkState>::start_flag
+item fln_hash <fln_hash::blake3::ChunkState>::update
+item fln_hash <fln_hash::blake3::Hasher>::add_chunk_chaining_value
+item fln_hash <fln_hash::blake3::Hasher>::finalize
+item fln_hash <fln_hash::blake3::Hasher>::finalize_xof
+item fln_hash <fln_hash::blake3::Hasher>::new_derive_key
+item fln_hash <fln_hash::blake3::Hasher>::new_internal
+item fln_hash <fln_hash::blake3::Hasher>::pop_stack
+item fln_hash <fln_hash::blake3::Hasher>::push_stack
+item fln_hash <fln_hash::blake3::Hasher>::update
+item fln_hash <fln_hash::blake3::Output>::chaining_value
+item fln_hash <fln_hash::blake3::Output>::root_output_bytes
+item fln_hash <fln_hash::canon::CanonHasher as core::ops::deref::DerefMut>::deref_mut
+item fln_hash <fln_hash::canon::CanonHasher>::finish
+item fln_hash <fln_hash::canon::CanonHasher>::new
+item fln_hash <fln_hash::canon::CanonWriter as core::default::Default>::default
+item fln_hash <fln_hash::canon::CanonWriter>::bool
+item fln_hash <fln_hash::canon::CanonWriter>::bytes
+item fln_hash <fln_hash::canon::CanonWriter>::counting
+item fln_hash <fln_hash::canon::CanonWriter>::i64
+item fln_hash <fln_hash::canon::CanonWriter>::overflowed
+item fln_hash <fln_hash::canon::CanonWriter>::put
+item fln_hash <fln_hash::canon::CanonWriter>::str
+item fln_hash <fln_hash::canon::CanonWriter>::u32
+item fln_hash <fln_hash::canon::CanonWriter>::u64
+item fln_hash <fln_hash::canon::CanonWriter>::u8
+item fln_hash <fln_hash::canon::CanonWriter>::written
+item fln_hash <fln_hash::domain::Digest as core::clone::Clone>::clone
+item fln_hash <fln_hash::domain::Domain>::tag
+item fln_hash <fln_hash::domain::DomainHasher>::finalize
+item fln_hash <fln_hash::domain::DomainHasher>::new
+item fln_hash <fln_hash::domain::DomainHasher>::update
+item fln_hash fln_hash::blake3::compress
+item fln_hash fln_hash::blake3::first_8_words
+item fln_hash fln_hash::blake3::g
+item fln_hash fln_hash::blake3::parent_cv
+item fln_hash fln_hash::blake3::parent_output
+item fln_hash fln_hash::blake3::permute
+item fln_hash fln_hash::blake3::round
+item fln_hash fln_hash::blake3::words_from_le_block
+item fln_hash fln_hash::blake3::words_from_le_key
+item fln_hash fln_hash::canon::binder_info_tag
+item fln_hash fln_hash::canon::write_data_value
+item fln_hash fln_hash::domain::hash
+item fln_kernel <fln_kernel::Declaration>::level_params
+item fln_kernel <fln_kernel::Declaration>::name
+item fln_kernel <fln_kernel::admit::Engine>::block_names
+item fln_kernel <fln_kernel::admit::Engine>::charge
+item fln_kernel <fln_kernel::admit::Engine>::check_constructors
+item fln_kernel <fln_kernel::admit::Engine>::check_inductive_types
+item fln_kernel <fln_kernel::admit::Engine>::check_nested_full
+item fln_kernel <fln_kernel::admit::Engine>::check_positivity
+item fln_kernel <fln_kernel::admit::Engine>::check_recursors
+item fln_kernel <fln_kernel::admit::Engine>::compute_is_rec
+item fln_kernel <fln_kernel::admit::Engine>::compute_is_reflexive
+item fln_kernel <fln_kernel::admit::Engine>::elim_only_at_universe_zero
+item fln_kernel <fln_kernel::admit::Engine>::generate_recursors
+item fln_kernel <fln_kernel::admit::Engine>::get_ind_indices
+item fln_kernel <fln_kernel::admit::Engine>::init_elim_level
+item fln_kernel <fln_kernel::admit::Engine>::init_k_target
+item fln_kernel <fln_kernel::admit::Engine>::is_rec_argument
+item fln_kernel <fln_kernel::admit::Engine>::is_valid_ind_app_at
+item fln_kernel <fln_kernel::admit::Engine>::lower_to_param_canonical
+item fln_kernel <fln_kernel::admit::Engine>::mentions_block
+item fln_kernel <fln_kernel::admit::Engine>::mentions_block_type
+item fln_kernel <fln_kernel::admit::Engine>::mk_local
+item fln_kernel <fln_kernel::admit::Engine>::mk_local_for
+item fln_kernel <fln_kernel::admit::Engine>::mk_rec_infos
+item fln_kernel <fln_kernel::admit::Engine>::mk_rec_rules
+item fln_kernel <fln_kernel::admit::Engine>::nested_aux_app
+item fln_kernel <fln_kernel::admit::Engine>::nested_mint
+item fln_kernel <fln_kernel::admit::Engine>::nested_occurrence
+item fln_kernel <fln_kernel::admit::Engine>::nested_replace
+item fln_kernel <fln_kernel::admit::Engine>::nested_replace_ctor
+item fln_kernel <fln_kernel::admit::Engine>::new
+item fln_kernel <fln_kernel::admit::Engine>::open_ctor_fields
+item fln_kernel <fln_kernel::admit::Engine>::open_pi
+item fln_kernel <fln_kernel::admit::Engine>::rec_levels
+item fln_kernel <fln_kernel::admit::Engine>::rec_lparams
+item fln_kernel <fln_kernel::admit::Engine>::remaining
+item fln_kernel <fln_kernel::admit::Engine>::restore_const_app
+item fln_kernel <fln_kernel::admit::Engine>::restore_expr
+item fln_kernel <fln_kernel::admit::Engine>::run
+item fln_kernel <fln_kernel::admit::Engine>::run_synthesized
+item fln_kernel <fln_kernel::admit::Engine>::valid_ind_app_index
+item fln_kernel <fln_kernel::admit::Engine>::with_tc
+item fln_kernel <fln_kernel::admit::Local as core::clone::Clone>::clone
+item fln_kernel <fln_kernel::admit::Local>::fvar
+item fln_kernel <fln_kernel::admit::NestedState as core::default::Default>::default
+item fln_kernel <fln_kernel::admit::NestedState>::find_aux_ctor
+item fln_kernel <fln_kernel::admit::NestedState>::is_aux_name
+item fln_kernel <fln_kernel::admit::NestedState>::lookup_aux
+item fln_kernel <fln_kernel::admit::NestedState>::restore_ctor_name
+item fln_kernel <fln_kernel::tc::DependencyScanRefusal>::blocks
+item fln_kernel <fln_kernel::tc::DependencyScanSeen>::admit
+item fln_kernel <fln_kernel::tc::DependencyScanSeen>::new
+item fln_kernel <fln_kernel::tc::ExprResultCache>::bounded
+item fln_kernel <fln_kernel::tc::ExprResultCache>::get
+item fln_kernel <fln_kernel::tc::ExprResultCache>::insert
+item fln_kernel <fln_kernel::tc::ExprResultCache>::insert_identity_replacing_collision
+item fln_kernel <fln_kernel::tc::ExprResultCache>::insert_priority_result
+item fln_kernel <fln_kernel::tc::ExprResultCache>::insert_reduction_result
+item fln_kernel <fln_kernel::tc::ExprResultCache>::insert_with_collision_policy
+item fln_kernel <fln_kernel::tc::ExprResultCache>::new
+item fln_kernel <fln_kernel::tc::ExprResultCache>::reclaim_dead_rows
+item fln_kernel <fln_kernel::tc::ExprResultCache>::record_cross_scope_with_collision_policy
+item fln_kernel <fln_kernel::tc::ExprResultCache>::rolling
+item fln_kernel <fln_kernel::tc::InferMode as core::cmp::PartialEq>::eq
+item fln_kernel <fln_kernel::tc::InstantiateCache>::bounded
+item fln_kernel <fln_kernel::tc::InstantiateCache>::get
+item fln_kernel <fln_kernel::tc::InstantiateCache>::insert
+item fln_kernel <fln_kernel::tc::InstantiateCache>::new
+item fln_kernel <fln_kernel::tc::InstantiateCache>::packed_key
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::bounded
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::context_id
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::context_key
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::context_key::fold_hashes
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::ensure_context
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::get
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::insert
+item fln_kernel <fln_kernel::tc::InstantiateLParamsCache>::new
+item fln_kernel <fln_kernel::tc::InstantiateRevCache>::get
+item fln_kernel <fln_kernel::tc::InstantiateRevCache>::insert
+item fln_kernel <fln_kernel::tc::InstantiateRevCache>::new
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::bounded
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::context_id
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::context_key
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::get
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::insert
+item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::new
+item fln_kernel <fln_kernel::tc::LazyDelta as core::clone::Clone>::clone
+item fln_kernel <fln_kernel::tc::LocalDependency as core::cmp::PartialEq>::eq
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::bounded
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::contains
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::insert
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::new
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::packed_key
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::reclaim_dead_rows
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::record_cross_scope
+item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::scoped_key
+item fln_kernel <fln_kernel::tc::RecursorMajorCache>::get
+item fln_kernel <fln_kernel::tc::RecursorMajorCache>::insert
+item fln_kernel <fln_kernel::tc::RecursorMajorCache>::new
+item fln_kernel <fln_kernel::tc::TypeChecker>::abstract_fvar_set
+item fln_kernel <fln_kernel::tc::TypeChecker>::adopt_local
+item fln_kernel <fln_kernel::tc::TypeChecker>::advance_app_stack
+item fln_kernel <fln_kernel::tc::TypeChecker>::cache_positive_defeq
+item fln_kernel <fln_kernel::tc::TypeChecker>::cache_stuck_recursor
+item fln_kernel <fln_kernel::tc::TypeChecker>::charge_bulk
+item fln_kernel <fln_kernel::tc::TypeChecker>::cheap_beta_reduce
+item fln_kernel <fln_kernel::tc::TypeChecker>::check_level
+item fln_kernel <fln_kernel::tc::TypeChecker>::consumption
+item fln_kernel <fln_kernel::tc::TypeChecker>::def_eq_public
+item fln_kernel <fln_kernel::tc::TypeChecker>::defeq_eta_tail
+item fln_kernel <fln_kernel::tc::TypeChecker>::defeq_reduce_pair
+item fln_kernel <fln_kernel::tc::TypeChecker>::definition_height
+item fln_kernel <fln_kernel::tc::TypeChecker>::drop_local
+item fln_kernel <fln_kernel::tc::TypeChecker>::ensure_sort_of
+item fln_kernel <fln_kernel::tc::TypeChecker>::ensure_sort_of_mode
+item fln_kernel <fln_kernel::tc::TypeChecker>::find_local
+item fln_kernel <fln_kernel::tc::TypeChecker>::finish_checked_app_argument
+item fln_kernel <fln_kernel::tc::TypeChecker>::finish_inductive_reduction
+item fln_kernel <fln_kernel::tc::TypeChecker>::finish_infer_proj
+item fln_kernel <fln_kernel::tc::TypeChecker>::finish_pending_projs
+item fln_kernel <fln_kernel::tc::TypeChecker>::fresh_fvar
+item fln_kernel <fln_kernel::tc::TypeChecker>::inductive_reduce_rec
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_app_check
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_app_only
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_core
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_core_mode
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_entry
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_lambda_spine
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_let_spine
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_only
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_only_core
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_pi_spine
+item fln_kernel <fln_kernel::tc::TypeChecker>::infer_proj
+item fln_kernel <fln_kernel::tc::TypeChecker>::instantiate
+item fln_kernel <fln_kernel::tc::TypeChecker>::instantiate_lparams
+item fln_kernel <fln_kernel::tc::TypeChecker>::instantiate_rev
+item fln_kernel <fln_kernel::tc::TypeChecker>::instantiate_rev_cached
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_def_eq
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_def_eq_binding
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_def_eq_core
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_def_eq_offset
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_def_eq_unit_like
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_non_rec_structure
+item fln_kernel <fln_kernel::tc::TypeChecker>::is_prop
+item fln_kernel <fln_kernel::tc::TypeChecker>::lazy_delta
+item fln_kernel <fln_kernel::tc::TypeChecker>::lazy_delta_proj_reduction
+item fln_kernel <fln_kernel::tc::TypeChecker>::lazy_delta_uncached
+item fln_kernel <fln_kernel::tc::TypeChecker>::major_to_cnstr_when_k
+item fln_kernel <fln_kernel::tc::TypeChecker>::major_to_cnstr_when_k_uncached
+item fln_kernel <fln_kernel::tc::TypeChecker>::major_to_cnstr_when_structure
+item fln_kernel <fln_kernel::tc::TypeChecker>::may_unfold
+item fln_kernel <fln_kernel::tc::TypeChecker>::new
+item fln_kernel <fln_kernel::tc::TypeChecker>::new_with_safety
+item fln_kernel <fln_kernel::tc::TypeChecker>::open_app_congruence
+item fln_kernel <fln_kernel::tc::TypeChecker>::open_checked_app
+item fln_kernel <fln_kernel::tc::TypeChecker>::prepare_inductive_reduction
+item fln_kernel <fln_kernel::tc::TypeChecker>::proof_irrel_eq
+item fln_kernel <fln_kernel::tc::TypeChecker>::push_local
+item fln_kernel <fln_kernel::tc::TypeChecker>::quick_def_eq_rules
+item fln_kernel <fln_kernel::tc::TypeChecker>::quot_reduce_rec
+item fln_kernel <fln_kernel::tc::TypeChecker>::recursor_major_induct
+item fln_kernel <fln_kernel::tc::TypeChecker>::reduce_nat
+item fln_kernel <fln_kernel::tc::TypeChecker>::reduce_proj
+item fln_kernel <fln_kernel::tc::TypeChecker>::reduce_recursor
+item fln_kernel <fln_kernel::tc::TypeChecker>::regular_same_head_apps_def_eq
+item fln_kernel <fln_kernel::tc::TypeChecker>::replace_fvar
+item fln_kernel <fln_kernel::tc::TypeChecker>::step
+item fln_kernel <fln_kernel::tc::TypeChecker>::take_local_generation
+item fln_kernel <fln_kernel::tc::TypeChecker>::truncate_locals
+item fln_kernel <fln_kernel::tc::TypeChecker>::try_eta
+item fln_kernel <fln_kernel::tc::TypeChecker>::try_eta_struct
+item fln_kernel <fln_kernel::tc::TypeChecker>::try_string_lit_expansion
+item fln_kernel <fln_kernel::tc::TypeChecker>::try_string_lit_expansion_core
+item fln_kernel <fln_kernel::tc::TypeChecker>::try_unfold_proj_app
+item fln_kernel <fln_kernel::tc::TypeChecker>::unfold_definition
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf_core
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf_core_for_defeq
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf_core_mode
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf_public
+item fln_kernel <fln_kernel::tc::TypeChecker>::whnf_recursor_chain
+item fln_kernel <fln_kernel::verdict::Budget>::narrowed
+item fln_kernel <fln_kernel::verdict::Budget>::objection_to_governing
+item fln_kernel <fln_kernel::verdict::BudgetObjection>::describe
+item fln_kernel <fln_kernel::verdict::Calibration>::engine
+item fln_kernel <fln_kernel::verdict::Calibration>::running_in
+item fln_kernel <fln_kernel::verdict::Consumption as core::default::Default>::default
+item fln_kernel <fln_kernel::verdict::EngineId>::as_str
+item fln_kernel <fln_kernel::verdict::EngineId>::is
+item fln_kernel <fln_kernel::verdict::ExecConfig>::current
+item fln_kernel <fln_kernel::verdict::ExecConfig>::describe
+item fln_kernel <fln_kernel::verdict::ExecConfig>::is
+item fln_kernel <fln_kernel::verdict::ExhaustionReason as core::fmt::Debug>::fmt
+item fln_kernel <fln_kernel::verdict::Profile>::as_str
+item fln_kernel <fln_kernel::verdict::Profile>::current
+item fln_kernel <fln_kernel::verdict::StackMeasurement>::engine
+item fln_kernel fln_kernel::add_consumption
+item fln_kernel fln_kernel::admit::abstract_fvar
+item fln_kernel fln_kernel::admit::append_after
+item fln_kernel fln_kernel::admit::append_after::append_base
+item fln_kernel fln_kernel::admit::append_after::rebuild
+item fln_kernel fln_kernel::admit::append_after::split
+item fln_kernel fln_kernel::admit::arrow
+item fln_kernel fln_kernel::admit::check_eq_type
+item fln_kernel fln_kernel::admit::check_inductive_block
+item fln_kernel fln_kernel::admit::check_quotient_init
+item fln_kernel fln_kernel::admit::check_quotient_inner
+item fln_kernel fln_kernel::admit::compare_recursor_sets
+item fln_kernel fln_kernel::admit::compare_recursors
+item fln_kernel fln_kernel::admit::consume_type_annotations
+item fln_kernel fln_kernel::admit::consume_type_annotations::gadget
+item fln_kernel fln_kernel::admit::depth_guard
+item fln_kernel fln_kernel::admit::divergence_note
+item fln_kernel fln_kernel::admit::expr_mentions_any
+item fln_kernel fln_kernel::admit::fold_app
+item fln_kernel fln_kernel::admit::has_loose_bvars_in_domain
+item fln_kernel fln_kernel::admit::has_macro_scopes
+item fln_kernel fln_kernel::admit::infer_implicit_strict
+item fln_kernel fln_kernel::admit::lower_param_expr
+item fln_kernel fln_kernel::admit::mk_lam_locals
+item fln_kernel fln_kernel::admit::mk_pi_locals
+item fln_kernel fln_kernel::admit::mk_rec_name
+item fln_kernel fln_kernel::admit::peel_app
+item fln_kernel fln_kernel::admit::pi
+item fln_kernel fln_kernel::admit::pin_expr_eq
+item fln_kernel fln_kernel::admit::reject
+item fln_kernel fln_kernel::admit::scratch_admit
+item fln_kernel fln_kernel::admit::strip_prefix
+item fln_kernel fln_kernel::admit::strip_prefix::components
+item fln_kernel fln_kernel::admit::subst_loose_bvars
+item fln_kernel fln_kernel::check
+item fln_kernel fln_kernel::check_header
+item fln_kernel fln_kernel::check_inner
+item fln_kernel fln_kernel::check_mutual_definitions
+item fln_kernel fln_kernel::check_nonsafe_definition
+item fln_kernel fln_kernel::check_result_to_outcome
+item fln_kernel fln_kernel::exhaustion_outcome
+item fln_kernel fln_kernel::recursive_header
+item fln_kernel fln_kernel::refuse_uncalibrated_budget
+item fln_kernel fln_kernel::remaining_budget
+item fln_kernel fln_kernel::stop_to_outcome
+item fln_kernel fln_kernel::tc::app_spine
+item fln_kernel fln_kernel::tc::app_spine_skipping_mdata
+item fln_kernel fln_kernel::tc::bool_const_expr
+item fln_kernel fln_kernel::tc::brief_expr
+item fln_kernel fln_kernel::tc::brief_level
+item fln_kernel fln_kernel::tc::brief_public
+item fln_kernel fln_kernel::tc::collect_fvar_ids
+item fln_kernel fln_kernel::tc::collect_undeclared_param
+item fln_kernel fln_kernel::tc::constant_is_unsafe
+item fln_kernel fln_kernel::tc::dead_row_reclaim_due
+item fln_kernel fln_kernel::tc::dependencies_are_live
+item fln_kernel fln_kernel::tc::dependencies_are_present
+item fln_kernel fln_kernel::tc::first_divergence
+item fln_kernel fln_kernel::tc::first_divergence::level_shape
+item fln_kernel fln_kernel::tc::first_divergence::level_shape_fuel
+item fln_kernel fln_kernel::tc::first_divergence::levels_diff
+item fln_kernel fln_kernel::tc::first_divergence_public
+item fln_kernel fln_kernel::tc::is_eager_reduce_argument
+item fln_kernel fln_kernel::tc::is_name2
+item fln_kernel fln_kernel::tc::is_nat_zero_expr
+item fln_kernel fln_kernel::tc::local_dependencies
+item fln_kernel fln_kernel::tc::nat_lit_expr
+item fln_kernel fln_kernel::tc::nat_lit_ext_value
+item fln_kernel fln_kernel::tc::nat_lit_pred
+item fln_kernel fln_kernel::tc::nat_lit_to_constructor
+item fln_kernel fln_kernel::tc::nat_op_leaf
+item fln_kernel fln_kernel::tc::nat_succ_peel
+item fln_kernel fln_kernel::tc::node_kind_name
+item fln_kernel fln_kernel::tc::peels_to_app
+item fln_kernel fln_kernel::tc::reject
+item fln_kernel fln_kernel::tc::remove_dead_rows
+item fln_kernel fln_kernel::tc::string_lit_to_constructor
+item fln_kernel fln_kernel::tc::substitute_level
+item fln_kernel fln_kernel::verdict::str_eq

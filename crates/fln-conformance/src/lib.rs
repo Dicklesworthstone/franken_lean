@@ -31,6 +31,10 @@
 //!   the one running it (bead `fln-cross-tree-baked-root-k60n`): the target directory is
 //!   shared across worktrees, so a rig can resolve, measure and report a whole verdict
 //!   about a repository that is not the one under test;
+//! * [`tcb_inventory`] — the functions of the workspace's own crates that the linker keeps
+//!   reachable from `fln_kernel::check` (bead `franken_lean-z8j.1.17`), read from the
+//!   `tcb-probe` binary's symbol table, so the trust base outside `fln-kernel/src` is counted
+//!   from the real call graph rather than a hand-kept list;
 //! * [`campaign`] — the Tribunal campaign frameworks (bead `fln-td9`): the mutation kill
 //!   ledger model, where a kill is only ever a stated-reason failure, inconclusive is
 //!   never promoted either way, and the denominator cannot shrink without evidence;
@@ -64,6 +68,7 @@ pub mod public_surface;
 mod public_surface_generated;
 pub mod suite_upgrade;
 pub mod syntax_hygiene;
+pub mod tcb_inventory;
 pub mod trace_replay;
 pub mod tree_identity;
 pub mod witness;
