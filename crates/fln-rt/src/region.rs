@@ -479,7 +479,11 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
                 size: usize::MAX,
             }
         })?;
-        if n > cap {
+        // The pinned compactor writes `m_capacity = m_size` for every array,
+        // scalar array and string (compact.cpp:252, 264, 323). Capacity sets the
+        // object's extent in this linear walk, so spare capacity would swallow the
+        // objects after it unseen (bead `fln-fur.1`): it is refused, not skipped.
+        if n != cap {
             return Err(RegionFault::BadObjectSize { offset, size: n });
         }
         let size = ARRAY_FIXED
@@ -512,7 +516,11 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
                 size: usize::MAX,
             }
         })?;
-        if n > cap {
+        // The pinned compactor writes `m_capacity = m_size` for every array,
+        // scalar array and string (compact.cpp:252, 264, 323). Capacity sets the
+        // object's extent in this linear walk, so spare capacity would swallow the
+        // objects after it unseen (bead `fln-fur.1`): it is refused, not skipped.
+        if n != cap {
             return Err(RegionFault::BadObjectSize { offset, size: n });
         }
         let size = SARRAY_FIXED
@@ -536,10 +544,12 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
                 size: usize::MAX,
             }
         })?;
-        if bytes == 0 || bytes > cap {
+        // `m_capacity = m_size`, as the pinned compactor writes it (compact.cpp:264):
+        // a larger capacity would extend the string over the objects after it.
+        if bytes == 0 || bytes != cap {
             return Err(RegionFault::StringIntegrity {
                 offset,
-                reason: "size 0 or beyond capacity",
+                reason: "size 0 or not equal to capacity",
             });
         }
         let size = STRING_FIXED

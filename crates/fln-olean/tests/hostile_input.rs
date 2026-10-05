@@ -306,10 +306,22 @@ fn a_truncation_with_a_huge_wanted_saturates_the_diagnostic() {
         .iter()
         .find(|obj| obj.tag == abi::TAG_STRING)
         .expect("the pilot carries a string");
+    // A capacity alone past its file is now refused before any extent is
+    // computed: the compactor writes `m_capacity = m_size` (bead `fln-fur.1`).
+    let mut capacity_only = bytes.clone();
+    put_u64(&mut capacity_only, string.off + 16, u64::MAX - 40);
+    let view = OleanView::parse(&capacity_only).expect("hostile parses structurally");
+    assert!(matches!(
+        view.shared_audit(),
+        Err(RegionError::StringIntegrity { .. })
+    ));
+
     let mut hostile = bytes.clone();
-    // Capacity just under the overflow line: STRING_FIXED + cap still fits a
-    // usize, so the engine reports Truncated — and the diagnostic add used to
-    // overflow while CONSTRUCTING the typed error.
+    // Size and capacity just under the overflow line, equal so the capacity law
+    // holds: STRING_FIXED + cap still fits a usize, so the engine reports
+    // Truncated — and the diagnostic add used to overflow while CONSTRUCTING the
+    // typed error.
+    put_u64(&mut hostile, string.off + 8, u64::MAX - 40);
     put_u64(&mut hostile, string.off + 16, u64::MAX - 40);
 
     let view = OleanView::parse(&hostile).expect("hostile parses structurally");
@@ -608,4 +620,53 @@ fn a_level_param_of_wrong_arity_is_refused() {
         }
     }
     assert_eq!(proven, 1, "a real Level param must trip the arity law");
+}
+
+/// The compactor writes `m_capacity = m_size` for strings and arrays
+/// (compact.cpp:264, 323), and capacity sets an object's extent in the linear
+/// full-surface walk. Spare capacity is refused, both inside an object's alignment
+/// slack and past it. Before bead `fln-fur.1` a string's capacity could grow over the
+/// objects after it: the walk skipped them unseen, and the pointer graph still
+/// decoded them.
+#[test]
+fn spare_capacity_is_refused_rather_than_walked_over() {
+    let bytes = pilot();
+    OleanView::parse(&bytes)
+        .expect("pilot parses")
+        .shared_audit()
+        .expect("the unmutated pilot audits");
+    let objects = collect_objects(&bytes);
+    for tag in [abi::TAG_STRING, abi::TAG_ARRAY] {
+        let object = objects
+            .iter()
+            .find(|object| object.tag == tag)
+            .unwrap_or_else(|| panic!("the pilot carries tag {tag}"));
+        let size = get_u64(&bytes, object.off + 8);
+        assert_eq!(
+            get_u64(&bytes, object.off + 16),
+            size,
+            "the writer's capacity is its size"
+        );
+        for spare in [1u64, 256] {
+            let mut hostile = bytes.clone();
+            put_u64(&mut hostile, object.off + 16, size + spare);
+            let error = OleanView::parse(&hostile)
+                .expect("parses structurally")
+                .shared_audit()
+                .expect_err("spare capacity must be refused");
+            assert!(
+                matches!(
+                    error,
+                    RegionError::StringIntegrity {
+                        reason: "size 0 or not equal to capacity",
+                        ..
+                    } | RegionError::DecodeShape {
+                        reason: "impossible object size",
+                        ..
+                    }
+                ),
+                "tag {tag} spare {spare}: {error:?}"
+            );
+        }
+    }
 }

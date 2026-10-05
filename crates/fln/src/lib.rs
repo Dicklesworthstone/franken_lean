@@ -546,6 +546,23 @@ pub enum OleanDecodeError {
     },
     Region(OleanRegionError),
     Declaration(OleanDeclarationError),
+    /// A part's fixed header is not the pinned toolchain's: its `flags`, `githash`
+    /// or `lean_version` differ (bead `fln-fur.1`). `part` is `None` for the
+    /// exported `.olean`.
+    HeaderNotPinned {
+        part: Option<OleanCompanionPart>,
+        mismatch: fln_olean::pin::HeaderPinMismatch,
+    },
+}
+
+/// Refuse a part whose header is not the pinned toolchain's, before any further
+/// decoding: the pinned loader refuses such a file as an "incompatible header".
+fn require_pinned_header(
+    file: &[u8],
+    part: Option<OleanCompanionPart>,
+) -> Result<(), OleanDecodeError> {
+    fln_olean::pin::check_pinned_header(file)
+        .map_err(|mismatch| OleanDecodeError::HeaderNotPinned { part, mismatch })
 }
 
 impl fmt::Display for OleanDecodeError {
@@ -570,6 +587,14 @@ impl fmt::Display for OleanDecodeError {
             }
             Self::Region(error) => write!(f, ".olean region: {error}"),
             Self::Declaration(error) => write!(f, ".olean declaration: {error}"),
+            Self::HeaderNotPinned {
+                part: None,
+                mismatch,
+            } => write!(f, "incompatible .olean header: {mismatch}"),
+            Self::HeaderNotPinned {
+                part: Some(part),
+                mismatch,
+            } => write!(f, "incompatible {part} header: {mismatch}"),
         }
     }
 }
@@ -858,6 +883,7 @@ pub fn decode_olean_artifact(
     }
 
     let view = OleanView::parse(artifact)?;
+    require_pinned_header(artifact, None)?;
     view.shared_audit()?;
     let walk = view.walk(limits.graph)?;
     let module = view.module_data(limits.module)?;
@@ -886,6 +912,7 @@ pub fn olean_module_imports(
         });
     }
     let view = OleanView::parse(artifact)?;
+    require_pinned_header(artifact, None)?;
     let module = view.module_data(limits.module)?;
     Ok(module
         .imports
@@ -928,6 +955,7 @@ pub fn decode_olean_module_artifacts(
     }
 
     let public_view = OleanView::parse(artifact)?;
+    require_pinned_header(artifact, None)?;
     public_view.shared_audit()?;
     public_view.walk(limits.graph)?;
     let module = public_view.module_data(limits.module)?;
@@ -952,6 +980,7 @@ pub fn decode_olean_module_artifacts(
                 error,
             }
         })?;
+    require_pinned_header(server_artifact, Some(server_part))?;
     if !same_identity(&server_view.header) {
         return Err(OleanDecodeError::CompanionHeaderMismatch { part: server_part });
     }
@@ -987,6 +1016,7 @@ pub fn decode_olean_module_artifacts(
                 part: private_part,
                 error,
             })?;
+    require_pinned_header(private_artifact, Some(private_part))?;
     if !same_identity(&private_view.header) {
         return Err(OleanDecodeError::CompanionHeaderMismatch { part: private_part });
     }

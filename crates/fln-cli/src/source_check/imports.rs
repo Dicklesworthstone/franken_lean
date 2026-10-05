@@ -536,7 +536,7 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
         }
         let imports = fln::olean_module_imports(&parts[0], decode).map_err(|error| {
             Failure::input(format!(
-                "{}: cannot read its imports: {error:?}",
+                "{}: cannot read its imports: {error}",
                 base.display()
             ))
         })?;
@@ -656,7 +656,7 @@ pub(crate) fn external_inputs(
         .into_iter()
         .map(|module| {
             let imports = fln::olean_module_imports(&module.parts[0], decode)
-                .map_err(|error| format!("{}: {error:?}", module.name.to_display_string()))?;
+                .map_err(|error| format!("{}: {error}", module.name.to_display_string()))?;
             let mut hasher = fln_hash::domain::DomainHasher::new(
                 fln_hash::domain::Domain::ArtifactClosureComponent,
             );

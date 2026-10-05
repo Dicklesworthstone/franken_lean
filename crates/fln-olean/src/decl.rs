@@ -1020,7 +1020,17 @@ impl<'a> DeclDecoder<'a> {
             });
         }
         let voff = self.view.deref(self.view.read_u64(off + 8)?)?;
-        let (_vtag, vother, vcs_sz) = self.view.obj_header(voff)?;
+        let (vtag, vother, vcs_sz) = self.view.obj_header(voff)?;
+        // The payload (`AxiomVal`, `DefinitionVal`, ...) is a one-constructor
+        // structure, so its tag is 0, as `ConstantVal`'s is checked to be. The tag
+        // used to be read and dropped, so a payload with any other tag decoded as
+        // if it were well formed (bead `fln-fur.1`).
+        if vtag != 0 {
+            return Err(DeclError::Shape {
+                offset: voff,
+                what: "ConstantInfo payload is a structure, so its constructor tag is 0",
+            });
+        }
 
         // The payload's stored object SIZE, checked against the layout this
         // decoder is about to read the object with.
@@ -4438,6 +4448,53 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// A `DefinitionVal` payload whose constructor tag is not 0 is refused (bead
+    /// `fln-fur.1`). The payload is a one-constructor structure; its tag used to be
+    /// read and dropped, so every tag decoded as the same definition. A single-bit
+    /// flip of a lake-built `.olean` hit exactly this byte and was admitted.
+    ///
+    /// Nothing shadows it: only the tag byte changes, so the arity, size and padding
+    /// rules all see the original object.
+    #[test]
+    fn a_constant_payload_with_a_nonzero_constructor_tag_is_refused() {
+        let bytes = definition_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified definition fixture decodes");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
+            .expect("DefinitionVal object");
+        assert_eq!(view.obj_header(val_off).expect("header"), (0, 4, 48));
+
+        for tag in [1u8, 7] {
+            let mut planted = bytes.clone();
+            planted[val_off as usize + 7] = tag;
+            let view = OleanView::parse(&planted).expect("planted region");
+            assert_eq!(view.obj_header(val_off).expect("header"), (tag, 4, 48));
+            let error = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_module_constants()
+                .expect_err("a payload tag other than 0 must be refused");
+            assert!(
+                matches!(
+                    error,
+                    DeclError::Shape {
+                        what: "ConstantInfo payload is a structure, so its constructor tag is 0",
+                        ..
+                    }
+                ),
+                "tag {tag}: {error:?}"
+            );
+        }
     }
 
     /// A `safety` byte outside `0..=2` is refused rather than read as one of
