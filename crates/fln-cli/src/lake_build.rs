@@ -10,6 +10,10 @@ use fln::{Name, Outcome};
 use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
 
+mod explain;
+mod snapshot;
+pub(crate) use explain::explain;
+
 const MAX_MODULES: usize = 256;
 const MAX_IMPORTS: usize = 4096;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
@@ -608,11 +612,20 @@ fn build(
         posture,
         records.persisted(),
     )?;
-    let paths = publish(
+    let output_dir = root.join(&config.build_dir).join("lib/lean");
+    let paths = publish(&root, &output_dir, &artifacts)?;
+    let snapshot = record_snapshot(
         &root,
-        &root.join(&config.build_dir).join("lib/lean"),
+        &config,
+        &libraries,
+        &entries,
+        &modules,
         &artifacts,
-    )?;
+        &output_dir,
+        &provenance,
+        posture,
+        records.state(),
+    );
     let output = if json {
         let paths = paths
             .iter()
@@ -649,8 +662,15 @@ fn build(
             .unavailable()
             .map(|reason| format!(",\"module_records_reason\":{}", json_string(reason)))
             .unwrap_or_default();
+        let snapshot = match &snapshot {
+            Ok(()) => "\"snapshot\":\"written\"".to_owned(),
+            Err(reason) => format!(
+                "\"snapshot\":\"failed\",\"snapshot_reason\":{}",
+                json_string(reason)
+            ),
+        };
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}],\"module_records\":{}{unavailable},\"modules\":[{rows}]}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}],\"module_records\":{}{unavailable},\"modules\":[{rows}],{snapshot}}}\n",
             json_string(&config.name),
             artifacts.len(),
             json_string(posture.as_str()),
@@ -661,13 +681,98 @@ fn build(
             .iter()
             .map(|report| format!(" Imports: {}.", source_check::posture_sentence(report)))
             .collect::<String>();
+        let snapshot = match &snapshot {
+            Ok(()) => String::new(),
+            Err(reason) => format!(" The build snapshot was not written: {reason}."),
+        };
         format!(
-            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}\n",
+            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{snapshot}\n",
             artifacts.len(),
             config.name
         )
     };
     Ok(MultiplexerOutput::success(output))
+}
+
+/// Write the build snapshot `fln build explain` compares against (bead
+/// `franken_lean-z8j.1.2`). It records inputs and outputs only; nothing reads it back
+/// as an authority. A failure is reported, never a reason to fail a published build.
+#[allow(clippy::too_many_arguments)]
+fn record_snapshot(
+    root: &Path,
+    config: &LakeConfig,
+    libraries: &[Library],
+    entries: &[Name],
+    modules: &BTreeMap<Name, Module>,
+    artifacts: &BTreeMap<Name, Vec<u8>>,
+    output_dir: &Path,
+    provenance: &[ModuleProvenance],
+    posture: ImportPosture,
+    records: &str,
+) -> Result<(), String> {
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    let mut rows = Vec::new();
+    let mut external = BTreeSet::new();
+    for (name, bytes) in artifacts {
+        let module = modules
+            .get(name)
+            .ok_or("an artifact has no source module")?;
+        let source = source_path(name, libraries)
+            .map_err(|failure| failure.detail)?
+            .ok_or("a built module has no library owner")?;
+        let mut artifact = source_import_relative_path(name).map_err(|failure| failure.to_string())?;
+        artifact.set_extension("olean");
+        for import in &module.imports {
+            if !modules.contains_key(import) {
+                external.insert(import.clone());
+            }
+        }
+        let row = provenance.iter().find(|row| &row.name == name);
+        rows.push(snapshot::ModuleRow {
+            name: name.to_display_string(),
+            source: relative(&source),
+            source_digest: snapshot::digest(&module.source),
+            imports: module.imports.iter().map(Name::to_display_string).collect(),
+            artifact: relative(&output_dir.join(artifact)),
+            artifact_digest: snapshot::digest(bytes),
+            key: row.and_then(|row| row.key).map(|key| key.to_hex()),
+            decision: row
+                .map_or("elaborated", |row| row.decision.as_str())
+                .to_owned(),
+        });
+    }
+    let roots: Vec<Name> = external.into_iter().collect();
+    let externals = if roots.is_empty() {
+        Vec::new()
+    } else {
+        source_check::external_inputs(&roots, root)?
+            .into_iter()
+            .map(|input| snapshot::ExternalRow {
+                name: input.name.to_display_string(),
+                digest: input.digest.to_hex(),
+                imports: input.imports.iter().map(Name::to_display_string).collect(),
+            })
+            .collect()
+    };
+    let text = snapshot::Snapshot {
+        posture: posture.as_str().to_owned(),
+        records: records.to_owned(),
+        targets: entries
+            .iter()
+            .map(|entry| format!("+{}:olean", entry.to_display_string()))
+            .collect(),
+        modules: rows,
+        externals,
+    }
+    .to_text();
+    let path = root.join(&config.build_dir).join(snapshot::FILE);
+    fln::publish_file_atomic(text.as_bytes(), &path)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// `jobs` external `.olean` closure modules are checked at once; the build does

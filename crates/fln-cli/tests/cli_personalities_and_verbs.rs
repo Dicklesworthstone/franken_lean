@@ -1006,7 +1006,7 @@ fn fln_build_explain_refuses_without_recorded_provenance() {
     let explain_json_stdout = String::from_utf8(explain_json.stdout).expect("utf8 stdout");
     assert!(explain_json_stdout.is_empty());
     let explain_json_stderr = String::from_utf8(explain_json.stderr).unwrap();
-    assert!(explain_json_stderr.contains("\"schema\":\"fln.build-explain/1\""));
+    assert!(explain_json_stderr.contains("\"schema\":\"fln.build-explain/2\""));
     assert!(explain_json_stderr.contains("\"status\":\"unsupported\""));
     assert!(!explain_json_stderr.contains("cache_outcome"));
 

@@ -154,12 +154,36 @@ Unsupported TOML build settings are rejected rather than silently ignored.
 These boundaries are not full Lake compatibility, fresh-artifact byte identity
 with the Reference, or a claim that the Lake convergence bead is complete.
 
-`fln build explain` also returns a nonzero unsupported result. No recorded,
-content-bound build provenance currently connects this command to the Ledger.
-Source timestamps, output presence, and `-- fln-interface-change` comments cannot
-establish cache validity or semantic early cutoff. No Reference or native rebuild
-decision is invented, including with `--faithful-invalidation`. JSON diagnostics
-use status `unsupported` and contain no build counts or cache outcomes.
+Every successful build writes a snapshot, `buildDir/fln-build.snapshot` (bead
+`franken_lean-z8j.1.2`). For every module it records the source path and content
+hash, the ordered imports, the output path and content hash, the record key and
+the decision. It also records the content hash of every external `.olean` in the
+closure, with that module's imports. The report says `"snapshot":"written"`, or
+`"failed"` with `snapshot_reason`; a failed write does not fail a published
+build. A failed build leaves the last successful snapshot in place. No build
+reads the snapshot: module reuse is decided by the record store alone.
+
+`fln build explain [--dir D] [--json] [MODULE]` compares that snapshot with the
+current tree and reports why each module of the recorded build (or of `MODULE`'s
+closure) would rebuild. It elaborates and admits nothing.
+- The Reference decision follows Lake's file-cone model. A module rebuilds when
+  its source bytes, its ordered imports, or the bytes of an external `.olean` in
+  its import cone changed, or when a local import rebuilds.
+- A missing output rebuilds that module alone. A changed output is listed under
+  changed outputs and changes no decision.
+- Each changed input is named with its old and new content hashes.
+- The native decision is reported as `unavailable (no Ledger records)`: it would
+  need Ledger demand records, which do not exist.
+
+Source timestamps, output presence and the text of a file (comments,
+`axiom `, `-- fln-interface-change`) never decide anything: only which files'
+bytes changed. `--faithful-invalidation` is accepted and changes nothing,
+because the Reference decision is already the file-cone model.
+
+Exit codes: 0 with a decision. 5 when no snapshot exists, or when the decision
+cannot be computed because an input cannot be read; the report then says which,
+with status `incomplete` and decision `unknown`. 1 for a malformed snapshot or a
+module outside the recorded build. JSON uses `fln.build-explain/2`.
 
 `lake check-build` has the narrow meaning in the pinned Reference's
 `Lake/CLI/Help.lean` and `Lake/CLI/Main.lean`: return zero exactly when default

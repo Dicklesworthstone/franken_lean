@@ -1373,7 +1373,9 @@ pub fn build_package(dir: &Path, _targets: &[String]) -> Result<LakeBuildReport,
 /// Refuse build explanations without content-bound, recorded build provenance.
 ///
 /// Neither a timestamp nor a source comment establishes semantic early cutoff.
-/// This applies equally to native and faithful-invalidation requests.
+/// This applies equally to native and faithful-invalidation requests. This crate
+/// has no source graph or build snapshot; `fln build explain` is implemented in
+/// `fln-cli` over the snapshot `lake build` writes (bead `franken_lean-z8j.1.2`).
 pub fn explain_build(
     dir: &Path,
     _target: Option<&str>,

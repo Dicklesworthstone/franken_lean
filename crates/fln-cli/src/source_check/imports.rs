@@ -569,6 +569,52 @@ pub(super) fn load_build_base(
         .map(|(_, base)| base.map(|base| (base.receipt, base.report)))
 }
 
+/// One external `.olean` module as a build input (bead `franken_lean-z8j.1.2`).
+pub(crate) struct ExternalInput {
+    pub(crate) name: Name,
+    /// `Domain::ArtifactClosureComponent` over every part, each length-prefixed and
+    /// marked present or absent.
+    pub(crate) digest: fln_hash::domain::Digest,
+    pub(crate) imports: Vec<Name>,
+}
+
+/// The external `.olean` closure of `roots`, as `lake build` resolves it: read and
+/// digested, never admitted. Build provenance and `fln build explain` compare these.
+pub(crate) fn external_inputs(
+    roots: &[Name],
+    source_root: &Path,
+) -> Result<Vec<ExternalInput>, String> {
+    let decode = fln::OleanCheckLimits::new(
+        MAX_OLEAN_BYTES,
+        fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+    )
+    .decode;
+    let loaded = load_olean_closure(roots, source_root).map_err(|failure| failure.detail)?;
+    loaded
+        .into_iter()
+        .map(|module| {
+            let imports = fln::olean_module_imports(&module.parts[0], decode)
+                .map_err(|error| format!("{}: {error:?}", module.name.to_display_string()))?;
+            let mut hasher = fln_hash::domain::DomainHasher::new(
+                fln_hash::domain::Domain::ArtifactClosureComponent,
+            );
+            hasher.update(b"fln.lake-external-olean/1\0");
+            for (index, part) in module.parts.iter().enumerate() {
+                // The base part is always read; companions are absent when empty.
+                let present = index == 0 || !part.is_empty();
+                hasher.update(&[u8::from(present)]);
+                hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+                hasher.update(part);
+            }
+            Ok(ExternalInput {
+                name: module.name,
+                digest: hasher.finalize(),
+                imports,
+            })
+        })
+        .collect()
+}
+
 /// The source module records a build under `posture` consults (bead `franken_lean-z8j.1.1`).
 pub(crate) fn module_records(posture: ImportPosture) -> reuse::ModuleRecords {
     reuse::ModuleRecords::new(posture)

@@ -211,8 +211,10 @@ const USAGE: &str = concat!(
     "names the planned subsystems that are not implemented yet.\n",
     "`serve-mcp`, `replay`, and `cache` are planned capabilities that are not\n",
     "implemented; they print a typed notice and exit 5.\n",
-    "`build explain` exits 5: recorded build provenance is unavailable, so it\n",
-    "reports no rebuild decision.\n",
+    "`build explain` compares the last successful `lake build` snapshot with the\n",
+    "tree: changed inputs with old and new hashes, and the Reference (file-cone)\n",
+    "rebuild decision. The native decision is unavailable (no Ledger records). It\n",
+    "exits 5 when no snapshot exists or an input cannot be read.\n",
     "`verify-capsule` checks the transport completeness and content-hash integrity\n",
     "of a sealed .flnpack capsule and decodes its certificate objects; it does not\n",
     "replay certificates through a checker.\n",
@@ -13108,77 +13110,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
 fn run_build_explain(
     target: Option<&str>,
     dir: Option<&Path>,
-    faithful_invalidation: bool,
+    // The Reference decision is already the faithful file-cone model; the flag
+    // selects nothing further (bead `franken_lean-z8j.1.2`).
+    _faithful_invalidation: bool,
     json: bool,
 ) -> MultiplexerOutput {
-    let base_dir = dir.unwrap_or_else(|| Path::new("."));
-    match fln_lake::explain_build(base_dir, target, faithful_invalidation) {
-        Ok(report) => {
-            if json {
-                let changed_json = report
-                    .changed_inputs
-                    .iter()
-                    .map(|s| format!("\"{s}\""))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let barriers_json = report
-                    .opaque_barriers
-                    .iter()
-                    .map(|s| format!("\"{s}\""))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                MultiplexerOutput::success(format!(
-                    "{{\"schema\":\"fln.build-explain/1\",\"status\":\"success\",\"package\":\"{}\",\"target\":\"{}\",\"reference_decision\":\"{}\",\"native_decision\":\"{}\",\"delta\":\"{}\",\"changed_inputs\":[{changed_json}],\"opaque_barriers\":[{barriers_json}],\"cache_outcome\":\"{}\"}}\n",
-                    report.package,
-                    report.target,
-                    report.reference_decision,
-                    report.native_decision,
-                    report.delta,
-                    report.cache_outcome,
-                ))
-            } else {
-                let changed_str = if report.changed_inputs.is_empty() {
-                    "(none)".to_owned()
-                } else {
-                    report.changed_inputs.join(", ")
-                };
-                let barriers_str = if report.opaque_barriers.is_empty() {
-                    "(none)".to_owned()
-                } else {
-                    report.opaque_barriers.join(", ")
-                };
-                MultiplexerOutput::success(format!(
-                    "Target: {} (package: {})\n  Reference decision: {}\n  Native decision:    {}\n  Delta:              {}\n  Changed inputs:     {}\n  Opaque barriers:    {}\n  Cache outcome:      {}\n",
-                    report.target,
-                    report.package,
-                    report.reference_decision,
-                    report.native_decision,
-                    report.delta,
-                    changed_str,
-                    barriers_str,
-                    report.cache_outcome,
-                ))
-            }
-        }
-        Err(err) => {
-            let unsupported = matches!(
-                err,
-                fln_lake::LakeExplainError::Unavailable
-                    | fln_lake::LakeExplainError::Discovery(
-                        fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)
-                    )
-            );
-            let mut output =
-                lake_operation_failure("fln.build-explain/1", &err.to_string(), unsupported, json);
-            // `build explain` is an `fln` verb, so a missing capability takes the
-            // multiplexer's documented exit 5, never the 1 that means "rejected
-            // or failed". The `lake` personality keeps Lake's own exit 1.
-            if unsupported {
-                output.exit_code = 5;
-            }
-            output
-        }
-    }
+    lake_build::explain(dir, target, json)
 }
 
 fn lake_operation_failure(
