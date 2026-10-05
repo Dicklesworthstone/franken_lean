@@ -79,7 +79,16 @@ fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
         .unwrap();
     assert_eq!(conjunction.synth_order, [2, 3]);
     assert!(decoded.defaults.iter().any(|row| row.class == n("OfNat")));
-    assert!(decoded.uninterpreted.contains(&n("Lean.aliasExtension")));
+    // `export Decidable (isTrue isFalse decide)` (vendored src/Init/Prelude.lean)
+    // is decoded, not reported as an uninterpreted extension.
+    assert!(!decoded.uninterpreted.contains(&n("Lean.aliasExtension")));
+    for name in ["isTrue", "isFalse", "decide"] {
+        assert!(
+            decoded.aliases.iter().any(|row| row.alias == n(name)
+                && row.declaration == Name::from_components(["Decidable", name])),
+            "the Prelude exports {name} as Decidable.{name}"
+        );
+    }
     assert!(
         decoded
             .instances

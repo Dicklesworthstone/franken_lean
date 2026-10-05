@@ -6,6 +6,8 @@
 //! src/Lean/Attributes.lean: sha256 8219a775586b85586ac84665045f0bcbc6cc78c2fd184d2f8c8b78d5bdd8d643
 //! src/Lean/Meta/Tactic/Simp/SimpTheorems.lean: sha256 78b3a7f971d3bd2aeca9c60a7850ec3449b9e48f9730000569fa43fa0274957d
 //! src/Lean/Meta/Tactic/Simp/Attr.lean: sha256 ce45e8a48edbab67408b197257e616091ab55c410254e3d303fe813f7fd42242
+//! src/Lean/ResolveName.lean: sha256 c42a2e8e21b0d0325a32f09827be6253aad276ac4d25b30b5281b420f1beccb9
+//! src/Init/Prelude.lean: sha256 44f86ebbb9ab743a05c6ebe2c674aadbf2c822bee874f1b16d7e6c8d56318dc9
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -61,3 +63,8 @@ pub const SIMP_EXTENSION: &str = "Lean.Meta.simpExtension";
 pub const CLASS_EXTENSION: &str = "Lean.classExtension";
 pub const INSTANCE_EXTENSION: &str = "Lean.Meta.instanceExtension";
 pub const DEFAULT_EXTENSION: &str = "Lean.Meta.defaultInstanceExtension";
+pub const ALIAS_EXTENSION: &str = "Lean.aliasExtension";
+pub const PROD_FST: usize = 0;
+pub const PROD_SND: usize = 1;
+pub const PROD_POINTERS: usize = 2;
+pub const PROD_SCALAR_BYTES: usize = 0;

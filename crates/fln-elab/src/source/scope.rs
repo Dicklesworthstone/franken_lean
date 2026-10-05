@@ -3,6 +3,7 @@
 use super::*;
 pub mod simp;
 pub mod variables;
+use crate::aliases::AliasTable;
 use fln_core::name::LeafView;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -113,7 +114,24 @@ impl SourceScope {
     pub fn resolve(
         &self,
         name: &Name,
+        exists: impl FnMut(&Name) -> bool,
+    ) -> Result<Option<Name>, ScopeError> {
+        self.resolve_with_aliases(name, exists, &AliasTable::default())
+    }
+
+    /// [`Self::resolve`], with imported `export` aliases beside declarations, as
+    /// the pin's `resolveGlobalName` consults `getAliases` at each namespace and
+    /// in each opened namespace (vendored `src/Lean/ResolveName.lean`). At one
+    /// namespace a real declaration (or local) wins; there an alias with two
+    /// targets is a refusal, never a choice. `_root_.x` names `x` exactly, as
+    /// the pin's `resolveExact` does. Not modelled: the pin skips aliases to
+    /// `protected` declarations for an atomic name, and this table records no
+    /// protection.
+    pub fn resolve_with_aliases(
+        &self,
+        name: &Name,
         mut exists: impl FnMut(&Name) -> bool,
+        aliases: &AliasTable,
     ) -> Result<Option<Name>, ScopeError> {
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
@@ -126,6 +144,11 @@ impl SourceScope {
             if exists(&candidate) {
                 return Ok(Some(candidate));
             }
+            match aliases.targets(&candidate) {
+                [] => {}
+                [target] => return Ok(Some(target.clone())),
+                targets => return Err(ScopeError::Ambiguous(name.clone(), targets.to_vec())),
+            }
             if namespace.is_anonymous() {
                 break;
             }
@@ -135,7 +158,12 @@ impl SourceScope {
         for opened in self.opened.iter().rev() {
             let candidate = opened.append_core(name);
             if exists(&candidate) && !candidates.contains(&candidate) {
-                candidates.push(candidate);
+                candidates.push(candidate.clone());
+            }
+            for target in aliases.targets(&candidate) {
+                if !candidates.contains(target) {
+                    candidates.push(target.clone());
+                }
             }
         }
         match candidates.len() {
@@ -174,15 +202,23 @@ impl Context {
         {
             self.tick()?;
         }
+        let aliases = self
+            .alias_cache
+            .read(&self.txn.env)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
         self.source_scope
-            .resolve(name, |candidate| {
-                self.txn.env.contains(candidate)
-                    || self.txn.lctx.find_by_user_name(candidate).is_some()
-                    || self
-                        .recursion
-                        .as_ref()
-                        .is_some_and(|r| &r.name == candidate)
-            })
+            .resolve_with_aliases(
+                name,
+                |candidate| {
+                    self.txn.env.contains(candidate)
+                        || self.txn.lctx.find_by_user_name(candidate).is_some()
+                        || self
+                            .recursion
+                            .as_ref()
+                            .is_some_and(|r| &r.name == candidate)
+                },
+                &aliases,
+            )
             .map_err(error)
     }
 
@@ -330,6 +366,70 @@ mod tests {
     fn n(s: &str) -> Name {
         Name::from_components(s.split('.'))
     }
+    /// The pin's `resolveGlobalName` consults `getAliases` beside declarations
+    /// at each namespace and in each opened namespace; `_root_.x` is exact.
+    #[test]
+    fn export_aliases_resolve_beside_declarations_at_each_namespace() {
+        let scope = SourceScope {
+            namespace: n("Outer"),
+            opened: vec![n("O")],
+            universes: vec![],
+            variables: variables::SectionVariables::default(),
+            instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+        };
+        let env = [
+            "Decidable.decide",
+            "Outer.mine",
+            "Bool.not",
+            "Other.not",
+            "X.one",
+            "Y.one",
+        ]
+        .into_iter()
+        .fold(fln_env::environment::Environment::new(), |env, name| {
+            env.add_decl(fln_env::constants::ConstantInfo::Axiom(
+                fln_env::constants::AxiomVal {
+                    base: fln_env::constants::ConstantVal {
+                        name: n(name),
+                        level_params: Vec::new(),
+                        type_: fln_core::expr::Expr::sort(fln_core::level::Level::one()),
+                    },
+                    is_unsafe: false,
+                },
+            ))
+            .unwrap()
+        });
+        let env = [
+            ("decide", "Decidable.decide"),
+            ("Outer.mine", "Bool.not"),
+            ("O.neg", "Other.not"),
+            ("two", "X.one"),
+            ("two", "Y.one"),
+        ]
+        .into_iter()
+        .fold(env, |env, (alias, target)| {
+            crate::aliases::register(&env, &n(alias), &n(target)).unwrap()
+        });
+        let aliases = AliasTable::read(&env).unwrap();
+        let resolve =
+            |name: &str| scope.resolve_with_aliases(&n(name), |x| env.contains(x), &aliases);
+        // A root alias, as `export Decidable (decide)` in the root namespace.
+        assert_eq!(resolve("decide").unwrap(), Some(n("Decidable.decide")));
+        // At one namespace the real declaration wins over an alias there.
+        assert_eq!(resolve("mine").unwrap(), Some(n("Outer.mine")));
+        // An alias in an opened namespace is a candidate like a declaration.
+        assert_eq!(resolve("neg").unwrap(), Some(n("Other.not")));
+        // Two targets for one alias are a refusal, never a choice.
+        assert!(matches!(resolve("two"), Err(ScopeError::Ambiguous(_, xs)) if xs.len() == 2));
+        // `_root_.decide` names `decide` exactly: no declaration, so nothing.
+        assert_eq!(resolve("_root_.decide").unwrap(), None);
+        // The alias-free form is unchanged.
+        assert_eq!(
+            scope.resolve(&n("decide"), |x| env.contains(x)).unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn namespace_prefixes_root_escapes_and_ambiguous_opens_have_distinct_rules() {
         let scope = SourceScope {

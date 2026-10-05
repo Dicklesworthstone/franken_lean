@@ -256,6 +256,9 @@ struct Context {
     // The instance registry, re-read only when it can have changed: every
     // numeric literal, operator and coercion asks it.
     registry_cache: crate::instances::RegistryCache,
+    // Imported `export` aliases, re-read only when the journal or the constants
+    // change: every unresolved identifier consults them.
+    alias_cache: crate::aliases::AliasCache,
     refinements: Vec<tactics::RefinementFrame>,
     recursion: Option<recursion::Recursion>,
 }
@@ -300,6 +303,7 @@ impl Context {
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
+            alias_cache: crate::aliases::AliasCache::default(),
             refinements: Vec::new(),
             recursion: None,
         }

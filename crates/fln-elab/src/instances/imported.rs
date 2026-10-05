@@ -493,6 +493,18 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record an imported `export` alias in the environment being activated.
+    /// The alias journal is not one this activation keeps or reads, so the
+    /// kept class and instance state stays exact.
+    pub fn register_alias(
+        mut self,
+        alias: &Name,
+        declaration: &Name,
+    ) -> Result<Self, crate::aliases::AliasError> {
+        self.env = crate::aliases::register(&self.env, alias, declaration)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {

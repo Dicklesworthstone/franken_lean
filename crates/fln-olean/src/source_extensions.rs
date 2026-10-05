@@ -14,7 +14,9 @@ use fln_rt::obj::Obj;
 use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
-pub use format::{CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, SIMP_EXTENSION};
+pub use format::{
+    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, SIMP_EXTENSION,
+};
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
 
@@ -45,12 +47,21 @@ pub struct DefaultEntry {
     pub priority: u32,
 }
 
+/// An `export` alias: `alias` names `declaration`. The pin's `export A (x)` in
+/// namespace `B` records `B.x ~> A.x` as `addAlias env a e`, the pair `(a, e)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasEntry {
+    pub alias: Name,
+    pub declaration: Name,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceExtensions {
     pub classes: Vec<ClassEntry>,
     pub instances: Vec<InstanceEntry>,
     pub defaults: Vec<DefaultEntry>,
     pub simps: Vec<SimpEntry>,
+    pub aliases: Vec<AliasEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -232,6 +243,13 @@ impl Reader {
             key_count: array_length(&field(&entry, format::INSTANCE_KEYS)?)?,
         })
     }
+    fn alias(&mut self, obj: &Obj) -> Result<AliasEntry, DecodeError> {
+        constructor(obj, 0, format::PROD_POINTERS)?;
+        Ok(AliasEntry {
+            alias: self.name(&field(obj, format::PROD_FST)?)?,
+            declaration: self.name(&field(obj, format::PROD_SND)?)?,
+        })
+    }
     fn default_instance(&mut self, obj: &Obj) -> Result<DefaultEntry, DecodeError> {
         constructor(obj, 0, format::DEFAULT_POINTERS)?;
         Ok(DefaultEntry {
@@ -255,6 +273,7 @@ pub fn decode(
         name(format::INSTANCE_EXTENSION),
         name(format::DEFAULT_EXTENSION),
         name(format::SIMP_EXTENSION),
+        name(format::ALIAS_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -292,7 +311,8 @@ pub fn decode(
                 1 => out.instances.push(reader.instance(&obj)?),
                 2 => out.defaults.push(reader.default_instance(&obj)?),
                 3 => out.simps.push(reader.simp(&obj)?),
-                _ => unreachable!("four selected extension families"),
+                4 => out.aliases.push(reader.alias(&obj)?),
+                _ => unreachable!("five selected extension families"),
             }
         }
     }

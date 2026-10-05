@@ -52,6 +52,8 @@ pub struct SourceMetadataReport {
     pub instances: usize,
     pub defaults: usize,
     pub scoped_instances: usize,
+    /// `export` aliases (the pin's `aliasExtension`), activated for name resolution.
+    pub aliases: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -270,6 +272,7 @@ impl Engine {
             metadata::CLASS_EXTENSION,
             metadata::INSTANCE_EXTENSION,
             metadata::DEFAULT_EXTENSION,
+            metadata::ALIAS_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -317,6 +320,7 @@ impl Engine {
                 instances: 0,
                 defaults: 0,
                 scoped_instances: 0,
+                aliases: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -340,7 +344,8 @@ impl Engine {
                     match kind {
                         0 => report.classes = block.entries.len(),
                         1 => report.instances = block.entries.len(),
-                        _ => report.defaults = block.entries.len(),
+                        2 => report.defaults = block.entries.len(),
+                        _ => report.aliases = block.entries.len(),
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
@@ -357,6 +362,7 @@ impl Engine {
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
+        let mut aliases = decoded.aliases.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
@@ -451,6 +457,25 @@ impl Engine {
                     .register_default(&row.declaration, row.priority)
                     .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
             }
+            for _ in 0..report.aliases {
+                cancelled!("source-olean/alias");
+                let row = aliases.next().ok_or(SourceOleanImportError::Internal(
+                    "alias count changed during decode",
+                ))?;
+                activation = activation
+                    .register_alias(&row.alias, &row.declaration)
+                    .map_err(|error| SourceOleanImportError::Metadata {
+                        module: report.module.clone(),
+                        declaration: row.declaration.clone(),
+                        reason: match error {
+                            fln_elab::aliases::AliasError::UnknownDeclaration(_) => {
+                                "an export alias names no admitted declaration"
+                            }
+                            fln_elab::aliases::AliasError::Limit => "export alias journal limit",
+                            fln_elab::aliases::AliasError::Malformed => "malformed export alias",
+                        },
+                    })?;
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -461,7 +486,11 @@ impl Engine {
                 "the activated registries disagree with their kept state",
             )
         })?;
-        if classes.next().is_some() || instances.next().is_some() || defaults.next().is_some() {
+        if classes.next().is_some()
+            || instances.next().is_some()
+            || defaults.next().is_some()
+            || aliases.next().is_some()
+        {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
             ));
@@ -506,6 +535,11 @@ trait Registrar: Sized {
         declaration: &Name,
         priority: u32,
     ) -> std::result::Result<Self, InstanceRegistryError>;
+    fn register_alias(
+        self,
+        alias: &Name,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::aliases::AliasError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -536,6 +570,13 @@ impl Registrar for instances::imported::ImportActivation {
         priority: u32,
     ) -> std::result::Result<Self, InstanceRegistryError> {
         self.register_default(declaration, priority)
+    }
+    fn register_alias(
+        self,
+        alias: &Name,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::aliases::AliasError> {
+        self.register_alias(alias, declaration)
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
@@ -833,6 +874,13 @@ pub(super) mod tests {
             priority: u32,
         ) -> std::result::Result<Self, InstanceRegistryError> {
             instances::defaults::register(&self.0, declaration, priority).map(Sequential)
+        }
+        fn register_alias(
+            self,
+            alias: &Name,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::aliases::AliasError> {
+            fln_elab::aliases::register(&self.0, alias, declaration).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)

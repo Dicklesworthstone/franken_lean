@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aliases;
 pub mod constraint;
 pub mod dataflow;
 pub mod decision;
