@@ -118,6 +118,12 @@ impl Preparation<'_> {
             .map_err(|_| unsupported("runtime specialization scope"))
     }
     pub(super) fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
+        // A projection whose receiver unfolds to its family's constructor
+        // selects that field, as definitional unfolding does (a boxed slot's
+        // type `p.carrier` names a concrete type). Pending projections are
+        // explicit frames, never host recursion. A projection that does not
+        // reduce is returned exactly as written, with its receiver unchanged.
+        let mut projections: Vec<(Expr, Vec<Expr>)> = Vec::new();
         let (mut head, mut args) = self.spine(source)?;
         args.reverse();
         loop {
@@ -133,23 +139,69 @@ impl Preparation<'_> {
                 ExprNode::Lam { body, .. } if !args.is_empty() => {
                     head = self.substitution(body, &args.pop().expect("type argument"))?
                 }
+                ExprNode::Proj { expr, .. } => {
+                    let receiver = expr.clone();
+                    reserve(&mut projections, self.limits.max_context_depth)?;
+                    projections.push((head.clone(), std::mem::take(&mut args)));
+                    head = receiver;
+                }
                 ExprNode::Const { name, levels } => {
-                    let Some(definition) = self.definition(name) else {
+                    if let Some(definition) = self.definition(name)
+                        && definition.base.level_params.len() == levels.len()
+                    {
+                        head = self.universe_instance(
+                            &definition.value,
+                            &definition.base.level_params,
+                            levels,
+                        )?;
+                        continue;
+                    }
+                    let Some(field) = projections
+                        .last()
+                        .and_then(|(projection, _)| self.projected_field(projection, &head, &args))
+                    else {
                         break;
                     };
-                    if definition.base.level_params.len() != levels.len() {
-                        break;
-                    }
-                    head = self.universe_instance(
-                        &definition.value,
-                        &definition.base.level_params,
-                        levels,
-                    )?;
+                    let (_, outer) = projections.pop().expect("pending projection");
+                    head = field;
+                    args = outer;
                 }
                 _ => break,
             }
         }
+        if let Some((projection, outer)) = projections.into_iter().next() {
+            return Ok(application(projection, outer.into_iter().rev()));
+        }
         Ok(application(head, args.into_iter().rev()))
+    }
+
+    /// The field `projection` selects from `head` applied to the reversed
+    /// `args`, when that is a saturated constructor of the projected family.
+    fn projected_field(&self, projection: &Expr, head: &Expr, args: &[Expr]) -> Option<Expr> {
+        let ExprNode::Proj {
+            struct_name, idx, ..
+        } = projection.node()
+        else {
+            return None;
+        };
+        let ExprNode::Const { name, .. } = head.node() else {
+            return None;
+        };
+        let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name) else {
+            return None;
+        };
+        let parameters = ctor.num_params as usize;
+        let fields = ctor.num_fields as usize;
+        let index = usize::try_from(*idx).ok()?;
+        if ctor.is_unsafe
+            || ctor.induct != *struct_name
+            || index >= fields
+            || args.len() != parameters.checked_add(fields)?
+        {
+            return None;
+        }
+        // `args` holds the application in reverse order.
+        args.get(args.len() - 1 - (parameters + index)).cloned()
     }
     pub(super) fn type_parameter(&mut self, type_: &Expr) -> Result<bool, IngressError> {
         let mut type_ = self.type_head(type_)?;

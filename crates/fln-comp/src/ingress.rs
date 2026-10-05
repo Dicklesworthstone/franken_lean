@@ -4718,6 +4718,34 @@ pub fn lower_closed_expr_with_closure_interfaces<'a>(
     interfaces: &[ClosureSignature],
     limits: IngressLimits,
 ) -> Result<IngressedProgram, IngressError> {
+    lower_closed_expr_at_result(
+        source,
+        scalar_constructors,
+        intrinsics,
+        constructors,
+        callables,
+        interfaces,
+        None,
+        limits,
+    )
+}
+
+/// [`lower_closed_expr_with_closure_interfaces`] with the root's declared
+/// result class. A root that produces an [`fir::ValueType::Abi`] value, such as
+/// a field read from a boxed polymorphic slot, receives the same explicit unbox
+/// that a function body receives at its declared result boundary. A root of
+/// any other class is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_closed_expr_at_result<'a>(
+    source: &'a Expr,
+    scalar_constructors: &[ScalarConstructorBinding],
+    intrinsics: &[IntrinsicBinding],
+    constructors: &[ConstructorBinding],
+    callables: CallableBindings<'a>,
+    interfaces: &[ClosureSignature],
+    expected_result: Option<fir::ValueType>,
+    limits: IngressLimits,
+) -> Result<IngressedProgram, IngressError> {
     if source.has_fvar() {
         return Err(IngressError::OpenFreeVariable);
     }
@@ -4782,7 +4810,7 @@ pub fn lower_closed_expr_with_closure_interfaces<'a>(
             parameter_count: 0,
             bindings: Vec::new(),
         },
-        None,
+        expected_result,
         &catalog,
         limits,
         &mut work,

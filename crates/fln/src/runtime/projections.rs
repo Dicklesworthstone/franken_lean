@@ -64,6 +64,7 @@ impl Preparation<'_> {
         }
         let mut value =
             self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        let mut receiver_type = None;
         for (index, argument) in arguments[..arity].iter().enumerate() {
             self.tick()?;
             let ExprNode::Lam {
@@ -72,6 +73,9 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
+            if index + 1 == arity {
+                receiver_type = Some(binder_type.clone());
+            }
             if index + 1 != arity
                 && !self.type_parameter(binder_type)?
                 && !matches!(
@@ -96,11 +100,31 @@ impl Preparation<'_> {
         // Only expose a field when this administrative projection is fully
         // resolved. A dynamic receiver still needs the existing lexical,
         // signature-aware projection layout pass after specialization.
-        let Some(field) = self.executable_projection(struct_name, *idx, expr)? else {
+        if let Some(field) = self.executable_projection(struct_name, *idx, expr)? {
+            return Ok(Some(
+                arguments[arity..].iter().cloned().fold(field, Expr::app),
+            ));
+        }
+        // A boxed slot's projection function has a dependent result type, so
+        // it is never compiled as a function. Select the field from the
+        // receiver's closed layout instead; the receiver still occurs once.
+        let Some(receiver_type) = receiver_type.filter(|type_| !type_.has_loose_bvars()) else {
             return Ok(None);
         };
+        let Some((shape, field)) = self.projection_slot(&receiver_type, struct_name, *idx)? else {
+            return Ok(None);
+        };
+        if field != records::boxed_slot_type()
+            || self.value_type(&shape.source)? != Some(ValueType::Constructor)
+        {
+            return Ok(None);
+        }
+        let projected = Expr::proj(shape.projection(&shape.constructors[0]), *idx, expr.clone());
         Ok(Some(
-            arguments[arity..].iter().cloned().fold(field, Expr::app),
+            arguments[arity..]
+                .iter()
+                .cloned()
+                .fold(projected, Expr::app),
         ))
     }
 

@@ -6829,6 +6829,7 @@ impl Engine {
         let runtime_type = preparation
             .normalize_type(&declared_type)
             .map_err(EngineExecutionError::Ingress)?;
+        let root_result = preparation.root_result(&runtime_type);
         let expression = preparation
             .expression_at_type(&expression, Some(declared_type.clone()))
             .map_err(EngineExecutionError::Ingress)?;
@@ -6850,13 +6851,14 @@ impl Engine {
         let interfaces = preparation
             .finalize_callables(&mut catalog.functions)
             .map_err(EngineExecutionError::Ingress)?;
-        let ingress = fln_comp::ingress::lower_closed_expr_with_closure_interfaces(
+        let ingress = fln_comp::ingress::lower_closed_expr_at_result(
             &expression,
             &catalog.scalar_constructors,
             &catalog.intrinsics,
             &preparation.constructors,
             preparation.callables(&catalog.functions),
             &interfaces,
+            root_result,
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;

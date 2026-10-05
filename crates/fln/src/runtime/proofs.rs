@@ -9,10 +9,11 @@ mod projections;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
 // observing a proof as a Bool; this representation exists only after admission.
-fn erased_type() -> Expr {
+// Record layouts give a type-valued field the same inert slot.
+pub(super) fn erased_type() -> Expr {
     Expr::const_(name("Bool"), vec![])
 }
-fn erased_value() -> Expr {
+pub(super) fn erased_value() -> Expr {
     Expr::const_(name("Bool.false"), vec![])
 }
 

@@ -215,14 +215,28 @@ fn invalid_indices_and_static_obligations_never_publish() {
     assert_eq!(base.logical_root(&options), root);
 }
 
+/// An existential type field is erased and its value boxed (fln-lvdh). The
+/// pinned Reference prints 42 for this program (with the name `Dyn0`, since
+/// its prelude already declares `Dynamic`).
+#[test]
+fn existential_type_fields_execute_with_a_boxed_value() {
+    run(
+        "inductive Dynamic : Nat -> Type 1 where | pack (A : Type) (value : A) : Dynamic 0\n\
+         def ignore (x : Dynamic 0) : Nat := 42\n#eval ignore (Dynamic.pack Bool true)",
+        "42",
+    );
+}
+
 #[test]
 fn type_indices_and_existential_runtime_representations_are_refused() {
     use fln::{Outcome, SourceCheckLimits};
     for source in [
         "inductive Dynamic : Type -> Type where | nat (n : Nat) : Dynamic Nat | flag (b : Bool) : Dynamic Bool\n\
          def ignore (x : Dynamic Nat) : Nat := 42\n#eval ignore (Dynamic.nat 7)",
-        "inductive Dynamic : Nat -> Type 1 where | pack (A : Type) (value : A) : Dynamic 0\n\
-         def ignore (x : Dynamic 0) : Nat := 42\n#eval ignore (Dynamic.pack Bool true)",
+        // A function field over the existential type has no layout; only a
+        // field typed by exactly the type field is a boxed slot.
+        "inductive Dynamic : Nat -> Type 1 where | pack (A : Type) (value : A) (measure : A -> Nat) : Dynamic 0\n\
+         def ignore (x : Dynamic 0) : Nat := 42\n#eval ignore (Dynamic.pack Nat 1 (fun n => n + 1))",
     ] {
         let base = engine();
         let options = KVMap::new();

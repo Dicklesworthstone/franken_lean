@@ -235,6 +235,13 @@ fn classifiers_do_not_erase_type_valued_decisions_or_false_proofs() {
         "def choose (d : Decidable (0 = 1)) : Nat := match d with | .isTrue h => 0 | .isFalse h => 42\n#eval choose (Decidable.isFalse (by intro h; cases h))",
         "42",
     );
+    // A type-valued field is erased as a type, never as a proof: the value
+    // typed by it keeps a boxed slot and reads back (fln-lvdh; the pinned
+    // Reference prints 42).
+    run(
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef p : Package := { carrier := Nat, value := 42 }\n#eval p.value",
+        "42",
+    );
     let base = Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
@@ -243,7 +250,6 @@ fn classifiers_do_not_erase_type_valued_decisions_or_false_proofs() {
     let root = base.logical_root(&options);
     for source in [
         "structure Bad where\n  value : Nat\n  proof : 0 = 1\ndef b : Bad := { value := 42, proof := by rfl }\n#eval b.value",
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef p : Package := { carrier := Nat, value := 42 }\n#eval 42",
         "structure Certified where\n  value : Nat\n  proof : value = value\ndef c : Certified := { value := 40, proof := by rfl }\n#eval { c with value := 42 }.value",
         "structure Certified where\n  value : Nat\n  proof : value = value\ndef c : Certified := { value := 42, proof := by rfl }\n#eval c.value\ntheorem bad : 0 = 1 := by rfl",
     ] {

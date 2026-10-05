@@ -5,6 +5,9 @@
 //! Proof fields keep inert scalar slots; other value-dependent fields remain
 //! refusals unless their checked indices erase to a uniform representation.
 //! Nondependent function fields are owned closures with checked interfaces.
+//! Type-valued fields are runtime-irrelevant, as in the Reference's compiler:
+//! each keeps an inert scalar slot, like a proof. A field whose type is exactly
+//! such a field holds a value of any type and is a boxed polymorphic slot.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
 use fln_core::level::Level;
@@ -24,6 +27,14 @@ pub(super) struct ShapeConstructor {
     pub name: Name,
     pub tag: u8,
     pub fields: Vec<Expr>,
+    /// Which fields hold a type (or type former) and are erased at runtime.
+    pub type_fields: Vec<bool>,
+}
+
+/// The layout-only field type of a boxed polymorphic slot. It names no
+/// declaration and never reaches a checker; only the record catalog reads it.
+pub(super) fn boxed_slot_type() -> Expr {
+    Expr::const_(name("_fln_runtime_boxed"), vec![])
 }
 
 impl Shape {
@@ -164,29 +175,62 @@ impl Preparation<'_> {
             if type_.has_fvar() {
                 return Ok(None);
             }
+            let mut type_fields = Vec::new();
             while let ExprNode::ForallE {
                 binder_type, body, ..
             } = type_.node()
             {
                 self.tick()?;
-                // A later field's representation may not depend on a runtime
-                // field. Retain that boundary after substituting type params.
-                if body.has_loose_bvars() {
-                    return Ok(None);
-                }
-                let field = self.normalize_type(binder_type)?;
-                let (head, _) = self.spine(&field)?;
-                if !matches!(
-                    head.node(),
-                    ExprNode::Const { .. } | ExprNode::ForallE { .. }
-                ) {
-                    return Ok(None);
-                }
+                // A field typed by exactly an earlier type-valued field holds
+                // a value of whatever type that field names: a boxed slot.
+                let boxed = match binder_type.node() {
+                    ExprNode::BVar { idx } => usize::try_from(*idx)
+                        .ok()
+                        .and_then(|idx| idx.checked_add(1))
+                        .and_then(|distance| type_fields.len().checked_sub(distance))
+                        .and_then(|position| type_fields.get(position).copied())
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                let (field, type_field) = if boxed {
+                    if self
+                        .environment
+                        .contains(&super::name("_fln_runtime_boxed"))
+                    {
+                        return Err(unsupported("runtime boxed slot name collision"));
+                    }
+                    (boxed_slot_type(), false)
+                } else {
+                    // Any other field's representation may not depend on an
+                    // earlier field. Retain that boundary after substituting
+                    // type params.
+                    if binder_type.has_loose_bvars() {
+                        return Ok(None);
+                    }
+                    let field = self.normalize_type(binder_type)?;
+                    if self.type_parameter(&field)? {
+                        (proofs::erased_type(), true)
+                    } else {
+                        let (head, _) = self.spine(&field)?;
+                        if !matches!(
+                            head.node(),
+                            ExprNode::Const { .. } | ExprNode::ForallE { .. }
+                        ) {
+                            return Ok(None);
+                        }
+                        (field, false)
+                    }
+                };
                 reserve(&mut fields, self.limits.max_context_depth)?;
                 fields.push(field);
+                reserve(&mut type_fields, self.limits.max_context_depth)?;
+                type_fields.push(type_field);
                 type_ = body.clone();
             }
-            if fields.len() != ctor.num_fields as usize || self.normalize_type(&type_)? != source {
+            if type_.has_loose_bvars()
+                || fields.len() != ctor.num_fields as usize
+                || self.normalize_type(&type_)? != source
+            {
                 return Ok(None);
             }
             let constructor_name = if specialized {
@@ -203,6 +247,7 @@ impl Preparation<'_> {
                 name: constructor_name,
                 tag,
                 fields,
+                type_fields,
             });
         }
         let shape = Shape {
@@ -416,6 +461,7 @@ impl Preparation<'_> {
                     {
                         self.tick()?;
                         if scalar_type(field).is_none()
+                            && field != &boxed_slot_type()
                             && !shapes.iter().any(|shape| &shape.source == field)
                         {
                             reserve(&mut dependencies, self.limits.max_nodes)?;
@@ -460,6 +506,8 @@ impl Preparation<'_> {
                                 self.tick()?;
                                 let value = if shapes.iter().any(|member| field == &member.source) {
                                     ValueType::Constructor
+                                } else if field == &boxed_slot_type() {
+                                    ValueType::Abi
                                 } else if let Some((value, _)) =
                                     executable_value_type(field, &self.value_types)
                                 {
@@ -622,7 +670,10 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let parameters = ctor.num_params as usize;
-        if parameters == 0 && levels.is_empty() || args.len() < parameters {
+        // A nonparametric constructor keeps its own name. It is rewritten only
+        // to erase a type-valued field argument that is still present.
+        let specialized = parameters != 0 || !levels.is_empty();
+        if !specialized && args.is_empty() || args.len() < parameters {
             return Ok(None);
         }
         let Some(ConstantInfo::Induct(inductive)) = self.environment.find(&ctor.induct) else {
@@ -641,12 +692,23 @@ impl Preparation<'_> {
         let Some(binding) = shape.constructors.iter().find(|c| c.original == *name) else {
             return Ok(None);
         };
+        let mut rewritten = specialized;
         let mut value = Expr::const_(binding.name.clone(), vec![]);
-        for field in &args[parameters..] {
+        for (index, field) in args[parameters..].iter().enumerate() {
             self.tick()?;
-            value = Expr::app(value, field.clone());
+            // A type argument has no runtime value; its slot holds the same
+            // inert scalar as an erased proof and is never evaluated.
+            let field = if binding.type_fields.get(index).copied().unwrap_or(false)
+                && field != &proofs::erased_value()
+            {
+                rewritten = true;
+                proofs::erased_value()
+            } else {
+                field.clone()
+            };
+            value = Expr::app(value, field);
         }
-        Ok(Some(value))
+        Ok(rewritten.then_some(value))
     }
 
     /// A nonrecursive singleton eliminator becomes one let-bound major and
@@ -710,6 +772,13 @@ impl Preparation<'_> {
             body,
             false,
         )))
+    }
+
+    /// The class a closed root reads when its normalized declared type has a
+    /// scalar representation. Ingress uses it only to unbox an ABI root, such
+    /// as a field read from a boxed slot; any other root is unchanged.
+    pub(crate) fn root_result(&self, runtime_type: &Expr) -> Option<ValueType> {
+        scalar_type(runtime_type)
     }
 
     pub(super) fn constructor(&mut self, name: &Name) -> Result<(), IngressError> {
@@ -828,7 +897,7 @@ mod closure_fields_tests {
             .unwrap()
             .check_source_files(
                 &[b"inductive Good where | leaf | node (f : Nat -> Good)\n\
-                    structure Payload where\n  carrier : Type\n  value : carrier\n\
+                    structure Payload where\n  carrier : Type\n  display : carrier -> String\n\
                     inductive Bad where | mk (f : Nat -> Bad) (payload : Payload)\n\
                     inductive ProofChild where | leaf | node (f : Nat -> ProofChild) (h : 0 = 0)"],
                 &KVMap::new(),
@@ -847,7 +916,9 @@ mod closure_fields_tests {
         );
         // Proof payloads now have a valid representation. Keep a positive
         // counterexample alongside the refusal fixture; the latter must fail
-        // after anchoring Bad, when its value-dependent Payload is discovered.
+        // after anchoring Bad, when its Payload is discovered. A boxed field
+        // typed by a type field has a layout (fln-lvdh); a function field over
+        // that type does not, so Payload stays refused.
         let proof_child = Expr::const_(name("ProofChild"), vec![]);
         assert_eq!(
             prep.value_type(&proof_child).unwrap(),
@@ -905,5 +976,136 @@ mod closure_fields_tests {
             clean.finalize_callables(&mut []).unwrap()
         );
         assert_eq!(stopped.constructors, clean.constructors);
+    }
+}
+
+#[cfg(test)]
+mod type_field_tests {
+    use super::*;
+
+    const SOURCE: &str = "structure Package where\n  carrier : Type\n  value : carrier\nstructure Box where\n  carrier : Type\nstructure Mixed where\n  label : String\n  carrier : Type\n  value : carrier\n  count : Nat\n  ok : count = count\nstructure Plain where\n  count : Nat\nstructure Listed where\n  carrier : Type\n  items : List carrier\nstructure Shown where\n  carrier : Type\n  value : carrier\n  display : carrier -> String\ndef packed : Package := Package.mk Nat 7\ndef rebuild (p : Package) : Package := match p with\n  | Package.mk c v => Package.mk c v";
+
+    fn engine() -> Engine {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .check_source_files(
+                &[SOURCE.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine
+    }
+
+    fn family(name_: &str) -> Expr {
+        Expr::const_(name(name_), vec![])
+    }
+
+    fn fields<'p>(prep: &'p Preparation<'_>, constructor: &str) -> &'p [ValueType] {
+        &prep
+            .constructors
+            .iter()
+            .find(|binding| binding.name == name(constructor))
+            .expect("constructor binding")
+            .fields
+    }
+
+    #[test]
+    fn type_fields_take_inert_slots_and_their_values_take_boxed_slots() {
+        let engine = engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        for name_ in ["Package", "Box", "Mixed"] {
+            assert_eq!(
+                prep.value_type(&family(name_)).unwrap(),
+                Some(ValueType::Constructor),
+                "{name_}"
+            );
+        }
+        assert_eq!(
+            fields(&prep, "Package.mk"),
+            [ValueType::Bool, ValueType::Abi]
+        );
+        assert_eq!(fields(&prep, "Box.mk"), [ValueType::Bool]);
+        // label, carrier (erased type), value (boxed), count, ok (erased proof)
+        assert_eq!(
+            fields(&prep, "Mixed.mk"),
+            [
+                ValueType::String,
+                ValueType::Bool,
+                ValueType::Abi,
+                ValueType::Nat,
+                ValueType::Bool
+            ]
+        );
+        let shape = prep.record_shape(&family("Mixed")).unwrap().unwrap();
+        let ctor = &shape.constructors[0];
+        assert_eq!(ctor.type_fields, [false, true, false, false, false]);
+        assert_eq!(ctor.fields[1], proofs::erased_type());
+        assert_eq!(ctor.fields[2], boxed_slot_type());
+    }
+
+    #[test]
+    fn other_dependencies_on_a_type_field_remain_refusals() {
+        // Only a field typed by exactly a type field is a boxed slot. A type
+        // field used inside another field's type is refused, never given a
+        // made-up layout, and leaves nothing in the catalog.
+        let engine = engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        for name_ in ["Listed", "Shown"] {
+            assert_eq!(prep.value_type(&family(name_)).unwrap(), None, "{name_}");
+        }
+        assert!(prep.constructors.is_empty());
+    }
+
+    #[test]
+    fn construction_erases_only_type_arguments_and_only_once() {
+        let engine = engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let mk = family("Package.mk");
+        let rewritten = prep
+            .specialize_constructor(&mk, &[family("Nat"), nat::literal(7)])
+            .unwrap()
+            .expect("the type argument is erased");
+        assert_eq!(
+            rewritten,
+            Expr::app(
+                Expr::app(mk.clone(), proofs::erased_value()),
+                nat::literal(7)
+            )
+        );
+        // An erased application is final, so expression preparation cannot loop.
+        assert!(
+            prep.specialize_constructor(&mk, &[proofs::erased_value(), nat::literal(7)])
+                .unwrap()
+                .is_none()
+        );
+        // A nonparametric constructor without a type field keeps its own path.
+        assert!(
+            prep.specialize_constructor(&family("Plain.mk"), &[nat::literal(7)])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_projection_type_reduces_only_through_a_constructor() {
+        let engine = engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let carrier = |receiver: Expr| Expr::proj(name("Package"), 0, receiver);
+        assert_eq!(
+            prep.type_head(&carrier(family("packed"))).unwrap(),
+            family("Nat")
+        );
+        // A receiver stuck behind a match, or a bound variable, is returned
+        // exactly as written, receiver included.
+        let stuck = carrier(Expr::app(family("rebuild"), family("packed")));
+        assert_eq!(prep.type_head(&stuck).unwrap(), stuck);
+        let open = carrier(Expr::bvar(0).unwrap());
+        assert_eq!(prep.type_head(&open).unwrap(), open);
     }
 }

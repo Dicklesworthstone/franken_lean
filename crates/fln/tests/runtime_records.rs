@@ -103,10 +103,26 @@ fn distinct_record_layouts_do_not_alias_by_constructor_tag() {
         "42",
     );
 }
+/// A type-valued field is erased and a field typed by it is a boxed slot
+/// (fln-lvdh). The pinned Reference prints 42 for this program.
+#[test]
+fn type_valued_fields_are_erased_and_their_values_boxed() {
+    let engine = base("structure Package where\n  carrier : Type\n  value : carrier");
+    run(
+        &engine,
+        "def p : Package := { carrier := Nat, value := 42 }\n#eval p.value",
+        "42",
+    );
+}
 #[test]
 fn unsupported_value_dependent_fields_do_not_become_unchecked_objects() {
-    let engine = base("structure Package where\n  carrier : Type\n  value : carrier");
-    let source = "def p : Package := { carrier := Nat, value := 42 }";
+    // A function field over a type field has no layout (fln-lvdh boxes only
+    // a field typed by exactly the type field). The Reference accepts this
+    // program; FrankenLean refuses it rather than build an unchecked object.
+    let engine = base(
+        "structure Shown where\n  carrier : Type\n  value : carrier\n  measure : carrier -> Nat",
+    );
+    let source = "def s : Shown := { carrier := Nat, value := 41, measure := fun n => n + 1 }";
     let root = engine.logical_root(&KVMap::new());
     assert!(
         engine
