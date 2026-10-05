@@ -18,7 +18,10 @@ impl Context {
         self.constrain_type(actual, expected)
     }
 
-    fn has_coercion_class(&self, name: &str) -> Result<bool, NatDefinitionElabError> {
+    pub(in crate::source) fn has_coercion_class(
+        &self,
+        name: &str,
+    ) -> Result<bool, NatDefinitionElabError> {
         let name = Name::from_components([name]);
         if !self.txn.env.contains(&name) {
             return Ok(false);
@@ -244,7 +247,10 @@ impl Context {
 
     /// Called only inside a speculative coercion context. The root's search
     /// can solve its own prerequisites without requiring unrelated dictionaries.
-    fn coercion_instance(&mut self, target: Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+    pub(in crate::source) fn coercion_instance(
+        &mut self,
+        target: Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let registry =
             InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
                 .map_err(registry_error)?;
@@ -298,7 +304,7 @@ impl Context {
         }))
     }
 
-    fn coerce_value(
+    pub(in crate::source) fn coerce_value(
         &mut self,
         term: &Typed,
         expected: &Expr,

@@ -22,6 +22,75 @@ pub enum UniverseInstantiationError {
     LevelTooDeep(LevelTooDeep),
 }
 
+/// `(base, k)` with `level = succ^k base` and `base` not a successor.
+fn level_offset(level: &Level) -> (&Level, u32) {
+    let mut base = level;
+    let mut offset = 0u32;
+    while let LevelView::Succ(inner) = base.view() {
+        base = inner;
+        offset = offset.saturating_add(1);
+    }
+    (base, offset)
+}
+
+fn is_zero_level(level: &Level) -> bool {
+    matches!(level.view(), LevelView::Zero)
+}
+
+/// The pin's `is_not_zero` (kernel/level.cpp).
+fn is_never_zero(level: &Level) -> bool {
+    match level.view() {
+        LevelView::Succ(_) => true,
+        LevelView::Max(left, right) => is_never_zero(left) || is_never_zero(right),
+        LevelView::IMax(_, right) => is_never_zero(right),
+        LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => false,
+    }
+}
+
+/// The pin's `mk_max` (kernel/level.cpp:81): cheap simplifications only.
+fn pin_mk_max(l1: Level, l2: Level) -> Result<Level, UniverseInstantiationError> {
+    let (base1, k1) = level_offset(&l1);
+    let (base2, k2) = level_offset(&l2);
+    if is_zero_level(base1) && is_zero_level(base2) {
+        return Ok(if k1 >= k2 { l1 } else { l2 });
+    }
+    if l1 == l2 || is_zero_level(&l2) {
+        return Ok(l1);
+    }
+    if is_zero_level(&l1) {
+        return Ok(l2);
+    }
+    if let LevelView::Max(left, right) = l2.view()
+        && (left == &l1 || right == &l1)
+    {
+        return Ok(l2);
+    }
+    if let LevelView::Max(left, right) = l1.view()
+        && (left == &l2 || right == &l2)
+    {
+        return Ok(l1);
+    }
+    if base1 == base2 {
+        return Ok(if k1 > k2 { l1 } else { l2 });
+    }
+    Ok(Level::max(l1, l2)?)
+}
+
+/// The pin's `mk_imax` (kernel/level.cpp:112).
+fn pin_mk_imax(l1: Level, l2: Level) -> Result<Level, UniverseInstantiationError> {
+    if is_never_zero(&l2) {
+        return pin_mk_max(l1, l2);
+    }
+    let one = matches!(l1.view(), LevelView::Succ(inner) if is_zero_level(inner));
+    if is_zero_level(&l2) || is_zero_level(&l1) || one {
+        return Ok(l2);
+    }
+    if l1 == l2 {
+        return Ok(l1);
+    }
+    Ok(Level::imax(l1, l2)?)
+}
+
 impl std::fmt::Display for UniverseInstantiationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -169,8 +238,18 @@ impl UniverseStore {
                     }
                 }
                 LevelView::Succ(inner) => child(inner).succ()?,
-                LevelView::Max(left, right) => Level::max(child(left), child(right))?,
-                LevelView::IMax(left, right) => Level::imax(child(left), child(right))?,
+                // The pin's `instantiate_mvars` rebuilds a changed `max`/`imax`
+                // with `update_max` (kernel/level.cpp:293), which simplifies.
+                LevelView::Max(left, right) | LevelView::IMax(left, right) => {
+                    let (new_left, new_right) = (child(left), child(right));
+                    if &new_left == left && &new_right == right {
+                        current.clone()
+                    } else if matches!(current.view(), LevelView::Max(..)) {
+                        pin_mk_max(new_left, new_right)?
+                    } else {
+                        pin_mk_imax(new_left, new_right)?
+                    }
+                }
                 LevelView::Zero | LevelView::Param(_) => current.clone(),
             };
             done.insert(key, result);

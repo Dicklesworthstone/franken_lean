@@ -344,8 +344,22 @@ fn test_universe_store_instantiation() {
     universes.assign(u1.clone(), Level::zero());
     universes.assign(u2.clone(), Level::succ(Level::zero()).unwrap());
 
+    // The pin rebuilds a changed `max` with `update_max`, which calls `mk_max`
+    // (vendored kernel/level.cpp:293): two explicit levels give the deeper one.
     let compound_level = Level::max(Level::mvar(u1), Level::mvar(u2)).unwrap();
     let instantiated = universes.instantiate(&compound_level).unwrap();
-    let expected = Level::max(Level::zero(), Level::succ(Level::zero()).unwrap()).unwrap();
-    assert_eq!(instantiated, expected);
+    assert_eq!(instantiated, Level::succ(Level::zero()).unwrap());
+
+    // Two distinct parameters stay a `max`: simplification never merges them.
+    let u3 = LMVarId(Name::from_components(["u3"]));
+    let u4 = LMVarId(Name::from_components(["u4"]));
+    let a = Level::param(Name::from_components(["a"]));
+    let b = Level::param(Name::from_components(["b"]));
+    universes.assign(u3.clone(), a.clone());
+    universes.assign(u4.clone(), b.clone());
+    let open = Level::max(Level::mvar(u3), Level::mvar(u4)).unwrap();
+    assert_eq!(
+        universes.instantiate(&open).unwrap(),
+        Level::max(a, b).unwrap()
+    );
 }

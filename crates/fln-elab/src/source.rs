@@ -25,6 +25,7 @@ pub use level_syntax::LevelSyntaxError;
 pub mod inspect;
 mod matching;
 mod numeric;
+mod operators;
 mod patterns;
 mod record;
 mod record_terms;
@@ -62,6 +63,10 @@ pub enum SourceInferenceError {
     },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
+    /// An operator tree needs a coercion at a leaf. The pin inserts the
+    /// `expandCoe`-unfolded coercion; the native coercion search does not
+    /// produce that term, so this is refused rather than approximated.
+    OperatorCoercion,
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     SimpSet(scope::simp::SimpSetError),
@@ -113,6 +118,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceSynthesisRequired => write!(
                 f,
                 "native instance search could not resolve all instance arguments"
+            ),
+            Self::OperatorCoercion => write!(
+                f,
+                "operator elaboration needs a coercion to the tree's maximal type, and expanded coercion insertion is not implemented"
             ),
             Self::InvalidInstanceBinder => write!(
                 f,
@@ -920,6 +929,7 @@ impl Context {
             Argument(Typed, Expr, &'a [Syntax], Option<Expr>, bool),
             Apply(Typed, &'a [Syntax], Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
+            Operator(operators::OperatorTree<'a>, Option<Expr>),
             Arrow(Option<Expr>),
             BinderNext(binders::Telescope<'a>),
             BinderDomain(binders::Telescope<'a>),
@@ -1324,6 +1334,20 @@ impl Context {
                                         Some(self.type_expected()?),
                                         true,
                                     ));
+                                    continue;
+                                }
+                                // The pin's `binop%`/`binrel%`/`unop%`/`rightact%`
+                                // expression trees. A notation whose function is
+                                // absent keeps the seed bridge below.
+                                if let Some(notation) = operators::pin_notation(kind)
+                                    && self.pin_notation_available(notation)?
+                                {
+                                    let tree = self.operator_tree(syntax, notation)?;
+                                    let leaves = tree.leaves.clone();
+                                    tasks.push(Task::Operator(tree, expected));
+                                    for leaf in leaves.into_iter().rev() {
+                                        tasks.push(Task::Visit(leaf, None, true));
+                                    }
                                     continue;
                                 }
                                 if kind == &Name::str(Name::anonymous(), "term¬_") {
@@ -1874,6 +1898,18 @@ impl Context {
                                 expected,
                                 explicit,
                             ));
+                        }
+                        Task::Operator(tree, expected) => {
+                            let start = values
+                                .len()
+                                .checked_sub(tree.leaves.len())
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            let leaves = values.split_off(start);
+                            values.push(self.finish_operator_tree(
+                                tree,
+                                leaves,
+                                expected.as_ref(),
+                            )?);
                         }
                         Task::Infix(intrinsic, expected) => {
                             let right = values.pop().expect("infix right visit");

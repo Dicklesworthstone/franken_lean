@@ -675,7 +675,26 @@ impl Context {
                     value = value
                         .abstract_fvar(&binder.id, 0)
                         .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    value = Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info);
+                    // `tryResolve` closes the answer with `mkLambdaFVars xs
+                    // instVal (etaReduce := true)`: `fun x => f x` is `f`.
+                    let eta = match value.node() {
+                        ExprNode::App { f, a }
+                            if matches!(a.node(), ExprNode::BVar { idx: 0 })
+                                && !f.has_loose_bvar(0) =>
+                        {
+                            Some(
+                                f.subst_loose(0, &[Expr::sort(Level::zero())])
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                            )
+                        }
+                        _ => None,
+                    };
+                    value = match eta {
+                        Some(function) => function,
+                        None => {
+                            Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info)
+                        }
+                    };
                 }
                 if frames[index].replay_first {
                     frames[index].replay_first = false;
