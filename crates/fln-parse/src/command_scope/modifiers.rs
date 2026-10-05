@@ -40,29 +40,14 @@ pub(crate) fn is_modifier(word: &str) -> bool {
     SLOTS.iter().any(|slot| slot.contains(&word))
 }
 
-/// The keyword text of `token`, when it is one of the modifier keywords. `partial` is lexed
-/// as an identifier in declaration bodies (`reference_tokens::SEED_IDENTIFIER_ALLOWANCE`), so
-/// an identifier spelling exactly a keyword counts here too; an escaped `«partial»` does not,
-/// because its source span is not the bare word.
-fn keyword<'t>(view: &SourceView, token: &'t LexedToken) -> Option<&'t str> {
-    let text = match &token.kind {
-        TokenKind::Symbol(symbol) => symbol.as_str(),
-        TokenKind::Ident(name) => {
-            let spelled = view.normalized().span_str(token.extent)?;
-            let display = name.to_display_string();
-            if spelled != display {
-                return None;
-            }
-            // Borrow the keyword from the static table so the result outlives `name`.
-            return SLOTS
-                .iter()
-                .flat_map(|slot| slot.iter())
-                .find(|word| **word == spelled)
-                .copied();
-        }
-        TokenKind::Literal(_) => return None,
-    };
-    is_modifier(text).then_some(text)
+/// The keyword text of `token`, when it is one of the modifier keywords. Every modifier is a
+/// keyword at the pin, so it is always a symbol; an escaped `«partial»` is an identifier and
+/// never a modifier.
+fn keyword(token: &LexedToken) -> Option<&str> {
+    match &token.kind {
+        TokenKind::Symbol(symbol) if is_modifier(symbol) => Some(symbol.as_str()),
+        _ => None,
+    }
 }
 
 /// The modifier tokens found after the attributes: for each slot, the token index of its
@@ -95,24 +80,15 @@ impl Modifiers {
             let Some(at) = slot else {
                 continue;
             };
-            let word = tokens
-                .get(at)
-                .and_then(|token| keyword(view, token))
-                .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+            let word = tokens.get(at).and_then(keyword).ok_or(
+                NatDefinitionParseError::OutsideSeedGrammar {
                     at: original_position(view, tokens, at),
                     expected: NatDefinitionExpectation::DefinitionKeyword,
-                })?;
-            let atom = match leaves.leaf(at)? {
-                // `partial` arrives as an identifier leaf; the pin's node holds an atom.
-                Syntax::Ident { info, .. } => Syntax::Atom {
-                    info,
-                    val: word.into(),
                 },
-                atom => atom,
-            };
+            )?;
             *part = null_node(vec![Syntax::node(
                 parser_kind(&["Command", word]),
-                vec![atom],
+                vec![leaves.leaf(at)?],
             )]);
         }
         Ok(())
@@ -120,18 +96,18 @@ impl Modifiers {
 }
 
 /// Whether `token` is a modifier keyword, so the command it starts is a declaration.
-pub(crate) fn leads(view: &SourceView, token: &LexedToken) -> bool {
-    keyword(view, token).is_some()
+pub(crate) fn leads(token: &LexedToken) -> bool {
+    keyword(token).is_some()
 }
 
 /// Scan the modifier keywords starting at token `start` (just after any attributes). Slots
 /// are taken in order and each at most once; scanning stops at the first token that does not
 /// fill the next possible slot.
-pub(crate) fn scan(view: &SourceView, tokens: &[LexedToken], start: usize) -> Modifiers {
+pub(crate) fn scan(tokens: &[LexedToken], start: usize) -> Modifiers {
     let mut slots = [None; 5];
     let mut at = start;
     let mut next_slot = 0;
-    while let Some(word) = tokens.get(at).and_then(|token| keyword(view, token)) {
+    while let Some(word) = tokens.get(at).and_then(keyword) {
         let Some(offset) = SLOTS[next_slot..]
             .iter()
             .position(|slot| slot.contains(&word))

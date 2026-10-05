@@ -522,7 +522,7 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 /// The production lexer's table for declaration bodies: the pin's table for an ordinary file
 /// (implicit `import Init`), derived from `contracts/REFERENCE_GRAMMAR_CENSUS.txt` by
-/// [`reference_tokens`], minus its declared six-keyword remainder. It replaced a hand-written
+/// [`reference_tokens`], with every keyword reserved. It replaced a hand-written
 /// list of about 80 tokens that refused `⟨`, `≤`, `×`, `>` and `$`, carried `|-`, which is no
 /// token at the pin, and let builtin keywords such as `at`, `do` and `from` lex as identifiers
 /// (beads `fln-vokf`, `fln-notation-from-imports-0edr`).
@@ -2026,7 +2026,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                 })
             }
             // `private`, `protected`, `noncomputable`, … lead a declaration (`declModifiers`).
-            _ if command_scope::modifiers::leads(&view, token) => source_declaration(source),
+            _ if command_scope::modifiers::leads(token) => source_declaration(source),
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
                 Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: view.to_original(token.extent.start()),
@@ -2201,7 +2201,7 @@ fn declaration_prefix(
     let attributes_end = command_scope::attributes::inline_end(view, tokens)?;
     Ok((
         attributes_end,
-        command_scope::modifiers::scan(view, tokens, attributes_end).end(),
+        command_scope::modifiers::scan(tokens, attributes_end).end(),
     ))
 }
 
@@ -2221,7 +2221,7 @@ fn declaration_modifiers(
         parts[1] = command_scope::attributes::inline_syntax(leaves, tokens, attributes_end)?;
     }
     if declaration_start != attributes_end {
-        command_scope::modifiers::scan(view, tokens, attributes_end).fill(
+        command_scope::modifiers::scan(tokens, attributes_end).fill(
             view,
             leaves,
             tokens,

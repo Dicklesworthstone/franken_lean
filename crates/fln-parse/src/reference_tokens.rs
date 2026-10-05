@@ -42,13 +42,14 @@
 //! census covers, and refuses one it does not; threading it into the body parsers is the step
 //! that retires the first gap.
 //!
-//! ## The declared remainder: keywords still lexed as identifiers
+//! ## No keyword is lexed as an identifier
 //!
-//! Declaration bodies are lexed against [`production_table`], which is
-//! [`implicit_init_table`] minus [`SEED_IDENTIFIER_ALLOWANCE`]. Every other keyword at the pin is
-//! reserved, as in the Reference (bead `franken_lean-z8j.1.6.2`). Every allowed word is a known
-//! Reference divergence: FrankenLean accepts programs that use it as a name, and the pinned
-//! Reference rejects them. See the constant for why it exists and how it shrinks.
+//! Declaration bodies and scope commands lex against the same table, [`implicit_init_table`],
+//! so every keyword at the pin is reserved, as in the Reference (bead
+//! `franken_lean-z8j.1.6.2`). A seed-dialect allowance once kept twelve keywords lexed as names
+//! for frozen examples and tests; their users were renamed and the allowance is gone.
+//! `the_production_table_is_exactly_the_census_table_for_an_ordinary_file` fails if any word
+//! is ever taken out of the table again.
 
 use fln_core::name::Name;
 use fln_syntax::token::TokenTable;
@@ -60,52 +61,6 @@ use std::sync::OnceLock;
 pub const GRAMMAR_CENSUS: &str = include_str!("../../../contracts/REFERENCE_GRAMMAR_CENSUS.txt");
 
 const SCHEMA: &str = "fln-reference-grammar-census/1";
-
-/// One source that still uses an allowed keyword as a name: a repository-relative file and
-/// the exact text in it that does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AllowanceWitness {
-    pub file: &'static str,
-    pub snippet: &'static str,
-}
-
-const fn witness(file: &'static str, snippet: &'static str) -> AllowanceWitness {
-    AllowanceWitness { file, snippet }
-}
-
-/// A declared one-way allowance preserving frozen seed-dialect behavior. It is NOT Lean
-/// compatibility.
-///
-/// Every word here is a keyword at the pin, and every one is a known Reference divergence:
-/// FrankenLean accepts programs that use it as a name, which the pinned Reference rejects
-/// (`expected identifier`). The words are lexed as identifiers only so that the frozen
-/// seed-dialect examples and the existing tests listed with each word keep their present
-/// verdicts until their owners rename the names (the examples' ledger rows are `fln-defect`).
-/// This is global lexer behavior: no declaration body reserves these words, whichever file is
-/// being lexed, because the lexer cannot tell a seed-dialect file from a Lean file. The
-/// witnesses are a documentation and ratchet binding only. `tests/reference_grammar_census.rs`
-/// pins the set by equality and requires every witness to still occur, so when a listed use is
-/// renamed its witness must go, and when a word's last witness goes the word must go: the set
-/// only shrinks.
-pub const SEED_IDENTIFIER_ALLOWANCE: &[(&str, &[AllowanceWitness])] = &[
-    // Each remaining user is the keyword test in `command_scope.rs`, which asserts that these two
-    // words still lex as names inside a declaration. Every test program and example that used a
-    // listed word as an incidental name was renamed (fln-ffce); the other ten words left with them.
-    (
-        "end",
-        &[witness(
-            "crates/fln-parse/src/command_scope.rs",
-            "def choose (end : Nat) : Nat :=",
-        )],
-    ),
-    (
-        "universe",
-        &[witness(
-            "crates/fln-parse/src/command_scope.rs",
-            "«open» universe : Nat",
-        )],
-    ),
-];
 
 /// A floor on the builtin table. The pin has 238; a census that parses but yields far fewer was
 /// truncated or mis-generated, and an empty table would make every symbol a lexical refusal.
@@ -433,24 +388,19 @@ fn implicit_init_tokens() -> BTreeSet<String> {
     }
 }
 
-/// The table of an ordinary file — no `prelude`, so exactly the implicit `import Init`. The
-/// scope-command layer lexes against it. See the module docs for what this is not.
+/// The table of an ordinary file — no `prelude`, so exactly the implicit `import Init`.
+/// Production lexes every body and scope command against it. See the module docs for what
+/// this is not.
 pub fn implicit_init_table() -> &'static TokenTable {
     static TABLE: OnceLock<TokenTable> = OnceLock::new();
     TABLE.get_or_init(|| TokenTable::from_tokens(implicit_init_tokens()))
 }
 
-/// The table declaration bodies are lexed against: [`implicit_init_table`] minus the declared
-/// [`SEED_IDENTIFIER_ALLOWANCE`].
+/// The table declaration bodies are lexed against: exactly [`implicit_init_table`], with every
+/// keyword reserved. A name of its own so `tests/reference_grammar_census.rs` holds the
+/// production lexer itself to the census.
 pub fn production_table() -> &'static TokenTable {
-    static TABLE: OnceLock<TokenTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut tokens = implicit_init_tokens();
-        for (word, _) in SEED_IDENTIFIER_ALLOWANCE {
-            tokens.remove(*word);
-        }
-        TokenTable::from_tokens(tokens)
-    })
+    implicit_init_table()
 }
 
 /// The module-header table: builtin tokens plus the header parser's own.

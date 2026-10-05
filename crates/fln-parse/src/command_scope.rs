@@ -32,11 +32,10 @@ pub enum ScopeCommand {
     Trivia,
 }
 
-/// The scope layer's table: the full implicit-Init table. Every scope keyword this layer
-/// recognises (`namespace`, `end`, `open`, `universe`, `scoped`, `omit`, …) is a token at the
-/// pin, so nothing is added by hand; `prelude` is header-only and lives in `imports`' header
-/// table. Declaration bodies use the production table, which still lexes the declared
-/// remainder (`reference_tokens::SEED_IDENTIFIER_ALLOWANCE`) as identifiers.
+/// The scope layer's table: the full implicit-Init table, the same one declaration bodies use.
+/// Every scope keyword this layer recognises (`namespace`, `end`, `open`, `universe`, `scoped`,
+/// `omit`, …) is a token at the pin, so nothing is added by hand; `prelude` is header-only and
+/// lives in `imports`' header table.
 fn table() -> &'static TokenTable {
     crate::reference_tokens::implicit_init_table()
 }
@@ -403,21 +402,52 @@ mod tests {
     }
     #[test]
     fn scope_words_inside_branch_binders_and_indented_terms_stay_in_the_declaration() {
-        for source in [
-            "def choose (x : Bool) : Nat := by\n  cases x with\n  | false => exact 0\n  | true => let end := 7; exact end",
-            "def choose (x : Nat) : Nat := match x with | Nat.zero => 0 | Nat.succ end => end",
-            "def choose (end : Nat) : Nat :=\n  end",
-            "def choose (namespace section open universe : Nat) : Nat := open",
-            "def choose («namespace» «section» «open» universe : Nat) : Nat := «open»",
+        // Each bare scope word is a keyword, so the pinned Reference refuses the declaration;
+        // escaped, each is an ordinary name and the Reference accepts it. Captured with the pin
+        // (v4.32.0, 2026-10-05) on `namespace Example\n<declaration>\nend Example`:
+        //   1. `let end := 7` -> 5:16 unexpected token 'end'; expected '(', ':=', '|' or term
+        //   2. `Nat.succ end =>` -> 2:69 unexpected token 'end'; expected '=>'
+        //   3. `(end : Nat)` -> 2:12 unexpected token 'end'; expected '_' or identifier
+        //   4. `(namespace …` -> 2:12 unexpected token 'namespace'; expected '_' or identifier
+        //   5. `«open» universe :` -> 2:40 unexpected token 'universe'; expected ')'
+        //   6-9. the same with every word escaped: accepted.
+        // Wherever the declaration is refused, the scope words inside it still never split it.
+        for (source, accepted) in [
+            (
+                "def choose (x : Bool) : Nat := by\n  cases x with\n  | false => exact 0\n  | true => let end := 7; exact end",
+                false,
+            ),
+            (
+                "def choose (x : Nat) : Nat := match x with | Nat.zero => 0 | Nat.succ end => end",
+                false,
+            ),
+            ("def choose (end : Nat) : Nat :=\n  end", false),
+            (
+                "def choose (namespace section open universe : Nat) : Nat := open",
+                false,
+            ),
+            (
+                "def choose («namespace» «section» «open» universe : Nat) : Nat := «open»",
+                false,
+            ),
+            (
+                "def choose (x : Bool) : Nat := by\n  cases x with\n  | false => exact 0\n  | true => let «end» := 7; exact «end»",
+                true,
+            ),
+            (
+                "def choose (x : Nat) : Nat := match x with | Nat.zero => 0 | Nat.succ «end» => «end»",
+                true,
+            ),
+            ("def choose («end» : Nat) : Nat :=\n  «end»", true),
+            (
+                "def choose («namespace» «section» «open» «universe» : Nat) : Nat := «open»",
+                true,
+            ),
         ] {
             let file = format!("namespace Example\n{source}\nend Example");
             let commands = partition(file.as_bytes()).unwrap();
             assert_eq!(commands.len(), 3, "{file}");
-            // `namespace`, `section` and `open` are keywords at the pin and the Reference refuses
-            // them as binder names; `end` and `universe` are still lexed as identifiers in
-            // declarations (reference_tokens::SEED_IDENTIFIER_ALLOWANCE).
-            let reserved = source.contains("(namespace");
-            assert_eq!(parse_definition(commands[1].1).is_ok(), !reserved, "{file}");
+            assert_eq!(parse_definition(commands[1].1).is_ok(), accepted, "{file}");
             assert_eq!(
                 parse(commands[2].1).unwrap(),
                 Some(ScopeCommand::End(Some(Name::from_components(["Example"]))))

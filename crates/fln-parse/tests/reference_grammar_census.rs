@@ -19,8 +19,8 @@
 
 use fln_core::name::Name;
 use fln_parse::reference_tokens::{
-    CensusError, GRAMMAR_CENSUS, SEED_IDENTIFIER_ALLOWANCE, TokenCensus, UnknownModule,
-    header_table, implicit_init_table, production_table, reference_census,
+    CensusError, GRAMMAR_CENSUS, TokenCensus, UnknownModule, header_table, implicit_init_table,
+    production_table, reference_census,
 };
 use fln_parse::{NatDefinitionParseError, parse_definition, parse_source_command};
 use fln_syntax::source::{BytePos, SourceText};
@@ -69,28 +69,19 @@ fn the_production_table_is_exactly_the_census_table_for_an_ordinary_file() {
         scope, derived,
         "the scope table must be the census table, with nothing added by hand"
     );
-    // Declaration bodies: the same table minus exactly the declared remainder, nothing else.
+    // Declaration bodies: exactly the same table. No keyword is lexed as a name; a word taken
+    // out of the table (the retired seed allowance did that for twelve) fails here.
     let production: BTreeSet<String> = production_table()
         .tokens()
         .into_iter()
         .map(str::to_string)
         .collect();
-    let mut expected = derived.clone();
-    for (word, _) in SEED_IDENTIFIER_ALLOWANCE {
-        assert!(
-            expected.remove(*word),
-            "allowance member {word} is not a token at the pin"
-        );
-    }
-    assert_eq!(production, expected);
+    assert_eq!(
+        production, derived,
+        "production lexes against the census table"
+    );
     for token in census.builtin_tokens() {
-        assert!(
-            production.contains(token)
-                || SEED_IDENTIFIER_ALLOWANCE
-                    .iter()
-                    .any(|(word, _)| word == &token),
-            "builtin token {token} missing"
-        );
+        assert!(production.contains(token), "builtin token {token} missing");
     }
     // The measured symptoms (2026-10-04): builtin and Init tokens the hand table refused.
     for token in [
@@ -357,24 +348,15 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
             + source[column..]
                 .find(token)
                 .expect("token after the column");
-        let allowed = SEED_IDENTIFIER_ALLOWANCE
-            .iter()
-            .any(|(word, _)| word == &token);
         match parse_definition(source.as_bytes()) {
-            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if !allowed => {
+            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) => {
                 assert_eq!(
                     refused,
                     BytePos(at),
                     "{source}: refused at the Reference's token"
                 );
             }
-            // A declared divergence: the word is in the seed allowance, so FrankenLean accepts
-            // what the pin refuses. The row starts requiring agreement when the word leaves.
-            Ok(_) if allowed => {}
-            other => panic!(
-                "{source}: the Reference refuses ({reference}); allowance member: {allowed}; \
-                 got {other:?}"
-            ),
+            other => panic!("{source}: the Reference refuses ({reference}), got {other:?}"),
         }
         // Escaped, the same word is an identifier and the Reference accepts the program.
         let escaped = source.replace(token, &format!("«{token}»"));
@@ -385,63 +367,39 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
     }
 }
 
-/// The declared remainder is exactly this set, and every member still has a user.
+/// No keyword is lexed as a name: every alphabetic token of the census table is a keyword in
+/// production, and its escaped spelling is an identifier. This is what the retired seed
+/// allowance broke for twelve words; re-adding any word anywhere fails here.
 #[test]
-fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
-    // Set equality: growing the allowance means editing this list too, in review. A member whose
-    // listed uses have all been renamed fails below until it is removed here and from the
-    // constant, so the set only shrinks.
-    const PERMITTED: [&str; 2] = ["end", "universe"];
-    let members: Vec<&str> = SEED_IDENTIFIER_ALLOWANCE
-        .iter()
-        .map(|(word, _)| *word)
-        .collect();
-    let unique: BTreeSet<&str> = members.iter().copied().collect();
-    assert_eq!(unique.len(), members.len(), "no duplicate members");
-    assert_eq!(
-        unique,
-        PERMITTED.into_iter().collect::<BTreeSet<_>>(),
-        "the allowance is exactly the declared set"
-    );
-    let root = fln_core::checked_manifest_dir!().join("../..");
-    let scope = implicit_init_table();
-    for (word, witnesses) in SEED_IDENTIFIER_ALLOWANCE {
-        // A member that stopped being a keyword at the pin is stale.
-        assert!(
-            matches!(lex_one(scope, word), Ok(TokenKind::Symbol(symbol)) if symbol == *word),
-            "{word} is no longer a token at the pin"
-        );
-        // Production still reads it as an identifier.
-        assert!(matches!(
-            lex_one(production_table(), word),
-            Ok(TokenKind::Ident(_))
-        ));
-        assert!(
-            !witnesses.is_empty(),
-            "`{word}` has no remaining user: remove it"
-        );
-        for witness in *witnesses {
-            // The witness spells the word as a whole word, not as part of another name.
-            let spelled = witness.snippet.match_indices(word).any(|(at, _)| {
-                let before = witness.snippet[..at].chars().next_back();
-                let after = witness.snippet[at + word.len()..].chars().next();
-                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '«')
-                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '»')
-            });
-            assert!(
-                spelled,
-                "the witness for `{word}` does not use it: {witness:?}"
-            );
-            let text = std::fs::read_to_string(root.join(witness.file))
-                .unwrap_or_else(|error| panic!("{}: {error}", witness.file));
-            assert!(
-                text.contains(witness.snippet),
-                "{} no longer contains {:?}: drop this witness, and drop `{word}` if it was the last",
-                witness.file,
-                witness.snippet
-            );
+fn every_keyword_is_reserved_in_production() {
+    // Every keyword of the census table, lexed by the production lexer: a word dropped from
+    // production's table would lex as an identifier here.
+    let production = production_table();
+    let mut words = 0;
+    for token in implicit_init_table().tokens() {
+        if !token.chars().next().is_some_and(char::is_alphabetic)
+            || !token.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
         }
+        words += 1;
+        assert!(
+            matches!(lex_one(production, token), Ok(TokenKind::Symbol(symbol)) if symbol == token),
+            "`{token}` must lex as a keyword"
+        );
+        assert!(
+            matches!(
+                lex_one(production, &format!("«{token}»")),
+                Ok(TokenKind::Ident(_))
+            ),
+            "`«{token}»` must lex as an identifier"
+        );
     }
+    // Not vacuous: the pin's Init table has well over a hundred alphabetic keywords.
+    assert!(
+        words > 100,
+        "only {words} alphabetic keywords: a broken table"
+    );
 }
 
 /// Totality of the kind-use census, against the grammar census.
