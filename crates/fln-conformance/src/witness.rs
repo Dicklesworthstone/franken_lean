@@ -1045,13 +1045,17 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 25] = [
             count: 1,
         },
     ),
-    // This row's evidence says the matrix governs twenty-four rows, so the citation tracks the
-    // row count — but it must live in a DIFFERENT file than the needle describes. Citing
-    // `witness.rs` for a literal inside `witness.rs` counts the citation itself: the first
-    // attempt used `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the
-    // declaration and once as its own needle. The mechanism caught that on its first run,
-    // which is a small proof it discriminates. The suite's expectation moves whenever the
-    // matrix does, so anchoring there tracks the same fact without self-reference.
+    // This citation pins the suite's ACKNOWLEDGED-row expectation, not the row count this
+    // row's evidence states. It moves when an Acknowledged row is added, removed or promoted,
+    // and NOT when an Enforced or Supported row is added: the six franken_lean-z8j.1.19 rows
+    // took the matrix from eighteen rows to twenty-four and left this needle at 14. So a stale
+    // row count in the evidence prose does not fire it; only the acknowledged population does.
+    // (Corrected 2026-10-05: this comment said the citation tracks the row count.)
+    // It lives in a DIFFERENT file than the needle describes. Citing `witness.rs` for a literal
+    // inside `witness.rs` counts the citation itself: the first attempt used
+    // `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the declaration and
+    // once as its own needle. The mechanism caught that on its first run, which is a small
+    // proof it discriminates.
     (
         "B8-DOCS-CI-ENFORCES-WORDING",
         Citation::OccursExactly {
