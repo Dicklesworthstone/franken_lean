@@ -15,6 +15,17 @@
 //! An **improvement** is reported and never fails: a module the receipt did not accept that
 //! the fresh run accepts, or a module the fresh run has that the receipt does not.
 //!
+//! A **non-acceptance that changed shape** — a module not accepted on either side whose
+//! verdict or `blockedBy` differs — is reported for a human and never fails: it moves no
+//! coverage ([`CoverageComparison::changed`]).
+//!
+//! **Only format-independent fields are read.** A row's coverage is its module, verdict,
+//! declaration count and `blockedBy`. Declaration digests, logical roots and any other
+//! field whose value depends on a hashing or encoding format (for example a new
+//! `decl-content-dag/1` digest tag) are ignored on both sides, and `detail` text — which can
+//! quote such values — is reported but never compared. So a run of a later binary with new
+//! digests and identical verdicts passes against a receipt bound to an older binary.
+//!
 //! Timings (`elapsedMs`) are measurements, never compared. Before either document is
 //! compared it must be **self-consistent** — its summary counts are recomputed from its
 //! rows and must agree, module names are unique, and the schema is the frontier schema —
@@ -43,6 +54,8 @@ pub struct FrontierRow {
     pub verdict: String,
     pub declarations: u64,
     pub detail: String,
+    /// The import a `blocked` module waits on; `None` for every other verdict.
+    pub blocked_by: Option<String>,
 }
 
 /// A parsed, self-consistent frontier document.
@@ -92,6 +105,10 @@ pub struct CoverageComparison {
     pub newly_accepted: Vec<(String, String)>,
     /// Modules the fresh run has that the receipt does not: (module, verdict).
     pub added: Vec<(String, String)>,
+    /// Modules not accepted on either side whose verdict or `blockedBy` differs:
+    /// (module, (receipt verdict, receipt blockedBy), (now verdict, now blockedBy)).
+    #[allow(clippy::type_complexity)]
+    pub changed: Vec<(String, (String, Option<String>), (String, Option<String>))>,
     pub receipt_accepted: usize,
     pub current_accepted: usize,
     pub receipt_modules: usize,
@@ -142,6 +159,17 @@ impl CoverageComparison {
         }
         for (module, verdict) in &self.added {
             out.push_str(&format!("IMPROVEMENT added module: {module} ({verdict})\n"));
+        }
+        let shown = |(verdict, by): &(String, Option<String>)| match by {
+            Some(by) => format!("{verdict} by {by}"),
+            None => verdict.clone(),
+        };
+        for (module, before, now) in &self.changed {
+            out.push_str(&format!(
+                "CHANGED non-acceptance (no coverage moved): {module} {} -> {}\n",
+                shown(before),
+                shown(now)
+            ));
         }
         out.push_str(if self.dropped() {
             "verdict: COVERAGE DROPPED\n"
@@ -194,6 +222,13 @@ pub fn compare(receipt: &Frontier, current: &Frontier) -> CoverageComparison {
             (false, true) => comparison
                 .newly_accepted
                 .push((old.module.clone(), old.verdict.clone())),
+            (false, false) if old.verdict != new.verdict || old.blocked_by != new.blocked_by => {
+                comparison.changed.push((
+                    old.module.clone(),
+                    (old.verdict.clone(), old.blocked_by.clone()),
+                    (new.verdict.clone(), new.blocked_by.clone()),
+                ));
+            }
             _ => {}
         }
     }
@@ -275,6 +310,15 @@ pub fn parse(text: &str) -> Result<Frontier, FrontierError> {
             verdict,
             declarations: count,
             detail: string(row, "detail")?.to_owned(),
+            blocked_by: match field(row, "blockedBy")? {
+                Value::Null => None,
+                Value::String(module) => Some(module.clone()),
+                _ => {
+                    return Err(FrontierError::Shape(format!(
+                        "row {index} has a blockedBy that is neither null nor a string"
+                    )));
+                }
+            },
         });
     }
     let summary = [
@@ -336,11 +380,12 @@ impl Frontier {
             .iter()
             .map(|row| {
                 format!(
-                    "{{\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":0,\"detail\":{},\"detailTruncated\":false,\"blockedBy\":null}}",
+                    "{{\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":0,\"detail\":{},\"detailTruncated\":false,\"blockedBy\":{}}}",
                     quote(&row.module),
                     quote(&row.verdict),
                     row.declarations,
-                    quote(&row.detail)
+                    quote(&row.detail),
+                    row.blocked_by.as_deref().map_or_else(|| "null".to_owned(), quote)
                 )
             })
             .collect::<Vec<_>>()

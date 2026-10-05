@@ -136,6 +136,7 @@ fn additions_and_new_acceptances_are_improvements_not_drops() {
     let row = planted_row(&mut older);
     row.verdict = "blocked".to_owned();
     row.declarations = 0;
+    row.blocked_by = Some("Init.Data.List.Lemmas".to_owned());
     let older = parse(&older.to_json()).expect("the variant is a self-consistent frontier");
     // Today's run also has a module the receipt never saw.
     let mut current = full.clone();
@@ -144,6 +145,7 @@ fn additions_and_new_acceptances_are_improvements_not_drops() {
         verdict: "accepted".to_owned(),
         declarations: 3,
         detail: String::new(),
+        blocked_by: None,
     });
     let current = parse(&current.to_json()).expect("the variant is a self-consistent frontier");
 
@@ -211,6 +213,105 @@ fn a_document_that_disagrees_with_itself_is_refused_not_compared() {
     ));
 }
 
+/// A later binary may hash declarations differently (a new digest tag such as
+/// `decl-content-dag/1` changes every digest and logical root). The receipt stays bound to its
+/// own binary, so the ratchet reads only format-independent fields: this rewrites the receipt
+/// as such a run would report it, with new digest fields on the document and every row and
+/// a detail string quoting a root, and keeps every verdict and count.
+fn in_a_new_digest_format(frontier: &fln_conformance::stdlib_frontier::Frontier) -> String {
+    const ROOT: &str = "9f3c0d1e2a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9012a3b4c5d6";
+    let text = frontier.to_json();
+    let rows = format!(
+        "\"elapsedMs\":0,\"digestFormat\":\"decl-content-dag/1\",\"logicalRoot\":\"{ROOT}\",\"declarationDigest\":\"{ROOT}\","
+    );
+    let rewritten = text
+        .replace("\"elapsedMs\":0,", &rows)
+        .replacen(
+            "\"schema\":\"fln.check-olean-frontier/1\",",
+            &format!(
+                "\"schema\":\"fln.check-olean-frontier/1\",\"digestFormat\":\"decl-content-dag/1\",\"logicalRoot\":\"{ROOT}\","
+            ),
+            1,
+        )
+        .replacen(
+            "\"detail\":\"\"",
+            &format!("\"detail\":\"root {ROOT} under decl-content-dag/1\""),
+            1,
+        );
+    assert_ne!(rewritten, text, "the format plant must change the document");
+    rewritten
+}
+
+#[test]
+fn a_new_digest_format_with_identical_verdicts_passes() {
+    let receipt = receipt();
+    let current = parse(&in_a_new_digest_format(&receipt))
+        .expect("a new-format frontier is still a frontier document");
+    let comparison = compare(&receipt, &current);
+    assert!(!comparison.dropped(), "{}", comparison.render());
+    assert!(!comparison.improved(), "{}", comparison.render());
+    assert!(comparison.changed.is_empty(), "{}", comparison.render());
+}
+
+#[test]
+fn a_new_digest_format_with_a_regressed_verdict_fails() {
+    let receipt = receipt();
+    let mut regressed = receipt.clone();
+    let row = planted_row(&mut regressed);
+    row.verdict = "failed".to_owned();
+    row.declarations = 0;
+    row.detail = "planted refusal".to_owned();
+    let current = parse(&in_a_new_digest_format(&regressed))
+        .expect("a new-format frontier is still a frontier document");
+    let comparison = compare(&receipt, &current);
+    assert!(comparison.dropped(), "{}", comparison.render());
+    assert_eq!(
+        comparison.no_longer_accepted,
+        [(
+            PLANT.to_owned(),
+            "failed".to_owned(),
+            "planted refusal".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_changed_non_acceptance_is_reported_and_moves_no_coverage() {
+    let full = receipt();
+    let blocked = |by: &str| {
+        let mut frontier = full.clone();
+        let row = planted_row(&mut frontier);
+        row.verdict = "blocked".to_owned();
+        row.declarations = 0;
+        row.blocked_by = Some(by.to_owned());
+        parse(&frontier.to_json()).expect("the variant is a self-consistent frontier")
+    };
+    let comparison = compare(&blocked("Init.Data.List.Lemmas"), &blocked("Init.Core"));
+    assert!(
+        !comparison.dropped() && !comparison.improved(),
+        "{}",
+        comparison.render()
+    );
+    assert_eq!(
+        comparison.changed,
+        [(
+            PLANT.to_owned(),
+            (
+                "blocked".to_owned(),
+                Some("Init.Data.List.Lemmas".to_owned())
+            ),
+            ("blocked".to_owned(), Some("Init.Core".to_owned()))
+        )]
+    );
+    assert!(
+        comparison
+            .render()
+            .contains("CHANGED non-acceptance (no coverage moved)"),
+        "{}",
+        comparison.render()
+    );
+}
+
 /// The installed command: exit 0 on the receipt itself, 1 naming a planted drop, 2 on a
 /// document it cannot compare. The current frontier arrives on stdin, as from a pipe.
 #[test]
@@ -252,6 +353,23 @@ fn the_ratchet_command_exits_by_coverage() {
         "{stdout}"
     );
     assert!(stdout.ends_with("verdict: COVERAGE DROPPED\n"), "{stdout}");
+
+    let (code, stdout, stderr) = run(in_a_new_digest_format(&receipt()));
+    assert_eq!(
+        code,
+        Some(0),
+        "a new digest format alone is not a drop: {stdout}{stderr}"
+    );
+
+    let mut regressed = receipt();
+    planted_row(&mut regressed).verdict = "inconclusive".to_owned();
+    planted_row(&mut regressed).declarations = 0;
+    let (code, stdout, stderr) = run(in_a_new_digest_format(&regressed));
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!("DROP no longer accepted: {PLANT}")),
+        "{stdout}"
+    );
 
     let (code, stdout, stderr) = run("{\"schema\":".to_owned());
     assert_eq!(code, Some(2), "{stdout}{stderr}");
