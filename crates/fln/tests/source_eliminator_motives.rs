@@ -102,6 +102,26 @@ fn the_motive_abstracts_majors_and_follows_under_and_over_application() {
     ));
 }
 
+/// `tryPostponeIfNoneOrMVar` also postpones on an expected type headed by a
+/// metavariable, not only on a missing one. `binrel%` elaborates `pick … h`
+/// without an expected type, so `pick`'s `p` is still `?p` when its first
+/// argument, the eliminator, is reached; only the later argument `h` fixes `p`
+/// to `c = c`. The motive must then be `fun x => x = x`. Computed at once from
+/// `?p`, it would be the constant `fun _ => ?p`, which the two minor premises
+/// cannot both fit. The pin accepts the first program and refuses the second
+/// (a type mismatch in the `cons` minor premise).
+#[test]
+fn an_eliminator_whose_expected_type_is_a_metavariable_waits_for_it() {
+    let pick = "theorem pick {p : Prop} (x : p) (y : p) : p := x";
+    accepted(&format!(
+        "{CHAIN}{pick}\ntheorem t (c : Chain) (h : c = c) : pick (Chain.rec (rfl : Chain.nil = Chain.nil) (fun hd tl _ => (rfl : Chain.cons hd tl = Chain.cons hd tl)) c) h = h := rfl"
+    ));
+    // Under the computed motive, a minor premise of the wrong type is refused.
+    refused(&format!(
+        "{CHAIN}{pick}\ntheorem t (c : Chain) (h : c = c) : pick (Chain.rec (rfl : Chain.nil = Chain.nil) (fun hd tl _ => (rfl : Chain.nil = Chain.nil)) c) h = h := rfl"
+    ));
+}
+
 /// The pin's refusal when no expected type ever becomes available.
 #[test]
 fn an_eliminator_without_an_expected_type_is_refused_as_the_pin_refuses_it() {
