@@ -23,7 +23,10 @@
 //! of `fln-uyuz`, the store is a per-user trust boundary, not a kernel-signed receipt.
 use super::reuse::CheckerIdentity;
 use super::*;
-use crate::{OleanCheckLimits, OleanDecodeLimits, decode_olean_artifact, plan_olean_declarations};
+use crate::{
+    ArtifactReadings, OleanCheckLimits, OleanDecodeLimits, ReadingCheck, decode_olean_artifact,
+    plan_olean_declarations,
+};
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
 };
@@ -513,6 +516,11 @@ pub(super) fn readmit(
     if !plan.already_present.is_empty() || !plan.subsumed.is_empty() {
         return refuse(ModuleRecordRefusal::Plan);
     }
+    // The checker seat judges each declaration as it reads the artifact itself
+    // (bead `franken_lean-z8j.1.14`); a record it cannot read is not reused.
+    let Ok(readings) = ArtifactReadings::new(&decoded.independent) else {
+        return refuse(ModuleRecordRefusal::Decode);
+    };
     let mut engine = imported.clone();
     let mut declarations = Vec::with_capacity(plan.order.len());
     for &unit in &plan.order {
@@ -532,6 +540,7 @@ pub(super) fn readmit(
             unit.declaration.clone(),
             options,
             meter.limits.source.admission,
+            ReadingCheck::Artifact(&readings),
         ) {
             Ok(Outcome::Complete(admitted)) => {
                 engine = admitted.engine;

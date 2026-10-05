@@ -4353,6 +4353,9 @@ fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str,
         | fln::OleanCheckError::ConflictingModuleDeclaration { .. }
         | fln::OleanCheckError::MissingConstants { .. }
         | fln::OleanCheckError::DependencyCycle { .. } => ("declaration-closure", false, 1),
+        // Two decoders read the artifact differently: a fact about a decoder,
+        // not the declaration, rendered as a seat's disagreement is (above).
+        fln::OleanCheckError::IndependentReadingDiffers { .. } => ("inconclusive", false, 3),
         fln::OleanCheckError::Admission(error) => admission_error_disposition(error),
     }
 }

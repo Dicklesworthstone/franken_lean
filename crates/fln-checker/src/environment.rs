@@ -603,6 +603,112 @@ impl ConstantEntry {
     fn into_parts(self) -> (WireName, ConstantDeclaration) {
         (self.name, self.declaration)
     }
+
+    /// The identity of this reading of a declaration, modulo term sharing (bead
+    /// `franken_lean-z8j.1.14`). Two readings of one `.olean` declaration, the one
+    /// K1 judges and the checker's own, agree exactly when their digests do: every
+    /// field a declaration carries is covered.
+    pub fn reading_digest(&self) -> fln_hash::domain::Digest {
+        use crate::reading;
+        let declaration = &self.declaration;
+        let mut h = reading::start(b"constant");
+        reading::name(&mut h, &self.name);
+        reading::names(&mut h, &declaration.level_parameters);
+        h.update(&reading::expr_digest(&declaration.type_).0);
+        h.update(&[
+            match declaration.kind {
+                ConstantKind::Axiom => 0,
+                ConstantKind::Theorem => 1,
+                ConstantKind::Opaque => 2,
+                ConstantKind::Definition => 3,
+                ConstantKind::Inductive => 4,
+                ConstantKind::Constructor => 5,
+                ConstantKind::Recursor => 6,
+                ConstantKind::Quotient => 7,
+            },
+            match declaration.safety {
+                ConstantSafety::Safe => 0,
+                ConstantSafety::Unsafe => 1,
+            },
+        ]);
+        match &declaration.body {
+            None => {
+                h.update(&[0]);
+            }
+            Some(ConstantBody::Definition(body)) => {
+                h.update(&[1]).update(&reading::expr_digest(&body.value).0);
+                match body.hint {
+                    ReducibilityHint::Opaque => h.update(&[0]),
+                    ReducibilityHint::Abbrev => h.update(&[1]),
+                    ReducibilityHint::Regular(height) => {
+                        h.update(&[2]).update(&height.to_le_bytes())
+                    }
+                };
+                h.update(&[match body.safety {
+                    DefinitionSafety::Unsafe => 0,
+                    DefinitionSafety::Safe => 1,
+                    DefinitionSafety::Partial => 2,
+                }]);
+                reading::names(&mut h, &body.mutual);
+            }
+            Some(ConstantBody::Theorem { value, mutual }) => {
+                h.update(&[2]).update(&reading::expr_digest(value).0);
+                reading::names(&mut h, mutual);
+            }
+            Some(ConstantBody::Opaque { value, mutual }) => {
+                h.update(&[3]).update(&reading::expr_digest(value).0);
+                reading::names(&mut h, mutual);
+            }
+        }
+        match &declaration.metadata {
+            ConstantMetadata::None => {
+                h.update(&[0]);
+            }
+            ConstantMetadata::Inductive(inductive) => {
+                h.update(&[1])
+                    .update(&inductive.num_parameters.to_le_bytes())
+                    .update(&inductive.num_indices.to_le_bytes())
+                    .update(&inductive.num_nested.to_le_bytes())
+                    .update(&[u8::from(inductive.recursive), u8::from(inductive.reflexive)]);
+                reading::names(&mut h, &inductive.mutual);
+                reading::names(&mut h, &inductive.constructors);
+            }
+            ConstantMetadata::Constructor(constructor) => {
+                h.update(&[2]);
+                reading::name(&mut h, &constructor.inductive);
+                h.update(&constructor.index.to_le_bytes())
+                    .update(&constructor.num_parameters.to_le_bytes())
+                    .update(&constructor.num_fields.to_le_bytes());
+            }
+            ConstantMetadata::Recursor(recursor) => {
+                h.update(&[3])
+                    .update(&recursor.num_parameters.to_le_bytes())
+                    .update(&recursor.num_indices.to_le_bytes())
+                    .update(&recursor.num_motives.to_le_bytes())
+                    .update(&recursor.num_minors.to_le_bytes())
+                    .update(&[u8::from(recursor.k)])
+                    .update(&(recursor.rules.len() as u64).to_le_bytes());
+                reading::names(&mut h, &recursor.mutual);
+                for rule in &recursor.rules {
+                    reading::name(&mut h, &rule.constructor);
+                    h.update(&rule.num_fields.to_le_bytes())
+                        .update(&reading::expr_digest(&rule.rhs).0);
+                }
+            }
+            ConstantMetadata::Quotient(kind) => {
+                h.update(&[
+                    4,
+                    match kind {
+                        QuotientKind::Type => 0,
+                        QuotientKind::Constructor => 1,
+                        QuotientKind::Lift => 2,
+                        QuotientKind::Induction => 3,
+                    },
+                ]);
+            }
+        }
+        h.finalize()
+    }
 }
 
 #[derive(Clone)]

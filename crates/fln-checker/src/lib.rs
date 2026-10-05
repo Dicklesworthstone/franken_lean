@@ -235,6 +235,41 @@
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
 //!
+//! ## The `.olean` input path (bead `franken_lean-z8j.1.14`)
+//!
+//! Everything above guards *this crate*. The decoder sharing that bead measured
+//! happened outside it: `fln` re-encoded the `fln-core` terms `fln-olean` had
+//! decoded and handed them here, so every `.olean` declaration both seats judged
+//! had passed through one decoder, and a misread binder, level, literal or index
+//! reached both identically. The crate boundary was intact and the checker was
+//! still not independent of the decode.
+//!
+//! * **The checker reads the artifact itself.** [`olean`] goes from a chain's bytes
+//!   to this crate's own terms, written from the pinned Reference (`compact.cpp`'s
+//!   framing, `lean.h`'s object layout, and `Declaration.lean`, `Expr.lean`,
+//!   `Level.lean` and `KVMap.lean` for the structures). [`reading`] identifies one
+//!   declaration's reading modulo term sharing, since two decoders legitimately
+//!   share subterms differently. The checker seat (`fln`'s
+//!   `review_with_independent_checker`) compares each declaration it is asked to
+//!   judge with its own reading and **disagrees** on any difference; an artifact
+//!   it cannot read leaves it with no answer, never an agreement.
+//! * **WALKED, by the linker.** `fln-conformance`'s `checker_reader_closure` test
+//!   reads every function the linker keeps reachable from `fln::independent_reading`,
+//!   the whole input path, and refuses anything outside this crate, `fln_hash`'s
+//!   hashing and that one facade function. Planting the old shared decode inside
+//!   it is refused, naming 162 `fln-core`, `fln-olean`, `fln-rt` and `fln-env`
+//!   functions. Text cannot establish "transitively calls"; a call graph can.
+//! * **What is still shared, stated so nobody infers more.** The seat still
+//!   *judges* the primary's projection, not its own entry: the two are checked
+//!   equal first, so the judged term is the one it read up to a collision of a
+//!   256-bit digest. Constants the checker's environment projects for a
+//!   declaration's dependencies come from the primary's values too; each was
+//!   compared when its own module was admitted by a council, and a closure loaded
+//!   into an engine without one was never compared. Source declarations have no
+//!   artifact and still cross in the wire format. And none of this touches the
+//!   *algorithmic* independence of §8.3b and §8.3c — which judgments the checker
+//!   must not copy from K1 — which remains open in that bead's scope.
+//!
 //! ## Semantic registry — every name above, bound to the rule that refuses it
 //!
 //! **Why this exists.** Everything above is prose, and prose about enforcement rots
@@ -366,7 +401,9 @@ pub mod infer;
 pub mod instantiate;
 pub mod nat_reduce;
 pub mod numeric;
+pub mod olean;
 pub mod policy;
+pub mod reading;
 pub mod string_reduce;
 pub mod term;
 pub mod universe;
