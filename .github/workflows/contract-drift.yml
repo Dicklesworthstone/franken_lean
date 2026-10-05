@@ -16,7 +16,12 @@ jobs:
   contract-drift:
     name: regenerate contracts against the pinned Reference
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # 360 is a GitHub-hosted job's maximum. 180 could not hold this job. In run
+    # 37286836414 the rgha suites alone ran 178 minutes before cancellation. One
+    # kernel_replay cell that decodes the whole pinned stdlib ran over 29 minutes
+    # in the dev profile on a fast local core. The grammar census adds about 32
+    # minutes and the extern census materialization about 14.
+    timeout-minutes: 360
     steps:
       - name: checkout FrankenLean
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -256,100 +261,6 @@ jobs:
         shell: bash
         run: |
           python3 -I -S scripts/extract/gen_extern_rows.py --check
-
-      - name: pin-dependent conformance suites (fln-rgha)
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        shell: bash
-        env:
-          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
-        run: |
-          # Four binaries carry typed-skip sites cited by NINE terminal coverage rows in
-          # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
-          # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
-          # seventh is the per-frontend diagnostic projection differential. The eighth is
-          # the complete CLI/Lake census differential, and the ninth joins the option,
-          # CLI/Lake, and LSP products through fresh real processes. The tenth has the
-          # pinned leanchecker and lean consume a FrankenLean-written module that imports
-          # the Reference's Init (the mixed-producer seed, franken_lean-0nz). All ten are
-          # compiled PinRig entries. Until this step the nine cited rows
-          # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
-          # ran no cargo, so the intersection was empty (bead fln-rgha).
-          #
-          # They run HERE, not in ci.yml, deliberately. ci.yml installs no elan on purpose --
-          # see the comment above its contract-handoff step, where a prior attempt produced a
-          # setup failure that LOOKED LIKE A REAL VERIFICATION, which is this bead's own
-          # defect. The pinned toolchain is 2.8 GB; that is not a per-push cost. Rust comes
-          # from rust-toolchain.toml, which auto-selects the pinned nightly.
-          #
-          # THE EXECUTION JOIN. Exit 0 and libtest's per-test `ok` cannot be the gate here.
-          # Measured by cc_3 at b45ff944 and independently by cc_2 at 9b6a7dfa: with the pin
-          # present and masked, cargo's externally visible dispositions are identical because
-          # each typed skip is an early return inside a test that then passes. Grepping the log
-          # merely changes cargo's capture policy and still cannot prove which assertions ran.
-          #
-          # Each registered pin rig therefore owns one structured record file. The record is
-          # written only after the assertion-bearing body completes, or as typed_skip_no_pin
-          # from the declining branch. The verifier below derives the expected set from the
-          # compiled PinRig registry and the live #[ignore] attributes, binds every record to
-          # SUITE.lock's tag and full commit, writes a first-class tally, and refuses missing,
-          # duplicate, stale, unexpected or skipped records. The directory is unique to this
-          # workflow attempt so a prior green cannot satisfy a later run.
-          artifact_root="target/e2e/contract-drift-rgha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          export FLN_RIG_EXECUTION_DIR="$PWD/$artifact_root/records"
-          export FLN_RIG_EXECUTION_SUMMARY="$PWD/$artifact_root/rig-execution-summary.txt"
-          mkdir -p "$FLN_RIG_EXECUTION_DIR"
-          log="$RUNNER_TEMP/rgha-suites.log"
-          set +e
-          cargo test --locked -p fln-conformance \
-            --test kernel_replay \
-            --test pin_option_defaults \
-            --test ext_observable_capture \
-            --test pin_ctor_inventory \
-            --test lsp_census_no_mock_e2e \
-            --test cli_lake_census_no_mock_e2e \
-            --test public_surface_no_mock_e2e \
-            --test g0_4_no_mock_e2e \
-            --test olean_mixed_producer_no_mock_e2e \
-            --test diag_render \
-            -- --nocapture > "$log" 2>&1
-          rc=$?
-          cargo test --locked -p fln-conformance \
-            --test ci_execution_join \
-            configured_pin_rig_records_prove_each_scheduled_rig_executed \
-            -- --exact --nocapture
-          collector_rc=$?
-          set -e
-          result_lines=$(grep -c '^test result:' "$log" || true)
-          passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" \
-            | paste -sd+ - | bc 2>/dev/null || echo 0)
-          [[ -z "$passed" ]] && passed=0
-          printf 'rgha-join: cargo_rc=%s collector_rc=%s result_lines=%s passed=%s\n' \
-            "$rc" "$collector_rc" "$result_lines" "$passed"
-          fail=0
-          if (( rc != 0 )); then
-            echo "rgha-join: REFUSED - cargo exited $rc; a real failure, not a skip question" >&2
-            fail=1
-          fi
-          if (( collector_rc != 0 )); then
-            echo "rgha-join: REFUSED - the structured per-rig execution join failed" >&2
-            fail=1
-          fi
-          # These two floors answer only whether the command shape collapsed. They do not
-          # carry execution evidence; the structured records above do.
-          if (( result_lines < 10 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 10 binaries reported a result" >&2
-            fail=1
-          fi
-          if (( passed < 30 )); then
-            echo "rgha-join: REFUSED - only $passed tests ran (floor 30 after mixed-producer registration); a zero-test cargo success is not a run" >&2
-            fail=1
-          fi
-          (( fail )) && exit 2
-          cat "$FLN_RIG_EXECUTION_SUMMARY"
-          echo "rgha-join: PASS - exact structured record for every scheduled pin rig"
-          # WHAT THIS DOES NOT ESTABLISH: that the suites checked their subject CORRECTLY.
-          # It proves that the registered assertion-bearing bodies executed and did not
-          # silently skip; the soundness of the assertions remains their own obligation.
 
       - name: verify imported tag queries and real module publication
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
@@ -641,6 +552,113 @@ jobs:
           FLN_GRAMMAR_CENSUS_JOBS: 4
         run: |
           ./scripts/extract/gen_grammar_census.sh --check
+
+      - name: pin-dependent conformance suites (fln-rgha)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          # This is the job's longest step, so it runs LAST, after every other lane has
+          # reported. In run 37286836414 it sat third and ran 178 minutes before the job
+          # limit cancelled it, and every lane after it was skipped. Nothing else reads
+          # its records. Its whole-corpus cells (present_olean_* in kernel_replay decode
+          # each of the pin's 2,433 stdlib modules) are slow in the dev profile. That
+          # profile is not raised: build_profile_calibration (bead 4o3n) refuses an
+          # optimised build that keeps debug assertions, because the kernel's stack bound
+          # would then name a configuration it was not measured in.
+          #
+          # Four binaries carry typed-skip sites cited by NINE terminal coverage rows in
+          # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
+          # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
+          # seventh is the per-frontend diagnostic projection differential. The eighth is
+          # the complete CLI/Lake census differential, and the ninth joins the option,
+          # CLI/Lake, and LSP products through fresh real processes. The tenth has the
+          # pinned leanchecker and lean consume a FrankenLean-written module that imports
+          # the Reference's Init (the mixed-producer seed, franken_lean-0nz). All ten are
+          # compiled PinRig entries. Until this step the nine cited rows
+          # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
+          # ran no cargo, so the intersection was empty (bead fln-rgha).
+          #
+          # They run HERE, not in ci.yml, deliberately. ci.yml installs no elan on purpose --
+          # see the comment above its contract-handoff step, where a prior attempt produced a
+          # setup failure that LOOKED LIKE A REAL VERIFICATION, which is this bead's own
+          # defect. The pinned toolchain is 2.8 GB; that is not a per-push cost. Rust comes
+          # from rust-toolchain.toml, which auto-selects the pinned nightly.
+          #
+          # THE EXECUTION JOIN. Exit 0 and libtest's per-test `ok` cannot be the gate here.
+          # Measured by cc_3 at b45ff944 and independently by cc_2 at 9b6a7dfa: with the pin
+          # present and masked, cargo's externally visible dispositions are identical because
+          # each typed skip is an early return inside a test that then passes. Grepping the log
+          # merely changes cargo's capture policy and still cannot prove which assertions ran.
+          #
+          # Each registered pin rig therefore owns one structured record file. The record is
+          # written only after the assertion-bearing body completes, or as typed_skip_no_pin
+          # from the declining branch. The verifier below derives the expected set from the
+          # compiled PinRig registry and the live #[ignore] attributes, binds every record to
+          # SUITE.lock's tag and full commit, writes a first-class tally, and refuses missing,
+          # duplicate, stale, unexpected or skipped records. The directory is unique to this
+          # workflow attempt so a prior green cannot satisfy a later run.
+          artifact_root="target/e2e/contract-drift-rgha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export FLN_RIG_EXECUTION_DIR="$PWD/$artifact_root/records"
+          export FLN_RIG_EXECUTION_SUMMARY="$PWD/$artifact_root/rig-execution-summary.txt"
+          mkdir -p "$FLN_RIG_EXECUTION_DIR"
+          log="$RUNNER_TEMP/rgha-suites.log"
+          set +e
+          # The suites' output also goes to the job log, as it runs. Run 37286836414
+          # spent three hours here with it all in $log, and the job's timeout destroyed
+          # the only record of which cell was running. cargo's own status is taken
+          # from PIPESTATUS, not tee's.
+          cargo test --locked -p fln-conformance \
+            --test kernel_replay \
+            --test pin_option_defaults \
+            --test ext_observable_capture \
+            --test pin_ctor_inventory \
+            --test lsp_census_no_mock_e2e \
+            --test cli_lake_census_no_mock_e2e \
+            --test public_surface_no_mock_e2e \
+            --test g0_4_no_mock_e2e \
+            --test olean_mixed_producer_no_mock_e2e \
+            --test diag_render \
+            -- --nocapture 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          cargo test --locked -p fln-conformance \
+            --test ci_execution_join \
+            configured_pin_rig_records_prove_each_scheduled_rig_executed \
+            -- --exact --nocapture
+          collector_rc=$?
+          set -e
+          result_lines=$(grep -c '^test result:' "$log" || true)
+          passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" \
+            | paste -sd+ - | bc 2>/dev/null || echo 0)
+          [[ -z "$passed" ]] && passed=0
+          printf 'rgha-join: cargo_rc=%s collector_rc=%s result_lines=%s passed=%s\n' \
+            "$rc" "$collector_rc" "$result_lines" "$passed"
+          fail=0
+          if (( rc != 0 )); then
+            echo "rgha-join: REFUSED - cargo exited $rc; a real failure, not a skip question" >&2
+            fail=1
+          fi
+          if (( collector_rc != 0 )); then
+            echo "rgha-join: REFUSED - the structured per-rig execution join failed" >&2
+            fail=1
+          fi
+          # These two floors answer only whether the command shape collapsed. They do not
+          # carry execution evidence; the structured records above do.
+          if (( result_lines < 10 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 10 binaries reported a result" >&2
+            fail=1
+          fi
+          if (( passed < 30 )); then
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 30 after mixed-producer registration); a zero-test cargo success is not a run" >&2
+            fail=1
+          fi
+          (( fail )) && exit 2
+          cat "$FLN_RIG_EXECUTION_SUMMARY"
+          echo "rgha-join: PASS - exact structured record for every scheduled pin rig"
+          # WHAT THIS DOES NOT ESTABLISH: that the suites checked their subject CORRECTLY.
+          # It proves that the registered assertion-bearing bodies executed and did not
+          # silently skip; the soundness of the assertions remains their own obligation.
 
       - name: archive contract drift evidence
         if: always()

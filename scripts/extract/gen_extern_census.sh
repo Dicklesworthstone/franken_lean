@@ -335,11 +335,32 @@ publish_candidates() {
     "$MANIFEST"
 }
 
+# The staging directory must share a filesystem with contracts/: the candidates move
+# into place by rename(2), atomic only within one filesystem (stage_scratch_candidates
+# refuses otherwise). Use the lock directory (this box's /data/tmp, else TMPDIR or
+# /tmp) when it is on that filesystem, else the checkout's own target/. A hardcoded
+# /data/tmp does not exist on a GitHub-hosted runner, where the census step of run
+# 37286836414 died at this mktemp (bead franken_lean-z8j.1.17). This sets a variable
+# rather than printing a path, so the typed refusal exits the script, not a subshell.
+resolve_staging_parent() {
+  local device candidate
+  device="$(stat -c '%d' "$ROOT/contracts")"
+  for candidate in "$LOCK_DIR" "$ROOT/target"; do
+    if mkdir -p -- "$candidate" 2>/dev/null \
+      && [ "$(stat -c '%d' "$candidate")" = "$device" ]; then
+      STAGING_PARENT="$candidate"
+      return 0
+    fi
+  done
+  reject "non_atomic_staging_device" "no scratch directory shares a filesystem with contracts"
+}
+
 generate_candidates() {
   ensure_clean_publication_state
   mkdir -p "$ROOT/contracts"
+  resolve_staging_parent
   local scratch
-  scratch="$(mktemp -d /data/tmp/fln-extern-builtin-stage.XXXXXX)"
+  scratch="$(mktemp -d "$STAGING_PARENT/fln-extern-builtin-stage.XXXXXX")"
   generate_scratch "$scratch"
   stage_scratch_candidates "$scratch"
 }
