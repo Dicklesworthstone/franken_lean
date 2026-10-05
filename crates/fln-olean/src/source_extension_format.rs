@@ -10,6 +10,8 @@
 //! src/Init/Prelude.lean: sha256 44f86ebbb9ab743a05c6ebe2c674aadbf2c822bee874f1b16d7e6c8d56318dc9
 //! src/Lean/Modifiers.lean: sha256 dee35dbc823a48b9ac79f11db4b2741f89702dd1ac0a7df83050e7f61d2154fd
 //! src/Lean/EnvExtension.lean: sha256 18086b4119360fad18b8434e2e0b3ef6f52d23f57a4d93ca4f7f7ffbe0685e87
+//! src/Lean/Meta/DiscrTree/Types.lean: sha256 c2964c861300247b99afb068c5c77046c8f746b8881e9cfb81e63195ba3d3773
+//! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -71,3 +73,14 @@ pub const PROD_SND: usize = 1;
 pub const PROD_POINTERS: usize = 2;
 pub const PROD_SCALAR_BYTES: usize = 0;
 pub const PROTECTED_EXTENSION: &str = "Lean.protectedExt";
+pub const KEY_STAR: u8 = 0;
+pub const KEY_OTHER: u8 = 1;
+pub const KEY_LIT: u8 = 2;
+pub const KEY_LIT_POINTERS: usize = 1;
+pub const KEY_FVAR: u8 = 3;
+pub const KEY_FVAR_POINTERS: usize = 2;
+pub const KEY_CONST: u8 = 4;
+pub const KEY_CONST_POINTERS: usize = 2;
+pub const KEY_ARROW: u8 = 5;
+pub const KEY_PROJ: u8 = 6;
+pub const KEY_PROJ_POINTERS: usize = 3;

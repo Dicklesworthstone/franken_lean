@@ -78,6 +78,7 @@ fn imported_scoped_dictionaries_are_dormant_until_lexically_activated() {
             priority: 1000,
             synth_order: vec![],
             scope: Some(n("Alpha")),
+            keys: Vec::new(),
         },
     )
     .unwrap();

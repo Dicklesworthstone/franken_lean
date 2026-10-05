@@ -389,14 +389,16 @@ impl Context {
                 // Keep the condition in the checked dictionary's type and both
                 // branches in the ordinary Decidable recursor. No source branch
                 // is selected by evaluating a proposition or a host Boolean.
-                let proposition = self.whnf(&major.value)?;
+                // The instance problem is `Decidable c` for the condition as
+                // elaborated, as the pin's `ite` poses it. Normalizing `c` first
+                // turned `n < 5` into `Nat.le (Nat.succ n) 5`, which no stored
+                // instance path matches (bead fln-52qv).
+                let proposition = self.instantiate(&major.value)?;
                 let type_ = Expr::app(
                     Expr::const_(Name::from_components(["Decidable"]), vec![]),
                     proposition,
                 );
                 let dictionary = self.instance_hole(type_.clone())?;
-                // Normalization helps instance selection for computed conditions,
-                // but cannot erase an invalid unselected arm of that condition.
                 // Retain the original proposition as a checked local value.
                 major = Typed {
                     value: Expr::let_e(

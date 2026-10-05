@@ -434,6 +434,7 @@ impl Engine {
                             priority: row.priority,
                             synth_order: row.synth_order,
                             scope: row.scope,
+                            keys: row.keys.into_iter().map(instance_key).collect(),
                         },
                     )
                     .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
@@ -627,6 +628,21 @@ impl Registrar for instances::imported::ImportActivation {
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
+    }
+}
+
+/// A decoded stored `DiscrTree.Key` as the native instance index holds it.
+fn instance_key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
+    use instances::discr_tree::Key;
+    use metadata::InstanceKey;
+    match key {
+        InstanceKey::Star => Key::Star,
+        InstanceKey::Other => Key::Other,
+        InstanceKey::Lit(literal) => Key::Lit(literal),
+        InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        InstanceKey::Const(name, arity) => Key::Const(name, arity),
+        InstanceKey::Arrow => Key::Arrow,
+        InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 
@@ -1020,6 +1036,7 @@ pub(super) mod tests {
                 priority: 1000,
                 synth_order: Vec::new(),
                 scope: None,
+                keys: Vec::new(),
             };
             let scoped = instances::imported::InstanceParameters {
                 scope: Some(n("Planted.Scope")),

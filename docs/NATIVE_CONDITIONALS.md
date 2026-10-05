@@ -40,9 +40,11 @@ theorem recover (p : Prop) [Decidable p] (hp : p) : p := by
   · exact hp
 ```
 
-Computed propositions are normalized for instance selection, while their original
-source values remain checked let bindings in the final term. Normalization cannot
-erase a bad unselected arm of a computed condition. Unknown propositions require
+The decision is sought for the condition as elaborated, `Decidable c`, as the pin's
+`ite` poses it; the condition is not normalized first (bead `fln-52qv`: normalizing
+turned `n < 5` into `Nat.le (Nat.succ n) 5`, which no instance's stored path
+matches). The original source value remains a checked let binding in the final
+term, so a bad unselected arm of a computed condition is still refused. Unknown propositions require
 an actual local or registered global decision; no classical decision is invented.
 The original branch syntax is borrowed directly, not copied into alternative
 source strings or recursively reparsed.

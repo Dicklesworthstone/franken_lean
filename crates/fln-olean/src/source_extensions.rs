@@ -7,7 +7,7 @@
 //! explicitly scoped. Other extension schemas are not interpreted here.
 use crate::region::OpaqueExtensionBlock;
 use crate::source_extension_format as format;
-use fln_core::expr::{Expr, ExprNode};
+use fln_core::expr::{Expr, ExprNode, Literal};
 use fln_core::name::Name;
 use fln_rt::convert::{Conversion, ConvertError};
 use fln_rt::native_heap::NativeHeap;
@@ -38,8 +38,28 @@ pub struct InstanceEntry {
     pub synth_order: Vec<u32>,
     /// `Some` is inactive until that namespace is explicitly activated.
     pub scope: Option<Name>,
-    /// The index is rebuilt from checked types by the native search engine.
-    pub key_count: usize,
+    /// The pin's discrimination-tree path for the instance's type, computed when
+    /// the instance was registered (`mkInstanceKey`, vendored
+    /// `src/Lean/Meta/Instances.lean`) and stored with it. The pin never stores
+    /// an empty path. FrankenLean's own artifacts may, and an empty path leaves
+    /// the instance out of the index, so it is never filtered.
+    pub keys: Vec<InstanceKey>,
+}
+
+/// One edge of a pin `DiscrTree` path (`DiscrTree.Key`, vendored
+/// `src/Lean/Meta/DiscrTree/Types.lean`), in constructor order. Arities and
+/// projection indices are the pin's `Nat`s, bounded here to `u32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceKey {
+    Star,
+    Other,
+    Lit(Literal),
+    /// The free variable's `FVarId`, whose only field is this `Name`.
+    FVar(Name, u32),
+    Const(Name, u32),
+    Arrow,
+    /// Structure name, field index, argument count.
+    Proj(Name, u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +97,8 @@ pub struct DecodeLimits {
     pub max_objects: u64,
     pub max_entries: usize,
     pub max_indices: usize,
+    /// Cumulative instance `DiscrTree` keys across the batch.
+    pub max_keys: usize,
 }
 impl Default for DecodeLimits {
     fn default() -> Self {
@@ -85,6 +107,7 @@ impl Default for DecodeLimits {
             max_objects: 1_000_000,
             max_entries: 65_536,
             max_indices: 65_536,
+            max_keys: 1 << 20,
         }
     }
 }
@@ -156,6 +179,7 @@ fn array_length(obj: &Obj) -> Result<usize, DecodeError> {
 struct Reader {
     conversion: Conversion,
     indices_left: usize,
+    keys_left: usize,
 }
 impl Reader {
     fn name(&mut self, obj: &Obj) -> Result<Name, DecodeError> {
@@ -184,6 +208,64 @@ impl Reader {
             out.push(value);
         }
         Ok(out)
+    }
+    /// `InstanceEntry.keys`. A field-less key is a boxed scalar carrying its
+    /// constructor index; every other key is a constructor object with that tag.
+    fn keys(&mut self, obj: &Obj) -> Result<Vec<InstanceKey>, DecodeError> {
+        let size = array_length(obj)?;
+        self.keys_left = self
+            .keys_left
+            .checked_sub(size)
+            .ok_or_else(|| limit("instance keys"))?;
+        let mut out = Vec::with_capacity(size);
+        for index in 0..size {
+            out.push(self.key(&obj.array_child(index))?);
+        }
+        Ok(out)
+    }
+    fn key(&mut self, obj: &Obj) -> Result<InstanceKey, DecodeError> {
+        if obj.is_scalar() {
+            return match u8::try_from(obj.unbox()) {
+                Ok(format::KEY_STAR) => Ok(InstanceKey::Star),
+                Ok(format::KEY_OTHER) => Ok(InstanceKey::Other),
+                Ok(format::KEY_ARROW) => Ok(InstanceKey::Arrow),
+                _ => Err(shape("unknown field-less DiscrTree key")),
+            };
+        }
+        let tag = u8::try_from(obj.obj_tag()).map_err(|_| shape("unknown DiscrTree key"))?;
+        match tag {
+            format::KEY_LIT => {
+                constructor(obj, tag, format::KEY_LIT_POINTERS)?;
+                let literal = self
+                    .conversion
+                    .project_literal(&field(obj, 0)?)
+                    .map_err(DecodeError::Conversion)?;
+                Ok(InstanceKey::Lit(literal))
+            }
+            format::KEY_FVAR => {
+                constructor(obj, tag, format::KEY_FVAR_POINTERS)?;
+                Ok(InstanceKey::FVar(
+                    self.name(&field(obj, 0)?)?,
+                    natural(&field(obj, 1)?)?,
+                ))
+            }
+            format::KEY_CONST => {
+                constructor(obj, tag, format::KEY_CONST_POINTERS)?;
+                Ok(InstanceKey::Const(
+                    self.name(&field(obj, 0)?)?,
+                    natural(&field(obj, 1)?)?,
+                ))
+            }
+            format::KEY_PROJ => {
+                constructor(obj, tag, format::KEY_PROJ_POINTERS)?;
+                Ok(InstanceKey::Proj(
+                    self.name(&field(obj, 0)?)?,
+                    natural(&field(obj, 1)?)?,
+                    natural(&field(obj, 2)?)?,
+                ))
+            }
+            _ => Err(shape("unknown DiscrTree key")),
+        }
     }
     fn class(&mut self, obj: &Obj) -> Result<ClassEntry, DecodeError> {
         constructor(obj, 0, format::CLASS_POINTERS)?;
@@ -245,7 +327,7 @@ impl Reader {
             priority: natural(&field(&entry, format::INSTANCE_PRIORITY)?)?,
             synth_order: self.indices(&field(&entry, format::INSTANCE_SYNTH_ORDER)?)?,
             scope,
-            key_count: array_length(&field(&entry, format::INSTANCE_KEYS)?)?,
+            keys: self.keys(&field(&entry, format::INSTANCE_KEYS)?)?,
         })
     }
     fn alias(&mut self, obj: &Obj) -> Result<AliasEntry, DecodeError> {
@@ -288,6 +370,7 @@ pub fn decode(
     let mut reader = Reader {
         conversion: Conversion::new(),
         indices_left: limits.max_indices,
+        keys_left: limits.max_keys,
     };
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();

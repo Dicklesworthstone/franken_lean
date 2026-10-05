@@ -7,6 +7,7 @@
 
 pub mod coercions;
 pub mod defaults;
+pub mod discr_tree;
 pub mod export;
 pub mod imported;
 pub mod numeric;
@@ -84,6 +85,8 @@ pub struct InstanceRegistry {
     imported: imported::Metadata,
     /// Dormant namespace registrations, in their original journal order.
     scoped: BTreeMap<Name, BTreeMap<Name, Vec<InstanceEntry>>>,
+    /// The pin's discrimination tree over `imported`, built on first use.
+    index: discr_tree::IndexCell,
 }
 
 fn extension_name() -> Name {
@@ -329,6 +332,12 @@ impl InstanceRegistry {
     }
     pub fn candidates(&self, class: &Name) -> &[InstanceEntry] {
         self.instances.get(class).map_or(&[], Vec::as_slice)
+    }
+    /// The pin's discrimination tree over the imported instances' stored paths
+    /// ([`discr_tree`], bead `fln-52qv`). A registry is not changed once read,
+    /// so the index built on first use stays its index.
+    pub(crate) fn instance_index(&self) -> &discr_tree::InstanceIndex {
+        self.index.get(self)
     }
     pub fn imported_class_parameters(&self, class: &Name) -> Option<&imported::ClassParameters> {
         self.imported.classes.get(class)

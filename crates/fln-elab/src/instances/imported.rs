@@ -7,7 +7,8 @@
 use super::*;
 use fln_core::expr::BinderInfo;
 
-const MAGIC: &[u8] = b"FLNIMPI\x01";
+/// Version 2 adds each instance's stored discrimination-tree path.
+const MAGIC: &[u8] = b"FLNIMPI\x02";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassParameters {
@@ -22,6 +23,10 @@ pub struct InstanceParameters {
     pub synth_order: Vec<u32>,
     /// A scoped registration is retained but is not an ordinary global instance.
     pub scope: Option<Name>,
+    /// The pin's discrimination-tree path for the instance's type, as stored
+    /// with it (`InstanceEntry.keys`). Empty when unknown: such an instance is
+    /// never filtered out of a candidate list.
+    pub keys: Vec<super::discr_tree::Key>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,7 +36,7 @@ pub(super) struct Metadata {
 }
 
 fn name() -> Name {
-    Name::from_components(["FrankenLean", "importedInstances", "v1"])
+    Name::from_components(["FrankenLean", "importedInstances", "v2"])
 }
 fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
@@ -217,6 +222,7 @@ impl Metadata {
                     priority,
                     scope,
                     synth_order: indices(&mut bytes)?,
+                    keys: super::discr_tree::read_keys(&mut bytes)?,
                 };
                 validate_order(env, &declaration, &parameters)?;
                 self.instances.insert(declaration, parameters);
@@ -257,6 +263,7 @@ fn instance_metadata_payload(
         write_name(scope, &mut payload)?;
     }
     write_indices(&parameters.synth_order, &mut payload)?;
+    super::discr_tree::write_keys(&parameters.keys, &mut payload)?;
     Ok(payload)
 }
 

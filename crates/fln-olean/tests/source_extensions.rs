@@ -1,8 +1,11 @@
 //! The actual pinned Prelude journals, plus hostile captured-entry mutations.
 #![forbid(unsafe_code)]
+use fln_core::expr::{Literal, NatLit};
 use fln_core::name::Name;
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
-use fln_olean::source_extensions::{DecodeError, DecodeLimits, SourceExtensions, decode};
+use fln_olean::source_extensions::{
+    DecodeError, DecodeLimits, InstanceKey, SourceExtensions, decode,
+};
 use fln_rt::convert::inject_name;
 use fln_rt::obj::Obj;
 use fln_rt::region::{compact, materialize};
@@ -288,4 +291,177 @@ fn extension_names_are_structural_and_duplicate_blocks_refuse() {
         decoded.uninterpreted,
         [Name::from_components(["Lean.classExtension"])]
     );
+}
+
+/// The pin's stored `DiscrTree` paths (`InstanceEntry.keys`), read back from the
+/// pinned Prelude. Expected values are the pin's own: `Meta.instanceExtension`
+/// state under `import Lean`, printed with `repr` per instance, and the key
+/// kinds counted over every instance whose module is `Init.Prelude`.
+#[test]
+fn real_prelude_instance_keys_are_the_pins_paths() {
+    let decoded = read(blocks()).unwrap();
+    let keys = |name: &str| {
+        decoded
+            .instances
+            .iter()
+            .find(|row| row.declaration == n(name))
+            .unwrap()
+            .keys
+            .clone()
+    };
+    let c = |name: &str, arity: u32| InstanceKey::Const(n(name), arity);
+    use InstanceKey::{Arrow, Other, Star};
+    assert_eq!(
+        keys("instDecidableAnd"),
+        [c("Decidable", 1), c("And", 2), Star, Star]
+    );
+    assert_eq!(keys("instOfNatNat"), [c("OfNat", 2), c("Nat", 0), Star]);
+    assert_eq!(keys("instBEqOfDecidableEq"), [c("BEq", 1), Star]);
+    assert_eq!(
+        keys("Nat.decLt"),
+        [
+            c("Decidable", 1),
+            c("LT.lt", 4),
+            c("Nat", 0),
+            Star,
+            Star,
+            Star
+        ]
+    );
+    assert_eq!(
+        keys("instDecidableEqNat"),
+        [c("Decidable", 1), c("Eq", 3), c("Nat", 0), Star, Star]
+    );
+    assert_eq!(keys("instLTNat"), [c("LT", 1), c("Nat", 0)]);
+    assert_eq!(keys("instHAdd"), [c("HAdd", 3), Star, Star, Star]);
+    assert_eq!(
+        keys("instDecidableNot"),
+        [c("Decidable", 1), c("Not", 1), Star]
+    );
+    assert_eq!(keys("Pi.instNonempty"), [c("Nonempty", 1), Arrow, Star]);
+    assert_eq!(keys("instInhabitedSort"), [c("Inhabited", 1), Other]);
+    let mut kinds = [0usize; 7];
+    for row in &decoded.instances {
+        assert!(
+            matches!(row.keys[0], InstanceKey::Const(..)),
+            "{:?}",
+            row.declaration
+        );
+        for key in &row.keys {
+            kinds[match key {
+                Star => 0,
+                Other => 1,
+                InstanceKey::Lit(_) => 2,
+                InstanceKey::FVar(..) => 3,
+                InstanceKey::Const(..) => 4,
+                Arrow => 5,
+                InstanceKey::Proj(..) => 6,
+            }] += 1;
+        }
+    }
+    assert_eq!(kinds, [239, 1, 0, 0, 289, 5, 0]);
+    let total: usize = kinds.iter().sum();
+    let limits = |max_keys| DecodeLimits {
+        max_keys,
+        ..Default::default()
+    };
+    assert!(decode(blocks(), limits(total)).is_ok());
+    assert!(matches!(
+        decode(blocks(), limits(total - 1)),
+        Err(DecodeError::Limit { .. })
+    ));
+}
+
+/// An instance entry whose stored path is `keys`, around a real Prelude entry.
+fn with_keys(keys: Vec<Obj>) -> Vec<OpaqueExtensionBlock> {
+    let original = entry("Lean.Meta.instanceExtension").ctor_child(0);
+    let mut fields: Vec<Obj> = (0..5).map(|i| original.ctor_child(i)).collect();
+    fields[0] = Obj::mk_array(keys);
+    let wrapped = Obj::mk_ctor(0, vec![Obj::mk_ctor(0, fields, &[0])], &[]);
+    one("Lean.Meta.instanceExtension", &wrapped)
+}
+
+#[test]
+fn every_key_kind_decodes_and_forged_keys_refuse() {
+    let name = |text: &str| inject_name(&n(text));
+    let literal =
+        |tag: u8, payload: Obj| Obj::mk_ctor(2, vec![Obj::mk_ctor(tag, vec![payload], &[])], &[]);
+    let kinds = vec![
+        Obj::mk_ctor(4, vec![name("Decidable"), Obj::mk_nat(1)], &[]),
+        literal(0, Obj::mk_nat(5)),
+        literal(0, Obj::mk_mpz(&[0, 1], false)),
+        literal(1, Obj::mk_string("é")),
+        Obj::mk_ctor(
+            6,
+            vec![name("Subtype"), Obj::mk_nat(0), Obj::mk_nat(0)],
+            &[],
+        ),
+        Obj::mk_ctor(3, vec![name("h"), Obj::mk_nat(2)], &[]),
+        Obj::mk_nat(0),
+        Obj::mk_nat(1),
+        Obj::mk_nat(5),
+    ];
+    let decoded = read(&with_keys(kinds)).unwrap();
+    assert_eq!(
+        decoded.instances[0].keys,
+        [
+            InstanceKey::Const(n("Decidable"), 1),
+            InstanceKey::Lit(Literal::Nat(NatLit::from_u64(5))),
+            InstanceKey::Lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+            InstanceKey::Lit(Literal::Str("é".into())),
+            InstanceKey::Proj(n("Subtype"), 0, 0),
+            InstanceKey::FVar(n("h"), 2),
+            InstanceKey::Star,
+            InstanceKey::Other,
+            InstanceKey::Arrow,
+        ]
+    );
+    // FrankenLean's own artifacts store no path; that instance is left unindexed.
+    assert!(read(&with_keys(vec![])).unwrap().instances[0].keys.is_empty());
+    let head = || Obj::mk_ctor(4, vec![name("Decidable"), Obj::mk_nat(1)], &[]);
+    for (why, forged) in [
+        ("`lit` as a scalar", vec![head(), Obj::mk_nat(2)]),
+        ("an unknown scalar key", vec![head(), Obj::mk_nat(7)]),
+        (
+            "an unknown key constructor",
+            vec![head(), Obj::mk_ctor(7, vec![name("x")], &[])],
+        ),
+        (
+            "`const` without its arity",
+            vec![Obj::mk_ctor(4, vec![name("Decidable")], &[])],
+        ),
+        (
+            "`const` naming a string",
+            vec![Obj::mk_ctor(
+                4,
+                vec![Obj::mk_string("x"), Obj::mk_nat(1)],
+                &[],
+            )],
+        ),
+        (
+            "an arity that is not a Nat",
+            vec![Obj::mk_ctor(
+                4,
+                vec![name("Decidable"), Obj::mk_string("1")],
+                &[],
+            )],
+        ),
+        (
+            "an unknown literal",
+            vec![head(), literal(2, Obj::mk_nat(5))],
+        ),
+        (
+            "a negative literal",
+            vec![head(), literal(0, Obj::mk_mpz(&[1], true))],
+        ),
+        (
+            "`proj` without its argument count",
+            vec![
+                head(),
+                Obj::mk_ctor(6, vec![name("S"), Obj::mk_nat(0)], &[]),
+            ],
+        ),
+    ] {
+        assert!(read(&with_keys(forged)).is_err(), "{why} must refuse");
+    }
 }

@@ -6,6 +6,11 @@
 use super::*;
 use std::ops::Range;
 
+/// The discrimination-tree filter's read-only audit (bead `fln-52qv`).
+pub use super::instances::audit::{
+    CandidateAudit, InstanceGoalAudit, Selection, audit_instance_goal,
+};
+
 /// Which elaboration boundary the caller wants to observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationKind {

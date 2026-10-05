@@ -134,6 +134,7 @@ instance combined {B : Type} [x : First B] [y : Second B] : Root := Root.mk (@Fi
             priority: 1000,
             synth_order: vec![2, 1],
             scope: None,
+            keys: Vec::new(),
         },
     )
     .unwrap();
@@ -172,6 +173,7 @@ fn malformed_or_unadmitted_metadata_is_failure_atomic() {
                     priority: 1000,
                     synth_order: vec![],
                     scope: None,
+                    keys: Vec::new(),
                 }
             )
             .is_err()
@@ -182,11 +184,13 @@ fn malformed_or_unadmitted_metadata_is_failure_atomic() {
             priority: 1000,
             synth_order: vec![0],
             scope: None,
+            keys: Vec::new(),
         },
         InstanceParameters {
             priority: 1000,
             synth_order: vec![],
             scope: Some(Name::anonymous()),
+            keys: Vec::new(),
         },
     ] {
         assert!(
@@ -210,6 +214,7 @@ fn scoped_imports_are_not_global_instances() {
             priority: 10000,
             synth_order: vec![],
             scope: Some(n("Feature")),
+            keys: Vec::new(),
         },
     )
     .unwrap();

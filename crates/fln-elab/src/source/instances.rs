@@ -4,6 +4,7 @@
 use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
 
+pub(super) mod audit;
 mod parameters;
 mod reconcile;
 mod table;
@@ -473,14 +474,29 @@ impl Context {
                 candidates.push(Candidate::Local(local.id.clone()));
             }
         }
-        candidates.extend(
-            registry
-                .candidates(&class)
-                .iter()
-                .map(|row| Candidate::Global(row.declaration.clone())),
-        );
         if let Some(default) = default {
             candidates = vec![Candidate::Global(default.clone())];
+        } else {
+            // The pin tries only the global instances its discrimination tree
+            // returns for the goal (`getInstances`, vendored
+            // Lean/Meta/SynthInstance.lean:201-240), in registry order here
+            // (bead fln-52qv). A hole left uninstantiated only widens the query.
+            let goal = self
+                .txn
+                .instantiate_expr(&prepared.target)
+                .unwrap_or_else(|_| prepared.target.clone());
+            candidates.extend(
+                registry
+                    .instance_index()
+                    .narrow(
+                        &self.txn.env,
+                        &self.txn.lctx,
+                        &goal,
+                        registry.candidates(&class),
+                    )
+                    .into_iter()
+                    .map(|row| Candidate::Global(row.declaration.clone())),
+            );
         }
         // A universe-only unknown is still an open query. A later prerequisite
         // can rule out its first answer and require an alternative universe;

@@ -834,6 +834,14 @@ impl Conversion {
             .ok_or_else(|| malformed("level", "level was not projected"))
     }
 
+    /// Project a borrowed Compat `Literal` (a natural or a string), counted
+    /// against the same node budget as every other projection. Data only, as
+    /// [`Self::project_name`].
+    pub fn project_literal(&mut self, obj: &Obj) -> Result<Literal, ConvertError> {
+        self.enter("literal")?;
+        self.literal(obj)
+    }
+
     fn literal(&mut self, obj: &Obj) -> Result<Literal, ConvertError> {
         if obj.is_scalar() {
             return Err(malformed(
