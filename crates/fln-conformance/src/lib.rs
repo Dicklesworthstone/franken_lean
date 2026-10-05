@@ -35,6 +35,10 @@
 //!   reachable from `fln_kernel::check` (bead `franken_lean-z8j.1.17`), read from the
 //!   `tcb-probe` binary's symbol table, so the trust base outside `fln-kernel/src` is counted
 //!   from the real call graph rather than a hand-kept list;
+//! * [`stdlib_frontier`] — the stdlib frontier coverage ratchet (bead
+//!   `franken_lean-z8j.1.16`): a fresh `check-olean --continue --json` frontier against the
+//!   retained receipt, failing on a lost module, a lost acceptance or a changed declaration
+//!   count, and reporting additions as improvements;
 //! * [`campaign`] — the Tribunal campaign frameworks (bead `fln-td9`): the mutation kill
 //!   ledger model, where a kill is only ever a stated-reason failure, inconclusive is
 //!   never promoted either way, and the denominator cannot shrink without evidence;
@@ -66,6 +70,7 @@ pub mod poison;
 pub mod precedence;
 pub mod public_surface;
 mod public_surface_generated;
+pub mod stdlib_frontier;
 pub mod suite_upgrade;
 pub mod syntax_hygiene;
 pub mod tcb_inventory;
