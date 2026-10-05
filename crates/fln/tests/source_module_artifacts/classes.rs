@@ -1,4 +1,5 @@
 //! Source class declarations survive compiled library boundaries and cache reuse.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};

@@ -1,4 +1,5 @@
 //! Real serialized artifact closures exercise the private per-module receipt.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_check::modules::{
     SourceModuleBuildError, SourceModuleCacheLimits, SourceModuleCheck, SourceModuleCheckError,

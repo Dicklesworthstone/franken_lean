@@ -1,4 +1,5 @@
 //! Installed commands must use the context receipt, not the full ambient engine.
+#![forbid(unsafe_code)]
 use super::*;
 
 fn lake(project: &Project, targets: &[&str]) -> Output {

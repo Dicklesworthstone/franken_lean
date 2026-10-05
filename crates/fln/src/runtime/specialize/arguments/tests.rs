@@ -408,4 +408,5 @@ fn late_static_arguments_use_a_bounded_heap_telescope() {
         .unwrap();
 }
 
+#[cfg(test)]
 mod stages;

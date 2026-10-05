@@ -1,4 +1,5 @@
 //! Nonlocal returns use ordinary source dictionaries, both checkers and Golem.
+#![forbid(unsafe_code)]
 use super::*;
 
 #[test]

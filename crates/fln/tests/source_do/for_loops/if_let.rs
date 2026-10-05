@@ -1,4 +1,5 @@
 //! Real pattern conditions pass source checking, both council seats, and Golem.
+#![forbid(unsafe_code)]
 use super::*;
 
 fn library() -> Engine {

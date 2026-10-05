@@ -1,4 +1,5 @@
 //! Source text -> branch sequences -> both checkers -> native Golem execution.
+#![forbid(unsafe_code)]
 use super::*;
 
 const PROGRAMS: &str = r#"

@@ -1,4 +1,5 @@
 //! Change only the declared safety of independently built inductive fixtures.
+#![forbid(unsafe_code)]
 use fln_checker::environment::{ConstantDeclaration, ConstantEntry, ConstantSafety};
 
 pub fn retag(entry: &ConstantEntry, safety: ConstantSafety) -> ConstantEntry {

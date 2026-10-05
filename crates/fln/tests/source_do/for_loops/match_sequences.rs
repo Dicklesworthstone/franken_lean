@@ -1,4 +1,5 @@
 //! Native source matches share the same checked branch and runtime pipeline.
+#![forbid(unsafe_code)]
 use super::*;
 
 const PROGRAMS: &str = r#"

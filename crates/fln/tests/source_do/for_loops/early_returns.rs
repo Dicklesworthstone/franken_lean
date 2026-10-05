@@ -1,4 +1,5 @@
 //! Guarded returns keep the enclosing do result, not a branch's unit result.
+#![forbid(unsafe_code)]
 use super::*;
 
 #[test]

@@ -1,4 +1,5 @@
 //! Real source and real State dictionaries distinguish loop exit from iteration exit.
+#![forbid(unsafe_code)]
 use super::*;
 
 const PROGRAMS: &str = r#"

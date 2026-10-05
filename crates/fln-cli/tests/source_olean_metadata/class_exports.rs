@@ -1,4 +1,5 @@
 //! Installed Lake builds retain classes, not only their record declarations.
+#![forbid(unsafe_code)]
 use super::*;
 
 fn build(project: &Project, targets: &[&str]) -> Output {

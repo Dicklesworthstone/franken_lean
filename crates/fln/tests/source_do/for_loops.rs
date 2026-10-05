@@ -1,5 +1,6 @@
 //! Real source -> class inference -> declaration council -> Golem regressions.
 //! The miniature libraries are ordinary source declarations, not trusted fixtures.
+#![forbid(unsafe_code)]
 use super::{checked, limits};
 use fln::{Engine, EngineExecutionLimits, KVMap, VmExit};
 

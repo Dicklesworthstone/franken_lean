@@ -1,4 +1,5 @@
 //! Source-level conditional control flow retains both council seats and Golem.
+#![forbid(unsafe_code)]
 use super::*;
 
 const PROGRAMS: &str = r#"

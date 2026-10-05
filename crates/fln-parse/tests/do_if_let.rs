@@ -1,4 +1,5 @@
 //! Pattern conditions use the ordinary pattern parser without inventing do scopes.
+#![forbid(unsafe_code)]
 use fln_parse::parse_definition;
 use fln_syntax::tree::Syntax;
 
