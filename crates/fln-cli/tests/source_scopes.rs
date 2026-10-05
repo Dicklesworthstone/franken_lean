@@ -57,12 +57,14 @@ fn installed_cli_checks_scoped_polymorphic_recursion_without_execution() {
 fn invalid_scope_suffixes_emit_no_success_or_artifacts() {
     for (source, outcome, authority) in [
         ("def pfx := 7\nnamespace A\nend B", "input", false),
-        // After restoring the root scope, preserve the existing K1 diagnostic
-        // reconstruction for an unknown constant, rather than relabeling it.
+        // After restoring the root scope, `value` is unknown again. The pin reports it during
+        // elaboration (`8:11: error(lean.unknownIdentifier): Unknown identifier `value``;
+        // v4.32.0, 2026-10-05), so this is an elaboration refusal, not a K1 rejection of a
+        // rebuilt candidate.
         (
             "namespace A\ndef value := 7\nend A\nsection\nopen A\ndef pfx := value\nend\ndef bad := value",
-            "kernel-rejection",
-            true,
+            "elaboration",
+            false,
         ),
         ("def pfx := 7\nopen Missing", "input", false),
     ] {

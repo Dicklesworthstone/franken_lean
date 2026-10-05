@@ -35,10 +35,10 @@ pub mod mvar;
 pub mod perturbation;
 pub mod protected_names;
 pub mod records;
+pub mod reducibility;
 pub mod scheduler;
 pub mod seed;
 pub mod source;
-mod source_diagnostic;
 pub mod txn;
 pub mod universe;
 
@@ -502,13 +502,45 @@ pub fn elaborate_definition_in_with_budget(
     environment: &Environment,
     budget: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::definition(syntax, environment, budget) {
-        Err(
-            error @ NatDefinitionElabError::Inference(
-                source::SourceInferenceError::UnknownConstant(_),
-            ),
-        ) => source_diagnostic::definition(syntax, environment, budget).ok_or(error),
-        result => result,
+    // An unknown name is an elaboration error, reported as the pin reports it. There is no
+    // K1 detour: a candidate rebuilt only to be kernel-rejected would relabel the pin's
+    // elaboration error as a kernel rejection.
+    source::definition(syntax, environment, budget)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// The pin words an unknown name `Unknown constant` when a proper prefix of it is a
+/// constant (`Nat.nope`, `f.nope`, `Nat.succ.nope`) and `Unknown identifier` otherwise
+/// (`missing`, `Foo.b` when only the namespace `Foo` exists), both under
+/// `lean.unknownIdentifier`. Measured on the pinned `lean` (v4.32.0), 2026-10-05.
+/// A dotted name on a local function (`f.nope` with `def f`) never reaches here: it is
+/// taken as field notation and refused as an unknown record field (fln-dyfz).
+///
+/// Only the error is passed: the elaborator's entry points run on small host stacks, so the
+/// success value is never moved through an extra frame.
+#[inline(never)]
+fn with_pin_unknown_name_wording(
+    error: NatDefinitionElabError,
+    environment: &Environment,
+) -> NatDefinitionElabError {
+    match error {
+        NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(name)) => {
+            let mut prefix = name.parent();
+            let mut under_constant = false;
+            while !prefix.is_anonymous() {
+                if environment.contains(&prefix) {
+                    under_constant = true;
+                    break;
+                }
+                prefix = prefix.parent();
+            }
+            NatDefinitionElabError::Inference(if under_constant {
+                source::SourceInferenceError::UnknownMemberConstant(name)
+            } else {
+                source::SourceInferenceError::UnknownConstant(name)
+            })
+        }
+        error => error,
     }
 }
 
@@ -536,16 +568,9 @@ pub fn elaborate_evaluation_in_with_budget(
     environment: &Environment,
     budget: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::query(syntax, generated_name.clone(), environment, budget, true) {
-        Err(
-            error @ NatDefinitionElabError::Inference(
-                source::SourceInferenceError::UnknownConstant(_),
-            ),
-        ) => {
-            source_diagnostic::evaluation(syntax, generated_name, environment, budget).ok_or(error)
-        }
-        result => result,
-    }
+    // As for definitions: an unknown name is the pin's elaboration error, not a K1 rejection.
+    source::query(syntax, generated_name, environment, budget, true)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a

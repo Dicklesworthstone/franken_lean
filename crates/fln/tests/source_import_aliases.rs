@@ -45,6 +45,21 @@ const ACCEPTED: &[&str] = &[
     "theorem t : decide (2 + 2 = 4) = true := rfl",
 ];
 
+/// Names nothing provides, with the pin's message for each file (`prelude`,
+/// `import Init.Core`, the line), run as above on 2026-10-05:
+/// `3:16: error(lean.unknownIdentifier): Unknown identifier `fooBarUnknown``, and the same at
+/// 3:16 for `notAnExportedName`.
+const UNKNOWN: &[(&str, &str)] = &[
+    (
+        "def b : Bool := fooBarUnknown (2 = 2)",
+        "Unknown identifier `fooBarUnknown`",
+    ),
+    (
+        "def u : Bool := notAnExportedName true",
+        "Unknown identifier `notAnExportedName`",
+    ),
+];
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -215,16 +230,24 @@ fn imported_export_aliases_resolve_as_the_pins_names() {
                     "{source} must be admitted: {checked:?}"
                 );
             }
-            // A name no declaration and no alias provides is still refused.
+            // A name no declaration and no alias provides is refused at elaboration, in the
+            // pin's words, never as a kernel rejection of a reference to a missing constant.
             let before = engine.logical_root(&KVMap::new());
-            let unknown = "def u : Bool := notAnExportedName true";
-            assert!(
-                engine
+            for (unknown, expected) in UNKNOWN {
+                let refused = engine
                     .check_source_files(&[unknown.as_bytes()], &KVMap::new(), limits)
-                    .is_err(),
-                "{unknown} must be refused"
-            );
-            assert_eq!(engine.logical_root(&KVMap::new()), before);
+                    .expect_err(unknown);
+                assert_eq!(
+                    refused.disposition().0,
+                    "elaboration",
+                    "{unknown}: {refused}"
+                );
+                assert!(
+                    refused.to_string().contains(expected),
+                    "{unknown}: {refused}"
+                );
+                assert_eq!(engine.logical_root(&KVMap::new()), before);
+            }
         })
         .expect("spawn the checking thread")
         .join()

@@ -57,6 +57,9 @@ pub struct SourceMetadataReport {
     /// `protected` declarations (the pin's `protectedExt`), activated so that an
     /// atomic identifier does not resolve to one.
     pub protected: usize,
+    /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
+    /// `instances` transparency instance selection runs at.
+    pub reducibility: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -277,6 +280,7 @@ impl Engine {
             metadata::DEFAULT_EXTENSION,
             metadata::ALIAS_EXTENSION,
             metadata::PROTECTED_EXTENSION,
+            metadata::REDUCIBILITY_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -326,6 +330,7 @@ impl Engine {
                 scoped_instances: 0,
                 aliases: 0,
                 protected: 0,
+                reducibility: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -351,7 +356,8 @@ impl Engine {
                         1 => report.instances = block.entries.len(),
                         2 => report.defaults = block.entries.len(),
                         3 => report.aliases = block.entries.len(),
-                        _ => report.protected = block.entries.len(),
+                        4 => report.protected = block.entries.len(),
+                        _ => report.reducibility = block.entries.len(),
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
@@ -370,6 +376,7 @@ impl Engine {
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
+        let mut reducibility = decoded.reducibility.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
@@ -513,6 +520,30 @@ impl Engine {
                     reason,
                 }
             })?;
+            for _ in 0..report.reducibility {
+                cancelled!("source-olean/reducibility");
+                let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
+                    "reducibility count changed during decode",
+                ))?;
+                activation = activation
+                    .register_reducibility(&row.declaration, reducibility_status(row.status))
+                    .map_err(|error| SourceOleanImportError::Metadata {
+                        module: report.module.clone(),
+                        declaration: row.declaration.clone(),
+                        reason: match error {
+                            fln_elab::reducibility::ReducibilityError::UnknownDeclaration(_) => {
+                                "a reducibility status names no admitted declaration"
+                            }
+                            fln_elab::reducibility::ReducibilityError::Limit => {
+                                "reducibility journal limit"
+                            }
+                            fln_elab::reducibility::ReducibilityError::Malformed
+                            | fln_elab::reducibility::ReducibilityError::Instances(_) => {
+                                "malformed reducibility status"
+                            }
+                        },
+                    })?;
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -528,6 +559,7 @@ impl Engine {
             || defaults.next().is_some()
             || aliases.next().is_some()
             || protected.next().is_some()
+            || reducibility.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
@@ -582,6 +614,11 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError>;
+    fn register_reducibility(
+        self,
+        declaration: &Name,
+        status: fln_elab::reducibility::Reducibility,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -626,6 +663,13 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
         self.register_protected(declarations)
     }
+    fn register_reducibility(
+        self,
+        declaration: &Name,
+        status: fln_elab::reducibility::Reducibility,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+        self.register_reducibility(declaration, status)
+    }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
     }
@@ -643,6 +687,19 @@ fn instance_key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
         InstanceKey::Const(name, arity) => Key::Const(name, arity),
         InstanceKey::Arrow => Key::Arrow,
         InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+    }
+}
+
+/// The decoded olean status as the elaborator's.
+fn reducibility_status(
+    status: metadata::ReducibilityStatus,
+) -> fln_elab::reducibility::Reducibility {
+    use fln_elab::reducibility::Reducibility;
+    match status {
+        metadata::ReducibilityStatus::Reducible => Reducibility::Reducible,
+        metadata::ReducibilityStatus::Semireducible => Reducibility::Semireducible,
+        metadata::ReducibilityStatus::Irreducible => Reducibility::Irreducible,
+        metadata::ReducibilityStatus::ImplicitReducible => Reducibility::ImplicitReducible,
     }
 }
 
@@ -950,6 +1007,13 @@ pub(super) mod tests {
             declarations: &[Name],
         ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
             fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_reducibility(
+            self,
+            declaration: &Name,
+            status: fln_elab::reducibility::Reducibility,
+        ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+            fln_elab::reducibility::register(&self.0, declaration, status).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)

@@ -361,7 +361,9 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(!piped_late_refusal.status.success());
     assert!(piped_late_refusal.stdout.is_empty());
     assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&piped_late_refusal.stderr).contains("unknown constant"));
+    // The pin, on this stdin: `<stdin>:2:20: error(lean.unknownIdentifier): Unknown
+    // identifier `missing`` (v4.32.0, 2026-10-05). An elaboration error, not a K1 rejection.
+    assert!(utf8(&piped_late_refusal.stderr).contains("Unknown identifier `missing`"));
 
     let piped_budget_stop = run_lean_stdin(
         &[Path::new("--stdin"), Path::new("--max-bytes=1")],
@@ -436,7 +438,9 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
     assert!(utf8(&refused.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&refused.stderr).contains("unknown constant"));
+    // The pin on this file: `2:20: error(lean.unknownIdentifier): Unknown identifier
+    // `missing`` (v4.32.0, 2026-10-05).
+    assert!(utf8(&refused.stderr).contains("Unknown identifier `missing`"));
 
     std::fs::write(&source, b"def answer : Nat := 40 + 2\n#eval answer\n")
         .expect("repair the refused source");
@@ -797,7 +801,9 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(!late_refusal.status.success());
     assert!(late_refusal.stdout.is_empty());
     assert!(utf8(&late_refusal.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&late_refusal.stderr).contains("unknown constant"));
+    // The pin on this project (Base and Middle compiled to .olean, then Main): `3:20:
+    // error(lean.unknownIdentifier): Unknown identifier `missing`` (v4.32.0, 2026-10-05).
+    assert!(utf8(&late_refusal.stderr).contains("Unknown identifier `missing`"));
 
     let late_product = root.join("LateFailure.flbc");
     let late_fln = run_fln(&[

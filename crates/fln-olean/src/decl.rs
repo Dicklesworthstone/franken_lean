@@ -4385,6 +4385,101 @@ mod tests {
         );
     }
 
+    /// A `Name.num` component wider than `u64` decodes to `Unsupported`, the
+    /// construct named, and never to a shape refusal: Lean allows the name and
+    /// FrankenLean's `Name` cannot carry it yet. Nothing in the pinned stdlib has one
+    /// (the mpz census above), so the plant points a real `Name.num` slot at the
+    /// two-limb `mpz` the same module already holds for a literal.
+    #[test]
+    fn a_name_num_component_wider_than_u64_is_unsupported_not_malformed() {
+        let wide = NatLit::from_limbs_le(vec![5, 1]);
+        let mut bytes = encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: Name::num(Name::from_components(["Demo"]), 7),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    value: Expr::lit(Literal::Nat(wide)),
+                    hints: ReducibilityHints::Regular(5),
+                    safety: DefinitionSafety::Safe,
+                    all: Vec::new(),
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes;
+        let view = OleanView::parse(&bytes).expect("header");
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
+            .expect("DefinitionVal object");
+        let cv_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let name_off = view
+            .deref(view.read_u64(cv_off + 8).expect("name pointer"))
+            .expect("Name object");
+        assert_eq!(
+            view.obj_header(name_off).expect("name header").0,
+            2,
+            "Name.num"
+        );
+        let slot = name_off as usize + 16;
+        assert_eq!(
+            view.read_u64(name_off + 16).expect("component"),
+            (7 << 1) | 1,
+            "a boxed scalar component"
+        );
+        // The value is `Expr.lit (Literal.natVal wide)`: two hops to the mpz pointer.
+        let lit_off = view
+            .deref(view.read_u64(val_off + 16).expect("value pointer"))
+            .expect("Expr.lit object");
+        let literal_off = view
+            .deref(view.read_u64(lit_off + 8).expect("literal pointer"))
+            .expect("Literal object");
+        let mpz = view.read_u64(literal_off + 8).expect("mpz pointer");
+        assert_eq!(mpz & 1, 0, "a two-limb natural is a heap mpz");
+        bytes[slot..slot + 8].copy_from_slice(&mpz.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a component wider than u64 cannot become a Name");
+        assert!(
+            matches!(
+                error,
+                DeclError::Unsupported {
+                    what: "Name.num mpz",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A scalar `ReducibilityHints` outside `{0, 1}` is refused rather than
     /// read as opaque or abbrev.
     ///

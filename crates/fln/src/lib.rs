@@ -823,6 +823,21 @@ impl OleanDecodeError {
             )
     }
 
+    /// The construct the decoder stopped at because it does not interpret it yet,
+    /// when that is the whole reason: a limit of this implementation, not a fault in
+    /// the input (FL-INV-07). Today that is a `Name.num` whose component needs an
+    /// `mpz`.
+    pub fn unsupported_construct(&self) -> Option<&'static str> {
+        match self {
+            Self::Declaration(OleanDeclarationError::Unsupported { what, .. })
+            | Self::CompanionDeclaration {
+                error: OleanDeclarationError::Unsupported { what, .. },
+                ..
+            } => Some(what),
+            _ => None,
+        }
+    }
+
     /// Whether the host refused a reservation the decoder needed: a non-answer
     /// about this host, never a property of the input.
     pub const fn is_host_allocation_refusal(&self) -> bool {
@@ -1507,6 +1522,20 @@ fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
             OleanModuleVerdict::Inconclusive(Inconclusive::dependency_unavailable(format!(
                 "host memory: {error}"
             )))
+        }
+        // A construct this implementation cannot judge yet is a non-answer about the
+        // tool, never evidence against the module (FL-INV-07): a payload the decoder
+        // does not interpret, or an envelope the checker facade cannot rebuild.
+        OleanCheckError::Decode(decode) | OleanCheckError::ModuleDecode { error: decode, .. }
+            if decode.unsupported_construct().is_some() =>
+        {
+            OleanModuleVerdict::Inconclusive(Inconclusive::unsupported(error.to_string()))
+        }
+        OleanCheckError::UnsupportedDeclaration { .. }
+        | OleanCheckError::MutualEnvelopeUnsupported { .. }
+        | OleanCheckError::InductiveEnvelopeUnsupported { .. }
+        | OleanCheckError::QuotientEnvelopeUnsupported { .. } => {
+            OleanModuleVerdict::Inconclusive(Inconclusive::unsupported(error.to_string()))
         }
         OleanCheckError::Decode(decode) | OleanCheckError::ModuleDecode { error: decode, .. } => {
             match decode.resource_usage() {
@@ -10287,6 +10316,22 @@ mod tests {
         EngineExecutionLimits::new(test_budget())
     }
 
+    /// The pin-worded message of an elaboration-time unknown name, if `error` is one (also
+    /// through a batch command). `None` for every other refusal, K1's included.
+    fn unknown_name_message(error: &EngineExecutionError) -> Option<String> {
+        use fln_elab::source::SourceInferenceError;
+        match error {
+            EngineExecutionError::BatchCommand { error, .. } => unknown_name_message(error),
+            EngineExecutionError::Frontend(super::DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    inference @ (SourceInferenceError::UnknownConstant(_)
+                    | SourceInferenceError::UnknownMemberConstant(_)),
+                ),
+            )) => Some(inference.to_string()),
+            _ => None,
+        }
+    }
+
     fn seeded_engine() -> Engine {
         Engine::with_nat_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the Nat seed council does not reject")
@@ -14967,11 +15012,15 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the Nat-only constructor must not silently invent String authority");
-        assert!(matches!(
-            missing_type,
-            EngineExecutionError::KernelRejected { ref message, .. }
-                if message.contains("String")
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) reports
+        // `Unknown constant `String`` at the literal, having auto-bound the unknown annotation
+        // `String` as an implicit; this door has no auto-bound implicits and stops at the
+        // annotation.
+        assert_eq!(
+            unknown_name_message(&missing_type).as_deref(),
+            Some("Unknown identifier `String`"),
+            "{missing_type:?}"
+        );
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the source seed passes the dual-checker council")
@@ -15162,14 +15211,20 @@ mod tests {
                 test_limits(),
             )
             .expect_err("a later definition refusal exposes no partial evaluation batch");
-        assert!(matches!(
-            refusal,
-            EngineExecutionError::BatchCommand {
-                index: 1,
-                error,
-                ..
-            } if matches!(*error, EngineExecutionError::KernelRejected { .. })
-        ));
+        // The pin on this file: `2:14: error(lean.unknownIdentifier): Unknown identifier
+        // `missing`` (v4.32.0, 2026-10-05), an elaboration error.
+        assert!(
+            matches!(
+                &refusal,
+                EngineExecutionError::BatchCommand {
+                    index: 1,
+                    error,
+                    ..
+                } if unknown_name_message(error).as_deref()
+                    == Some("Unknown identifier `missing`")
+            ),
+            "{refusal:?}"
+        );
         assert_eq!(engine.logical_root(&options), base_root);
 
         let recovered = engine
@@ -16110,13 +16165,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.add 40 2", &options, test_limits())
             .expect_err("the Nat-only seed must not invent the Nat.add constant");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error, as at the pin: a `prelude` file declaring only `Nat` gets
+        // `error(lean.unknownIdentifier): Unknown constant `Nat.add`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.add`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16165,24 +16220,26 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := 40 + 2", &options, test_limits())
             .expect_err("notation must not invent Nat.add authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) stops one step
+        // earlier, at `Unknown constant `OfNat``, because its numerals elaborate through
+        // `OfNat`; this seed's numerals are native, so the first missing constant is `Nat.add`.
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.add`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         let missing_equality = nat_only
             .execute_source_definition(b"def equal : Bool := 40 == 42", &options, test_limits())
             .expect_err("notation must not invent Nat.beq authority");
-        assert!(matches!(
-            missing_equality,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error at the first missing name, the annotation's `Bool`. The pin has
+        // no faithful analog: without `Init`, `==` is not even a token (a `prelude` file
+        // declaring only `Nat` gets `Unknown constant `OfNat`` and `expected token`).
+        assert_eq!(
+            unknown_name_message(&missing_equality).as_deref(),
+            Some("Unknown identifier `Bool`"),
+            "{missing_equality:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
@@ -16283,13 +16340,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.pred 9", &options, test_limits())
             .expect_err("the Nat type alone must not invent Nat.pred authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring only `Nat` gets
+        // `Unknown constant `Nat.pred`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.pred`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16360,13 +16417,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.log2 8", &options, test_limits())
             .expect_err("the Nat type alone must not invent Nat.log2 authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring only `Nat` gets
+        // `Unknown constant `Nat.log2`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.log2`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16546,13 +16603,13 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the String-only engine must not invent String.append authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `String.append`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `String.append`"),
+            "{missing:?}"
+        );
         assert_eq!(string_only.logical_root(&options), base_root);
         assert!(
             !string_only
@@ -16605,13 +16662,13 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the String type alone must not invent String.length authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `String.length`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `String.length`"),
+            "{missing:?}"
+        );
         assert_eq!(string_only.logical_root(&options), base_root);
         assert!(
             !string_only
@@ -16662,13 +16719,13 @@ mod tests {
         let missing = unseeded
             .execute_source_definition(b"def answer := Nat.beq 42 42", &options, test_limits())
             .expect_err("the scalar types alone must not invent Nat.beq authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `Nat.beq`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.beq`"),
+            "{missing:?}"
+        );
         assert_eq!(unseeded.logical_root(&options), base_root);
         assert!(
             !unseeded
@@ -16731,13 +16788,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := true", &options, test_limits())
             .expect_err("the Nat-only door must not invent Bool constructor authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) says
+        // `Unknown identifier `true``; this door names the constructor it resolved `true` to.
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown identifier `Bool.true`"),
+            "{missing:?}"
+        );
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the exact Bool block passes the dual-checker council")
@@ -18524,5 +18581,137 @@ mod tests {
                 "malformed input, or a stop that cannot show its overrun, stays failed, got {verdict:?}"
             );
         }
+    }
+
+    /// A construct this implementation cannot judge yet is a typed `Unsupported`
+    /// non-answer naming the construct, never `failed` (FL-INV-07): the decoder's
+    /// `Name.num` that needs an `mpz`, and the planner's four `*Unsupported` refusals.
+    /// None occurs in the stdlib receipt or S20's 5,712 rows, so each is planted. A
+    /// genuinely malformed declaration payload stays `failed`.
+    #[test]
+    fn frontier_rows_type_unsupported_constructs_as_inconclusive_naming_them() {
+        use fln_core::outcome::{Inconclusive, InconclusiveCause};
+
+        let module = Name::from_components(["Planted"]);
+        let name = |text: &str| Name::from_components(text.split('.'));
+        let mpz = || OleanDeclarationError::Unsupported {
+            offset: 4096,
+            what: "Name.num mpz",
+        };
+        let cases = [
+            (
+                OleanCheckError::Decode(OleanDecodeError::Declaration(mpz())),
+                "Name.num mpz",
+            ),
+            (
+                OleanCheckError::ModuleDecode {
+                    module: module.clone(),
+                    error: OleanDecodeError::CompanionDeclaration {
+                        part: super::OleanCompanionPart::Private,
+                        error: mpz(),
+                    },
+                },
+                "Name.num mpz",
+            ),
+            (
+                OleanCheckError::UnsupportedDeclaration {
+                    name: name("Planted.Quot"),
+                    kind: "quotient",
+                },
+                "Planted.Quot",
+            ),
+            (
+                OleanCheckError::MutualEnvelopeUnsupported {
+                    name: name("Planted.left"),
+                    members: vec![name("Planted.left"), name("Planted.right")],
+                },
+                "mutual declaration envelope for `Planted.left`",
+            ),
+            (
+                OleanCheckError::InductiveEnvelopeUnsupported {
+                    name: name("Planted.T"),
+                    members: vec![name("Planted.T.mk")],
+                },
+                "inductive declaration envelope for `Planted.T`",
+            ),
+            (
+                OleanCheckError::QuotientEnvelopeUnsupported {
+                    names: vec![name("Quot"), name("Quot.mk")],
+                },
+                "quotient initialization envelope",
+            ),
+        ];
+        for (error, construct) in cases {
+            let verdict = super::frontier_error_verdict(error);
+            match &verdict {
+                super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::Unsupported { construct: named },
+                    ..
+                }) => assert!(
+                    named.text().contains(construct),
+                    "the row names the construct `{construct}`: {named:?}"
+                ),
+                other => panic!("an unsupported construct is a typed non-answer, got {other:?}"),
+            }
+        }
+        let malformed = super::frontier_error_verdict(OleanCheckError::Decode(
+            OleanDecodeError::Declaration(OleanDeclarationError::Shape {
+                offset: 64,
+                what: "planted shape",
+            }),
+        ));
+        assert!(
+            matches!(malformed, super::OleanModuleVerdict::Failed(_)),
+            "malformed input stays failed, got {malformed:?}"
+        );
+    }
+
+    /// The real frontier over a real artifact whose mutual definitions name a member
+    /// list the planner cannot rebuild: the row is an `Unsupported` non-answer naming
+    /// the declaration, and the well-formed control is accepted.
+    #[test]
+    fn a_planted_unbuildable_mutual_envelope_is_an_unsupported_frontier_row() {
+        use fln_core::outcome::{Inconclusive, InconclusiveCause};
+
+        let engine = Engine::from_environment(Environment::new());
+        let module = Name::from_components(["Planted"]);
+        let row = |constants: &[ConstantInfo]| {
+            let bytes = standalone_olean(constants);
+            let inputs = [OleanModuleInput {
+                name: &module,
+                artifact: &bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }];
+            let frontier = engine
+                .check_olean_frontier(
+                    &inputs,
+                    &KVMap::new(),
+                    OleanCheckLimits::new(bytes.len(), test_budget()),
+                )
+                .expect("a one-module set is a frontier, not a whole-set refusal");
+            assert_eq!(frontier.rows.len(), 1);
+            frontier.rows.into_iter().next().expect("one row").verdict
+        };
+        let mut mismatched = mutual_olean_declarations();
+        let ConstantInfo::Defn(right) = &mut mismatched[0] else {
+            panic!("the fixture's first row is the right mutual definition")
+        };
+        right.all.reverse();
+        match row(&mismatched) {
+            super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::Unsupported { construct },
+                ..
+            }) => assert!(
+                construct.text().contains("Fixture.mutualRight"),
+                "the row names the declaration: {construct:?}"
+            ),
+            other => panic!("an unbuildable envelope is not a failed module, got {other:?}"),
+        }
+        let control = row(&mutual_olean_declarations());
+        assert!(
+            matches!(control, super::OleanModuleVerdict::Accepted { .. }),
+            "the well-formed mutual block is accepted, got {control:?}"
+        );
     }
 }

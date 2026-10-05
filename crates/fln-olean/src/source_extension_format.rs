@@ -12,6 +12,7 @@
 //! src/Lean/EnvExtension.lean: sha256 18086b4119360fad18b8434e2e0b3ef6f52d23f57a4d93ca4f7f7ffbe0685e87
 //! src/Lean/Meta/DiscrTree/Types.lean: sha256 c2964c861300247b99afb068c5c77046c8f746b8881e9cfb81e63195ba3d3773
 //! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
+//! src/Lean/ReducibilityAttrs.lean: sha256 8d11c2c5d9217eb7034426217b2075526ca4e55f1fdb73d8475d5034f3a6b1a2
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -84,3 +85,8 @@ pub const KEY_CONST_POINTERS: usize = 2;
 pub const KEY_ARROW: u8 = 5;
 pub const KEY_PROJ: u8 = 6;
 pub const KEY_PROJ_POINTERS: usize = 3;
+pub const REDUCIBILITY_EXTENSION: &str = "reducibilityCore";
+pub const REDUCIBILITY_REDUCIBLE: usize = 0;
+pub const REDUCIBILITY_SEMIREDUCIBLE: usize = 1;
+pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;
+pub const REDUCIBILITY_IMPLICIT_REDUCIBLE: usize = 3;

@@ -51,6 +51,10 @@ pub use pending::{PendingAnswer, PendingSynthesis};
 pub enum UnificationTransparency {
     None,
     Abbreviations,
+    /// The pin's `instances` transparency, at which instance selection runs:
+    /// abbreviations, plus definitions whose reducibility status is `reducible`
+    /// or `implicitReducible` (instances among them; bead fln-gkhu).
+    Instances,
     SafeDefinitions,
 }
 
@@ -116,6 +120,8 @@ pub enum UnificationError {
     HeartbeatLimit,
     LooseBoundVariable,
     ExpressionScope,
+    /// The reducibility journal an `Instances` unfold consults could not be read.
+    Reducibility(crate::reducibility::ReducibilityError),
     Metavariable(MetavarError),
     Universe(UniverseInstantiationError),
     /// A native proof-conversion check stopped without a Boolean answer.
@@ -150,6 +156,7 @@ impl std::fmt::Display for UnificationError {
             }
             Self::Metavariable(error) => write!(f, "{error}"),
             Self::Universe(error) => write!(f, "{error}"),
+            Self::Reducibility(error) => write!(f, "{error}"),
             Self::ConversionCheck { .. } => {
                 write!(f, "kernel proof-conversion check did not complete")
             }

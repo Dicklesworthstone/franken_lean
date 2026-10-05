@@ -17,13 +17,17 @@
 //! # The goal side may lose precision, never a candidate
 //!
 //! The pin keys a goal subterm after `reduceDT`: `whnfCore`, then unfolding
-//! every definition whose `ReducibilityStatus` is `reducible`. FrankenLean does
-//! not hold that status yet (bead `fln-gkhu`), so a goal key never claims more
-//! than is known, and each uncertainty widens the query instead:
+//! every definition whose `ReducibilityStatus` is `reducible`. A goal key never
+//! claims more than is known, and each uncertainty widens the query instead:
 //!
 //! - A constant that is not a definition is never unfolded: an inductive type,
 //!   constructor, axiom, theorem, opaque constant, `Quot` or `Quot.mk`.
-//! - A definition is known *not* reducible when some stored path, at a non-root
+//! - A definition with a recorded status (`crate::reducibility`, bead
+//!   `fln-gkhu`) is unfolded and keyed by its unfolding alone when it is
+//!   `reducible`, and kept folded otherwise. An unreadable status journal makes
+//!   it a star.
+//! - A definition with no recorded status is known *not* reducible when some
+//!   stored path, at a non-root
 //!   position, keeps it folded. The pin's `reduce` unfolds every reducible head
 //!   it meets, and unfolding a definition that is neither a matcher nor smart
 //!   unfolded always succeeds, so a folded occurrence is the pin's own record
@@ -415,6 +419,8 @@ impl InstanceIndex {
 enum Head {
     /// Never unfolded.
     Folded,
+    /// Always unfolded: a definition whose recorded status is `reducible`.
+    Unfold,
     /// Unfolded if reducible, which is not known here.
     Either,
     /// Reduced by rules not modelled here.
@@ -440,11 +446,17 @@ impl Query<'_> {
             Some(ConstantInfo::Defn(_)) => {
                 let smart = Name::str(name.clone(), "_sunfold");
                 if is_matcher(name) || self.env.find(&smart).is_some() {
-                    Head::Star
-                } else if self.folded.contains(name) {
-                    Head::Folded
-                } else {
-                    Head::Either
+                    return Head::Star;
+                }
+                // The pin's `reduce` unfolds exactly the `reducible` heads
+                // (`withReducible`), so a recorded status decides; an unreadable
+                // journal decides nothing and widens to a star.
+                match crate::reducibility::known_status(self.env, name) {
+                    Ok(Some(crate::reducibility::Reducibility::Reducible)) => Head::Unfold,
+                    Ok(Some(_)) => Head::Folded,
+                    Ok(None) if self.folded.contains(name) => Head::Folded,
+                    Ok(None) => Head::Either,
+                    Err(_) => Head::Star,
                 }
             }
             Some(ConstantInfo::Rec(_)) | None => Head::Star,
@@ -471,22 +483,25 @@ impl Query<'_> {
             match head.node() {
                 ExprNode::Lit { literal } => out.push((Key::Lit(literal.clone()), Vec::new())),
                 ExprNode::Const { name, .. } => {
-                    let unfold = match self.head(name) {
+                    let (folded, unfold) = match self.head(name) {
                         Head::Star => return star(),
-                        Head::Folded => false,
-                        Head::Either => true,
+                        Head::Folded => (true, false),
+                        Head::Unfold => (false, true),
+                        Head::Either => (true, true),
                     };
-                    // `toNatLit?` reads the term `whnfCore` left, whose head
-                    // carries no metadata; its arguments keep theirs.
-                    let numeral = if root {
-                        None
-                    } else {
-                        numeral(&args.iter().rev().cloned().fold(head.clone(), Expr::app))
-                    };
-                    out.push(match numeral {
-                        Some(value) => (Key::Lit(Literal::Nat(value)), Vec::new()),
-                        None => (Key::Const(name.clone(), arity), args.clone()),
-                    });
+                    if folded {
+                        // `toNatLit?` reads the term `whnfCore` left, whose head
+                        // carries no metadata; its arguments keep theirs.
+                        let numeral = if root {
+                            None
+                        } else {
+                            numeral(&args.iter().rev().cloned().fold(head.clone(), Expr::app))
+                        };
+                        out.push(match numeral {
+                            Some(value) => (Key::Lit(Literal::Nat(value)), Vec::new()),
+                            None => (Key::Const(name.clone(), arity), args.clone()),
+                        });
+                    }
                     if unfold {
                         // At the root `reduceUntilBadKey` may stop short of an
                         // unfolding; never filter on a root that may move.

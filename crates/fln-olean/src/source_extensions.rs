@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION,
-    SIMP_EXTENSION,
+    REDUCIBILITY_EXTENSION, SIMP_EXTENSION,
 };
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
@@ -77,6 +77,24 @@ pub struct AliasEntry {
     pub declaration: Name,
 }
 
+/// The pin's `ReducibilityStatus` (vendored `src/Lean/ReducibilityAttrs.lean`):
+/// which transparency modes may unfold a definition. `ImplicitReducible`
+/// unfolds at `instances` transparency and above; instances carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReducibilityStatus {
+    Reducible,
+    Semireducible,
+    Irreducible,
+    ImplicitReducible,
+}
+
+/// One `reducibilityCore` entry: a module's own declaration and its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducibilityEntry {
+    pub declaration: Name,
+    pub status: ReducibilityStatus,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceExtensions {
     pub classes: Vec<ClassEntry>,
@@ -87,6 +105,8 @@ pub struct SourceExtensions {
     /// `protected` declarations (the pin's `protectedExt`): each entry names one
     /// declaration its own module tagged. A name tagged twice is refused.
     pub protected: Vec<Name>,
+    /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
+    pub reducibility: Vec<ReducibilityEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -330,6 +350,24 @@ impl Reader {
             keys: self.keys(&field(&entry, format::INSTANCE_KEYS)?)?,
         })
     }
+    fn reducibility(&mut self, obj: &Obj) -> Result<ReducibilityEntry, DecodeError> {
+        constructor(obj, 0, format::PROD_POINTERS)?;
+        let status = field(obj, format::PROD_SND)?;
+        if !status.is_scalar() {
+            return Err(shape("reducibility status is not an enumeration value"));
+        }
+        let status = match status.unbox() {
+            format::REDUCIBILITY_REDUCIBLE => ReducibilityStatus::Reducible,
+            format::REDUCIBILITY_SEMIREDUCIBLE => ReducibilityStatus::Semireducible,
+            format::REDUCIBILITY_IRREDUCIBLE => ReducibilityStatus::Irreducible,
+            format::REDUCIBILITY_IMPLICIT_REDUCIBLE => ReducibilityStatus::ImplicitReducible,
+            _ => return Err(shape("unknown reducibility status")),
+        };
+        Ok(ReducibilityEntry {
+            declaration: self.name(&field(obj, format::PROD_FST)?)?,
+            status,
+        })
+    }
     fn alias(&mut self, obj: &Obj) -> Result<AliasEntry, DecodeError> {
         constructor(obj, 0, format::PROD_POINTERS)?;
         Ok(AliasEntry {
@@ -362,6 +400,7 @@ pub fn decode(
         name(format::SIMP_EXTENSION),
         name(format::ALIAS_EXTENSION),
         name(format::PROTECTED_EXTENSION),
+        name(format::REDUCIBILITY_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -411,7 +450,8 @@ pub fn decode(
                     }
                     out.protected.push(declaration);
                 }
-                _ => unreachable!("six selected extension families"),
+                6 => out.reducibility.push(reader.reducibility(&obj)?),
+                _ => unreachable!("seven selected extension families"),
             }
         }
     }

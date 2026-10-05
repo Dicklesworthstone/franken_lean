@@ -16946,7 +16946,8 @@ fn resource_exhaustion(v: &Outcome<Verdict>) -> Option<&ResourceUsage> {
             InconclusiveCause::ResourceExhausted { usage } => Some(usage),
             InconclusiveCause::Cancelled { .. }
             | InconclusiveCause::DependencyUnavailable { .. }
-            | InconclusiveCause::AuthorityIncomplete { .. } => None,
+            | InconclusiveCause::AuthorityIncomplete { .. }
+            | InconclusiveCause::Unsupported { .. } => None,
         },
         Outcome::Complete(_) | Outcome::InternalFault(_) => None,
     }
@@ -16995,6 +16996,13 @@ fn verdict_facts(v: &Outcome<Verdict>) -> (String, Option<String>, String, u64, 
                 "inconclusive:AuthorityIncomplete".into(),
                 None,
                 what.text().to_string(),
+                0,
+                0,
+            ),
+            InconclusiveCause::Unsupported { construct } => (
+                "inconclusive:Unsupported".into(),
+                None,
+                construct.text().to_string(),
                 0,
                 0,
             ),

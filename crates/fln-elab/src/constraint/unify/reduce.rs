@@ -99,79 +99,94 @@ impl Engine<'_> {
                         let argument = args.pop().expect("nonempty application spine");
                         head = self.substitute(body, &argument)?;
                     }
-                    ExprNode::Const { name, levels } => match self.work.env.find(name) {
-                        Some(ConstantInfo::Defn(definition))
-                            if definition.safety == DefinitionSafety::Safe
-                                && definition.base.level_params.len() == levels.len()
-                                && match self.budget.transparency {
-                                    UnificationTransparency::None => false,
-                                    UnificationTransparency::Abbreviations => {
-                                        definition.hints == ReducibilityHints::Abbrev
-                                    }
-                                    UnificationTransparency::SafeDefinitions => true,
-                                } =>
-                        {
-                            let value = definition.value.clone();
-                            let parameters = definition.base.level_params.clone();
-                            self.scan(&value)?;
-                            head = crate::universe::parameters::instantiate(
-                                || self.meter.node(),
-                                || UnificationError::ExpressionScope,
-                                &value,
-                                &parameters,
-                                levels,
-                            )?;
-                        }
-                        Some(ConstantInfo::Quot(_)) => {
-                            let Some(major) = self.quotient_major_index(&head, args.len())? else {
-                                break;
-                            };
-                            let value = args[args.len() - major - 1].clone();
-                            continuations.push(Continuation::Quotient {
-                                head,
-                                arguments: std::mem::take(&mut args),
-                                major,
-                            });
-                            head = value;
-                        }
-                        Some(ConstantInfo::Rec(recursor)) => {
-                            // Iota is independent of delta transparency. Do not
-                            // guess the layout of unsupported recursor families.
-                            if recursor.is_unsafe
-                                || recursor.all.is_empty()
-                                || count(recursor.num_motives)? != recursor.all.len()
-                                || recursor.base.level_params.len() != levels.len()
+                    ExprNode::Const { name, levels } => {
+                        // The pin's `instances` transparency also unfolds what its
+                        // reducibility status marks `reducible` or `implicitReducible`.
+                        let status_unfolds = self.budget.transparency
+                            == UnificationTransparency::Instances
+                            && crate::reducibility::table(&self.work.env)
+                                .map_err(UnificationError::Reducibility)?
+                                .status(name)
+                                .unfolds_at_instances();
+                        match self.work.env.find(name) {
+                            Some(ConstantInfo::Defn(definition))
+                                if definition.safety == DefinitionSafety::Safe
+                                    && definition.base.level_params.len() == levels.len()
+                                    && match self.budget.transparency {
+                                        UnificationTransparency::None => false,
+                                        UnificationTransparency::Abbreviations => {
+                                            definition.hints == ReducibilityHints::Abbrev
+                                        }
+                                        UnificationTransparency::Instances => {
+                                            definition.hints == ReducibilityHints::Abbrev
+                                                || status_unfolds
+                                        }
+                                        UnificationTransparency::SafeDefinitions => true,
+                                    } =>
                             {
-                                break;
+                                let value = definition.value.clone();
+                                let parameters = definition.base.level_params.clone();
+                                self.scan(&value)?;
+                                head = crate::universe::parameters::instantiate(
+                                    || self.meter.node(),
+                                    || UnificationError::ExpressionScope,
+                                    &value,
+                                    &parameters,
+                                    levels,
+                                )?;
                             }
-                            let (prefix, major) = recursor_positions(recursor)?;
-                            if major >= args.len() {
-                                break;
+                            Some(ConstantInfo::Quot(_)) => {
+                                let Some(major) = self.quotient_major_index(&head, args.len())?
+                                else {
+                                    break;
+                                };
+                                let value = args[args.len() - major - 1].clone();
+                                continuations.push(Continuation::Quotient {
+                                    head,
+                                    arguments: std::mem::take(&mut args),
+                                    major,
+                                });
+                                head = value;
                             }
-                            // Charge metadata before cloning its proportional
-                            // arrays; rule bodies themselves remain shared.
-                            for _ in &recursor.rules {
-                                self.meter.node()?;
+                            Some(ConstantInfo::Rec(recursor)) => {
+                                // Iota is independent of delta transparency. Do not
+                                // guess the layout of unsupported recursor families.
+                                if recursor.is_unsafe
+                                    || recursor.all.is_empty()
+                                    || count(recursor.num_motives)? != recursor.all.len()
+                                    || recursor.base.level_params.len() != levels.len()
+                                {
+                                    break;
+                                }
+                                let (prefix, major) = recursor_positions(recursor)?;
+                                if major >= args.len() {
+                                    break;
+                                }
+                                // Charge metadata before cloning its proportional
+                                // arrays; rule bodies themselves remain shared.
+                                for _ in &recursor.rules {
+                                    self.meter.node()?;
+                                }
+                                for _ in &recursor.base.level_params {
+                                    self.meter.node()?;
+                                }
+                                for _ in &recursor.all {
+                                    self.meter.node()?;
+                                }
+                                let recursor = Box::new(recursor.clone());
+                                let value = args[args.len() - major - 1].clone();
+                                continuations.push(Continuation::Recursor {
+                                    head,
+                                    recursor,
+                                    arguments: std::mem::take(&mut args),
+                                    prefix,
+                                    major,
+                                });
+                                head = value;
                             }
-                            for _ in &recursor.base.level_params {
-                                self.meter.node()?;
-                            }
-                            for _ in &recursor.all {
-                                self.meter.node()?;
-                            }
-                            let recursor = Box::new(recursor.clone());
-                            let value = args[args.len() - major - 1].clone();
-                            continuations.push(Continuation::Recursor {
-                                head,
-                                recursor,
-                                arguments: std::mem::take(&mut args),
-                                prefix,
-                                major,
-                            });
-                            head = value;
+                            _ => break,
                         }
-                        _ => break,
-                    },
+                    }
                     _ => break,
                 }
             }

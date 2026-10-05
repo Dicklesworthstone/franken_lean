@@ -4,7 +4,7 @@ use fln_core::expr::{Literal, NatLit};
 use fln_core::name::Name;
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
 use fln_olean::source_extensions::{
-    DecodeError, DecodeLimits, InstanceKey, SourceExtensions, decode,
+    DecodeError, DecodeLimits, InstanceKey, ReducibilityStatus, SourceExtensions, decode,
 };
 use fln_rt::convert::inject_name;
 use fln_rt::obj::Obj;
@@ -130,6 +130,47 @@ fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
             .iter()
             .all(|row| !row.value.has_expr_mvar() && !row.value.has_level_mvar())
     );
+}
+
+/// The Prelude's `reducibilityCore` entries (bead fln-gkhu), against what the
+/// pinned `lean` reports through `getReducibilityStatus` for the same names:
+/// instOfNatNat, Nat.add, instAddNat, instLTNat and Nat.decLt are
+/// implicitReducible; inferInstance is reducible; id, OfNat.ofNat, Nat.lt and
+/// Nat.le are semireducible, the default, which the pin records by absence.
+#[test]
+fn real_prelude_decodes_the_reducibility_status_the_pin_reports() {
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n("reducibilityCore")));
+    assert_eq!(decoded.reducibility.len(), 1061);
+    let status = |name: &str| {
+        let rows: Vec<_> = decoded
+            .reducibility
+            .iter()
+            .filter(|row| row.declaration == n(name))
+            .map(|row| row.status)
+            .collect();
+        assert!(rows.len() <= 1, "{name} is recorded once");
+        rows.first()
+            .copied()
+            .unwrap_or(ReducibilityStatus::Semireducible)
+    };
+    for name in [
+        "instOfNatNat",
+        "Nat.add",
+        "instAddNat",
+        "instLTNat",
+        "Nat.decLt",
+    ] {
+        assert_eq!(
+            status(name),
+            ReducibilityStatus::ImplicitReducible,
+            "{name}"
+        );
+    }
+    assert_eq!(status("inferInstance"), ReducibilityStatus::Reducible);
+    for name in ["id", "OfNat.ofNat", "Nat.lt", "Nat.le"] {
+        assert_eq!(status(name), ReducibilityStatus::Semireducible, "{name}");
+    }
 }
 
 #[test]
