@@ -1,0 +1,24 @@
+{
+ "companion_to": "v4.32.0.receipt.json (unchanged)",
+ "bead": "fln-elp6",
+ "build": {
+  "command": "cargo build --locked --release -p fln-cli --bin fln",
+  "source_commit": "a8d0032f039b02b0c7324008871505f58ee914b4",
+  "toolchain": "rust-toolchain.toml at that commit (nightly-2026-08-31)",
+  "output": "target/release/fln",
+  "sha256": "906c51a56e7391b4d589d44100ef5db837c6d1bfad474d5947a7691aee88363a",
+  "reproduced": "an independent rebuild of the same commit gave the same sha256 (franken_lean bead fln-elp6, comment 3082)"
+ },
+ "input": {
+  "root": "~/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean",
+  "files": 7295,
+  "bytes": 1711833728,
+  "digest": "da69c55713b6aea65aab5c5980cf69fd7574897200ab1a4586cbd59fb9a9fb2b",
+  "digest_algorithm": "sha256 of the concatenated lines '<lowercase hex sha256 of the file>  <path relative to the root>\\n', one per file ending in .olean, .olean.server or .olean.private, sorted by relative path"
+ },
+ "streams": {
+  "stdout": "the --json result, retained verbatim as v4.32.0.json",
+  "stderr": "the --progress stream (fln.check-olean-frontier-progress/1), not retained"
+ },
+ "host_scheduling": "this host runs ananicy-cpp, which gives every fln* process nice -4 (a higher scheduling priority under contention); the receipt's wall time is therefore specific to this host and its load, and is not a throughput figure"
+}
