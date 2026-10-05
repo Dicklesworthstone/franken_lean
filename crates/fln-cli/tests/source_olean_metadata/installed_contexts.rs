@@ -9,6 +9,7 @@ fn lake(project: &Project, targets: &[&str]) -> Output {
         .args(["--json", "build"])
         .args(targets)
         .env("LEAN_PATH", project.0.join("objects"))
+        .env("FLN_IMPORT_REUSE_DIR", project.0.join(".records"))
         .output()
         .unwrap()
 }
@@ -132,14 +133,16 @@ fn installed_lake_builds_distinct_contexts_reimports_and_preserves_prior_outputs
 
 #[test]
 fn installed_distinct_contexts_keep_shared_dependency_reuse_across_targets() {
-    let project = fixture();
-    separate_sources(&project);
-    project.write("Second.lean", "prelude\nimport Left Right\ndef secondLeft : Family a := left\ndef secondRight : Family b := right\n");
-    project.write("lakefile.toml", "name = \"contexts\"\n[[lean_lib]]\nname = \"Main\"\nroots = [\"Main\", \"Second\", \"Left\", \"Right\"]\n");
+    // A fresh project per target order: the subject is reuse within one invocation,
+    // not the records an earlier invocation left (bead `franken_lean-z8j.1.1`).
     for targets in [
         ["+Main:olean", "+Second:olean"],
         ["+Second:olean", "+Main:olean"],
     ] {
+        let project = fixture();
+        separate_sources(&project);
+        project.write("Second.lean", "prelude\nimport Left Right\ndef secondLeft : Family a := left\ndef secondRight : Family b := right\n");
+        project.write("lakefile.toml", "name = \"contexts\"\n[[lean_lib]]\nname = \"Main\"\nroots = [\"Main\", \"Second\", \"Left\", \"Right\"]\n");
         let report = success(lake(&project, &targets));
         assert!(report.contains("\"modules_built\":4"), "{report}");
         assert!(report.contains("\"module_elaborations\":4"), "{report}");

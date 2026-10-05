@@ -330,6 +330,7 @@ fn lake_build_uses_checked_metadata_and_original_external_import_order() {
         .arg(&p.0)
         .args(["--json", "build", "+Main:olean"])
         .env("LEAN_PATH", p.0.join("objects"))
+        .env("FLN_IMPORT_REUSE_DIR", p.0.join(".records"))
         .output()
         .unwrap();
     success(output);

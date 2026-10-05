@@ -3,6 +3,7 @@
 //! `fln::source_check::modules::reuse`; this file only decides where records are
 //! kept and who is checking, so moving the store elsewhere changes no trust semantics.
 use super::*;
+use fln::source_check::modules::persisted::{PersistedModules, SourceModuleKey, SourceModuleStore};
 use fln::source_check::modules::reuse::{
     CheckerIdentity, ImportClosureKey, ImportPosture, ImportPostureReport, ImportPostureRequest,
     ImportReuseStore, RecordLookup, RecordWrite, ReuseVerified,
@@ -67,6 +68,77 @@ impl ImportReuseStore for RecordDirectory {
         let path = self.path(key);
         fln::publish_file_atomic(bytes, &path)
             .map_err(|error| format!("{}: {error}", path.display()))
+    }
+}
+
+/// Source module records (bead `franken_lean-z8j.1.1`) sit beside the import records,
+/// one directory down, under the same trust boundary and checker identity.
+impl SourceModuleStore for RecordDirectory {
+    fn load(&self, key: SourceModuleKey) -> Result<Option<Vec<u8>>, String> {
+        let path = self.module_path(key);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+            Ok(_) => {}
+        }
+        read_bounded(&path, MAX_RECORD_BYTES, "source module record")
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn save(&self, key: SourceModuleKey, bytes: &[u8]) -> Result<(), String> {
+        let directory = self.0.join("source-modules");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let path = self.module_path(key);
+        fln::publish_file_atomic(bytes, &path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+}
+
+impl RecordDirectory {
+    fn module_path(&self, key: SourceModuleKey) -> PathBuf {
+        self.0
+            .join("source-modules")
+            .join(format!("{}.record", key.to_hex()))
+    }
+}
+
+/// Where a build's source module records come from, resolved against this host:
+/// nowhere under `recheck`, the import record directory's `source-modules/` under
+/// `reuse-verified`, or nowhere with a reason when that cannot be established.
+pub(crate) struct ModuleRecords(Resolved);
+
+impl ModuleRecords {
+    pub(in crate::source_check) fn new(posture: ImportPosture) -> Self {
+        ModuleRecords(Resolved::new(posture))
+    }
+
+    pub(crate) fn persisted(&self) -> Option<PersistedModules<'_>> {
+        match &self.0 {
+            Resolved::Reuse(checker, directory) => Some(PersistedModules {
+                checker: *checker,
+                store: directory,
+            }),
+            Resolved::Recheck | Resolved::Unavailable(_) => None,
+        }
+    }
+
+    /// The report's `"module_records"` value.
+    pub(crate) fn state(&self) -> &'static str {
+        match &self.0 {
+            Resolved::Recheck => "off",
+            Resolved::Reuse(..) => "on",
+            Resolved::Unavailable(_) => "unavailable",
+        }
+    }
+
+    /// Why records are unavailable, when they are.
+    pub(crate) fn unavailable(&self) -> Option<&str> {
+        match &self.0 {
+            Resolved::Unavailable(reason) => Some(reason),
+            Resolved::Recheck | Resolved::Reuse(..) => None,
+        }
     }
 }
 

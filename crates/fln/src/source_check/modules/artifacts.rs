@@ -21,6 +21,10 @@ pub struct SourceModuleBuild {
     /// Every returned artifact is still encoded under this call's writer budget.
     pub reused_modules: usize,
     pub elaborated_modules: usize,
+    /// Modules re-admitted from persisted records rather than elaborated.
+    pub persisted_modules: usize,
+    /// Each module of the closure, in build order, and how it was obtained.
+    pub modules: Vec<super::persisted::ModuleProvenance>,
 }
 
 #[derive(Debug)]
@@ -197,7 +201,7 @@ impl PendingArtifact {
         })
     }
 
-    fn encode(
+    pub(super) fn encode(
         &self,
         budget: OleanWriteBudget,
     ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
@@ -263,6 +267,7 @@ impl Engine {
                 cache: None,
                 collect_artifacts: true,
                 contexts: None,
+                records: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?
@@ -292,6 +297,8 @@ pub(super) fn finish(
         artifacts,
         reused_modules: run.result.reused_modules,
         elaborated_modules: run.result.elaborated_modules,
+        persisted_modules: run.persisted_modules,
+        modules: run.provenance,
     })
 }
 

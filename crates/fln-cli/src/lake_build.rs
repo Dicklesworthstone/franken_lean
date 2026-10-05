@@ -1,6 +1,7 @@
 //! Checked TOML package module builds. Only the Reference's `+Module:olean`
 //! facet is complete here; library defaults also require other Lean artifacts.
 use super::*;
+use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession, parse_source_header,
@@ -314,6 +315,10 @@ struct Compilation {
     artifacts: BTreeMap<Name, Vec<u8>>,
     elaborated_modules: usize,
     reused_modules: usize,
+    /// Modules re-admitted from persisted records (bead `franken_lean-z8j.1.1`).
+    cached_modules: usize,
+    /// Each module's first provenance in this build, in build order.
+    modules: Vec<ModuleProvenance>,
     /// One per external `.olean` closure obtained, in the order obtained.
     imports: Vec<ImportPostureReport>,
 }
@@ -324,11 +329,14 @@ fn compile(
     modules: &BTreeMap<Name, Module>,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    records: Option<PersistedModules<'_>>,
 ) -> Result<Compilation, Failure> {
     let mut artifacts = BTreeMap::new();
     let mut imports = Vec::new();
     let mut elaborated_modules = 0usize;
     let mut reused_modules = 0usize;
+    let mut cached_modules = 0usize;
+    let mut provenance: Vec<ModuleProvenance> = Vec::new();
     // Retain only one external world, never one large engine per target. Target
     // order is observable on failure and is not rearranged to manufacture hits.
     let mut active: Option<(Vec<Name>, SourceModuleSession)> = None;
@@ -414,7 +422,7 @@ fn compile(
             .as_mut()
             .expect("the current external context is installed")
             .1
-            .compile(&inputs, entry, budget)
+            .compile_with_records(&inputs, entry, budget, records, None)
             .map_err(|error| {
                 let (class, authority, _) = error.disposition();
                 Failure {
@@ -440,6 +448,12 @@ fn compile(
         };
         elaborated_modules += built.elaborated_modules;
         reused_modules += built.reused_modules;
+        cached_modules += built.persisted_modules;
+        for row in built.modules {
+            if !provenance.iter().any(|seen| seen.name == row.name) {
+                provenance.push(row);
+            }
+        }
         for artifact in built.artifacts {
             if let Some(previous) = artifacts.get(&artifact.name) {
                 if previous != &artifact.bytes {
@@ -463,6 +477,8 @@ fn compile(
         artifacts,
         elaborated_modules,
         reused_modules,
+        cached_modules,
+        modules: provenance,
         imports,
     })
 }
@@ -576,12 +592,22 @@ fn build(
     let config = config(&root)?;
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
+    let records = source_check::module_records(posture);
     let Compilation {
         artifacts,
         elaborated_modules,
         reused_modules,
+        cached_modules,
+        modules: provenance,
         imports,
-    } = compile(&root, &entries, &modules, jobs, posture)?;
+    } = compile(
+        &root,
+        &entries,
+        &modules,
+        jobs,
+        posture,
+        records.persisted(),
+    )?;
     let paths = publish(
         &root,
         &root.join(&config.build_dir).join("lib/lean"),
@@ -598,11 +624,37 @@ fn build(
             .map(|report| format!("{{{}}}", source_check::posture_json(report)))
             .collect::<Vec<_>>()
             .join(",");
+        let rows = provenance
+            .iter()
+            .map(|row| {
+                let mut fields = format!(
+                    "\"name\":{},\"decision\":{}",
+                    json_string(&row.name.to_display_string()),
+                    json_string(row.decision.as_str())
+                );
+                if let Some(key) = row.key {
+                    fields.push_str(&format!(",\"key\":{}", json_string(&key.to_hex())));
+                }
+                if let Some(record) = row.record.code() {
+                    fields.push_str(&format!(",\"record\":{}", json_string(&record)));
+                }
+                if let Some(write) = row.record_write.code() {
+                    fields.push_str(&format!(",\"recordWrite\":{}", json_string(write)));
+                }
+                format!("{{{fields}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let unavailable = records
+            .unavailable()
+            .map(|reason| format!(",\"module_records_reason\":{}", json_string(reason)))
+            .unwrap_or_default();
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":0,\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}],\"module_records\":{}{unavailable},\"modules\":[{rows}]}}\n",
             json_string(&config.name),
             artifacts.len(),
             json_string(posture.as_str()),
+            json_string(records.state()),
         )
     } else {
         let imports = imports
@@ -610,7 +662,7 @@ fn build(
             .map(|report| format!(" Imports: {}.", source_check::posture_sentence(report)))
             .collect::<String>();
         format!(
-            "Built {} checked .olean modules for {} (0 disk cached; {reused_modules} module checks reused).{imports}\n",
+            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}\n",
             artifacts.len(),
             config.name
         )

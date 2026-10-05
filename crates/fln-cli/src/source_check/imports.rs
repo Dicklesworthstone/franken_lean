@@ -569,6 +569,11 @@ pub(super) fn load_build_base(
         .map(|(_, base)| base.map(|base| (base.receipt, base.report)))
 }
 
+/// The source module records a build under `posture` consults (bead `franken_lean-z8j.1.1`).
+pub(crate) fn module_records(posture: ImportPosture) -> reuse::ModuleRecords {
+    reuse::ModuleRecords::new(posture)
+}
+
 /// The posture fields of an import report, for the Lake build report.
 pub(crate) fn posture_json(report: &ImportPostureReport) -> String {
     reuse::json_fields(report)

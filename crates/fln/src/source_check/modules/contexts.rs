@@ -274,6 +274,7 @@ impl imported::SourceOleanImport {
                 cache: None,
                 collect_artifacts: false,
                 contexts: Some(&self.contexts),
+                records: None,
             },
         )
         .map(|outcome| outcome.map_complete(|run| run.result.checked))
@@ -304,6 +305,7 @@ impl imported::SourceOleanImport {
                 cache: None,
                 collect_artifacts: true,
                 contexts: Some(&self.contexts),
+                records: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?;

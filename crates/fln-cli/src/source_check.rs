@@ -20,7 +20,7 @@ pub(super) fn load_build_base(
         .map_err(|error| (error.class, error.detail, error.authority))
 }
 
-pub(crate) use imports::{posture_json, posture_sentence};
+pub(crate) use imports::{module_records, posture_json, posture_sentence};
 
 /// Remove `--import-posture P` / `--import-posture=P` from an interactive front
 /// door's arguments, which otherwise keep their order. Options end at `--`. The

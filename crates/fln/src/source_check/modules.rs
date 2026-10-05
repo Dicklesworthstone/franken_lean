@@ -12,6 +12,7 @@ mod cache;
 mod contexts;
 mod graph;
 pub mod imported;
+pub mod persisted;
 mod replay;
 pub mod reuse;
 pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};

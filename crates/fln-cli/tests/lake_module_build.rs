@@ -32,6 +32,8 @@ impl Package {
             .args(["--json", "build"])
             .args(targets)
             .env("LEAN_PATH", self.0.join("no-imports"))
+            // A store of the package's own, never the user's (bead `franken_lean-z8j.1.1`).
+            .env("FLN_IMPORT_REUSE_DIR", self.0.join(".records"))
             .output()
             .unwrap()
     }
@@ -106,6 +108,7 @@ fn builds_real_module_closure_and_downstream_source_imports_it() {
         .arg(&consumer.0)
         .args(["--json", "build", "+Consumer:olean"])
         .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+        .env("FLN_IMPORT_REUSE_DIR", consumer.0.join(".records"))
         .output()
         .unwrap();
     success(&out);

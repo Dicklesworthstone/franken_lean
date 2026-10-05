@@ -25,6 +25,15 @@ fn extension_error(
     }
 }
 impl Export {
+    /// Each journal this module appended to, with the rows it appended, in order.
+    pub(super) fn journal_suffixes(
+        &self,
+    ) -> impl Iterator<Item = (&ExtensionDescriptor, &[Arc<[u8]>])> {
+        self.extensions
+            .iter()
+            .map(|suffix| (&suffix.descriptor, suffix.entries.as_slice()))
+    }
+
     pub(super) fn require_artifact_support(
         &self,
         module: &Name,

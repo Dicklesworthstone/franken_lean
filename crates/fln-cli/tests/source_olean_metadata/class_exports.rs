@@ -9,6 +9,7 @@ fn build(project: &Project, targets: &[&str]) -> Output {
         .args(["--json", "build"])
         .args(targets)
         .env("LEAN_PATH", project.0.join("objects"))
+        .env("FLN_IMPORT_REUSE_DIR", project.0.join(".records"))
         .output()
         .unwrap()
 }

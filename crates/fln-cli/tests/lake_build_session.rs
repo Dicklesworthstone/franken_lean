@@ -28,12 +28,19 @@ impl Package {
         std::fs::write(path, bytes).unwrap();
     }
     fn build(&self, targets: &[&str], imports: Option<&Path>) -> Output {
+        self.build_with(&[], targets, imports)
+    }
+    /// Each package keeps its own record store, so no test reads another's records
+    /// (bead `franken_lean-z8j.1.1`).
+    fn build_with(&self, options: &[&str], targets: &[&str], imports: Option<&Path>) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lake"))
             .arg("--dir")
             .arg(&self.0)
             .args(["--json", "build"])
+            .args(options)
             .args(targets)
             .env("LEAN_PATH", imports.unwrap_or(&self.0.join("no-imports")))
+            .env("FLN_IMPORT_REUSE_DIR", self.0.join(".records"))
             .output()
             .unwrap()
     }
@@ -53,7 +60,9 @@ impl Drop for Package {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn success(output: Output, modules: usize, elaborated: usize, reused: usize) {
+/// `cached` counts modules re-admitted from persisted records; `reused`, modules
+/// reused from an earlier target of the same invocation.
+fn success(output: Output, modules: usize, elaborated: usize, reused: usize, cached: usize) {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let report = String::from_utf8(output.stdout).unwrap();
@@ -61,7 +70,7 @@ fn success(output: Output, modules: usize, elaborated: usize, reused: usize) {
         format!("\"modules_built\":{modules}"),
         format!("\"module_elaborations\":{elaborated}"),
         format!("\"module_checks_reused\":{reused}"),
-        "\"modules_cached\":0".to_owned(),
+        format!("\"modules_cached\":{cached}"),
         "\"admission\":\"K1+independent-checker\"".to_owned(),
     ] {
         assert!(report.contains(&field), "{field}: {report}");
@@ -88,14 +97,17 @@ fn library() -> Package {
 #[test]
 fn sibling_targets_share_the_checked_dependency_and_keep_artifact_bytes() {
     let package = library();
-    success(package.build(&["+Lib.Left:olean"], None), 2, 2, 0);
+    success(package.build(&["+Lib.Left:olean"], None), 2, 2, 0, 0);
     let base = package.artifact("Lib.Base");
     let left = package.artifact("Lib.Left");
+    // Base and Left are re-admitted from this package's records; Right reuses the
+    // Base its sibling target just obtained.
     success(
         package.build(&["+Lib.Left:olean", "+Lib.Right:olean"], None),
         3,
-        3,
         1,
+        1,
+        2,
     );
     assert_eq!(package.artifact("Lib.Base"), base);
     assert_eq!(package.artifact("Lib.Left"), left);
@@ -103,8 +115,9 @@ fn sibling_targets_share_the_checked_dependency_and_keep_artifact_bytes() {
     success(
         package.build(&["+Lib.Right:olean", "+Lib.Left:olean"], None),
         3,
-        3,
+        0,
         1,
+        3,
     );
     assert_eq!(package.artifact("Lib.Right"), right);
     assert_eq!(package.artifact("Lib.Left"), left);
@@ -112,12 +125,11 @@ fn sibling_targets_share_the_checked_dependency_and_keep_artifact_bytes() {
 
 #[test]
 fn requested_dependency_is_not_elaborated_again_and_duplicate_targets_are_deduplicated() {
-    let package = library();
     for targets in [
         ["+Lib.Base:olean", "+Lib.Left:olean", "+Lib.Base:olean"],
         ["+Lib.Left:olean", "+Lib.Base:olean", "+Lib.Left:olean"],
     ] {
-        success(package.build(&targets, None), 2, 2, 1);
+        success(library().build(&targets, None), 2, 2, 1, 0);
     }
 }
 
@@ -125,19 +137,44 @@ fn requested_dependency_is_not_elaborated_again_and_duplicate_targets_are_dedupl
 fn a_new_invocation_rechecks_source_and_ignores_forged_previous_products() {
     let package = library();
     let targets = ["+Lib.Left:olean", "+Lib.Right:olean"];
-    success(package.build(&targets, None), 3, 3, 1);
+    let recheck =
+        |package: &Package| package.build_with(&["--import-posture", "recheck"], &targets, None);
+    success(recheck(&package), 3, 3, 1, 0);
     let original = package.artifact("Lib.Base");
     package.write(
         ".lake/build/lib/lean/Lib/Base.olean",
         b"forged cache success",
     );
-    success(package.build(&targets, None), 3, 3, 1);
+    success(recheck(&package), 3, 3, 1, 0);
     assert_eq!(package.artifact("Lib.Base"), original);
     package.write(
         "Lib/Base.lean",
         format!("{BASE}def Lib.extra (P : Prop) (h : P) : P := h\n"),
     );
-    success(package.build(&targets, None), 3, 3, 1);
+    success(recheck(&package), 3, 3, 1, 0);
+    assert_ne!(package.artifact("Lib.Base"), original);
+}
+
+/// The default posture's twin of the test above (bead `franken_lean-z8j.1.1`): a new
+/// invocation re-admits each module from its record instead of elaborating it, still
+/// never reads the previous output, and an edited source is elaborated again.
+#[test]
+fn a_new_invocation_re_admits_records_and_ignores_forged_previous_products() {
+    let package = library();
+    let targets = ["+Lib.Left:olean", "+Lib.Right:olean"];
+    success(package.build(&targets, None), 3, 3, 1, 0);
+    let original = package.artifact("Lib.Base");
+    package.write(
+        ".lake/build/lib/lean/Lib/Base.olean",
+        b"forged cache success",
+    );
+    success(package.build(&targets, None), 3, 0, 1, 3);
+    assert_eq!(package.artifact("Lib.Base"), original);
+    package.write(
+        "Lib/Base.lean",
+        format!("{BASE}def Lib.extra (P : Prop) (h : P) : P := h\n"),
+    );
+    success(package.build(&targets, None), 3, 3, 1, 0);
     assert_ne!(package.artifact("Lib.Base"), original);
 }
 
@@ -145,7 +182,7 @@ fn a_new_invocation_rechecks_source_and_ignores_forged_previous_products() {
 fn a_late_target_failure_cannot_publish_any_cached_or_changed_artifact() {
     let package = library();
     let targets = ["+Lib.Left:olean", "+Lib.Right:olean"];
-    success(package.build(&targets, None), 3, 3, 1);
+    success(package.build(&targets, None), 3, 3, 1, 0);
     let original: Vec<_> = ["Lib.Base", "Lib.Left", "Lib.Right"]
         .iter()
         .map(|name| (*name, package.artifact(name)))
@@ -189,6 +226,7 @@ fn changing_external_roots_replaces_the_bound_import_world_without_name_leakage(
         2,
         2,
         0,
+        0,
     );
     let package = Package::new("Lib");
     for (module, import) in [("First", "A"), ("Second", "B"), ("Third", "A")] {
@@ -205,6 +243,7 @@ fn changing_external_roots_replaces_the_bound_import_world_without_name_leakage(
         ),
         3,
         3,
+        0,
         0,
     );
     let before = package.artifact("Lib.Second");

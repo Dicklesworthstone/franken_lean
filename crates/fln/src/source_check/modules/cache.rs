@@ -1,5 +1,9 @@
 //! Process-local reuse of immutable, successfully checked module snapshots.
 //! Identity is exact bytes plus private dependency stamps, never a digest match.
+use super::persisted::{
+    KeyStep, ModuleDecision, ModuleProvenance, ModuleRecordLookup, ModuleRecordWrite,
+    PendingRecord, PersistedModules, SourceModuleKey, SourceModuleRecord,
+};
 use super::*;
 use std::sync::Arc;
 
@@ -154,6 +158,24 @@ impl SourceModuleSession {
         write_budget: OleanWriteBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
+        self.compile_with_records(modules, entry, write_budget, None, cancellation)
+    }
+
+    /// [`Self::compile_with_cancel`], also consulting and writing persisted module
+    /// records (bead `franken_lean-z8j.1.1`). A module with a record for its exact key
+    /// is re-admitted from it rather than elaborated, and only if the re-admission
+    /// reaches every recorded root and the recorded artifact; any other record is
+    /// refused and the module elaborated. Each module elaborated by a completely
+    /// successful build gets a record. A persisted hit retains no end-of-file source
+    /// scope, so `checked.scope` is empty when the entry itself was a hit.
+    pub fn compile_with_records(
+        &mut self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        write_budget: OleanWriteBudget,
+        records: Option<PersistedModules<'_>>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
         artifacts::validate_base(&self.base, modules)?;
         let run = match run_collecting(
             &self.base,
@@ -169,6 +191,10 @@ impl SourceModuleSession {
                 }),
                 collect_artifacts: true,
                 contexts: self.contexts.as_deref(),
+                records: records.map(|persisted| RecordOptions {
+                    persisted,
+                    write_budget,
+                }),
             },
         )
         .map_err(SourceModuleBuildError::Check)?
@@ -183,6 +209,31 @@ impl SourceModuleSession {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let mut modules = run.provenance;
+        if let Some(records) = records {
+            for pending in &run.pending_records {
+                let write = match artifacts
+                    .iter()
+                    .find(|artifact| artifact.name == pending.name)
+                {
+                    Some(artifact) => {
+                        let record = pending.record(records.checker, &artifact.bytes);
+                        match records.store.save(pending.key, &record.to_bytes()) {
+                            Ok(()) => ModuleRecordWrite::Stored,
+                            Err(reason) => ModuleRecordWrite::Failed(reason),
+                        }
+                    }
+                    None => ModuleRecordWrite::Failed(
+                        "no artifact was encoded for the module".to_owned(),
+                    ),
+                };
+                if let Some(row) = modules.iter_mut().find(|row| {
+                    row.name == pending.name && row.decision == ModuleDecision::Elaborated
+                }) {
+                    row.record_write = write;
+                }
+            }
+        }
         self.entries = run.entries;
         self.source_bytes = run.source_bytes;
         Ok(Outcome::Complete(SourceModuleBuild {
@@ -190,6 +241,8 @@ impl SourceModuleSession {
             artifacts,
             reused_modules: run.result.reused_modules,
             elaborated_modules: run.result.elaborated_modules,
+            persisted_modules: run.persisted_modules,
+            modules,
         }))
     }
 
@@ -231,6 +284,7 @@ impl SourceModuleSession {
                 cache: Some(view),
                 collect_artifacts: false,
                 contexts: self.contexts.as_deref(),
+                records: None,
             },
         )?;
         Ok(match outcome {
@@ -253,12 +307,22 @@ pub(super) struct RunOptions<'a> {
     pub(super) cache: Option<CacheView<'a>>,
     pub(super) collect_artifacts: bool,
     pub(super) contexts: Option<&'a contexts::ImportContexts>,
+    /// Persisted module records; consulted only when collecting artifacts.
+    pub(super) records: Option<RecordOptions<'a>>,
+}
+pub(super) struct RecordOptions<'a> {
+    pub(super) persisted: PersistedModules<'a>,
+    /// The budget a hit's re-encoding is compared under.
+    pub(super) write_budget: OleanWriteBudget,
 }
 pub(super) struct Run {
     pub(super) result: SourceModuleSessionCheck,
     pub(super) artifacts: Vec<Arc<artifacts::PendingArtifact>>,
     entries: BTreeMap<Name, Arc<CachedModule>>,
     source_bytes: usize,
+    pub(super) persisted_modules: usize,
+    pub(super) provenance: Vec<ModuleProvenance>,
+    pending_records: Vec<PendingRecord>,
 }
 
 /// Single execution path for stateless checks and reusable sessions. Cache hits
@@ -283,6 +347,7 @@ pub(super) fn run(
             cache,
             collect_artifacts: false,
             contexts: None,
+            records: None,
         },
     )
 }
@@ -300,7 +365,9 @@ pub(super) fn run_collecting(
         cache,
         collect_artifacts,
         contexts,
+        records,
     } = run_options;
+    let records = records.filter(|_| collect_artifacts);
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
             "source-modules/before-plan",
@@ -327,6 +394,10 @@ pub(super) fn run_collecting(
     let mut replayed_declarations = 0usize;
     let mut reused_modules = 0usize;
     let mut elaborated_modules = 0usize;
+    let mut persisted_modules = 0usize;
+    let mut provenance = Vec::new();
+    let mut pending_records = Vec::new();
+    let mut result_roots: BTreeMap<usize, LogicalRoot> = BTreeMap::new();
     let mut entry_result = None;
     for &index in &plan.order {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -401,10 +472,40 @@ pub(super) fn run_collecting(
                 retained_bytes += module.source.len();
             }
             reused_modules += 1;
+            provenance.push(ModuleProvenance {
+                name: module.name.clone(),
+                decision: ModuleDecision::ReusedInSession,
+                key: None,
+                record: ModuleRecordLookup::NotConsulted,
+                record_write: ModuleRecordWrite::NotAttempted,
+                result_root: cached.result_root,
+            });
             cached.checked()
         } else {
             let before_work = meter.work;
             let before_bytes = meter.bytes;
+            let key = records.as_ref().map(|records| {
+                let steps: Vec<_> = steps
+                    .iter()
+                    .map(|step| match step {
+                        contexts::Step::External(name) => KeyStep::External(name.clone()),
+                        contexts::Step::Source(dependency) => KeyStep::Source(
+                            modules[*dependency].name.clone(),
+                            *result_roots
+                                .get(dependency)
+                                .expect("postorder predecessor root"),
+                        ),
+                    })
+                    .collect();
+                SourceModuleKey::compute(
+                    records.persisted.checker,
+                    options,
+                    base_logical_root,
+                    module.name,
+                    module.source,
+                    &steps,
+                )
+            });
             let mut imported = imported_base;
             for step in steps {
                 if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -449,98 +550,219 @@ pub(super) fn run_collecting(
                 };
                 replayed_declarations += export.declarations.len();
             }
-            let mut declarations = Vec::new();
-            let header = &plan.headers[index];
-            let source = &module.source[header.body_start.0..];
-            let mut source_limits = limits.source;
-            source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
-            let result = if source.is_empty() {
-                let root = imported.logical_root(options);
-                Ok(Outcome::Complete(SourceFileCheck {
-                    engine: imported.clone(),
-                    files: 1,
-                    commands: 0,
-                    theorems: 0,
-                    base_logical_root: root,
-                    result_logical_root: root,
-                    scope: fln_elab::source::scope::SourceScope::default(),
-                }))
-            } else {
-                imported.check_source_files_recording(
-                    &[source],
-                    options,
-                    source_limits,
-                    Some(&mut declarations),
-                )
+            let after_steps_work = meter.work;
+            let after_steps_bytes = meter.bytes;
+            let mut lookup = ModuleRecordLookup::NotConsulted;
+            let mut recorded = None;
+            if let (Some(records), Some(key)) = (&records, key) {
+                lookup = match records.persisted.store.load(key) {
+                    Ok(None) => ModuleRecordLookup::Absent,
+                    Err(reason) => ModuleRecordLookup::Unavailable(reason),
+                    Ok(Some(bytes)) => match SourceModuleRecord::parse(
+                        &bytes,
+                        key,
+                        records.persisted.checker,
+                        module.name,
+                    ) {
+                        Err(refusal) => ModuleRecordLookup::Refused(refusal),
+                        Ok(record) => match persisted::readmit(
+                            &record,
+                            module.name,
+                            &plan.headers[index],
+                            &imported,
+                            options,
+                            records.write_budget,
+                            &mut meter,
+                            cancellation,
+                        )? {
+                            Outcome::Complete(Ok(hit)) => {
+                                // Charge what elaborating the module charged, so a warm
+                                // build meets the bounds a cold build would.
+                                let replayed = meter.work - after_steps_work;
+                                meter.work(hit.work.saturating_sub(replayed))?;
+                                let copied = meter.bytes - after_steps_bytes;
+                                meter.bytes(hit.bytes.saturating_sub(copied))?;
+                                recorded = Some(hit);
+                                ModuleRecordLookup::Hit
+                            }
+                            Outcome::Complete(Err(refusal)) => ModuleRecordLookup::Refused(refusal),
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        },
+                    },
+                };
             }
-            .map_err(|mut error| {
-                match &mut error {
-                    SourceCheckError::Scope { offset, .. }
-                    | SourceCheckError::Command { offset, .. } => {
-                        *offset = offset.saturating_add(header.body_start.0);
+            if let Some(hit) = recorded {
+                artifacts.push(Arc::clone(&hit.artifact));
+                let checked = SourceFileCheck {
+                    engine: hit.engine.clone(),
+                    files: 1,
+                    commands: hit.commands,
+                    theorems: hit.theorems,
+                    base_logical_root: hit.base_root,
+                    result_logical_root: hit.result_root,
+                    scope: fln_elab::source::scope::SourceScope::default(),
+                };
+                if cache.is_some() {
+                    let stamp = Arc::new(());
+                    stamps.insert(index, Arc::clone(&stamp));
+                    if keep {
+                        pending.insert(
+                            module.name.clone(),
+                            Arc::new(CachedModule {
+                                source: Arc::from(module.source),
+                                stamp,
+                                dependencies: identities,
+                                engine: hit.engine,
+                                export: Arc::clone(&hit.export),
+                                artifact: Some(Arc::clone(&hit.artifact)),
+                                commands: hit.commands,
+                                theorems: hit.theorems,
+                                base_root: hit.base_root,
+                                result_root: hit.result_root,
+                                work: meter.work - before_work,
+                                bytes: meter.bytes - before_bytes,
+                                scope: fln_elab::source::scope::SourceScope::default(),
+                            }),
+                        );
+                        retained_bytes += module.source.len();
                     }
-                    _ => {}
                 }
-                SourceModuleCheckError::Source {
-                    module: module.name.clone(),
-                    error,
+                exports.insert(index, hit.export);
+                persisted_modules += 1;
+                provenance.push(ModuleProvenance {
+                    name: module.name.clone(),
+                    decision: ModuleDecision::Cached,
+                    key,
+                    record: lookup,
+                    record_write: ModuleRecordWrite::NotAttempted,
+                    result_root: hit.result_root,
+                });
+                checked
+            } else {
+                // Measured from here, so a refused record's re-admission is not
+                // recorded as elaboration work.
+                let elaboration_work = meter.work;
+                let elaboration_bytes = meter.bytes;
+                let mut declarations = Vec::new();
+                let header = &plan.headers[index];
+                let source = &module.source[header.body_start.0..];
+                let mut source_limits = limits.source;
+                source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
+                let result = if source.is_empty() {
+                    let root = imported.logical_root(options);
+                    Ok(Outcome::Complete(SourceFileCheck {
+                        engine: imported.clone(),
+                        files: 1,
+                        commands: 0,
+                        theorems: 0,
+                        base_logical_root: root,
+                        result_logical_root: root,
+                        scope: fln_elab::source::scope::SourceScope::default(),
+                    }))
+                } else {
+                    imported.check_source_files_recording(
+                        &[source],
+                        options,
+                        source_limits,
+                        Some(&mut declarations),
+                    )
                 }
-            })?;
-            let checked = match result {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            let export = Arc::new(replay::Export::capture(
-                module.name,
-                imported.environment(),
-                checked.engine.environment(),
-                declarations,
-                &mut meter,
-            )?);
-            let artifact = if collect_artifacts {
-                export.require_artifact_support(module.name)?;
-                let artifact = Arc::new(artifacts::PendingArtifact::capture(
+                .map_err(|mut error| {
+                    match &mut error {
+                        SourceCheckError::Scope { offset, .. }
+                        | SourceCheckError::Command { offset, .. } => {
+                            *offset = offset.saturating_add(header.body_start.0);
+                        }
+                        _ => {}
+                    }
+                    SourceModuleCheckError::Source {
+                        module: module.name.clone(),
+                        error,
+                    }
+                })?;
+                let checked = match result {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let export = Arc::new(replay::Export::capture(
                     module.name,
-                    header,
                     imported.environment(),
                     checked.engine.environment(),
+                    declarations,
                     &mut meter,
                 )?);
-                artifacts.push(Arc::clone(&artifact));
-                Some(artifact)
-            } else {
-                None
-            };
-            if cache.is_some() {
-                let stamp = Arc::new(());
-                stamps.insert(index, Arc::clone(&stamp));
-                if keep {
-                    pending.insert(
-                        module.name.clone(),
-                        Arc::new(CachedModule {
-                            source: Arc::from(module.source),
-                            stamp,
-                            dependencies: identities,
-                            engine: checked.engine.clone(),
-                            export: Arc::clone(&export),
-                            artifact,
-                            commands: checked.commands,
-                            theorems: checked.theorems,
-                            base_root: checked.base_logical_root,
-                            result_root: checked.result_logical_root,
-                            work: meter.work - before_work,
-                            bytes: meter.bytes - before_bytes,
-                            scope: checked.scope.clone(),
-                        }),
-                    );
-                    retained_bytes += module.source.len();
+                let artifact = if collect_artifacts {
+                    export.require_artifact_support(module.name)?;
+                    let artifact = Arc::new(artifacts::PendingArtifact::capture(
+                        module.name,
+                        header,
+                        imported.environment(),
+                        checked.engine.environment(),
+                        &mut meter,
+                    )?);
+                    artifacts.push(Arc::clone(&artifact));
+                    Some(artifact)
+                } else {
+                    None
+                };
+                if cache.is_some() {
+                    let stamp = Arc::new(());
+                    stamps.insert(index, Arc::clone(&stamp));
+                    if keep {
+                        pending.insert(
+                            module.name.clone(),
+                            Arc::new(CachedModule {
+                                source: Arc::from(module.source),
+                                stamp,
+                                dependencies: identities,
+                                engine: checked.engine.clone(),
+                                export: Arc::clone(&export),
+                                artifact,
+                                commands: checked.commands,
+                                theorems: checked.theorems,
+                                base_root: checked.base_logical_root,
+                                result_root: checked.result_logical_root,
+                                work: meter.work - before_work,
+                                bytes: meter.bytes - before_bytes,
+                                scope: checked.scope.clone(),
+                            }),
+                        );
+                        retained_bytes += module.source.len();
+                    }
                 }
+                if let Some(key) = key {
+                    pending_records.push(PendingRecord {
+                        name: module.name.clone(),
+                        key,
+                        export: Arc::clone(&export),
+                        base_root: checked.base_logical_root,
+                        result_root: checked.result_logical_root,
+                        commands: checked.commands,
+                        theorems: checked.theorems,
+                        work: meter.work - elaboration_work,
+                        bytes: meter.bytes - elaboration_bytes,
+                    });
+                }
+                provenance.push(ModuleProvenance {
+                    name: module.name.clone(),
+                    decision: ModuleDecision::Elaborated,
+                    key,
+                    record: lookup,
+                    record_write: ModuleRecordWrite::NotAttempted,
+                    result_root: checked.result_logical_root,
+                });
+                exports.insert(index, export);
+                elaborated_modules += 1;
+                checked
             }
-            exports.insert(index, export);
-            elaborated_modules += 1;
-            checked
         };
+        result_roots.insert(index, checked.result_logical_root);
         // Semantic source limits apply to reused modules too, including when a
         // changed sibling consumes more of the same aggregate command budget.
         commands = commands
@@ -581,5 +803,8 @@ pub(super) fn run_collecting(
         },
         entries: pending,
         source_bytes: retained_bytes,
+        persisted_modules,
+        provenance,
+        pending_records,
     }))
 }

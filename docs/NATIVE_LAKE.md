@@ -77,11 +77,59 @@ External dependencies can be inherited through local source imports. Builds
 whose source modules require different external environments currently refuse
 instead of exposing an unrelated sibling's imports.
 
-Builds always recheck the current source bytes. Existing output files, their
-timestamps, and old placeholder contents never authorize a cache hit. A source
-edit with its old mtime restored still rebuilds. The JSON report uses
-`fln.lake-build/2`, identifies the `olean` facet, lists the emitted paths, and
-reports `modules_cached: 0`.
+Source modules are reused across builds by content, under the same posture
+(bead `franken_lean-z8j.1.1`). Under `reuse-verified`, every module a successful
+build elaborates leaves a record in the record directory's `source-modules/`.
+The record is keyed by one digest over:
+- the running binary's identity;
+- the options;
+- the logical root of the external import world;
+- the module's name and source bytes;
+- the ordered steps that build its imported environment, each local dependency
+  named by the logical root of its checked environment.
+
+A later build that reaches a module with that exact key re-admits the module from
+its record instead of elaborating it:
+- the recorded artifact's declarations are planned as `fln check-olean` plans
+  them;
+- both checkers admit them onto the module's real imported environment, which
+  must have the recorded root;
+- the recorded journal rows are replayed, and the result must reach the
+  recorded root;
+- re-encoding the result must give the recorded artifact byte for byte.
+
+Any other record is refused by name (`refused:seal`, `refused:key`,
+`refused:result-root`, ...): a damaged or misfiled record, one from another
+binary, or one that fails any of those checks. The module is then elaborated
+and its record rewritten. So:
+- a no-op build, or a build after an mtime-only touch, elaborates nothing;
+- a body edit elaborates the edited module and every module whose imported
+  environment changed with it;
+- an edit that leaves a module's checked declarations unchanged, such as a
+  comment, elaborates that module only;
+- a source edit with its old mtime restored still rebuilds.
+
+Existing output files, their timestamps and old placeholder contents never take
+part: a hit republishes the re-encoded artifact without reading the build
+directory.
+
+Re-admission does not show that the recorded declarations are the ones the
+source elaborates to. Like an import record, a module record is only as
+trustworthy as the store it sits in. Re-admission also still needs the module's
+imported environment, so a module under the implicit `Init` pays for the reused
+`Init` closure even when nothing changed. `--import-posture recheck` elaborates
+every module and reads and writes no record.
+
+The JSON report uses `fln.lake-build/2`, identifies the `olean` facet, and lists
+the emitted paths. It also reports:
+- `modules_cached`: modules re-admitted from records;
+- `module_elaborations`;
+- `module_checks_reused`: modules reused from an earlier target of the same
+  invocation;
+- `module_records`: `on`, `off`, or `unavailable` with
+  `module_records_reason`;
+- `modules[]`: each module's `decision` (`elaborated`, `cached` or
+  `reused-in-session`), `key`, `record` lookup and `recordWrite`.
 
 All selected module closures must finish checking and encoding before output
 replacement starts. Parse, elaboration, kernel, import, and encoding failures
