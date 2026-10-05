@@ -767,7 +767,11 @@ impl Context {
 
     /// `isDefEqGuarded`: assignments are kept only when the check succeeds,
     /// and a failed or postponed check is `false`, never an error.
-    fn defeq_guarded(&mut self, left: &Expr, right: &Expr) -> Result<bool, NatDefinitionElabError> {
+    pub(super) fn defeq_guarded(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
         let mut trial = self.clone();
         let result = trial.coercion_eq(left, right);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;

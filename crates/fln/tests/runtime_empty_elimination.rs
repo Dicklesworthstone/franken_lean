@@ -178,8 +178,22 @@ fn user_empty_propositions_and_indexed_empty_data_are_eliminated() {
         "inductive Never (n : Nat) : Prop where\ndef ignore (f : Never 3 -> Nat) : Nat := 42\n#eval ignore (fun h => Never.rec (motive := fun _ => Nat) h)",
         "42",
     );
-    run(
-        "inductive VoidAt : Nat -> Type where\ndef optional (n : Nat) (x : Option (VoidAt n)) : Nat := match x with | .none => 42 | .some h => VoidAt.rec (motive := fun k _ => Nat) h\n#eval optional 5 Option.none",
-        "42",
+    // A family with no constructors has every written index promoted to a
+    // parameter by the pinned Reference (`fixedIndicesToParams`), so its
+    // recursor's motive takes the major alone. The index-abstracting motive is
+    // refused, as the pin refuses it ("Application type mismatch").
+    let source = |motive: &str| {
+        format!(
+            "inductive VoidAt : Nat -> Type where\ndef ignoreVoid (n : Nat) (x : Option (VoidAt n)) : Nat := match x with | .none => 42 | .some h => VoidAt.rec (motive := {motive}) h\n#eval ignoreVoid 5 Option.none"
+        )
+    };
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let refused = source("fun k _ => Nat");
+    assert!(
+        base.execute_source_definitions(&[refused.as_bytes()], &KVMap::new(), limits())
+            .is_err()
     );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    run(&source("fun _ => Nat"), "42");
 }

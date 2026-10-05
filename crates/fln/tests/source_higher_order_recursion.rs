@@ -250,7 +250,7 @@ fn function_child_calls_preserve_partial_application_and_outer_lambdas() {
         def offset (t : Branching) (acc : Nat) : Nat := match t with
           | .leaf n => n + acc
           | .node children => let smaller := offset (children 4); smaller (acc + 1)
-        theorem partial : offset (Branching.node (fun n => Branching.leaf n)) 7 = 12 := by rfl
+        theorem partiallyApplied : offset (Branching.node (fun n => Branching.leaf n)) 7 = 12 := by rfl
         def under (t : Branching) : Nat -> Nat := match t with
           | .leaf n => fun x => n + x
           | .node children => fun x => under (children x) (x + 1)
@@ -283,17 +283,20 @@ const INDEXED_FUNCTIONS: &str = r#"
       | node (index : Nat) (children : Nat -> Indexed index) : Indexed index
 "#;
 
+/// `Indexed`'s index is bound by every constructor and returned unchanged, also
+/// by the function child's codomain, so the pin promotes it to a parameter:
+/// `Indexed 7` fixes it and a constructor pattern writes `_` there.
 #[test]
-fn fixed_index_function_children_keep_conditional_recursion_evidence() {
+fn fixed_index_function_children_recurse_through_applied_calls() {
     check(&format!(
         r#"{INDEXED_FUNCTIONS}
         def atSeven (t : Indexed 7) (acc : Nat) : Nat := match t with
-          | .leaf k value => value + acc
-          | .node k children => atSeven (children 4) (acc + 1)
+          | .leaf _ value => value + acc
+          | .node _ children => atSeven (children 4) (acc + 1)
         theorem computed : atSeven (Indexed.node 7 (fun n => Indexed.leaf 7 n)) 3 = 8 := by rfl
         def partially (t : Indexed 7) : Nat -> Nat := match t with
-          | .leaf k value => fun x => value + x
-          | .node k children => fun x => partially (children x) (x + 1)
+          | .leaf _ value => fun x => value + x
+          | .node _ children => fun x => partially (children x) (x + 1)
         theorem outer : partially (Indexed.node 7 (fun n => Indexed.leaf 7 n)) 5 = 11 := by rfl
         "#
     ));

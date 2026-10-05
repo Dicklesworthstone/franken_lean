@@ -597,6 +597,27 @@ impl Context {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
         let index_values = parameters.split_off(family.num_params as usize);
+        // The pin's `induction` adds the major's indices as implicit targets and
+        // requires each to be a distinct local (`checkInductionTargets`). Only
+        // `cases` and `match` refine non-variable or repeated indices.
+        if induction && equations.is_none() && matches!(input, EliminationSyntax::Tactic(_)) {
+            let mut seen = HashSet::new();
+            for value in &index_values {
+                self.tick()?;
+                let value = self.instantiate(value)?;
+                let ExprNode::FVar { id } = value.node() else {
+                    return Err(error(TacticError::InductionIndexNotVariable));
+                };
+                if !seen.insert(id.clone()) {
+                    return Err(error(TacticError::InductionIndexRepeated));
+                }
+            }
+            for parameter in &parameters {
+                if !self.elimination_reads(parameter)?.is_disjoint(&seen) {
+                    return Err(error(TacticError::InductionMotiveMismatch));
+                }
+            }
+        }
         let recursive_source = matches!(input, EliminationSyntax::RecursiveMatch(_));
         if recursive_source && equations.is_none() {
             return self.eliminate_constrained_indices(

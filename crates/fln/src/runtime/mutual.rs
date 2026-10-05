@@ -75,11 +75,11 @@ impl Preparation<'_> {
             reserve(&mut family_levels, self.limits.max_context_depth)?;
             family_levels.push(levels[index].clone());
         }
-        let mut source = Expr::const_(family.base.name.clone(), family_levels.clone());
-        for parameter in &args[..rec.num_params as usize] {
-            self.tick()?;
-            source = Expr::app(source, parameter.clone());
-        }
+        // Mutual members share one parameter telescope. Value-parameter
+        // arguments are erased like type arguments and never evaluated.
+        let source =
+            self.runtime_family(family, &family_levels, &args[..rec.num_params as usize])?;
+        let (_, parameters) = self.spine(&source)?;
         if self.value_type(&source)? != Some(ValueType::Constructor) {
             return Ok(None);
         }
@@ -94,9 +94,7 @@ impl Preparation<'_> {
             let Some(ConstantInfo::Induct(info)) = self.environment.find(member) else {
                 return Ok(None);
             };
-            let Some(domains) =
-                self.index_domains(info, &family_levels, &args[..rec.num_params as usize])?
-            else {
+            let Some(domains) = self.index_domains(info, &family_levels, &parameters)? else {
                 return Ok(None);
             };
             reserve(&mut indices, self.limits.max_context_depth)?;

@@ -35,7 +35,8 @@ mod tactics;
 
 use super::*;
 use crate::constraint::unify::{
-    UnificationBudget, UnificationDeferred, UnificationError, UnificationTransparency,
+    UnificationBudget, UnificationDeferred, UnificationError, UnificationReport,
+    UnificationTransparency,
 };
 use fln_core::expr::{FVarId, MVarId};
 use fln_core::level::{LMVarId, Level};
@@ -234,6 +235,9 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    // Nesting of pending instance synthesis started by unification, the pin's
+    // `synthPendingDepth`. Bounded by `MAX_SYNTH_PENDING_DEPTH`.
+    synth_pending_depth: u8,
     level_params: Vec<Name>,
     explicit_levels: usize,
     infer_level_params: bool,
@@ -241,6 +245,10 @@ struct Context {
     // declarations in the local context decide visibility, including rollback.
     induction_specializations: Vec<(Name, Name)>,
     matrix_rows: std::collections::HashSet<Name>,
+    // Generated pattern columns at a constructor's parameter positions. The pin
+    // makes those positions inaccessible, so a match binds nothing there, and a
+    // source name the pattern matrix aliased to such a column is refused.
+    inaccessible_columns: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -249,6 +257,18 @@ struct Context {
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
     NatDefinitionElabError::Inference(reason)
+}
+
+/// The refusals after which a source batch gets its one safe-definition retry.
+fn retries_with_delta(result: &Result<UnificationReport, UnificationError>) -> bool {
+    matches!(
+        result,
+        Err(UnificationError::Deferred(
+            UnificationDeferred::UnsupportedEquation | UnificationDeferred::NotAPattern
+        )) | Err(UnificationError::Metavariable(
+            MetavarError::OccursCheckFailed { .. }
+        ))
+    )
 }
 
 impl Context {
@@ -266,11 +286,13 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            synth_pending_depth: 0,
             level_params: Vec::new(),
             explicit_levels: 0,
             infer_level_params: false,
             induction_specializations: Vec::new(),
             matrix_rows: std::collections::HashSet::new(),
+            inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
             refinements: Vec::new(),
             recursion: None,
@@ -626,21 +648,58 @@ impl Context {
         let mut result =
             self.txn
                 .unify_many_with(pairs, UnificationBudget::new(self.kernel), &|| false);
-        if allow_delta
-            && matches!(
-                &result,
-                Err(UnificationError::Deferred(
-                    UnificationDeferred::UnsupportedEquation | UnificationDeferred::NotAPattern
-                )) | Err(UnificationError::Metavariable(
-                    MetavarError::OccursCheckFailed { .. }
-                ))
-            )
-        {
+        if allow_delta && retries_with_delta(&result) {
             let mut budget = UnificationBudget::new(self.kernel);
             budget.transparency = UnificationTransparency::SafeDefinitions;
             result = self.txn.unify_many_with(pairs, budget, &|| false);
         }
         result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+    }
+
+    /// `unify_source_batch` for the pending source equations, where a batch
+    /// stuck on one of this context's instance holes may synthesize it.
+    fn unify_pending_batch(
+        &mut self,
+        pairs: &[(Expr, Expr)],
+        allow_delta: bool,
+    ) -> Result<Result<(), UnificationError>, NatDefinitionElabError> {
+        let mut result = self.unify_pending(pairs, UnificationBudget::new(self.kernel))?;
+        if allow_delta && retries_with_delta(&result) {
+            let mut budget = UnificationBudget::new(self.kernel);
+            budget.transparency = UnificationTransparency::SafeDefinitions;
+            result = self.unify_pending(pairs, budget)?;
+        }
+        Ok(result.map(|report| assert!(report.awakened.is_empty(), "private source queue")))
+    }
+
+    /// One source unification request. A fixed point blocked on one of this
+    /// context's instance holes may synthesize it and continue, as the pin's
+    /// `isDefEq` calls `synthPending` (vendored Meta/ExprDefEq.lean
+    /// `unstuckMVar`, Meta/SynthInstance.lean `synthPendingImp`), nested at most
+    /// `maxSynthPendingDepth` deep. The outer error is the synthesis's own
+    /// typed failure, exactly as `resolve_instances` would have returned it.
+    fn unify_pending(
+        &mut self,
+        pairs: &[(Expr, Expr)],
+        budget: UnificationBudget,
+    ) -> Result<Result<UnificationReport, UnificationError>, NatDefinitionElabError> {
+        if self.synth_pending_depth > instances::MAX_SYNTH_PENDING_DEPTH
+            || self.instance_goals.is_empty()
+        {
+            return Ok(self.txn.unify_many_with(pairs, budget, &|| false));
+        }
+        // The owner reads this context while the solver mutates the
+        // transaction; it works on the solver's state, never on this copy.
+        let detached = ElabTxn::new(Environment::new(), KVMap::new(), 0);
+        let mut txn = std::mem::replace(&mut self.txn, detached);
+        let mut owner = instances::PendingInstances::new(self);
+        let result = txn.unify_many_with_pending(pairs, budget, &|| false, &mut owner);
+        let fault = owner.into_fault();
+        self.txn = txn;
+        match fault {
+            Some(fault) => Err(fault),
+            None => Ok(result),
+        }
     }
 
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
@@ -661,7 +720,7 @@ impl Context {
                 .equations
                 .iter()
                 .all(|equation| equation.policy != EquationPolicy::BeforeSelection);
-            let deferred = match self.unify_source_batch(&pairs, allow_delta) {
+            let deferred = match self.unify_pending_batch(&pairs, allow_delta)? {
                 Ok(()) => {
                     self.equations.clear();
                     return Ok(());
@@ -710,10 +769,10 @@ impl Context {
                     // are obligations of the final ordinary K1 declaration.
                     continue;
                 }
-                match self.unify_source_batch(
+                match self.unify_pending_batch(
                     &[(left.clone(), right.clone())],
                     equation.policy != EquationPolicy::BeforeSelection,
-                ) {
+                )? {
                     Ok(()) => {}
                     Err(UnificationError::Deferred(_)) => {
                         equation.sides = (left, right);
@@ -1105,6 +1164,15 @@ impl Context {
                                     else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
+                                    // A name written at a promoted parameter position
+                                    // (`| .done k, _`): the pin's type mismatch.
+                                    if let Syntax::Ident { val: column, .. } = subject
+                                        && self.inaccessible_columns.contains(column)
+                                    {
+                                        return Err(failure(SourceInferenceError::Match(
+                                            matching::MatchError::InaccessibleParameter,
+                                        )));
+                                    }
                                     let value = self.atom(subject, None)?;
                                     if !matches!(value.value.node(), ExprNode::FVar { .. }) {
                                         return Err(failure(SourceInferenceError::Scope));

@@ -10,6 +10,108 @@ mod table;
 
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
+/// The pin's `maxSynthPendingDepth` default (vendored Meta/Basic.lean). As in
+/// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
+pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
+
+/// The owner of this context's instance holes during one unification request:
+/// the pin's `synthPendingImp`. A stuck hole whose class inputs the request
+/// has determined is solved by the ordinary search below, on a copy holding
+/// the request's working assignments, one level deeper. Only the closed answer
+/// returns to the solver, which validates it as any other assignment.
+pub(super) struct PendingInstances<'c> {
+    context: &'c Context,
+    registry: Option<InstanceRegistry>,
+    fault: Option<NatDefinitionElabError>,
+}
+
+impl<'c> PendingInstances<'c> {
+    /// `context` supplies everything but the transaction, which the solver owns.
+    pub(super) fn new(context: &'c Context) -> Self {
+        Self {
+            context,
+            registry: None,
+            fault: None,
+        }
+    }
+
+    /// A search that stopped without an answer, kept with its own type.
+    pub(super) fn into_fault(self) -> Option<NatDefinitionElabError> {
+        self.fault
+    }
+
+    fn search(
+        &mut self,
+        trial: &mut Context,
+        goal: &MVarId,
+    ) -> Result<Option<(Expr, Name)>, NatDefinitionElabError> {
+        if self.registry.is_none() {
+            self.registry = Some(
+                InstanceRegistry::read_with_scopes(
+                    &trial.txn.env,
+                    &trial.source_scope.instance_scopes,
+                )
+                .map_err(registry_error)?,
+            );
+        }
+        let registry = self.registry.as_ref().expect("registry read above");
+        if !trial.search_instance(goal.clone(), registry)? {
+            return Ok(None);
+        }
+        let value = trial.instantiate(&Expr::mvar(goal.clone()))?;
+        let Some(AssignmentJustification::InstanceSearch { class_name }) = trial
+            .txn
+            .mvars
+            .get_assignment(goal)
+            .map(|assignment| assignment.justification.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(Some((value, class_name)))
+    }
+}
+
+impl crate::constraint::unify::PendingSynthesis for PendingInstances<'_> {
+    fn synthesize(
+        &mut self,
+        state: &ElabTxn,
+        goal: &MVarId,
+        spent: u64,
+    ) -> crate::constraint::unify::PendingAnswer {
+        use crate::constraint::unify::PendingAnswer;
+        if self.fault.is_some() || !self.context.instance_goals.contains(goal) {
+            return PendingAnswer {
+                result: Ok(None),
+                spent: 0,
+            };
+        }
+        let mut trial = self.context.clone();
+        trial.txn = state.clone();
+        trial.txn.budget.heartbeats_consumed =
+            state.budget.heartbeats_consumed.saturating_add(spent);
+        trial.equations.clear();
+        trial.stalled_flush = None;
+        trial.synth_pending_depth = trial.synth_pending_depth.saturating_add(1);
+        let start = trial.txn.budget.heartbeats_consumed;
+        let result = self.search(&mut trial, goal);
+        let spent = trial.txn.budget.heartbeats_consumed.saturating_sub(start);
+        match result {
+            Ok(answer) => PendingAnswer {
+                result: Ok(answer),
+                spent,
+            },
+            Err(error) => {
+                // The solver stops; its caller reports this error in place of
+                // the stand-in, exactly as `resolve_instances` would have.
+                self.fault = Some(error);
+                PendingAnswer {
+                    result: Err(UnificationError::Cancelled),
+                    spent,
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 enum Candidate {

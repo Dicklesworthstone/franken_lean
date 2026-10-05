@@ -30,7 +30,9 @@ pub enum TacticError {
     ExpectedProposition,
     DecisionNotTrue,
     NoGoals,
-    UnsolvedGoals { count: usize },
+    UnsolvedGoals {
+        count: usize,
+    },
     NoMatchingAssumption,
     SyntheticHoleOutsideRefine,
     IncompatibleSyntheticHole,
@@ -48,6 +50,15 @@ pub enum TacticError {
     EliminationLocal,
     EliminationCoverage,
     EliminationArity,
+    /// `induction` on a major whose type has an index that is not a local
+    /// variable: the pin's `checkInductionTargets` (vendored
+    /// Lean/Elab/Tactic/Induction.lean:947-954) refuses it and suggests `cases`.
+    InductionIndexNotVariable,
+    /// `induction` on a major whose type repeats one index local.
+    InductionIndexRepeated,
+    /// `induction` on a major whose parameters mention one of its index
+    /// locals: the pin's motive, abstracted over the index, cannot be typed.
+    InductionMotiveMismatch,
     UnsupportedEliminator,
     InvalidGeneralization,
     SubstitutionLocal,
@@ -96,6 +107,15 @@ impl std::fmt::Display for TacticError {
             Self::EliminationArity => {
                 write!(f, "elimination has duplicate or excessive binder names")
             }
+            Self::InductionIndexNotVariable => write!(
+                f,
+                "Invalid target: Index in target's type is not a variable (consider using the `cases` tactic instead)"
+            ),
+            Self::InductionIndexRepeated => write!(
+                f,
+                "Invalid target: Target (or one of its indices) occurs more than once"
+            ),
+            Self::InductionMotiveMismatch => write!(f, "Type mismatch when assigning motive"),
             Self::UnsupportedEliminator => write!(
                 f,
                 "elimination requires a supported admitted single-family recursor"

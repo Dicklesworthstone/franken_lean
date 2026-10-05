@@ -46,11 +46,50 @@ fn indexed_induction_can_return_data_at_the_refined_index() {
 
 #[test]
 fn dependent_index_telescopes_are_abstracted_in_family_order() {
-    check(
-        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (value : P a) : Witness A P a value\n\
-        def extract {A : Type} {P : A -> Type} (a : A) (value : P a) (w : Witness A P a value) : P a := by\n  cases w with\n  | intro x v => exact v\n\
-        theorem sample : extract 3 true (Witness.intro 3 true : Witness Nat (fun x => Bool) 3 true) = true := by rfl",
+    // `tagged` binds the telescope after a tag, so the pinned Reference keeps
+    // `(a : A) (value : P a)` as dependent indices; `cases` must abstract them in
+    // family order for `P a` to be refined consistently in each branch.
+    let tagged = "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (value : P a) : Witness A P a value | tagged (tag : Bool) (a : A) (value : P a) : Witness A P a value\n";
+    check(&format!(
+        "{tagged}\
+        def extract {{A : Type}} {{P : A -> Type}} (a : A) (value : P a) (w : Witness A P a value) : P a := by\n  cases w with\n  | intro x v => assumption\n  | tagged t x v => assumption\n\
+        theorem sample : @extract Nat (fun x => Bool) 3 true (@Witness.intro Nat (fun x => Bool) 3 true) = true := by rfl\n\
+        theorem sample_tagged : @extract Nat (fun x => Bool) 3 false (@Witness.tagged Nat (fun x => Bool) true 3 false) = false := by rfl"
+    ));
+    check(&format!(
+        "{tagged}\
+        def tagOf {{A : Type}} {{P : A -> Type}} (a : A) (value : P a) (w : Witness A P a value) : Bool := by\n  cases w with\n  | intro x v => exact false\n  | tagged t x v => exact t\n\
+        theorem sample : @tagOf Nat (fun x => Bool) 3 true (@Witness.intro Nat (fun x => Bool) 3 true) = false := by rfl\n\
+        theorem sample_tagged : @tagOf Nat (fun x => Bool) 3 false (@Witness.tagged Nat (fun x => Bool) true 3 false) = true := by rfl"
+    ));
+    // With `intro` alone the telescope is promoted to parameters
+    // (`fixedIndicesToParams`), so `intro` has no fields to name.
+    let promoted = "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (value : P a) : Witness A P a value\n";
+    check(&format!(
+        "{promoted}\
+        def extract {{A : Type}} {{P : A -> Type}} (a : A) (value : P a) (w : Witness A P a value) : P a := by\n  cases w with\n  | intro => exact value\n\
+        theorem sample : @extract Nat (fun x => Bool) 3 true (@Witness.intro Nat (fun x => Bool) 3 true) = true := by rfl"
+    ));
+    // Pin: "Too many variable names provided at alternative `intro`: 2
+    // provided, but 0 expected".
+    let source = format!(
+        "{promoted}\
+        def extract {{A : Type}} {{P : A -> Type}} (a : A) (value : P a) (w : Witness A P a value) : P a := by\n  cases w with\n  | intro x v => exact v"
     );
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let error = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(&source);
+    assert!(
+        format!("{error:?}").contains("EliminationArity"),
+        "{error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
 }
 
 #[test]

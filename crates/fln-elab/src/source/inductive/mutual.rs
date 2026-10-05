@@ -5,22 +5,6 @@ use super::*;
 use crate::inductive::mutual_inductive_declaration;
 use std::collections::HashSet;
 
-fn rename(
-    context: &mut Context,
-    mut term: Expr,
-    replacements: &[(FVarId, Expr)],
-) -> Result<Expr, NatDefinitionElabError> {
-    for (id, value) in replacements {
-        context.tick()?;
-        term = term
-            .abstract_fvar(id, 0)
-            .map_err(|_| invalid())?
-            .subst_loose(0, std::slice::from_ref(value))
-            .map_err(|_| invalid())?;
-    }
-    Ok(term)
-}
-
 fn family_type(
     header: &Header<'_>,
     level: &Level,

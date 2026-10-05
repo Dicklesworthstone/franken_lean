@@ -166,7 +166,9 @@ impl Preparation<'_> {
                 let mut body = self.lift(&args[minor_index], lift)?;
                 minor_index += 1;
                 let mut hypotheses = Vec::new();
-                let mut logical_fields = self.indexed_constructor_telescope(shape, ctor)?;
+                // Value parameters are not threaded through mutual peers: a
+                // child index computed from one is refused, never guessed.
+                let mut logical_fields = self.indexed_constructor_telescope(shape, ctor, &[])?;
                 for (field_index, field_type) in ctor.fields.iter().enumerate() {
                     self.tick()?;
                     let field =

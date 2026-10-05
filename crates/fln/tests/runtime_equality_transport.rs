@@ -32,10 +32,43 @@ fn transport_keeps_a_scalar_payload() {
         "42",
     );
 }
+/// Refused before anything is published; `reason` names the refusal that
+/// corresponds to the pinned Reference's own reason.
+fn refuse(source: &str, reason: &str) {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let error = engine
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+        .expect_err(source);
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains(reason),
+        "expected {reason} for:\n{source}\ngot {rendered}"
+    );
+    assert_eq!(root, engine.logical_root(&KVMap::new()));
+}
+// A written index that every constructor binds as its own field and returns
+// unchanged is promoted to a parameter by the pinned Reference
+// (`fixedIndicesToParams`), so a constructor pattern may only write `_` there:
+// a named variable is the pin's "Type mismatch" and FrankenLean's
+// `InaccessibleParameter`. A family that binds the index elsewhere, or not at
+// all in some constructor, keeps it as an index, and a match refines it to the
+// constructor's fields. Every `run` program below is accepted by pinned `lean`
+// v4.32.0 with the same `#eval` output, and every `refuse` program is refused.
 #[test]
 fn a_constructor_field_index_can_be_matched() {
+    // `zero` keeps the index, so `k` is a stored field refined against `n`.
     run(
+        "inductive Indexed : Nat -> Type where | make (n : Nat) : Indexed n | zero : Indexed 0\ndef value (n : Nat) (x : Indexed n) : Nat := match x with | .make k => k | .zero => 0\n#eval value 42 (Indexed.make 42)",
+        "42",
+    );
+    refuse(
         "inductive Indexed : Nat -> Type where | make (n : Nat) : Indexed n\ndef value (n : Nat) (x : Indexed n) : Nat := match x with | .make k => k\n#eval value 42 (Indexed.make 42)",
+        "InaccessibleParameter",
+    );
+    // With `make` alone the index is promoted and the pin reads the parameter.
+    run(
+        "inductive Indexed : Nat -> Type where | make (n : Nat) : Indexed n\ndef value (n : Nat) (x : Indexed n) : Nat := match x with | .make _ => n\n#eval value 42 (Indexed.make 42)",
         "42",
     );
 }
@@ -52,15 +85,37 @@ fn equality_transport_preserves_the_indexed_object_representation() {
 }
 #[test]
 fn refined_matches_can_rebuild_recursive_objects() {
+    // `step` raises the index, so it is kept: each match refines it to `k`.
     run(
+        "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk (Nat.succ n)\ndef copy (n : Nat) (w : Walk n) : Walk n := match w with | .done k => Walk.done k | .step k child => Walk.step k (copy k child)\ndef depth (n : Nat) (w : Walk n) : Nat := match w with | .done k => k | .step k child => depth k child + 1\n#eval depth 42 (copy 42 (Walk.step 41 (Walk.step 40 (Walk.done 40))))",
+        "42",
+    );
+    refuse(
         "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\ndef copy (n : Nat) (w : Walk n) : Walk n := match w with | .done k => Walk.done k | .step k child => Walk.step k (copy k child)\ndef depth (n : Nat) (w : Walk n) : Nat := by induction w with | done k => exact k | step k child ih => exact ih + 1\n#eval depth 40 (copy 40 (Walk.step 40 (Walk.step 40 (Walk.done 40))))",
+        "InaccessibleParameter",
+    );
+    // The same family with its index promoted, in the pin's form.
+    run(
+        "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\ndef copy (n : Nat) (w : Walk n) : Walk n := match w with | .done _ => Walk.done n | .step _ child => Walk.step n (copy n child)\ndef depth (n : Nat) (w : Walk n) : Nat := match w with | .done _ => n | .step _ child => depth n child + 1\n#eval depth 40 (copy 40 (Walk.step 40 (Walk.step 40 (Walk.done 40))))",
         "42",
     );
 }
 #[test]
 fn repeated_indices_and_two_recursive_children_retain_their_evidence() {
+    // `leaf` binds its payload first, so neither index is promoted: both are
+    // refined to the repeated `k`, and each child keeps its own evidence.
     run(
+        "inductive TreeAt : Nat -> Nat -> Type where | leaf (a : Nat) (n : Nat) : TreeAt n n | fork (n : Nat) (left right : TreeAt n n) : TreeAt n n\ndef copy (n m : Nat) (t : TreeAt n m) : TreeAt n m := match t with | .leaf a k => TreeAt.leaf a k | .fork k l r => TreeAt.fork k (copy k k l) (copy k k r)\ndef sum (n m : Nat) (t : TreeAt n m) : Nat := match t with | .leaf a k => a | .fork k l r => sum k k l + sum k k r\n#eval sum 3 3 (copy 3 3 (TreeAt.fork 3 (TreeAt.leaf 20 3) (TreeAt.leaf 22 3)))",
+        "42",
+    );
+    refuse(
         "inductive TreeAt : Nat -> Nat -> Type where | leaf (n : Nat) (a : Nat) : TreeAt n n | fork (n : Nat) (left right : TreeAt n n) : TreeAt n n\ndef copy (n m : Nat) (t : TreeAt n m) : TreeAt n m := match t with | .leaf k a => TreeAt.leaf k a | .fork k l r => TreeAt.fork k (copy k k l) (copy k k r)\ndef sum (n m : Nat) (t : TreeAt n m) : Nat := by induction t with | leaf k a => exact a | fork k l r ihl ihr => exact ihl + ihr\n#eval sum 3 3 (copy 3 3 (TreeAt.fork 3 (TreeAt.leaf 3 20) (TreeAt.leaf 3 22)))",
+        "InaccessibleParameter",
+    );
+    // With `leaf (n : Nat) (a : Nat)` the first index is promoted; the second
+    // is still refined to that parameter, in the pin's form.
+    run(
+        "inductive TreeAt : Nat -> Nat -> Type where | leaf (n : Nat) (a : Nat) : TreeAt n n | fork (n : Nat) (left right : TreeAt n n) : TreeAt n n\ndef copy (n m : Nat) (t : TreeAt n m) : TreeAt n m := match t with | .leaf _ a => TreeAt.leaf n a | .fork _ l r => TreeAt.fork n (copy n n l) (copy n n r)\ndef sum (n m : Nat) (t : TreeAt n m) : Nat := match t with | .leaf _ a => a | .fork _ l r => sum n n l + sum n n r\n#eval sum 3 3 (copy 3 3 (TreeAt.fork 3 (TreeAt.leaf 3 20) (TreeAt.leaf 3 22)))",
         "42",
     );
 }

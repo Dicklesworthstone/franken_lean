@@ -1,4 +1,8 @@
 //! Real source recursion at constrained indices, admitted by both checkers.
+//! Every family here whose constructors bind a written index as their own field
+//! and return it unchanged has that index promoted to a parameter, as the
+//! pinned Reference's `fixedIndicesToParams` does, so a constructor pattern
+//! names it only with `_` (pin `isNextArgAccessible`).
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 fn check(source: &str) -> Engine {
@@ -19,13 +23,16 @@ fn check(source: &str) -> Engine {
         .engine
 }
 const LOOP: &str = "inductive Loop : Nat -> Type where | base (n : Nat) : Loop n | step (n : Nat) (child : Loop n) : Loop n\n";
+/// Structural recursion at the fixed index `7`: `Loop`'s index is promoted, so
+/// `7` is a parameter and the constructor patterns write `_` for it.
+const COPIED: &str = "def copied (x : Loop 7) : Loop 7 := match x with | .base _ => Loop.base 7 | .step _ rest => Loop.step 7 (copied rest)";
 #[test]
 fn fixed_index_recursive_copy_is_computed_by_the_real_recursor() {
     check(&format!(
         r#"{LOOP}
 def copy (x : Loop 7) : Loop 7 := match x with
-  | .base n => Loop.base n
-  | .step n rest => Loop.step n (copy rest)
+  | .base _ => Loop.base 7
+  | .step _ rest => Loop.step 7 (copy rest)
 def sample : Loop 7 := Loop.step 7 (Loop.step 7 (Loop.base 7))
 theorem copied : copy sample = sample := by rfl
 "#
@@ -36,8 +43,8 @@ fn constrained_recursion_can_change_an_accumulator() {
     check(&format!(
         r#"{LOOP}
 def count (x : Loop 7) (acc : Nat) : Nat := match x with
-  | .base n => acc
-  | .step n rest => count rest (acc + 1)
+  | .base _ => acc
+  | .step _ rest => count rest (acc + 1)
 theorem counted : count (Loop.step 7 (Loop.step 7 (Loop.base 7))) 4 = 6 := by rfl
 "#
     ));
@@ -50,9 +57,9 @@ inductive Tree : Nat -> Nat -> Type where
   | leaf (a b : Nat) : Tree a b
   | fork (a b : Nat) (left right : Tree a b) : Tree a b
 def size (n : Nat) (tree : Tree n n) : Nat := match tree with
-  | .leaf a b => 1
-  | .fork a b left right => size n left + size n right
- theorem count : size 3 (Tree.fork 3 3 (Tree.leaf 3 3) (Tree.leaf 3 3)) = 2 := by rfl
+  | .leaf _ _ => 1
+  | .fork _ _ left right => size n left + size n right
+theorem count : size 3 (Tree.fork 3 3 (Tree.leaf 3 3) (Tree.leaf 3 3)) = 2 := by rfl
 "#,
     );
 }
@@ -62,12 +69,12 @@ fn constrained_recursive_copy_supports_a_universal_induction_proof() {
     check(&format!(
         r#"{LOOP}
 def copy (x : Loop 7) : Loop 7 := match x with
-  | .base n => Loop.base n
-  | .step n rest => Loop.step n (copy rest)
+  | .base _ => Loop.base 7
+  | .step _ rest => Loop.step 7 (copy rest)
 theorem identity (x : Loop 7) : copy x = x := by
   induction x with
-  | base n => rfl
-  | step n rest ih => simp only [copy, ih]
+  | base => rfl
+  | step rest ih => simp only [copy, ih]
 "#
     ));
 }
@@ -102,6 +109,9 @@ theorem usable (h : Evidence 0) : Evidence 0 := copy h
     );
 }
 
+/// Both indices of `Trace` are promoted together, so `f a` and `v` are fixed
+/// parameters of the recursion while `acc` changes. The pin cannot infer the
+/// motive `P` from `true : P 7`, so it is named.
 #[test]
 fn dependent_indices_and_changing_suffixes_keep_their_actual_types() {
     check(
@@ -111,21 +121,29 @@ inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
   | step (a : A) (v : P a) (child : Trace A P a v) : Trace A P a v
 def depth {A : Type} {P : A -> Type} (f : A -> A) (a : A) (v : P (f a))
     (t : Trace A P (f a) v) (acc : Nat) : Nat := match t with
-  | .base x vx => acc
-  | .step x vx child => depth f a v child (acc + 1)
-def t : Trace Nat (fun n => Bool) 7 true := Trace.step 7 true (Trace.base 7 true)
-theorem counted : depth Nat.succ 6 true t 4 = 5 := by rfl
+  | .base _ _ => acc
+  | .step _ _ child => depth f a v child (acc + 1)
+def t : Trace Nat (fun n => Bool) 7 true :=
+  Trace.step (P := fun n => Bool) 7 true (Trace.base (P := fun n => Bool) 7 true)
+theorem counted : depth (P := fun n => Bool) Nat.succ 6 true t 4 = 5 := by rfl
 "#,
     );
 }
 
+/// `e` depends on the input and is generalized by the match; `h`, before the
+/// input, is passed `rfl` rather than itself, so the pin's fixed prefix stops
+/// before it and it varies with the recursion.
 #[test]
-fn dependent_arguments_before_and_after_the_input_are_generalized() {
+fn a_dependent_argument_after_the_input_is_generalized_and_one_before_it_stays_fixed() {
+    // The pin also accepts `depth rfl rest rfl`: its fixed prefix is only what
+    // every recursive call passes unchanged, and it generalizes the rest. Here
+    // an argument before the input that changes is refused as ChangedParameter,
+    // even over Nat (bead fln-structural-fixed-prefix-bcvq), so this passes `h`.
     check(&format!(
         r#"{LOOP}
 def depth (h : 7 = 7) (x : Loop 7) (e : x = x) : Nat := match x with
-  | .base n => n
-  | .step n rest => depth rfl rest rfl + 1
+  | .base _ => 7
+  | .step _ rest => depth h rest rfl + 1
 theorem counted : depth rfl (Loop.step 7 (Loop.base 7)) rfl = 8 := by rfl
 "#
     ));
@@ -139,8 +157,8 @@ inductive ListAt (A : Type) : Nat -> Type where
   | nil (n : Nat) : ListAt A n
   | cons (n : Nat) (head : A) (tail : ListAt A n) : ListAt A n
 def copy {A : Type} (xs : ListAt A 3) : ListAt A 3 := match xs with
-  | .nil n => ListAt.nil n
-  | .cons n x tail => ListAt.cons n x (copy tail)
+  | .nil _ => ListAt.nil 3
+  | .cons _ x tail => ListAt.cons 3 x (copy tail)
 def sample : ListAt Nat 3 := ListAt.cons 3 11 (ListAt.nil 3)
 theorem copied : copy sample = sample := by rfl
 "#,
@@ -154,15 +172,18 @@ fn reject(source: &str) {
         .into_complete()
         .unwrap();
     let root = engine.logical_root(&KVMap::new());
+    let Err(error) = engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) else {
+        panic!("accepted invalid source: {source}");
+    };
+    // No program here is refused for its patterns: a named variable in a
+    // promoted position would be refused before the property under test.
     assert!(
-        engine
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits)
-            )
-            .is_err(),
-        "accepted invalid source: {source}"
+        !format!("{error:?}").contains("InaccessibleParameter"),
+        "refused for its pattern, not its recursion: {source}\n{error:?}"
     );
     assert_eq!(root, engine.logical_root(&KVMap::new()));
     engine
@@ -187,7 +208,7 @@ fn nondecreasing_calls_cannot_hide_in_unused_values_or_annotations() {
         "let escaped := bad; escaped rest",
     ] {
         reject(&format!(
-            "{LOOP}\ndef bad (x : Loop 7) : Nat := match x with | .base n => 0 | .step n rest => {body}"
+            "{LOOP}\ndef bad (x : Loop 7) : Nat := match x with | .base _ => 0 | .step _ rest => {body}"
         ));
     }
 }
@@ -211,7 +232,7 @@ def bad (tag : Nat) (x : Marked tag tag) : Nat := match x with | .base => 0 | .s
 "#,
     );
     reject(&format!(
-        "{LOOP}\ndef bad (x : Loop 7) : 0 = 1 := match x with | .base n => rfl | .step n rest => bad rest"
+        "{LOOP}\ndef bad (x : Loop 7) : 0 = 1 := match x with | .base _ => rfl | .step _ rest => bad rest"
     ));
     reject(
         r#"
@@ -224,7 +245,7 @@ def bad (h : Evidence 0) : Nat := match h with | .base => 0 | .step child => bad
 #[test]
 fn user_proofs_cannot_see_the_compilers_recursive_hypotheses() {
     reject(
-        "inductive Branch : Nat -> Type where | base (n : Nat) : Branch n | left (n : Nat) (child : Branch n) : Branch n | right (n : Nat) (child : Branch n) : Branch n\ndef proof (x : Branch 7) : 0 = 0 := match x with | .base n => rfl | .left n rest => proof rest | .right n rest => by assumption",
+        "inductive Branch : Nat -> Type where | base (n : Nat) : Branch n | left (n : Nat) (child : Branch n) : Branch n | right (n : Nat) (child : Branch n) : Branch n\ndef proof (x : Branch 7) : 0 = 0 := match x with | .base _ => rfl | .left _ rest => proof rest | .right _ rest => by assumption",
     );
 }
 
@@ -233,8 +254,8 @@ fn partial_child_calls_keep_their_remaining_dependent_function_arguments() {
     check(&format!(
         r#"{LOOP}
 def combine (x : Loop 7) (a b : Nat) : Nat := match x with
-  | .base n => a * 10 + b
-  | .step n rest => let next := combine rest a; next (b + 1)
+  | .base _ => a * 10 + b
+  | .step _ rest => let next := combine rest a; next (b + 1)
 theorem counted : combine (Loop.step 7 (Loop.base 7)) 3 5 = 36 := by rfl
 "#
     ));
@@ -245,8 +266,8 @@ fn eta_completed_child_calls_do_not_capture_an_enclosing_lambda() {
     check(&format!(
         r#"{LOOP}
 def combine (x : Loop 7) (a b : Nat) : Nat := match x with
-  | .base n => a * 10 + b
-  | .step n rest =>
+  | .base _ => a * 10 + b
+  | .step _ rest =>
     let next : Nat -> Nat -> Nat := fun v => combine rest v;
     next a (b + 1)
 theorem counted : combine (Loop.step 7 (Loop.base 7)) 3 5 = 36 := by rfl
@@ -261,7 +282,7 @@ fn emitted_recursion_terms_use_admitted_recursors_not_self_constants_or_axioms()
     use fln_env::constants::ConstantInfo;
     use std::collections::HashSet;
     let engine = check(&format!(
-        "{LOOP}\ndef copied (x : Loop 7) : Loop 7 := match x with | .base n => Loop.base n | .step n rest => Loop.step n (copied rest)"
+        "{LOOP}\n{COPIED}\ntheorem copied_once : copied (Loop.step 7 (Loop.base 7)) = Loop.step 7 (Loop.base 7) := by rfl"
     ));
     let name = Name::from_components(["copied"]);
     let Some(ConstantInfo::Defn(definition)) = engine.environment().find(&name) else {
@@ -294,8 +315,10 @@ fn emitted_recursion_terms_use_admitted_recursors_not_self_constants_or_axioms()
             _ => {}
         }
     }
+    // `Loop`'s index is a parameter here, so the recursor's motive has no index
+    // to transport along: the old `Eq.rec` requirement belonged to the dialect's
+    // index equations and is not asserted. `copied_once` checks the computation.
     assert!(constants.contains(&Name::from_components(["Loop", "rec"])));
-    assert!(constants.contains(&Name::from_components(["Eq", "rec"])));
     assert!(!constants.contains(&name));
     assert!(constants.iter().all(|name| !matches!(
         engine.environment().find(name),
@@ -309,9 +332,9 @@ fn low_budgets_and_failed_suffixes_do_not_publish_successful_prefixes() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = check(LOOP);
     let root = engine.logical_root(&KVMap::new());
-    let good = "def copied (x : Loop 7) : Loop 7 := match x with | .base n => Loop.base n | .step n rest => Loop.step n (copied rest)";
+    let good = COPIED;
     let bad =
-        "def bad (x : Loop 7) : 0 = 1 := match x with | .base n => rfl | .step n rest => bad rest";
+        "def bad (x : Loop 7) : 0 = 1 := match x with | .base _ => rfl | .step _ rest => bad rest";
     let mut low = SourceCheckLimits::new(limits);
     low.admission.kernel = low.admission.kernel.narrowed(0, 32);
     match engine.check_source_files(&[good.as_bytes()], &KVMap::new(), low) {

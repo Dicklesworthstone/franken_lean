@@ -172,7 +172,7 @@ pub fn inductive_declaration(
     spec: &InductiveSpec,
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
-    build_inductive(spec, budget, None)
+    build_inductive(spec, budget, None, None)
 }
 
 /// Field universes inform candidate generation only. Both admission engines
@@ -183,16 +183,45 @@ pub(crate) fn inductive_with_field_universes(
     budget: RecordBudget,
     field_universes: &[Vec<Level>],
 ) -> Result<Declaration, InductiveError> {
-    build_inductive(spec, budget, Some(field_universes))
+    build_inductive(spec, budget, Some(field_universes), None)
+}
+
+/// [`inductive_with_field_universes`] for a family whose trailing parameters
+/// were written as indices and promoted (the Reference's
+/// `fixedIndicesToParams`). `promoted[c]` holds constructor `c`'s own binders
+/// for those parameters: the same locals as the trailing `spec.parameters`,
+/// with the constructor's written names, binder styles and domains. Only the
+/// constructor types read them; the family, recursor and rules bind the
+/// promoted parameters by the family's own index binders, as the pin does.
+pub(crate) fn inductive_with_promoted_parameters(
+    spec: &InductiveSpec,
+    budget: RecordBudget,
+    field_universes: &[Vec<Level>],
+    promoted: &[Vec<LocalDecl>],
+) -> Result<Declaration, InductiveError> {
+    build_inductive(spec, budget, Some(field_universes), Some(promoted))
 }
 
 fn build_inductive(
     spec: &InductiveSpec,
     budget: RecordBudget,
     field_universes: Option<&[Vec<Level>]>,
+    promoted: Option<&[Vec<LocalDecl>]>,
 ) -> Result<Declaration, InductiveError> {
     if spec.name.is_anonymous() {
         return Err(InductiveError::InvalidName);
+    }
+    if let Some(promoted) = promoted
+        && (promoted.len() != spec.constructors.len()
+            || promoted.iter().any(|own| {
+                own.len() > spec.parameters.len()
+                    || own
+                        .iter()
+                        .zip(&spec.parameters[spec.parameters.len() - own.len()..])
+                        .any(|(binder, parameter)| binder.id != parameter.id || binder.is_let())
+            }))
+    {
+        return Err(InductiveError::InvalidTelescope);
     }
     let count = spec
         .constructors
@@ -286,7 +315,7 @@ fn build_inductive(
     let family = app(family_prefix.clone(), spec.indices.iter().map(fv));
     let mut names = HashSet::new();
     let mut recursive = Vec::new();
-    for constructor in &spec.constructors {
+    for (position, constructor) in spec.constructors.iter().enumerate() {
         let LeafView::Str(label) = constructor.name.leaf_view() else {
             return Err(InductiveError::InvalidName);
         };
@@ -295,6 +324,17 @@ fn build_inductive(
         }
         if !names.insert(constructor.name.clone()) {
             return Err(InductiveError::DuplicateConstructor);
+        }
+        if let Some(promoted) = promoted {
+            let own = &promoted[position];
+            let first = spec.parameters.len() - own.len();
+            for (offset, binder) in own.iter().enumerate() {
+                let scope: HashSet<_> = spec.parameters[..first + offset]
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect();
+                builder.scan(&binder.type_, &scope, &spec.name)?;
+            }
         }
         let mut allowed: HashSet<_> = spec.parameters.iter().map(|p| p.id.clone()).collect();
         let mut fields = Vec::new();
@@ -385,7 +425,10 @@ fn build_inductive(
         minors.push(minor);
         let result = app(family_prefix.clone(), ctor.result_indices.iter().cloned());
         let type_ = builder.close(&ctor.fields, result, false, false)?;
-        let type_ = builder.close(&spec.parameters, type_, false, true)?;
+        let own = promoted.map_or(&[][..], |promoted| promoted[index].as_slice());
+        let type_ = builder.close(own, type_, false, false)?;
+        let shared = &spec.parameters[..spec.parameters.len() - own.len()];
+        let type_ = builder.close(shared, type_, false, true)?;
         constructors.push(ConstructorVal {
             base: ConstantVal {
                 name: ctor_names[index].clone(),

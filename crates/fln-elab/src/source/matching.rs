@@ -22,6 +22,11 @@ pub enum MatchError {
     DuplicateConstructor,
     MissingConstructor,
     WrongArity,
+    /// A named variable in a constructor parameter's position. Only a promoted
+    /// index makes a parameter explicit; the pin elaborates its argument as an
+    /// inaccessible term (`isNextArgAccessible`, vendored
+    /// Lean/Elab/PatternVar.lean:178-188), so only `_` fits there.
+    InaccessibleParameter,
     DuplicateVariable,
     UnreachableRow,
 }
@@ -47,6 +52,9 @@ impl std::fmt::Display for MatchError {
             Self::DuplicateConstructor => "match repeats a constructor or a catch-all",
             Self::MissingConstructor => "match does not cover every constructor",
             Self::WrongArity => "constructor pattern has the wrong number of explicit fields",
+            Self::InaccessibleParameter => {
+                "a constructor parameter is inaccessible in a pattern; only `_` may stand there"
+            }
             Self::DuplicateVariable => "constructor pattern repeats a variable",
             Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
         })
@@ -144,6 +152,31 @@ pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitio
     Ok(None)
 }
 impl Context {
+    /// How many of `constructor`'s parameter binders are explicit. Parameters
+    /// the family declared are implicit in its constructors; a promoted index
+    /// keeps the binder its constructor wrote, which may be explicit.
+    fn explicit_parameter_binders(
+        &mut self,
+        constructor: &fln_env::constants::ConstructorVal,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let mut type_ = &constructor.base.type_;
+        let mut explicit = 0;
+        for _ in 0..constructor.num_params {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_info, body, ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if *binder_info == BinderInfo::Default {
+                explicit += 1;
+            }
+            type_ = body;
+        }
+        Ok(explicit)
+    }
+
     /// Independent local indices can be generalized without inventing index
     /// equalities. Repeated, fixed and let-bound indices need an equation
     /// refinement compiler, so they are not silently treated as independent.
@@ -849,10 +882,42 @@ impl Context {
                 if !constructors.contains(&constructor_name) {
                     return Err(error(MatchError::InvalidPattern));
                 }
-                let fields = arguments
+                let mut fields = arguments
                     .iter()
                     .map(pattern_name)
                     .collect::<Result<Vec<_>, _>>()?;
+                // Explicit constructor parameters, which only a promoted index has,
+                // take a written argument each; the pin makes them inaccessible
+                // (`isNextArgAccessible`, vendored Lean/Elab/PatternVar.lean:178-188),
+                // so only `_` may stand there, and the fields follow them. A match
+                // the pattern-matrix compiler generated names every column with an
+                // unspellable numeric name; dropped here, that column is bound by
+                // nothing, and an alias of it is refused (`inaccessible_columns`).
+                let Some(ConstantInfo::Ctor(constructor)) =
+                    self.txn.env.find(&constructor_name).cloned()
+                else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                let parameters = self.explicit_parameter_binders(&constructor)?;
+                if fields.len() < parameters {
+                    return Err(error(MatchError::WrongArity));
+                }
+                let inaccessible = |field: &Option<Name>| match field {
+                    None => true,
+                    Some(name) => {
+                        parts.generated
+                            && name.parent().is_anonymous()
+                            && matches!(name.leaf_view(), LeafView::Num(_))
+                    }
+                };
+                if !fields[..parameters].iter().all(inaccessible) {
+                    return Err(error(MatchError::InaccessibleParameter));
+                }
+                // A generated column dropped here binds nothing; remember it, so a
+                // source alias of it is refused as the pin refuses it.
+                for column in fields.drain(..parameters).flatten() {
+                    self.inaccessible_columns.insert(column);
+                }
                 let mut names = HashSet::new();
                 if fields
                     .iter()

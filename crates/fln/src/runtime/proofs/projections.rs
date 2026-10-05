@@ -30,10 +30,13 @@ impl Preparation<'_> {
         }
         // A second preparation pass may see a private projection key, but it
         // must be bound to this exact previously discovered source family.
-        if name != structure
-            && self.data_shapes.get(&source).map(|shape| &shape.name) != Some(structure)
-        {
-            return Err(unsupported("projection receiver family mismatch"));
+        // Layouts are keyed by the runtime type, in which value parameters
+        // are erased; the original parameters are still used below.
+        if name != structure {
+            let key = self.erase_data_indices(&source)?;
+            if self.data_shapes.get(&key).map(|shape| &shape.name) != Some(structure) {
+                return Err(unsupported("projection receiver family mismatch"));
+            }
         }
         let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(&family.ctors[0]) else {
             return Ok(None);

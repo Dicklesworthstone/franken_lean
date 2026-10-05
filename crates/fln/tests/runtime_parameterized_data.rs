@@ -221,6 +221,127 @@ fn runtime_fields_stay_strict_even_when_the_match_ignores_them() {
     );
 }
 
+// Value parameters. Like the pinned compiler, a constructor object stores only
+// its fields, so one layout serves every value of a parameter whose type is
+// not a sort. Every program below is accepted by pinned `lean` v4.32.0, whose
+// `#eval` prints the asserted value.
+#[test]
+fn value_parameters_are_not_stored_in_constructor_objects() {
+    run(
+        "inductive Box (n : Nat) : Type where | make : Box n\ndef k (b : Box 3) : Nat := 42\n#eval k Box.make",
+        "42",
+    );
+    run(
+        "inductive Box (n : Nat) : Type where | make : Box n\ndef size (n : Nat) (b : Box n) : Nat := match b with | .make => n + 40\n#eval size 2 Box.make",
+        "42",
+    );
+    run(
+        "inductive Cell (n : Nat) : Type where | make (v : Nat) : Cell n\ndef read (n : Nat) (c : Cell n) : Nat := match c with | .make v => v + n\n#eval read 2 (Cell.make 40)",
+        "42",
+    );
+    run(
+        "inductive Pair (A : Type) (n : Nat) : Type where | mk (a : A) (b : Nat) : Pair A n\ndef second (A : Type) (n : Nat) (p : Pair A n) : Nat := match p with | .mk _ b => b\n#eval second String 9 (Pair.mk \"x\" 42)",
+        "42",
+    );
+}
+
+#[test]
+fn fields_whose_types_mention_a_value_parameter_share_one_layout() {
+    let tags = "inductive Tag (n : Nat) : Type where | mk (v : Nat) : Tag n\ndef tagValue (n : Nat) (t : Tag n) : Nat := match t with | .mk w => w\n";
+    // A family field at the parameter and a proof about it both erase it.
+    run(
+        &format!(
+            "{tags}inductive Bounded (n : Nat) : Type where | mk (t : Tag n) (v : Nat) (h : v = n) : Bounded n\ndef total (n : Nat) (b : Bounded n) : Nat := match b with | .mk t v _ => tagValue n t + v\n#eval total 2 (Bounded.mk (Tag.mk 40) 2 (by rfl))"
+        ),
+        "42",
+    );
+    // A function field whose domain mentions the parameter.
+    run(
+        &format!(
+            "{tags}inductive Reader (n : Nat) : Type where | mk (f : Tag n -> Nat) (t : Tag n) : Reader n\ndef apply (n : Nat) (r : Reader n) : Nat := match r with | .mk f t => f t\n#eval apply 5 (Reader.mk (fun t => tagValue 5 t + 2) (Tag.mk 40))"
+        ),
+        "42",
+    );
+}
+
+#[test]
+fn promoted_indices_run_equations_with_wildcard_parameter_patterns() {
+    // The pin promotes this uniform written index to a parameter
+    // (`fixedIndicesToParams`): `Ladder.rung : (n : Nat) -> Ladder n -> Ladder n`.
+    let ladder = "inductive Ladder : Nat -> Type where | base (n : Nat) : Ladder n | rung (n : Nat) (rest : Ladder n) : Ladder n\n";
+    run(
+        &format!(
+            "{ladder}def depth (n : Nat) : Ladder n -> Nat | .base _ => 0 | .rung _ rest => depth n rest + 1\ndef copy (n : Nat) : Ladder n -> Ladder n | .base _ => Ladder.base n | .rung _ rest => Ladder.rung n (copy n rest)\n#eval depth 7 (copy 7 (Ladder.rung 7 (Ladder.rung 7 (Ladder.base 7))))"
+        ),
+        "2",
+    );
+    run(
+        &format!(
+            "{ladder}def climb (n : Nat) : Ladder n -> Nat | .base _ => n | .rung _ rest => n + climb n rest\n#eval climb 14 (Ladder.rung 14 (Ladder.rung 14 (Ladder.base 14)))"
+        ),
+        "42",
+    );
+    run(
+        &format!(
+            "{ladder}def drain (n : Nat) : Ladder n -> Nat -> Nat | .base _, acc => acc | .rung _ rest, acc => drain n rest (acc + n)\n#eval drain 21 (Ladder.rung 21 (Ladder.rung 21 (Ladder.base 21))) 0"
+        ),
+        "42",
+    );
+    // Only the first index is promoted; the second stays an index. A child's
+    // index and the parameter both reach each recursive call.
+    run(
+        "inductive Steps : Nat -> Nat -> Type where | stop (n : Nat) : Steps n 0 | step (n : Nat) (k : Nat) (rest : Steps n k) : Steps n (Nat.succ k)\ndef total (n m : Nat) : Steps n m -> Nat | .stop _ => n | .step _ k rest => n + total n k rest\n#eval total 14 2 (Steps.step 14 1 (Steps.step 14 0 (Steps.stop 14)))",
+        "42",
+    );
+}
+
+#[test]
+fn mutual_and_nested_value_parameter_families_execute() {
+    run(
+        "mutual\ninductive Even (n : Nat) : Type where | zero : Even n | next (o : Odd n) : Even n\ninductive Odd (n : Nat) : Type where | next (e : Even n) : Odd n\nend\ndef shape (n : Nat) (o : Odd n) : Nat := match o with | .next e => match e with | .zero => n | .next _ => n + 1\n#eval shape 41 (Odd.next (Even.next (Odd.next Even.zero)))",
+        "42",
+    );
+    run(
+        "inductive Cell (n : Nat) : Type where | make (v : Nat) : Cell n\ndef read (n : Nat) (c : Cell n) : Nat := match c with | .make v => v + n\ndef sumCells (n : Nat) (xs : List (Cell n)) : Nat := match xs with | [] => 0 | c :: rest => read n c + sumCells n rest\n#eval sumCells 1 [Cell.make 39, Cell.make 1]",
+        "42",
+    );
+}
+
+#[test]
+fn value_parameter_arguments_are_erased_like_type_arguments() {
+    // `Cell.make 42` elaborates to `@Cell.make (work 30) 42`. The parameter is
+    // dropped without being evaluated; only the field is a runtime value.
+    let prefix = "def work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1\ninductive Cell (n : Nat) : Type where | make (v : Nat) : Cell n\n";
+    let reader = |parameter: &str| {
+        format!(
+            "{prefix}def first (c : Cell ({parameter})) : Nat := match c with | .make v => v\n#eval first (Cell.make 42)"
+        )
+    };
+    let idle = run(&reader("0"), "42");
+    let erased = run(&reader("work 30"), "42");
+    assert!(
+        erased < idle + 30,
+        "value parameter was evaluated: {idle} vs {erased}"
+    );
+}
+
+#[test]
+fn a_field_representation_computed_from_a_value_parameter_is_refused() {
+    // The pin runs this with a boxed field of unknown type and prints 5. Here
+    // no single layout serves both `Nat` and `String`, so the program is a
+    // typed refusal that publishes nothing, never a guessed representation.
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = b"inductive Dep (b : Bool) : Type where | mk (x : if b then Nat else String) : Dep b\ndef get (d : Dep true) : Nat := match d with | .mk x => x\n#eval get (Dep.mk (5 : Nat))";
+    // The source elaborates; compiler ingress refuses the representation.
+    let error = base
+        .execute_source_definitions(&[source], &options, limits())
+        .expect_err("value-dependent field representation");
+    assert!(format!("{error:?}").contains("Ingress("), "{error:?}");
+    assert_eq!(base.logical_root(&options), root);
+}
+
 #[test]
 fn reused_recursive_results_remain_shared_after_type_specialization() {
     let source = "def make (n : Nat) : List Nat := match n with | .zero => [] | .succ k => n :: make k\ndef double (xs : List Nat) : Nat := match xs with | .nil => 1 | .cons n tail => double tail + double tail\n#eval double (make 25)";

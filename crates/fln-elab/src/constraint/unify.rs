@@ -19,6 +19,7 @@ mod delayed;
 mod flex_flex;
 mod normalize;
 mod pattern_spine;
+mod pending;
 mod proof_irrelevance;
 mod record_eta;
 mod reduce;
@@ -41,6 +42,7 @@ use fln_kernel::{Declaration, check};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) use delayed::DelayedConstraint;
+pub use pending::{PendingAnswer, PendingSynthesis};
 
 /// Native delta policy. Opaque declarations, unsafe definitions and partial
 /// definitions never unfold. Polymorphic bodies are instantiated simultaneously
@@ -490,6 +492,7 @@ struct Engine<'a> {
     // or a local context. Pin every key's allocation until this batch ends so a
     // freed temporary cannot donate its address to an unrelated expression.
     fact_cache: HashMap<usize, (Expr, Facts)>,
+    pending: pending::PendingState<'a>,
 }
 
 impl Engine<'_> {
@@ -1160,11 +1163,16 @@ impl Engine<'_> {
                 // point may a pattern intersection introduce a typed residual.
                 // Replay every original equation after that progress; creating
                 // an assignment is not a license to discard its obligation.
-                let mut progress = false;
-                for equation in &postponed {
-                    if self.prune_flex_flex(equation)? {
-                        progress = true;
-                        break;
+                // Before any approximation, a stuck instance hole whose class
+                // inputs this batch has determined is synthesized by its owner
+                // (the pin's `synthPending`), and the batch continues.
+                let mut progress = self.synthesize_pending(&postponed, &mut pending)?;
+                if !progress {
+                    for equation in &postponed {
+                        if self.prune_flex_flex(equation)? {
+                            progress = true;
+                            break;
+                        }
                     }
                 }
                 if !progress {
@@ -1390,6 +1398,30 @@ impl ElabTxn {
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
+        self.unify_many_pending(equations, budget, cancelled, None)
+    }
+
+    /// `unify_many_with`, where a fixed point blocked on an opaque hole asks
+    /// `pending` to synthesize it (the pin's `synthPending`). Its answer is an
+    /// ordinary assignment: scope-checked, typed by the worklist and validated
+    /// by K1 with the rest of the batch, all-or-nothing.
+    pub fn unify_many_with_pending(
+        &mut self,
+        equations: &[(Expr, Expr)],
+        budget: UnificationBudget,
+        cancelled: &dyn Fn() -> bool,
+        pending: &mut dyn PendingSynthesis,
+    ) -> Result<UnificationReport, UnificationError> {
+        self.unify_many_pending(equations, budget, cancelled, Some(pending))
+    }
+
+    fn unify_many_pending<'a>(
+        &mut self,
+        equations: &[(Expr, Expr)],
+        budget: UnificationBudget,
+        cancelled: &'a dyn Fn() -> bool,
+        pending: Option<&'a mut dyn PendingSynthesis>,
+    ) -> Result<UnificationReport, UnificationError> {
         if cancelled() {
             return Err(UnificationError::Cancelled);
         }
@@ -1409,7 +1441,7 @@ impl ElabTxn {
             }
             scoped.push((left.clone(), right.clone(), self.lctx.clone()));
         }
-        self.unify_obligations_with(&scoped, &[], &[], budget, cancelled)
+        self.unify_obligations(&scoped, &[], &[], budget, cancelled, pending)
     }
 
     pub(super) fn unify_obligations_with(
@@ -1419,6 +1451,18 @@ impl ElabTxn {
         delayed: &[DelayedConstraint],
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
+    ) -> Result<UnificationReport, UnificationError> {
+        self.unify_obligations(equations, typings, delayed, budget, cancelled, None)
+    }
+
+    fn unify_obligations<'a>(
+        &mut self,
+        equations: &[Equation],
+        typings: &[TypingConstraint],
+        delayed: &[DelayedConstraint],
+        budget: UnificationBudget,
+        cancelled: &'a dyn Fn() -> bool,
+        pending: Option<&'a mut dyn PendingSynthesis>,
     ) -> Result<UnificationReport, UnificationError> {
         if cancelled() {
             return Err(UnificationError::Cancelled);
@@ -1461,12 +1505,16 @@ impl ElabTxn {
             awakened: Vec::new(),
             kernel_checks: 0,
             fact_cache: HashMap::new(),
+            pending: pending::PendingState::new(pending, remaining),
         };
         let result = engine.solve(equations, typings, delayed);
+        // Synthesis spends the same heartbeats as the batch that asked for it,
+        // including when it, or the batch, stops without an answer.
         self.budget.heartbeats_consumed = self
             .budget
             .heartbeats_consumed
             .checked_add(engine.meter.steps)
+            .and_then(|consumed| consumed.checked_add(engine.pending.spent()))
             .ok_or(UnificationError::HeartbeatLimit)?;
         result?;
         if cancelled() {

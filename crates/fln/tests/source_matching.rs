@@ -555,6 +555,54 @@ fn indexed_generalization_cannot_rescue_an_ill_typed_original_motive() {
     }
 }
 
+// Field-index families, held to the pinned Reference (`lean` v4.32.0). A
+// leading written index that every constructor binds as its own field and
+// returns unchanged is promoted to a parameter (`fixedIndicesToParams`,
+// `Lean/Elab/MutualInductive.lean`), so a constructor pattern may only write `_`
+// in that position (`isNextArgAccessible`): a named variable there is the pin's
+// "Type mismatch" and FrankenLean's `InaccessibleParameter`. A family whose
+// constructors bind the index in another position, or not at all, keeps it as an
+// index, and matching then refines it to the constructor's fields. Every
+// `check` program below is accepted by the pin, and every `reject` program is
+// refused by it.
+/// Both indices are promoted: `Cell` has two parameters and `make` no fields.
+const PROMOTED_CELL: &str =
+    "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\n";
+/// The result swaps the fields, so neither index is promoted; `make x y`
+/// refines `n := y` and `m := x`.
+const SWAPPED_CELL: &str =
+    "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell y x\n";
+/// The index is promoted: `Cell` has one parameter and `make` no fields.
+const PROMOTED_FIELD: &str = "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\n";
+/// `zero` binds no field for the index, so it stays an index and `make x`
+/// refines it to the field `x`.
+const FIELD_CELL: &str =
+    "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x | zero : Cell 0\n";
+/// The dependent telescope `(a : A) (v : P a)` is promoted together.
+const PROMOTED_WITNESS: &str = "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (v : P a) : Witness A P a v\n";
+/// `tagged` binds the telescope after a tag, so it stays a dependent index.
+const TAGGED_WITNESS: &str = "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (v : P a) : Witness A P a v | tagged (tag : Bool) (a : A) (v : P a) : Witness A P a v\n";
+
+/// Refused, leaving the engine's environment unchanged; `reason` names the
+/// refusal that corresponds to the pin's own reason.
+fn reject(source: &str, reason: &str) {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let error = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(source);
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains(reason),
+        "expected {reason} for:\n{source}\ngot {rendered}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+}
+
 #[test]
 fn indexed_matches_preserve_index_order_with_checked_field_refinement() {
     check(
@@ -563,44 +611,104 @@ fn indexed_matches_preserve_index_order_with_checked_field_refinement() {
     check(
         "inductive Mark (a : Nat) : Nat -> Type where | mk : Mark a a\ndef point (a n : Nat) (x : Mark a n) : Nat := match x with | .mk => a\ntheorem checked : point 7 7 Mark.mk = 7 := by rfl",
     );
-    for fields in ["x y", "_ _"] {
-        let source = format!(
-            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make {fields} => n\ntheorem inspected : inspect 3 7 (Cell.make 3 7) = 3 := by rfl"
-        );
-        check(&source);
-    }
+    // Both indices are kept and refined crosswise: `n := y`, `m := x`.
+    check(&format!(
+        "{SWAPPED_CELL}def inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => (n * 10 + m) * 100 + (x * 10 + y)\ntheorem inspected : inspect 7 3 (Cell.make 3 7) = 7337 := by rfl"
+    ));
+    let promoted = |fields: &str| {
+        format!(
+            "{PROMOTED_CELL}def inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make {fields} => n\ntheorem inspected : inspect 3 7 (Cell.make 3 7) = 3 := by rfl"
+        )
+    };
+    check(&promoted("_ _"));
+    reject(&promoted("x y"), "InaccessibleParameter");
 }
 
 #[test]
 fn direct_field_index_branches_keep_refined_fields_and_shadowed_names() {
-    check(
-        "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 3 7 (Cell.make 3 7) = 37 := by rfl",
+    check(&format!(
+        "{SWAPPED_CELL}def digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 7 3 (Cell.make 3 7) = 37 := by rfl"
+    ));
+    // The field `n` shadows the outer `n` in its own branch only.
+    check(&format!(
+        "{FIELD_CELL}def shadow (n k : Nat) (cell : Cell k) : Nat := match cell with | .make n => n | .zero => n\ntheorem checked : shadow 1 9 (Cell.make 9) = 9 := by rfl\ntheorem outer : shadow 1 0 Cell.zero = 1 := by rfl"
+    ));
+    // Promoted, the fields are parameters and are read through the binders.
+    check(&format!(
+        "{PROMOTED_CELL}def digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make _ _ => n * 10 + m\ntheorem checked : digits 3 7 (Cell.make 3 7) = 37 := by rfl"
+    ));
+    check(&format!(
+        "{PROMOTED_FIELD}def shadow (n : Nat) (cell : Cell n) : Nat := match cell with | .make _ => n\ntheorem checked : shadow 9 (Cell.make 9) = 9 := by rfl"
+    ));
+    reject(
+        &format!(
+            "{PROMOTED_CELL}def digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 3 7 (Cell.make 3 7) = 37 := by rfl"
+        ),
+        "InaccessibleParameter",
     );
-    check(
-        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef shadow (n : Nat) (cell : Cell n) : Nat := match cell with | .make n => n\ntheorem checked : shadow 9 (Cell.make 9) = 9 := by rfl",
+    reject(
+        &format!(
+            "{PROMOTED_FIELD}def shadow (n : Nat) (cell : Cell n) : Nat := match cell with | .make n => n\ntheorem checked : shadow 9 (Cell.make 9) = 9 := by rfl"
+        ),
+        "InaccessibleParameter",
     );
 }
 
 #[test]
 fn field_index_captures_are_related_through_checked_aliases() {
-    for body in [
-        "let captured := n; match cell with | .make x => captured",
-        "let identity : Nat -> Nat := fun z => z; match cell with | .make x => identity n",
-        "match cell with | .make x => let unused := n; x",
+    for (family, field, body) in [
+        (
+            FIELD_CELL,
+            "x",
+            "let captured := n; match cell with | .make x => captured | .zero => 0",
+        ),
+        (
+            FIELD_CELL,
+            "x",
+            "let identity : Nat -> Nat := fun z => z; match cell with | .make x => identity n | .zero => 0",
+        ),
+        (
+            FIELD_CELL,
+            "x",
+            "match cell with | .make x => let unused := n; x | .zero => 0",
+        ),
+        (
+            PROMOTED_FIELD,
+            "_",
+            "let captured := n; match cell with | .make _ => captured",
+        ),
+        (
+            PROMOTED_FIELD,
+            "_",
+            "let identity : Nat -> Nat := fun z => z; match cell with | .make _ => identity n",
+        ),
+        (
+            PROMOTED_FIELD,
+            "_",
+            "match cell with | .make _ => let unused := n; n",
+        ),
     ] {
         let source = format!(
-            "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef read (n : Nat) (cell : Cell n) : Nat := {body}\ntheorem checked : read 9 (Cell.make 9) = 9 := by rfl"
+            "{family}def read (n : Nat) (cell : Cell n) : Nat := {body}\ntheorem checked : read 9 (Cell.make 9) = 9 := by rfl"
         );
         check(&source);
+        if field == "_" {
+            // The same aliases with a named field in the promoted position.
+            reject(
+                &source.replace(".make _ =>", ".make x =>"),
+                "InaccessibleParameter",
+            );
+        }
     }
 }
 
 #[test]
 fn refined_field_index_equations_are_retained_in_the_proof_term() {
-    let result = check(
-        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\n\
-        theorem relation (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with | .make x => (rfl : cell = Cell.make x)",
-    );
+    // The branch proves the refined statement `Cell.make x y = Cell.make x y`,
+    // so the term must carry the refinement `n := y`, `m := x`.
+    let result = check(&format!(
+        "{SWAPPED_CELL}theorem relation (n m : Nat) (cell : Cell n m) : cell = Cell.make m n := match cell with | .make x y => (rfl : Cell.make x y = Cell.make x y)"
+    ));
     let Some(ConstantInfo::Thm(theorem)) = result
         .engine
         .environment()
@@ -611,34 +719,107 @@ fn refined_field_index_equations_are_retained_in_the_proof_term() {
     let names = constants(&theorem.value);
     assert!(names.contains(&Name::from_components(["Cell", "rec"])));
     assert!(names.contains(&Name::from_components(["Eq", "rec"])));
+    // Promoted, there is no index to refine; the recursor alone proves it.
+    let result = check(&format!(
+        "{PROMOTED_FIELD}theorem relation (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with | .make _ => rfl"
+    ));
+    let Some(ConstantInfo::Thm(theorem)) = result
+        .engine
+        .environment()
+        .find(&Name::from_components(["relation"]))
+    else {
+        panic!("checked source theorem");
+    };
+    assert!(constants(&theorem.value).contains(&Name::from_components(["Cell", "rec"])));
+    reject(
+        &format!(
+            "{PROMOTED_FIELD}theorem relation (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with | .make x => (rfl : cell = Cell.make x)"
+        ),
+        "InaccessibleParameter",
+    );
 }
 
 #[test]
 fn generic_field_indices_transport_the_original_dependent_scope() {
-    check(
-        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\n\
-        def reconstruct (n : Nat) (cell : Cell n) : Cell n := match cell with | .make x => Cell.make n\n\
-        theorem restored (n : Nat) (cell : Cell n) (h : cell = cell) (P : cell = cell -> Prop) (hp : P h) : P h := match cell with | .make x => hp\n\
-        theorem reconstruct_ok : reconstruct 4 (Cell.make 4) = Cell.make 4 := by rfl",
-    );
-    check(
-        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (v : P a) : Witness A P a v\n\
-        def retain (A : Type) (P : A -> Type) (a : A) (v : P a) (w : Witness A P a v) : P a := match w with | .intro x value => v\n\
-        theorem keep_ok : retain Nat (fun x => Bool) 7 true (Witness.intro 7 true) = true := by rfl",
-    );
+    // `h`, `P` and `hp` depend on the discriminant and are generalized with it.
+    check(&format!(
+        "{FIELD_CELL}def reconstruct (n : Nat) (cell : Cell n) : Cell n := match cell with | .make x => Cell.make x | .zero => Cell.zero\n\
+        theorem restored (n : Nat) (cell : Cell n) (h : cell = cell) (P : cell = cell -> Prop) (hp : P h) : P h := match cell with | .make x => hp | .zero => hp\n\
+        theorem reconstruct_ok : reconstruct 4 (Cell.make 4) = Cell.make 4 := by rfl"
+    ));
+    check(&format!(
+        "{PROMOTED_FIELD}def reconstruct (n : Nat) (cell : Cell n) : Cell n := match cell with | .make _ => Cell.make n\n\
+        theorem restored (n : Nat) (cell : Cell n) (h : cell = cell) (P : cell = cell -> Prop) (hp : P h) : P h := match cell with | .make _ => hp\n\
+        theorem reconstruct_ok : reconstruct 4 (Cell.make 4) = Cell.make 4 := by rfl"
+    ));
+    // The dependent telescope is refined in family order: `value : P x`.
+    check(&format!(
+        "{TAGGED_WITNESS}def retain (A : Type) (P : A -> Type) (a : A) (v : P a) (w : Witness A P a v) : P a := match w with | .intro x value => value | .tagged t x value => value\n\
+        theorem keep_ok : retain Nat (fun x => Bool) 7 true (@Witness.intro Nat (fun x => Bool) 7 true) = true := by rfl\n\
+        theorem tagged_ok : retain Nat (fun x => Bool) 7 false (@Witness.tagged Nat (fun x => Bool) true 7 false) = false := by rfl"
+    ));
+    check(&format!(
+        "{PROMOTED_WITNESS}def retain (A : Type) (P : A -> Type) (a : A) (v : P a) (w : Witness A P a v) : P a := match w with | .intro _ _ => v\n\
+        theorem keep_ok : retain Nat (fun x => Bool) 7 true (@Witness.intro Nat (fun x => Bool) 7 true) = true := by rfl"
+    ));
+    for source in [
+        format!(
+            "{PROMOTED_FIELD}def reconstruct (n : Nat) (cell : Cell n) : Cell n := match cell with | .make x => Cell.make n"
+        ),
+        format!(
+            "{PROMOTED_WITNESS}def retain (A : Type) (P : A -> Type) (a : A) (v : P a) (w : Witness A P a v) : P a := match w with | .intro x value => v"
+        ),
+    ] {
+        reject(&source, "InaccessibleParameter");
+    }
 }
 
 #[test]
 fn refined_field_indices_do_not_equate_distinct_inputs_or_drop_bad_annotations() {
-    for body in [
-        "theorem bad (n m : Nat) (cell : Cell n m) : n = m := match cell with | .make x y => rfl",
-        "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make x y => Cell.make y x",
-        "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => let unused := (n : String); x",
-        "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : String); match cell with | .make x y => x",
+    // Each refused body has an accepted twin that differs only in the defect.
+    for (family, body, twin) in [
+        (
+            SWAPPED_CELL,
+            "theorem bad (n m : Nat) (cell : Cell n m) : n = m := match cell with | .make x y => rfl",
+            "theorem bad (n m : Nat) (cell : Cell n m) : n = n := match cell with | .make x y => rfl",
+        ),
+        (
+            SWAPPED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make x y => Cell.make y x",
+            "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make x y => Cell.make x y",
+        ),
+        (
+            SWAPPED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => let unused := (x : String); x",
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => let unused := (x : Nat); x",
+        ),
+        (
+            SWAPPED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : String); match cell with | .make x y => x",
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : Nat); match cell with | .make x y => x",
+        ),
+        (
+            PROMOTED_CELL,
+            "theorem bad (n m : Nat) (cell : Cell n m) : n = m := match cell with | .make _ _ => rfl",
+            "theorem bad (n m : Nat) (cell : Cell n m) : n = n := match cell with | .make _ _ => rfl",
+        ),
+        (
+            PROMOTED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make _ _ => Cell.make m n",
+            "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make _ _ => Cell.make n m",
+        ),
+        (
+            PROMOTED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make _ _ => let unused := (n : String); n",
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make _ _ => let unused := (n : Nat); n",
+        ),
+        (
+            PROMOTED_CELL,
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : String); match cell with | .make _ _ => n",
+            "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : Nat); match cell with | .make _ _ => n",
+        ),
     ] {
-        let source = format!(
-            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\n{body}"
-        );
+        let source = format!("{family}{body}");
         let e = engine();
         let root = e.logical_root(&KVMap::new());
         let rejected = e
@@ -664,6 +845,15 @@ fn refined_field_indices_do_not_equate_distinct_inputs_or_drop_bad_annotations()
             );
         }
         assert_eq!(e.logical_root(&KVMap::new()), root);
+        check(&format!("{family}{twin}"));
+    }
+    // The previous spelling names the promoted fields, which the pin refuses
+    // before any of the bodies' own defects.
+    for body in [
+        "theorem bad (n m : Nat) (cell : Cell n m) : n = m := match cell with | .make x y => rfl",
+        "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make x y => Cell.make y x",
+    ] {
+        reject(&format!("{PROMOTED_CELL}{body}"), "InaccessibleParameter");
     }
 }
 

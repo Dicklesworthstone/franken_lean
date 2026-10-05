@@ -70,6 +70,9 @@ impl Preparation<'_> {
         }
         let mut family_type =
             self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
+        let erased = self.erased_parameter()?;
+        let pending = indexed::pending_parameter();
+        let mut values = Vec::new();
         for parameter in &parameters {
             self.tick()?;
             let normal = self.normalize_type(&family_type)?;
@@ -79,12 +82,18 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
-            // Erasing a static type argument is not permission to discard a
-            // value parameter, even when that value happens to be closed.
-            if !self.type_parameter(binder_type)? {
+            // A value parameter is not a field: as in the pinned compiler, a
+            // constructor object stores only its fields. One layout serves
+            // every value, so only the erased key has one. Whether a field's
+            // representation depends on the value is decided below, after
+            // erasure, never by guessing from a particular (closed) value.
+            let value = !self.type_parameter(binder_type)?;
+            if value && parameter != &erased {
                 return Ok(None);
             }
-            family_type = self.substitution(body, parameter)?;
+            family_type = self.substitution(body, if value { &pending } else { parameter })?;
+            reserve(&mut values, self.limits.max_context_depth)?;
+            values.push(value);
         }
         if family.num_indices != 0 {
             if self.index_domains(family, levels, &parameters)?.is_none() {
@@ -136,18 +145,25 @@ impl Preparation<'_> {
             let mut fields = Vec::new();
             let mut type_ =
                 self.universe_instance(&ctor.base.type_, &ctor.base.level_params, levels)?;
-            for parameter in &parameters {
+            for (parameter, value) in parameters.iter().zip(&values) {
                 self.tick()?;
                 let ExprNode::ForallE { body, .. } = type_.node() else {
                     return Ok(None);
                 };
-                type_ = self.substitution(body, parameter)?;
+                type_ = self.substitution(body, if *value { &pending } else { parameter })?;
             }
             // Erase the checked telescope before deciding whether a field's
             // representation depends on an earlier runtime value. A proof may
             // mention that value, but its inert slot never depends on it. The
             // logical field count/order is retained for projections and minors.
             type_ = self.erase_runtime_type(&type_)?;
+            // The same holds for a value parameter: a proof about it, or a
+            // family taking it as a value parameter or scalar index, erases
+            // it. Anything still mentioning it (a type computed from the
+            // value) has no uniform representation and is refused.
+            if type_.has_fvar() {
+                return Ok(None);
+            }
             while let ExprNode::ForallE {
                 binder_type, body, ..
             } = type_.node()
@@ -580,11 +596,10 @@ impl Preparation<'_> {
             reserve(&mut family_levels, self.limits.max_context_depth)?;
             family_levels.push(level);
         }
-        let mut source = Expr::const_(family.base.name.clone(), family_levels);
-        for parameter in &args[..rec.num_params as usize] {
-            self.tick()?;
-            source = Expr::app(source, parameter.clone());
-        }
+        // Value-parameter arguments are erased like type arguments: the
+        // recursor's layout never depends on them, and they are not evaluated.
+        let source =
+            self.runtime_family(family, &family_levels, &args[..rec.num_params as usize])?;
         let source = self.normalize_type(&source)?;
         if self.value_type(&source)? != Some(ValueType::Constructor) {
             return Ok(None);
@@ -610,11 +625,12 @@ impl Preparation<'_> {
         if parameters == 0 && levels.is_empty() || args.len() < parameters {
             return Ok(None);
         }
-        let mut family = Expr::const_(ctor.induct.clone(), levels.clone());
-        for parameter in &args[..parameters] {
-            self.tick()?;
-            family = Expr::app(family, parameter.clone());
-        }
+        let Some(ConstantInfo::Induct(inductive)) = self.environment.find(&ctor.induct) else {
+            return Ok(None);
+        };
+        // A value parameter is not stored in the object and, like a type
+        // argument, is dropped here without being evaluated.
+        let family = self.runtime_family(inductive, levels, &args[..parameters])?;
         let family = self.normalize_type(&family)?;
         if self.value_type(&family)? != Some(ValueType::Constructor) {
             return Ok(None);

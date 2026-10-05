@@ -192,6 +192,7 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let family = shape.source.clone();
+        let parameter_arguments = &args[..rec.num_params as usize];
         let args = &args[rec.num_params as usize..];
         let (family_head, family_parameters) = self.spine(&family)?;
         let ExprNode::Const {
@@ -204,19 +205,38 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(info)) = self.environment.find(family_name) else {
             return Ok(None);
         };
-        let Some(mut domains) = self.index_domains(info, family_levels, &family_parameters)? else {
+        let Some(index_domains) = self.index_domains(info, family_levels, &family_parameters)?
+        else {
             return Ok(None);
         };
-        let Some(motive) = self.indexed_motive(&args[0], &domains, &family)? else {
+        let Some(motive) = self.indexed_motive(&args[0], &index_domains, &family)? else {
             return Ok(None);
         };
+        // A child's index may be computed from a value parameter (a promoted
+        // index is). Such a parameter is not stored in the object, so an
+        // indexed recursion threads it as a leading, unchanging argument,
+        // evaluated once at this call. Without indices nothing needs it.
+        let threaded = if rec.num_indices == 0 {
+            Vec::new()
+        } else {
+            self.value_parameter_domains(info, family_levels, &family_parameters)?
+                .ok_or_else(|| unsupported("value parameter representation"))?
+        };
+        let mut domains = Vec::new();
         let mut parameters = Vec::new();
-        for domain in &domains {
+        for (domain, kind) in threaded
+            .iter()
+            .map(|(_, domain)| (domain, "value parameter representation"))
+            .chain(
+                index_domains
+                    .iter()
+                    .map(|domain| (domain, "index representation")),
+            )
+        {
+            reserve(&mut domains, self.limits.max_context_depth)?;
             reserve(&mut parameters, self.limits.max_context_depth)?;
-            parameters.push(
-                self.value_type(domain)?
-                    .ok_or_else(|| unsupported("index representation"))?,
-            );
+            parameters.push(self.value_type(domain)?.ok_or_else(|| unsupported(kind))?);
+            domains.push(domain.clone());
         }
         reserve(&mut domains, self.limits.max_context_depth)?;
         reserve(&mut parameters, self.limits.max_context_depth)?;
@@ -285,6 +305,12 @@ impl Preparation<'_> {
             );
         }
         let major = variable(0)?;
+        // In a branch, threaded parameter `j` is the `j`th closure domain.
+        let mut values = Vec::new();
+        for position in 0..threaded.len() {
+            reserve(&mut values, self.limits.max_context_depth)?;
+            values.push(variable(parameters.len() - position)?);
+        }
         let mut branches = Vec::new();
         let mut constructors = Vec::new();
         for (index, (ctor, rule)) in shape.constructors.iter().zip(&rec.rules).enumerate() {
@@ -296,7 +322,7 @@ impl Preparation<'_> {
                 .lift_loose(0, lift)
                 .map_err(|_| unsupported("recursive data minor scope"))?;
             let mut hypotheses = Vec::new();
-            let mut logical_fields = self.indexed_constructor_telescope(&shape, ctor)?;
+            let mut logical_fields = self.indexed_constructor_telescope(&shape, ctor, &values)?;
             for (field_index, field_type) in ctor.fields.iter().enumerate() {
                 self.tick()?;
                 let field = Expr::proj(shape.projection(ctor), field_index as u64, major.clone());
@@ -324,12 +350,26 @@ impl Preparation<'_> {
                     let indices = if rec.num_indices == 0 {
                         Vec::new()
                     } else {
-                        self.indexed_recursive_field_arguments(
+                        // Threaded parameters pass through unchanged. Like
+                        // the child's indices, they are scoped inside its
+                        // argument telescope.
+                        let depth = u32::try_from(recursive.binders.len())
+                            .map_err(|_| unsupported("recursive child arity"))?;
+                        let mut indices = Vec::new();
+                        for value in &values {
+                            reserve(&mut indices, self.limits.max_application_args)?;
+                            indices.push(self.lift(value, depth)?);
+                        }
+                        for index in self.indexed_recursive_field_arguments(
                             &recursive,
                             logical_type,
                             &family,
                             rec.num_indices as usize,
-                        )?
+                        )? {
+                            reserve(&mut indices, self.limits.max_application_args)?;
+                            indices.push(index);
+                        }
+                        indices
                     };
                     let (hypothesis, type_) = self.recursive_hypothesis(
                         &recursive,
@@ -379,6 +419,10 @@ impl Preparation<'_> {
             result,
         });
         let mut arguments = Vec::new();
+        for (position, _) in &threaded {
+            reserve(&mut arguments, self.limits.max_application_args)?;
+            arguments.push(parameter_arguments[*position].clone());
+        }
         for arg in &args[rec.rules.len() + 1..] {
             reserve(&mut arguments, self.limits.max_application_args)?;
             arguments.push(arg.clone());

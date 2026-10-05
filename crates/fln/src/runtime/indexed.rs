@@ -1,22 +1,45 @@
-//! Erase value indices from runtime *types*, never from executable arguments.
-//! A supported family has one uniform layout at fixed type parameters. Both
-//! checkers see the original indexed declaration and every original application.
+//! Erase value indices and value parameters from runtime *types*, never from
+//! executable arguments. A supported family has one uniform layout at fixed
+//! type parameters: like the pinned compiler, a constructor object stores only
+//! its fields, so neither an index nor a value parameter selects a layout. Both
+//! checkers see the original declaration and every original application.
 use super::*;
+use fln_core::expr::FVarId;
 use fln_core::level::Level;
 use fln_env::constants::InductiveVal;
 use std::collections::HashMap;
 
+/// Stands for an unknown value parameter while a family or constructor
+/// telescope is opened. A free variable selects no reduction, so a type still
+/// mentioning it after runtime erasure depends on the parameter's actual value
+/// and has no uniform representation. It never reaches executable code.
+pub(super) fn pending_parameter() -> Expr {
+    Expr::fvar(FVarId(name("_fln_runtime_value_parameter")))
+}
+
 impl Preparation<'_> {
-    /// The indexed profile has independent scalar index domains. Type
-    /// indices and domains depending on earlier indices are not layout evidence.
-    /// This is deliberately nonrecursive: discovering an index type must not
-    /// recursively start discovery of the family whose layout is being built.
-    pub(super) fn index_domains(
+    /// The canonical erased argument of a value parameter in a runtime type.
+    /// It is not a term of the logical environment and is never evaluated; a
+    /// layout keyed by it serves every value of that parameter.
+    pub(super) fn erased_parameter(&self) -> Result<Expr, IngressError> {
+        let erased = name("_fln_runtime_erased_parameter");
+        if self.environment.contains(&erased) {
+            return Err(unsupported("runtime erased parameter name collision"));
+        }
+        Ok(Expr::const_(erased, vec![]))
+    }
+
+    /// Open an admitted family's parameter telescope. A static type parameter
+    /// is instantiated with its argument. Every other parameter is a value
+    /// parameter; its argument is never inspected, normalized or evaluated
+    /// here, and the pending marker stands for it. Returns the per-parameter
+    /// value flags and the remaining index telescope.
+    fn parameter_telescope(
         &mut self,
         family: &InductiveVal,
         levels: &[Level],
         parameters: &[Expr],
-    ) -> Result<Option<Vec<Expr>>, IngressError> {
+    ) -> Result<Option<(Vec<bool>, Expr)>, IngressError> {
         if family.is_unsafe
             || family.num_nested != 0
             || family.base.level_params.len() != levels.len()
@@ -24,8 +47,10 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
+        let pending = pending_parameter();
         let mut type_ =
             self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
+        let mut values = Vec::new();
         for parameter in parameters {
             self.tick()?;
             let normal = self.type_head(&type_)?;
@@ -35,11 +60,102 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
-            if !self.type_parameter(binder_type)? {
-                return Ok(None);
-            }
-            type_ = self.substitution(body, parameter)?;
+            let value = !self.type_parameter(binder_type)?;
+            type_ = self.substitution(body, if value { &pending } else { parameter })?;
+            reserve(&mut values, self.limits.max_context_depth)?;
+            values.push(value);
         }
+        Ok(Some((values, type_)))
+    }
+
+    /// Value-parameter flags of an admitted *data* family. A proposition keeps
+    /// its original syntax: its inhabitants are erased proofs, never layouts.
+    pub(super) fn value_parameters(
+        &mut self,
+        family: &InductiveVal,
+        levels: &[Level],
+        parameters: &[Expr],
+    ) -> Result<Option<Vec<bool>>, IngressError> {
+        let Some((values, mut type_)) = self.parameter_telescope(family, levels, parameters)?
+        else {
+            return Ok(None);
+        };
+        for _ in 0..family.num_indices {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE { body, .. } = normal.node() else {
+                return Ok(None);
+            };
+            type_ = body.clone();
+        }
+        let sort = self.type_head(&type_)?;
+        Ok(
+            matches!(sort.node(), ExprNode::Sort { level } if level.is_never_zero())
+                .then_some(values),
+        )
+    }
+
+    /// Replace each value-parameter argument of a data family with the erased
+    /// marker, without inspecting it. Static type arguments are unchanged.
+    pub(super) fn runtime_parameters(
+        &mut self,
+        family: &InductiveVal,
+        levels: &[Level],
+        parameters: &[Expr],
+    ) -> Result<Option<Vec<Expr>>, IngressError> {
+        let Some(values) = self.value_parameters(family, levels, parameters)? else {
+            return Ok(None);
+        };
+        let erased = self.erased_parameter()?;
+        let mut result = Vec::new();
+        for (parameter, value) in parameters.iter().zip(values) {
+            self.tick()?;
+            reserve(&mut result, self.limits.max_application_args)?;
+            result.push(if value {
+                erased.clone()
+            } else {
+                parameter.clone()
+            });
+        }
+        Ok(Some(result))
+    }
+
+    /// The runtime type selecting a constructor's or recursor's layout. Value
+    /// arguments are erased before any normalization, so a computed parameter
+    /// is neither unfolded into a layout key nor evaluated. A family that is
+    /// not supported data keeps its original application, and its refusal.
+    pub(super) fn runtime_family(
+        &mut self,
+        family: &InductiveVal,
+        levels: &[Level],
+        parameters: &[Expr],
+    ) -> Result<Expr, IngressError> {
+        let parameters = match self.runtime_parameters(family, levels, parameters)? {
+            Some(parameters) => parameters,
+            None => parameters.to_vec(),
+        };
+        let mut source = Expr::const_(family.base.name.clone(), levels.to_vec());
+        for parameter in parameters {
+            self.tick()?;
+            source = Expr::app(source, parameter);
+        }
+        Ok(source)
+    }
+
+    /// The indexed profile has independent scalar index domains. Type
+    /// indices and domains depending on earlier indices or on a value
+    /// parameter are not layout evidence. This is deliberately nonrecursive:
+    /// discovering an index type must not recursively start discovery of the
+    /// family whose layout is being built.
+    pub(super) fn index_domains(
+        &mut self,
+        family: &InductiveVal,
+        levels: &[Level],
+        parameters: &[Expr],
+    ) -> Result<Option<Vec<Expr>>, IngressError> {
+        let Some((_, mut type_)) = self.parameter_telescope(family, levels, parameters)? else {
+            return Ok(None);
+        };
         let mut domains = Vec::new();
         for _ in 0..family.num_indices {
             self.tick()?;
@@ -52,6 +168,7 @@ impl Preparation<'_> {
             };
             let domain = self.normalize_type(binder_type)?;
             if domain.has_loose_bvars()
+                || domain.has_fvar()
                 || !matches!(
                     executable_value_type(&domain, &self.value_types),
                     Some((ValueType::Nat | ValueType::Bool | ValueType::String, _))
@@ -107,18 +224,33 @@ impl Preparation<'_> {
                     }
                     if let ExprNode::Const { name, levels } = head.node()
                         && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
-                        && family.num_indices != 0
                         && args.len()
                             == (family.num_params as usize)
                                 .saturating_add(family.num_indices as usize)
-                        && self
-                            .index_domains(family, levels, &args[..family.num_params as usize])?
-                            .is_some()
+                        && let Some(parameters) = self.runtime_parameters(
+                            family,
+                            levels,
+                            &args[..family.num_params as usize],
+                        )?
                     {
-                        normal = args[..family.num_params as usize]
-                            .iter()
-                            .cloned()
-                            .fold(head.clone(), Expr::app);
+                        // Value parameters and scalar indices are erased before
+                        // their children are visited: neither is traversed or
+                        // normalized, so a computed argument never expands here.
+                        let erase_indices = family.num_indices != 0
+                            && self.index_domains(family, levels, &parameters)?.is_some();
+                        if erase_indices
+                            || parameters.as_slice() != &args[..family.num_params as usize]
+                        {
+                            let indices = if erase_indices {
+                                &[][..]
+                            } else {
+                                &args[family.num_params as usize..]
+                            };
+                            normal = parameters
+                                .into_iter()
+                                .chain(indices.iter().cloned())
+                                .fold(head.clone(), Expr::app);
+                        }
                     }
                     reserve(&mut work, self.limits.max_nodes)?;
                     work.push(Work::Finish(source, normal.clone()));
@@ -243,29 +375,87 @@ impl Preparation<'_> {
         Ok(Some(result))
     }
 
+    /// Open a constructor's parameter telescope at its layout's family. Static
+    /// type arguments come from the layout key, which carries no value
+    /// parameter: `values` supplies each value parameter in order (a runtime
+    /// value the caller threads), and any one not supplied is the pending
+    /// marker, so nothing computed from it can reach executable code.
     pub(super) fn indexed_constructor_telescope(
         &mut self,
         shape: &records::Shape,
         ctor: &records::ShapeConstructor,
+        values: &[Expr],
     ) -> Result<Expr, IngressError> {
         let (head, args) = self.spine(&shape.source)?;
-        let ExprNode::Const { levels, .. } = head.node() else {
+        let ExprNode::Const { name, levels } = head.node() else {
             return Err(unsupported("constructor family head"));
         };
+        let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
+            return Err(unsupported("constructor family metadata"));
+        };
+        let flags = self
+            .value_parameters(family, levels, &args)?
+            .ok_or_else(|| unsupported("constructor parameter telescope"))?;
         let Some(ConstantInfo::Ctor(original)) = self.environment.find(&ctor.original) else {
             return Err(unsupported("constructor telescope metadata"));
         };
+        let pending = pending_parameter();
+        let mut supplied = values.iter();
         let mut type_ =
             self.universe_instance(&original.base.type_, &original.base.level_params, levels)?;
-        for arg in args {
+        for (arg, value) in args.iter().zip(flags) {
             self.tick()?;
             let normal = self.type_head(&type_)?;
             let ExprNode::ForallE { body, .. } = normal.node() else {
                 return Err(unsupported("constructor parameter telescope"));
             };
-            type_ = self.substitution(body, &arg)?;
+            let replacement = if value {
+                supplied.next().unwrap_or(&pending)
+            } else {
+                arg
+            };
+            type_ = self.substitution(body, replacement)?;
         }
         Ok(type_)
+    }
+
+    /// The runtime domains of a family's value parameters, by position. A
+    /// child's index may be computed from one (a promoted index is), so a
+    /// native recursion threads each as an unchanging runtime argument. A
+    /// domain whose representation depends on an earlier value is refused.
+    pub(super) fn value_parameter_domains(
+        &mut self,
+        family: &InductiveVal,
+        levels: &[Level],
+        parameters: &[Expr],
+    ) -> Result<Option<Vec<(usize, Expr)>>, IngressError> {
+        let Some(flags) = self.value_parameters(family, levels, parameters)? else {
+            return Ok(None);
+        };
+        let pending = pending_parameter();
+        let mut type_ =
+            self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
+        let mut domains = Vec::new();
+        for (position, (parameter, value)) in parameters.iter().zip(flags).enumerate() {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            if value {
+                let domain = self.erase_runtime_type(binder_type)?;
+                if domain.has_fvar() || domain.has_loose_bvars() {
+                    return Err(unsupported("value parameter representation"));
+                }
+                reserve(&mut domains, self.limits.max_context_depth)?;
+                domains.push((position, domain));
+            }
+            type_ = self.substitution(body, if value { &pending } else { parameter })?;
+        }
+        Ok(Some(domains))
     }
 
     /// Recursive calls retain the actual indices from the admitted field type.
@@ -288,6 +478,14 @@ impl Preparation<'_> {
         let mut indices = Vec::new();
         for index in &args[parameters.len()..] {
             self.tick()?;
+            // The pending marker is the only free variable in an opened
+            // constructor telescope. An index computed from a value parameter
+            // the caller does not thread has no runtime value here.
+            if index.has_fvar() {
+                return Err(unsupported(
+                    "index computed from an unthreaded value parameter",
+                ));
+            }
             reserve(&mut indices, self.limits.max_application_args)?;
             indices.push(index.clone());
         }

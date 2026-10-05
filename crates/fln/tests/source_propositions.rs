@@ -95,11 +95,44 @@ fn indexed_recursive_relations_support_actual_induction() {
 }
 #[test]
 fn singleton_data_fields_must_be_recoverable_as_exact_indices() {
+    // The result swaps the fields, so the pinned Reference keeps both indices;
+    // each data field is an exact index, so the predicate eliminates into data.
     check(
-        "inductive At (A : Type) : A -> Prop where | intro (a : A) : At A a\ndef recover (A : Type) (a : A) (h : At A a) : A := by cases h with | intro value => exact value\ntheorem recovered : recover Nat 7 (At.intro 7) = 7 := by rfl",
+        "inductive Swap (A : Type) : A -> A -> Prop where | intro (a b : A) : Swap A b a\ndef recover (A : Type) (a b : A) (h : Swap A a b) : A := match h with | .intro x y => x\ntheorem recovered : recover Nat 7 3 (Swap.intro 3 7) = 3 := by rfl",
     );
+    // `At A a` returns its field unchanged, so the pin promotes the index
+    // (`fixedIndicesToParams`): `intro` has no field, and the value is `a`.
+    let at = "inductive At (A : Type) : A -> Prop where | intro (a : A) : At A a\n";
+    check(&format!(
+        "{at}def recover (A : Type) (a : A) (h : At A a) : A := by cases h with | intro => exact a\ntheorem recovered : recover Nat 7 (At.intro 7) = 7 := by rfl"
+    ));
+    // Pin: "Too many variable names provided at alternative `intro`: 1
+    // provided, but 0 expected".
+    let named = format!(
+        "{at}def recover (A : Type) (a : A) (h : At A a) : A := by cases h with | intro value => exact value\ntheorem recovered : recover Nat 7 (At.intro 7) = 7 := by rfl"
+    );
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let error = base
+        .check_source_files(
+            &[named.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(&named);
+    assert!(
+        format!("{error:?}").contains("EliminationArity"),
+        "{error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    // A field under a computed index, or beside a promoted one, is not
+    // recoverable, so these predicates eliminate only into `Prop` (pin: "Type
+    // mismatch when assigning motive").
     refuses(
         "inductive Hidden : Nat -> Prop where | intro (n : Nat) : Hidden (Nat.succ n)\ndef extract (n : Nat) (h : Hidden n) : Nat := by cases h with | intro value => exact value",
+    );
+    refuses(
+        "inductive Tagged : Nat -> Prop where | intro (n m : Nat) : Tagged n\ndef extract (n : Nat) (h : Tagged n) : Nat := by cases h with | intro m => exact m",
     );
 }
 #[test]

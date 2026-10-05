@@ -58,7 +58,9 @@ impl Context {
         };
         let mut budget = UnificationBudget::new(self.kernel);
         budget.transparency = UnificationTransparency::SafeDefinitions;
-        match self.txn.unify(&actual, &expected, budget) {
+        // The pin's `isDefEq` here synthesizes an instance its unification has
+        // determined (`change 5 = 5` meets `(2 : Int) + 3 = 5` with `?α := Int`).
+        match self.unify_pending(&[(actual.clone(), expected.clone())], budget)? {
             Ok(_) => Ok(true),
             Err(error) => {
                 let error = failure(SourceInferenceError::Unification(Box::new(error)));

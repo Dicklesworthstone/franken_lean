@@ -54,6 +54,67 @@ fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
     fln_cli::run(args)
 }
 
+// FrankenLean's refusal texts for the pinned Reference's reasons. The pin
+// (`lean` v4.32.0) says, respectively: "Too many variable names provided at
+// alternative", "Invalid target: Index in target's type is not a variable",
+// "Type mismatch when assigning motive", and "Type mismatch" at a named
+// variable standing in a constructor's parameter position.
+const ELIMINATION_ARITY: &str = "elimination has duplicate or excessive binder names";
+const INDUCTION_INDEX_NOT_VARIABLE: &str =
+    "Invalid target: Index in target's type is not a variable";
+const INDUCTION_MOTIVE_MISMATCH: &str = "Type mismatch when assigning motive";
+const INACCESSIBLE_PARAMETER: &str = "a constructor parameter is inaccessible in a pattern";
+
+/// Checks `prefix` with the installed `fln check-source --json`, then each
+/// refused suffix as a second file after it, re-checking `prefix` after every
+/// refusal. The prefix must report every `expected` field with an empty stderr.
+/// A refusal must exit non-zero with an empty stdout (no success is published)
+/// and, when a reason is given, name it on stderr. Each recovery must print
+/// exactly the first report, so a refused batch leaves nothing behind, and the
+/// prefix file is never rewritten. Every prefix here is accepted by the pinned
+/// Reference `lean` v4.32.0 and every prefix-plus-suffix is refused by it.
+fn check_then_refuse_suffixes(prefix: &str, expected: &[&str], refusals: &[(&str, Option<&str>)]) {
+    let prefix = file(prefix);
+    let original = std::fs::read(&prefix).unwrap();
+    let accept = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        let json = String::from_utf8(output.stdout).unwrap();
+        for field in expected {
+            assert!(json.contains(field), "{json}");
+        }
+        json
+    };
+    let first = accept();
+    for (source, reason) in refusals {
+        let suffix = file(source);
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(&suffix)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "accepted a refused suffix: {source}"
+        );
+        assert!(output.stdout.is_empty(), "{stderr}");
+        assert!(!stderr.is_empty(), "{source}");
+        if let Some(reason) = reason {
+            assert!(stderr.contains(reason), "{source}\n{stderr}");
+        }
+        assert_eq!(accept(), first);
+        assert_eq!(std::fs::read(&prefix).unwrap(), original);
+    }
+}
+
 #[test]
 fn installed_local_recursion_checks_runs_and_replays_without_partial_publication() {
     let text = include_str!("../../../examples/native_local_recursion.lean");
@@ -547,7 +608,7 @@ fn installed_binary_checks_instance_dependent_field_receivers_atomically() {
     );
     let good = file(
         "theorem dotted : point.x = 0 := by rfl\n\
-         theorem postfix : (point).x = 0 := by rfl",
+         theorem parenthesized : (point).x = 0 := by rfl",
     );
     let bad = file("theorem wrong : point.x = 1 := by rfl");
     for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
@@ -1022,28 +1083,66 @@ fn installed_binary_checks_indexed_declarations_and_refuses_wrong_lengths() {
     }
 }
 
+/// `examples/native_indexed_elimination.lean` is refused by the pin (a `def` by
+/// `induction` needs the code generator's unsupported `Vec.rec`, and
+/// `Witness`'s two indices are promoted to parameters, so `intro` binds no
+/// field). This is the same file in pin syntax: recursion by equations,
+/// induction over the genuine `Vec` index, and `cases` on the promoted
+/// dependent telescope `Witness A P a value`.
+const INDEXED_ELIMINATION: &str = r#"inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def length {A : Type} : (n : Nat) -> Vec A n -> Nat
+  | _, .nil => 0
+  | _, .cons k _ tail => Nat.succ (length k tail)
+
+theorem length_ok {A : Type} (n : Nat) (xs : Vec A n) : length n xs = n := by
+  induction xs with
+  | nil => rfl
+  | cons k x tail ih => simp only [length, ih]
+
+def copy {A : Type} : (n : Nat) -> Vec A n -> Vec A n
+  | _, .nil => Vec.nil
+  | _, .cons k x tail => Vec.cons k x (copy k tail)
+
+theorem copy_ok {A : Type} (n : Nat) (xs : Vec A n) : copy n xs = xs := by
+  induction xs with
+  | nil => rfl
+  | cons k x tail ih => simp only [copy, ih]
+
+def two : Vec Nat 2 := Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)
+theorem length_two : length 2 two = 2 := by rfl
+theorem copy_two : copy 2 two = two := by rfl
+
+inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
+  | intro (a : A) (value : P a) : Witness A P a value
+
+def extract {A : Type} {P : A -> Type} (a : A) (value : P a)
+    (w : Witness A P a value) : P a := by
+  cases w with
+  | intro => exact value
+
+theorem dependent_example :
+    extract (P := fun x => Bool) 3 true (Witness.intro (P := fun x => Bool) 3 true) = true := by rfl
+"#;
+
 #[test]
 fn installed_binary_checks_indexed_induction_and_dependent_cases() {
-    let path = file(include_str!(
-        "../../../examples/native_indexed_elimination.lean"
-    ));
-    let before = std::fs::read(&path).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["check-source", "--json"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    check_then_refuse_suffixes(
+        INDEXED_ELIMINATION,
+        &[
+            "\"commands\":11",
+            "\"theorems\":5",
+            "\"authority\":true",
+            "\"executed\":false",
+        ],
+        // The old example's alternative names fields for the promoted indices.
+        &[(
+            "theorem named (w : Witness Nat (fun x => Bool) 3 true) : True := by\n  cases w with\n  | intro x v => exact True.intro\n",
+            Some(ELIMINATION_ARITY),
+        )],
     );
-    let text = String::from_utf8(output.stdout).unwrap();
-    for field in ["\"commands\":11", "\"theorems\":5", "\"executed\":false"] {
-        assert!(text.contains(field), "{text}");
-    }
-    assert!(output.stderr.is_empty());
-    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]
@@ -1367,198 +1466,450 @@ fn installed_heterogeneous_equality_checks_bridges_substitution_and_failure_isol
     }
 }
 
+/// `examples/native_index_refinement.lean` in pin syntax (the pin refuses the
+/// example: `end` is a keyword, and `PairAt`'s and `Witness`'s indices are
+/// promoted to parameters, so `mk` and `intro` bind no fields). `cases` still
+/// refines `Vec`'s non-variable indices `Nat.succ n` and `2`, and eliminates the
+/// impossible `Diagonal 0 1` with no alternatives.
+const INDEX_REFINEMENT: &str = r#"inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def head {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : A := by
+  cases xs with
+  | cons k x tail => exact x
+
+def tail {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : Vec A n := by
+  cases xs with
+  | cons k x rest => exact rest
+
+def second (xs : Vec Nat 2) : Nat := by
+  cases xs with
+  | cons k x rest =>
+    cases rest with
+    | cons j y last => exact y
+
+theorem head_ok : head 1 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 7 := by rfl
+theorem tail_ok : tail 1 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = Vec.cons 0 9 Vec.nil := by rfl
+theorem second_ok : second (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 9 := by rfl
+
+inductive PairAt : Nat -> Nat -> Type where
+  | mk (a b : Nat) : PairAt a b
+
+def repeated (n : Nat) (p : PairAt n n) : Nat := by
+  cases p with
+  | mk => exact n + n
+
+theorem repeated_ok : repeated 7 (PairAt.mk 7 7) = 14 := by rfl
+
+inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
+  | intro (a : A) (value : P a) : Witness A P a value
+
+def getWitness (w : Witness Nat (fun x => Bool) 7 true) : Bool := by
+  cases w with
+  | intro => exact true
+
+theorem witness_ok : getWitness (Witness.intro (P := fun x => Bool) 7 true) = true := by rfl
+
+inductive Diagonal : Nat -> Nat -> Type where
+  | mk (n : Nat) : Diagonal n n
+
+def impossible (x : Diagonal 0 1) : Nat := by cases x
+"#;
+
 #[test]
 fn installed_fixed_index_cases_preserve_checked_computation_and_batch_isolation() {
-    let prefix = file(include_str!(
-        "../../../examples/native_index_refinement.lean"
-    ));
-    let bad =
-        file("theorem invalid (xs : Vec Nat 1) : 0 = 1 := by cases xs with | cons k x tail => rfl");
-    let before = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&bad);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if valid {
-            let result = String::from_utf8(output.stdout).unwrap();
-            for field in [
-                "\"commands\":15",
-                "\"theorems\":5",
-                "\"executed\":false",
-                "\"authority\":true",
-            ] {
-                assert!(result.contains(field), "{result}");
-            }
-            assert!(output.stderr.is_empty());
-        } else {
-            assert!(output.stdout.is_empty());
-            assert!(!output.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), before);
-    }
+    check_then_refuse_suffixes(
+        INDEX_REFINEMENT,
+        &[
+            "\"commands\":15",
+            "\"theorems\":5",
+            "\"executed\":false",
+            "\"authority\":true",
+        ],
+        &[
+            // False: the refined `Vec Nat 1` gives no proof of `0 = 1`.
+            (
+                "theorem invalid (xs : Vec Nat 1) : 0 = 1 := by cases xs with | cons k x tail => rfl",
+                None,
+            ),
+            // The old example's fields for `PairAt`'s promoted indices.
+            (
+                "def named (p : PairAt 7 7) : Nat := by\n  cases p with\n  | mk a b => exact a + b\n",
+                Some(ELIMINATION_ARITY),
+            ),
+        ],
+    );
 }
+
+/// `examples/native_constrained_matching.lean` in pin syntax. The pin refuses
+/// the example: `PairAt`, `Witness` and `Cell` have promoted indices, so only
+/// `_` may stand in those constructor positions, and `second` names the `cons`
+/// length field that its literal indices `2` and `1` fix. `match` still refines
+/// `Vec`'s non-variable indices and `Choice 1`.
+const CONSTRAINED_MATCHING: &str = r#"inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def head {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : A := match xs with
+  | .cons k x rest => x
+
+def tail {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : Vec A n := match xs with
+  | .cons k x rest => rest
+
+def second (xs : Vec Nat 2) : Nat := match xs with
+  | .cons _ x rest => match rest with
+    | .cons _ y remaining => y
+
+theorem head_ok : head 0 (Vec.cons 0 9 Vec.nil) = 9 := by rfl
+theorem tail_ok : tail 0 (Vec.cons 0 9 Vec.nil) = Vec.nil := by rfl
+theorem second_ok : second (Vec.cons 1 5 (Vec.cons 0 9 Vec.nil)) = 9 := by rfl
+
+inductive PairAt : Nat -> Nat -> Type where
+  | mk (a b : Nat) : PairAt a b
+
+def total (n : Nat) (x : PairAt n n) : Nat := match x with
+  | .mk _ _ => n + n
+
+theorem total_ok : total 7 (PairAt.mk 7 7) = 14 := by rfl
+
+inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
+  | intro (a : A) (v : P a) : Witness A P a v
+
+def extract (w : Witness Nat (fun x => Bool) 7 true) : Bool := match w with
+  | .intro _ _ => true
+
+theorem extract_ok : extract (Witness.intro (P := fun x => Bool) 7 true) = true := by rfl
+
+inductive Choice : Nat -> Type where
+  | absent : Choice 0
+  | first (x : Nat) : Choice 1
+  | second (x : Nat) : Choice 1
+
+def keep (x : Choice 1) : Choice 1 := match x with
+  | .first n => Choice.first n
+  | rest => rest
+
+theorem keep_ok : keep (Choice.second 9) = Choice.second 9 := by rfl
+
+inductive Cell : Nat -> Type where
+  | make (x : Nat) : Cell x
+
+def readIndex (n : Nat) (cell : Cell n) : Nat := match cell with
+  | .make _ => let retained := n; retained
+
+theorem cell_reconstructed (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with
+  | .make _ => rfl
+
+theorem index_ok : readIndex 9 (Cell.make 9) = 9 := by rfl
+"#;
 
 #[test]
 fn installed_fixed_index_matches_check_real_terms_and_recover_after_failure() {
-    let prefix = file(include_str!(
-        "../../../examples/native_constrained_matching.lean"
-    ));
-    let invalid =
-        file("theorem bad (xs : Vec Nat 1) : 0 = 1 := match xs with | .cons k x rest => rfl");
-    let bytes = std::fs::read(&prefix).unwrap();
-    for success in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !success {
-            command.arg(&invalid);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            success,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if success {
-            let json = String::from_utf8(output.stdout).unwrap();
-            for expected in ["\"commands\":20", "\"theorems\":8", "\"executed\":false"] {
-                assert!(json.contains(expected), "{json}");
-            }
-        } else {
-            assert!(output.stdout.is_empty());
-            assert!(!output.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
-    }
+    check_then_refuse_suffixes(
+        CONSTRAINED_MATCHING,
+        &[
+            "\"commands\":20",
+            "\"theorems\":8",
+            "\"authority\":true",
+            "\"executed\":false",
+        ],
+        &[
+            // False: the refined `Vec Nat 1` gives no proof of `0 = 1`.
+            (
+                "theorem bad (xs : Vec Nat 1) : 0 = 1 := match xs with | .cons _ x rest => rfl",
+                None,
+            ),
+            // The old example's named variables in `PairAt`'s parameter positions.
+            (
+                "def named (n : Nat) (x : PairAt n n) : Nat := match x with\n  | .mk a b => a + b\n",
+                Some(INACCESSIBLE_PARAMETER),
+            ),
+        ],
+    );
 }
 
-#[test]
-fn installed_constrained_induction_checks_both_engines_without_partial_success() {
-    let prefix = file(include_str!(
-        "../../../examples/native_induction_specialization.lean"
-    ));
-    let invalid = file(
-        "theorem bad (w : Walk 3) : 0 = 1 := by induction w with | done k => rfl | step k child ih => exact ih",
-    );
-    let original = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if valid {
-            let json = String::from_utf8(output.stdout).unwrap();
-            for expected in [
-                "\"commands\":16",
-                "\"theorems\":6",
-                "\"executed\":false",
-                "\"authority\":true",
-            ] {
-                assert!(json.contains(expected), "{json}");
-            }
-        } else {
-            assert!(output.stdout.is_empty());
-            assert!(!output.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), original);
-    }
-}
+/// `examples/native_induction_specialization.lean` in pin syntax. `Walk 3` is
+/// a promoted parameter, so `induction` keeps `3` fixed and binds no field for
+/// it; `TreeAt`'s index is promoted too, so its two recursive children get
+/// separate hypotheses. The example's induction on `Vec A (Nat.succ n)` and on
+/// `Diagonal 0 1` is refused by the pin (the index is not a variable), so the
+/// non-variable index is refined by `cases` here, with `induction` on the
+/// remaining variable-indexed tail.
+const PROMOTED_INDUCTION: &str = r#"inductive Walk : Nat -> Type where
+  | done (n : Nat) : Walk n
+  | step (n : Nat) (child : Walk n) : Walk n
+
+def copyWalk (n : Nat) : Walk n -> Walk n
+  | .done _ => Walk.done n
+  | .step _ child => Walk.step n (copyWalk n child)
+
+theorem copy_at_three (w : Walk 3) : copyWalk 3 w = w := by
+  induction w with
+  | done => rfl
+  | step child ih => simp only [copyWalk, ih]
+
+def zeroAcc (n : Nat) (w : Walk n) (acc : Nat) : Nat := match w with
+  | .done _ => 0
+  | .step _ child => zeroAcc n child (acc + 1)
+
+theorem arbitrary_accumulator (w : Walk 3) (acc : Nat) : zeroAcc 3 w acc = 0 := by
+  induction w generalizing acc with
+  | done => rfl
+  | step child ih => simp only [zeroAcc, ih]
+
+inductive TreeAt (A : Type) : Nat -> Type where
+  | leaf (n : Nat) (value : A) : TreeAt A n
+  | fork (n : Nat) (left right : TreeAt A n) : TreeAt A n
+
+def copyTree {A : Type} (n : Nat) : TreeAt A n -> TreeAt A n
+  | .leaf _ value => TreeAt.leaf n value
+  | .fork _ left right => TreeAt.fork n (copyTree n left) (copyTree n right)
+
+theorem two_children {A : Type} (n : Nat) (t : TreeAt A n) : copyTree n t = t := by
+  induction t with
+  | leaf value => rfl
+  | fork left right ihl ihr => simp only [copyTree, ihl, ihr]
+
+inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def copyVec {A : Type} : (n : Nat) -> Vec A n -> Vec A n
+  | _, .nil => Vec.nil
+  | _, .cons k x rest => Vec.cons k x (copyVec k rest)
+
+def nonemptyHead {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : A := by
+  cases xs with
+  | cons k x rest => exact x
+
+theorem head_value : nonemptyHead 0 (Vec.cons 0 7 Vec.nil) = 7 := by rfl
+
+theorem nonempty_copy {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : copyVec (Nat.succ n) xs = xs := by
+  cases xs with
+  | cons k x rest =>
+    simp only [copyVec]
+    induction rest generalizing x with
+    | nil => rfl
+    | cons j y tail ih => simp only [copyVec, ih]
+
+theorem dependent_scope (w : Walk 3) (h : w = w) (P : w = w -> Prop) (hp : P h) : P h := by
+  induction w with
+  | done => exact hp
+  | step child ih => exact hp
+
+inductive Diagonal : Nat -> Nat -> Type where
+  | mk (n : Nat) : Diagonal n n
+
+def impossible (d : Diagonal 0 1) : Nat := by cases d
+"#;
 
 #[test]
-fn installed_constrained_induction_checks_proofs_and_rejects_a_false_suffix() {
-    let prefix = file(include_str!(
-        "../../../examples/native_constrained_induction.lean"
-    ));
-    let invalid = file(
-        "theorem bad (xs : Vec Nat 1) : 0 = 1 := by\n  induction xs with\n  | cons k x tail ih => exact ih tail (HEq.refl 1) (HEq.refl tail)",
+fn installed_promoted_index_induction_checks_both_engines_without_partial_success() {
+    check_then_refuse_suffixes(
+        PROMOTED_INDUCTION,
+        &[
+            "\"commands\":16",
+            "\"theorems\":6",
+            "\"executed\":false",
+            "\"authority\":true",
+        ],
+        &[
+            // False: no induction hypothesis proves `0 = 1`.
+            (
+                "theorem bad (w : Walk 3) : 0 = 1 := by induction w with | done => rfl | step child ih => exact ih",
+                None,
+            ),
+            // The old suffix names a field for the promoted `3`.
+            (
+                "theorem bad (w : Walk 3) : 0 = 1 := by induction w with | done k => rfl | step k child ih => exact ih",
+                Some(ELIMINATION_ARITY),
+            ),
+            // The old example's `induction` on the non-variable index `Nat.succ n`.
+            (
+                "def headByInduction {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : A := by\n  induction xs with\n  | cons k x rest ih => exact x\n",
+                Some(INDUCTION_INDEX_NOT_VARIABLE),
+            ),
+            // The old example's `induction` on the impossible `Diagonal 0 1`.
+            (
+                "def impossibleByInduction (d : Diagonal 0 1) : Nat := by induction d\n",
+                Some(INDUCTION_INDEX_NOT_VARIABLE),
+            ),
+            // The old example's `TreeAt A n n`: the promoted parameter `n` is
+            // also the remaining index, so the motive cannot be assigned.
+            (
+                "inductive Twin (A : Type) : Nat -> Nat -> Type where\n  | leaf (n : Nat) (value : A) : Twin A n n\n  | fork (n : Nat) (left right : Twin A n n) : Twin A n n\n\ntheorem twin_children {A : Type} (n : Nat) (t : Twin A n n) : t = t := by\n  induction t with\n  | leaf value => rfl\n  | fork left right ihl ihr => rfl\n",
+                Some(INDUCTION_MOTIVE_MISMATCH),
+            ),
+        ],
     );
-    let bytes = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if valid {
-            let json = String::from_utf8(output.stdout).unwrap();
-            for expected in [
-                "\"commands\":12",
-                "\"theorems\":6",
-                "\"authority\":true",
-                "\"executed\":false",
-            ] {
-                assert!(json.contains(expected), "{json}");
-            }
-        } else {
-            assert!(output.stdout.is_empty());
-            assert!(!output.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
-    }
 }
 
+/// `examples/native_constrained_induction.lean` (refused by the pin) in pin
+/// syntax. `Loop 7` and `Trace A P (f a) v` eliminate with their promoted
+/// parameters fixed, so the child hypotheses are unconditional; the example's
+/// conditional `ih rest (HEq.refl 7) (HEq.refl rest)` does not exist in the
+/// pin. A length proof at the non-variable index `Nat.succ n` refines it with
+/// `cases`, then inducts on the variable-indexed tail.
+const PROMOTED_INDUCTION_PROOFS: &str = r#"inductive Loop : Nat -> Type where
+  | seed (n : Nat) : Loop n
+  | step (n : Nat) (rest : Loop n) : Loop n
+
+def copyLoop (n : Nat) : Loop n -> Loop n
+  | .seed _ => Loop.seed n
+  | .step _ rest => Loop.step n (copyLoop n rest)
+
+theorem fixed_copy (x : Loop 7) : copyLoop 7 x = x := by
+  induction x with
+  | seed => rfl
+  | step rest ih => simp only [copyLoop, ih]
+
+theorem accumulator_copy (x : Loop 7) (acc : Nat) : copyLoop 7 x = x := by
+  induction x generalizing acc with
+  | seed => rfl
+  | step rest ih => simp only [copyLoop, ih (acc + 1)]
+
+inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def length : (n : Nat) -> Vec Nat n -> Nat
+  | _, .nil => 0
+  | _, .cons k _ tail => Nat.succ (length k tail)
+
+theorem positive_length (n : Nat) (xs : Vec Nat (Nat.succ n)) : length (Nat.succ n) xs = Nat.succ n := by
+  cases xs with
+  | cons k x tail =>
+    simp only [length]
+    induction tail with
+    | nil => rfl
+    | cons j y rest ih => simp only [length, ih]
+
+theorem copy_computes : copyLoop 7 (Loop.step 7 (Loop.seed 7)) = Loop.step 7 (Loop.seed 7) := by rfl
+
+theorem length_computes : length 2 (Vec.cons 1 3 (Vec.cons 0 9 Vec.nil)) = 2 := by rfl
+
+inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
+  | base (a : A) (v : P a) : Trace A P a v
+  | step (a : A) (v : P a) (child : Trace A P a v) : Trace A P a v
+
+def traceCopy {A : Type} {P : A -> Type} (a : A) (v : P a) : Trace A P a v -> Trace A P a v
+  | .base _ _ => Trace.base a v
+  | .step _ _ child => Trace.step a v (traceCopy a v child)
+
+theorem dependent_copy (A : Type) (P : A -> Type) (f : A -> A) (a : A) (v : P (f a))
+    (value : Trace A P (f a) v) : traceCopy (f a) v value = value := by
+  induction value with
+  | base => rfl
+  | step child ih => simp only [traceCopy, ih]
+"#;
+
 #[test]
-fn installed_constrained_recursion_checks_computations_proofs_and_failure_recovery() {
-    let prefix = file(include_str!(
-        "../../../examples/native_constrained_recursion.lean"
-    ));
-    let invalid = file(
-        "def bad (w : Walk 7) : Nat := match w with | .done n => 0 | .step n child => let ignored := bad w; 0",
+fn installed_promoted_index_induction_checks_proofs_and_rejects_a_false_suffix() {
+    check_then_refuse_suffixes(
+        PROMOTED_INDUCTION_PROOFS,
+        &[
+            "\"commands\":12",
+            "\"theorems\":6",
+            "\"authority\":true",
+            "\"executed\":false",
+        ],
+        &[
+            // False: the hypotheses in scope do not prove `0 = 1`.
+            (
+                "theorem bad (x : Loop 7) : 0 = 1 := by\n  induction x with\n  | seed => rfl\n  | step rest ih => assumption",
+                None,
+            ),
+            // The old suffix: `induction` on the non-variable index of `Vec Nat 1`.
+            (
+                "theorem bad (xs : Vec Nat 1) : 0 = 1 := by\n  induction xs with\n  | cons k x tail ih => exact ih tail (HEq.refl 1) (HEq.refl tail)",
+                Some(INDUCTION_INDEX_NOT_VARIABLE),
+            ),
+        ],
     );
-    let original = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if valid {
-            let json = String::from_utf8(output.stdout).unwrap();
-            for expected in [
-                "\"commands\":16",
-                "\"theorems\":6",
-                "\"authority\":true",
-                "\"executed\":false",
-            ] {
-                assert!(json.contains(expected), "{json}");
-            }
-        } else {
-            assert!(output.stdout.is_empty());
-            assert!(!output.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), original);
-    }
+}
+
+/// `examples/native_constrained_recursion.lean` in pin syntax. `Walk`,
+/// `TreeAt` and `Trace` have promoted indices, so their constructor patterns
+/// put `_` in the parameter positions (the example's named variables there are
+/// refused by the pin), and the implicit `P` of `Trace` is given explicitly
+/// where the pin cannot infer it.
+const FIXED_PARAMETER_RECURSION: &str = r#"inductive Walk : Nat -> Type where
+  | done (n : Nat) : Walk n
+  | step (n : Nat) (child : Walk n) : Walk n
+
+def copyAtSeven (w : Walk 7) : Walk 7 := match w with
+  | .done _ => Walk.done 7
+  | .step _ child => Walk.step 7 (copyAtSeven child)
+
+def countFrom (w : Walk 7) (acc : Nat) : Nat := match w with
+  | .done _ => acc
+  | .step _ child => countFrom child (acc + 1)
+
+def sample : Walk 7 := Walk.step 7 (Walk.step 7 (Walk.done 7))
+theorem copied : copyAtSeven sample = sample := by rfl
+theorem counted : countFrom sample 4 = 6 := by rfl
+
+theorem copy_identity (w : Walk 7) : copyAtSeven w = w := by
+  induction w with
+  | done => rfl
+  | step child ih => simp only [copyAtSeven, ih]
+
+inductive TreeAt : Nat -> Nat -> Type where
+  | leaf (a b : Nat) : TreeAt a b
+  | fork (a b : Nat) (left right : TreeAt a b) : TreeAt a b
+
+def sizeRepeated (n : Nat) (tree : TreeAt n n) : Nat := match tree with
+  | .leaf _ _ => 1
+  | .fork _ _ left right => sizeRepeated n left + sizeRepeated n right
+
+theorem two_leaves : sizeRepeated 3 (TreeAt.fork 3 3 (TreeAt.leaf 3 3) (TreeAt.leaf 3 3)) = 2 := by rfl
+
+def combine (w : Walk 7) (a b : Nat) : Nat := match w with
+  | .done _ => a * 10 + b
+  | .step _ child =>
+    let next : Nat -> Nat -> Nat := fun v => combine child v;
+    next a (b + 1)
+
+theorem partial_application : combine sample 3 5 = 37 := by rfl
+
+inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
+  | base (a : A) (v : P a) : Trace A P a v
+  | step (a : A) (v : P a) (child : Trace A P a v) : Trace A P a v
+
+def traceDepth {A : Type} {P : A -> Type} (f : A -> A) (a : A) (v : P (f a))
+    (t : Trace A P (f a) v) (acc : Nat) : Nat := match t with
+  | .base _ _ => acc
+  | .step _ _ child => traceDepth f a v child (acc + 1)
+
+def traceSample : Trace Nat (fun n => Bool) 7 true :=
+  Trace.step (P := fun n => Bool) 7 true (Trace.base (P := fun n => Bool) 7 true)
+theorem dependent_indices : traceDepth (P := fun n => Bool) Nat.succ 6 true traceSample 4 = 5 := by rfl
+"#;
+
+#[test]
+fn installed_fixed_parameter_recursion_checks_computations_proofs_and_failure_recovery() {
+    check_then_refuse_suffixes(
+        FIXED_PARAMETER_RECURSION,
+        &[
+            "\"commands\":16",
+            "\"theorems\":6",
+            "\"authority\":true",
+            "\"executed\":false",
+        ],
+        &[
+            // Non-terminating: recurses on `w` itself rather than on `child`.
+            (
+                "def bad (w : Walk 7) : Nat := match w with | .done _ => 0 | .step _ child => let ignored := bad w; 0",
+                None,
+            ),
+            // The old suffix names variables in `Walk`'s parameter position.
+            (
+                "def bad (w : Walk 7) : Nat := match w with | .done n => 0 | .step n child => let ignored := bad w; 0",
+                Some(INACCESSIBLE_PARAMETER),
+            ),
+        ],
+    );
 }
 
 #[test]
@@ -1635,42 +1986,92 @@ fn installed_pattern_matrices_check_all_files_and_preserve_failure_isolation() {
     }
 }
 
+/// `examples/native_matrix_recursion.lean` in pin syntax. The pin refuses the
+/// example: `Seq` is already an Init declaration (renamed `Chain` here), and
+/// `zipVec` names the second vector's length field, which the first fixes. The
+/// example's recursive matrix over `Walk 7` becomes `alternate` over `Vec`:
+/// the pin-syntax `Walk` matrix (`| .done _, _ => 7 | ...`) is accepted by
+/// the pin but refused by FrankenLean, a gap recorded with this rewrite.
+const MATRIX_RECURSION: &str = r#"-- Recursive matrix programs and a proof for every input.
+inductive Chain (A : Type) where
+  | nil
+  | cons (value : A) (tail : Chain A)
+
+def zipSum (xs ys : Chain Nat) : Chain Nat := match xs, ys with
+  | .nil, _ => Chain.nil
+  | .cons x xt, .nil => Chain.nil
+  | .cons x xt, .cons y yt => Chain.cons (x + y) (zipSum xt yt)
+
+theorem zip_example : zipSum (Chain.cons 1 (Chain.cons 2 Chain.nil)) (Chain.cons 3 (Chain.cons 4 Chain.nil)) = Chain.cons 4 (Chain.cons 6 Chain.nil) := by rfl
+
+inductive Vec (A : Type) : Nat -> Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+
+def zipVec (n : Nat) (xs ys : Vec Nat n) : Vec Nat n := match xs, ys with
+  | .nil, .nil => Vec.nil
+  | .cons k x xt, .cons _ y yt => Vec.cons k (x + y) (zipVec k xt yt)
+
+theorem vector_example : zipVec 2 (Vec.cons 1 1 (Vec.cons 0 2 Vec.nil)) (Vec.cons 1 3 (Vec.cons 0 4 Vec.nil)) = Vec.cons 1 4 (Vec.cons 0 6 Vec.nil) := by rfl
+
+def copyMatrix (n : Nat) (b : Bool) : Nat := match n, b with
+  | .zero, _ => 0
+  | .succ k, _ => Nat.succ (copyMatrix k b)
+
+theorem copy_all (n : Nat) (b : Bool) : copyMatrix n b = n := by
+  induction n with
+  | zero => rfl
+  | succ k ih => simp only [copyMatrix, ih]
+
+def accumulate (n : Nat) (flag : Bool) (acc : Nat) : Nat := match n, flag with
+  | .zero, _ => acc
+  | .succ k, true => accumulate k false (acc + 1)
+  | .succ k, false => accumulate k true (acc + 2)
+
+theorem accumulated : accumulate 4 true 10 = 16 := by rfl
+
+def alternate : (n : Nat) -> Vec Nat n -> Bool -> Nat
+  | _, .nil, _ => 7
+  | _, .cons k _ tail, true => alternate k tail false + 1
+  | _, .cons k _ tail, false => alternate k tail true + 2
+
+theorem alternate_ok : alternate 2 (Vec.cons 1 0 (Vec.cons 0 0 Vec.nil)) true = 10 := by rfl
+
+def sumNested (xs : Chain (Chain Nat)) : Nat := match xs with
+  | .nil => 0
+  | .cons .nil tail => sumNested tail
+  | .cons (.cons x inner) tail => x + sumNested tail
+
+theorem nested_ok : sumNested (Chain.cons (Chain.cons 3 Chain.nil) (Chain.cons (Chain.cons 4 Chain.nil) Chain.nil)) = 7 := by rfl
+
+def zipWith {A B C : Type} (f : A -> B -> C) (xs : Chain A) (ys : Chain B) : Chain C := match xs, ys with
+  | .nil, _ => Chain.nil
+  | .cons x xt, .nil => Chain.nil
+  | .cons x xt, .cons y yt => Chain.cons (f x y) (zipWith f xt yt)
+
+theorem polymorphic_ok : zipWith (fun x y => x + y) (Chain.cons 4 Chain.nil) (Chain.cons 5 Chain.nil) = Chain.cons 9 Chain.nil := by rfl
+"#;
+
 #[test]
 fn installed_recursive_matrices_compute_check_proofs_and_isolate_failed_suffixes() {
-    let prefix = file(include_str!(
-        "../../../examples/native_matrix_recursion.lean"
-    ));
-    let invalid = file("theorem invalid : copyMatrix 2 true = 3 := by rfl");
-    let before = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let result = command.output().unwrap();
-        assert_eq!(
-            result.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        if valid {
-            let json = String::from_utf8(result.stdout).unwrap();
-            for field in [
-                "\"commands\":17",
-                "\"theorems\":7",
-                "\"authority\":true",
-                "\"executed\":false",
-            ] {
-                assert!(json.contains(field), "{json}");
-            }
-        } else {
-            assert!(result.stdout.is_empty());
-            assert!(!result.stderr.is_empty());
-        }
-        assert_eq!(std::fs::read(&prefix).unwrap(), before);
-    }
+    check_then_refuse_suffixes(
+        MATRIX_RECURSION,
+        &[
+            "\"commands\":16",
+            "\"theorems\":7",
+            "\"authority\":true",
+            "\"executed\":false",
+        ],
+        &[
+            // False: `copyMatrix 2 true` computes 2.
+            ("theorem invalid : copyMatrix 2 true = 3 := by rfl", None),
+            // The old example's named variable in `Walk`'s parameter position.
+            (
+                "inductive Walk : Nat -> Type where\n  | done (n : Nat) : Walk n\n  | step (n : Nat) (child : Walk n) : Walk n\n\ndef named (w : Walk 7) : Nat := match w with\n  | .done k => k\n  | .step k child => named child\n",
+                Some(INACCESSIBLE_PARAMETER),
+            ),
+        ],
+    );
 }
 
 #[test]

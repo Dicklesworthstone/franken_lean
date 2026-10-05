@@ -68,15 +68,17 @@ fn correlated_indexed_matrices_recurse_at_the_actual_child_index() {
       theorem zipped : zipVec 2 (Vec.cons 1 1 (Vec.cons 0 2 Vec.nil)) (Vec.cons 1 3 (Vec.cons 0 4 Vec.nil)) = Vec.cons 1 4 (Vec.cons 0 6 Vec.nil) := by rfl"));
 }
 
+/// `Walk`'s index is promoted to a parameter (the pin's `fixedIndicesToParams`),
+/// so `Walk 7` fixes it and a constructor pattern writes `_` there.
 const WALK: &str = "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n";
 #[test]
-fn constrained_matrix_recursion_uses_checked_child_equations() {
+fn fixed_index_matrix_recursion_changes_the_other_column() {
     check(&format!(
         "{WALK}
       def countSeven (w : Walk 7) (flag : Bool) : Nat := match w, flag with
-        | .done k, _ => k
-        | .step k child, true => countSeven child false + 1
-        | .step k child, false => countSeven child true + 2
+        | .done _, _ => 7
+        | .step _ child, true => countSeven child false + 1
+        | .step _ child, false => countSeven child true + 2
       theorem counted : countSeven (Walk.step 7 (Walk.step 7 (Walk.done 7))) true = 10 := by rfl"
     ));
 }
@@ -107,10 +109,10 @@ fn nested_pattern_in_payload_is_not_a_recursive_field() {
 #[test]
 fn partial_calls_keep_remaining_parameters_below_source_lambdas() {
     check(
-        "def partial (n : Nat) (flag : Bool) (acc : Nat) : Nat := match n, flag with
+        "def partialSum (n : Nat) (flag : Bool) (acc : Nat) : Nat := match n, flag with
       | .zero, _ => acc
-      | .succ k, _ => (fun extra => partial k false (acc + extra)) 2
-      theorem called : partial 3 true 7 = 13 := by rfl",
+      | .succ k, _ => (fun extra => partialSum k false (acc + extra)) 2
+      theorem called : partialSum 3 true 7 = 13 := by rfl",
     );
     check(
         "def deferred (n : Nat) (flag : Bool) (acc : Nat) : Nat := match n, flag with
@@ -224,20 +226,24 @@ fn separate_recursive_children_keep_separate_hypotheses_through_other_columns() 
       theorem counted : weighted (Tree.fork (Tree.leaf 3) (Tree.fork (Tree.leaf 5) (Tree.leaf 7))) true = 15 := by rfl");
 }
 
+/// Both indices of `Trace` form a dependent telescope (`v : P a`) that is
+/// promoted together, so the matrix recurses with `a v` fixed as parameters.
+/// The pin cannot infer the motive `P` from `true : P 3`, so it is named.
 #[test]
-fn dependent_index_matrices_keep_the_original_index_telescope() {
+fn promoted_dependent_index_telescopes_survive_matrix_recursion() {
     check("inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where
         | stop (a : A) (v : P a) : Trace A P a v
         | step (a : A) (v : P a) (child : Trace A P a v) : Trace A P a v
       def traceCopy {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) (b : Bool) : Trace A P a v := match t, b with
-        | .stop x y, _ => Trace.stop x y
-        | .step x y child, _ => Trace.step x y (traceCopy x y child b)
-      def trace : Trace Nat (fun a => Bool) 3 true := Trace.step 3 true (Trace.stop 3 true)
-      theorem copied : traceCopy 3 true trace false = trace := by rfl
+        | .stop _ _, _ => Trace.stop a v
+        | .step _ _ child, _ => Trace.step a v (traceCopy a v child b)
+      def trace : Trace Nat (fun a => Bool) 3 true :=
+        Trace.step (P := fun a => Bool) 3 true (Trace.stop (P := fun a => Bool) 3 true)
+      theorem copied : traceCopy (P := fun a => Bool) 3 true trace false = trace := by rfl
       theorem allCopied (A : Type) (P : A -> Type) (a : A) (v : P a) (t : Trace A P a v) (b : Bool) : traceCopy a v t b = t := by
         induction t with
-        | stop x y => rfl
-        | step x y child ih => simp only [traceCopy, ih]");
+        | stop => rfl
+        | step child ih => simp only [traceCopy, ih]");
 }
 
 #[test]

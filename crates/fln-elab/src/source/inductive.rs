@@ -2,7 +2,7 @@
 //! The provisional family is a local type parameter, never an unchecked global.
 use super::*;
 use crate::inductive::{
-    ConstructorSpec, InductiveError, InductiveSpec, inductive_with_field_universes,
+    ConstructorSpec, InductiveError, InductiveSpec, inductive_with_promoted_parameters,
 };
 use crate::records::{Builder, RecordBudget};
 
@@ -60,6 +60,167 @@ pub(super) fn checked_type(
             outcome,
         )))),
     }
+}
+
+fn rename(
+    context: &mut Context,
+    mut term: Expr,
+    replacements: &[(FVarId, Expr)],
+) -> Result<Expr, NatDefinitionElabError> {
+    for (id, value) in replacements {
+        context.tick()?;
+        term = term
+            .abstract_fvar(id, 0)
+            .map_err(|_| invalid())?
+            .subst_loose(0, std::slice::from_ref(value))
+            .map_err(|_| invalid())?;
+    }
+    Ok(term)
+}
+
+/// The argument lists of the outermost applications of `family` in `term`,
+/// as `forEachWhere (stopWhenVisited := true)` visits them: an occurrence's
+/// own arguments are not searched further.
+fn family_occurrences(
+    context: &mut Context,
+    term: &Expr,
+    family: &FVarId,
+) -> Result<Vec<Vec<Expr>>, NatDefinitionElabError> {
+    let mut found = Vec::new();
+    let mut work = vec![term.clone()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(term) = work.pop() {
+        if !seen.insert(term.allocation_identity()) {
+            continue;
+        }
+        context.tick()?;
+        let mut head = &term;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            arguments.push(a.clone());
+            head = f;
+        }
+        if matches!(head.node(), ExprNode::FVar { id } if id == family) {
+            arguments.reverse();
+            found.push(arguments);
+            continue;
+        }
+        match term.node() {
+            ExprNode::App { f, a } => {
+                work.push(a.clone());
+                work.push(f.clone());
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                work.push(body.clone());
+                work.push(binder_type.clone());
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                work.push(body.clone());
+                work.push(value.clone());
+                work.push(type_.clone());
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => work.push(expr.clone()),
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// How many leading indices the Reference promotes to parameters
+/// (`fixedIndicesToParams`, vendored Lean/Elab/MutualInductive.lean:509-608).
+///
+/// Index `j` is fixed when every constructor binds it as its own field `j` and
+/// returns that field verbatim as result index `j`, and every occurrence of
+/// the family in a field type passes the constructor's own result argument at
+/// that position. A prefix of fixed indices is promoted while each
+/// constructor's field domain is definitionally equal to the index's domain.
+/// Promotion is on by default in the pin (`inductive.autoPromoteIndices`) and
+/// changes the declaration: its parameter count, recursor and field counts.
+fn promotable_indices(
+    context: &mut Context,
+    base: &LocalContext,
+    parameters: &[LocalDecl],
+    indices: &[LocalDecl],
+    family: &FVarId,
+    constructors: &[ConstructorSpec],
+) -> Result<usize, NatDefinitionElabError> {
+    let first = parameters.len();
+    let arity = first + indices.len();
+    let mut fixed = vec![true; indices.len()];
+    for ctor in constructors {
+        context.tick()?;
+        let mut type_args: Vec<Expr> = parameters
+            .iter()
+            .map(|p| Expr::fvar(p.id.clone()))
+            .collect();
+        for index in &ctor.result_indices {
+            type_args.push(context.instantiate(index)?);
+        }
+        for (j, flag) in fixed.iter_mut().enumerate() {
+            if ctor
+                .fields
+                .get(j)
+                .is_none_or(|field| type_args[first + j] != Expr::fvar(field.id.clone()))
+            {
+                *flag = false;
+            }
+        }
+        for field in &ctor.fields {
+            let type_ = context.instantiate(&field.type_)?;
+            for arguments in family_occurrences(context, &type_, family)? {
+                for i in first..arity {
+                    if arguments.get(i) != type_args.get(i) {
+                        fixed[i - first] = false;
+                    }
+                }
+            }
+        }
+    }
+    let saved = context.txn.lctx.clone();
+    context.txn.lctx = base.clone();
+    let mut replacements: Vec<Vec<(FVarId, Expr)>> = vec![Vec::new(); constructors.len()];
+    let mut promoted = 0;
+    let result = loop {
+        if promoted == indices.len() || !fixed[promoted] {
+            break Ok(promoted);
+        }
+        let index = &indices[promoted];
+        let domain = context.instantiate(&index.type_)?;
+        let mut agree = true;
+        for (ctor, replacements) in constructors.iter().zip(&replacements) {
+            let field = context.instantiate(&ctor.fields[promoted].type_)?;
+            let field = rename(context, field, replacements)?;
+            if field != domain && !context.defeq_guarded(&field, &domain)? {
+                agree = false;
+                break;
+            }
+        }
+        if !agree {
+            break Ok(promoted);
+        }
+        context.txn.lctx.add_param(
+            index.id.clone(),
+            index.user_name.clone(),
+            domain,
+            index.binder_info,
+        );
+        for (ctor, replacements) in constructors.iter().zip(&mut replacements) {
+            replacements.push((
+                ctor.fields[promoted].id.clone(),
+                Expr::fvar(index.id.clone()),
+            ));
+        }
+        promoted += 1;
+    };
+    context.txn.lctx = saved;
+    result
 }
 
 /// Source ascriptions are retained as identity lets until checked_type checks
@@ -270,9 +431,10 @@ pub(super) fn elaborate_inductive_scoped(
         family_type,
         BinderInfo::Default,
     );
+    let base = context.txn.lctx.clone();
     let Bodies {
         mut constructors,
-        field_universes,
+        mut field_universes,
         annotations,
         inferred,
     } = bodies(&mut context, &parameters, &indices, &self_id, ctors, budget)?;
@@ -286,6 +448,49 @@ pub(super) fn elaborate_inductive_scoped(
     }
     context.resolve_instances(true)?;
     context.flush(true)?;
+    // The family type is unchanged by promotion: its binders only regroup.
+    let count = promotable_indices(
+        &mut context,
+        &base,
+        &parameters,
+        &indices,
+        &self_id,
+        &constructors,
+    )?;
+    let mut promoted = vec![Vec::new(); constructors.len()];
+    if count > 0 {
+        let promoted_indices: Vec<LocalDecl> = indices.drain(..count).collect();
+        for ((ctor, own), universes) in constructors
+            .iter_mut()
+            .zip(&mut promoted)
+            .zip(&mut field_universes)
+        {
+            let mut replacements = Vec::new();
+            let fields = ctor.fields.split_off(count);
+            for (field, index) in ctor.fields.iter().zip(&promoted_indices) {
+                let mut binder = field.clone();
+                binder.id = index.id.clone();
+                let type_ = context.instantiate(&field.type_)?;
+                binder.type_ = rename(&mut context, type_, &replacements)?;
+                own.push(binder);
+                replacements.push((field.id.clone(), Expr::fvar(index.id.clone())));
+            }
+            ctor.fields = fields;
+            for field in &mut ctor.fields {
+                let type_ = context.instantiate(&field.type_)?;
+                field.type_ = rename(&mut context, type_, &replacements)?;
+            }
+            let result_indices = ctor.result_indices.split_off(count);
+            ctor.result_indices = Vec::with_capacity(result_indices.len());
+            for index in result_indices {
+                let index = context.instantiate(&index)?;
+                ctor.result_indices
+                    .push(rename(&mut context, index, &replacements)?);
+            }
+            universes.drain(..count);
+        }
+        parameters.extend(promoted_indices);
+    }
     let result_level = explicit.unwrap_or(inferred);
     let mut closer = Builder {
         remaining: budget.max_nodes,
@@ -324,7 +529,8 @@ pub(super) fn elaborate_inductive_scoped(
         checked_type(&mut context, annotation, budget)?;
     }
     let mut roots = vec![family_type];
-    for ctor in &constructors {
+    for (ctor, own) in constructors.iter().zip(&promoted) {
+        roots.extend(own.iter().map(|b| b.type_.clone()));
         roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
         roots.extend(ctor.result_indices.iter().cloned());
     }
@@ -342,7 +548,15 @@ pub(super) fn elaborate_inductive_scoped(
         family_constant = Expr::app(family_constant, Expr::fvar(parameter.id.clone()));
     }
     parameters.splice(0..0, section);
-    for ctor in &mut constructors {
+    for (ctor, own) in constructors.iter_mut().zip(&mut promoted) {
+        for binder in own {
+            binder.type_ = binder
+                .type_
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, std::slice::from_ref(&family_constant))
+                .map_err(|_| invalid())?;
+        }
         for field in &mut ctor.fields {
             field.type_ = field
                 .type_
@@ -367,7 +581,7 @@ pub(super) fn elaborate_inductive_scoped(
         constructors,
         result_level,
     };
-    inductive_with_field_universes(&specification, budget, &field_universes)
+    inductive_with_promoted_parameters(&specification, budget, &field_universes, &promoted)
         .map_err(|e| failure(SourceInferenceError::Inductive(e)))
 }
 
