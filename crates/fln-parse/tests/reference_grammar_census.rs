@@ -257,14 +257,10 @@ fn the_header_and_the_body_use_the_pins_two_tables() {
 #[test]
 fn production_lexes_the_tokens_the_hand_table_refused() {
     // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
-    // what remains is the seed grammar's own typed refusal at that same token, which says
-    // nothing about validity: the seed grammar has no anonymous constructor, `×` or `≤`, and
-    // adding them is a grammar feature the seed-dialect freeze forbids (fln-ew20).
+    // what remains is the grammar's own typed refusal at that same token, which says nothing
+    // about validity. Each such parser is added only with the pin's own tree for it
+    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `×` and `≤` come next.
     for (source, token) in [
-        (
-            "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩",
-            "⟨",
-        ),
         ("def p : Nat × Nat := (1, 2)", "×"),
         (
             "theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega",
@@ -280,6 +276,13 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
             "{source}: the grammar, not the lexer, refuses at {token}"
         );
     }
+    // `⟨` was the third: the anonymous-constructor parser (Term.anonymousCtor) now takes it.
+    assert!(
+        parse_source_command(
+            "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩".as_bytes()
+        )
+        .is_ok()
+    );
 }
 
 /// Programs the pinned Reference refuses at a keyword used as a name, with its first error

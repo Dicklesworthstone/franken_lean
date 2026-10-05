@@ -70,7 +70,8 @@ pub(super) fn update_openers(
                 "(" => stack.push((index, ")", false)),
                 "[" => stack.push((index, "]", false)),
                 "⦃" => stack.push((index, "⦄", false)),
-                "}" | ")" | "]" | "⦄" => {
+                "⟨" => stack.push((index, "⟩", false)),
+                "}" | ")" | "]" | "⦄" | "⟩" => {
                     stack.pop();
                 }
                 ":=" => {

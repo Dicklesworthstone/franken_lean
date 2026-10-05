@@ -242,8 +242,8 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
             }
             match symbol.as_str() {
-                "(" | "[" | "@[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
-                ")" | "]" | "}" | "⦄" => depth = depth.saturating_sub(1),
+                "(" | "[" | "@[" | "{" | ".{" | "⦃" | "⟨" => depth = depth.saturating_add(1),
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
                 _ => {}
             }
         }

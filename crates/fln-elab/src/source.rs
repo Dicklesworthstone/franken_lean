@@ -5,6 +5,8 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod anonymous_ctor;
+pub use anonymous_ctor::AnonymousCtorError;
 mod application;
 mod binders;
 mod calc;
@@ -89,6 +91,8 @@ pub enum SourceInferenceError {
     Scope,
     Universe(crate::universe::UniverseInstantiationError),
     Unification(Box<UnificationError>),
+    /// `⟨…⟩` could not be expanded (`elabAnonymousCtor`).
+    AnonymousCtor(AnonymousCtorError),
 }
 
 impl std::fmt::Display for SourceInferenceError {
@@ -158,6 +162,7 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::Universe(error) => write!(f, "{error}"),
             Self::Unification(error) => write!(f, "{error}"),
+            Self::AnonymousCtor(error) => write!(f, "{error}"),
         }
     }
 }
@@ -1007,6 +1012,33 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
+        /// `⟨a, b, …⟩` interleaved with their `,` separators, which are skipped.
+        #[derive(Clone, Copy)]
+        enum Arguments<'a> {
+            Plain(&'a [Syntax]),
+            Separated(&'a [Syntax]),
+        }
+        impl<'a> Arguments<'a> {
+            fn split_first(self) -> Option<(&'a Syntax, Self)> {
+                match self {
+                    Arguments::Plain(items) => items
+                        .split_first()
+                        .map(|(first, rest)| (first, Arguments::Plain(rest))),
+                    Arguments::Separated(items) => {
+                        let start = items.iter().position(
+                            |item| !matches!(item, Syntax::Atom { val, .. } if val.as_str() == ","),
+                        )?;
+                        items[start..]
+                            .split_first()
+                            .map(|(first, rest)| (first, Arguments::Separated(rest)))
+                    }
+                }
+            }
+            fn is_empty(self) -> bool {
+                self.split_first().is_none()
+            }
+        }
         enum Task<'a> {
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoAction(&'a [Syntax], Option<Expr>),
@@ -1031,8 +1063,8 @@ impl Context {
             StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
-            Argument(Typed, Expr, &'a [Syntax], Option<Expr>, bool),
-            Apply(Typed, &'a [Syntax], Option<Expr>, bool),
+            Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
+            Apply(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Operator(operators::OperatorTree<'a>, Option<Expr>),
             Arrow(Option<Expr>),
@@ -1101,7 +1133,12 @@ impl Context {
                         Task::DoAction(arguments, expected) => {
                             let action = values.pop().expect("do action visit");
                             let function = self.do_action(action)?;
-                            tasks.push(Task::Apply(function, arguments, expected, false));
+                            tasks.push(Task::Apply(
+                                function,
+                                Arguments::Plain(arguments),
+                                expected,
+                                false,
+                            ));
                         }
                         Task::CalcNext(build) => {
                             if let Some(step) = build.steps.get(build.cursor) {
@@ -1183,7 +1220,12 @@ impl Context {
                                         } else {
                                             self.do_pure_result(function, expected.as_ref())?
                                         };
-                                        tasks.push(Task::Apply(function, args, expected, false));
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(args),
+                                            expected,
+                                            false,
+                                        ));
                                     }
                                     continue;
                                 }
@@ -1464,13 +1506,43 @@ impl Context {
                                     }
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "anonymousCtor"]) {
+                                    let parts =
+                                        expect_node(syntax, kind, 3, "anonymous constructor")?;
+                                    expect_atom(&parts[0], "⟨", "anonymous constructor opener")?;
+                                    expect_atom(&parts[2], "⟩", "anonymous constructor closer")?;
+                                    let elements = expect_null_args(
+                                        &parts[1],
+                                        "anonymous constructor fields",
+                                    )?;
+                                    for (index, element) in elements.iter().enumerate() {
+                                        if index % 2 == 1 {
+                                            expect_atom(element, ",", "field separator")?;
+                                        }
+                                    }
+                                    let provided = elements.len().div_ceil(2);
+                                    let function =
+                                        self.anonymous_constructor(expected.as_ref(), provided)?;
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Separated(elements),
+                                        expected,
+                                        false,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &Name::str(Name::anonymous(), "term¬_") {
                                     let parts =
                                         expect_node(syntax, kind, 2, "propositional negation")?;
                                     expect_atom(&parts[0], "¬", "negation prefix")?;
                                     let function =
                                         self.constant(&Name::from_components(["Not"]))?;
-                                    tasks.push(Task::Apply(function, &parts[1..], expected, false));
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(&parts[1..]),
+                                        expected,
+                                        false,
+                                    ));
                                     continue;
                                 }
                                 if kind == &Name::str(Name::anonymous(), "term-_") {
@@ -1479,7 +1551,12 @@ impl Context {
                                     expect_atom(&parts[0], "-", "negation prefix")?;
                                     let function =
                                         self.constant(&Name::from_components(["Neg", "neg"]))?;
-                                    tasks.push(Task::Apply(function, &parts[1..], expected, false));
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(&parts[1..]),
+                                        expected,
+                                        false,
+                                    ));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "app"]) {
@@ -1935,7 +2012,12 @@ impl Context {
                                     function, arguments, expected, explicit,
                                 )?));
                             } else {
-                                tasks.push(Task::Apply(function, arguments, expected, explicit));
+                                tasks.push(Task::Apply(
+                                    function,
+                                    Arguments::Plain(arguments),
+                                    expected,
+                                    explicit,
+                                ));
                             }
                         }
                         Task::NamedNext(mut state) => {

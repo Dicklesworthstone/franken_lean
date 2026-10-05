@@ -76,7 +76,8 @@ pub(super) fn parse(
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
-                ")" | "}" | "]" | "⦄" if nesting.pop() != Some(s.as_str()) => {
+                "⟨" => nesting.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" if nesting.pop() != Some(s.as_str()) => {
                     return Err(refuse(&view, &tokens, end_header));
                 }
                 _ => {}
@@ -110,7 +111,8 @@ pub(super) fn parse(
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
-                ")" | "}" | "]" | "⦄" => {
+                "⟨" => nesting.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" => {
                     if nesting.pop() != Some(s.as_str()) {
                         return Err(refuse(&view, &tokens, at));
                     }

@@ -31,12 +31,12 @@ pub(super) fn candidate(
     }
     let mut nested = 0usize;
     for index in start + 1..at {
-        if ["(", "{", ".{", "[", "⦃"]
+        if ["(", "{", ".{", "[", "⦃", "⟨"]
             .iter()
             .any(|t| is_symbol(tokens, index, t))
         {
             nested += 1;
-        } else if [")", "}", "]", "⦄"]
+        } else if [")", "}", "]", "⦄", "⟩"]
             .iter()
             .any(|t| is_symbol(tokens, index, t))
         {
@@ -94,7 +94,7 @@ pub(super) fn advance(
         if p.otherwise_end.is_none() {
             p.otherwise_end = Some(at);
             if depth == p.depth
-                && ![")", "]", "}", "⦄", ",", "|", "else"]
+                && ![")", "]", "}", "⦄", "⟩", ",", "|", "else"]
                     .iter()
                     .any(|t| is_symbol(tokens, at, t))
                 && column(view, tokens, at) >= column(view, tokens, p.start)

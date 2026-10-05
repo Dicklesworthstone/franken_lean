@@ -643,7 +643,7 @@ fn local_line_break(
     if at <= from || at >= tokens.len() || from >= tokens.len() {
         return false;
     }
-    if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄"))
+    if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄" | "⟩"))
     {
         return false;
     }
@@ -710,7 +710,8 @@ fn find_let_separator(
                 "{" | ".{" => delimiters.push("}"),
                 "[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
-                ")" | "}" | "]" | "⦄" => {
+                "⟨" => delimiters.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" => {
                     if delimiters.pop() != Some(symbol.as_str()) {
                         return None;
                     }
@@ -743,7 +744,8 @@ fn type_end(tokens: &[LexedToken], from: usize, delimiter: &str) -> usize {
                 "{" | ".{" => delimiters.push("}"),
                 "[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
-                ")" | "}" | "]" | "⦄" if !delimiters.is_empty() => {
+                "⟨" => delimiters.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" if !delimiters.is_empty() => {
                     delimiters.pop();
                 }
                 _ => {}
@@ -848,8 +850,8 @@ fn bounded_let_bindings(
                 }
                 if let TokenKind::Symbol(s) = &tokens[at].kind {
                     match s.as_str() {
-                        "(" | "{" | ".{" | "[" | "⦃" => depth += 1,
-                        ")" | "}" | "]" | "⦄" => depth = depth.saturating_sub(1),
+                        "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
+                        ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
                         _ => {}
                     }
                 }
@@ -1448,7 +1450,7 @@ fn bounded_term_frames(
                 &mut frames,
                 grammar,
                 index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
             )?;
             let mut frame = frames.pop().expect("waiting assertion value frame");
             let prefix = frame.prefix.take().expect("waiting assertion prefix");
@@ -1476,7 +1478,7 @@ fn bounded_term_frames(
         }
         if grammar == DefinitionGrammar::Scalar
             && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
-                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "," | "=>" | "↦" | ";" | ":=" | "from"))
+                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
                 || term_locals::word(tokens, index, "from")
                 || frames
                     .last()
@@ -1490,7 +1492,7 @@ fn bounded_term_frames(
                 &mut frames,
                 grammar,
                 index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
             )?;
             if let Some(mut frame) = frames.pop_if(|frame| {
                 frame
@@ -1516,7 +1518,7 @@ fn bounded_term_frames(
         if grammar == DefinitionGrammar::Scalar
             && lists.current(&frames)
             && matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
-                if symbol == "," || symbol == "]")
+                if lists.delimits(symbol))
         {
             lists.delimiter(leaves, view, tokens, &mut frames, index)?;
             continue;
@@ -1541,7 +1543,12 @@ fn bounded_term_frames(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
             {
-                lists.open(&mut frames, index);
+                lists.open(&mut frames, index, collections::Bracket::List);
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "⟨" =>
+            {
+                lists.open(&mut frames, index, collections::Bracket::AnonymousCtor);
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
@@ -1721,7 +1728,7 @@ fn bounded_term_frames(
                     &mut frames,
                     grammar,
                     index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
                 )?;
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {
                     record_terms::delimiter(
@@ -1803,7 +1810,7 @@ fn bounded_term_frames(
                     &mut frames,
                     grammar,
                     index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
                 )?;
                 if lists.current(&frames) {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {

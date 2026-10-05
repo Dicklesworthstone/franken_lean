@@ -31,11 +31,12 @@ pub(super) fn parse(
     while end < limit {
         match &tokens[end].kind {
             TokenKind::Symbol(symbol)
-                if matches!(symbol.as_str(), "(" | "[" | "{" | ".{" | "⦃") =>
+                if matches!(symbol.as_str(), "(" | "[" | "{" | ".{" | "⦃" | "⟨") =>
             {
                 depth += 1
             }
-            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⦄") => {
+            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⦄" | "⟩") =>
+            {
                 if depth == 0 {
                     break;
                 }
@@ -504,10 +505,10 @@ fn simpa(
     let mut using_at = None;
     for at in range.start + 1..range.end {
         match &tokens[at].kind {
-            TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | ".{" | "⦃") => {
+            TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | ".{" | "⦃" | "⟨") => {
                 depth += 1
             }
-            TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄") => {
+            TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩") => {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;

@@ -412,6 +412,7 @@ fn plan(
             "{" | ".{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),
+            "⟨" => delimiters.push("⟩"),
             ":" if active.last().is_some_and(|p| {
                 p.depth == depth
                     && p.with.is_none()
@@ -428,7 +429,7 @@ fn plan(
             ":" if lets.last().is_some_and(|(d, enclosing, _, _, _)| {
                 *d == depth && active.len() <= *enclosing
             }) => {}
-            ")" | "}" | "]" | "⦄" | "," | ":" => {
+            ")" | "}" | "]" | "⦄" | "⟩" | "," | ":" => {
                 // Commas before `with`, or before a row's arrow, separate
                 // columns of this match rather than terminate its branch body.
                 if symbol == ","
@@ -452,7 +453,7 @@ fn plan(
                 {
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
-                if matches!(symbol.as_str(), ")" | "}" | "]" | "⦄")
+                if matches!(symbol.as_str(), ")" | "}" | "]" | "⦄" | "⟩")
                     && delimiters.pop() != Some(symbol.as_str())
                 {
                     return Err(refuse(view, tokens, at));
@@ -711,8 +712,8 @@ fn columns(tokens: &[LexedToken], range: Range<usize>) -> Vec<(Range<usize>, Opt
     for at in range.clone() {
         if let TokenKind::Symbol(symbol) = &tokens[at].kind {
             match symbol.as_str() {
-                "(" | "{" | ".{" | "[" | "⦃" => depth += 1,
-                ")" | "}" | "]" | "⦄" => depth = depth.saturating_sub(1),
+                "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
+                ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
                 "," if depth == 0 => {
                     result.push((start..at, Some(at)));
                     start = at + 1;

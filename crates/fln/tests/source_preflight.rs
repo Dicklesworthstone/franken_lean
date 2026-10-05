@@ -55,7 +55,9 @@ fn is_parse_refusal(error: &SourceCheckError) -> bool {
 /// the lexer, the command partition, a scope command, a declaration command.
 const MALFORMED: &[&str] = &[
     "this is not lean @@@ garbage\n",
-    "theorem t (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩\n",
+    // `⟨hp, hq⟩` itself now parses (Term.anonymousCtor); the doubled separator is refused, as
+    // the pin refuses it ("unexpected token ','; expected '⟩'").
+    "theorem t (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp,, hq⟩\n",
     "def a : Nat := 1\ndef b : Nat := (1 +\n",
     "def a : Nat := 1\nnamespace\n",
     "def a : Nat := 1\ntheorem t : a = 1 :=\n",

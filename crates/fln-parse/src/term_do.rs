@@ -92,7 +92,7 @@ fn newline(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
 }
 fn closing(tokens: &[LexedToken], at: usize) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind),
-        Some(TokenKind::Symbol(s)) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ","))
+        Some(TokenKind::Symbol(s)) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ","))
 }
 
 fn is_failure_value(syntax: &Syntax) -> bool {

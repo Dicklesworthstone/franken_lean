@@ -148,9 +148,9 @@ pub(super) fn proof_limit(
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
             match s.as_str() {
-                "(" | "[" | "{" | ".{" | "⦃" => depth += 1,
-                ")" | "]" | "}" | "⦄" if depth == 0 => return at,
-                ")" | "]" | "}" | "⦄" => depth -= 1,
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" if depth == 0 => return at,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth -= 1,
                 _ => {}
             }
         }

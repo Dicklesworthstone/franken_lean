@@ -123,7 +123,7 @@ impl DoScopes {
             at >= s.first
                 && !s.braced
                 && s.depth == depth
-                && ([")", "]", "}", "⦄", ","]
+                && ([")", "]", "}", "⦄", "⟩", ","]
                     .iter()
                     .any(|t| is_symbol(tokens, at, t))
                     || (later_line(view, tokens, at, s.first)

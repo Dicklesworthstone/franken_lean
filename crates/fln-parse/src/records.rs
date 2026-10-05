@@ -151,7 +151,8 @@ fn fields(
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
-                ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
+                "⟨" => stack.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
                     return Err(refuse(view, tokens, index));
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
@@ -223,7 +224,8 @@ fn parents(
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
-                ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
+                "⟨" => stack.push("⟩"),
+                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
                     return Err(refuse(view, tokens, index));
                 }
                 _ => {}

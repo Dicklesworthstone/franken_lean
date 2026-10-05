@@ -33,7 +33,7 @@ pub(super) fn plan(
     let mut depth = 0;
     for at in first..limit {
         if depth == 0 {
-            if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄"))
+            if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩"))
                 || at > first && newline(view, tokens, at) && column(view, tokens, at) < baseline
             {
                 end = at;

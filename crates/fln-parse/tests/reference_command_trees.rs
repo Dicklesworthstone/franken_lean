@@ -101,6 +101,56 @@ const ANONYMOUS_INSTANCES: &[Accepted] = &[
     },
 ];
 
+/// `⟨a, b, …⟩`: `Term.anonymousCtor`, `"⟨" >> sepBy termParser ", " (allowTrailingSep := true)
+/// >> "⟩"` (`Lean/Parser/Term.lean:216`), alone, nested, with a trailing comma, as a do-`let`
+/// pattern, and inside a list. The Point rows were captured after
+/// `structure Point where x : Nat y : Nat`, and the do row after
+/// `structure P where a : Nat b : Nat`.
+const ANONYMOUS_CONSTRUCTORS: &[Accepted] = &[
+    Accepted {
+        source: "theorem t (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`hp] [":" `p] [] ")") (Term.explicitBinder "(" [`hq] [":" `q] [] ")")] (Term.typeSpec ":" («term_∧_» `p "∧" `q))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [`hp "," `hq] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def u : Unit := ⟨⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `u []) (Command.optDeclSig [] [(Term.typeSpec ":" `Unit)]) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [] "⟩") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "instance : Add P := ⟨fun a b => ⟨a.x + b.x, a.y + b.y⟩⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.instance (Term.attrKind []) "instance" [] [] (Command.declSig [] (Term.typeSpec ":" (Term.app `Add [`P]))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(Term.fun "fun" (Term.basicFun [`a `b] [] "=>" (Term.anonymousCtor "⟨" [(«term_+_» `a.x "+" `b.x) "," («term_+_» `a.y "+" `b.y)] "⟩")))] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def p : Point := ⟨1, 2,⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `p []) (Command.optDeclSig [] [(Term.typeSpec ":" `Point)]) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "1") "," (num "2") ","] "⟩") (Termination.suffix [] []) []) []))"#,
+    },
+    // A `⟨…⟩` pattern before a do-`let`'s `|` fallback: the fallback scanner
+    // (`matching/fallback.rs`) must count `⟨` as an opener, or `⟩` underflows its depth and
+    // the alternative is refused at the `|`.
+    Accepted {
+        source: "def f (p : Option P) : Option Nat := do\n  let some ⟨a, b⟩ := p | none\n  pure (a + b)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`p] [":" (Term.app `Option [`P])] [] ")")] [(Term.typeSpec ":" (Term.app `Option [`Nat]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLetElse "let" [] (Term.letConfig []) (Term.app `some [(Term.anonymousCtor "⟨" [`a "," `b] "⟩")]) ":=" `p "|" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr `none) [])]) [(Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `pure [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `a "+" `b) ")")])) [])])]) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def k : List Point := [⟨1, 2⟩, ⟨3, 4⟩]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `k []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `List [`Point]))]) (Command.declValSimple ":=" («term[_]» "[" [(Term.anonymousCtor "⟨" [(num "1") "," (num "2")] "⟩") "," (Term.anonymousCtor "⟨" [(num "3") "," (num "4")] "⟩")] "]") (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// Malformed `⟨…⟩`, refused at the pin's token. Captured as above (the pin's columns count
+/// code points; `at` is the byte offset in `source`).
+const ANONYMOUS_CONSTRUCTOR_REFUSALS: &[Refused] = &[
+    Refused {
+        source: "def p : Point := ⟨1,, 2⟩",
+        message: "4:20: error: unexpected token ','; expected '⟩'",
+        at: 22,
+    },
+    Refused {
+        source: "def p : Point := ⟨,⟩",
+        message: "4:18: error: unexpected token ','; expected '⟩'",
+        at: 20,
+    },
+];
+
 /// Modifiers out of the pin's order: the pin stops at the first one it cannot place.
 const MODIFIER_REFUSALS: &[Refused] = &[
     Refused {
@@ -185,8 +235,25 @@ fn anonymous_instances_produce_the_pins_trees() {
 }
 
 #[test]
+fn anonymous_constructors_produce_the_pins_trees() {
+    for row in ANONYMOUS_CONSTRUCTORS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
 fn modifiers_out_of_order_are_refused_at_the_pins_token() {
-    for row in MODIFIER_REFUSALS {
+    refusals_agree(MODIFIER_REFUSALS);
+}
+
+#[test]
+fn malformed_anonymous_constructors_are_refused_at_the_pins_token() {
+    refusals_agree(ANONYMOUS_CONSTRUCTOR_REFUSALS);
+}
+
+fn refusals_agree(rows: &[Refused]) {
+    for row in rows {
         // The pin reports the end of the preceding token; the token it names comes next.
         let named = row
             .message
