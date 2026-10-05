@@ -18,8 +18,15 @@ impl Context {
         // This equality must hold before subsequent tactics run, not merely
         // during final admission. Otherwise `first` could select a branch
         // which changed the target to an unrelated proposition.
+        // The pin's `elabChange` (vendored Tactic/Change.lean:30-48) retries
+        // after pending synthesis, and `runTermElab` applies default instances
+        // before its final `isDefEq`, so `change 5 = 5` meets `2 + 3 = 5`.
         if !self.coercion_eq(&annotation.value, &goal.target)? {
-            return Err(error(TacticError::ChangeMismatch));
+            self.resolve_instances_with_defaults()?;
+            self.flush(false)?;
+            if !self.coercion_eq(&annotation.value, &goal.target)? {
+                return Err(error(TacticError::ChangeMismatch));
+            }
         }
         let target = self.instantiate(&annotation.value)?;
         let (witness, child) = self.proof_goal(target.clone())?;
