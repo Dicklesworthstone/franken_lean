@@ -64,6 +64,17 @@ fn the_baseline_authority_fixture_is_clean() {
 /// integration-test target.
 #[test]
 fn target_inventory_does_not_count_nested_modules_as_cargo_targets() {
+    // The baseline's own targets: a library per crate, plus the checker-reading
+    // guard's test and probe binary that FLN-STRUCT-042 requires.
+    assert_eq!(
+        {
+            let ws = TempWs::new("authority-target-baseline");
+            base(&ws);
+            ws.run().authority_inventory.targets
+        },
+        FIXTURE_CRATES.len() + 2,
+        "the baseline's targets are one library per crate plus the guard's test and probe"
+    );
     let ws = TempWs::new("authority-target-cardinality");
     base(&ws);
     ws.write(
@@ -78,7 +89,7 @@ fn target_inventory_does_not_count_nested_modules_as_cargo_targets() {
     assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
     assert_eq!(
         out.authority_inventory.targets,
-        FIXTURE_CRATES.len() + 1,
+        FIXTURE_CRATES.len() + 3,
         "one integration-test root plus its module was not classified exactly"
     );
 }

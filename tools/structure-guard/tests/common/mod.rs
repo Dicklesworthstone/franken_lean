@@ -266,6 +266,19 @@ pub const OLEAN_ILEAN_FORMAT_FIXTURE: &str =
 pub const EXTERN_BUILTIN_ENVIRONMENT_FIXTURE: &str =
     include_str!("../../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
+/// The independent checker's reading-path guard and its probe, as the repository
+/// has them. FLN-STRUCT-042 requires both wherever `fln-checker` exists, so the
+/// baseline carries the real text, and a seeded test plants its violation by
+/// editing or dropping that text.
+pub const CHECKER_READING_GUARD_FILE: &str =
+    "crates/fln-conformance/tests/checker_reader_closure.rs";
+pub const CHECKER_READING_GUARD_FIXTURE: &str =
+    include_str!("../../../../crates/fln-conformance/tests/checker_reader_closure.rs");
+pub const CHECKER_READING_PROBE_FILE: &str =
+    "crates/fln-conformance/src/bin/checker-reader-probe.rs";
+pub const CHECKER_READING_PROBE_FIXTURE: &str =
+    include_str!("../../../../crates/fln-conformance/src/bin/checker-reader-probe.rs");
+
 fn fixture_hash_fields(domain: &str, fields: &[&[u8]]) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325_u64;
     for byte in domain.as_bytes().iter().copied().chain(std::iter::once(0)) {
@@ -505,6 +518,8 @@ pub fn base(ws: &TempWs) {
         ws.write(&format!("crates/{name}/Cargo.toml"), &manifest(name, &[]));
         ws.write(&format!("crates/{name}/src/lib.rs"), lib_rs(boundary));
     }
+    ws.write(CHECKER_READING_GUARD_FILE, CHECKER_READING_GUARD_FIXTURE);
+    ws.write(CHECKER_READING_PROBE_FILE, CHECKER_READING_PROBE_FIXTURE);
 }
 
 pub fn codes(outcome: &RunOutcome) -> Vec<&'static str> {

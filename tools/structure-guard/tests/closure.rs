@@ -294,6 +294,20 @@ fn base_files() -> Vec<(String, String)> {
     }
     files.push(("Cargo.lock".to_string(), cargo_lock));
     files.push(("ci/CLOSURE_ALLOWLIST.txt".to_string(), allowlist));
+    // FLN-STRUCT-042 requires the independent checker's reading-path guard wherever
+    // fln-checker exists; the fixture carries the repository's own.
+    for (rel, text) in [
+        (
+            "crates/fln-conformance/tests/checker_reader_closure.rs",
+            include_str!("../../../crates/fln-conformance/tests/checker_reader_closure.rs"),
+        ),
+        (
+            "crates/fln-conformance/src/bin/checker-reader-probe.rs",
+            include_str!("../../../crates/fln-conformance/src/bin/checker-reader-probe.rs"),
+        ),
+    ] {
+        files.push((rel.to_string(), text.to_string()));
+    }
     files
 }
 

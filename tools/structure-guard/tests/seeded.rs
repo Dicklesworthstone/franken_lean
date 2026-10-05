@@ -1786,6 +1786,209 @@ fn the_python_shadow_baseline_is_clean() {
 }
 
 // ---------------------------------------------------------------------------
+// FLN-STRUCT-042 — the independent checker's reading-path guard
+// (bead `franken_lean-z8j.1.14`)
+//
+// The guard is the linker-reachability test in fln-conformance. The baseline
+// fixture carries its real text and its probe's; each plant below edits that text
+// the way a regression would.
+// ---------------------------------------------------------------------------
+
+const READING_GUARD_HEAD: &str =
+    "#[test]\nfn the_checker_reading_path_reaches_nothing_of_the_primary_decoder() {";
+
+/// `text` with its one `old` replaced by `new`. An anchor that is missing or
+/// repeated fails the test, so a plant that hit nothing cannot pass as refused.
+fn plant(text: &str, old: &str, new: &str) -> String {
+    assert_eq!(
+        text.matches(old).count(),
+        1,
+        "the plant's anchor must occur exactly once: {old:?}"
+    );
+    text.replacen(old, new, 1)
+}
+
+fn reading_guard_findings(ws: &TempWs) -> Vec<String> {
+    ws.run()
+        .findings
+        .iter()
+        .filter(|finding| finding.code == "FLN-STRUCT-042")
+        .map(|finding| format!("{}: {}", finding.path, finding.detail))
+        .collect()
+}
+
+/// A baseline whose guard file is `guard` and whose probe is the real one.
+fn with_reading_guard(tag: &str, guard: &str) -> Vec<String> {
+    let ws = TempWs::new(tag);
+    base(&ws);
+    ws.write(CHECKER_READING_GUARD_FILE, guard);
+    reading_guard_findings(&ws)
+}
+
+/// THE BASELINE: the repository's own guard and probe pass, so each plant below
+/// is refused for what it changed and not because the rule refuses everything.
+#[test]
+fn the_real_checker_reading_guard_is_accepted() {
+    let ws = TempWs::new("reading-guard-clean");
+    base(&ws);
+    assert_eq!(reading_guard_findings(&ws), Vec::<String>::new());
+}
+
+/// THE PLANTED REMOVAL, of the test and of the probe it measures.
+#[test]
+fn a_removed_checker_reading_guard_is_refused() {
+    for (tag, removed) in [
+        ("reading-guard-removed", CHECKER_READING_GUARD_FILE),
+        ("reading-guard-probe-removed", CHECKER_READING_PROBE_FILE),
+    ] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.retain_paths(|path| path != removed);
+        let found = reading_guard_findings(&ws);
+        assert!(
+            found
+                .iter()
+                .any(|finding| finding.starts_with(&format!("{removed}: "))
+                    && finding.contains("cannot be read")),
+            "removing {removed} must be refused: {found:?}"
+        );
+    }
+}
+
+/// THE PLANTED `#[ignore]`, and the other attributes that keep the test compiled
+/// while `cargo test` skips it or reads its failure as a pass.
+#[test]
+fn a_disabled_checker_reading_guard_is_refused() {
+    for (tag, attribute) in [
+        ("ignore", "#[ignore]"),
+        ("ignore-reason", "#[ignore = \"slow\"]"),
+        ("cfg-attr-ignore", "#[cfg_attr(not(miri), ignore)]"),
+        ("should-panic", "#[should_panic]"),
+        ("cfg-out", "#[cfg(any())]"),
+    ] {
+        for (order, guard) in [
+            ("after", format!("#[test]\n{attribute}\nfn")),
+            ("before", format!("{attribute}\n#[test]\nfn")),
+        ] {
+            let head = READING_GUARD_HEAD.replacen("#[test]\nfn", &guard, 1);
+            let found = with_reading_guard(
+                &format!("reading-guard-{tag}-{order}"),
+                &plant(CHECKER_READING_GUARD_FIXTURE, READING_GUARD_HEAD, &head),
+            );
+            assert!(
+                found
+                    .iter()
+                    .any(|finding| finding.contains("can stop it running")),
+                "{attribute} {order} #[test] must be refused: {found:?}"
+            );
+        }
+    }
+
+    let found = with_reading_guard(
+        "reading-guard-not-a-test",
+        &plant(
+            CHECKER_READING_GUARD_FIXTURE,
+            READING_GUARD_HEAD,
+            READING_GUARD_HEAD
+                .strip_prefix("#[test]\n")
+                .expect("the guard head starts with its #[test]"),
+        ),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|finding| finding.contains("is not a #[test]")),
+        "a guard without #[test] never runs and must be refused: {found:?}"
+    );
+
+    let found = with_reading_guard(
+        "reading-guard-file-cfg",
+        &plant(
+            CHECKER_READING_GUARD_FIXTURE,
+            "#![forbid(unsafe_code)]",
+            "#![forbid(unsafe_code)]\n#![cfg(any())]",
+        ),
+    );
+    assert!(
+        found.iter().any(|finding| finding.contains("#![cfg]")),
+        "a file-level cfg compiles the whole guard out and must be refused: {found:?}"
+    );
+}
+
+/// THE DECOYS. A guard renamed with its old name left in a comment, a needle moved
+/// into a comment, a test pointed at another binary, and a probe rooted elsewhere
+/// all still mention the read path somewhere; none of them measures it.
+#[test]
+fn a_checker_reading_guard_that_no_longer_measures_the_read_path_is_refused() {
+    let found = with_reading_guard(
+        "reading-guard-renamed",
+        &plant(
+            CHECKER_READING_GUARD_FIXTURE,
+            READING_GUARD_HEAD,
+            "// the_checker_reading_path_reaches_nothing_of_the_primary_decoder\n#[test]\nfn \
+             renamed() {",
+        ),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|finding| finding.contains("is not defined")),
+        "a guard named only in a comment must be refused: {found:?}"
+    );
+
+    let needle = "(\"fln_checker\", \"fln_checker::olean::read_constants\"),";
+    let found = with_reading_guard(
+        "reading-guard-needle-commented",
+        &plant(
+            CHECKER_READING_GUARD_FIXTURE,
+            needle,
+            &format!("// {needle}"),
+        ),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|finding| finding.contains("no longer names `fln_checker::olean::read_constants`")),
+        "a reader needle kept only in a comment must be refused: {found:?}"
+    );
+
+    let found = with_reading_guard(
+        "reading-guard-other-binary",
+        &plant(
+            CHECKER_READING_GUARD_FIXTURE,
+            "\"CARGO_BIN_EXE_checker-reader-probe\"",
+            "\"CARGO_BIN_EXE_tcb-probe\"",
+        ),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|finding| finding.contains("no longer names `CARGO_BIN_EXE_checker-reader-probe`")),
+        "a guard measuring another binary must be refused: {found:?}"
+    );
+
+    let ws = TempWs::new("reading-guard-probe-rerooted");
+    base(&ws);
+    ws.write(
+        CHECKER_READING_PROBE_FILE,
+        &plant(
+            CHECKER_READING_PROBE_FIXTURE,
+            "= fln::independent_reading;",
+            "= fln::other_reading;",
+        ),
+    );
+    let found = reading_guard_findings(&ws);
+    assert!(
+        found.iter().any(|finding| {
+            finding.starts_with(&format!("{CHECKER_READING_PROBE_FILE}: "))
+                && finding.contains("does not refer to `fln::independent_reading`")
+        }),
+        "a probe rooted elsewhere, with the read path only in its docs, must be refused: \
+         {found:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D18 mode closure (bead franken_lean-r2st)
 //
 // The registration chain is real — ci.yml runs scripts/check.sh, whose

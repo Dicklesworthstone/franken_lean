@@ -143,6 +143,12 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
 }
 
 fn rust_lexemes(text: &str) -> Vec<Lexeme> {
+    lex(text, None)
+}
+
+/// The lexemes of `text`, and, into `strings` when given, the raw contents of its
+/// string literals (escapes unprocessed). Comments contribute to neither.
+fn lex(text: &str, mut strings: Option<&mut Vec<String>>) -> Vec<Lexeme> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -186,6 +192,7 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
             continue;
         }
         if let Some((mut end, hashes)) = raw_string_end(bytes, cursor) {
+            let content = end;
             while end < bytes.len() {
                 if bytes[end] == b'\n' {
                     line += 1;
@@ -195,6 +202,9 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
                         .get(end + 1..end + 1 + hashes)
                         .is_some_and(|tail| tail.iter().all(|value| *value == b'#'))
                 {
+                    if let Some(strings) = strings.as_deref_mut() {
+                        strings.push(text[content..end].to_string());
+                    }
                     end += 1 + hashes;
                     break;
                 }
@@ -205,6 +215,7 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
         }
         if byte == b'"' {
             cursor += 1;
+            let content = cursor;
             let mut escaped = false;
             while cursor < bytes.len() {
                 let current = bytes[cursor];
@@ -217,6 +228,9 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
                 } else if current == b'\\' {
                     escaped = true;
                 } else if current == b'"' {
+                    if let Some(strings) = strings.as_deref_mut() {
+                        strings.push(text[content..cursor - 1].to_string());
+                    }
                     break;
                 }
             }
@@ -715,6 +729,86 @@ pub fn identifier_sites(text: &str, wanted: &[&str]) -> Vec<NamedMacroSite> {
     sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
     sites.dedup();
     sites
+}
+
+/// The raw contents of every string literal in `text`, in source order. A string
+/// inside a comment is not a literal and is not reported.
+pub fn string_literals(text: &str) -> Vec<String> {
+    let mut strings = Vec::new();
+    lex(text, Some(&mut strings));
+    strings
+}
+
+/// Whether `text` spells the path `segments` (`a::b`) as code, not in a comment or
+/// a string.
+pub fn path_occurs(text: &str, segments: &[&str]) -> bool {
+    let mut spelled = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            spelled.extend([":", ":"]);
+        }
+        spelled.push(*segment);
+    }
+    !spelled.is_empty()
+        && rust_lexemes(text).windows(spelled.len()).any(|window| {
+            window
+                .iter()
+                .zip(&spelled)
+                .all(|(lexeme, wanted)| lexeme.text == *wanted)
+        })
+}
+
+/// The name of every inner attribute (`#![name ...]`) in `text`.
+pub fn inner_attribute_names(text: &str) -> Vec<String> {
+    attributes(text)
+        .into_iter()
+        .filter(|attribute| attribute.inner)
+        .filter_map(|attribute| attribute.lexemes.into_iter().next().map(|first| first.text))
+        .collect()
+}
+
+/// For each definition of a function named `name`, the names of the outer
+/// attributes written on it, in source order (`#[cfg_attr(..)]` is `cfg_attr`).
+/// Doc comments are comments, not attributes, and are not listed.
+pub fn fn_attribute_names(text: &str, name: &str) -> Vec<Vec<String>> {
+    let lexemes = rust_lexemes(text);
+    let mut definitions = Vec::new();
+    for at in 1..lexemes.len() {
+        if lexemes[at].text != name || lexemes[at - 1].text != "fn" {
+            continue;
+        }
+        // Step back over the qualifiers (`pub(crate)`, `async`, `unsafe`, ...) to
+        // where the attributes, if any, end.
+        let mut cursor = at - 1;
+        while cursor > 0 && !matches!(lexemes[cursor - 1].text.as_str(), "]" | ";" | "{" | "}") {
+            cursor -= 1;
+        }
+        let mut names = Vec::new();
+        while cursor > 0 && lexemes[cursor - 1].text == "]" {
+            let mut open = cursor - 1;
+            let mut depth = 0_usize;
+            loop {
+                match lexemes[open].text.as_str() {
+                    "]" => depth += 1,
+                    "[" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                if depth == 0 || open == 0 {
+                    break;
+                }
+                open -= 1;
+            }
+            if depth != 0 || open == 0 || lexemes[open - 1].text != "#" {
+                break;
+            }
+            let first = lexemes.get(open + 1).filter(|first| first.text != "]");
+            names.push(first.map_or_else(String::new, |first| first.text.clone()));
+            cursor = open - 1;
+        }
+        names.reverse();
+        definitions.push(names);
+    }
+    definitions
 }
 
 /// One `.name(..)` method call, carrying the argument count that distinguishes

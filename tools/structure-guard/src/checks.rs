@@ -79,6 +79,9 @@
 //!   module the evidence bootstrap imports — Python resolves the script directory and
 //!   the cwd before the standard library, so such a file replaces the module that
 //!   computes the digests and decides the verdicts (bead `franken_lean-h40t`).
+//! * `FLN-STRUCT-042` the independent checker's reading-path guard is missing, cannot
+//!   run under plain `cargo test`, or no longer measures the checker's read path
+//!   (bead `franken_lean-z8j.1.14`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -1352,6 +1355,145 @@ fn audit_python_import_shadowing(root: &Path, findings: &mut Vec<Finding>) {
                      this file replaces `{stem}` for every trusted invocation that reaches it"
                 ),
             });
+        }
+    }
+}
+
+/// The independent checker's reading-path guard: the test, the function in it, and
+/// the probe binary whose linked functions it reads.
+const CHECKER_READING_GUARD: &str = "crates/fln-conformance/tests/checker_reader_closure.rs";
+const CHECKER_READING_GUARD_FN: &str =
+    "the_checker_reading_path_reaches_nothing_of_the_primary_decoder";
+const CHECKER_READING_PROBE: &str = "crates/fln-conformance/src/bin/checker-reader-probe.rs";
+
+/// What the guard must name in code: the probe it measures, then the read path's root
+/// and the checker's reader, which it requires to be reachable so that an empty scan
+/// fails instead of passing.
+const CHECKER_READING_GUARD_NAMES: [&str; 3] = [
+    "CARGO_BIN_EXE_checker-reader-probe",
+    "fln::independent_reading",
+    "fln_checker::olean::read_constants",
+];
+
+/// FLN-STRUCT-042 — the independent checker's reading-path guard is missing,
+/// cannot run, or no longer measures the read path (bead `franken_lean-z8j.1.14`).
+///
+/// Whether the checker's `.olean` input path can call the primary's decoder is a
+/// call-graph property, and this file cannot measure it. The measurement is
+/// `CHECKER_READING_GUARD`: it reads the functions the linker kept in
+/// `checker-reader-probe`, whose only workspace reference is
+/// `fln::independent_reading`, and refuses any outside the checker's own reader.
+/// What this rule decides is that the measurement still runs and still points at
+/// that path:
+///
+/// * the test file exists, and its guard function is a `#[test]` with no other
+///   attribute but `doc`, so no `ignore`, `should_panic`, `cfg` or `cfg_attr`;
+/// * the file has no inner `cfg` or `cfg_attr`, which could compile it out whole;
+/// * the test names the probe, the read path's root and the reader as code;
+/// * the probe refers to `fln::independent_reading` as code.
+///
+/// Comments do not count for any of these. The manifest cannot switch the test off
+/// unseen either: `manifest::parse` refuses `[[test]]` tables and `autotests`.
+/// The rule applies wherever `fln-checker` exists, the crate whose independent
+/// reading the guard measures.
+fn audit_checker_reading_guard(root: &Path, findings: &mut Vec<Finding>) {
+    if !root.join("crates/fln-checker").is_dir() {
+        return;
+    }
+    let mut refuse = |path: &str, detail: String| {
+        findings.push(Finding {
+            code: "FLN-STRUCT-042",
+            path: path.to_string(),
+            detail,
+        });
+    };
+    match fs::read_to_string(root.join(CHECKER_READING_GUARD)) {
+        Err(error) => refuse(
+            CHECKER_READING_GUARD,
+            format!(
+                "the independent checker's reading-path guard cannot be read ({error}), so \
+                 nothing measures whether the checker's .olean input path reaches the \
+                 primary's decoder"
+            ),
+        ),
+        Ok(text) => {
+            let definitions = ledger::fn_attribute_names(&text, CHECKER_READING_GUARD_FN);
+            if definitions.is_empty() {
+                refuse(
+                    CHECKER_READING_GUARD,
+                    format!("the guard function `{CHECKER_READING_GUARD_FN}` is not defined"),
+                );
+            }
+            for attributes in &definitions {
+                if !attributes.iter().any(|name| name == "test") {
+                    refuse(
+                        CHECKER_READING_GUARD,
+                        format!(
+                            "`{CHECKER_READING_GUARD_FN}` is not a #[test], so `cargo test` \
+                             never runs it"
+                        ),
+                    );
+                }
+                let others: Vec<&str> = attributes
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| !matches!(*name, "test" | "doc"))
+                    .collect();
+                if !others.is_empty() {
+                    refuse(
+                        CHECKER_READING_GUARD,
+                        format!(
+                            "`{CHECKER_READING_GUARD_FN}` carries #[{}], which can stop it \
+                             running or invert its verdict; the guard takes #[test] alone",
+                            others.join("], #[")
+                        ),
+                    );
+                }
+            }
+            let inner: Vec<String> = ledger::inner_attribute_names(&text)
+                .into_iter()
+                .filter(|name| matches!(name.as_str(), "cfg" | "cfg_attr"))
+                .collect();
+            if !inner.is_empty() {
+                refuse(
+                    CHECKER_READING_GUARD,
+                    format!(
+                        "the guard file carries #![{}], which can compile the whole test out",
+                        inner.join("], #![")
+                    ),
+                );
+            }
+            let literals = ledger::string_literals(&text);
+            for name in CHECKER_READING_GUARD_NAMES {
+                if !literals.iter().any(|literal| literal == name) {
+                    refuse(
+                        CHECKER_READING_GUARD,
+                        format!(
+                            "the guard no longer names `{name}` in code, so it may measure \
+                             another binary or pass on an empty scan"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    match fs::read_to_string(root.join(CHECKER_READING_PROBE)) {
+        Err(error) => refuse(
+            CHECKER_READING_PROBE,
+            format!(
+                "the checker-reader probe cannot be read ({error}), so the guard has no \
+                 linked binary to measure"
+            ),
+        ),
+        Ok(text) => {
+            if !ledger::path_occurs(&text, &["fln", "independent_reading"]) {
+                refuse(
+                    CHECKER_READING_PROBE,
+                    "the probe does not refer to `fln::independent_reading` in code, so the \
+                     functions the linker keeps in it are not the checker's read path"
+                        .to_string(),
+                );
+            }
         }
     }
 }
@@ -2679,6 +2821,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     }
 
     audit_python_import_shadowing(root, &mut findings);
+    audit_checker_reading_guard(root, &mut findings);
 
     // ---- line-count covenants ----------------------------------------------------------
     let mut covenants: Vec<CovenantFact> = Vec::new();

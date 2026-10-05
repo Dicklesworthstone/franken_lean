@@ -188,7 +188,7 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1117`). It is planted three ways:
+//!   (`tools/structure-guard/src/checks.rs:1120`). It is planted three ways:
 //!   `seeded.rs:1322` proves the baseline clean, `seeded.rs:1332`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
@@ -259,6 +259,11 @@
 //!   hashing and that one facade function. Planting the old shared decode inside
 //!   it is refused, naming 162 `fln-core`, `fln-olean`, `fln-rt` and `fln-env`
 //!   functions. Text cannot establish "transitively calls"; a call graph can.
+//! * **KEPT IN FORCE by structure-guard.** `FLN-STRUCT-042` fails if that test is
+//!   missing, carries any attribute beside `#[test]` (so no `#[ignore]`), is compiled
+//!   out by a file-level `cfg`, stops naming its probe and the read path, or if the
+//!   probe stops rooting at `fln::independent_reading`. The measurement stays in
+//!   the test; the rule makes sure it runs.
 //! * **What is still shared, stated so nobody infers more.** The seat still
 //!   *judges* the primary's projection, not its own entry: the two are checked
 //!   equal first, so the judged term is the one it read up to a collision of a
@@ -266,9 +271,57 @@
 //!   declaration's dependencies come from the primary's values too; each was
 //!   compared when its own module was admitted by a council, and a closure loaded
 //!   into an engine without one was never compared. Source declarations have no
-//!   artifact and still cross in the wire format. And none of this touches the
-//!   *algorithmic* independence of §8.3b and §8.3c — which judgments the checker
-//!   must not copy from K1 — which remains open in that bead's scope.
+//!   artifact and still cross in the wire format.
+//!
+//! ### Independence policy: what the separate decode buys, and what it does not
+//!
+//! **It guarantees** that no code fault in the primary's decode reaches this
+//! crate's reading. `fln-olean`, `fln-core`'s term construction, `fln-hash`'s
+//! canonical readers, `fln-rt` and `fln-env` are all off the read path, and a
+//! declaration the two decoders read differently is a disagreement, not a pass.
+//! Measured: the decoder differential is identical on a 441-module sample (47,033
+//! declarations), and a planted binder swap in `fln-olean` makes the seat disagree.
+//!
+//! **It does not guarantee independent knowledge of the format.** Both decoders
+//! were written against the same pinned sources: `compact.cpp`'s framing,
+//! `lean.h`'s object layout, and the field orders in `Declaration.lean`,
+//! `Expr.lean` and `Level.lean`. This one was written with `OLEAN_CONTRACT.md` and
+//! `fln-olean`'s source at hand. The separation is of code, not of understanding.
+//! Suppose both hold the same wrong belief about the format: a misordered field, a
+//! misread constructor tag, a wrong scalar width. Then the same wrong term is
+//! decoded twice, and the differential and the council both agree with it. Only a
+//! reader that does not share that knowledge catches it: the Reference loading the
+//! same `.olean`, or a §8.7 foreign witness such as lean4checker.
+//!
+//! **Nor does it make the checker's judgment independent of K1's (§8.3b, §8.3c),
+//! and that independence is thinner than the charter's first line suggests.**
+//! What differs, and holds:
+//! * the reduction code is this crate's own (flat arenas, explicit frames);
+//! * public weak-head reduction unfolds safe definitions eagerly.
+//!
+//! Conversion has converged. It unfolds one definition at a time in descending
+//! definitional height, the order K1 takes from the pin. Checker fixes have been
+//! made to match the pin's lazy-delta details that K1 also follows (`87c08a69`,
+//! `d37e0d83`). Two took K1 as a model beside the pin: `c1047c3f`'s "Upstream
+//! Lean 4 / K1" same-head shortcut, and the structure-eta fix `fln-51y8` comment
+//! 2869 planned with K1's `tc.rs` as its reference. A misreading of the
+//! specification that both engines took from one source is the R6 common mode, and
+//! only the external witnesses cover it. The rules below keep this from thinning
+//! further. Each can be checked in review from the diff and the commit message:
+//!
+//! 1. A checker fix cites the pinned Reference (a source line at the pin) or a KR
+//!    row of `KERNEL_CONTRACT.md` as its authority, never `fln-kernel`'s source. A
+//!    commit or bead comment that justifies checker behaviour by K1's code is a
+//!    finding against this policy.
+//! 2. Public weak-head reduction stays eager. A change that makes `whnf.rs` defer
+//!    delta the way K1's conversion does needs its own bead arguing why §8.3b's
+//!    difference has to go.
+//! 3. A performance fix here uses this crate's own means (its arenas and memos). It
+//!    does not port a K1 cache, shortcut or ordering. Where the pin itself requires
+//!    an ordering, as lazy delta does, the fix cites the pin, per rule 1.
+//! 4. Nothing on the `.olean` read path decodes through another crate's reader.
+//!    `checker_reader_closure` measures this, and `FLN-STRUCT-042` keeps that
+//!    measurement in force.
 //!
 //! ## Semantic registry — every name above, bound to the rule that refuses it
 //!
@@ -360,7 +413,7 @@
 //! cite crates/fln-hash/src/canon.rs:811 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:585 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1117 :: code: "FLN-STRUCT-037"
+//! cite tools/structure-guard/src/checks.rs:1120 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1332 :: fn every_semantic_item_is_refused_inside_fln_checker
 //! cite tools/structure-guard/tests/seeded.rs:1367 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
