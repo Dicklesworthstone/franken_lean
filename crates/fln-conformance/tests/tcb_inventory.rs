@@ -8,7 +8,9 @@
 //! them with the checked-in disclosure `crates/fln-conformance/evidence/tcb_inventory.txt` in
 //! both directions, and holds the code outside `fln-kernel` to the budget that file declares.
 //! A function that enters or leaves the trust base therefore cannot land without its author
-//! regenerating the disclosure, and the diff names it.
+//! regenerating the disclosure, and the diff names it. The comparison covers the item sets and
+//! the counts they determine, not symbol counts, which differ between build configurations of
+//! the same tree (they are printed instead).
 //!
 //! What the measurement does and does not establish is stated on
 //! `fln_conformance::tcb_inventory`.
@@ -129,6 +131,11 @@ fn the_tcb_inventory_matches_what_check_links() {
             .map(|(crate_name, items)| format!("{crate_name}={}", items.len()))
             .collect::<Vec<_>>()
             .join(" "),
+    );
+    // Logged, never compared: these depend on the build's codegen partitioning.
+    println!(
+        "tcb-inventory: linked symbols in this build: {}",
+        measured.symbol_summary()
     );
     if disclosed != rendered {
         let now = item_lines(&rendered);

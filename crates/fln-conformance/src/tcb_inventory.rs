@@ -25,7 +25,8 @@
 //! closure to the crate of the function containing it. `core`'s `sort_by` instantiated with a
 //! kernel closure is toolchain code. An *item* is a source-level function: generic
 //! instantiations of one function, and the closures inside it, collapse into that function's
-//! item. The inventory lists items per workspace crate and counts symbols beside them.
+//! item. The disclosure lists items per workspace crate. Symbols are counted for the log
+//! only, because how many a build keeps depends on its codegen partitioning ([`render`]).
 //!
 //! # What it does not establish
 //!
@@ -38,7 +39,8 @@
 //!   its proxy for that profile.
 //! * Compile-time evaluation leaves no function behind, so `const` code that only runs at
 //!   compile time is not counted.
-//! * The toolchain's own crates (`core`, `alloc`, `std`) are counted, not listed.
+//! * The toolchain's own crates (`core`, `alloc`, `std`) are counted in the log, not listed or
+//!   disclosed: that count moves with the build configuration while the items do not.
 //! * The root is `check` alone. Another public kernel entry point is outside the measurement
 //!   unless `check` reaches it.
 //! * Units are functions. The covenant counts lines, so the two numbers are different
@@ -864,6 +866,23 @@ impl Inventory {
             .map(|(_, items)| items.len())
             .sum()
     }
+
+    /// The symbol counts, for a log line: per workspace crate, then the toolchain's and the
+    /// non-Rust ones. They describe this build, not the source, so they are never disclosed
+    /// or compared (see [`render`]).
+    pub fn symbol_summary(&self) -> String {
+        let per_crate: Vec<String> = self
+            .symbols
+            .iter()
+            .map(|(crate_name, symbols)| format!("{crate_name}={}", symbols.len()))
+            .collect();
+        format!(
+            "{} toolchain={} non-rust={}",
+            per_crate.join(" "),
+            self.other_symbols,
+            self.non_rust_symbols
+        )
+    }
 }
 
 /// Build the inventory from a symbol list. Every `_R` symbol must demangle.
@@ -898,10 +917,18 @@ pub fn inventory(symbols: &[String]) -> Result<Inventory, InventoryError> {
     Ok(inventory)
 }
 
-/// The schema line of the disclosure file.
-pub const SCHEMA: &str = "schema fln.tcb-inventory/1";
+/// The schema line of the disclosure file. Version 2 drops the symbol counts: they
+/// depend on how the build partitions code, not on the source (see [`render`]).
+pub const SCHEMA: &str = "schema fln.tcb-inventory/2";
 
 /// Render the disclosure: counts, the declared budget, then every item.
+///
+/// Only what the source determines is disclosed: the item sets and their counts. Symbol
+/// counts are not. The same tree at the same pinned toolchain linked 5,127 toolchain
+/// symbols on this host's cargo configuration (`incremental = false`) and 5,183 with
+/// stock settings (incremental, full debug info), the extra 56 being per-codegen-unit
+/// copies of `hashbrown` lookup closures over `fln_core` types. Every item matched.
+/// [`Inventory::symbol_summary`] reports the symbol counts for the log instead.
 pub fn render(inventory: &Inventory, adjacent_budget: usize) -> String {
     let mut text = String::new();
     text.push_str(
@@ -920,18 +947,12 @@ pub fn render(inventory: &Inventory, adjacent_budget: usize) -> String {
     text.push('\n');
     text.push_str("root fln_kernel::check\n");
     for (crate_name, items) in &inventory.items {
-        let symbols = inventory.symbols.get(crate_name).map_or(0, BTreeSet::len);
-        text.push_str(&format!(
-            "crate {crate_name} items={} symbols={symbols}\n",
-            items.len()
-        ));
+        text.push_str(&format!("crate {crate_name} items={}\n", items.len()));
     }
     text.push_str(&format!(
-        "total items={} adjacent-items={} toolchain-symbols={} non-rust-symbols={}\n",
+        "total items={} adjacent-items={}\n",
         inventory.item_count(),
         inventory.adjacent_item_count(),
-        inventory.other_symbols,
-        inventory.non_rust_symbols,
     ));
     text.push_str(&format!("budget adjacent-items<={adjacent_budget}\n"));
     for (crate_name, items) in &inventory.items {
@@ -1071,9 +1092,26 @@ mod tests {
             .entry("fln_kernel".to_owned())
             .or_default()
             .insert("fln_kernel::check".to_owned());
+        // Symbol counts describe the build, so they never reach the disclosure: two
+        // inventories that differ only in them render identically.
+        inventory.other_symbols = 5_127;
+        inventory.non_rust_symbols = 11;
         let text = render(&inventory, 7);
+        let mut other_build = inventory.clone();
+        other_build.other_symbols = 5_183;
+        other_build
+            .symbols
+            .entry("fln_core".to_owned())
+            .or_default()
+            .insert("fln_core::level::normalize::{closure#0}".to_owned());
+        assert_eq!(render(&other_build, 7), text);
+        assert!(!text.contains("symbols"), "{text}");
         assert_eq!(declared_budget(&text), Some(7));
-        assert!(text.contains("total items=2 adjacent-items=1 "), "{text}");
+        assert!(
+            text.contains("\ntotal items=2 adjacent-items=1\n"),
+            "{text}"
+        );
+        assert!(text.contains("\ncrate fln_core items=1\n"), "{text}");
         assert!(
             text.contains("\nitem fln_core fln_core::level::normalize\n"),
             "{text}"
