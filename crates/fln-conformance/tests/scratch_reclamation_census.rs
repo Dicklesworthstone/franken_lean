@@ -115,6 +115,39 @@ const SELF_CLEANING: &[(&str, &str)] = &[
         "crates/fln-cli/tests/lsp_definition_navigation.rs",
         "remove_dir",
     ),
+    // Classified 2026-10-05 after reading each file. The next five make one `temp_dir()`
+    // call apiece, inside a guard constructor that makes a pid-and-counter-unique root;
+    // every test's files, record store (`FLN_IMPORT_REUSE_DIR`) and outputs live under that
+    // root, and the guard removes it on drop.
+    // The build-explain packages (`0f2f535a`), removed on drop.
+    ("crates/fln-cli/tests/build_explain.rs", "remove_dir_all"),
+    // The lake source-module record packages (`61260daa`), removed on drop. The one
+    // store outside the root, `relative/records`, is refused by the CLI as not absolute
+    // and writes nothing.
+    (
+        "crates/fln-cli/tests/lake_module_records.rs",
+        "remove_dir_all",
+    ),
+    // The LSP `.olean`-import projects (`d695491d`), removed on drop.
+    (
+        "crates/fln-cli/tests/lsp_olean_imports.rs",
+        "remove_dir_all",
+    ),
+    // The header-pin forgery scratch (`26a58548`), removed on drop.
+    ("crates/fln-cli/tests/olean_header_pin.rs", "remove_dir_all"),
+    // The import-reuse scratch (`907bfdc0`), removed on drop on the passing path and kept
+    // when the test panics, for diagnosis. The copied `fln-other` binary lives inside it.
+    (
+        "crates/fln-cli/tests/source_import_reuse.rs",
+        "remove_dir_all",
+    ),
+    // The corrupted-closure search path (`d38870fc`): a pid-named copy of seven pinned
+    // Init modules, removed by hand right after the two check-source runs and before the
+    // assertions, so only a panic in the copy or the runs leaves it behind.
+    (
+        "crates/fln-cli/tests/source_olean_imports.rs",
+        "remove_dir_all",
+    ),
 ];
 
 /// Unrouted CLI integration test producers (added in W5/W7/W12 batch test commits, and
