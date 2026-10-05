@@ -338,7 +338,7 @@ else
     --string vendor_binding vendor-binding.json \
     --producer-binding-root "$ROOT" "${AP6_GOVERNED_ARGS[@]}" \
     --string live_head "$AP6_LIVE_HEAD" \
-    --json-value budgets "{\"capture_bytes_per_stream\":$AP6_CAPTURE_BYTES,\"output_budget_bytes\":$AP6_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$AP6_TIMEOUT_MS,\"kill_grace_ms\":$AP6_GRACE_MS,\"kernel_step_budget\":10000000,\"kernel_depth_budget\":4096}"
+    --json-value budgets "{\"capture_bytes_per_stream\":$AP6_CAPTURE_BYTES,\"output_budget_bytes\":$AP6_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$AP6_TIMEOUT_MS,\"kill_grace_ms\":$AP6_GRACE_MS,\"kernel_step_budget\":10000000,\"kernel_depth_budget\":4160}"
   : > "$AP6_HUMAN"
 
   # Helper scripts for the pure-assertion steps (census + corruption), so
@@ -416,6 +416,19 @@ PY
     "$AP6_SUBJECT_BEFORE" "$(ap6_hash_subject)"
 
   # -- step: admission_replay — the supervised no-mock replay + row validation -
+  # The same binary's `--list`, which the validator holds the replay's libtest summary
+  # to: every listed test passed or was ignored, none failed or was filtered, and the
+  # pass count meets KERNEL_ADMISSION_TARGET_PASS_FLOOR (franken_lean-ap6). An exact
+  # count pinned in the validator went stale as the target grew.
+  if ! ( cd "$ROOT" && CARGO_TARGET_DIR=target_local \
+      cargo test --locked -q -p fln-conformance --test kernel_replay -- --list ) \
+      > "$AP6_ART_DIR/admission_replay.list" \
+    || ! ( cd "$ROOT" && CARGO_TARGET_DIR=target_local \
+      cargo test --locked -q -p fln-conformance --test kernel_replay -- --list --ignored ) \
+      > "$AP6_ART_DIR/admission_replay.ignored.list"; then
+    ap6_note "FAIL: cannot list the kernel_replay target's tests"
+    exit 1
+  fi
   AP6_SUBJECT_BEFORE="$(ap6_hash_subject)"
   ap6_supervise admission_replay "$ROOT" 101 false \
     env FLN_KERNEL_E2E_RUN_ID="$AP6_RUN_ID" \
@@ -433,6 +446,10 @@ PY
     --expected-cwd "$ROOT/crates/fln-conformance" --expected-argv "$AP6_CARGO_ARGV" \
     --expected-stdout-artifact admission_replay.out \
     --expected-stderr-artifact admission_replay.err \
+    --test-listing "$AP6_ART_DIR/admission_replay.list" \
+    --expected-test-listing-artifact admission_replay.list \
+    --ignored-test-listing "$AP6_ART_DIR/admission_replay.ignored.list" \
+    --expected-ignored-test-listing-artifact admission_replay.ignored.list \
     --expected-cache-state "$AP6_CACHE_STATE" \
     --artifact-root "$AP6_ART_DIR" --output "$AP6_ADMISSION_VALIDATION"
   AP6_FIXTURE_ROOT="$("${PYTHON[@]}" - "$AP6_ADMISSION_VALIDATION" <<'PY'
@@ -630,6 +647,10 @@ PY
     --expected-cwd "$ROOT/crates/fln-conformance" --expected-argv "$AP6_CARGO_ARGV" \
     --expected-stdout-artifact admission_replay.out \
     --expected-stderr-artifact admission_replay.err \
+    --test-listing "$AP6_ART_DIR/admission_replay.list" \
+    --expected-test-listing-artifact admission_replay.list \
+    --ignored-test-listing "$AP6_ART_DIR/admission_replay.ignored.list" \
+    --expected-ignored-test-listing-artifact admission_replay.ignored.list \
     --expected-cache-state "$AP6_CACHE_STATE" \
     --expected-input-root "$AP6_FIXTURE_ROOT" \
     --artifact-root "$AP6_ART_DIR" --output "$AP6_RECHECK_VALIDATION"

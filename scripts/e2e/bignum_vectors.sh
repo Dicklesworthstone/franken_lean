@@ -621,11 +621,28 @@ emit profile_binding passed \
 
 # ---- step 3: the real suite ------------------------------------------------------------
 note "running the bignum + ABI consumer suites"
+# Not -q: cargo's `Running <target>` headers name each target in both the run and
+# its listing, so the validator joins them target by target. The listing is the same
+# binaries' `--list`: every listed test must have passed or been ignored, none
+# filtered or failed, with recorded per-target floors (franken_lean-npl). Exact counts
+# pinned in the validator went stale as the suites grew.
 set +e
 ( cd "$ROOT" && CARGO_TARGET_DIR="$BUILD_TARGET" \
-    cargo test -q -p fln-bignum -p fln-unsafe-abi -p fln-rt ) \
+    cargo test -p fln-bignum -p fln-unsafe-abi -p fln-rt ) \
   > "$ART_DIR/suite.log" 2>&1
 rc=$?
+if [ "$rc" -eq 0 ]; then
+  ( cd "$ROOT" && CARGO_TARGET_DIR="$BUILD_TARGET" \
+      cargo test -p fln-bignum -p fln-unsafe-abi -p fln-rt -- --list ) \
+    > "$ART_DIR/suite.list" 2>&1
+  rc=$?
+fi
+if [ "$rc" -eq 0 ]; then
+  ( cd "$ROOT" && CARGO_TARGET_DIR="$BUILD_TARGET" \
+      cargo test -p fln-bignum -p fln-unsafe-abi -p fln-rt -- --list --ignored ) \
+    > "$ART_DIR/suite.ignored.list" 2>&1
+  rc=$?
+fi
 set -e
 if [ "$rc" -ne 0 ]; then
   emit suite failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"suite.log\""

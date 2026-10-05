@@ -875,6 +875,19 @@ CARTRIDGE_MAX_SEMANTIC_BYTES = 65_536
 CARTRIDGE_MAX_TELEMETRY_BYTES = 8_192
 CARTRIDGE_MAX_EXTRACTED_FILES = 16
 CARTRIDGE_MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
+# The consumer suites (`cargo test -p fln-bignum -p fln-unsafe-abi -p fln-rt`, run
+# without -q so cargo names each target) are held target by target to the same
+# targets' `--list` (`judge_cargo_test_full_run`). Pinned exact counts (the literal
+# `88 passed` from 10c5b930) went stale when fln-unsafe-abi's suite grew past 88, and
+# from then on no run could validate. These are FLOORS for the three targets the old
+# literals named; lower one only when its tests are deliberately removed
+# (franken_lean-npl).
+BIGNUM_SUITE_PASS_FLOORS = {
+    "unittests src/lib.rs [fln_bignum]": 18,
+    "tests/properties.rs [properties]": 14,
+    "unittests src/lib.rs [fln_unsafe_abi]": 98,
+}
+BIGNUM_SUITE_MIN_TARGETS = 10
 BIGNUM_SEMANTIC_SCHEMA = "fln.e2e.bignum-semantic/1"
 BIGNUM_TELEMETRY_SCHEMA = "fln.e2e.bignum-telemetry/1"
 BIGNUM_VALIDATION_SCHEMA = "fln.e2e.bignum-validation/1"
@@ -1420,6 +1433,200 @@ ENVIRONMENT_RESOURCE_COLLISION_FIELDS = {
     "final_state",
 }
 
+# ---- libtest full-target accounting (franken_lean-ap6, franken_lean-npl) ---------
+# A lane proves its whole test target ran by joining the run's libtest summary to the
+# same binary's `--list`: every listed test either passed or was ignored, none failed,
+# none was filtered out, and the pass count meets a recorded floor. The expected
+# count is therefore derived from the binary, never hand-kept, so adding a test
+# cannot strand the lane, while a filtered run, a failing test, or a lost test cannot
+# validate.
+LIBTEST_SUMMARY_RE = re.compile(
+    r"^test result: (?P<state>ok|FAILED)\. (?P<passed>\d+) passed; "
+    r"(?P<failed>\d+) failed; (?P<ignored>\d+) ignored; (?P<measured>\d+) measured; "
+    r"(?P<filtered>\d+) filtered out; finished in [0-9]+(?:\.[0-9]+)?s$"
+)
+LIBTEST_RUNNING_RE = re.compile(r"^running (?P<count>\d+) tests?$")
+LIBTEST_LISTING_TRAILER_RE = re.compile(
+    r"^(?P<tests>\d+) tests?, (?P<benchmarks>\d+) benchmarks?$"
+)
+# cargo's per-target headers: `Running <source> (<binary path>)` and
+# `Doc-tests <crate>`. The binary's trailing `-<16 hex>` metadata hash varies with
+# the build, so a target is keyed by its source and binary stem.
+CARGO_TEST_RUNNING_RE = re.compile(
+    r"^\s*Running (?P<source>.+?) \((?P<binary>[^()]+)\)\s*$"
+)
+CARGO_TEST_DOC_RE = re.compile(r"^\s*Doc-tests (?P<crate>\S+)\s*$")
+
+
+def libtest_listed_count(lines: list[str], *, label: str) -> int:
+    """The number of tests a libtest `--list` listing names. Quiet listings
+    (`cargo test -q`) carry only `<name>: test` lines; a default listing ends with
+    `N tests, M benchmarks`, which must agree. A benchmark is refused, because it
+    would be counted under `measured`, not `passed`."""
+    tests = sum(1 for line in lines if line.endswith(": test"))
+    benchmarks = sum(1 for line in lines if line.endswith(": benchmark"))
+    trailers = [
+        match
+        for line in lines
+        if (match := LIBTEST_LISTING_TRAILER_RE.fullmatch(line.strip())) is not None
+    ]
+    if len(trailers) > 1:
+        raise EvidenceError(f"{label}: listing has {len(trailers)} count trailers")
+    if trailers and (
+        int(trailers[0]["tests"]) != tests
+        or int(trailers[0]["benchmarks"]) != benchmarks
+    ):
+        raise EvidenceError(
+            f"{label}: listing trailer {trailers[0].group(0)!r} disagrees with the "
+            f"{tests} test and {benchmarks} benchmark lines it follows"
+        )
+    if benchmarks:
+        raise EvidenceError(f"{label}: listing names {benchmarks} benchmark(s)")
+    return tests
+
+
+def judge_libtest_full_target(
+    summary: str,
+    listed: int,
+    *,
+    label: str,
+    floor: int | None,
+    ignored_listed: int,
+    running: int | None = None,
+) -> dict[str, int]:
+    """Hold one test target's libtest summary to the same binary's listings.
+
+    `listed` is what `--list` names and `ignored_listed` what `--list --ignored`
+    names. Refuses a malformed summary, any failed test, any filtered-out test, any
+    measured benchmark, passed + ignored != listed (part of the target never ran),
+    ignored != ignored_listed (ignored tests were run, or others skipped), a
+    `running N tests` count other than the listing's, and passed below `floor`.
+    """
+    match = LIBTEST_SUMMARY_RE.fullmatch(summary.strip())
+    if match is None:
+        raise EvidenceError(f"{label}: malformed libtest summary {summary.strip()!r}")
+    counts = {
+        key: int(match[key])
+        for key in ("passed", "failed", "ignored", "measured", "filtered")
+    }
+    if match["state"] != "ok" or counts["failed"]:
+        raise EvidenceError(f"{label}: {counts['failed']} test(s) failed")
+    if counts["filtered"]:
+        raise EvidenceError(
+            f"{label}: {counts['filtered']} test(s) filtered out; the whole target "
+            "did not run"
+        )
+    if counts["measured"]:
+        raise EvidenceError(f"{label}: {counts['measured']} benchmark(s) measured")
+    if counts["passed"] + counts["ignored"] != listed:
+        raise EvidenceError(
+            f"{label}: {counts['passed']} passed + {counts['ignored']} ignored != "
+            f"{listed} listed by the binary's --list; the whole target did not run"
+        )
+    if counts["ignored"] != ignored_listed:
+        raise EvidenceError(
+            f"{label}: {counts['ignored']} ignored, but the binary's --list --ignored "
+            f"names {ignored_listed}"
+        )
+    if running is not None and running != listed:
+        raise EvidenceError(
+            f"{label}: the run reports running {running} tests, the binary lists {listed}"
+        )
+    if floor is not None and counts["passed"] < floor:
+        raise EvidenceError(
+            f"{label}: {counts['passed']} passed, below the recorded floor of {floor}"
+        )
+    counts["listed"] = listed
+    counts["ignored_listed"] = ignored_listed
+    return counts
+
+
+def cargo_test_targets(text: str, *, label: str) -> list[tuple[str, list[str]]]:
+    """Split non-quiet `cargo test` output (a run or a `--list`) into its targets,
+    in order, each keyed `<source> [<binary stem>]` or `doc-tests <crate>`. Lines
+    before the first header (compilation) belong to no target."""
+    targets: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        running = CARGO_TEST_RUNNING_RE.fullmatch(line)
+        doc = CARGO_TEST_DOC_RE.fullmatch(line)
+        if running is not None:
+            stem = re.sub(
+                r"-[0-9a-f]{16}$", "", running["binary"].replace("\\", "/").split("/")[-1]
+            )
+            targets.append((f"{running['source']} [{stem}]", []))
+        elif doc is not None:
+            targets.append((f"doc-tests {doc['crate']}", []))
+        elif targets:
+            targets[-1][1].append(line)
+    if not targets:
+        raise EvidenceError(f"{label}: no cargo test target headers")
+    keys = [key for key, _ in targets]
+    if len(set(keys)) != len(keys):
+        raise EvidenceError(f"{label}: a cargo test target appears twice")
+    return targets
+
+
+def judge_cargo_test_full_run(
+    run_text: str,
+    listing_text: str,
+    ignored_listing_text: str,
+    *,
+    label: str,
+    floors: dict[str, int],
+    minimum_targets: int,
+) -> list[dict[str, Any]]:
+    """Hold every target of a non-quiet multi-target `cargo test` run to the same
+    targets' `--list` and `--list --ignored`: identical targets in identical order,
+    and each one judged by `judge_libtest_full_target`. `floors` names the targets
+    whose pass counts are recorded; each must be present."""
+    run_targets = cargo_test_targets(run_text, label=f"{label} run")
+    listed_targets = cargo_test_targets(listing_text, label=f"{label} listing")
+    ignored_targets = cargo_test_targets(
+        ignored_listing_text, label=f"{label} ignored listing"
+    )
+    run_keys = [key for key, _ in run_targets]
+    listed_keys = [key for key, _ in listed_targets]
+    if run_keys != listed_keys or [key for key, _ in ignored_targets] != listed_keys:
+        raise EvidenceError(
+            f"{label}: the run's targets {run_keys} are not the listing's {listed_keys}"
+        )
+    if len(run_keys) < minimum_targets:
+        raise EvidenceError(
+            f"{label}: {len(run_keys)} test targets ran, fewer than {minimum_targets}"
+        )
+    missing = sorted(set(floors) - set(run_keys))
+    if missing:
+        raise EvidenceError(f"{label}: floored target(s) did not run: {missing}")
+    report: list[dict[str, Any]] = []
+    for (key, run_lines), (_, listing_lines), (_, ignored_lines) in zip(
+        run_targets, listed_targets, ignored_targets
+    ):
+        summaries = [line for line in run_lines if line.startswith("test result:")]
+        if len(summaries) != 1:
+            raise EvidenceError(
+                f"{label}: target {key} has {len(summaries)} libtest summaries"
+            )
+        runs = [
+            int(match["count"])
+            for line in run_lines
+            if (match := LIBTEST_RUNNING_RE.fullmatch(line.strip())) is not None
+        ]
+        if len(runs) != 1:
+            raise EvidenceError(f"{label}: target {key} has {len(runs)} `running` lines")
+        counts = judge_libtest_full_target(
+            summaries[0],
+            libtest_listed_count(listing_lines, label=f"{label} {key}"),
+            label=f"{label} {key}",
+            floor=floors.get(key),
+            ignored_listed=libtest_listed_count(
+                ignored_lines, label=f"{label} {key} ignored"
+            ),
+            running=runs[0],
+        )
+        report.append({"target": key, **counts})
+    return report
+
+
 KERNEL_ADMISSION_SCHEMA = "fln.e2e.kernel-admission"
 KERNEL_ADMISSION_FAULT_SCHEMA = "fln.e2e.kernel-admission-fault"
 KERNEL_ADMISSION_VERSION = 2
@@ -1428,10 +1635,18 @@ KERNEL_ADMISSION_TESTS = (
     "prelude_replays_through_the_kernel",
     "admission_fault_matrix_is_typed_and_atomic",
 )
-KERNEL_ADMISSION_TARGET_PASSED = 14
-KERNEL_ADMISSION_TARGET_IGNORED = 3
+# The kernel_replay target's expected test count is not pinned here: it is derived
+# at run time from the same binary's `--list` (see `judge_libtest_full_target`), and
+# the whole target must have run. Pinned counts (14 passed / 3 ignored, from
+# b51f7700) went stale as the target grew, and from then on no run could validate.
+# What stays recorded is a FLOOR, so a silent loss of tests still fails. Lower it
+# only when tests are deliberately removed (franken_lean-ap6).
+KERNEL_ADMISSION_TARGET_PASS_FLOOR = 99
 KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
-KERNEL_ADMISSION_BUDGET_DEPTH = 4_096
+# The replay checks under `fln_kernel::verdict::Budget::DEFAULT`, whose depth is
+# `Budget::DEFAULT_DEPTH`: 4,160 since 62a5ff9a (2026-08-19), which raised it from
+# 4,096. Every matrix row of contract-drift run 37353599135 carries 4160.
+KERNEL_ADMISSION_BUDGET_DEPTH = 4_160
 # The pinned Init.Prelude verdict census (beads franken_lean-irm +
 # franken_lean-ap6). Moves only with a deliberate, bead-tracked change.
 KERNEL_ADMISSION_CENSUS = {
@@ -11341,13 +11556,36 @@ def validate_bignum_no_mock_evidence(
         suite_path,
         max_bytes=MAX_LOG_BYTES,
     )
-    if (
-        suite_data.count(b"test result: ok.") < 10
-        or b"18 passed; 0 failed" not in suite_data
-        or b"14 passed; 0 failed" not in suite_data
-        or b"88 passed; 0 failed" not in suite_data
-        or b"test result: FAILED." in suite_data
-    ):
+    listing_path = require_within(
+        inner_root / "suite.list",
+        artifact_root,
+        label="bignum consumer suite listing",
+    )
+    listing_data, _listing_bytes, _listing_digest = stable_file_facts(
+        listing_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    ignored_listing_path = require_within(
+        inner_root / "suite.ignored.list",
+        artifact_root,
+        label="bignum consumer suite ignored listing",
+    )
+    ignored_listing_data, _ignored_bytes, _ignored_digest = stable_file_facts(
+        ignored_listing_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    try:
+        suite_targets = judge_cargo_test_full_run(
+            suite_data.decode("utf-8"),
+            listing_data.decode("utf-8"),
+            ignored_listing_data.decode("utf-8"),
+            label="bignum consumer suites",
+            floors=BIGNUM_SUITE_PASS_FLOORS,
+            minimum_targets=BIGNUM_SUITE_MIN_TARGETS,
+        )
+    except UnicodeDecodeError as error:
+        raise EvidenceError("bignum consumer suite log or listing is not UTF-8") from error
+    if b"test result: FAILED." in suite_data:
         raise EvidenceError("bignum consumer suites did not meet their floors")
 
     c4_run_path = require_within(
@@ -11566,6 +11804,7 @@ def validate_bignum_no_mock_evidence(
         "run_id": expected_run_id,
         "schema": BIGNUM_VALIDATION_SCHEMA,
         "semantic_sha256": semantic_digest,
+        "suite_targets": suite_targets,
         "telemetry_sha256": telemetry_digest,
         "vectors": BIGNUM_VECTOR_COUNT,
         "verdict": "pass",
@@ -14959,6 +15198,10 @@ def validate_kernel_admission(
     artifact_root: Path,
     expected_stdout_artifact: str,
     expected_stderr_artifact: str,
+    test_listing_path: Path,
+    expected_test_listing_artifact: str,
+    ignored_test_listing_path: Path,
+    expected_ignored_test_listing_artifact: str,
     expected_cwd: str | None = None,
     expected_argv: str | None = None,
     expected_cache_state: str | None = None,
@@ -14968,6 +15211,8 @@ def validate_kernel_admission(
     franken_lean-ap6): the {1,8,32} thread matrix must be byte-identical, the
     pinned census exact, every named mutant killed typed, every resource phase
     typed Inconclusive-never-verdict, and the machine/human streams disjoint.
+    The whole kernel_replay target must have run: its summary is held to the same
+    binary's `--list` (`test_listing_path`) and to KERNEL_ADMISSION_TARGET_PASS_FLOOR.
     """
     if phase not in {"positive", "recovery"}:
         raise EvidenceError(f"unsupported kernel-admission phase: {phase!r}")
@@ -15005,11 +15250,35 @@ def validate_kernel_admission(
     stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
         read_kernel_admission_stream(stderr_path, root, label="stderr")
     )
+    (
+        listing_path,
+        _listing_data,
+        listing_text,
+        listing_digest,
+        listing_relative,
+    ) = read_kernel_admission_stream(test_listing_path, root, label="test listing")
+    (
+        ignored_listing_path,
+        _ignored_listing_data,
+        ignored_listing_text,
+        ignored_listing_digest,
+        ignored_listing_relative,
+    ) = read_kernel_admission_stream(
+        ignored_test_listing_path, root, label="ignored test listing"
+    )
     if stdout_path == stderr_path:
         raise EvidenceError("kernel-admission stdout and stderr are not distinct")
+    if len({stdout_path, stderr_path, listing_path, ignored_listing_path}) != 4:
+        raise EvidenceError("kernel-admission test listings are not distinct artifacts")
     for label, expected, actual in (
         ("stdout", expected_stdout_artifact, stdout_relative),
         ("stderr", expected_stderr_artifact, stderr_relative),
+        ("test listing", expected_test_listing_artifact, listing_relative),
+        (
+            "ignored test listing",
+            expected_ignored_test_listing_artifact,
+            ignored_listing_relative,
+        ),
     ):
         expected_as_path = Path(expected)
         if (
@@ -15046,25 +15315,35 @@ def validate_kernel_admission(
         raise EvidenceError(f"kernel-admission {phase} stdout contains failure material")
     if kernel_admission_failure_material(stderr_text):
         raise EvidenceError(f"kernel-admission {phase} stderr contains failure material")
-    pass_result_lines = [
+    result_lines = [
         line.strip()
         for line in stdout_text.splitlines()
-        if line.strip().startswith("test result: ok.")
+        if line.strip().startswith("test result:")
     ]
-    expected_summary = re.compile(
-        rf"^test result: ok\. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
-        rf"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
-        r"0 measured; 0 filtered out; finished in .+$"
-    )
-    if (
-        len(pass_result_lines) != 1
-        or expected_summary.fullmatch(pass_result_lines[0]) is None
-    ):
+    running_counts = [
+        int(match["count"])
+        for line in stdout_text.splitlines()
+        if (match := LIBTEST_RUNNING_RE.fullmatch(line.strip())) is not None
+    ]
+    if len(result_lines) != 1 or len(running_counts) != 1:
         raise EvidenceError(
-            f"kernel-admission {phase} log lacks the exact full-target "
-            f"{KERNEL_ADMISSION_TARGET_PASSED}-pass/"
-            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
+            f"kernel-admission {phase} log lacks exactly one full-target libtest "
+            f"summary ({len(result_lines)} summaries, {len(running_counts)} "
+            "`running` lines)"
         )
+    target_tests = judge_libtest_full_target(
+        result_lines[0],
+        libtest_listed_count(
+            listing_text.splitlines(), label=f"kernel-admission {phase} test listing"
+        ),
+        label=f"kernel-admission {phase} full target",
+        floor=KERNEL_ADMISSION_TARGET_PASS_FLOOR,
+        ignored_listed=libtest_listed_count(
+            ignored_listing_text.splitlines(),
+            label=f"kernel-admission {phase} ignored test listing",
+        ),
+        running=running_counts[0],
+    )
 
     matrix_records: list[dict[str, Any]] = []
     fault_records: list[dict[str, Any]] = []
@@ -15510,6 +15789,12 @@ def validate_kernel_admission(
         "stderr_artifact": stderr_relative,
         "stdout_sha256": stdout_digest,
         "stderr_sha256": stderr_digest,
+        "test_listing_artifact": listing_relative,
+        "test_listing_sha256": listing_digest,
+        "ignored_test_listing_artifact": ignored_listing_relative,
+        "ignored_test_listing_sha256": ignored_listing_digest,
+        "target_tests": target_tests,
+        "target_pass_floor": KERNEL_ADMISSION_TARGET_PASS_FLOOR,
     }
 
 
@@ -21845,6 +22130,14 @@ def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
     stderr_path = require_within(
         Path(args.stderr_file), artifact_root, label="kernel-admission stderr"
     )
+    listing_path = require_within(
+        Path(args.test_listing), artifact_root, label="kernel-admission test listing"
+    )
+    ignored_listing_path = require_within(
+        Path(args.ignored_test_listing),
+        artifact_root,
+        label="kernel-admission ignored test listing",
+    )
     report = validate_kernel_admission(
         stdout_path,
         stderr_path,
@@ -21854,6 +22147,12 @@ def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
         artifact_root=artifact_root,
         expected_stdout_artifact=args.expected_stdout_artifact,
         expected_stderr_artifact=args.expected_stderr_artifact,
+        test_listing_path=listing_path,
+        expected_test_listing_artifact=args.expected_test_listing_artifact,
+        ignored_test_listing_path=ignored_listing_path,
+        expected_ignored_test_listing_artifact=(
+            args.expected_ignored_test_listing_artifact
+        ),
         expected_cwd=args.expected_cwd,
         expected_argv=args.expected_argv,
         expected_cache_state=args.expected_cache_state,
@@ -30239,17 +30538,40 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             clock += 10
         return records
 
-    def admission_pass_log(records: list[dict[str, Any]]) -> bytes:
+    # The fixture target: the floor's worth of passing tests and nine ignored, all
+    # named by the fixture binary's quiet `--list` (one `<name>: test` line each).
+    admission_fixture_passed = KERNEL_ADMISSION_TARGET_PASS_FLOOR
+    admission_fixture_ignored = 9
+    admission_fixture_listed = admission_fixture_passed + admission_fixture_ignored
+
+    def admission_listing(count: int) -> bytes:
+        return "".join(
+            f"fixture_test_{index:03}: test\n" for index in range(count)
+        ).encode("ascii")
+
+    def admission_summary(
+        *,
+        state: str = "ok",
+        passed: int = admission_fixture_passed,
+        failed: int = 0,
+        ignored: int = admission_fixture_ignored,
+        filtered: int = 0,
+    ) -> bytes:
         return (
-            f"running {KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
-            "tests\n"
-        ).encode() + (
-            b"".join(canonical_json(record) for record in records)
-            + (
-                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
-                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
-                "0 measured; 0 filtered out; finished in 0.01s\n"
-            ).encode()
+            f"test result: {state}. {passed} passed; {failed} failed; {ignored} "
+            f"ignored; 0 measured; {filtered} filtered out; finished in 0.01s\n"
+        ).encode("ascii")
+
+    def admission_pass_log(
+        records: list[dict[str, Any]],
+        *,
+        running: int = admission_fixture_listed,
+        summary: bytes | None = None,
+    ) -> bytes:
+        return (
+            f"running {running} tests\n".encode("ascii")
+            + b"".join(canonical_json(record) for record in records)
+            + (admission_summary() if summary is None else summary)
         )
 
     admission_stderr_bytes = (
@@ -30271,6 +30593,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         *,
         expected_input_root: str | None = None,
     ) -> dict[str, Any]:
+        # Each case's listings sit beside its stdout, as `<case>.list` and
+        # `<case>.ignored.list`.
+        listing_artifact = stdout_artifact.removesuffix(".out") + ".list"
+        ignored_listing_artifact = (
+            stdout_artifact.removesuffix(".out") + ".ignored.list"
+        )
         return validate_kernel_admission(
             stdout_path,
             stderr_path,
@@ -30280,6 +30608,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             artifact_root=admission_validation_root,
             expected_stdout_artifact=stdout_artifact,
             expected_stderr_artifact=stderr_artifact,
+            test_listing_path=admission_validation_root / listing_artifact,
+            expected_test_listing_artifact=listing_artifact,
+            ignored_test_listing_path=(
+                admission_validation_root / ignored_listing_artifact
+            ),
+            expected_ignored_test_listing_artifact=ignored_listing_artifact,
             expected_cwd=admission_cwd,
             expected_argv=admission_argv,
             expected_cache_state=admission_cache_state,
@@ -30292,6 +30626,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         *,
         stdout_bytes: bytes | None = None,
         stderr_bytes: bytes | None = None,
+        listing_bytes: bytes | None = None,
+        ignored_listing_bytes: bytes | None = None,
     ) -> tuple[Path, Path, str, str]:
         stdout_artifact = f"{name}.out"
         stderr_artifact = f"{name}.err"
@@ -30311,6 +30647,18 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             stderr_file,
             admission_stderr_bytes if stderr_bytes is None else stderr_bytes,
         )
+        write_new(
+            admission_validation_root / f"{name}.list",
+            admission_listing(admission_fixture_listed)
+            if listing_bytes is None
+            else listing_bytes,
+        )
+        write_new(
+            admission_validation_root / f"{name}.ignored.list",
+            admission_listing(admission_fixture_ignored)
+            if ignored_listing_bytes is None
+            else ignored_listing_bytes,
+        )
         return stdout_file, stderr_file, stdout_artifact, stderr_artifact
 
     def expect_admission_rejection(
@@ -30320,12 +30668,19 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         *,
         stdout_bytes: bytes | None = None,
         stderr_bytes: bytes | None = None,
+        listing_bytes: bytes | None = None,
+        ignored_listing_bytes: bytes | None = None,
         expected_message: str | None = None,
         expected_input_root: str | None = None,
     ) -> None:
         stdout_file, stderr_file, stdout_artifact, stderr_artifact = (
             write_admission_case(
-                name, mutate, stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes
+                name,
+                mutate,
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                listing_bytes=listing_bytes,
+                ignored_listing_bytes=ignored_listing_bytes,
             )
         )
         try:
@@ -30404,27 +30759,266 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             + b"test result: ok. 2 passed; 0 failed; 0 ignored; "
             b"0 measured; 0 filtered out; finished in 0.01s\n"
         ),
+        expected_message="listed by the binary's --list",
+    )
+
+    # The three planted mutants of the full-target join (franken_lean-ap6): a
+    # filtered run, one failing test, and a pass count below the recorded floor.
+    # Each must be refused, for its own reason.
+    filtered_out = "admission_filtered_run.out"
+    filtered_err = "admission_filtered_run.err"
+    expect_admission_rejection(
+        "filtered kernel-admission run",
+        "admission_filtered_run",
+        stdout_bytes=admission_pass_log(
+            admission_records_for(filtered_out, filtered_err),
+            running=admission_fixture_listed - 8,
+            summary=admission_summary(
+                passed=admission_fixture_passed,
+                ignored=admission_fixture_ignored - 8,
+                filtered=8,
+            ),
+        ),
+        expected_message="filtered out; the whole target did not run",
+    )
+    failing_out = "admission_one_failing_test.out"
+    failing_err = "admission_one_failing_test.err"
+    expect_admission_rejection(
+        "kernel-admission run with one failing test",
+        "admission_one_failing_test",
+        stdout_bytes=admission_pass_log(
+            admission_records_for(failing_out, failing_err),
+            summary=admission_summary(
+                state="FAILED", passed=admission_fixture_passed - 1, failed=1
+            ),
+        ),
+        expected_message="failure material",
+    )
+    below_out = "admission_below_floor.out"
+    below_err = "admission_below_floor.err"
+    expect_admission_rejection(
+        "kernel-admission target below its recorded floor",
+        "admission_below_floor",
+        stdout_bytes=admission_pass_log(
+            admission_records_for(below_out, below_err),
+            running=admission_fixture_listed - 2,
+            summary=admission_summary(passed=admission_fixture_passed - 2),
+        ),
+        listing_bytes=admission_listing(admission_fixture_listed - 2),
         expected_message=(
-            f"exact full-target {KERNEL_ADMISSION_TARGET_PASSED}-pass/"
-            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
+            f"below the recorded floor of {KERNEL_ADMISSION_TARGET_PASS_FLOOR}"
         ),
     )
+    # A run that also executed the ignored tests (`--include-ignored`) still has
+    # passed + ignored == listed; the ignored listing is what refuses it.
+    included_out = "admission_included_ignored.out"
+    included_err = "admission_included_ignored.err"
+    expect_admission_rejection(
+        "kernel-admission run that executed its ignored tests",
+        "admission_included_ignored",
+        stdout_bytes=admission_pass_log(
+            admission_records_for(included_out, included_err),
+            summary=admission_summary(passed=admission_fixture_listed, ignored=0),
+        ),
+        expected_message=(
+            f"0 ignored, but the binary's --list --ignored names "
+            f"{admission_fixture_ignored}"
+        ),
+    )
+    # The judge itself, on the summary forms the lane-level cases above cannot
+    # reach (a failure-material scan answers first for a FAILED summary).
+    for summary, listed, message in (
+        (
+            "test result: FAILED. 98 passed; 1 failed; 9 ignored; 0 measured; "
+            "0 filtered out; finished in 0.01s",
+            108,
+            "1 test(s) failed",
+        ),
+        (
+            "test result: ok. 99 passed; 0 failed; 9 ignored; 0 measured; "
+            "0 filtered out; finished in 0.01s",
+            109,
+            "109 listed by the binary's --list",
+        ),
+        (
+            "test result: ok. 99 passed; 0 failed; 9 ignored; 1 measured; "
+            "0 filtered out; finished in 0.01s",
+            108,
+            "benchmark(s) measured",
+        ),
+        ("test result: ok. 99 passed", 108, "malformed libtest summary"),
+    ):
+        try:
+            judge_libtest_full_target(
+                summary,
+                listed,
+                label="self-test",
+                floor=KERNEL_ADMISSION_TARGET_PASS_FLOOR,
+                ignored_listed=9,
+            )
+        except EvidenceError as error:
+            require(message in str(error), f"judge refused {summary!r} as: {error}")
+        else:
+            raise EvidenceError(f"judge accepted {summary!r} over {listed} listed")
+    for listing, message in (
+        (["a: test", "", "2 tests, 0 benchmarks"], "disagrees"),
+        (["a: test", "b: benchmark", "", "1 test, 1 benchmark"], "benchmark(s)"),
+    ):
+        try:
+            libtest_listed_count(listing, label="self-test")
+        except EvidenceError as error:
+            require(message in str(error), f"listing refused as: {error}")
+        else:
+            raise EvidenceError(f"listing {listing!r} was accepted")
+    require(
+        libtest_listed_count(["a: test", "b: test", "", "2 tests, 0 benchmarks"], label="x")
+        == 2
+        and libtest_listed_count(["a: test", "b: test"], label="x") == 2,
+        "a well-formed listing, quiet or not, lost its count",
+    )
+
+    # The bignum lane's multi-target join (franken_lean-npl), in the shape a
+    # non-quiet `cargo test -p fln-bignum -p fln-unsafe-abi -p fln-rt` prints:
+    # cargo's target headers, then each binary's own output.
+    bignum_shape = [
+        ("unittests src/lib.rs", "fln_bignum", 18, 0),
+        ("tests/properties.rs", "properties", 14, 0),
+        ("unittests src/lib.rs", "fln_unsafe_abi", 98, 0),
+    ] + [(f"tests/extra_{index}.rs", f"extra_{index}", 1, 1) for index in range(7)]
+
+    def bignum_header(source: str, stem: str) -> str:
+        return f"     Running {source} (target_local/debug/deps/{stem}-0123456789abcdef)\n"
+
+    def bignum_run(
+        shape: list[tuple[str, str, int, int]],
+        *,
+        override: dict[str, str] | None = None,
+    ) -> str:
+        text = "   Compiling fln-bignum v0.0.0\n"
+        for source, stem, passed, ignored in shape:
+            key = f"{source} [{stem}]"
+            summary = (override or {}).get(
+                key,
+                f"test result: ok. {passed} passed; 0 failed; {ignored} ignored; "
+                "0 measured; 0 filtered out; finished in 0.01s",
+            )
+            text += (
+                bignum_header(source, stem)
+                + f"\nrunning {passed + ignored} tests\n"
+                + "".join(f"test t{index} ... ok\n" for index in range(passed))
+                + f"\n{summary}\n\n"
+            )
+        return text + "   Doc-tests fln_bignum\n\nrunning 0 tests\n\n" + (
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.00s\n"
+        )
+
+    def bignum_listing(
+        shape: list[tuple[str, str, int, int]], *, ignored_only: bool = False
+    ) -> str:
+        text = "   Compiling fln-bignum v0.0.0\n"
+        for source, stem, passed, ignored in shape:
+            count = ignored if ignored_only else passed + ignored
+            text += (
+                bignum_header(source, stem)
+                + "".join(f"t{index}: test\n" for index in range(count))
+                + f"\n{count} tests, 0 benchmarks\n"
+            )
+        return text + "   Doc-tests fln_bignum\n0 tests, 0 benchmarks\n"
+
+    bignum_report = judge_cargo_test_full_run(
+        bignum_run(bignum_shape),
+        bignum_listing(bignum_shape),
+        bignum_listing(bignum_shape, ignored_only=True),
+        label="self-test bignum",
+        floors=BIGNUM_SUITE_PASS_FLOORS,
+        minimum_targets=BIGNUM_SUITE_MIN_TARGETS,
+    )
+    require(
+        len(bignum_report) == len(bignum_shape) + 1
+        and bignum_report[2]["target"] == "unittests src/lib.rs [fln_unsafe_abi]"
+        and bignum_report[2]["passed"] == 98,
+        "the bignum multi-target join lost a target",
+    )
+    abi = "unittests src/lib.rs [fln_unsafe_abi]"
+    below = [row if row[1] != "fln_unsafe_abi" else (row[0], row[1], 97, 0) for row in bignum_shape]
+    for name, run_text, listing_shape, message in (
+        (
+            "filtered bignum target",
+            bignum_run(
+                bignum_shape,
+                override={
+                    abi: "test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; "
+                    "8 filtered out; finished in 0.01s"
+                },
+            ),
+            bignum_shape,
+            "filtered out; the whole target did not run",
+        ),
+        (
+            "bignum target with one failing test",
+            bignum_run(
+                bignum_shape,
+                override={
+                    abi: "test result: FAILED. 97 passed; 1 failed; 0 ignored; "
+                    "0 measured; 0 filtered out; finished in 0.01s"
+                },
+            ),
+            bignum_shape,
+            "1 test(s) failed",
+        ),
+        (
+            "bignum target that executed its ignored test",
+            bignum_run(
+                bignum_shape,
+                override={
+                    "tests/extra_0.rs [extra_0]": "test result: ok. 2 passed; 0 failed; "
+                    "0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+                },
+            ),
+            bignum_shape,
+            "0 ignored, but the binary's --list --ignored names 1",
+        ),
+        (
+            "bignum target below its recorded floor",
+            bignum_run(below),
+            below,
+            "below the recorded floor of 98",
+        ),
+        (
+            "bignum run whose targets are not the listing's",
+            bignum_run(bignum_shape),
+            bignum_shape[:-1],
+            "are not the listing's",
+        ),
+        (
+            "bignum run missing a floored target",
+            bignum_run(bignum_shape[1:]),
+            bignum_shape[1:],
+            "floored target(s) did not run",
+        ),
+    ):
+        try:
+            judge_cargo_test_full_run(
+                run_text,
+                bignum_listing(listing_shape),
+                bignum_listing(listing_shape, ignored_only=True),
+                label="self-test bignum",
+                floors=BIGNUM_SUITE_PASS_FLOORS,
+                minimum_targets=BIGNUM_SUITE_MIN_TARGETS,
+            )
+        except EvidenceError as error:
+            require(message in str(error), f"{name} refused for the wrong reason: {error}")
+        else:
+            raise EvidenceError(f"{name} was accepted")
 
     expect_admission_rejection(
         "malformed kernel-admission row",
         "admission_malformed",
         stdout_bytes=(
-            (
-                f"running "
-                f"{KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
-                f"tests\n"
-            ).encode("ascii")
+            f"running {admission_fixture_listed} tests\n".encode("ascii")
             + b'{"schema":"' + KERNEL_ADMISSION_SCHEMA.encode() + b'", not-json\n'
-            + (
-                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
-                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
-                f"0 measured; 0 filtered out; finished in 0.01s\n"
-            ).encode("ascii")
+            + admission_summary()
         ),
     )
 
@@ -33177,6 +33771,20 @@ def build_parser() -> argparse.ArgumentParser:
     admission_parser.add_argument("--expected-argv")
     admission_parser.add_argument("--expected-stdout-artifact", required=True)
     admission_parser.add_argument("--expected-stderr-artifact", required=True)
+    admission_parser.add_argument(
+        "--test-listing",
+        required=True,
+        help="the kernel_replay binary's `--list` output, captured by the lane",
+    )
+    admission_parser.add_argument("--expected-test-listing-artifact", required=True)
+    admission_parser.add_argument(
+        "--ignored-test-listing",
+        required=True,
+        help="the kernel_replay binary's `--list --ignored` output",
+    )
+    admission_parser.add_argument(
+        "--expected-ignored-test-listing-artifact", required=True
+    )
     admission_parser.add_argument("--expected-cache-state")
     admission_parser.add_argument("--expected-input-root")
     admission_parser.add_argument("--artifact-root", required=True)
