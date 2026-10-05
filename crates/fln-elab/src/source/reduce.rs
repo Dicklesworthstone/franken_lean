@@ -883,10 +883,14 @@ mod source_k_tests {
     }
     #[test]
     fn source_k_chains_use_the_heap_reduction_worklist() {
+        // Only the reduction is the subject of the 64 KiB stack. The environment (the
+        // seed's kernel admission) is built on this test's own thread: built inside, the
+        // test overflowed whenever it ran before anything else in the binary, aborting
+        // every other lib test of that run.
+        let env = environment();
         std::thread::Builder::new()
             .stack_size(64 * 1024)
-            .spawn(|| {
-                let env = environment();
+            .spawn(move || {
                 let mut context = Context::new(&env, Budget::for_stack_bytes(64 * 1024));
                 context.txn.budget.max_heartbeats = 5_000_000;
                 let mut input = number(9);
