@@ -39,16 +39,21 @@ const INIT_CORE: &[&str] = &[
     "Init.Core",
 ];
 
+/// Each admitted by the pin (`prelude`, `import Init.Core`, the line; exit 0). The last
+/// names the real declaration `Decidable.decide` directly, so a declaration keeps its
+/// precedence over the alias that shadows nothing here (pinned `lean` v4.32.0, 2026-10-05).
 const ACCEPTED: &[&str] = &[
     "def b : Bool := decide (2 = 2)",
     "def c : Bool := not true",
     "theorem t : decide (2 + 2 = 4) = true := rfl",
+    "def b3 : Bool := Decidable.decide (2 = 2)",
 ];
 
 /// Names nothing provides, with the pin's message for each file (`prelude`,
 /// `import Init.Core`, the line), run as above on 2026-10-05:
-/// `3:16: error(lean.unknownIdentifier): Unknown identifier `fooBarUnknown``, and the same at
-/// 3:16 for `notAnExportedName`.
+/// `3:16: error(lean.unknownIdentifier): Unknown identifier `fooBarUnknown``, the same at
+/// 3:16 for `notAnExportedName`, and `3:15: error(lean.unknownIdentifier): Unknown constant
+/// `Nat.nope`` (a proper prefix, `Nat`, is a constant).
 const UNKNOWN: &[(&str, &str)] = &[
     (
         "def b : Bool := fooBarUnknown (2 = 2)",
@@ -58,6 +63,7 @@ const UNKNOWN: &[(&str, &str)] = &[
         "def u : Bool := notAnExportedName true",
         "Unknown identifier `notAnExportedName`",
     ),
+    ("def n : Nat := Nat.nope", "Unknown constant `Nat.nope`"),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
