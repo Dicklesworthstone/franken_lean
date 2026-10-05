@@ -481,14 +481,27 @@ impl Default for DeclarationBudget {
 /// rather than as authoritative facts, so there is no partial-work field for a caller
 /// to read while skipping the authority check (decision `fln-um4a`).
 ///
-/// Nothing is published, computed, or cached on refusal — in particular no provisional
-/// digest exists to leak, because this runs before any hashing.
+/// Nothing is published or cached on refusal, and no digest is returned on any path.
+/// The byte dimension is the length of the Merkle preimage (bead
+/// fln-merkle-decl-digest-80ni), so measuring it hashes each distinct expression
+/// node: this function no longer runs before hashing, and claims only that nothing
+/// it computed escapes a refusal.
 ///
 /// Cancellation is not sampled here and no checkpoint is claimed: there is no
 /// input-sized traversal to abandon. It arrives with the expression dimensions.
 pub fn preflight_declaration_rows(
     info: &ConstantInfo,
     budget: DeclarationBudget,
+) -> Outcome<DeclarationUsage> {
+    preflight_declaration_rows_measured(info, budget, Environment::decl_content_len(info))
+}
+
+/// [`preflight_declaration_rows`] with the canonical byte length already measured, so a
+/// caller that also needs the digest takes both from one Merkle walk.
+fn preflight_declaration_rows_measured(
+    info: &ConstantInfo,
+    budget: DeclarationBudget,
+    canonical_bytes: usize,
 ) -> Outcome<DeclarationUsage> {
     let base = info.constant_val();
     let usage = DeclarationUsage {
@@ -507,7 +520,7 @@ pub fn preflight_declaration_rows(
         // the fact cannot describe a different encoding. Running it costs one pass over a
         // declaration whose structure the row families have not yet bounded, which is why
         // the byte dimension is checked LAST in the frozen order — see `ORDER`.
-        canonical_bytes: usize_to_u64(Environment::decl_content_len(info)),
+        canonical_bytes: usize_to_u64(canonical_bytes),
         expressions: 0,
         expr_nodes: 0,
         expanded_weight: 0,
@@ -558,9 +571,10 @@ pub fn preflight_declaration_rows(
 /// the partial facts are deliberately not returned, because a partial usage total is a
 /// number that understates the work while looking like a measurement.
 ///
-/// Nothing is hashed, published, or cached here on any path. In particular no
-/// provisional digest exists to be returned, logged, or cached, because preflight
-/// completes before hashing begins.
+/// Nothing is published or cached here on any path, and no digest is returned,
+/// logged, or cached. Measuring the byte dimension hashes each distinct expression
+/// node (the Merkle preimage, bead fln-merkle-decl-digest-80ni), so preflight no
+/// longer completes before hashing begins; it only keeps what it hashed private.
 ///
 /// # Maximum logical depth is reported here as a fact, and is not a budget dimension
 ///
@@ -581,10 +595,26 @@ pub fn preflight_declaration(
     budget: DeclarationBudget,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<DeclarationUsage> {
-    let mut usage = match preflight_declaration_rows(info, budget).non_answer_for() {
-        Ok(non_answer) => return non_answer,
-        Err(usage) => usage,
-    };
+    preflight_declaration_measured(
+        info,
+        budget,
+        cancellation,
+        Environment::decl_content_len(info),
+    )
+}
+
+/// [`preflight_declaration`] with the canonical byte length already measured.
+fn preflight_declaration_measured(
+    info: &ConstantInfo,
+    budget: DeclarationBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+    canonical_bytes: usize,
+) -> Outcome<DeclarationUsage> {
+    let mut usage =
+        match preflight_declaration_rows_measured(info, budget, canonical_bytes).non_answer_for() {
+            Ok(non_answer) => return non_answer,
+            Err(usage) => usage,
+        };
     if let Some(non_answer) =
         preflight_declaration_expressions(info, budget, cancellation, &mut usage)
     {
@@ -1212,11 +1242,16 @@ impl Environment {
         if self.constants.contains_key(&name) {
             return Outcome::complete(DeclarationPlan::DuplicateName { name });
         }
-        let usage = match preflight_declaration(&info, budget, cancellation).non_answer_for() {
-            Ok(non_answer) => return non_answer,
-            Err(usage) => usage,
-        };
-        let provisional_digest = Environment::decl_content_digest(&info);
+        // One Merkle walk gives both the byte fact preflight budgets and the digest;
+        // they used to be two walks. A refusal drops the digest unpublished.
+        let (provisional_digest, canonical_bytes) = Environment::decl_content_digest_and_len(&info);
+        let usage =
+            match preflight_declaration_measured(&info, budget, cancellation, canonical_bytes)
+                .non_answer_for()
+            {
+                Ok(non_answer) => return non_answer,
+                Err(usage) => usage,
+            };
         Outcome::complete(DeclarationPlan::Prepared(PreparedDeclarationAdmission {
             schema: DECLARATION_PLAN_SCHEMA,
             info: Arc::new(info),
@@ -1372,6 +1407,18 @@ impl Environment {
         let mut w = CanonHasher::new(Domain::DeclContent);
         Environment::write_decl_content(info, &mut w, &mut merkle);
         w.finish()
+    }
+
+    /// [`Self::decl_content_digest`] and [`Self::decl_content_len`] from one Merkle
+    /// walk: the stream is hashed as it is written, and its length is counted as it
+    /// is hashed.
+    fn decl_content_digest_and_len(info: &ConstantInfo) -> (Digest, usize) {
+        let mut merkle = ExprMerkle::new();
+        let mut w = CanonHasher::new(Domain::DeclContent);
+        Environment::write_decl_content(info, &mut w, &mut merkle);
+        let stream = w.written();
+        let records = usize::try_from(merkle.record_bytes()).unwrap_or(usize::MAX);
+        (w.finish(), stream.saturating_add(records))
     }
 
     /// The bytes the digest is over: the declaration's own stream, plus each distinct
@@ -4556,6 +4603,44 @@ mod tests {
         assert_eq!(
             Environment::decl_content_digest(&info),
             hash(Domain::DeclContent, &bytes)
+        );
+    }
+
+    /// The planned admission takes the digest and the byte fact from one Merkle walk;
+    /// they must be exactly what the two separate walks give.
+    #[test]
+    fn one_walk_gives_the_digest_and_the_byte_fact_the_separate_walks_give() {
+        for kind in AllBearingKind::ALL {
+            let info = all_bearing_decl(kind, vec![n("a"), n("b")]);
+            assert_eq!(
+                Environment::decl_content_digest_and_len(&info),
+                (
+                    Environment::decl_content_digest(&info),
+                    Environment::decl_content_len(&info)
+                ),
+                "{}",
+                kind.label()
+            );
+        }
+        let plan = Environment::new()
+            .plan_add_decl(
+                all_bearing_decl(AllBearingKind::Definition, vec![n("a")]),
+                DeclarationBudget::UNBOUNDED,
+                CollisionBudget::default(),
+                None,
+            )
+            .into_complete()
+            .expect("an unbounded plan completes");
+        let DeclarationPlan::Prepared(prepared) = plan else {
+            unreachable!("a fresh name is always prepared; only an existing name is a duplicate");
+        };
+        assert_eq!(
+            prepared.provisional_digest,
+            Environment::decl_content_digest(&prepared.info)
+        );
+        assert_eq!(
+            prepared.usage.canonical_bytes,
+            usize_to_u64(Environment::decl_content_len(&prepared.info))
         );
     }
 
