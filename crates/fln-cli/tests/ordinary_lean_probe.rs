@@ -1,8 +1,13 @@
 //! Ordinary-Lean acceptance probe (bead fln-ordinary-lean-probe-g03u).
 //!
-//! Thirty ordinary Lean programs as people write them (implicit `Init`, no
+//! Thirty-three ordinary Lean programs as people write them (implicit `Init`, no
 //! `prelude`) live in `fixtures/ordinary_lean_probe/`: set A is the 2026-09-27
-//! reality-check set, set B the 2026-10-04 one. Its `manifest.tsv` names each
+//! reality-check set, set B the 2026-10-04 one, and set C the 2026-10-05
+//! protected-name spellings (bead fln-eq4k): `add` under `open Nat`, as its own
+//! line and as `open Nat in`, which the pin rejects because `Nat.add` is
+//! `protected`, and the qualified `Nat.add` control it accepts. FrankenLean's
+//! `lean` refuses all three at parse today (it does not take `open`); they guard
+//! the class for the day it does. Its `manifest.tsv` names each
 //! program's set and records what the pinned Reference `lean <file>` does when
 //! run from that directory: exit code, stdout and stderr.
 //!
@@ -41,9 +46,9 @@ use std::time::{Duration, Instant};
 
 const CORPUS: &str = "crates/fln-cli/tests/fixtures/ordinary_lean_probe";
 const MANIFEST: &str = "manifest.tsv";
-/// The declared population: 16 programs in set A and 14 in set B. A scan that
-/// finds fewer is broken; it is never a smaller corpus.
-const CORPUS_FLOOR: usize = 30;
+/// The declared population: 16 programs in set A, 14 in set B and 3 in set C. A
+/// scan that finds fewer is broken; it is never a smaller corpus.
+const CORPUS_FLOOR: usize = 33;
 const WORKERS: usize = 8;
 const PROGRAM_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -167,8 +172,11 @@ fn parse_manifest(text: &str) -> Result<Vec<Row>, Vec<String>> {
             ));
             continue;
         }
-        if !matches!(fields[1], "A" | "B") {
-            problems.push(format!("{at}: set must be A or B, found {:?}", fields[1]));
+        if !matches!(fields[1], "A" | "B" | "C") {
+            problems.push(format!(
+                "{at}: set must be A, B or C, found {:?}",
+                fields[1]
+            ));
         }
         let parsed = (
             fields[2].parse::<i32>().map_err(|error| error.to_string()),
@@ -485,7 +493,7 @@ fn the_checked_in_corpus_matches_its_manifest() {
         *sets.entry(row.set.as_str()).or_default() += 1;
         sets
     });
-    assert_eq!(sets, BTreeMap::from([("A", 16), ("B", 14)]));
+    assert_eq!(sets, BTreeMap::from([("A", 16), ("B", 14), ("C", 3)]));
 }
 
 fn row(file: &str, exit: i32, stdout: &str) -> Row {
@@ -606,6 +614,8 @@ fn manifest_fields_round_trip_through_their_escapes() {
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].set.as_str(), rows[0].exit), ("B", 1));
     assert_eq!(rows[0].stdout, text);
-    assert!(parse_manifest("x.lean\tC\t0\t\t\n").is_err());
+    // An undeclared set is refused (A, B and C are the declared ones).
+    assert!(parse_manifest("x.lean\tD\t0\t\t\n").is_err());
+    assert!(parse_manifest("x.lean\tC\t0\t\t\n").is_ok());
     assert!(parse_manifest("x.lean\tA\t0\t\n").is_err());
 }

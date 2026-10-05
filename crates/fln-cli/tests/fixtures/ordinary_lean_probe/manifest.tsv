@@ -1,5 +1,6 @@
 # Ordinary-Lean acceptance probe (bead fln-ordinary-lean-probe-g03u). Measuring, never gating the seed dialect.
 # Set A: the 2026-09-27 reality-check programs. Set B: the 2026-10-04 ones (both `#check` lines share b05).
+# Set C: the 2026-10-05 protected-name spellings of bead fln-eq4k (two the pin rejects, one control it accepts).
 # Columns 3-5 are the pinned Reference `lean <file>` run from this directory: exit code, stdout, stderr,
 # escaped with \\ \n \t \r. They were recorded from the pin, never written by hand, and
 # crates/fln-cli/tests/ordinary_lean_probe.rs refuses any row the live pin no longer reproduces.
@@ -34,3 +35,6 @@ b11_list_map.lean	B	0	[2, 4, 6]\n
 b12_namespace.lean	B	0	7\n	
 b13_fib.lean	B	0	610\n	
 b14_reject_unknown_identifier.lean	B	1	b14_reject_unknown_identifier.lean:1:15: error(lean.unknownIdentifier): Unknown identifier `doesNotExist`\n	
+c01_reject_open_protected_add.lean	C	1	c01_reject_open_protected_add.lean:2:12: error: Function expected at\n  add\nbut this term has type\n  ?m.1\n\nNote: Expected a function because this term is being applied to the argument\n  1\n\nHint: The identifier `add` is unknown, and Lean's `autoImplicit` option causes an unknown identifier to be treated as an implicitly bound variable with an unknown type. However, the unknown type cannot be a function, and a function is what Lean expects here. This is often the result of a typo or a missing `import` or `open` statement.\n	
+c02_reject_open_in_protected_add.lean	C	1	c02_reject_open_in_protected_add.lean:2:12: error: Function expected at\n  add\nbut this term has type\n  ?m.1\n\nNote: Expected a function because this term is being applied to the argument\n  1\n\nHint: The identifier `add` is unknown, and Lean's `autoImplicit` option causes an unknown identifier to be treated as an implicitly bound variable with an unknown type. However, the unknown type cannot be a function, and a function is what Lean expects here. This is often the result of a typo or a missing `import` or `open` statement.\n	
+c03_open_in_qualified_add.lean	C	0		
