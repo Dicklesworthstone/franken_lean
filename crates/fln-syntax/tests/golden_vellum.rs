@@ -137,7 +137,13 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// build sha (line 6 of its host capture) where the launch time (line 5) belongs. Re-run from
 /// the run's retained artifacts with that index corrected, the receipt differs in that one field
 /// alone, now `2026-10-05T10:53:54Z`, and nothing else in the tree cites the sha.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 202;
+///
+/// **202 -> 201: a row left because its commit joined main.** The z8j.1.14 checker draft
+/// cited in comment 3105 was a banked local commit; the history-preservation merge
+/// `merge(history): retain the original landed checker draft identities` (2026-10-05) made it
+/// an ancestor of main with a tree identical to its first parent's, so it is now main-reachable
+/// and its row was stale. Ancestry, not content, decides this law.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 201;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -288,7 +294,6 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "bae6d-014",
     "bb561-892",
     "bb665-b0b",
-    "bbdf1-633",
     "be14e-e9",
     "be14e-e9b",
     "bf693-bb2",
