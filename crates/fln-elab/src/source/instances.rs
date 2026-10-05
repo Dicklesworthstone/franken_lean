@@ -1,5 +1,6 @@
 //! Transactional, bounded native instance search. Class inputs must be known
-//! before search; output parameters may be inferred by the selected instance.
+//! before search; instance-implicit inputs may first synthesize their own
+//! dictionary, and output parameters may be inferred by the selected instance.
 //! Search uses an explicit stack and never turns exhaustion into "not found".
 use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};

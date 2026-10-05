@@ -149,9 +149,53 @@ fn section_instances_used_by_defaults_become_real_class_parameters() {
     );
     assert_eq!(names(&e, "Selected"), ["A", "inh"]);
     assert_eq!(binders(&e, "Selected")[1].1, BinderInfo::InstImplicit);
+    // Projection binder inference must stay faithful: the missing dictionary
+    // is synthesized from the class telescope, not an instance projection binder.
+    assert_eq!(binders(&e, "Selected.value")[1].1, BinderInfo::Implicit);
     assert_eq!(
         binders(&e, "Selected.value._default")[1].1,
         BinderInfo::InstImplicit
+    );
+}
+
+#[test]
+fn projection_instance_inputs_require_their_own_dictionary() {
+    let base = checked(
+        &engine(),
+        "class Tag where
+          value : Nat
+        def customTag : Tag := Tag.mk 7
+        class Uses [tag : Tag] where
+          value : Nat
+        instance useCustom : @Uses customTag := @Uses.mk customTag 42",
+    );
+    let root = base.logical_root(&KVMap::new());
+    // The outer instance cannot simply assign an unknown input from its result.
+    assert!(
+        base.check_source_files(
+            &[b"def unresolved : Nat := Uses.value"],
+            &KVMap::new(),
+            limits(),
+        )
+        .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    let available = checked(&base, "instance tagInstance : Tag := customTag");
+    checked(
+        &available,
+        "def resolved : Nat := Uses.value
+        theorem value : resolved = 42 := by rfl",
+    );
+    // A known dictionary is still a matching constraint; synthesis must not
+    // erase it or replace it with the globally available dictionary.
+    assert!(
+        available
+            .check_source_files(
+                &[b"def mismatch : Nat := Uses.value (tag := Tag.mk 9)"],
+                &KVMap::new(),
+                limits(),
+            )
+            .is_err()
     );
 }
 
