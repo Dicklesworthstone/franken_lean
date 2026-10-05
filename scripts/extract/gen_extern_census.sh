@@ -30,7 +30,17 @@ OBSERVED_002_CANDIDATE="$OBSERVED_002.candidate"
 PARTITION_CANDIDATE="$PARTITION.candidate"
 MANIFEST_CANDIDATE="$MANIFEST.candidate"
 MODE="${1:-generate}"
-PUBLICATION_LOCK="/data/tmp/fln-extern-builtin-census.lockfile"
+# The publication lock lives in the machine's shared scratch space when there is one
+# (this box's /data/tmp), else in TMPDIR, else /tmp: the resolution census_materialize.sh
+# uses, so both serialize on ONE file. A hardcoded /data/tmp does not exist on a
+# GitHub-hosted runner, where `exec 200>` then failed without stopping the script and
+# the flock on the closed descriptor was refused (bead franken_lean-z8j.1.17).
+if [ -d /data/tmp ]; then
+  LOCK_DIR=/data/tmp
+else
+  LOCK_DIR="${TMPDIR:-/tmp}"
+fi
+PUBLICATION_LOCK="$LOCK_DIR/fln-extern-builtin-census.lockfile"
 
 note() { echo "[gen_extern_census] $*" >&2; }
 reject() {
@@ -38,9 +48,21 @@ reject() {
   exit 3
 }
 
-exec 200>"$PUBLICATION_LOCK"
-if ! flock -w 2400 200; then
-  reject "publication_lock_timeout" "could not serialize census publication"
+# census_materialize.sh holds this lock across verify-and-regenerate and runs this script
+# inside it. Re-opening fd 200 here would block on the caller's lock for the full
+# timeout (measured: a child re-opening a parent's flock-held file times out). A caller
+# that hands its locked descriptor down says so; it is kept only if fd 200 really is this
+# lock file, and a held flock on an inherited descriptor is the caller's own lock.
+if [ "${FLN_EXTERN_CENSUS_LOCK_INHERITED:-}" = 1 ] \
+  && [ "$(readlink -f /proc/self/fd/200 2>/dev/null)" = "$(readlink -f "$PUBLICATION_LOCK")" ]; then
+  if ! flock -n 200; then
+    reject "publication_lock_timeout" "the inherited census publication lock is not held"
+  fi
+else
+  exec 200>"$PUBLICATION_LOCK"
+  if ! flock -w 2400 200; then
+    reject "publication_lock_timeout" "could not serialize census publication"
+  fi
 fi
 
 # ---- locate and verify the pinned Reference binary (D8: oracle-only) -------------------
@@ -235,7 +257,7 @@ sync_file() {
 
 quarantine_candidates() {
   local quarantine
-  quarantine="$(mktemp -d /data/tmp/fln-extern-builtin-retained.XXXXXX)"
+  quarantine="$(mktemp -d "$LOCK_DIR/fln-extern-builtin-retained.XXXXXX")"
   local candidate
   for candidate in \
     "$EXTERN_CANDIDATE" \

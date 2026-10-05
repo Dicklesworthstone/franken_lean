@@ -188,7 +188,10 @@ fi
 LEAN="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/bin/lean"
 if [ -x "$LEAN" ]; then
   note "regenerating census from the pinned Reference (tag=$PIN_TAG)"
-  "$GENERATOR" generate || inconclusive "census_generate_failed" "gen_extern_census.sh could not publish"
+  # Hand the held publication lock (fd 200) down: the generator re-opening it would
+  # block on this script's own lock until its timeout.
+  FLN_EXTERN_CENSUS_LOCK_INHERITED=1 "$GENERATOR" generate \
+    || inconclusive "census_generate_failed" "gen_extern_census.sh could not publish"
   if census_matches_pins; then
     note "census regenerated from the pin and matches the committed pins"
     exit 0

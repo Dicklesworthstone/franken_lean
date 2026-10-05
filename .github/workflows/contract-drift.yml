@@ -119,7 +119,26 @@ jobs:
           lean --version | grep -F "$pin_commit"
           lake --version
 
+      # Every cargo step below builds FrankenLean, which rust-toolchain.toml pins to an
+      # exact nightly. Install it explicitly, as ci.yml does, rather than relying on
+      # rustup's implicit install from the toolchain file.
+      - name: install the pinned Rust toolchain
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        run: |
+          channel="$(python3 -I -S -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+          rustup run "$channel" rustc --version
+          rustup run "$channel" cargo --version
+
+      # Every step from here on runs whenever the pinned Reference installed, even after
+      # an earlier step failed: each lane is its own check, and stopping at the first red
+      # hid every later one (none of them had ever executed in CI before run
+      # 37276449789). The job still fails if any step fails.
       - name: run the leanchecker witness lane (Reference-kernel oracle, franken_lean-z8j.1.17)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-leanchecker-witness-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -138,6 +157,7 @@ jobs:
           mv "${runs[0]}" "$step_root"
 
       - name: build pinned certificate-format witness tools
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           lean4export_root="$GITHUB_WORKSPACE/target/ci-tools/lean4export"
@@ -163,11 +183,23 @@ jobs:
             cd "$lean4export_root"
             lake build
           )
+          # nanoda is a standalone cargo package. Built in place, cargo walks up from
+          # target/ci-tools/nanoda to FrankenLean's own Cargo.toml and refuses ("current
+          # package believes it's in a workspace when it's not"), which is how this step
+          # failed on its first execution (run 37276449789). Build a copy outside the
+          # workspace, from inside it, so neither FrankenLean's workspace nor its pinned
+          # nightly applies to the third-party tool. The revision check above is on the
+          # checkout; the copy is byte-identical including .git.
+          nanoda_build="$RUNNER_TEMP/fln-nanoda-src"
+          cp -a "$nanoda_root" "$nanoda_build"
+          test "$(git -C "$nanoda_build" rev-parse --verify 'HEAD^{commit}')" = "$nanoda_revision"
           nanoda_target="$RUNNER_TEMP/fln-nanoda-target"
-          cargo build --release --locked \
-            --manifest-path "$nanoda_root/Cargo.toml" \
-            --target-dir "$nanoda_target" \
-            --bin nanoda_bin
+          (
+            cd "$nanoda_build"
+            cargo build --release --locked \
+              --target-dir "$nanoda_target" \
+              --bin nanoda_bin
+          )
           lean4export_bin="$lean4export_root/.lake/build/bin/lean4export"
           nanoda_bin="$nanoda_target/release/nanoda_bin"
           test -x "$lean4export_bin"
@@ -180,6 +212,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: expose the toolchain/vendor identity joins
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         env:
           PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
@@ -192,22 +225,26 @@ jobs:
           ./scripts/verify_vendor_tree.sh
 
       - name: verify the pinned LSP wire inventory
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           python3 -I -S scripts/extract/gen_lsp_wire_census.py --check
 
       - name: verify the pinned CLI and Lake census
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           python3 -I -S scripts/extract/gen_cli_lake_census.py --check
           python3 -I -S scripts/extract/gen_cli_lake_census.py --check-probes
 
       - name: verify the joined public-surface contract
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           python3 -I -S scripts/extract/gen_public_surface_contract.py --check
 
       - name: materialize the extern/builtin census shards
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # The extern row join reads the untracked builtin shards; with the pin
@@ -215,11 +252,13 @@ jobs:
           ./scripts/extract/census_materialize.sh
 
       - name: verify the extern row contract
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           python3 -I -S scripts/extract/gen_extern_rows.py --check
 
       - name: pin-dependent conformance suites (fln-rgha)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         env:
           PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
@@ -313,6 +352,7 @@ jobs:
           # silently skip; the soundness of the assertions remains their own obligation.
 
       - name: verify imported tag queries and real module publication
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # The tag test uses checked-in bytes on every ordinary test run.
@@ -334,6 +374,7 @@ jobs:
             --no-fail-fast -- --include-ignored --nocapture
 
       - name: hold the Reference-differential ledger to the pinned Reference (fln-ew20)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # The product gate enforces the seed-dialect freeze from the ledger
@@ -344,6 +385,7 @@ jobs:
             --test source_reference_differential --no-fail-fast
 
       - name: measure ordinary Lean against the pinned Reference (fln-ordinary-lean-probe-g03u)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # Measuring, not gating: prints one line per probe program and the
@@ -353,6 +395,7 @@ jobs:
             --test ordinary_lean_probe --no-fail-fast -- --nocapture
 
       - name: run the certificate-format independent-checker lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-certificate-format-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -376,6 +419,7 @@ jobs:
             --artifact-root "$artifact"
 
       - name: run the certificate-cartridge no-mock lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-cartridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -399,6 +443,7 @@ jobs:
             --artifact-root "$artifact"
 
       - name: run the bignum-vectors no-mock lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-bignum-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -422,6 +467,7 @@ jobs:
             --artifact-root "$artifact"
 
       - name: run the suite-upgrade isolated-candidate no-mock lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-suite-upgrade-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -445,6 +491,7 @@ jobs:
             --digest "$artifact/manifest.digest" --offline
 
       - name: run the G0-4 syntax and hygiene no-mock lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-g04-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -468,6 +515,7 @@ jobs:
             --digest "$artifact/manifest.digest" --offline
 
       - name: run the per-frontend diagnostic projection no-mock lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-diagnostic-projection-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -491,6 +539,7 @@ jobs:
             --digest "$artifact/manifest.digest" --offline
 
       - name: run the governed kernel replay evidence lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # Registration and shellcheck never established that this lane ran. Execute the
@@ -519,6 +568,7 @@ jobs:
             --artifact-root "$child"
 
       - name: verify the epoch lab and run Reference-vs-Reference E2E
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           # This lane belongs here rather than in ci.yml: it requires the 2.8 GB
@@ -549,6 +599,7 @@ jobs:
             --artifact-root "$artifact"
 
       - name: run the seeded contract drift lane
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
         run: |
           step_root="target/e2e/contract-drift-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -583,7 +634,7 @@ jobs:
       # every Init/Std source file (about 5-10 CPU-minutes per 100 files), so it runs last
       # and runs even when an earlier lane failed, as long as the pin installed.
       - name: check the pinned grammar census for drift (fln-vokf)
-        if: always() && steps.toolchain.outcome == 'success'
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         timeout-minutes: 90
         shell: bash
         env:
