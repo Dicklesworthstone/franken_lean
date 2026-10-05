@@ -849,3 +849,92 @@ fn a_cancellation_inside_the_shortcut_bound_is_not_deferred() {
         "a cancellation inside the bounded shortcut must end the check: {verdict:?}"
     );
 }
+
+/// A pair the typed lane has asked the untyped converter about is answered from
+/// its own record when asked again in the same run (bead
+/// `fln-checker-associator-time-y8wc`). `f x y := h x` keeps its first argument
+/// under a stuck head and drops its second. The congruence attempt on `f` asks
+/// `k q ≟ slow (k p)` (a `WRAPS`-deep walk that defers on the proofs) and then
+/// fails on `b ≟ a`, giving the pair back. Weak head normalization turns the
+/// pair of `f`s into `h (k q) ≟ h (slow (k p))`, whose congruence asks
+/// `k q ≟ slow (k p)` again: the slow shape of `TensorProduct.rightComm_def`.
+#[test]
+fn the_typed_lane_answers_a_repeated_pair_without_walking_it_again() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq_with};
+    use fln_checker::whnf::WhnfContext;
+    const WRAPS: usize = 200;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound, |inner, _| app(c("idA"), [inner]));
+    let slow = |proof: &str| app(c("slow"), [app(c("k"), [c(proof)])]);
+    let keep_first = lam(
+        c("A"),
+        lam(c("A"), app(c("h"), [Expr::bvar(1).expect("bound")])),
+    );
+    let env = environment_of(vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("a", c("A")),
+        entry("b", c("A")),
+        entry("k", pi(c("P"), c("A"))),
+        entry("h", pi(c("A"), c("A"))),
+        entry("T", pi(c("A"), Expr::sort(Level::one()))),
+        definition(
+            "idA",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), Expr::bvar(0).expect("bound"))),
+        ),
+        definition(
+            "slow",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), tower)),
+        ),
+        definition(
+            "f",
+            decoded(&pi(c("A"), pi(c("A"), c("A")))),
+            decoded(&keep_first),
+        ),
+        entry(
+            "w",
+            app(c("T"), [app(c("f"), [app(c("k"), [c("q")]), c("b")])]),
+        ),
+    ]);
+    let walk_polls = Cell::new(0_u64);
+    let walk = def_eq_with(
+        &decoded(&app(c("k"), [c("q")])),
+        &decoded(&slow("p")),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            walk_polls.set(walk_polls.get() + 1);
+            false
+        },
+    );
+    assert!(
+        matches!(walk, DefEqOutcome::Deferred { .. }),
+        "the repeated pair must defer untyped for this test to mean anything: {walk:?}"
+    );
+    let walk = walk_polls.get();
+    let declared = app(c("T"), [app(c("f"), [slow("p"), c("a")])]);
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(
+        &env,
+        &candidate("d", declared, c("w")),
+        AdmissionBudget::unlimited(),
+        || {
+            polls.set(polls.get() + 1);
+            false
+        },
+    );
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let admission = polls.get();
+    // Measured: one walk polls 339,124 times and admission 684,401 (2.02 walks).
+    // Asking the given-back pair again polled 855,089 (2.52 walks); it costs less
+    // than a whole walk only because the context's whnf memo shares its steps.
+    assert!(
+        4 * admission < 9 * walk,
+        "admission polled {admission} times, more than two and a quarter untyped walks \
+         of the repeated pair ({walk} each): the typed lane walked it again"
+    );
+}

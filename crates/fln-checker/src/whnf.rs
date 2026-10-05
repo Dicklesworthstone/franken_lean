@@ -1048,6 +1048,9 @@ struct Reducer<'a, 'c> {
     /// key alive, so an address can never be reused for another term while it
     /// is a key.
     keyed_thunks: std::collections::HashMap<WhnfKey, (Cursor, Arc<Thunk>)>,
+    /// This run's materialized input, which a result that changed nothing
+    /// reuses (`Reducer::unchanged_input`).
+    entry: Option<Arc<WireExpr>>,
 }
 
 /// The reported-progress counters when a recursor frame starts normalizing
@@ -1708,6 +1711,42 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let reduced = self.reduce_demanded_nat(term)?;
         let (head, args) = self.peel_application(&reduced)?;
         Ok(Spine { head, args })
+    }
+
+    /// The materialized input, when a stuck spine is that input exactly.
+    /// Building such a spine and copying it out reproduces the input node for
+    /// node, sharing included, so a weak head normal form that changed nothing
+    /// is the input itself, not two fresh copies of it (bead
+    /// `fln-checker-associator-time-y8wc`).
+    fn unchanged_input(&self, stuck: &Spine) -> Result<Option<Arc<WireExpr>>, Halt> {
+        let Some(input) = &self.entry else {
+            return Ok(None);
+        };
+        Ok(Self::spine_is(stuck, input, input.root())?.then(|| Arc::clone(input)))
+    }
+
+    /// Whether `spine` is node `id` of `arena` exactly: that node's own head
+    /// applied to its own arguments, each a position of `arena` under no
+    /// environment. Building it would reproduce that node.
+    fn spine_is(spine: &Spine, arena: &Arc<WireExpr>, id: ExprId) -> Result<bool, Halt> {
+        let plain = |cursor: &Cursor| Arc::ptr_eq(&cursor.arena, arena) && cursor.env.is_empty();
+        if !plain(&spine.head) || !spine.args.iter().all(plain) {
+            return Ok(false);
+        }
+        // Peel the node's application spine, last argument first.
+        let mut id = id;
+        let mut args = spine.args.iter().rev();
+        for _ in 0..spine.args.len() {
+            let Some(ExprNode::Apply { function, argument }) = arena.node(id) else {
+                return Ok(false);
+            };
+            if args.next().map(|cursor| cursor.root) != Some(*argument) {
+                return Ok(false);
+            }
+            Self::validate_child(id, *function)?;
+            id = *function;
+        }
+        Ok(id == spine.head.root)
     }
 
     /// One term for a spine: its head, or the head applied to its arguments.
@@ -3202,6 +3241,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
 
     fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
         let current = self.materialize_term(input, root, WhnfPhase::Initial)?;
+        self.entry = Some(Arc::clone(&current.arena));
         let Some(memo) = self.context.source.memo() else {
             return self.normalize(current);
         };
@@ -3637,6 +3677,26 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     args: frame.outer_arguments,
                 }));
             }
+            // A projection whose structure stayed exactly as written is that
+            // projection: reuse its node instead of rebuilding it, charging the
+            // steps the rebuild would (one to compose the structure's spine, if
+            // it has arguments, and one to compose the projection).
+            if frame.projection.env.is_empty()
+                && let Some(ExprNode::Projection { expression, .. }) =
+                    frame.projection.arena.node(frame.projection.root)
+                && Self::spine_is(&stuck, &frame.projection.arena, *expression)?
+            {
+                if !stuck.args.is_empty() {
+                    self.control.step(stuck.head.root.index(), self.cancelled)?;
+                }
+                self.control
+                    .step(frame.projection.root.index(), self.cancelled)?;
+                stuck = Spine {
+                    head: frame.projection,
+                    args: frame.outer_arguments,
+                };
+                continue;
+            }
             let expression = self.build_spine(stuck)?;
             stuck = Spine {
                 head: self.compose_projection(&frame.projection, &expression)?,
@@ -3649,11 +3709,24 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// The weak head normal form, built as one arena.
     #[inline(never)]
     fn finish(&mut self, stuck: Spine) -> Result<WhnfResult, Halt> {
-        let current = self.build_spine(stuck)?;
-        let term = if current.env.is_empty() {
-            self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?
-        } else {
-            self.close(&current, WhnfPhase::Final)?
+        let term = match self.unchanged_input(&stuck)? {
+            Some(input) => {
+                // The rebuild would charge one step to compose the spine, if it
+                // has arguments, and one to copy it out.
+                if !stuck.args.is_empty() {
+                    self.control.step(stuck.head.root.index(), self.cancelled)?;
+                }
+                self.control.step(input.root().index(), self.cancelled)?;
+                WireExpr::clone(&input)
+            }
+            None => {
+                let current = self.build_spine(stuck)?;
+                if current.env.is_empty() {
+                    self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?
+                } else {
+                    self.close(&current, WhnfPhase::Final)?
+                }
+            }
         };
         Ok(WhnfResult {
             term,
@@ -4811,6 +4884,7 @@ fn whnf_at_mode_with(
         string_expansions: std::collections::HashMap::new(),
         bodies: std::collections::HashMap::new(),
         keyed_thunks: std::collections::HashMap::new(),
+        entry: None,
     };
     outcome(reducer.run(term, root))
 }

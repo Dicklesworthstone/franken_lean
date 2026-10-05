@@ -37,6 +37,8 @@ struct Probe<'a> {
     /// it only stops the attempt being repeated; the pair itself takes the
     /// other rules.
     incongruent: PairSet,
+    /// The untyped converter's answers in this run (`PairAnswers`).
+    answers: PairAnswers,
 }
 /// A set of term pairs, looked up without copying the terms.
 #[derive(Default)]
@@ -64,6 +66,77 @@ impl PairSet {
                 .entry(Self::fingerprint(&left, &right))
                 .or_default()
                 .push((left, right));
+        }
+    }
+}
+/// The untyped converter's answers already obtained in one run, by pair.
+///
+/// The same pairs are asked again and again: a failed congruence attempt gives
+/// back the obligations it took, and the decompositions that follow re-ask
+/// them. On `TensorProduct.rightComm_def` (bead
+/// `fln-checker-associator-time-y8wc`), 91,603 of 107,837 untyped queries
+/// repeated a pair already asked in the same run, and those queries were nearly
+/// all of the declaration's time. The pin answers a repeat from its conversion
+/// caches (`m_eqv_manager`, `m_failure` in the vendored `type_checker.cpp`).
+///
+/// An answer is reused only within the run that obtained it, for the reason
+/// `taken` is: local names are fresh and bound once, so a pair of terms means
+/// the same thing in every context of one run, and every query runs under the
+/// same fresh conversion budget, so asking again would return the same answer.
+/// A stop or a fault is never recorded: it ends the run.
+///
+/// Memory is bounded by generations. A pair is asked again soon after it was
+/// given back, so the record keeps the recent pairs: when the current table
+/// holds `MAX_GENERATION_NODES` nodes it becomes the previous one, the previous
+/// one is dropped, and both are consulted. A dropped pair is simply asked again.
+#[derive(Default)]
+struct PairAnswers {
+    current: PairTable,
+    previous: PairTable,
+}
+#[derive(Default)]
+struct PairTable {
+    buckets: std::collections::HashMap<u64, Vec<(WireExpr, WireExpr, Option<bool>)>>,
+    nodes: usize,
+}
+impl PairTable {
+    fn get(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> Option<Option<bool>> {
+        self.buckets
+            .get(&fingerprint)?
+            .iter()
+            .find(|(l, r, _)| l == left && r == right)
+            .map(|(_, _, answer)| *answer)
+    }
+}
+impl PairAnswers {
+    /// About a hundred megabytes of terms per generation.
+    const MAX_GENERATION_NODES: usize = 1 << 21;
+    /// A full bucket takes no more pairs, so no collision makes a lookup
+    /// compare more than this many.
+    const MAX_BUCKET: usize = 8;
+    fn get(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> Option<Option<bool>> {
+        self.current
+            .get(fingerprint, left, right)
+            .or_else(|| self.previous.get(fingerprint, left, right))
+    }
+    fn insert(
+        &mut self,
+        fingerprint: u64,
+        left: &WireExpr,
+        right: &WireExpr,
+        answer: Option<bool>,
+    ) {
+        let nodes = left.nodes().len().saturating_add(right.nodes().len());
+        if nodes > Self::MAX_GENERATION_NODES {
+            return;
+        }
+        if self.current.nodes.saturating_add(nodes) > Self::MAX_GENERATION_NODES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        let bucket = self.current.buckets.entry(fingerprint).or_default();
+        if bucket.len() < Self::MAX_BUCKET {
+            bucket.push((left.clone(), right.clone(), answer));
+            self.current.nodes += nodes;
         }
     }
 }
@@ -238,27 +311,35 @@ impl Probe<'_> {
         right: &WireExpr,
         context: &InferenceContext,
     ) -> Result<Option<bool>> {
+        let fingerprint = PairSet::fingerprint(left, right);
+        if let Some(answer) = self.answers.get(fingerprint, left, right) {
+            return Ok(answer);
+        }
         let budget = self.budget.defeq;
         let result =
             def_eq_before_typed_with(left, right, context.reduction(), budget, &mut || {
                 self.poll()
             });
         self.check_stop()?;
-        match result {
-            DefEqOutcome::Equal(_) => Ok(Some(true)),
-            DefEqOutcome::NotEqual { .. } | DefEqOutcome::Refused { .. } => Ok(Some(false)),
-            DefEqOutcome::Deferred { .. } => Ok(None),
-            DefEqOutcome::Inconclusive(stop) => Err(Box::new(InferenceOutcome::Inconclusive(
-                InferenceStop::DefEq {
-                    argument: 0,
-                    stop: Box::new(stop),
-                    progress: self.progress(),
-                },
-            ))),
-            DefEqOutcome::InternalFault(fault) => {
-                Err(self.fault(InferenceFault::DefEq { argument: 0, fault }))
+        let answer = match result {
+            DefEqOutcome::Equal(_) => Some(true),
+            DefEqOutcome::NotEqual { .. } | DefEqOutcome::Refused { .. } => Some(false),
+            DefEqOutcome::Deferred { .. } => None,
+            DefEqOutcome::Inconclusive(stop) => {
+                return Err(Box::new(InferenceOutcome::Inconclusive(
+                    InferenceStop::DefEq {
+                        argument: 0,
+                        stop: Box::new(stop),
+                        progress: self.progress(),
+                    },
+                )));
             }
-        }
+            DefEqOutcome::InternalFault(fault) => {
+                return Err(self.fault(InferenceFault::DefEq { argument: 0, fault }));
+            }
+        };
+        self.answers.insert(fingerprint, left, right, answer);
+        Ok(answer)
     }
     /// The argument pairs of two applications of one head: the same local, or
     /// the same constant at equal universe levels, applied to equally many
@@ -1342,6 +1423,7 @@ pub(crate) fn proof_conversion_with(
         reserved: BTreeSet::new(),
         next: 0,
         incongruent: PairSet::default(),
+        answers: PairAnswers::default(),
     };
     match probe.run(left, right, context, true) {
         Ok(equal) => ProofConversionOutcome::Complete {

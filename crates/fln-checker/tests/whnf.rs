@@ -3781,3 +3781,58 @@ fn a_k_gate_side_that_runs_away_falls_through_to_the_conversion() {
         Some(&checker_name("KTestMinor"))
     );
 }
+
+/// A weak head normal form that changes nothing is its input, not a copy rebuilt
+/// from it (bead `fln-checker-associator-time-y8wc`). A stuck application is copied
+/// once, on the way in. Rebuilding its spine and copying that out again, as every
+/// such result once was, trebled the work: on `TensorProduct.rightComm_def` three
+/// quarters of all weak head normalizations changed nothing.
+#[test]
+fn a_weak_head_normal_form_that_changes_nothing_is_not_rebuilt() {
+    const DEPTH: usize = 4_000;
+    let free = |label: &str| Expr::fvar(FVarId(primary_name(label)));
+    let tower = (0..DEPTH).fold(free("x"), |inner, _| Expr::app(free("g"), inner));
+    let stuck = decoded(&Expr::app(Expr::app(free("f"), tower.clone()), tower));
+    let (outcome, polls) = polled_whnf(&stuck, &WhnfContext::default(), WhnfBudget::unlimited());
+    let result = complete(outcome);
+    let nodes = u64::try_from(stuck.nodes().len()).expect("small");
+    assert_eq!(result.term.nodes().len(), stuck.nodes().len());
+    assert_eq!(result.reductions, 0);
+    // Measured on 16,005 nodes: one copy polls twice per node, 32,018 in all;
+    // rebuilding as well polled 96,038. The bound sits between the two.
+    assert!(
+        polls < 4 * nodes,
+        "{polls} polls for a {nodes}-node term that did not change: it was rebuilt"
+    );
+    // The rebuild's steps are still charged, so callers' budgets see no change:
+    // 8 with or without the rebuild.
+    assert_eq!(result.steps, 8);
+}
+
+/// The same for a projection of a stuck structure: the projection node is reused,
+/// not rebuilt around a rebuilt structure (bead `fln-checker-associator-time-y8wc`).
+#[test]
+fn a_projection_of_a_stuck_structure_is_not_rebuilt() {
+    const DEPTH: usize = 4_000;
+    let free = |label: &str| Expr::fvar(FVarId(primary_name(label)));
+    let tower = (0..DEPTH).fold(free("x"), |inner, _| Expr::app(free("g"), inner));
+    let structure = Expr::app(free("f"), tower);
+    let stuck = decoded(&Expr::proj(
+        primary_name("GeneratedStructure"),
+        0,
+        structure,
+    ));
+    let (outcome, polls) = polled_whnf(&stuck, &projection_context(2), WhnfBudget::unlimited());
+    let result = complete(outcome);
+    let nodes = u64::try_from(stuck.nodes().len()).expect("small");
+    assert_eq!(result.term.nodes().len(), stuck.nodes().len());
+    assert_eq!(result.reductions, 0);
+    // Measured on 8,004 nodes: 24,021 polls; rebuilding the projection and its
+    // structure, then copying it out, polled 72,044.
+    assert!(
+        polls < 6 * nodes,
+        "{polls} polls for a {nodes}-node projection that did not change: it was rebuilt"
+    );
+    // Steps as the rebuild charged them: 8,013 either way.
+    assert_eq!(result.steps, 8_013);
+}
