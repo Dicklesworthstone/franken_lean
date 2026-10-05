@@ -137,12 +137,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
-    CiJob, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES, autodiscovery_overrides,
-    check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, feature_gated_modules,
-    features_off_by_default, ignored_tests, installs_reference_pin, invokes_check_sh, is_terminal,
-    logical_lines, module_path_prefix, names_scenario_in_code, reach_covers,
-    reaches_the_pinned_reference, record_field, scenario_assignments, shell_code_only,
-    test_function_citation, test_functions, test_reach, unmodelled_feature_cfgs,
+    CiJob, ELAN_ROOTS, ELAN_TOOLCHAINS_SEGMENT, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES,
+    autodiscovery_overrides, check_sh_reaches_workspace, ci_jobs, code_only, e2e_scenario_keys,
+    feature_gated_modules, features_off_by_default, ignored_tests, installs_reference_pin,
+    invokes_check_sh, is_terminal, logical_lines, module_path_prefix, names_scenario_in_code,
+    reach_covers, reaches_the_pinned_reference, record_field, scenario_assignments,
+    shell_code_only, test_function_citation, test_functions, test_reach, unmodelled_feature_cfgs,
     workspace_member_patterns,
 };
 use fln_conformance::pin::{
@@ -188,6 +188,9 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-lld",
     "fln-sv7x",
     "franken_lean-l8bj",
+    "fln-d18-product-half-rgsg",
+    "franken_lean-z8j.1.3",
+    "franken_lean-z8j.1.4",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -235,7 +238,27 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// the rows migrate off the surface.
 ///
 /// 11 -> 10 at franken_lean-zht's closure: migrated to pin-independent k1_judgments + kernel_contract suites.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 10;
+///
+/// 10 -> 13 on 2026-10-05, when the scan stopped missing elan paths built in two pieces
+/// (`execution::reaches_the_elan_layout_in_pieces`, bead franken_lean-z8j.1.22). That made two
+/// fln-cli surfaces pin-reaching that always had been: `crates/fln-cli/src/lib.rs`
+/// (`doctor_reference_toolchain`, the doctor's informational oracle check) and
+/// `crates/fln-cli/tests/cli_personalities_and_verbs.rs` (the `#[ignore]`d
+/// `check_olean_continue_resolves_imports_across_roots`). The second also became pin-reaching
+/// under the contiguous rule the same day, when `ec3a213c` (merged by `f3037037`) added
+/// `olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude` with a literal
+/// `.elan/toolchains`. Three closed rows cite tests on those surfaces: rgsg (`lib::tests::source_run_sidecar_is_exact_and_published_before_its_
+/// product`), z8j.1.3 (the doctor tests) and z8j.1.4 (verify-capsule, the reserved verbs,
+/// doctor's argument refusal). None of the cited tests is the pin-gated one. Measured
+/// 2026-10-05 on an rch worker with `ELAN_HOME` pointing nowhere: 9 of the 10 distinct cited
+/// tests pass. The tenth, `doctor_reports_a_missing_reference_toolchain_without_failing`,
+/// reports the Reference missing as intended and fails only its outside-a-checkout
+/// assertion (`checkout_pins` found the synced `SUITE.lock`, because that worker's temp
+/// directory sits inside the checkout), which is not a pin dependence. They are the same
+/// surface-granularity debt as fln-7li and fln-lld, newly visible rather than newly
+/// created; it shrinks when CI runs those surfaces with the pin or the rows migrate off
+/// them.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 13;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -1019,6 +1042,19 @@ fn collect_rs(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
     }
 }
 
+/// The pin-reaching subset of `surfaces`. One function, so a planted surface is judged by
+/// exactly the filter the real derivation uses.
+fn pin_reaching_surfaces(
+    surfaces: &BTreeMap<String, String>,
+    excluded: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    surfaces
+        .iter()
+        .filter(|(path, text)| !excluded.contains(*path) && reaches_the_pinned_reference(text))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 fn derive(root: &Path) -> Derivation {
     let members = member_dirs(root);
 
@@ -1033,11 +1069,7 @@ fn derive(root: &Path) -> Derivation {
         .iter()
         .map(|(path, _)| (*path).to_string())
         .collect();
-    let pin_reaching: BTreeSet<String> = surfaces
-        .iter()
-        .filter(|(path, text)| !excluded.contains(*path) && reaches_the_pinned_reference(text))
-        .map(|(path, _)| path.clone())
-        .collect();
+    let pin_reaching = pin_reaching_surfaces(&surfaces, &excluded);
 
     // Every lane script, read by directory listing rather than by any list of names. The
     // Reference-vs-Reference producer lives under scripts/tribunal while the product lanes
@@ -3411,6 +3443,161 @@ fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
         has(&findings, "ceiling:"),
         "growing the declaration must trip the ceiling — that is the whole reason it is an \
          equality; got {findings:?}"
+    );
+}
+
+/// The z8j.1.5 differential rig's locator, verbatim in shape: the elan root and the
+/// `toolchains` segment are joined in separate calls, so no contiguous coordinate appears.
+const TWO_PIECE_LOCATOR: &str = r#"
+fn planted_reference_lean(tag: &str) -> Option<std::path::PathBuf> {
+    let elan = std::env::var_os("ELAN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".elan")))?;
+    let lean = elan
+        .join("toolchains")
+        .join(format!("leanprover--lean4---{tag}"))
+        .join("bin")
+        .join("lean");
+    lean.is_file().then_some(lean)
+}
+"#;
+
+/// The escape, reproduced and closed (bead `franken_lean-z8j.1.22`): a locator that builds
+/// the elan path in two pieces matches no contiguous coordinate, and the scan must still
+/// call it pin-reaching. Negative controls keep the rule from becoming "mentions elan".
+#[test]
+fn a_two_piece_elan_path_is_pin_reaching() {
+    // The escape existed: no coordinate occurs in the planted code as a substring.
+    assert!(
+        !PIN_COORDINATES
+            .iter()
+            .any(|coordinate| code_only(TWO_PIECE_LOCATOR).contains(coordinate)),
+        "the plant must not contain a contiguous coordinate, or it does not reproduce the escape"
+    );
+    assert!(reaches_the_pinned_reference(TWO_PIECE_LOCATOR));
+
+    // The same in shell, as scripts/e2e/hygiene_no_mock_e2e.sh spells it.
+    let shell = "ELAN_ROOT=\"${ELAN_HOME:-$HOME/.elan}\"\n\
+                 LEAN=\"$ELAN_ROOT/toolchains/leanprover--lean4---$PIN_TAG/bin/lean\"\n";
+    assert!(reaches_the_pinned_reference(&shell_code_only(shell)));
+
+    // Each piece is needed, and each must be a whole path segment.
+    for root in ELAN_ROOTS {
+        let only_root = format!("let root = std::env::var_os(\"{root}\");\n");
+        assert!(
+            !reaches_the_pinned_reference(&only_root),
+            "{root} alone reached"
+        );
+        let both = format!("{only_root}let t = \"{ELAN_TOOLCHAINS_SEGMENT}\";\n");
+        assert!(
+            reaches_the_pinned_reference(&both),
+            "{root} + toolchains did not reach"
+        );
+    }
+    for unrelated in [
+        "let t = Path::new(\"toolchains\");\n",
+        "let f = \"backup.elan\"; let t = \"toolchains\";\n",
+        "let f = \".elan\"; let t = \"rust_toolchains\";\n",
+        "// $HOME/.elan\nlet t = \"toolchains\";\n",
+    ] {
+        assert!(
+            !reaches_the_pinned_reference(unrelated),
+            "matched a file that does not locate the elan layout: {unrelated}"
+        );
+    }
+}
+
+/// The real tree: the rig the escape was found in is now in the pin-reaching set, through
+/// the rule rather than a special case.
+#[test]
+fn the_differential_rig_is_pin_reaching_by_the_derived_rule() {
+    let d = derive(&root());
+    // The rig the escape was found in, and the doctor's product locator: both build the path
+    // in pieces and carry no contiguous coordinate.
+    for path in [
+        "crates/fln-cli/tests/source_reference_differential.rs",
+        "crates/fln-cli/src/lib.rs",
+    ] {
+        let text = d
+            .surfaces
+            .get(path)
+            .unwrap_or_else(|| fixture_panic!("{path} is not a scanned surface"));
+        assert!(
+            !PIN_COORDINATES
+                .iter()
+                .any(|coordinate| code_only(text).contains(coordinate)),
+            "{path} now names a contiguous coordinate, so it no longer tests the two-piece rule"
+        );
+        assert!(
+            d.pin_reaching.contains(path),
+            "{path} escapes the pin-reach scan"
+        );
+    }
+}
+
+/// A terminal row resting on a surface whose ONLY route to the pin is a two-piece path
+/// reddens the join, just as a contiguous coordinate does.
+///
+/// Judged as a DIFFERENCE against the unplanted tree rather than from `baseline()`: the plant
+/// must add a finding naming its own row whatever else the real tree reports, so an unrelated
+/// red elsewhere in the population can neither mask this kill nor be mistaken for it.
+#[test]
+fn mutant_a_two_piece_locator_on_a_pinless_ci_surface_reddens() {
+    const PLANTED: &str = "fln-planted-two-piece";
+    let mut d = derive(&root());
+    let surface = d
+        .surfaces
+        .keys()
+        .find(|path| {
+            path.contains("/tests/")
+                && !d.pin_reaching.contains(*path)
+                && run_by_ci(&d, path)
+                && !run_by_ci_with_the_pin(&d, path)
+        })
+        .expect("a test surface CI runs without the pin that does not reach it yet")
+        .clone();
+    let row = TerminalRow {
+        bead: PLANTED.to_string(),
+        surfaces: [surface.clone()].into(),
+        scenarios: vec!["quality_gate".to_string()],
+        coarse: BTreeSet::new(),
+        fine: Vec::new(),
+    };
+    let names_the_plant = |findings: &[String]| {
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("population-grew:") && finding.contains(PLANTED))
+    };
+
+    // Control: the same row on the unplanted surface is not a finding.
+    let mut control = derive(&root());
+    control.rows.push(row.clone());
+    assert!(
+        !names_the_plant(&judge(
+            &control,
+            UNEXECUTED_EVIDENCE_ALLOWANCE,
+            UNEXECUTED_EVIDENCE_CEILING,
+        )),
+        "{surface} is already a finding before the plant, so the plant proves nothing"
+    );
+
+    let planted = format!("{}\n{TWO_PIECE_LOCATOR}", d.surfaces[&surface]);
+    d.surfaces.insert(surface.clone(), planted);
+    d.pin_reaching = pin_reaching_surfaces(&d.surfaces, &d.excluded);
+    assert!(
+        d.pin_reaching.contains(&surface),
+        "the planted two-piece locator did not make {surface} pin-reaching"
+    );
+    d.rows.push(row);
+    let findings = judge(
+        &d,
+        UNEXECUTED_EVIDENCE_ALLOWANCE,
+        UNEXECUTED_EVIDENCE_CEILING,
+    );
+    assert!(
+        names_the_plant(&findings),
+        "a row on a surface that reaches the pin only through a two-piece path must redden; \
+         got {findings:?}"
     );
 }
 

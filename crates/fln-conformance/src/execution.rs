@@ -82,10 +82,51 @@ pub fn code_only(source: &str) -> String {
         .join("\n")
 }
 
+/// The two names for the root elan installs toolchains under: its default directory and
+/// the environment variable that relocates it.
+pub const ELAN_ROOTS: &[&str] = &[".elan", "ELAN_HOME"];
+
+/// The directory under an elan root that holds every installed toolchain, the pin among them.
+pub const ELAN_TOOLCHAINS_SEGMENT: &str = "toolchains";
+
 /// Can this source text reach the pinned Reference?
 pub fn reaches_the_pinned_reference(source: &str) -> bool {
     let code = code_only(source);
     PIN_COORDINATES.iter().any(|needle| code.contains(needle))
+        || reaches_the_elan_layout_in_pieces(&code)
+}
+
+/// Does this code name an elan root and the `toolchains` segment as separate path pieces?
+///
+/// **The escape this closes (bead `franken_lean-z8j.1.22`).** `.elan/toolchains` is a
+/// contiguous needle, so a locator that builds the same path a segment at a time —
+/// `PathBuf::from(home).join(".elan")` and later `.join("toolchains")`, or
+/// `${ELAN_HOME:-$HOME/.elan}` then `"$ELAN_ROOT/toolchains/…"` — consulted the pin while
+/// matching no coordinate. Measured 2026-10-05, three Rust surfaces and one lane did exactly
+/// that: the z8j.1.5 differential rig (`crates/fln-cli/tests/source_reference_differential.rs`),
+/// `crates/fln-cli/tests/cli_personalities_and_verbs.rs`, the CLI's own locator in
+/// `crates/fln-cli/src/lib.rs`, and `scripts/e2e/hygiene_no_mock_e2e.sh`. No rig is named
+/// here: the rule is about the layout, so the next locator spelled this way is caught too.
+///
+/// Both pieces must appear as whole path segments: bounded on each side by a character that
+/// cannot continue a file name (`/`, a quote, a brace, whitespace…), so `foo.elan` or
+/// `rust_toolchains` match nothing. The order and distance between them do not matter,
+/// because a path built in pieces puts arbitrary code between them.
+pub fn reaches_the_elan_layout_in_pieces(code: &str) -> bool {
+    ELAN_ROOTS.iter().any(|root| names_path_segment(code, root))
+        && names_path_segment(code, ELAN_TOOLCHAINS_SEGMENT)
+}
+
+/// Whether `segment` occurs in `code` as a whole path segment.
+fn names_path_segment(code: &str, segment: &str) -> bool {
+    let continues_a_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    code.match_indices(segment).any(|(at, _)| {
+        let before = code.get(..at).and_then(|head| head.chars().next_back());
+        let after = code
+            .get(at + segment.len()..)
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(continues_a_name) && !after.is_some_and(continues_a_name)
+    })
 }
 
 // ---------------------------------------------------------------------------
