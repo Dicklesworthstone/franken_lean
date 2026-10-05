@@ -95,10 +95,10 @@ fn successful_join_emits_zero_unmatched_method_bound_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/6\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/7\""));
     assert!(stdout.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
     assert!(stdout.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
-    assert!(stdout.contains("\"methodResponseSchema\":\"fln.lsp-method-response/2\""));
+    assert!(stdout.contains("\"methodResponseSchema\":\"fln.lsp-method-response/3\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));

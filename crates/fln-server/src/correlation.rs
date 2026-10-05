@@ -55,6 +55,8 @@ enum RequestContract {
     NoInformationQuery,
     PlainGoal,
     Hover,
+    Completion,
+    Definition,
     UnsupportedRpc,
     UnknownMethod,
 }
@@ -67,9 +69,9 @@ impl RequestContract {
             "textDocument/waitForDiagnostics" => Self::DiagnosticWait,
             "$/lean/plainGoal" => Self::PlainGoal,
             "textDocument/hover" => Self::Hover,
-            "$/lean/plainTermGoal" | "textDocument/completion" | "textDocument/definition" => {
-                Self::NoInformationQuery
-            }
+            "textDocument/completion" => Self::Completion,
+            "textDocument/definition" => Self::Definition,
+            "$/lean/plainTermGoal" => Self::NoInformationQuery,
             "$/lean/rpc/connect" | "$/lean/rpc/call" => Self::UnsupportedRpc,
             _ => Self::UnknownMethod,
         }
@@ -83,6 +85,8 @@ impl RequestContract {
             Self::NoInformationQuery => "no-information-query",
             Self::PlainGoal => "plain-goal",
             Self::Hover => "hover",
+            Self::Completion => "completion",
+            Self::Definition => "definition",
             Self::UnsupportedRpc => "unsupported-rpc",
             Self::UnknownMethod => "unknown-method",
         }
@@ -527,11 +531,13 @@ fn classify_method_response(
             format!("error code {code}"),
             "an object result, RequestCancelled, or RequestFailed",
         ),
-        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Result(value))
-            if value.trim() == "null" =>
-        {
-            Ok(MethodResponseClass::NoInformationQueryResult)
-        }
+        (
+            RequestContract::PlainGoal
+            | RequestContract::Hover
+            | RequestContract::Completion
+            | RequestContract::Definition,
+            ResponseShape::Result(value),
+        ) if value.trim() == "null" => Ok(MethodResponseClass::NoInformationQueryResult),
         (RequestContract::PlainGoal, ResponseShape::Result(value))
             if crate::json::plain_goal_result(value) =>
         {
@@ -542,22 +548,46 @@ fn classify_method_response(
         {
             Ok(MethodResponseClass::SemanticQueryResult)
         }
+        // Both front doors answer these since 2026-09-26/27 (e845bbbd, 46e05cf3). Until
+        // 2026-10-05 this contract accepted only `null` for them, so a transcript of the
+        // real server failed it and a wrong answer could not be told from a right one.
+        (RequestContract::Completion, ResponseShape::Result(value))
+            if crate::json::completion_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
+        (RequestContract::Definition, ResponseShape::Result(value))
+            if crate::json::definition_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
         (
-            RequestContract::PlainGoal | RequestContract::Hover,
+            RequestContract::PlainGoal
+            | RequestContract::Hover
+            | RequestContract::Completion
+            | RequestContract::Definition,
             ResponseShape::Error(-32602 | -32803 | -32800),
         ) => Ok(MethodResponseClass::SemanticQueryError),
-        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Result(value)) => {
-            mismatch(
-                result_kind(value).to_owned(),
-                "null or a typed native semantic result",
-            )
-        }
-        (RequestContract::PlainGoal | RequestContract::Hover, ResponseShape::Error(code)) => {
-            mismatch(
-                format!("error code {code}"),
-                "InvalidParams, RequestFailed, or RequestCancelled",
-            )
-        }
+        (
+            RequestContract::PlainGoal
+            | RequestContract::Hover
+            | RequestContract::Completion
+            | RequestContract::Definition,
+            ResponseShape::Result(value),
+        ) => mismatch(
+            result_kind(value).to_owned(),
+            "null or a typed native semantic result",
+        ),
+        (
+            RequestContract::PlainGoal
+            | RequestContract::Hover
+            | RequestContract::Completion
+            | RequestContract::Definition,
+            ResponseShape::Error(code),
+        ) => mismatch(
+            format!("error code {code}"),
+            "InvalidParams, RequestFailed, or RequestCancelled",
+        ),
         (RequestContract::NoInformationQuery, ResponseShape::Result(value))
             if value.trim() == "null" =>
         {
@@ -845,10 +875,10 @@ pub fn correlate_transcripts(
 pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-server-correlation/6\",",
+            "{{\"schema\":\"fln.lsp-client-server-correlation/7\",",
             "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\",",
-            "\"methodResponseSchema\":\"fln.lsp-method-response/2\",",
+            "\"methodResponseSchema\":\"fln.lsp-method-response/3\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -983,8 +1013,8 @@ mod tests {
         assert_eq!(stats.no_information_query_results, 1);
         assert_eq!(stats.cancellation_target_id_bytes, 0);
         let receipt = render_correlation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/6\""));
-        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/2\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/7\""));
+        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/3\""));
         assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
         assert!(receipt.contains("\"methodContractResponses\":3"));

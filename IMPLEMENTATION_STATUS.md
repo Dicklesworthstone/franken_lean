@@ -176,12 +176,12 @@ Landed:
 - Correlation independently rebuilds request and cancellation indexes and requires their accounting and prior-request facts to agree with the client-session pass.
 - Missing, duplicate, unsolicited, and numerically normalized response IDs fail closed. Equivalent JSON string spellings correlate by decoded value.
 - Client-request, server-response, and cancellation-target indexes are independently bounded to 262,144 IDs and 32 MiB of canonical ID bytes.
-- Correlation schema `fln.lsp-client-server-correlation/5` names `fln.lsp-method-response/1` and validates each response against the current bounded dispatcher's outer method contract:
+- Correlation schema `fln.lsp-client-server-correlation/7` names `fln.lsp-method-response/3` and validates each response against the current bounded dispatcher's outer method contract:
   - `initialize` returns an object;
   - `shutdown` returns `null`;
   - `waitForDiagnostics` returns an object, `RequestCancelled`, or `RequestFailed`;
-  - plain goals and hover return `null`, a typed goal or hover result, or `InvalidParams`, `RequestFailed` or `RequestCancelled`;
-  - term goals, completion, and definition must return the no-information `null` result. The installed front doors now answer completion and definition (below), so this contract lags them;
+  - plain goals, hover, completion and definition return `null`, a result in the native server's profile for that method, or `InvalidParams`, `RequestFailed` or `RequestCancelled`. Completion must be a `CompletionList` of at most 256 plaintext items with single-line edits; definition must be one `Location` with a nonempty range (method-response/3, 2026-10-05; before that, completion and definition accepted only `null`);
+  - term goals must return the no-information `null` result;
   - unsupported Lean RPC calls return `RequestFailed`;
   - unknown methods return `MethodNotFound`.
 - Method-derived result and error counts must reconcile exactly with the server transcript's validated totals, and every matched response must belong to one method contract class.
@@ -201,7 +201,7 @@ Landed:
 #### Still incomplete
 
 - Parser errors have real UTF-16 positions. Most bounded-source type failures are kernel rejections rather than `NatDefinitionElabError` values, and neither path carries an offending *token* position — but they now carry a **command-level** position: `EngineExecutionError::BatchCommand` gained an `at` offset that the source command loops populate, so a kernel or elaboration failure lands on the failing command's line rather than the file head (`c6190ee3`, tested by `kernel_rejection_reports_the_command_line_not_the_file_head`). Token-level (offending sub-expression) positions remain a larger follow-on.
-- Method-response schema v1 is an outer contract. It does not validate the complete initialize capability object. For goals and hover it checks the result's JSON shape, not its content, and for completion and definition it accepts only `null`. Successful diagnostic waits are object-valued rather than bound to a deeper inner schema.
+- Method-response schema v3 is an outer contract. It does not validate the complete initialize capability object. For goals, hover, completion and definition it checks the result's shape and bounds, not whether its content is right for the source. Successful diagnostic waits are object-valued rather than bound to a deeper inner schema.
 - Independent `CLIENT` and `SERVER` recordings still have no shared order. The new `TIMELINE` profile supplies recorder-defined event order, not wall-clock time, duration, scheduler execution, transport flush completion, or active CPU-work intervals.
 - No production recorder yet emits and identity-binds the interleaved event format. Fixture or caller-generated timelines must not be promoted to live-daemon evidence by implication.
 - Timeline schema v1 does not yet bind a particular `didOpen`, `didChange`, or `didSave` to its progress, terminal publication, diagnostic clearing, and completion episode. Complete document-to-progress-to-publication causality remains open.

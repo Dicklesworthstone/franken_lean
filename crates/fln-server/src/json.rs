@@ -132,7 +132,11 @@ pub(super) fn hover_result(value: &str) -> bool {
     {
         return false;
     }
-    let range = object_member(root, "range");
+    matches!(range_points(object_member(root, "range")), Some((start, end)) if start <= end)
+}
+
+/// One LSP `Range` as ordered `(line, character)` pairs, each a non-negative i32.
+fn range_points(range: RawField<'_>) -> Option<((i64, i64), (i64, i64))> {
     let point = |key| {
         let point = object_member(range, key);
         match (
@@ -148,5 +152,101 @@ pub(super) fn hover_result(value: &str) -> bool {
             _ => None,
         }
     };
-    matches!((point("start"),point("end")),(Some(start),Some(end)) if start <= end)
+    Some((point("start")?, point("end")?))
+}
+
+/// A nonempty string with no control characters, as the native server emits.
+fn plain_string_member(object: RawField<'_>, key: &str) -> bool {
+    matches!(
+        object_string_member(object, key),
+        DecodedField::Valid(text) if !text.is_empty() && !text.chars().any(char::is_control)
+    )
+}
+
+/// The elements of a JSON array, each as raw text; `None` if it is not one, if an element is
+/// malformed, or if it holds more than `limit` elements.
+fn array_elements(value: &str, limit: usize) -> Option<Vec<&str>> {
+    let bytes = value.as_bytes();
+    let mut i = skip_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'[') {
+        return None;
+    }
+    i += 1;
+    let mut elements = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        if bytes.get(i) == Some(&b']') {
+            return (skip_ws(bytes, i + 1) == bytes.len()).then_some(elements);
+        }
+        if elements.len() >= limit {
+            return None;
+        }
+        let end = parse_value_end(value, i, 0)?;
+        elements.push(value.get(i..end)?);
+        i = skip_ws(bytes, end);
+        if bytes.get(i) == Some(&b',') {
+            i += 1;
+            if bytes.get(skip_ws(bytes, i)) == Some(&b']') {
+                return None;
+            }
+        } else if bytes.get(i) != Some(&b']') {
+            return None;
+        }
+    }
+}
+
+/// The native completion profile (`dispatch/semantic/completion.rs`): a `CompletionList`
+/// with a boolean `isIncomplete` and at most 256 plaintext items. Each item has a nonempty
+/// label, kind 1..=25, `insertTextFormat` 1 (plaintext; the server never sends snippets),
+/// an optional string `filterText`, and a `textEdit` whose range is ordered and on one
+/// line, with nonempty `newText`.
+pub(super) fn completion_result(value: &str) -> bool {
+    if value.len() > 1024 * 1024 {
+        return false;
+    }
+    let root = RawField::Value(value);
+    if !matches!(
+        object_boolean_member(root, "isIncomplete"),
+        BooleanField::Valid(_)
+    ) {
+        return false;
+    }
+    let RawField::Value(items) = object_member(root, "items") else {
+        return false;
+    };
+    let Some(items) = array_elements(items, 256) else {
+        return false;
+    };
+    items.into_iter().all(|item| {
+        let item = RawField::Value(item);
+        let edit = object_member(item, "textEdit");
+        let filter_text = match object_member(item, "filterText") {
+            RawField::Missing => true,
+            field => matches!(decoded_string(field), DecodedField::Valid(_)),
+        };
+        plain_string_member(item, "label")
+            && matches!(object_integer_member(item, "kind"), VersionField::Valid(kind) if (1..=25).contains(&kind))
+            && matches!(
+                object_integer_member(item, "insertTextFormat"),
+                VersionField::Valid(1)
+            )
+            && filter_text
+            && plain_string_member(edit, "newText")
+            && matches!(
+                range_points(object_member(edit, "range")),
+                Some((start, end)) if start <= end && start.0 == end.0
+            )
+    })
+}
+
+/// The native definition profile: one LSP `Location` whose URI is a nonempty string without
+/// control characters and whose range is nonempty, as `dispatch/semantic.rs` refuses an
+/// empty or inverted target range rather than sending one.
+pub(super) fn definition_result(value: &str) -> bool {
+    if value.len() > 1024 * 1024 {
+        return false;
+    }
+    let root = RawField::Value(value);
+    plain_string_member(root, "uri")
+        && matches!(range_points(object_member(root, "range")), Some((start, end)) if start < end)
 }

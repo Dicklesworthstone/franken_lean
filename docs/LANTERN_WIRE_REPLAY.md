@@ -40,7 +40,7 @@ The tools deliberately expose different grades. A stronger grade adds claims; it
 | Client lifecycle | `fln-lsp-validate --client-lifecycle INPUT` | `fln.lsp-client-lifecycle/1` | Initialize/initialized/shutdown/exit order plus known request/notification roles and parameter-container contracts. |
 | Client session | `fln-lsp-validate --client-session INPUT` | `fln.lsp-client-session/3` | Full-sync document state, monotone versions, wait classes, canonical request IDs, cancellation targets, and bounded retained metadata. |
 | Server structure | `fln-lsp-server-validate INPUT` | `fln.lsp-server-transcript/3` | Response shape, known notification schemas, result/error counts, and bounded decoded server metadata. |
-| Bidirectional join | `fln-lsp-correlate CLIENT SERVER` | `fln.lsp-client-server-correlation/5` | One-to-one canonical response IDs, cancellation-response classes, and the current method-to-response contract. |
+| Bidirectional join | `fln-lsp-correlate CLIENT SERVER` | `fln.lsp-client-server-correlation/7` | One-to-one canonical response IDs, cancellation-response classes, and the current method-to-response contract. |
 | Interleaved record order | `fln-lsp-timeline TIMELINE` | `fln.lsp-interleaved-timeline/1` | All strict projected-stream claims plus request-before-response, initialize-response-before-initialized, shutdown-response-before-exit, cancellation-before-target-response, and no-event-after-exit evidence. |
 
 Default replay intentionally accepts any syntax-valid client stream so malformed lifecycle and document behavior can remain executable negative fixtures. Strict replay preflights add lifecycle or session authority before any server execution or output publication.
@@ -178,10 +178,10 @@ The client must pass `--client-session`. The server must pass the structural ser
 
 Client-request, server-response, and cancellation-target indexes are independently bounded to 262,144 IDs and 32 MiB of canonical ID bytes.
 
-Correlation schema v5 adds:
+Correlation schema v7 carries:
 
 ```text
-methodResponseSchema = fln.lsp-method-response/1
+methodResponseSchema = fln.lsp-method-response/3
 ```
 
 For the current bounded dispatcher, each joined response must satisfy this outer contract:
@@ -191,7 +191,8 @@ For the current bounded dispatcher, each joined response must satisfy this outer
 | `initialize` | object-valued result |
 | `shutdown` | `result: null` |
 | `textDocument/waitForDiagnostics` | object-valued result, `RequestCancelled` (`-32800`), or `RequestFailed` (`-32803`) |
-| `$/lean/plainGoal`, `$/lean/plainTermGoal`, hover, completion, definition | current no-information `result: null` |
+| `$/lean/plainGoal`, hover, completion, definition | `result: null`, a result in the native server's profile for that method, `InvalidParams` (`-32602`), `RequestFailed` (`-32803`), or `RequestCancelled` (`-32800`). Goals: `rendered` plus a string array of at most 256. Hover: plaintext contents and an ordered range. Completion: a `CompletionList` with boolean `isIncomplete` and at most 256 items, each a nonempty label, kind 1-25, `insertTextFormat` 1 and a single-line `textEdit`. Definition: one `Location` with a nonempty URI and a nonempty range. |
+| `$/lean/plainTermGoal` | current no-information `result: null` |
 | `$/lean/rpc/connect`, `$/lean/rpc/call` | `RequestFailed` (`-32803`) because RPC sessions are not implemented |
 | any other request method | `MethodNotFound` (`-32601`) |
 
@@ -204,9 +205,9 @@ all method classes    == matched responses
 method contract violations == 0
 ```
 
-This prevents a transcript with the right IDs but the wrong dispatcher behavior from becoming successful evidence. For example, a hover response carrying `MethodNotFound` is rejected because the current server deliberately returns `null` for that no-information method.
+This prevents a transcript with the right IDs but the wrong dispatcher behavior from becoming successful evidence. For example, a hover response carrying `MethodNotFound` is rejected, and so is a completion item in snippet format or a definition with an empty range, because the native server never sends either.
 
-The current method contract is intentionally an **outer** contract. It proves that initialize returns an object, not that every capability inside that object is correct. It proves that a successful diagnostic wait returns an object, not yet the exact inner object schema. Semantic editor methods currently return `null`; accepting that result is evidence of present behavior, not proof that useful hover, completion, definition, or goal semantics exist.
+The current method contract is intentionally an **outer** contract. It proves that initialize returns an object, not that every capability inside that object is correct. It proves that a successful diagnostic wait returns an object, not yet the exact inner object schema. For goals, hover, completion and definition it checks each result's shape and bounds against what the native server emits; a result that passes is well-formed, not proof that its content is right for the source.
 
 ## Cancellation-bound response classification
 
