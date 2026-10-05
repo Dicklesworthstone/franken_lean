@@ -171,13 +171,10 @@ pub fn register(
             declaration.clone(),
         ));
     }
-    let mut payload = MAGIC.to_vec();
-    payload.push(3);
-    write_name(&class, &mut payload)?;
-    write_name(declaration, &mut payload)?;
-    payload.extend(priority.to_le_bytes());
-    write_name(namespace, &mut payload)?;
-    append(env, payload)
+    append(
+        env,
+        instance_payload(3, &class, declaration, priority, Some(namespace))?,
+    )
 }
 
 #[cfg(test)]

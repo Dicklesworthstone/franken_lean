@@ -96,6 +96,15 @@ pub fn register(
     if !InstanceRegistry::read(env)?.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
+    append(env, declaration, priority)
+}
+
+/// Append the journal row for an already validated default candidate.
+pub(super) fn append(
+    env: &Environment,
+    declaration: &Name,
+    priority: u32,
+) -> Result<Environment, InstanceRegistryError> {
     let mut payload = DEFAULT_MAGIC.to_vec();
     write_name(declaration, &mut payload)?;
     payload.extend(priority.to_le_bytes());

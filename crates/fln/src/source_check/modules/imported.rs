@@ -237,6 +237,26 @@ impl Engine {
         limits: SourceOleanImportLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceOleanImport>> {
+        self.activate_source_metadata_with::<instances::imported::ImportActivation>(
+            checked,
+            modules,
+            roots,
+            options,
+            limits,
+            cancellation,
+        )
+    }
+
+    /// [`Self::activate_source_metadata`] with the registrations made by `R`.
+    fn activate_source_metadata_with<R: Registrar>(
+        &self,
+        checked: CheckedOleanSet,
+        modules: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceOleanImport>> {
         macro_rules! cancelled {
             ($at:literal) => {
                 if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -340,35 +360,41 @@ impl Engine {
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
+        // One activation for the whole closure: the registries are read once and
+        // kept current, rather than re-read and re-validated before every row.
+        let mut activation = R::new(engine.environment.clone());
         for report in &mut reports {
-            let before = engine.environment.clone();
+            let before = activation.environment().clone();
             for _ in 0..report.classes {
                 cancelled!("source-olean/class");
                 let row = classes.next().ok_or(SourceOleanImportError::Internal(
                     "class count changed during decode",
                 ))?;
-                engine.environment = instances::imported::register_class(
-                    &engine.environment,
-                    &row.name,
-                    &instances::imported::ClassParameters {
-                        out_params: row.out_params,
-                        out_level_params: row.out_level_params,
-                    },
-                )
-                .map_err(|error| registry_error(&report.module, &row.name, error))?;
+                activation = activation
+                    .register_class(
+                        &row.name,
+                        &instances::imported::ClassParameters {
+                            out_params: row.out_params,
+                            out_level_params: row.out_level_params,
+                        },
+                    )
+                    .map_err(|error| registry_error(&report.module, &row.name, error))?;
             }
             for _ in 0..report.instances {
                 cancelled!("source-olean/instance");
                 let row = instances.next().ok_or(SourceOleanImportError::Internal(
                     "instance count changed during decode",
                 ))?;
-                let info = engine.environment.find(&row.declaration).ok_or_else(|| {
-                    registry_error(
-                        &report.module,
-                        &row.declaration,
-                        InstanceRegistryError::UnknownDeclaration(row.declaration.clone()),
-                    )
-                })?;
+                let info = activation
+                    .environment()
+                    .find(&row.declaration)
+                    .ok_or_else(|| {
+                        registry_error(
+                            &report.module,
+                            &row.declaration,
+                            InstanceRegistryError::UnknownDeclaration(row.declaration.clone()),
+                        )
+                    })?;
                 let expected = Expr::const_(
                     row.declaration.clone(),
                     info.constant_val()
@@ -388,28 +414,28 @@ impl Engine {
                     });
                 }
                 report.scoped_instances += usize::from(row.scope.is_some());
-                engine.environment = instances::imported::register_instance(
-                    &engine.environment,
-                    &row.declaration,
-                    &instances::imported::InstanceParameters {
-                        priority: row.priority,
-                        synth_order: row.synth_order,
-                        scope: row.scope,
-                    },
-                )
-                .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
+                activation = activation
+                    .register_instance(
+                        &row.declaration,
+                        &instances::imported::InstanceParameters {
+                            priority: row.priority,
+                            synth_order: row.synth_order,
+                            scope: row.scope,
+                        },
+                    )
+                    .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
             }
             for _ in 0..report.defaults {
                 cancelled!("source-olean/default");
                 let row = defaults.next().ok_or(SourceOleanImportError::Internal(
                     "default count changed during decode",
                 ))?;
-                let actual = engine
-                    .environment
+                let actual = activation
+                    .environment()
                     .find(&row.declaration)
                     .and_then(|info| {
                         instances::instance_telescope(
-                            &engine.environment,
+                            activation.environment(),
                             &info.constant_val().type_,
                         )
                     })
@@ -421,15 +447,20 @@ impl Engine {
                         reason: "default instance class does not match its checked type",
                     });
                 }
-                engine.environment = instances::defaults::register(
-                    &engine.environment,
-                    &row.declaration,
-                    row.priority,
-                )
-                .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
+                activation = activation
+                    .register_default(&row.declaration, row.priority)
+                    .map_err(|error| registry_error(&report.module, &row.declaration, error))?;
             }
-            journals.insert(report.module.clone(), (before, engine.environment.clone()));
+            journals.insert(
+                report.module.clone(),
+                (before, activation.environment().clone()),
+            );
         }
+        engine.environment = activation.finish().map_err(|_| {
+            SourceOleanImportError::Internal(
+                "the activated registries disagree with their kept state",
+            )
+        })?;
         if classes.next().is_some() || instances.next().is_some() || defaults.next().is_some() {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
@@ -451,6 +482,63 @@ impl Engine {
             modules: reports,
             contexts,
         }))
+    }
+}
+
+/// Who makes a closure's metadata registrations. Production makes them through one
+/// [`instances::imported::ImportActivation`]; the tests also make them one call at a
+/// time through the per-call functions, and require the same environment.
+trait Registrar: Sized {
+    fn new(env: Environment) -> Self;
+    fn environment(&self) -> &Environment;
+    fn register_class(
+        self,
+        class: &Name,
+        parameters: &instances::imported::ClassParameters,
+    ) -> std::result::Result<Self, InstanceRegistryError>;
+    fn register_instance(
+        self,
+        declaration: &Name,
+        parameters: &instances::imported::InstanceParameters,
+    ) -> std::result::Result<Self, InstanceRegistryError>;
+    fn register_default(
+        self,
+        declaration: &Name,
+        priority: u32,
+    ) -> std::result::Result<Self, InstanceRegistryError>;
+    fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
+}
+
+impl Registrar for instances::imported::ImportActivation {
+    fn new(env: Environment) -> Self {
+        Self::new(env)
+    }
+    fn environment(&self) -> &Environment {
+        self.environment()
+    }
+    fn register_class(
+        self,
+        class: &Name,
+        parameters: &instances::imported::ClassParameters,
+    ) -> std::result::Result<Self, InstanceRegistryError> {
+        self.register_class(class, parameters)
+    }
+    fn register_instance(
+        self,
+        declaration: &Name,
+        parameters: &instances::imported::InstanceParameters,
+    ) -> std::result::Result<Self, InstanceRegistryError> {
+        self.register_instance(declaration, parameters)
+    }
+    fn register_default(
+        self,
+        declaration: &Name,
+        priority: u32,
+    ) -> std::result::Result<Self, InstanceRegistryError> {
+        self.register_default(declaration, priority)
+    }
+    fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
+        self.finish()
     }
 }
 
@@ -711,6 +799,207 @@ pub(super) mod tests {
                 &serial.checked.engine,
                 &parallel.checked.engine,
                 "source result",
+            );
+        });
+    }
+
+    /// The per-call registration functions, one row at a time: the semantics a
+    /// batched [`instances::imported::ImportActivation`] must equal.
+    struct Sequential(Environment);
+    impl Registrar for Sequential {
+        fn new(env: Environment) -> Self {
+            Sequential(env)
+        }
+        fn environment(&self) -> &Environment {
+            &self.0
+        }
+        fn register_class(
+            self,
+            class: &Name,
+            parameters: &instances::imported::ClassParameters,
+        ) -> std::result::Result<Self, InstanceRegistryError> {
+            instances::imported::register_class(&self.0, class, parameters).map(Sequential)
+        }
+        fn register_instance(
+            self,
+            declaration: &Name,
+            parameters: &instances::imported::InstanceParameters,
+        ) -> std::result::Result<Self, InstanceRegistryError> {
+            instances::imported::register_instance(&self.0, declaration, parameters).map(Sequential)
+        }
+        fn register_default(
+            self,
+            declaration: &Name,
+            priority: u32,
+        ) -> std::result::Result<Self, InstanceRegistryError> {
+            instances::defaults::register(&self.0, declaration, priority).map(Sequential)
+        }
+        fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
+            Ok(self.0)
+        }
+    }
+
+    /// Activating a real closure's metadata through one batched activation gives the
+    /// environment, metadata reports, roots and per-module journals that registering
+    /// each row through the per-call functions gives (bead `fln-uyuz`). The closure's
+    /// declarations are admitted once by the council; the second, identical checked
+    /// set comes from the reuse rebuild, which re-proves it by root.
+    #[test]
+    fn batched_metadata_activation_equals_one_registration_at_a_time() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let roots = ["Init.Data.Cast", "Init.Data.Option.Coe", "Init.Data.Zero"];
+        let closure = closure(&lib, &roots);
+        let inputs = inputs(&closure);
+        let roots: Vec<Name> = roots.iter().map(|root| n(root)).collect();
+        on_import_stack(|| {
+            let base = Engine::from_environment(Environment::new());
+            let batched = import(&inputs, &roots, limits(1))
+                .expect("the pinned closure imports")
+                .into_complete()
+                .expect("the pinned closure imports completely");
+            assert!(
+                batched.modules.iter().any(|report| report.instances > 0)
+                    && batched.modules.iter().any(|report| report.classes > 0),
+                "the closure carries class and instance metadata"
+            );
+            let checker = super::super::reuse::CheckerIdentity::of_executable(b"sequential");
+            let key = super::super::reuse::ImportClosureKey::compute(
+                &inputs,
+                &roots,
+                &KVMap::new(),
+                checker,
+            );
+            let record = super::super::reuse::ImportReuseRecord::from_admission(
+                key,
+                checker,
+                &KVMap::new(),
+                &batched,
+            )
+            .expect("the admission is recordable");
+            let rebuilt = base
+                .rebuild_for_test(&inputs, &record)
+                .expect("the council's closure re-proves");
+            let sequential = base
+                .activate_source_metadata_with::<Sequential>(
+                    rebuilt,
+                    &inputs,
+                    &roots,
+                    &KVMap::new(),
+                    limits(1),
+                    None,
+                )
+                .expect("one registration at a time activates")
+                .into_complete()
+                .expect("one registration at a time activates completely");
+            assert!(
+                batched.engine.environment == sequential.engine.environment,
+                "the batched and per-call environments differ"
+            );
+            assert_eq!(batched.result_logical_root, sequential.result_logical_root);
+            assert_eq!(batched.modules, sequential.modules);
+            assert_eq!(
+                batched.contexts.complete.environment, sequential.contexts.complete.environment,
+                "complete contexts"
+            );
+
+            // A skipped check is invisible on valid metadata, so plant invalid rows
+            // over the activated environment: both registrars must refuse each one
+            // the same way, and accept the valid control the same way.
+            fn outcome<R: Registrar>(
+                env: &Environment,
+                step: impl Fn(R) -> std::result::Result<R, InstanceRegistryError>,
+            ) -> std::result::Result<Environment, InstanceRegistryError> {
+                step(R::new(env.clone())).and_then(R::finish)
+            }
+            let activated = &batched.engine.environment;
+            let global = instances::imported::InstanceParameters {
+                priority: 1000,
+                synth_order: Vec::new(),
+                scope: None,
+            };
+            let scoped = instances::imported::InstanceParameters {
+                scope: Some(n("Planted.Scope")),
+                ..global.clone()
+            };
+            type Answer = std::result::Result<Environment, InstanceRegistryError>;
+            type Case<'a> = Box<dyn Fn(&Environment) -> (Answer, Answer) + 'a>;
+            let cases: Vec<(&str, Case<'_>)> = vec![
+                (
+                    "a global instance re-registered as scoped",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("instInhabitedNat");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_instance(&declaration, &scoped)
+                            }),
+                            outcome::<Sequential>(env, |r| {
+                                r.register_instance(&declaration, &scoped)
+                            }),
+                        )
+                    }),
+                ),
+                (
+                    "a declaration that is not an instance",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("Nat.add");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_instance(&declaration, &global)
+                            }),
+                            outcome::<Sequential>(env, |r| {
+                                r.register_instance(&declaration, &global)
+                            }),
+                        )
+                    }),
+                ),
+                (
+                    "a default candidate registered twice",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("instInhabitedNat");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_default(&declaration, 100)?
+                                    .register_default(&declaration, 100)
+                            }),
+                            outcome::<Sequential>(env, |r| {
+                                r.register_default(&declaration, 100)?
+                                    .register_default(&declaration, 100)
+                            }),
+                        )
+                    }),
+                ),
+                (
+                    "the valid control: a global upsert of a registered instance",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("instInhabitedNat");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_instance(&declaration, &global)
+                            }),
+                            outcome::<Sequential>(env, |r| {
+                                r.register_instance(&declaration, &global)
+                            }),
+                        )
+                    }),
+                ),
+            ];
+            let mut refused = 0;
+            for (case, run) in &cases {
+                let (batched, sequential) = run(activated);
+                assert!(
+                    batched == sequential,
+                    "{case}: batched {:?}, per-call {:?}",
+                    batched.as_ref().err(),
+                    sequential.as_ref().err()
+                );
+                refused += usize::from(batched.is_err());
+            }
+            assert_eq!(
+                refused, 3,
+                "three planted rows are refused, the control is not"
             );
         });
     }

@@ -169,10 +169,19 @@ pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError>
     }
     let mut result = Metadata::default();
     for entry in extension.entries() {
-        if entry.payload.len() > MAX_ENTRY_BYTES {
+        result.apply(env, &entry.payload)?;
+    }
+    Ok(result)
+}
+
+impl Metadata {
+    /// Validate one journal row and fold it in, as [`read`] does for each row in
+    /// journal order. A later row for a name replaces the earlier one.
+    fn apply(&mut self, env: &Environment, payload: &[u8]) -> Result<(), InstanceRegistryError> {
+        if payload.len() > MAX_ENTRY_BYTES {
             return Err(InstanceRegistryError::Limit);
         }
-        let mut bytes: &[u8] = &entry.payload;
+        let mut bytes: &[u8] = payload;
         if take(&mut bytes, MAGIC.len())? != MAGIC {
             return Err(InstanceRegistryError::Malformed);
         }
@@ -185,7 +194,7 @@ pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError>
                     out_level_params: indices(&mut bytes)?,
                 };
                 validate_parameters(env, &declaration, &parameters)?;
-                result.classes.insert(declaration, parameters);
+                self.classes.insert(declaration, parameters);
             }
             1 => {
                 let priority = u32::from_le_bytes(
@@ -204,15 +213,45 @@ pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError>
                     synth_order: indices(&mut bytes)?,
                 };
                 validate_order(env, &declaration, &parameters)?;
-                result.instances.insert(declaration, parameters);
+                self.instances.insert(declaration, parameters);
             }
             _ => return Err(InstanceRegistryError::Malformed),
         }
         if !bytes.is_empty() {
             return Err(InstanceRegistryError::Malformed);
         }
+        Ok(())
     }
-    Ok(result)
+}
+
+/// This journal's row for a class (tag 0).
+fn class_metadata_payload(
+    class: &Name,
+    parameters: &ClassParameters,
+) -> Result<Vec<u8>, InstanceRegistryError> {
+    let mut payload = MAGIC.to_vec();
+    payload.push(0);
+    write_name(class, &mut payload)?;
+    write_indices(&parameters.out_params, &mut payload)?;
+    write_indices(&parameters.out_level_params, &mut payload)?;
+    Ok(payload)
+}
+
+/// This journal's row for an instance (tag 1).
+fn instance_metadata_payload(
+    declaration: &Name,
+    parameters: &InstanceParameters,
+) -> Result<Vec<u8>, InstanceRegistryError> {
+    let mut payload = MAGIC.to_vec();
+    payload.push(1);
+    write_name(declaration, &mut payload)?;
+    payload.extend(parameters.priority.to_le_bytes());
+    payload.push(u8::from(parameters.scope.is_some()));
+    if let Some(scope) = &parameters.scope {
+        write_name(scope, &mut payload)?;
+    }
+    write_indices(&parameters.synth_order, &mut payload)?;
+    Ok(payload)
 }
 
 fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, InstanceRegistryError> {
@@ -244,12 +283,7 @@ pub fn register_class(
 ) -> Result<Environment, InstanceRegistryError> {
     validate_parameters(env, class, parameters)?;
     let env = super::register_class(env, class)?;
-    let mut payload = MAGIC.to_vec();
-    payload.push(0);
-    write_name(class, &mut payload)?;
-    write_indices(&parameters.out_params, &mut payload)?;
-    write_indices(&parameters.out_level_params, &mut payload)?;
-    append(&env, payload)
+    append(&env, class_metadata_payload(class, parameters)?)
 }
 
 /// Preserve the foreign prerequisite permutation and priority. Scoped entries
@@ -281,16 +315,189 @@ pub fn register_instance(
     } else {
         super::set_instance(env, declaration, parameters.priority)?
     };
-    let mut payload = MAGIC.to_vec();
-    payload.push(1);
-    write_name(declaration, &mut payload)?;
-    payload.extend(parameters.priority.to_le_bytes());
-    payload.push(u8::from(parameters.scope.is_some()));
-    if let Some(scope) = &parameters.scope {
-        write_name(scope, &mut payload)?;
+    append(&env, instance_metadata_payload(declaration, parameters)?)
+}
+
+/// Activation of an import's class, instance and default-instance journals while
+/// its admitted constants stay fixed (bead `fln-uyuz`).
+///
+/// Row by row this is [`register_class`], [`register_instance`] and
+/// [`super::defaults::register`]: the same checks, in the same order, against the
+/// same journal state, appending the same rows in the same order. It differs only
+/// in keeping that state. Those functions re-read and re-validate every earlier row
+/// on each call (including an `instance_telescope` per instance), which made
+/// activating the pinned `Init` closure quadratic in its instances.
+///
+/// Re-reading cannot change an answer here. The constants do not change while this
+/// runs, so a row validated once stays valid, and every registration accepted here
+/// leaves the journals in a state [`InstanceRegistry::read`] accepts. [`Self::finish`]
+/// still reads each journal it touched once, so a disagreement between the kept
+/// state and the journals is refused, never trusted.
+///
+/// Each step consumes the activation: an error drops it, exactly as an error from
+/// the per-call functions leaves the caller with no successor environment.
+#[derive(Debug)]
+pub struct ImportActivation {
+    env: Environment,
+    registry: Option<(InstanceRegistry, super::Positions)>,
+    defaults: Option<Vec<Name>>,
+}
+
+/// The ordinary registry as [`InstanceRegistry::read`] would find it in `env`,
+/// read on first use.
+fn kept<'a>(
+    slot: &'a mut Option<(InstanceRegistry, super::Positions)>,
+    env: &Environment,
+) -> Result<&'a mut (InstanceRegistry, super::Positions), InstanceRegistryError> {
+    match slot {
+        Some(kept) => Ok(kept),
+        None => Ok(slot.insert(InstanceRegistry::read_unsorted(env)?)),
     }
-    write_indices(&parameters.synth_order, &mut payload)?;
-    append(&env, payload)
+}
+
+/// How many rows the ordinary registry journal holds: the next row's order.
+fn ordinary_rows(env: &Environment) -> usize {
+    env.extension(&super::extension_name())
+        .map_or(0, |state| state.len())
+}
+
+impl ImportActivation {
+    pub fn new(env: Environment) -> Self {
+        Self {
+            env,
+            registry: None,
+            defaults: None,
+        }
+    }
+
+    /// The environment with every registration so far.
+    pub fn environment(&self) -> &Environment {
+        &self.env
+    }
+
+    /// [`register_class`].
+    pub fn register_class(
+        mut self,
+        class: &Name,
+        parameters: &ClassParameters,
+    ) -> Result<Self, InstanceRegistryError> {
+        validate_parameters(&self.env, class, parameters)?;
+        let (registry, positions) = kept(&mut self.registry, &self.env)?;
+        validate_class(&self.env, class)?;
+        let mut env = self.env.clone();
+        if !registry.is_class(class) {
+            let order = ordinary_rows(&env);
+            let row = super::class_payload(class)?;
+            env = super::append(&env, row.clone())?;
+            registry.apply_row(&env, positions, order, &row)?;
+        }
+        let row = class_metadata_payload(class, parameters)?;
+        env = append(&env, row.clone())?;
+        registry.imported.apply(&env, &row)?;
+        self.env = env;
+        Ok(self)
+    }
+
+    /// [`register_instance`].
+    pub fn register_instance(
+        mut self,
+        declaration: &Name,
+        parameters: &InstanceParameters,
+    ) -> Result<Self, InstanceRegistryError> {
+        validate_order(&self.env, declaration, parameters)?;
+        let (registry, positions) = kept(&mut self.registry, &self.env)?;
+        let class = validate_instance(&self.env, declaration)?;
+        if !registry.is_class(&class) {
+            return Err(InstanceRegistryError::UnknownClass(class));
+        }
+        let listed = |registry: &InstanceRegistry| {
+            registry
+                .candidates(&class)
+                .iter()
+                .any(|entry| &entry.declaration == declaration)
+        };
+        let (tag, scope) = match &parameters.scope {
+            Some(scope) => {
+                // `register_instance`'s own check, then `scoped::register`'s.
+                if listed(registry)
+                    || registry.scoped.iter().any(|(name, classes)| {
+                        name != scope
+                            && classes
+                                .values()
+                                .any(|rows| rows.iter().any(|row| &row.declaration == declaration))
+                    })
+                {
+                    return Err(InstanceRegistryError::DuplicateInstance(
+                        declaration.clone(),
+                    ));
+                }
+                (3, Some(scope))
+            }
+            // `set_instance`'s check: a global registration may be upserted.
+            None => {
+                if registry.is_scoped_instance(declaration) {
+                    return Err(InstanceRegistryError::DuplicateInstance(
+                        declaration.clone(),
+                    ));
+                }
+                (2, None)
+            }
+        };
+        let order = ordinary_rows(&self.env);
+        let row = super::instance_payload(tag, &class, declaration, parameters.priority, scope)?;
+        let mut env = super::append(&self.env, row.clone())?;
+        registry.apply_row(&env, positions, order, &row)?;
+        let row = instance_metadata_payload(declaration, parameters)?;
+        env = append(&env, row.clone())?;
+        registry.imported.apply(&env, &row)?;
+        self.env = env;
+        Ok(self)
+    }
+
+    /// [`super::defaults::register`].
+    pub fn register_default(
+        mut self,
+        declaration: &Name,
+        priority: u32,
+    ) -> Result<Self, InstanceRegistryError> {
+        let existing = match &mut self.defaults {
+            Some(existing) => existing,
+            None => self.defaults.insert(
+                super::defaults::read(&self.env)?
+                    .into_iter()
+                    .map(|row| row.candidate.declaration)
+                    .collect(),
+            ),
+        };
+        if existing.len() >= MAX_ROWS {
+            return Err(InstanceRegistryError::Limit);
+        }
+        if existing.contains(declaration) {
+            return Err(InstanceRegistryError::DuplicateInstance(
+                declaration.clone(),
+            ));
+        }
+        let class = validate_instance(&self.env, declaration)?;
+        let (registry, _) = kept(&mut self.registry, &self.env)?;
+        if !registry.is_class(&class) {
+            return Err(InstanceRegistryError::UnknownClass(class));
+        }
+        self.env = super::defaults::append(&self.env, declaration, priority)?;
+        existing.push(declaration.clone());
+        Ok(self)
+    }
+
+    /// The activated environment, once each journal touched has been read back
+    /// whole and found to agree.
+    pub fn finish(self) -> Result<Environment, InstanceRegistryError> {
+        if self.registry.is_some() {
+            InstanceRegistry::read(&self.env)?;
+        }
+        if self.defaults.is_some() {
+            super::defaults::read(&self.env)?;
+        }
+        Ok(self.env)
+    }
 }
 
 #[cfg(test)]

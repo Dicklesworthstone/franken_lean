@@ -74,6 +74,9 @@ pub struct InstanceEntry {
     pub order: usize,
 }
 
+/// Each registered declaration's scope and slot in its candidate list.
+type Positions = BTreeMap<Name, (Option<Name>, usize)>;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstanceRegistry {
     classes: BTreeSet<Name>,
@@ -180,12 +183,26 @@ fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
 
 impl InstanceRegistry {
     pub fn read(env: &Environment) -> Result<Self, InstanceRegistryError> {
+        let (mut out, _) = Self::read_unsorted(env)?;
+        for entries in out.instances.values_mut() {
+            entries.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| b.order.cmp(&a.order))
+            });
+        }
+        Ok(out)
+    }
+
+    /// [`Self::read`] before candidates are put in search order, with the slot of
+    /// every registered declaration: the state [`Self::apply_row`] extends.
+    fn read_unsorted(env: &Environment) -> Result<(Self, Positions), InstanceRegistryError> {
         let Some(extension) = env.extension(&extension_name()) else {
             let metadata = imported::read(env)?;
             if !metadata.classes.is_empty() || !metadata.instances.is_empty() {
                 return Err(InstanceRegistryError::Malformed);
             }
-            return Ok(Self::default());
+            return Ok((Self::default(), Positions::new()));
         };
         if extension.descriptor != descriptor() {
             return Err(InstanceRegistryError::Malformed);
@@ -197,86 +214,9 @@ impl InstanceRegistry {
         // Keep a stable slot per declaration. Attribute updates replace its
         // priority in place, just as the Reference's DiscrTree.insertVal does;
         // re-registering an existing instance does not make it a newer peer.
-        let mut positions = BTreeMap::new();
+        let mut positions = Positions::new();
         for (order, entry) in extension.entries().enumerate() {
-            if entry.payload.len() > MAX_ENTRY_BYTES {
-                return Err(InstanceRegistryError::Limit);
-            }
-            let mut bytes: &[u8] = &entry.payload;
-            if take(&mut bytes, MAGIC.len())? != MAGIC {
-                return Err(InstanceRegistryError::Malformed);
-            }
-            let tag = take(&mut bytes, 1)?[0];
-            let class = read_name(&mut bytes)?;
-            match tag {
-                0 => {
-                    validate_class(env, &class)?;
-                    if !out.classes.insert(class) {
-                        return Err(InstanceRegistryError::Malformed);
-                    }
-                }
-                // Tag 1 is the original strict registration operation. Tag 2
-                // is a global attribute upsert; tag 3 is a namespace-scoped
-                // upsert. Old readers refuse new tags instead of treating
-                // dormant registrations as ordinary global instances.
-                1..=3 => {
-                    let declaration = read_name(&mut bytes)?;
-                    let priority = u32::from_le_bytes(
-                        take(&mut bytes, 4)?
-                            .try_into()
-                            .map_err(|_| InstanceRegistryError::Malformed)?,
-                    );
-                    if !out.classes.contains(&class)
-                        || validate_instance(env, &declaration)? != class
-                    {
-                        return Err(InstanceRegistryError::Malformed);
-                    }
-                    let scope = if tag == 3 {
-                        Some(read_name(&mut bytes)?)
-                    } else {
-                        None
-                    };
-                    let entries = match &scope {
-                        Some(scope) => out
-                            .scoped
-                            .entry(scope.clone())
-                            .or_default()
-                            .entry(class)
-                            .or_default(),
-                        None => out.instances.entry(class).or_default(),
-                    };
-                    if let Some((previous_scope, slot)) = positions.get(&declaration) {
-                        if tag == 1 || previous_scope != &scope {
-                            return Err(InstanceRegistryError::Malformed);
-                        }
-                        let previous: &mut InstanceEntry = entries
-                            .get_mut(*slot)
-                            .ok_or(InstanceRegistryError::Malformed)?;
-                        if previous.declaration != declaration {
-                            return Err(InstanceRegistryError::Malformed);
-                        }
-                        previous.priority = priority;
-                    } else {
-                        positions.insert(declaration.clone(), (scope, entries.len()));
-                        entries.push(InstanceEntry {
-                            declaration,
-                            priority,
-                            order,
-                        });
-                    }
-                }
-                _ => return Err(InstanceRegistryError::Malformed),
-            }
-            if !bytes.is_empty() {
-                return Err(InstanceRegistryError::Malformed);
-            }
-        }
-        for entries in out.instances.values_mut() {
-            entries.sort_by(|a, b| {
-                b.priority
-                    .cmp(&a.priority)
-                    .then_with(|| b.order.cmp(&a.order))
-            });
+            out.apply_row(env, &mut positions, order, &entry.payload)?;
         }
         out.imported = imported::read(env)?;
         for name in out.imported.classes.keys() {
@@ -300,7 +240,89 @@ impl InstanceRegistry {
                 return Err(InstanceRegistryError::Malformed);
             }
         }
-        Ok(out)
+        Ok((out, positions))
+    }
+
+    /// Validate one journal row and fold it into the registry, as [`Self::read`]
+    /// does for each row in journal order. `order` is the row's journal index.
+    fn apply_row(
+        &mut self,
+        env: &Environment,
+        positions: &mut Positions,
+        order: usize,
+        payload: &[u8],
+    ) -> Result<(), InstanceRegistryError> {
+        if payload.len() > MAX_ENTRY_BYTES {
+            return Err(InstanceRegistryError::Limit);
+        }
+        let mut bytes: &[u8] = payload;
+        if take(&mut bytes, MAGIC.len())? != MAGIC {
+            return Err(InstanceRegistryError::Malformed);
+        }
+        let tag = take(&mut bytes, 1)?[0];
+        let class = read_name(&mut bytes)?;
+        match tag {
+            0 => {
+                validate_class(env, &class)?;
+                if !self.classes.insert(class) {
+                    return Err(InstanceRegistryError::Malformed);
+                }
+            }
+            // Tag 1 is the original strict registration operation. Tag 2
+            // is a global attribute upsert; tag 3 is a namespace-scoped
+            // upsert. Old readers refuse new tags instead of treating
+            // dormant registrations as ordinary global instances.
+            1..=3 => {
+                let declaration = read_name(&mut bytes)?;
+                let priority = u32::from_le_bytes(
+                    take(&mut bytes, 4)?
+                        .try_into()
+                        .map_err(|_| InstanceRegistryError::Malformed)?,
+                );
+                if !self.classes.contains(&class) || validate_instance(env, &declaration)? != class
+                {
+                    return Err(InstanceRegistryError::Malformed);
+                }
+                let scope = if tag == 3 {
+                    Some(read_name(&mut bytes)?)
+                } else {
+                    None
+                };
+                let entries = match &scope {
+                    Some(scope) => self
+                        .scoped
+                        .entry(scope.clone())
+                        .or_default()
+                        .entry(class)
+                        .or_default(),
+                    None => self.instances.entry(class).or_default(),
+                };
+                if let Some((previous_scope, slot)) = positions.get(&declaration) {
+                    if tag == 1 || previous_scope != &scope {
+                        return Err(InstanceRegistryError::Malformed);
+                    }
+                    let previous: &mut InstanceEntry = entries
+                        .get_mut(*slot)
+                        .ok_or(InstanceRegistryError::Malformed)?;
+                    if previous.declaration != declaration {
+                        return Err(InstanceRegistryError::Malformed);
+                    }
+                    previous.priority = priority;
+                } else {
+                    positions.insert(declaration.clone(), (scope, entries.len()));
+                    entries.push(InstanceEntry {
+                        declaration,
+                        priority,
+                        order,
+                    });
+                }
+            }
+            _ => return Err(InstanceRegistryError::Malformed),
+        }
+        if !bytes.is_empty() {
+            return Err(InstanceRegistryError::Malformed);
+        }
+        Ok(())
     }
     pub fn is_class(&self, name: &Name) -> bool {
         self.classes.contains(name)
@@ -390,10 +412,36 @@ pub fn register_class(
     if registry.is_class(class) {
         return Ok(env.clone());
     }
+    append(env, class_payload(class)?)
+}
+
+/// The journal row registering `class` (tag 0).
+fn class_payload(class: &Name) -> Result<Vec<u8>, InstanceRegistryError> {
     let mut payload = MAGIC.to_vec();
     payload.push(0);
     write_name(class, &mut payload)?;
-    append(env, payload)
+    Ok(payload)
+}
+
+/// A journal row registering `declaration` under `class`: tag 1 is the strict
+/// registration, 2 the global upsert, 3 the namespace-scoped upsert (the only
+/// tag that carries a scope).
+fn instance_payload(
+    tag: u8,
+    class: &Name,
+    declaration: &Name,
+    priority: u32,
+    scope: Option<&Name>,
+) -> Result<Vec<u8>, InstanceRegistryError> {
+    let mut payload = MAGIC.to_vec();
+    payload.push(tag);
+    write_name(class, &mut payload)?;
+    write_name(declaration, &mut payload)?;
+    payload.extend(priority.to_le_bytes());
+    if let Some(scope) = scope {
+        write_name(scope, &mut payload)?;
+    }
+    Ok(payload)
 }
 
 /// Register an already admitted safe declaration; never admit or execute it.
@@ -417,12 +465,10 @@ pub fn register_instance(
             declaration.clone(),
         ));
     }
-    let mut payload = MAGIC.to_vec();
-    payload.push(1);
-    write_name(&class, &mut payload)?;
-    write_name(declaration, &mut payload)?;
-    payload.extend(priority.to_le_bytes());
-    append(env, payload)
+    append(
+        env,
+        instance_payload(1, &class, declaration, priority, None)?,
+    )
 }
 
 /// Add or reprioritize an already admitted safe declaration for a global
@@ -449,12 +495,10 @@ pub fn set_instance(
     if !registry.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
-    let mut payload = MAGIC.to_vec();
-    payload.push(2);
-    write_name(&class, &mut payload)?;
-    write_name(declaration, &mut payload)?;
-    payload.extend(priority.to_le_bytes());
-    append(env, payload)
+    append(
+        env,
+        instance_payload(2, &class, declaration, priority, None)?,
+    )
 }
 
 fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], InstanceRegistryError> {

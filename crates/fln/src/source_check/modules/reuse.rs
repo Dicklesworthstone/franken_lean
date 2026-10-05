@@ -1105,6 +1105,28 @@ impl Engine {
     }
 }
 
+/// The checked set `record` re-proves for `modules`, for tests elsewhere in the crate
+/// that need a second copy of a council-admitted closure without a second council.
+#[cfg(test)]
+impl Engine {
+    pub(super) fn rebuild_for_test(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        record: &ImportReuseRecord,
+    ) -> Option<CheckedOleanSet> {
+        match self.rebuild_reused_olean_set(
+            modules,
+            &KVMap::new(),
+            super::imported::tests::limits(1).check,
+            record,
+            None,
+        ) {
+            Outcome::Complete(Ok(checked)) => Some(checked),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::imported::tests::{closure, inputs, limits, n, on_import_stack, pinned_lib};
