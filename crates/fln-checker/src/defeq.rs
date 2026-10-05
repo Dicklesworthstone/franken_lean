@@ -20,6 +20,7 @@ mod memo;
 mod spine;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use memo::{ArgumentMemo, Remembered};
 
@@ -38,8 +39,8 @@ use crate::string_reduce::{
 };
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
-    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_at_with,
-    whnf_core_at_with, whnf_delta_step_at_with,
+    WhnfBudget, WhnfContext, WhnfFault, WhnfInput, WhnfOutcome, WhnfRefusal, WhnfStop,
+    whnf_at_with, whnf_core_of_with, whnf_delta_step_of_with,
 };
 use crate::wire::{
     ExprId, ExprNode, MAX_BVAR_INDEX, NamePart, WireExpr, WireName, expression_owned_units,
@@ -1315,22 +1316,38 @@ impl SlowControl {
     }
 }
 
+/// A term this comparison produced. `copied` marks the whnf module's own copy
+/// of a term, as a normalization reported it (`WhnfInput::Copied`); normalizing
+/// it again needs no input copy.
+struct Generated {
+    term: Arc<WireExpr>,
+    copied: bool,
+}
+
+fn generated_entry(
+    generated: &[Generated],
+    index: usize,
+    side: DefEqSide,
+) -> Result<&Generated, SlowHalt> {
+    generated
+        .get(index)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingGeneratedArena {
+            side,
+            generation: usize_units(index).saturating_add(1),
+        }))
+}
+
 fn source_term<'a>(
     reference: DefEqTerm,
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [WireExpr],
+    generated: &'a [Generated],
 ) -> Result<&'a WireExpr, SlowHalt> {
     match reference.source {
         DefEqSource::Original(DefEqSide::Left) => Ok(left),
         DefEqSource::Original(DefEqSide::Right) => Ok(right),
         DefEqSource::Generated { index, side } => {
-            generated
-                .get(index)
-                .ok_or(SlowHalt::Fault(DefEqFault::MissingGeneratedArena {
-                    side,
-                    generation: usize_units(index).saturating_add(1),
-                }))
+            Ok(&generated_entry(generated, index, side)?.term)
         }
     }
 }
@@ -1339,11 +1356,11 @@ fn source_term<'a>(
 struct TermSources<'a> {
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [WireExpr],
+    generated: &'a [Generated],
 }
 
 impl<'a> TermSources<'a> {
-    fn new(left: &'a WireExpr, right: &'a WireExpr, generated: &'a [WireExpr]) -> TermSources<'a> {
+    fn new(left: &'a WireExpr, right: &'a WireExpr, generated: &'a [Generated]) -> TermSources<'a> {
         TermSources {
             left,
             right,
@@ -1354,13 +1371,25 @@ impl<'a> TermSources<'a> {
     fn source(self, reference: DefEqTerm) -> Result<&'a WireExpr, SlowHalt> {
         source_term(reference, self.left, self.right, self.generated)
     }
+
+    /// The term as a whnf input: a generated term a normalization reported as
+    /// the whnf module's own copy is handed over as such.
+    fn whnf_input(self, reference: DefEqTerm) -> Result<WhnfInput<'a>, SlowHalt> {
+        if let DefEqSource::Generated { index, side } = reference.source {
+            let entry = generated_entry(self.generated, index, side)?;
+            if entry.copied {
+                return Ok(WhnfInput::Copied(&entry.term));
+            }
+        }
+        Ok(WhnfInput::Borrowed(self.source(reference)?))
+    }
 }
 
 fn slow_node<'a>(
     reference: DefEqTerm,
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [WireExpr],
+    generated: &'a [Generated],
 ) -> Result<(&'a WireExpr, &'a ExprNode), SlowHalt> {
     let term = source_term(reference, left, right, generated)?;
     let node = term
@@ -1420,7 +1449,7 @@ fn trace_unresolved(
     right_reference: DefEqTerm,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &[WireExpr],
+    generated: &[Generated],
 ) {
     if std::env::var_os("FLN_CHECKER_TRACE").is_none() {
         return;
@@ -1894,7 +1923,7 @@ fn resolve_nat_predecessor(
     side: DefEqSide,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &mut Vec<WireExpr>,
+    generated: &mut Vec<Generated>,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqTerm, SlowHalt> {
@@ -1916,7 +1945,7 @@ fn nat_offset_action(
     references: (DefEqTerm, DefEqTerm),
     left: &WireExpr,
     right: &WireExpr,
-    generated: &mut Vec<WireExpr>,
+    generated: &mut Vec<Generated>,
     offset_context: NatOffsetContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -2069,7 +2098,7 @@ type HeightPair = (Option<u32>, Option<u32>);
 fn lazy_delta_heights(
     (left_reference, right_reference): (DefEqTerm, DefEqTerm),
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<WireExpr>,
+    generated: &mut Vec<Generated>,
     (pending, offset_context, string_context, decomposed): (
         &mut Vec<PendingPair>,
         NatOffsetContext,
@@ -2134,7 +2163,7 @@ fn lazy_delta_heights(
         DefEqSide::Left => left_reference,
         DefEqSide::Right => right_reference,
     };
-    let result = normalize(
+    let (result, copied) = normalize(
         projection_reference,
         TermSources::new(left, right, generated),
         context,
@@ -2148,7 +2177,7 @@ fn lazy_delta_heights(
         // the pin.
         return Ok(Some((left_height, right_height)));
     }
-    let reduced = retain_generated(generated, projection_side, result.term);
+    let reduced = retain_normalized(generated, projection_side, result.term, copied);
     // The pin's `try_unfold_proj_app` compares the reduced term with its input
     // (`e_new != e`), not the work spent. Reductions can rebuild the same term:
     // a K gate over a stuck `Eq.rec` spends them and changes nothing. Pushing
@@ -2195,21 +2224,21 @@ fn normalize(
     mode: NormalizationMode,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<crate::whnf::WhnfResult, SlowHalt> {
+) -> Result<(crate::whnf::WhnfResult, bool), SlowHalt> {
     let budget = control.begin_normalization(cancelled)?;
-    let term = sources.source(reference)?;
-    let outcome = match mode {
+    let input = sources.whnf_input(reference)?;
+    let (outcome, copied) = match mode {
         NormalizationMode::Core => {
-            whnf_core_at_with(term, reference.root, context, budget, cancelled)
+            whnf_core_of_with(input, reference.root, context, budget, cancelled)
         }
         NormalizationMode::DeltaStep => {
-            whnf_delta_step_at_with(term, reference.root, context, budget, cancelled)
+            whnf_delta_step_of_with(input, reference.root, context, budget, cancelled)
         }
     };
     match outcome {
         WhnfOutcome::Complete(result) => {
             control.absorb_whnf(&result, cancelled)?;
-            Ok(result)
+            Ok((result, copied))
         }
         WhnfOutcome::Refused(refusal) => Err(SlowHalt::Refusal {
             side: reference.side(),
@@ -2724,7 +2753,7 @@ fn eta_candidate(
     (mut lambda, mut body): (DefEqTerm, ExprId),
     outside: DefEqTerm,
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<WireExpr>,
+    generated: &mut Vec<Generated>,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -2926,7 +2955,7 @@ fn exact_function_eta(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<WireExpr>,
+    generated: &mut Vec<Generated>,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -3267,10 +3296,23 @@ fn exact_structure_eta(
     )
 }
 
-fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
+fn retain_generated(generated: &mut Vec<Generated>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
+    retain_normalized(generated, side, term, false)
+}
+
+/// A normalization's result, with the copy flag it reported (`Generated`).
+fn retain_normalized(
+    generated: &mut Vec<Generated>,
+    side: DefEqSide,
+    term: WireExpr,
+    copied: bool,
+) -> DefEqTerm {
     let root = term.root();
     let index = generated.len();
-    generated.push(term);
+    generated.push(Generated {
+        term: Arc::new(term),
+        copied,
+    });
     DefEqTerm {
         source: DefEqSource::Generated { index, side },
         root,
@@ -3430,7 +3472,7 @@ fn regular_same_head_apps_def_eq(
     right_reference: DefEqTerm,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &[WireExpr],
+    generated: &[Generated],
     context: &WhnfContext,
     scope: ConversionScope,
     control: &mut SlowControl,
@@ -3733,7 +3775,7 @@ fn run_slow(
                     }
                 }
 
-                let left_result = normalize(
+                let (left_result, left_copied) = normalize(
                     left_reference,
                     TermSources::new(left, right, &generated),
                     context,
@@ -3741,7 +3783,7 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )?;
-                let right_result = normalize(
+                let (right_result, right_copied) = normalize(
                     right_reference,
                     TermSources::new(left, right, &generated),
                     context,
@@ -3765,13 +3807,17 @@ fn run_slow(
                 // The zero-shift structural comparison is metered by this query.
                 let mut next_left = left_reference;
                 let mut next_right = right_reference;
-                for (reference, result, next) in [
-                    (left_reference, left_result, &mut next_left),
-                    (right_reference, right_result, &mut next_right),
+                for (reference, result, copied, next) in [
+                    (left_reference, left_result, left_copied, &mut next_left),
+                    (right_reference, right_result, right_copied, &mut next_right),
                 ] {
                     if result.reductions != 0 {
-                        let candidate =
-                            retain_generated(&mut generated, reference.side(), result.term);
+                        let candidate = retain_normalized(
+                            &mut generated,
+                            reference.side(),
+                            result.term,
+                            copied,
+                        );
                         if !result.has_auxiliary_work
                             || !eta_structurally_equal(
                                 candidate,
@@ -4027,7 +4073,7 @@ fn run_slow(
                 let mut next_left = left_reference;
                 let mut next_right = right_reference;
                 if unfold_left {
-                    let result = normalize(
+                    let (result, copied) = normalize(
                         left_reference,
                         TermSources::new(left, right, &generated),
                         context,
@@ -4052,10 +4098,11 @@ fn run_slow(
                             control.progress,
                         ));
                     }
-                    next_left = retain_generated(&mut generated, DefEqSide::Left, result.term);
+                    next_left =
+                        retain_normalized(&mut generated, DefEqSide::Left, result.term, copied);
                 }
                 if unfold_right {
-                    let result = normalize(
+                    let (result, copied) = normalize(
                         right_reference,
                         TermSources::new(left, right, &generated),
                         context,
@@ -4080,7 +4127,8 @@ fn run_slow(
                             control.progress,
                         ));
                     }
-                    next_right = retain_generated(&mut generated, DefEqSide::Right, result.term);
+                    next_right =
+                        retain_normalized(&mut generated, DefEqSide::Right, result.term, copied);
                 }
                 pending.push((
                     next_left,

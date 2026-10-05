@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use fln_checker::defeq::{DefEqBudget, DefEqOutcome, DefEqStop, def_eq};
+use fln_checker::defeq::{DefEqBudget, DefEqOutcome, DefEqStop, def_eq, def_eq_with};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
@@ -4059,4 +4059,49 @@ fn a_quotient_eliminator_whose_major_changed_still_reduces_or_keeps_its_progress
         WhnfBudget::unlimited(),
     ));
     assert_eq!(result.term, decoded(&quot_lift(quotient_free("q"))));
+}
+
+/// Conversion hands a term it produced back to WHNF as the module's own copy,
+/// so normalizing it again skips the input copy (bead
+/// `fln-checker-associator-time-y8wc`, comment 3170). `(fun y => y) (k tower)`
+/// against `tower`, with `k := fun t => t`: the first pass beta-reduces the
+/// left side to `k tower`, and the next normalizes that result again, once
+/// without delta and once to unfold `k`, before the sides compare equal.
+#[test]
+fn conversion_normalizes_its_own_results_without_copying_them_again() {
+    const DEPTH: usize = 2_000;
+    let free = |label: &str| Expr::fvar(FVarId(primary_name(label)));
+    let tower = (0..DEPTH).fold(free("x"), |inner, _| Expr::app(free("g"), inner));
+    let lambda = |name: &str| {
+        Expr::lam(
+            primary_name(name),
+            free("A"),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        )
+    };
+    let context = definition_context(vec![definition_entry(
+        "k",
+        Vec::new(),
+        decoded(&lambda("t")),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    )]);
+    let left = decoded(&Expr::app(
+        lambda("y"),
+        Expr::app(constant("k"), tower.clone()),
+    ));
+    let right = decoded(&tower);
+    let mut polls = 0_u64;
+    let outcome = def_eq_with(&left, &right, &context, DefEqBudget::unlimited(), || {
+        polls += 1;
+        false
+    });
+    assert!(matches!(outcome, DefEqOutcome::Equal(_)), "{outcome:?}");
+    // Measured: 72,119 polls; copying the retained result again before each of
+    // its two normalizations polled 88,131.
+    assert!(
+        polls < 80_000,
+        "{polls} polls: conversion copied a result it had already copied"
+    );
 }

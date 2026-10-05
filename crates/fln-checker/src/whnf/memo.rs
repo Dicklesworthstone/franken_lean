@@ -31,6 +31,8 @@ struct Entry {
     delta_mode: DeltaMode,
     materialization: TermBudget,
     result: WhnfResult,
+    /// Whether `result`'s term is the module's own copy of a term (`WhnfInput`).
+    copied: bool,
 }
 
 impl Entry {
@@ -184,7 +186,7 @@ impl WhnfMemo {
         input: &WireExpr,
         delta_mode: DeltaMode,
         budget: &WhnfBudget,
-    ) -> Option<WhnfResult> {
+    ) -> Option<(WhnfResult, bool)> {
         let table = self.0.lock().ok()?;
         table
             .buckets
@@ -192,7 +194,7 @@ impl WhnfMemo {
             .iter()
             .find(|entry| entry.matches(input, delta_mode, budget.materialization))
             .filter(|entry| covers(budget, &entry.result))
-            .map(|entry| entry.result.clone())
+            .map(|entry| (entry.result.clone(), entry.copied))
     }
 
     /// Record a complete result. Results that reduced nothing are not worth a
@@ -203,6 +205,7 @@ impl WhnfMemo {
         delta_mode: DeltaMode,
         materialization: TermBudget,
         result: &WhnfResult,
+        copied: bool,
     ) {
         if result.reductions == 0 && result.delta_reductions == 0 {
             return;
@@ -231,6 +234,7 @@ impl WhnfMemo {
             delta_mode,
             materialization,
             result: result.clone(),
+            copied,
         });
         table.entries += 1;
         table.stored_nodes = table.stored_nodes.saturating_add(nodes);
@@ -425,6 +429,7 @@ mod tests {
                 has_auxiliary_work: false,
                 string_progress: StringExpansionProgress::default(),
             },
+            copied: false,
         };
         let admits_fresh = |bucket: &[Entry]| {
             admits(
