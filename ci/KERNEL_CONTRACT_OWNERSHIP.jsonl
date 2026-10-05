@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":561,"projection_hash":"ae2a576ed511a10e6d7fbcf457da3474f720234c1c2c9e3bd72c5aabad7a7298"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":562,"projection_hash":"369f6c902c73601ef1df4e5b2c03038f73b11827326b7e6b835d21871fc57392"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -125,6 +125,7 @@
 {"id":"fln-freeze-gate-blind-spot-bi3q"}
 {"id":"fln-frontier-oom-abort-w9dx"}
 {"id":"fln-fur"}
+{"id":"fln-fur.1"}
 {"id":"fln-g1-gate-decision-rysb"}
 {"id":"fln-g1mc"}
 {"id":"fln-g6d1"}
