@@ -144,6 +144,26 @@ fn four_stages_support_aliases_mixed_arities_and_direct_saturation() {
     );
 }
 
+/// Each value was computed by the pinned Reference (`lean` v4.32.0, `#eval`)
+/// on the same definitions (fln-staged-closure-partial-application-ug55).
+#[test]
+fn every_stage_of_a_four_stage_closure_can_be_partially_applied() {
+    let f = "let f : Nat -> Nat -> Nat -> Nat -> Nat -> Nat := (by intro a; let first := a + offset; intro b c; let middle := first + b + c; intro d; let last := middle + d; intro e; exact last + e)";
+    for (body, expected) in [
+        ("let g := f 1; g 2 3 4 5", "42"),
+        ("let g := f 1; let h := g 2; h 3 4 5", "42"),
+        ("let i := f 1 2 3; i 4 5", "42"),
+        ("let j := f 1 2 3 4; j 5", "42"),
+        ("let g := f 1; let h := g 2 3; let k := h 4; k 5", "42"),
+        ("let i := f 1 2 3; i 4 5 + i 0 0", "75"),
+    ] {
+        run(
+            &format!("def use (offset : Nat) : Nat := {f}; {body}\n#eval use 27"),
+            expected,
+        );
+    }
+}
+
 #[test]
 fn nested_stages_keep_owned_strings_records_and_returned_payloads_alive() {
     run(

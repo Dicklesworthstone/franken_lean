@@ -301,7 +301,17 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(body, expected));
                                 continue;
                             }
-                            if let Some(lambda) = self.local_callable_template(value, type_)? {
+                            // `let x : T := v; x` has no use site to specialize:
+                            // substituting would only drop the typed binding that
+                            // `annotate_callable_tail` uses to keep a staged
+                            // callback's checked type. Without it an intermediate
+                            // stage of a closure with four or more stages is never
+                            // registered, and ingress refuses its lambda.
+                            let result_binding = matches!(body.node(), ExprNode::BVar { idx: 0 })
+                                && matches!(self.value_type(type_)?, Some(ValueType::Closure(_)));
+                            if !result_binding
+                                && let Some(lambda) = self.local_callable_template(value, type_)?
+                            {
                                 // A local name must not hide a generic or staged
                                 // literal helper from later call-site specialization.
                                 // Only lambda syntax moves; computed initializers
