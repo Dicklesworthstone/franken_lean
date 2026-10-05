@@ -304,14 +304,16 @@ fn an_editor_session_checks_and_hovers_against_imported_oleans() {
         "{}",
         rejected.diagnostics
     );
-    // Ext.B exists on the search path, but this file never imported it.
+    // Ext.B exists on the search path, but this file never imported it. The pin on this
+    // file, with Ext.A, Ext.B and Local compiled to .olean: `4:40:
+    // error(lean.unknownIdentifier): Unknown identifier `Ext.B`` (v4.32.0, 2026-10-05).
     let leaked = USE.replace("Ext.A P (Local.id P h)", "Ext.B P h");
     let unimported = session.check(&change(&uri, 3, &leaked));
     assert!(unimported.source_check.is_none());
     assert!(
         unimported
             .diagnostics
-            .contains("source reference `Ext.B` does not name a known constant"),
+            .contains("Unknown identifier `Ext.B`"),
         "{}",
         unimported.diagnostics
     );

@@ -2718,9 +2718,10 @@ fn installed_proposition_conditionals_retain_invalid_unselected_branches() {
     }
 }
 
-/// A reference to an unknown constant is refused with that constant's name. The
-/// message used to read "source reference does not name a known constant" with no
-/// name at all, from term position and from an application head alike.
+/// A reference to an unknown constant is refused with that constant's name, in the pin's
+/// words, from term position and from an application head alike. The pin on these two
+/// files (v4.32.0, 2026-10-05): `1:39: error(lean.unknownIdentifier): Unknown identifier
+/// `notHere`` and `1:36: error(lean.unknownIdentifier): Unknown identifier `Missing.thing``.
 #[test]
 fn an_unknown_constant_is_refused_by_its_name() {
     for (source, name) in [
@@ -2742,9 +2743,7 @@ fn an_unknown_constant_is_refused_by_its_name() {
         assert!(!output.status.success(), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains(&format!(
-                "source reference `{name}` does not name a known constant"
-            )),
+            stderr.contains(&format!("Unknown identifier `{name}`")),
             "{stderr}"
         );
     }

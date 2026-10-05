@@ -10316,6 +10316,22 @@ mod tests {
         EngineExecutionLimits::new(test_budget())
     }
 
+    /// The pin-worded message of an elaboration-time unknown name, if `error` is one (also
+    /// through a batch command). `None` for every other refusal, K1's included.
+    fn unknown_name_message(error: &EngineExecutionError) -> Option<String> {
+        use fln_elab::source::SourceInferenceError;
+        match error {
+            EngineExecutionError::BatchCommand { error, .. } => unknown_name_message(error),
+            EngineExecutionError::Frontend(super::DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    inference @ (SourceInferenceError::UnknownConstant(_)
+                    | SourceInferenceError::UnknownMemberConstant(_)),
+                ),
+            )) => Some(inference.to_string()),
+            _ => None,
+        }
+    }
+
     fn seeded_engine() -> Engine {
         Engine::with_nat_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the Nat seed council does not reject")
@@ -14996,11 +15012,15 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the Nat-only constructor must not silently invent String authority");
-        assert!(matches!(
-            missing_type,
-            EngineExecutionError::KernelRejected { ref message, .. }
-                if message.contains("String")
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) reports
+        // `Unknown constant `String`` at the literal, having auto-bound the unknown annotation
+        // `String` as an implicit; this door has no auto-bound implicits and stops at the
+        // annotation.
+        assert_eq!(
+            unknown_name_message(&missing_type).as_deref(),
+            Some("Unknown identifier `String`"),
+            "{missing_type:?}"
+        );
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the source seed passes the dual-checker council")
@@ -15191,14 +15211,20 @@ mod tests {
                 test_limits(),
             )
             .expect_err("a later definition refusal exposes no partial evaluation batch");
-        assert!(matches!(
-            refusal,
-            EngineExecutionError::BatchCommand {
-                index: 1,
-                error,
-                ..
-            } if matches!(*error, EngineExecutionError::KernelRejected { .. })
-        ));
+        // The pin on this file: `2:14: error(lean.unknownIdentifier): Unknown identifier
+        // `missing`` (v4.32.0, 2026-10-05), an elaboration error.
+        assert!(
+            matches!(
+                &refusal,
+                EngineExecutionError::BatchCommand {
+                    index: 1,
+                    error,
+                    ..
+                } if unknown_name_message(error).as_deref()
+                    == Some("Unknown identifier `missing`")
+            ),
+            "{refusal:?}"
+        );
         assert_eq!(engine.logical_root(&options), base_root);
 
         let recovered = engine
@@ -16139,13 +16165,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.add 40 2", &options, test_limits())
             .expect_err("the Nat-only seed must not invent the Nat.add constant");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error, as at the pin: a `prelude` file declaring only `Nat` gets
+        // `error(lean.unknownIdentifier): Unknown constant `Nat.add`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.add`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16194,24 +16220,26 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := 40 + 2", &options, test_limits())
             .expect_err("notation must not invent Nat.add authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) stops one step
+        // earlier, at `Unknown constant `OfNat``, because its numerals elaborate through
+        // `OfNat`; this seed's numerals are native, so the first missing constant is `Nat.add`.
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.add`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         let missing_equality = nat_only
             .execute_source_definition(b"def equal : Bool := 40 == 42", &options, test_limits())
             .expect_err("notation must not invent Nat.beq authority");
-        assert!(matches!(
-            missing_equality,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error at the first missing name, the annotation's `Bool`. The pin has
+        // no faithful analog: without `Init`, `==` is not even a token (a `prelude` file
+        // declaring only `Nat` gets `Unknown constant `OfNat`` and `expected token`).
+        assert_eq!(
+            unknown_name_message(&missing_equality).as_deref(),
+            Some("Unknown identifier `Bool`"),
+            "{missing_equality:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
@@ -16312,13 +16340,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.pred 9", &options, test_limits())
             .expect_err("the Nat type alone must not invent Nat.pred authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring only `Nat` gets
+        // `Unknown constant `Nat.pred`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.pred`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16389,13 +16417,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := Nat.log2 8", &options, test_limits())
             .expect_err("the Nat type alone must not invent Nat.log2 authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring only `Nat` gets
+        // `Unknown constant `Nat.log2`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.log2`"),
+            "{missing:?}"
+        );
         assert_eq!(nat_only.logical_root(&options), base_root);
         assert!(
             !nat_only
@@ -16575,13 +16603,13 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the String-only engine must not invent String.append authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `String.append`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `String.append`"),
+            "{missing:?}"
+        );
         assert_eq!(string_only.logical_root(&options), base_root);
         assert!(
             !string_only
@@ -16634,13 +16662,13 @@ mod tests {
                 test_limits(),
             )
             .expect_err("the String type alone must not invent String.length authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `String.length`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `String.length`"),
+            "{missing:?}"
+        );
         assert_eq!(string_only.logical_root(&options), base_root);
         assert!(
             !string_only
@@ -16691,13 +16719,13 @@ mod tests {
         let missing = unseeded
             .execute_source_definition(b"def answer := Nat.beq 42 42", &options, test_limits())
             .expect_err("the scalar types alone must not invent Nat.beq authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // As at the pin: a `prelude` file declaring `Nat` and `String` gets
+        // `Unknown constant `Nat.beq`` (v4.32.0, 2026-10-05).
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown constant `Nat.beq`"),
+            "{missing:?}"
+        );
         assert_eq!(unseeded.logical_root(&options), base_root);
         assert!(
             !unseeded
@@ -16760,13 +16788,13 @@ mod tests {
         let missing = nat_only
             .execute_source_definition(b"def answer := true", &options, test_limits())
             .expect_err("the Nat-only door must not invent Bool constructor authority");
-        assert!(matches!(
-            missing,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::UnknownConstant,
-                ..
-            }
-        ));
+        // An elaboration error. The pin's `prelude` analog (only `Nat` declared) says
+        // `Unknown identifier `true``; this door names the constructor it resolved `true` to.
+        assert_eq!(
+            unknown_name_message(&missing).as_deref(),
+            Some("Unknown identifier `Bool.true`"),
+            "{missing:?}"
+        );
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the exact Bool block passes the dual-checker council")

@@ -50,6 +50,12 @@ pub enum SourceInferenceError {
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
+    /// An unknown name with a proper prefix that is itself a constant (`Nat.nope` when `Nat`
+    /// exists). The pin reads the rest as a member of that constant and words it
+    /// `Unknown constant`, not `Unknown identifier`. Produced only where an error leaves the
+    /// elaborator (`crate::with_pin_unknown_name_wording`); inside it every unknown name is
+    /// [`Self::UnknownConstant`].
+    UnknownMemberConstant(Name),
     InvalidNamedArgument(Name),
     DuplicateNamedArgument(Name),
     InvalidFieldReceiver(Name),
@@ -93,11 +99,13 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
-            Self::UnknownConstant(name) => write!(
-                f,
-                "source reference `{}` does not name a known constant",
-                name.to_display_string()
-            ),
+            // The pin's two wordings for `lean.unknownIdentifier`, verbatim.
+            Self::UnknownConstant(name) => {
+                write!(f, "Unknown identifier `{}`", name.to_display_string())
+            }
+            Self::UnknownMemberConstant(name) => {
+                write!(f, "Unknown constant `{}`", name.to_display_string())
+            }
             Self::InvalidNamedArgument(name) => write!(
                 f,
                 "invalid argument name `{}` for this application",
