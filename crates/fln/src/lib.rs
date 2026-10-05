@@ -1608,15 +1608,27 @@ pub struct OleanFrontierRow {
     pub elapsed: std::time::Duration,
 }
 
-/// What a frontier observer is told, in order: `Started` just before a module's
-/// declarations go to the council, `Decided` once its row exists. A module that is
-/// blocked, or that failed to decode, is decided without ever starting.
+/// What a frontier observer is told: `Started` just before a module's
+/// declarations go to the council, `Settled` the moment its row exists, and
+/// `Decided` once its row and every earlier one exist. A module that is blocked,
+/// or that failed to decode, settles and is decided without ever starting.
+///
+/// `Decided` arrives in frontier order, so that stream is the same at any thread
+/// count. `Settled` arrives in completion order, which is not: it exists so a row
+/// survives a crash that would have held it back behind a slower module still in
+/// flight (bead fln-frontier-oom-abort-w9dx). Every module settles exactly once,
+/// before it is decided, and both carry its frontier `position`.
 #[derive(Debug, Clone, Copy)]
 pub enum OleanFrontierEvent<'a> {
     Started {
         position: usize,
         total: usize,
         module: &'a Name,
+    },
+    Settled {
+        position: usize,
+        total: usize,
+        row: &'a OleanFrontierRow,
     },
     Decided {
         position: usize,
@@ -4193,6 +4205,19 @@ impl Engine {
 
             let mut running = vec![false; count];
             let mut in_flight = 0_usize;
+            // A council result's row, reported the moment it exists.
+            let settle =
+                |index: usize,
+                 pending_rows: &[Option<OleanFrontierRow>],
+                 on_event: &mut dyn FnMut(OleanFrontierEvent<'_>)| {
+                    if let Some(row) = &pending_rows[index] {
+                        on_event(OleanFrontierEvent::Settled {
+                            position: position[index] + 1,
+                            total: count,
+                            row,
+                        });
+                    }
+                };
             let record =
                 |done: FrontierDone,
                  running: &mut Vec<bool>,
@@ -4249,10 +4274,15 @@ impl Engine {
                     };
                     decided[index] = true;
                     engines.release(index, &closures, false)?;
-                    pending_rows[index] = Some(OleanFrontierRow {
+                    let row = pending_rows[index].insert(OleanFrontierRow {
                         name: modules[index].name.clone(),
                         verdict,
                         elapsed: std::time::Duration::ZERO,
+                    });
+                    on_event(OleanFrontierEvent::Settled {
+                        position: position[index] + 1,
+                        total: count,
+                        row,
                     });
                 }
 
@@ -4311,6 +4341,7 @@ impl Engine {
                         // so the events keep the one-at-a-time order.
                         let done = check(job);
                         in_flight -= 1;
+                        let index = done.index;
                         record(
                             done,
                             &mut running,
@@ -4319,6 +4350,7 @@ impl Engine {
                             &mut engines,
                             &mut pending_rows,
                         );
+                        settle(index, &pending_rows, on_event);
                         break;
                     }
                     if job_sender.send(job).is_err() {
@@ -4347,6 +4379,7 @@ impl Engine {
                             detail: "every frontier worker thread has stopped",
                         })?;
                 in_flight -= 1;
+                let index = done.index;
                 record(
                     done,
                     &mut running,
@@ -4355,6 +4388,7 @@ impl Engine {
                     &mut engines,
                     &mut pending_rows,
                 );
+                settle(index, &pending_rows, on_event);
             }
             drop(job_sender);
             Ok(())

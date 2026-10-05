@@ -93,17 +93,25 @@ fn a_failing_module_blocks_only_its_dependents() {
                 .collect();
             let mut observed = Vec::new();
             let mut started = Vec::new();
+            // (position, decided?) in arrival order, for the settle-before-decide law.
+            let mut arrivals = Vec::new();
             let frontier = Engine::from_environment(Environment::new())
                 .check_olean_frontier_observed(&inputs, &KVMap::new(), limits, &mut |event| {
                     match event {
                         OleanFrontierEvent::Started {
                             position, module, ..
                         } => started.push((position, module.clone())),
+                        OleanFrontierEvent::Settled { position, row, .. } => {
+                            arrivals.push((position, false, row.name.clone()));
+                        }
                         OleanFrontierEvent::Decided {
                             position,
                             total,
                             row,
-                        } => observed.push((position, total, row.name.clone())),
+                        } => {
+                            arrivals.push((position, true, row.name.clone()));
+                            observed.push((position, total, row.name.clone()));
+                        }
                     }
                 })
                 .expect("the set itself is well formed");
@@ -118,6 +126,24 @@ fn a_failing_module_blocks_only_its_dependents() {
                 .map(|(index, row)| (index + 1, 4, row.name.clone()))
                 .collect();
             assert_eq!(observed, expected);
+            // Every row also settles exactly once, at its own position and before
+            // it is decided (bead fln-frontier-oom-abort-w9dx): the settle line is
+            // what survives a crash that holds the decided stream back.
+            for (position, _, name) in &expected {
+                let settled: Vec<usize> = arrivals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (at, decided, _))| at == position && !decided)
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(settled.len(), 1, "{name:?} settles exactly once");
+                let decided = arrivals
+                    .iter()
+                    .position(|(at, decided, _)| at == position && *decided)
+                    .expect("every row is decided");
+                assert!(settled[0] < decided, "{name:?} settles before it is decided");
+                assert_eq!(&arrivals[settled[0]].2, name, "the settle line names its module");
+            }
             // Only modules that reach the council start: the undecodable Init.Coe and
             // its blocked dependent are decided without starting.
             let accepted: Vec<(usize, Name)> = frontier

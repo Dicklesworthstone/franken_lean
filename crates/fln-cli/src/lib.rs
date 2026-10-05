@@ -8853,15 +8853,25 @@ fn check_olean_module_frontier(
                             total,
                             module,
                         } => format!(
-                            "{{\"schema\":\"fln.check-olean-frontier-progress/1\",\"event\":\"started\",\"position\":{position},\"total\":{total},\"module\":{}}}\n",
+                            "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"started\",\"position\":{position},\"total\":{total},\"module\":{}}}\n",
                             json_string(&module.to_display_string()),
+                        ),
+                        // In completion order, so a crash keeps every row that
+                        // exists; `decided` repeats it in frontier order.
+                        fln::OleanFrontierEvent::Settled {
+                            position,
+                            total,
+                            row,
+                        } => format!(
+                            "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"settled\",\"position\":{position},\"total\":{total},{}}}\n",
+                            frontier_row_fields(row).json_members(),
                         ),
                         fln::OleanFrontierEvent::Decided {
                             position,
                             total,
                             row,
                         } => format!(
-                            "{{\"schema\":\"fln.check-olean-frontier-progress/1\",\"event\":\"decided\",\"position\":{position},\"total\":{total},{}}}\n",
+                            "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"decided\",\"position\":{position},\"total\":{total},{}}}\n",
                             frontier_row_fields(row).json_members(),
                         ),
                     };

@@ -1,0 +1,36 @@
+{
+ "bead": "fln-frontier-oom-abort-w9dx",
+ "run": "S22",
+ "why": "the first combined stdlib + Mathlib frontier to finish: S20 aborted at about 138 GiB; the w9dx repairs (engine release, streaming digest, typed allocation failure) completed it, its one host-memory refusal a typed row. Retained so that evidence is not a scratch file",
+ "command": "fln check-olean --continue --jobs 24 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/LeanSearchClient/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/Qq/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/aesop/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/batteries/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/importGraph/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/plausible/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/proofwidgets/.lake/build/lib/lean",
+ "limits": "ulimit -v 104857600 (KiB: 100 GiB)",
+ "binary": {
+  "sha256": "906c51a56e7391b4d589d44100ef5db837c6d1bfad474d5947a7691aee88363a",
+  "build_command": "cargo build --locked --release -p fln-cli --bin fln",
+  "source_commit": "a8d0032f",
+  "profile": "release"
+ },
+ "launched_utc_approx": "2026-10-05T06:10:23Z",
+ "exit": "exit=1 elapsed=36469s",
+ "peak_vmhwm_gib": 95.2,
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "frontier",
+  "authority": true,
+  "trust": "recheck",
+  "modules": 11083,
+  "accepted": 6750,
+  "failed": 2,
+  "inconclusive": 15,
+  "internalFault": 0,
+  "blocked": 4316,
+  "acceptedDeclarations": 538032
+ },
+ "result_sha256": "ce2fc37dc5c723a26171ff9ee36952b1088c6f07ecaddec65eec3ca62c1afcdc",
+ "result_file": "S22.json (the run's --json, verbatim)",
+ "not_established": [
+  "the binary predates later checker and kernel repairs, so this is not current main's frontier",
+  "wall time is this host's under concurrent load, not a throughput figure",
+  "launched_utc_approx is the status file's mtime minus the elapsed seconds"
+ ]
+}
