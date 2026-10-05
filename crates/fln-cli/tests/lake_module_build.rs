@@ -334,7 +334,18 @@ fn external_imports_build_identically_at_one_and_several_jobs() {
         let output = Command::new(env!("CARGO_BIN_EXE_lake"))
             .arg("--dir")
             .arg(&consumer.0)
-            .args(["--json", "build", "--jobs", jobs, "+Consumer:olean"])
+            // The council's job count is this test's subject. Under the default
+            // `reuse-verified` posture the second build would reuse the first one's
+            // record and report it, so the posture is pinned (bead `fln-uyuz`).
+            .args([
+                "--json",
+                "build",
+                "--import-posture",
+                "recheck",
+                "--jobs",
+                jobs,
+                "+Consumer:olean",
+            ])
             .env("LEAN_PATH", library.0.join(".lake/build/lib/lean"))
             .output()
             .unwrap();

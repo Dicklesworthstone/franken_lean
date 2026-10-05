@@ -5,12 +5,17 @@ use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 mod imports;
 pub(super) mod lsp;
 
+/// An admitted or reused external import closure, with the posture report that says which.
+pub(super) type BuildBase = Option<(SourceOleanImport, ImportPostureReport)>;
+/// A refused build base: failure class, detail, and whether the refusal is authoritative.
+pub(super) type BuildBaseFailure = (&'static str, String, bool);
+
 pub(super) fn load_build_base(
     roots: &[fln::Name],
     source_root: &Path,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
-) -> Result<Option<(SourceOleanImport, ImportPostureReport)>, (&'static str, String, bool)> {
+) -> Result<BuildBase, BuildBaseFailure> {
     imports::load_build_base(roots, source_root, jobs, posture)
         .map_err(|error| (error.class, error.detail, error.authority))
 }
