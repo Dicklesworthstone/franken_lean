@@ -427,6 +427,39 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          pin-dependent `olean_frontier` tests. Nothing per commit re-derives resolution ACROSS \
          ROOTS through the CLI, and this declaration does not claim otherwise",
     ),
+    (
+        "crates/fln-olean/tests/pinned_header_scan.rs",
+        "every_pinned_stdlib_part_passes_the_full_surface_audit",
+        "an on-demand whole-pin lane: it reads all 1.7 GB of the pinned stdlib's 7,295 parts \
+         (5.3 s in release) and needs the pin, so it never runs per push. Run it with `cargo \
+         test --release -p fln-olean --test pinned_header_scan -- --ignored`. What holds the \
+         same law per commit is a planted case, not the pin: \
+         `hostile_input::spare_capacity_is_refused_rather_than_walked_over` refuses spare \
+         string and array capacity, and the header half is the non-ignored, header-only \
+         `every_pinned_stdlib_part_carries_the_pinned_header`. Nothing per commit re-audits the \
+         pin's own parts, and no coverage row may cite this function as a CI run",
+    ),
+    (
+        "crates/fln-olean/tests/pinned_header_scan.rs",
+        "every_pinned_constant_decodes_under_the_shape_laws",
+        "an on-demand whole-pin lane: it decodes all 215,136 constants of the pin's 2,433 modules \
+         (12.7 s in release, 1.7 GB read) and needs the pin, so it never runs per push. Run it \
+         with `cargo test --release -p fln-olean --test pinned_header_scan -- --ignored`. The \
+         payload-tag law it re-checks over the pin is held per commit on a planted constant by \
+         fln-olean's `decl::tests::a_constant_payload_with_a_nonzero_constructor_tag_is_refused`. \
+         Nothing per commit re-decodes the pin's constants, and no coverage row may cite this \
+         function as a CI run",
+    ),
+    (
+        "crates/fln-olean/tests/pinned_header_scan.rs",
+        "every_part_under_the_scan_roots_passes_the_three_laws",
+        "not evidence for any per-commit claim: an operator-run scan of the trees named in \
+         FLN_OLEAN_SCAN_ROOTS (for example a built Mathlib corpus the host provisions \
+         externally), skipped when that variable is unset. Its one recorded run (`e17c8b19`: \
+         25,930 parts, 0 refused) is a bounded observation of that corpus at that commit. The \
+         laws it applies are the two pin lanes above plus the header pin, each with its \
+         per-commit planted case, and no coverage row may cite this function as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -476,7 +509,14 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// landed `#[ignore]`d and undeclared, reddening this suite for every pane from
 /// 2026-09-26. Declared from its own docstring. The remainder (no per-commit
 /// cross-root resolution through the CLI) is stated in the entry, not papered over.
-const IGNORED_PRODUCER_CEILING: usize = 14;
+///
+/// 14 -> 17 for `crates/fln-olean/tests/pinned_header_scan.rs`'s three scans (bead
+/// `fln-fur.1`): `26a58548` landed the two whole-pin lanes and `e17c8b19` the scan-roots
+/// lane, all `#[ignore]`d and undeclared, which reddened this suite from 2026-10-05.
+/// Declared from their own docstrings and commit measurements as on-demand lanes, each
+/// with the planted per-commit case that holds its law and the statement that nothing per
+/// commit re-reads the pin itself. One commit, three entries, one ceiling move.
+const IGNORED_PRODUCER_CEILING: usize = 17;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1839,10 +1879,14 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=6 rows=7 citations=8 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=7 rows=7 citations=8 all-rows-declared=true
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.
+    //
+    // `surfaces` rose 6 -> 7 with the declaration of the three `fln-fur.1` scans in
+    // crates/fln-olean/tests/pinned_header_scan.rs (2026-10-05). `rows` and `citations` are
+    // unmoved: no terminal row cites that surface.
     //
     // `rows` and `citations` fell 10 -> 7 and 11 -> 8 when `fln-7odd`, `fln-corpus-thread-matrix-93te`
     // and `fln-kx3y` were migrated off file-granular citations; `surfaces` is unmoved because
