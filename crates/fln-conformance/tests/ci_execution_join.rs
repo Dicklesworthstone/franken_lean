@@ -478,6 +478,22 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          pin's own modules through both readers, and no coverage row may cite this function \
          as a CI run",
     ),
+    (
+        "crates/fln-cli/tests/source_import_reuse.rs",
+        "nested_nat_comparisons_under_import_init_fit_the_default_budget",
+        "an on-demand lane (bead fln-52qv): `fln check-source` on `import Init` with two \
+         nested Nat comparisons, which needs the discrimination-tree filter to fit the default \
+         elaboration budget. A fresh record store admits the whole pinned Init through the council \
+         first (about 16 minutes in release), so it never runs per push. Run it with \
+         `FLN_REQUIRE_REFERENCE=1 cargo test --release -p fln-cli --test source_import_reuse -- \
+         --ignored --exact nested_nat_comparisons_under_import_init_fit_the_default_budget`, \
+         which fails rather than skips without the pin. \
+         What holds the filter per commit is a council-admitted Init.Core closure: \
+         `decidable_comparisons_on_nat_narrow_to_the_pins_list_under_init_core` (the pin's \
+         list) and `the_filter_keeps_every_candidate_the_selection_step_applies_under_init_core` \
+         (the superset differential), both pin-gated. Nothing per commit elaborates against \
+         the whole Init, and no coverage row may cite this function as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -539,7 +555,11 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// `franken_lean-z8j.1.14`): `79b5e477` landed it `#[ignore]`d and undeclared, which reddened
 /// this suite from 2026-10-05. Declared from its docstring and that commit's measurement as an
 /// on-demand lane, with the two planted per-commit cells that hold the comparison.
-const IGNORED_PRODUCER_CEILING: usize = 18;
+///
+/// 18 -> 19 for `crates/fln-cli/tests/source_import_reuse.rs`'s fln-52qv budget lane, declared
+/// in the same commit that adds it: a whole-Init council is too slow per push, and the entry
+/// names the pin-gated Init.Core tests that hold the filter per commit.
+const IGNORED_PRODUCER_CEILING: usize = 19;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1902,7 +1922,7 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=8 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=9 rows=13 citations=14 all-rows-declared=true
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.

@@ -409,3 +409,71 @@ fn check_olean_has_no_posture_and_trust_producer_is_refused() {
         "check-olean must not touch the record store"
     );
 }
+
+/// fln-52qv's budget test. Under `import Init`, two nested comparisons on `Nat` ask
+/// for `Decidable (a < b)` and `Decidable (b < 10)` in one declaration. Without the
+/// discrimination-tree filter each tries every `Decidable` instance in `Init`, and the
+/// declaration runs out of budget. With the filter each tries the pin's short list.
+/// The pin, with `import Init`, accepts it and the bead's own `if n < 5` (`control`).
+///
+/// With the narrowing call replaced by the full candidate list, this test at
+/// `eac0c3f0` refuses both programs: `"outcome":"resource"`, "unification step limit
+/// 100000 reached". Before fln-gkhu, at `b76d5590`, the same mutant refused the nested
+/// program at the heartbeat limit after 1,562 candidate trials (36 with the filter) and
+/// completed `if n < 5` in 815, which is why the nested program is the subject. Each
+/// program is checked on its own, so neither outcome can mask the other's.
+///
+/// On demand: a fresh record store admits all of `Init` through the council first,
+/// about 16 minutes in release with `--jobs 16`. Run it with
+///
+/// ```text
+/// FLN_REQUIRE_REFERENCE=1 cargo test --release -p fln-cli --test source_import_reuse \
+///     -- --ignored --exact nested_nat_comparisons_under_import_init_fit_the_default_budget
+/// ```
+///
+/// Under `FLN_REQUIRE_REFERENCE=1` a missing pin, or a `LEAN_PATH` that overrides it,
+/// fails the lane instead of skipping it.
+#[test]
+#[ignore = "on-demand: a fresh council of the whole pinned Init (about 16 minutes in release)"]
+fn nested_nat_comparisons_under_import_init_fit_the_default_budget() {
+    let Some(_) = pinned_lib() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned lib/lean is absent or LEAN_PATH overrides it"
+        );
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    };
+    let scratch = Scratch::new("instance-index-budget");
+    let store = scratch.0.join("records");
+    let fln = Path::new(env!("CARGO_BIN_EXE_fln"));
+    let nested = scratch.write(
+        "nested/Main.lean",
+        "import Init\ndef f2 (a b : Nat) : Nat := if a < b then (if b < 10 then 1 else 2) else 3\n",
+    );
+    let control = scratch.write(
+        "control/Main.lean",
+        "import Init\ndef f (n : Nat) : Nat := if n < 5 then n else 5\n",
+    );
+    let outcome = |entry: &Path| {
+        let run = check_source(fln, entry, &store, &["--jobs", "16"]);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.output.stdout),
+            String::from_utf8_lossy(&run.output.stderr)
+        );
+        eprintln!("check-source {}: {:.1} s", entry.display(), run.seconds);
+        let admitted = run.output.status.success()
+            && report.contains("\"outcome\":\"complete\",\"authority\":true")
+            && report.contains("\"commands\":1");
+        (admitted, report)
+    };
+    // The first run admits Init through the council; the second reuses its record.
+    let (nested_admitted, nested_report) = outcome(&nested);
+    let (control_admitted, control_report) = outcome(&control);
+    assert!(
+        nested_admitted && control_admitted,
+        "nested comparisons admitted: {nested_admitted} ({nested_report}); \
+         `if n < 5` control admitted: {control_admitted} ({control_report})"
+    );
+}
