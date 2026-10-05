@@ -3,6 +3,9 @@
 mod support;
 
 fn main() -> std::process::ExitCode {
+    // A refused allocation unwinds to the frontier's per-module guard instead of
+    // aborting the process (fln-frontier-oom-abort-w9dx).
+    fln::install_host_allocation_failure_hook();
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let output = match arguments.as_slice() {
         [argument] if argument.to_str() == Some("serve-lsp") => support::serve_lsp(),

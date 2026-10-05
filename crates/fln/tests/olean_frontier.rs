@@ -152,7 +152,8 @@ fn a_failing_module_blocks_only_its_dependents() {
                 matches!(verdict("Init.MethodSpecsSimp"), OleanModuleVerdict::Accepted { declarations } if *declarations > 0),
                 "an independent sibling of the failed module is still checked"
             );
-            let admitted: Vec<&Name> = frontier.engine.imported_modules().iter().collect();
+            let engine = frontier.engine.as_ref().expect("the accepted modules merge");
+            let admitted: Vec<&Name> = engine.imported_modules().iter().collect();
             assert_eq!(
                 admitted,
                 [&name("Init.MethodSpecsSimp"), &name("Init.Prelude")],
@@ -183,13 +184,14 @@ fn a_failing_module_blocks_only_its_dependents() {
                     .collect()
             };
             assert_eq!(summary(&parallel), summary(&frontier));
+            let parallel_engine = parallel.engine.as_ref().expect("the accepted modules merge");
             assert_eq!(
-                parallel.engine.imported_modules(),
-                frontier.engine.imported_modules()
+                parallel_engine.imported_modules(),
+                engine.imported_modules()
             );
             assert_eq!(
-                parallel.engine.logical_root(&KVMap::new()),
-                frontier.engine.logical_root(&KVMap::new()),
+                parallel_engine.logical_root(&KVMap::new()),
+                engine.logical_root(&KVMap::new()),
                 "the same accepted constants, whatever the thread count"
             );
         })
@@ -254,7 +256,14 @@ fn a_planted_planning_limit_is_inconclusive_and_still_blocks_dependents() {
                 matches!(verdict("Init.Coe"), OleanModuleVerdict::Blocked { by } if *by == name("Init.Prelude")),
                 "a dependent of an unanswered module is blocked, never checked"
             );
-            assert!(frontier.engine.imported_modules().is_empty());
+            assert!(
+                frontier
+                    .engine
+                    .as_ref()
+                    .expect("nothing accepted merges trivially")
+                    .imported_modules()
+                    .is_empty()
+            );
         })
         .expect("spawn the checking thread")
         .join()

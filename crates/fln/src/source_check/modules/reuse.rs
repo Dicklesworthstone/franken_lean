@@ -958,6 +958,14 @@ impl Engine {
         }
         let mut environment = self.environment.clone();
         let mut root = base_logical_root;
+        // Every module's root is the root of the environment after it. The base is
+        // empty and the olean path adds no extension state, so the roots can be
+        // accumulated: one builder gains each published (name, digest) pair and is
+        // finalized per module, instead of re-encoding every name already present
+        // for every one of the closure's modules (601 for `Init`). The final root is
+        // checked against `Environment::logical_root` below.
+        let mut roots = fln_hash::root::LogicalRootBuilder::new();
+        roots.set_options(options);
         let mut admitted_any = false;
         let mut checked_modules = Vec::with_capacity(ordered.len());
         for ((name, decoded), recorded) in ordered.into_iter().zip(&record.modules) {
@@ -996,6 +1004,7 @@ impl Engine {
                 };
                 environment = match plan.commit(&environment, cancellation) {
                     Outcome::Complete(DeclarationCommitted::Published(published)) => {
+                        roots.add_decl(info.name(), published.digest);
                         published.environment
                     }
                     Outcome::Complete(DeclarationCommitted::DuplicateName { .. }) => {
@@ -1011,7 +1020,7 @@ impl Engine {
             }
             if added {
                 admitted_any = true;
-                root = environment.logical_root(options);
+                root = roots.finalize();
             }
             if root.0 != recorded.result_root {
                 return refuse(ImportReuseRefusal::Root {
@@ -1047,6 +1056,14 @@ impl Engine {
                 at: "declarations",
                 module: None,
             });
+        }
+        // The accumulated roots stand in for `Environment::logical_root`; if they
+        // ever disagree that is a defect here, never a property of the record.
+        if environment.logical_root(options) != root {
+            return Outcome::InternalFault(InternalFault::new(
+                "import reuse",
+                "the accumulated logical root differs from the environment's",
+            ));
         }
         let mut imported = (*self.imported_modules).clone();
         imported.extend(checked_modules.iter().map(|module| module.name.clone()));
