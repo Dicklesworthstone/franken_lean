@@ -8,6 +8,8 @@
 //! src/Lean/Meta/Tactic/Simp/Attr.lean: sha256 ce45e8a48edbab67408b197257e616091ab55c410254e3d303fe813f7fd42242
 //! src/Lean/ResolveName.lean: sha256 c42a2e8e21b0d0325a32f09827be6253aad276ac4d25b30b5281b420f1beccb9
 //! src/Init/Prelude.lean: sha256 44f86ebbb9ab743a05c6ebe2c674aadbf2c822bee874f1b16d7e6c8d56318dc9
+//! src/Lean/Modifiers.lean: sha256 dee35dbc823a48b9ac79f11db4b2741f89702dd1ac0a7df83050e7f61d2154fd
+//! src/Lean/EnvExtension.lean: sha256 18086b4119360fad18b8434e2e0b3ef6f52d23f57a4d93ca4f7f7ffbe0685e87
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -68,3 +70,4 @@ pub const PROD_FST: usize = 0;
 pub const PROD_SND: usize = 1;
 pub const PROD_POINTERS: usize = 2;
 pub const PROD_SCALAR_BYTES: usize = 0;
+pub const PROTECTED_EXTENSION: &str = "Lean.protectedExt";

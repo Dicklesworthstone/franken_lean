@@ -110,9 +110,15 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         )) => match reason {
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
+            )
+            | SourceInferenceError::ProtectedJournal(
+                fln_elab::protected_names::ProtectedError::Malformed,
             ) => ("internal-fault", false, 4),
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
+            | SourceInferenceError::ProtectedJournal(
+                fln_elab::protected_names::ProtectedError::Limit,
+            )
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
             | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)
             | SourceInferenceError::InstanceRegistry(

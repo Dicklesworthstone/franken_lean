@@ -377,3 +377,96 @@ fn external_imports_build_identically_at_one_and_several_jobs() {
         "{refused}"
     );
 }
+
+/// A source module's own `protected` declarations survive into the `.olean` Lake
+/// builds (bead `fln-eq4k`): the pin's `protectedExt` block, sorted by
+/// `Name.quickLt` as the pin writes it and binary-searches it. Two readers then
+/// agree on a consumer: FrankenLean's `check-source` and, when installed, the
+/// pinned Reference `lean` itself, which refuses each tag's atomic name under
+/// `open` and accepts the qualified name and the unprotected sibling.
+#[test]
+fn protected_declarations_survive_into_the_olean_for_both_readers() {
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Guard.lean",
+        "prelude\nnamespace Lib\nprotected def one (P : Prop) (h : P) : P := h\n\
+         protected def two (P : Prop) (h : P) : P := h\n\
+         protected theorem three (P : Prop) (h : P) : P := h\n\
+         def plain (P : Prop) (h : P) : P := h\nend Lib\n",
+    );
+    success(&package.build(&["+Lib.Guard:olean"]));
+    let bytes = std::fs::read(package.artifact("Lib.Guard")).unwrap();
+    let blocks = fln_olean::region::OleanView::parse(&bytes)
+        .unwrap()
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 1 << 20)
+        .unwrap();
+    let decoded = fln_olean::source_extensions::decode(
+        &blocks,
+        fln_olean::source_extensions::DecodeLimits::default(),
+    )
+    .unwrap();
+    let mut expected: Vec<_> = ["Lib.one", "Lib.two", "Lib.three"]
+        .map(|name| fln_core::name::Name::from_components(name.split('.')))
+        .into();
+    expected.sort_by(|left, right| left.quick_cmp(right));
+    assert_eq!(decoded.protected, expected, "written in Name.quickLt order");
+
+    let client = Package::new("name = \"client\"\n");
+    // Inside `namespace Lib`, not under `open Lib`: the pin's resolution rule is the
+    // same at the current namespace, and `open Lib` would test something else. A
+    // FrankenLean-written olean records no `namespacesExt` entry, so the pin refuses
+    // `open Lib` itself as an "unknown namespace", whatever the tags say.
+    let consumer =
+        |body: &str| format!("prelude\nimport Lib.Guard\nnamespace Lib\n{body}\nend Lib\n");
+    // (program body, the pin's verdict on it)
+    let cases = [
+        ("theorem u (P : Prop) (h : P) : P := one P h", false),
+        ("theorem u (P : Prop) (h : P) : P := two P h", false),
+        ("theorem u (P : Prop) (h : P) : P := three P h", false),
+        ("theorem u (P : Prop) (h : P) : P := Lib.one P h", true),
+        ("theorem u (P : Prop) (h : P) : P := plain P h", true),
+    ];
+    let lib = package.0.join(".lake/build/lib/lean");
+    let pinned = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0"))
+        .filter(|root| root.join("bin/lean").is_file());
+    assert!(
+        pinned.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "FLN_REQUIRE_REFERENCE is set but the pinned Reference is absent"
+    );
+    for (index, (body, accepted)) in cases.iter().enumerate() {
+        let file = format!("Use{index}.lean");
+        client.write(&file, consumer(body));
+        let fln = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json", "--import-posture", "recheck"])
+            .arg(client.0.join(&file))
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", client.0.join(".records"))
+            .output()
+            .unwrap();
+        assert_eq!(fln.status.success(), *accepted, "fln on {body}: {fln:?}");
+        let Some(root) = &pinned else {
+            eprintln!("SKIP: pinned Reference absent; FrankenLean's verdict only");
+            continue;
+        };
+        let search = std::env::join_paths([lib.clone(), root.join("lib/lean")]).unwrap();
+        let lean = Command::new(root.join("bin/lean"))
+            .arg(client.0.join(&file))
+            .env("LEAN_PATH", search)
+            .output()
+            .unwrap();
+        assert_eq!(
+            lean.status.success(),
+            *accepted,
+            "the pinned lean on {body}, reading FrankenLean's olean: {lean:?}"
+        );
+        if !accepted {
+            // Refused because the tag held the atomic name back, nothing else.
+            let said = String::from_utf8_lossy(&lean.stdout);
+            assert!(
+                said.contains("Unknown identifier"),
+                "the pinned lean refused {body} for another reason: {said}"
+            );
+        }
+    }
+}

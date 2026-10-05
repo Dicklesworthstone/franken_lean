@@ -311,11 +311,26 @@ fn open_in_reaches_exactly_its_one_command() {
 /// (`crates/fln-parse/tests/reference_command_trees.rs`), but their semantics are not
 /// implemented: each is refused by the elaborator as syntax it does not support, a typed,
 /// non-authoritative refusal, never admitted with the modifier dropped or under an invented
-/// name. The pin accepts every one of these files.
+/// name. The pin accepts every one of these files. `protected` is the exception: it is
+/// elaborated (bead `fln-eq4k`), admitted and tagged, never admitted with the tag dropped.
 #[test]
 fn parsed_modifiers_and_nameless_instances_are_refused_until_elaborated() {
+    let protected = engine()
+        .check_source_files(
+            &[b"namespace Foo\nprotected def bar : Nat := 1\nend Foo"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        fln_elab::protected_names::ProtectedNames::read(protected.engine.environment())
+            .unwrap()
+            .contains(&Name::from_components(["Foo", "bar"])),
+        "`protected` is recorded, not dropped"
+    );
     for source in [
-        "namespace Foo\nprotected def bar : Nat := 1\nend Foo",
         "private def a : Nat := 1",
         "noncomputable def b : Nat := 2",
         "instance : Inhabited Nat := Inhabited.mk 0",
@@ -329,6 +344,9 @@ fn parsed_modifiers_and_nameless_instances_are_refused_until_elaborated() {
             .expect_err(source);
         let (class, authority, _) = error.disposition();
         assert_eq!((class, authority), ("input", false), "{source}: {error}");
-        assert!(error.to_string().contains("elaboration refused source"), "{source}: {error}");
+        assert!(
+            error.to_string().contains("elaboration refused source"),
+            "{source}: {error}"
+        );
     }
 }

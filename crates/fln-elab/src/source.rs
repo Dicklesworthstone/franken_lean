@@ -71,6 +71,8 @@ pub enum SourceInferenceError {
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     SimpSet(scope::simp::SimpSetError),
+    /// The protected-declaration journal refused a tag.
+    ProtectedJournal(crate::protected_names::ProtectedError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
     ObservationComplete,
@@ -132,6 +134,7 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
+            Self::ProtectedJournal(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
             }
@@ -259,6 +262,11 @@ struct Context {
     // Imported `export` aliases, re-read only when the journal or the constants
     // change: every unresolved identifier consults them.
     alias_cache: crate::aliases::AliasCache,
+    // Imported `protected` declarations, re-read on the same terms: an atomic
+    // identifier never reaches one through a namespace or an alias.
+    protected_cache: crate::protected_names::ProtectedCache,
+    // The declaration being elaborated, when it is `protected`.
+    protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
     recursion: Option<recursion::Recursion>,
 }
@@ -304,6 +312,8 @@ impl Context {
             matrix_aliases: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
             alias_cache: crate::aliases::AliasCache::default(),
+            protected_cache: crate::protected_names::ProtectedCache::default(),
+            protected_declaration: None,
             refinements: Vec::new(),
             recursion: None,
         }
@@ -2636,10 +2646,18 @@ fn definition_in_context_named(
         "declaration modifiers",
     )?;
     scope::simp::registration(syntax)?;
+    let mut is_protected = false;
     for (index, modifier) in modifiers.iter().enumerate() {
-        if index != 1 {
-            expect_empty_null(modifier, "empty declaration modifier")?;
+        match index {
+            1 => {}
+            PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
+            _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
+    }
+    if is_protected && generated_name.is_some() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a named protected declaration",
+        });
     }
     let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
     let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));
@@ -2679,12 +2697,19 @@ fn definition_in_context_named(
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
+    if is_protected {
+        context.check_protected_declaration_name(name)?;
+    }
     // Anonymous examples retain their surrounding lookup scope. Their internal
     // numeric identity is never a source namespace or a recursive source name.
     let name = &match generated_name {
         Some(generated) => generated,
         None => context.enter_declaration(name)?,
     };
+    // The pin tags a protected declaration before elaborating its body, and
+    // names its recursive local `<last namespace component>.<short name>`, so
+    // the body cannot reach it by its atomic name either.
+    context.protected_declaration = is_protected.then(|| name.clone());
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let signature = expect_node(
@@ -2921,6 +2946,80 @@ pub fn instance_registration(
     syntax: &Syntax,
 ) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
     instance_command::registration(syntax)
+}
+
+/// `declModifiers`' `protected` slot: docComment, attributes, visibility, then
+/// `protected` (vendored `src/Lean/Parser/Command.lean`, `declModifiers`).
+const PROTECTED_SLOT: usize = 3;
+
+/// Whether a `protected` slot is set: empty, or exactly one
+/// `Lean.Parser.Command.protected` node holding the keyword.
+fn protected_slot(slot: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    match expect_null_args(slot, "protected modifier")? {
+        [] => Ok(false),
+        [modifier] => {
+            let parts = expect_node(
+                modifier,
+                &parser_kind(&["Command", "protected"]),
+                1,
+                "protected modifier",
+            )?;
+            expect_atom(&parts[0], "protected", "protected keyword")?;
+            Ok(true)
+        }
+        _ => Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one protected modifier",
+        }),
+    }
+}
+
+/// The name a `protected` definition, theorem or instance is written with, if
+/// the command is one. The caller derives the full name from the scope, as for
+/// [`instance_registration`], and tags it in the protected-declaration journal
+/// only once the council has admitted the declaration. The pin tags it in
+/// `applyVisibility` (vendored `src/Lean/Elab/DeclModifiers.lean`).
+pub fn protected_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    if !protected_slot(&modifiers[PROTECTED_SLOT])? {
+        return Ok(None);
+    }
+    let instance = matches!(&declaration[1], Syntax::Node { kind, .. }
+        if kind == &parser_kind(&["Command", "instance"]));
+    let id = if instance {
+        instance_command::parts(&declaration[1])?.id.clone()
+    } else {
+        let Syntax::Node { args, .. } = &declaration[1] else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "named declaration",
+            });
+        };
+        args.get(1)
+            .cloned()
+            .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "declaration id",
+            })?
+    };
+    let id = expect_node(
+        &id,
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    match &id[0] {
+        Syntax::Ident { val, .. } if !val.is_anonymous() => Ok(Some(val.clone())),
+        _ => Err(NatDefinitionElabError::AnonymousDeclarationName),
+    }
 }
 
 pub use inductive::{elaborate_inductive, is_inductive};

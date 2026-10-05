@@ -33,6 +33,7 @@ pub mod lctx;
 pub mod messages;
 pub mod mvar;
 pub mod perturbation;
+pub mod protected_names;
 pub mod records;
 pub mod scheduler;
 pub mod seed;

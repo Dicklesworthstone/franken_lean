@@ -193,6 +193,25 @@ impl PendingArtifact {
                     out_level_params: class.parameters.out_level_params,
                 });
         }
+        // The module's own `protected` tags: those the checked environment
+        // records beyond its import base. The pin tags a declaration only in the
+        // module that declares it, and writes them into that module's olean.
+        let protected = |env: &Environment| {
+            fln_elab::protected_names::ProtectedNames::read(env).map_err(|_| {
+                SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::protected_names::journal_name(),
+                    reason: "invalid protected-declaration journal",
+                }
+            })
+        };
+        let inherited = protected(base)?;
+        for tagged in protected(checked)?.iter() {
+            meter.work(1)?;
+            if !inherited.contains(tagged) {
+                metadata.protected.push(tagged.clone());
+            }
+        }
         Ok(Self {
             name: name.clone(),
             imports,

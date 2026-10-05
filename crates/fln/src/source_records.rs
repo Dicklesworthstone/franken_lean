@@ -181,6 +181,18 @@ impl Engine {
                 let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?;
+                let protected = fln_elab::source::protected_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+                    .map(|name| scope.declaration_name(&name))
+                    .transpose()
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
                 let result = self
                     .admit_declarations(&[declaration], options, limits)
                     .map_err(EngineExecutionError::from)?;
@@ -230,6 +242,10 @@ impl Engine {
                                     ),
                                 ))
                             })?;
+                            batch.result_logical_root = batch.engine.logical_root(options);
+                        }
+                        if let Some(name) = protected {
+                            batch.engine.environment = tag_protected(&batch.engine, &name)?;
                             batch.result_logical_root = batch.engine.logical_root(options);
                         }
                         Outcome::Complete(batch)
@@ -356,4 +372,21 @@ pub(crate) fn parse_scoped_command(
         return Ok(ScopedCommandSyntax::Example(parsed));
     }
     Ok(ScopedCommandSyntax::Definition(parsed))
+}
+
+/// Tag an admitted `protected` declaration in the protected-declaration journal,
+/// after the council admitted it, so later commands (and this module's olean)
+/// see it as the pin's `addProtected` leaves it. A refusal is the command's.
+pub(crate) fn tag_protected(
+    engine: &Engine,
+    name: &Name,
+) -> Result<Environment, EngineExecutionError> {
+    fln_elab::protected_names::register_module(engine.environment(), std::slice::from_ref(name))
+        .map_err(|error| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::ProtectedJournal(error),
+                ),
+            ))
+        })
 }

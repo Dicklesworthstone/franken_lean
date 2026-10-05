@@ -1,4 +1,5 @@
-//! Data-only decoding of pinned class, instance, default-instance and simp journals.
+//! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
+//! and protected-declaration journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -15,7 +16,8 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, SIMP_EXTENSION,
+    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION,
+    SIMP_EXTENSION,
 };
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
@@ -62,6 +64,9 @@ pub struct SourceExtensions {
     pub defaults: Vec<DefaultEntry>,
     pub simps: Vec<SimpEntry>,
     pub aliases: Vec<AliasEntry>,
+    /// `protected` declarations (the pin's `protectedExt`): each entry names one
+    /// declaration its own module tagged. A name tagged twice is refused.
+    pub protected: Vec<Name>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -274,6 +279,7 @@ pub fn decode(
         name(format::DEFAULT_EXTENSION),
         name(format::SIMP_EXTENSION),
         name(format::ALIAS_EXTENSION),
+        name(format::PROTECTED_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -284,6 +290,7 @@ pub fn decode(
         indices_left: limits.max_indices,
     };
     let mut out = SourceExtensions::default();
+    let mut protected = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -312,7 +319,16 @@ pub fn decode(
                 2 => out.defaults.push(reader.default_instance(&obj)?),
                 3 => out.simps.push(reader.simp(&obj)?),
                 4 => out.aliases.push(reader.alias(&obj)?),
-                _ => unreachable!("five selected extension families"),
+                5 => {
+                    // The pin tags a declaration only in the module that declares
+                    // it (`TagDeclarationExtension.tag`), so a repeat is malformed.
+                    let declaration = reader.name(&obj)?;
+                    if !protected.insert(declaration.clone()) {
+                        return Err(shape("protected declaration tagged twice"));
+                    }
+                    out.protected.push(declaration);
+                }
+                _ => unreachable!("six selected extension families"),
             }
         }
     }

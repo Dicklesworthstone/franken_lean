@@ -5672,6 +5672,18 @@ impl Engine {
         let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let protected = fln_elab::source::protected_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .map(|name| fln_elab::source::scope::SourceScope::default().declaration_name(&name))
+            .transpose()
+            .map_err(|error| {
+                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::NameScope(error),
+                    ),
+                ))
+            })?;
         let result = self
             .admit_declaration(declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
@@ -5714,6 +5726,11 @@ impl Engine {
                             ),
                         ))
                     })?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some(name) = protected {
+                    admitted.engine.environment =
+                        source_records::tag_protected(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 Outcome::Complete(admitted)

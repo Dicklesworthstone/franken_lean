@@ -4,6 +4,7 @@ use super::*;
 pub mod simp;
 pub mod variables;
 use crate::aliases::AliasTable;
+use crate::protected_names::ProtectedNames;
 use fln_core::name::LeafView;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -22,6 +23,8 @@ pub enum ScopeError {
     UnknownVariable(Name),
     OmittedVariable(Name),
     VariableSelectionLimit,
+    /// `protected` on an atomic name in the root namespace (the pin's `mkDeclName`).
+    ProtectedOutsideNamespace,
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,6 +41,9 @@ impl std::fmt::Display for ScopeError {
                 name.to_display_string()
             ),
             Self::VariableSelectionLimit => write!(f, "section variable selection limit exceeded"),
+            Self::ProtectedOutsideNamespace => {
+                write!(f, "protected declarations must be in a namespace")
+            }
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
                 for (i, candidate) in candidates.iter().enumerate() {
@@ -116,40 +122,70 @@ impl SourceScope {
         name: &Name,
         exists: impl FnMut(&Name) -> bool,
     ) -> Result<Option<Name>, ScopeError> {
-        self.resolve_with_aliases(name, exists, &AliasTable::default())
+        self.resolve_with_aliases(
+            name,
+            exists,
+            &AliasTable::default(),
+            &ProtectedNames::default(),
+        )
     }
 
-    /// [`Self::resolve`], with imported `export` aliases beside declarations, as
-    /// the pin's `resolveGlobalName` consults `getAliases` at each namespace and
-    /// in each opened namespace (vendored `src/Lean/ResolveName.lean`). At one
-    /// namespace a real declaration (or local) wins; there an alias with two
-    /// targets is a refusal, never a choice. `_root_.x` names `x` exactly, as
-    /// the pin's `resolveExact` does. Not modelled: the pin skips aliases to
-    /// `protected` declarations for an atomic name, and this table records no
-    /// protection.
+    /// [`Self::resolve`], with imported `export` aliases beside declarations and
+    /// imported `protected` declarations held back, as the pin's
+    /// `resolveGlobalName` does (vendored `src/Lean/ResolveName.lean`).
+    ///
+    /// - It consults `getAliases` at each namespace and in each opened
+    ///   namespace. At one namespace a real declaration (or local) wins; there
+    ///   an alias with two targets is a refusal, never a choice.
+    /// - `resolveQualifiedName` never resolves an atomic identifier `id` to a
+    ///   protected `ns ++ id`, at the current namespace, its parents or an
+    ///   opened namespace, and `getAliases ... (skipProtected := id.isAtomic)`
+    ///   drops protected alias targets. So under `open Nat` the atomic `add`
+    ///   does not reach the protected `Nat.add`, while `Nat.add`, or any other
+    ///   non-atomic name, still does.
+    /// - At the root the pin matches the name exactly, with no protection test
+    ///   (only its aliases are filtered), and `_root_.x` names `x` exactly, as
+    ///   the pin's `resolveExact` does.
+    ///
+    /// Not modelled: `open X (y)`, `open X hiding y` and `open X renaming`,
+    /// whose explicit names the pin resolves without the protection test.
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
         mut exists: impl FnMut(&Name) -> bool,
         aliases: &AliasTable,
+        protected: &ProtectedNames,
     ) -> Result<Option<Name>, ScopeError> {
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
             let absolute = Name::from_components(parts[1..].iter().map(String::as_str));
             return Ok(exists(&absolute).then_some(absolute));
         }
+        let atomic = parts.len() == 1;
+        // `ns ++ id` for an atomic `id` under a namespace: not when protected.
+        let held_back = |candidate: &Name| atomic && protected.contains(candidate);
+        // `getAliases env (ns ++ id) (skipProtected := id.isAtomic)`.
+        let alias_targets = |candidate: &Name| -> Vec<Name> {
+            aliases
+                .targets(candidate)
+                .iter()
+                .filter(|target| !(atomic && protected.contains(target)))
+                .cloned()
+                .collect()
+        };
         let mut namespace = self.namespace.clone();
         loop {
             let candidate = namespace.append_core(name);
-            if exists(&candidate) {
+            let at_root = namespace.is_anonymous();
+            if (at_root || !held_back(&candidate)) && exists(&candidate) {
                 return Ok(Some(candidate));
             }
-            match aliases.targets(&candidate) {
+            match alias_targets(&candidate).as_slice() {
                 [] => {}
                 [target] => return Ok(Some(target.clone())),
                 targets => return Err(ScopeError::Ambiguous(name.clone(), targets.to_vec())),
             }
-            if namespace.is_anonymous() {
+            if at_root {
                 break;
             }
             namespace = namespace.parent();
@@ -157,12 +193,12 @@ impl SourceScope {
         let mut candidates = Vec::new();
         for opened in self.opened.iter().rev() {
             let candidate = opened.append_core(name);
-            if exists(&candidate) && !candidates.contains(&candidate) {
+            if !held_back(&candidate) && exists(&candidate) && !candidates.contains(&candidate) {
                 candidates.push(candidate.clone());
             }
-            for target in aliases.targets(&candidate) {
-                if !candidates.contains(target) {
-                    candidates.push(target.clone());
+            for target in alias_targets(&candidate) {
+                if !candidates.contains(&target) {
+                    candidates.push(target);
                 }
             }
         }
@@ -206,20 +242,50 @@ impl Context {
             .alias_cache
             .read(&self.txn.env)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
+        // A journal that cannot be read is a refusal, never an empty set: that
+        // would silently widen resolution to names the pin holds back.
+        let protected = self
+            .protected_cache
+            .read(&self.txn.env)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        // A protected declaration's own recursive reference by its atomic name
+        // is held back too: the pin names that local `<namespace>.<short>`.
+        let atomic = components(name).map_err(error)?.len() == 1;
+        let held_back_recursion =
+            |candidate: &Name| atomic && self.protected_declaration.as_ref() == Some(candidate);
         self.source_scope
             .resolve_with_aliases(
                 name,
                 |candidate| {
                     self.txn.env.contains(candidate)
                         || self.txn.lctx.find_by_user_name(candidate).is_some()
-                        || self
-                            .recursion
-                            .as_ref()
-                            .is_some_and(|r| &r.name == candidate)
+                        || self.recursion.as_ref().is_some_and(|r| {
+                            &r.name == candidate && !held_back_recursion(candidate)
+                        })
                 },
                 &aliases,
+                &protected,
             )
             .map_err(error)
+    }
+
+    /// The pin's `mkDeclName` for a `protected` declaration (vendored
+    /// `src/Lean/Elab/DeclModifiers.lean`): an atomic short name in the root
+    /// namespace is refused. `_root_.p.s` declares `s` in namespace `p`.
+    pub(super) fn check_protected_declaration_name(
+        &self,
+        name: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        let parts = components(name).map_err(error)?;
+        let (root_namespace, atomic) = if parts.first().is_some_and(|p| p == "_root_") {
+            (parts.len() <= 2, true)
+        } else {
+            (self.source_scope.namespace.is_anonymous(), parts.len() == 1)
+        };
+        if root_namespace && atomic {
+            return Err(error(ScopeError::ProtectedOutsideNamespace));
+        }
+        Ok(())
     }
 
     pub(super) fn enter_declaration(
@@ -411,8 +477,14 @@ mod tests {
             crate::aliases::register(&env, &n(alias), &n(target)).unwrap()
         });
         let aliases = AliasTable::read(&env).unwrap();
-        let resolve =
-            |name: &str| scope.resolve_with_aliases(&n(name), |x| env.contains(x), &aliases);
+        let resolve = |name: &str| {
+            scope.resolve_with_aliases(
+                &n(name),
+                |x| env.contains(x),
+                &aliases,
+                &ProtectedNames::default(),
+            )
+        };
         // A root alias, as `export Decidable (decide)` in the root namespace.
         assert_eq!(resolve("decide").unwrap(), Some(n("Decidable.decide")));
         // At one namespace the real declaration wins over an alias there.
@@ -427,6 +499,116 @@ mod tests {
         assert_eq!(
             scope.resolve(&n("decide"), |x| env.contains(x)).unwrap(),
             None
+        );
+    }
+
+    /// The pin's `resolveQualifiedName`: an atomic `id` never reaches a protected
+    /// `ns ++ id` through the current namespace, its parents or an opened
+    /// namespace, and `getAliases ... (skipProtected := id.isAtomic)` drops a
+    /// protected alias target. Non-atomic names and the root's exact match are
+    /// unaffected (vendored `src/Lean/ResolveName.lean`).
+    #[test]
+    fn protected_declarations_are_held_back_from_atomic_names_only() {
+        let env = [
+            "Nat.add",
+            "Nat.pred",
+            "Lean.SourceInfo.none",
+            "Outer.Nat.sub",
+            "top",
+        ]
+        .into_iter()
+        .fold(fln_env::environment::Environment::new(), |env, name| {
+            env.add_decl(fln_env::constants::ConstantInfo::Axiom(
+                fln_env::constants::AxiomVal {
+                    base: fln_env::constants::ConstantVal {
+                        name: n(name),
+                        level_params: Vec::new(),
+                        type_: fln_core::expr::Expr::sort(fln_core::level::Level::one()),
+                    },
+                    is_unsafe: false,
+                },
+            ))
+            .unwrap()
+        });
+        let env = [("plus", "Nat.add"), ("Q.plus", "Nat.add")]
+            .into_iter()
+            .fold(env, |env, (alias, target)| {
+                crate::aliases::register(&env, &n(alias), &n(target)).unwrap()
+            });
+        let env = crate::protected_names::register_module(
+            &env,
+            &[
+                n("Nat.add"),
+                n("Lean.SourceInfo.none"),
+                n("Outer.Nat.sub"),
+                n("top"),
+            ],
+        )
+        .unwrap();
+        let aliases = AliasTable::read(&env).unwrap();
+        let protected = ProtectedNames::read(&env).unwrap();
+        let scope = |namespace: &str, opened: &[&str]| SourceScope {
+            namespace: n(namespace),
+            opened: opened.iter().map(|o| n(o)).collect(),
+            universes: vec![],
+            variables: variables::SectionVariables::default(),
+            instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+        };
+        let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
+            scope.resolve_with_aliases(&n(name), |x| env.contains(x), &aliases, protected)
+        };
+        let none = ProtectedNames::default();
+        // `open Nat`: `add` is held back, `pred` is not, `Nat.add` is exact.
+        let open_nat = scope("", &["Nat"]);
+        assert_eq!(resolve(&open_nat, "add", &protected).unwrap(), None);
+        assert_eq!(
+            resolve(&open_nat, "add", &none).unwrap(),
+            Some(n("Nat.add"))
+        );
+        assert_eq!(
+            resolve(&open_nat, "pred", &protected).unwrap(),
+            Some(n("Nat.pred"))
+        );
+        assert_eq!(
+            resolve(&open_nat, "Nat.add", &protected).unwrap(),
+            Some(n("Nat.add"))
+        );
+        // Inside `namespace Nat` the same: the pin applies the test at each namespace.
+        let in_nat = scope("Nat", &[]);
+        assert_eq!(resolve(&in_nat, "add", &protected).unwrap(), None);
+        assert_eq!(resolve(&in_nat, "add", &none).unwrap(), Some(n("Nat.add")));
+        // A held-back name at an inner namespace does not stop the walk outward:
+        // `Outer.Nat.sub` is protected, and `Nat.sub` (non-atomic) is unaffected.
+        let in_outer_nat = scope("Outer.Nat", &[]);
+        assert_eq!(resolve(&in_outer_nat, "sub", &protected).unwrap(), None);
+        assert_eq!(
+            resolve(&scope("Outer", &[]), "Nat.sub", &protected).unwrap(),
+            Some(n("Outer.Nat.sub"))
+        );
+        // A non-atomic suffix reaches a protected declaration through `open`.
+        let open_lean = scope("", &["Lean"]);
+        assert_eq!(
+            resolve(&open_lean, "SourceInfo.none", &protected).unwrap(),
+            Some(n("Lean.SourceInfo.none"))
+        );
+        assert_eq!(
+            resolve(&scope("", &["Lean.SourceInfo"]), "none", &protected).unwrap(),
+            None
+        );
+        // An alias to a protected declaration is dropped for an atomic name only.
+        assert_eq!(resolve(&open_nat, "plus", &protected).unwrap(), None);
+        assert_eq!(
+            resolve(&open_nat, "plus", &none).unwrap(),
+            Some(n("Nat.add"))
+        );
+        assert_eq!(
+            resolve(&open_nat, "Q.plus", &protected).unwrap(),
+            Some(n("Nat.add"))
+        );
+        // The root's exact match has no protection test.
+        assert_eq!(
+            resolve(&open_nat, "top", &protected).unwrap(),
+            Some(n("top"))
         );
     }
 

@@ -505,6 +505,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record one imported module's `protected` declarations in the environment
+    /// being activated. Like the alias journal, it is not one this activation
+    /// keeps or reads.
+    pub fn register_protected(
+        mut self,
+        declarations: &[Name],
+    ) -> Result<Self, crate::protected_names::ProtectedError> {
+        self.env = crate::protected_names::register_module(&self.env, declarations)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {

@@ -89,6 +89,38 @@ fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
             "the Prelude exports {name} as Decidable.{name}"
         );
     }
+    // `protectedExt` (vendored src/Lean/Modifiers.lean) is decoded too. The pinned
+    // `lean` reports `(protectedExt.getModuleEntries env idx).size` = 611 for
+    // Init.Prelude, and `isProtected` true for the first five names below and
+    // false for the last four.
+    assert!(!decoded.uninterpreted.contains(&n("Lean.protectedExt")));
+    assert_eq!(decoded.protected.len(), 611);
+    for name in [
+        "Nat.add",
+        "Nat.lt_irrefl",
+        "Nat.le_refl",
+        "Nat.zero.elim",
+        "Lean.SourceInfo.none",
+    ] {
+        assert!(decoded.protected.contains(&n(name)), "{name} is protected");
+    }
+    for name in ["Nat.pred", "Nat.succ", "Nat.ble", "Nat.le.refl"] {
+        assert!(
+            !decoded.protected.contains(&n(name)),
+            "{name} is not protected"
+        );
+    }
+    // The pin writes each module's tags sorted by `Name.quickLt`
+    // (`mkTagDeclarationExtension`'s `toArrayFn`) and binary-searches them in
+    // `isTagged`. Its 611 entries are strictly ascending under fln_core's
+    // `quick_lt`, so FrankenLean's writer can produce an array the pin can search.
+    assert!(
+        decoded
+            .protected
+            .windows(2)
+            .all(|pair| pair[0].quick_lt(&pair[1])),
+        "the pin's protected entries are in Name.quickLt order"
+    );
     assert!(
         decoded
             .instances
@@ -172,6 +204,31 @@ fn forged_names_shapes_and_duplicate_synthesis_indices_refuse() {
             .collect();
         let malformed = Obj::mk_ctor(0, vec![Obj::mk_ctor(0, fields, &[0])], &[]);
         assert!(read(&one("Lean.Meta.instanceExtension", &malformed)).is_err());
+    }
+}
+
+/// A `protectedExt` entry is one `Name`. A name tagged twice (the pin tags a
+/// declaration only in its own module) and a payload that is not a `Name` are
+/// refused, and neither exposes the valid prefix decoded before it.
+#[test]
+fn protected_entries_are_names_and_a_repeat_refuses() {
+    let tagged = entry("Lean.protectedExt");
+    let single = one("Lean.protectedExt", &tagged);
+    let decoded = read(&single).unwrap();
+    assert_eq!(decoded.protected.len(), 1);
+    // Source activation merges every module's entries into one block, so this is
+    // also a name tagged by two modules.
+    let mut repeated = single.clone();
+    repeated[0].entries.push(single[0].entries[0].clone());
+    assert!(matches!(read(&repeated), Err(DecodeError::Shape { .. })));
+    for forged in [
+        Obj::mk_string("Nat.add"),
+        Obj::mk_nat(7),
+        Obj::mk_ctor(0, vec![tagged.clone_ref(), tagged.clone_ref()], &[]),
+    ] {
+        let mut prefixed = single.clone();
+        prefixed[0].entries.push(compact(&forged, 0).unwrap());
+        assert!(read(&prefixed).is_err(), "a non-Name payload is refused");
     }
 }
 

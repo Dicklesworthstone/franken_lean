@@ -54,6 +54,9 @@ pub struct SourceMetadataReport {
     pub scoped_instances: usize,
     /// `export` aliases (the pin's `aliasExtension`), activated for name resolution.
     pub aliases: usize,
+    /// `protected` declarations (the pin's `protectedExt`), activated so that an
+    /// atomic identifier does not resolve to one.
+    pub protected: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -273,6 +276,7 @@ impl Engine {
             metadata::INSTANCE_EXTENSION,
             metadata::DEFAULT_EXTENSION,
             metadata::ALIAS_EXTENSION,
+            metadata::PROTECTED_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -321,6 +325,7 @@ impl Engine {
                 defaults: 0,
                 scoped_instances: 0,
                 aliases: 0,
+                protected: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -345,7 +350,8 @@ impl Engine {
                         0 => report.classes = block.entries.len(),
                         1 => report.instances = block.entries.len(),
                         2 => report.defaults = block.entries.len(),
-                        _ => report.aliases = block.entries.len(),
+                        3 => report.aliases = block.entries.len(),
+                        _ => report.protected = block.entries.len(),
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
@@ -363,6 +369,7 @@ impl Engine {
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
+        let mut protected = decoded.protected.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
@@ -476,6 +483,35 @@ impl Engine {
                         },
                     })?;
             }
+            // One module's tags, recorded together inside its own journal window.
+            cancelled!("source-olean/protected");
+            let tagged: Vec<Name> = protected.by_ref().take(report.protected).collect();
+            if tagged.len() != report.protected {
+                return Err(SourceOleanImportError::Internal(
+                    "protected count changed during decode",
+                ));
+            }
+            activation = activation.register_protected(&tagged).map_err(|error| {
+                let (declaration, reason) = match error {
+                    fln_elab::protected_names::ProtectedError::UnknownDeclaration(name) => {
+                        (name, "a protected tag names no admitted declaration")
+                    }
+                    fln_elab::protected_names::ProtectedError::Duplicate(name) => {
+                        (name, "a declaration is tagged protected twice")
+                    }
+                    fln_elab::protected_names::ProtectedError::Limit => {
+                        (report.module.clone(), "protected-declaration journal limit")
+                    }
+                    fln_elab::protected_names::ProtectedError::Malformed => {
+                        (report.module.clone(), "malformed protected declaration")
+                    }
+                };
+                SourceOleanImportError::Metadata {
+                    module: report.module.clone(),
+                    declaration,
+                    reason,
+                }
+            })?;
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -490,6 +526,7 @@ impl Engine {
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
+            || protected.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
@@ -540,6 +577,10 @@ trait Registrar: Sized {
         alias: &Name,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::aliases::AliasError>;
+    fn register_protected(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -577,6 +618,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::aliases::AliasError> {
         self.register_alias(alias, declaration)
+    }
+    fn register_protected(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
+        self.register_protected(declarations)
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
@@ -881,6 +928,12 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::aliases::AliasError> {
             fln_elab::aliases::register(&self.0, alias, declaration).map(Sequential)
+        }
+        fn register_protected(
+            self,
+            declarations: &[Name],
+        ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
+            fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)
