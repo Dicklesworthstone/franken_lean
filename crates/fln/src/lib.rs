@@ -25,6 +25,10 @@
 //! long-lived server transport remains a separate, unfinished product surface.
 
 #![forbid(unsafe_code)]
+// The one unstable feature, for one hook: a refused host allocation must unwind
+// to the frontier's per-module guard instead of aborting every thread at once
+// (fln-frontier-oom-abort-w9dx; see `install_host_allocation_failure_hook`).
+#![feature(alloc_error_hook)]
 
 mod olean_imports;
 pub mod source_check;
@@ -1124,9 +1128,11 @@ pub struct CheckedOleanModule {
 /// ([`EngineAdmissionError::CouncilNoAnswer`]) and a planning budget that ran
 /// out are non-answers, so the module is `Inconclusive`, never refused. Our own
 /// accounting failing is an `InternalFault`. A kernel rejection, a council
-/// disagreement and a malformed artifact stay `Failed`, and so, for now, do a
-/// host allocation failure and a decode budget stop: neither carries the
-/// allowance a [`ResourceUsage`](fln_core::outcome::ResourceUsage) must report.
+/// disagreement and a malformed artifact stay `Failed`, and so, for now, does a
+/// decode budget stop. A refused allocation is a non-answer too: it is not a
+/// verdict about the module. It carries no declared allowance for a
+/// [`ResourceUsage`](fln_core::outcome::ResourceUsage) to report, so, like a
+/// silent council, it says what was unavailable (fln-frontier-oom-abort-w9dx).
 fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
     fn admission_leaf(error: &EngineAdmissionError) -> &EngineAdmissionError {
         match error {
@@ -1142,6 +1148,11 @@ fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
             EngineAdmissionError::CouncilNoAnswer { summary } => OleanModuleVerdict::Inconclusive(
                 Inconclusive::dependency_unavailable(format!("council had no answer: {summary}")),
             ),
+            leaf @ EngineAdmissionError::AllocationFailure { .. } => {
+                OleanModuleVerdict::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                    "host memory: {leaf}"
+                )))
+            }
             leaf @ (EngineAdmissionError::CheckerBridge { .. }
             | EngineAdmissionError::UnexpectedPublication { .. }) => fault(leaf.to_string()),
             _ => OleanModuleVerdict::Failed(error),
@@ -1158,8 +1169,76 @@ fn frontier_error_verdict(error: OleanCheckError) -> OleanModuleVerdict {
                 },
             ))
         }
+        OleanCheckError::AllocationFailure { .. } | OleanCheckError::HostMemory { .. } => {
+            OleanModuleVerdict::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                "host memory: {error}"
+            )))
+        }
         OleanCheckError::InternalInvariant { .. } => fault(error.to_string()),
         _ => OleanModuleVerdict::Failed(error),
+    }
+}
+
+/// The panic payload [`install_host_allocation_failure_hook`] raises when the
+/// host refuses an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostAllocationFailure {
+    /// The size of the refused request, in bytes.
+    pub requested: usize,
+}
+
+/// Make a refused host allocation unwind instead of aborting the process
+/// (fln-frontier-oom-abort-w9dx). Rust's default handler aborts every thread at
+/// once, so one module's exhaustion used to end a whole frontier run and lose
+/// every verdict in it. With this hook, the unwind reaches the frontier's
+/// per-module guard, and that module's row is a typed non-answer while the run
+/// continues. A binary calls this once, before any work. The process-wide hook
+/// belongs to whoever owns the process, so the library never installs it.
+pub fn install_host_allocation_failure_hook() {
+    std::alloc::set_alloc_error_hook(host_allocation_failure);
+}
+
+fn host_allocation_failure(layout: std::alloc::Layout) {
+    // The default handler's message; stderr is unbuffered, so this allocates
+    // nothing.
+    eprintln!("memory allocation of {} bytes failed", layout.size());
+    std::panic::panic_any(HostAllocationFailure {
+        requested: layout.size(),
+    });
+}
+
+/// Run one module's check. An unwind out of it ends only that module, as its
+/// row; it never ends the run. Without this, a panicking worker thread died
+/// before reporting, and its scheduler waited for the module forever.
+fn frontier_guarded(
+    index: usize,
+    retain: bool,
+    started: std::time::Instant,
+    check: impl FnOnce() -> FrontierDone,
+) -> FrontierDone {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).unwrap_or_else(|payload| {
+        let error = frontier_unwound(payload);
+        FrontierDone {
+            index,
+            verdict: frontier_error_verdict(error.clone()),
+            accepted: None,
+            engine: None,
+            elapsed: started.elapsed(),
+            retained: retain.then_some(FrontierRetained::Failed(error)),
+        }
+    })
+}
+
+/// What an unwind out of a module check means: the host refused an allocation,
+/// or one of our invariants broke. A panic is never a verdict.
+fn frontier_unwound(payload: Box<dyn std::any::Any + Send>) -> OleanCheckError {
+    match payload.downcast::<HostAllocationFailure>() {
+        Ok(failure) => OleanCheckError::HostMemory {
+            requested: failure.requested,
+        },
+        Err(_) => OleanCheckError::InternalInvariant {
+            detail: "a frontier module check panicked",
+        },
     }
 }
 
@@ -1586,6 +1665,12 @@ pub enum OleanCheckError {
         resource: &'static str,
         requested: usize,
     },
+    /// The host refused an allocation, and its handler unwound instead of
+    /// aborting ([`install_host_allocation_failure_hook`]). `requested` is in
+    /// bytes, where [`OleanCheckError::AllocationFailure`] counts entries.
+    HostMemory {
+        requested: usize,
+    },
     DuplicateDeclaration {
         name: Name,
     },
@@ -1706,6 +1791,10 @@ impl fmt::Display for OleanCheckError {
             } => write!(
                 formatter,
                 "could not reserve {requested} entries for {resource}"
+            ),
+            Self::HostMemory { requested } => write!(
+                formatter,
+                "the host refused an allocation of {requested} bytes"
             ),
             Self::DuplicateDeclaration { name } => write!(
                 formatter,
@@ -4376,6 +4465,19 @@ impl Engine {
         limits: OleanCheckLimits,
     ) -> FrontierDone {
         let started = std::time::Instant::now();
+        let (index, retain) = (job.index, job.retain);
+        frontier_guarded(index, retain, started, || {
+            self.frontier_check_module_unguarded(job, options, limits, started)
+        })
+    }
+
+    fn frontier_check_module_unguarded(
+        &self,
+        job: FrontierJob,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        started: std::time::Instant,
+    ) -> FrontierDone {
         let index = job.index;
         let retain = job.retain;
         let finish = |verdict: OleanModuleVerdict,
@@ -16997,6 +17099,78 @@ mod tests {
         );
     }
 
+    /// A refused host allocation inside one module's check is that module's typed
+    /// non-answer, and the process goes on (fln-frontier-oom-abort-w9dx). The
+    /// allocation really fails: the test re-runs itself under a 4 GiB address-space
+    /// limit (`prlimit --as`), installs the hook, and asks for 8 GiB inside the
+    /// frontier's guard.
+    #[test]
+    fn a_refused_host_allocation_in_a_module_check_is_that_module_s_non_answer() {
+        const CHILD: &str = "FLN_W9DX_HOST_ALLOCATION_CHILD";
+        const MARKER: &str = "w9dx: the run continued past a refused allocation";
+        const REQUESTED: usize = 8 << 30;
+        if std::env::var_os(CHILD).is_some() {
+            super::install_host_allocation_failure_hook();
+            let done = super::frontier_guarded(7, true, std::time::Instant::now(), || {
+                let block = std::hint::black_box(vec![0_u8; std::hint::black_box(REQUESTED)]);
+                panic!("{} bytes were allocated under a 4 GiB limit", block.len());
+            });
+            assert_eq!(done.index, 7);
+            assert!(done.accepted.is_none() && done.engine.is_none());
+            assert!(
+                matches!(
+                    &done.verdict,
+                    super::OleanModuleVerdict::Inconclusive(fln_core::outcome::Inconclusive {
+                        cause: fln_core::outcome::InconclusiveCause::DependencyUnavailable { what },
+                        ..
+                    }) if what.text() == format!(
+                        "host memory: the host refused an allocation of {REQUESTED} bytes"
+                    )
+                ),
+                "the module's row must be a typed non-answer, got {:?}",
+                done.verdict
+            );
+            assert!(
+                matches!(
+                    done.retained,
+                    Some(super::FrontierRetained::Failed(
+                        OleanCheckError::HostMemory {
+                            requested: REQUESTED
+                        }
+                    ))
+                ),
+                "a retained job keeps the typed error"
+            );
+            let after = std::hint::black_box(vec![1_u8; 1 << 20]);
+            assert_eq!(after.len(), 1 << 20);
+            println!("{MARKER}");
+            return;
+        }
+        let test = "tests::a_refused_host_allocation_in_a_module_check_is_that_module_s_non_answer";
+        let binary = std::env::current_exe().expect("the test binary's path");
+        // util-linux `prlimit` sets the child's address-space limit and execs it;
+        // no shell is involved.
+        let output = std::process::Command::new("prlimit")
+            .arg(format!("--as={}", 4_u64 << 30))
+            .arg("--")
+            .arg(&binary)
+            .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test binary under prlimit's address-space limit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(MARKER),
+            "the limited child did not survive its refused allocation: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains(&format!("memory allocation of {REQUESTED} bytes failed")),
+            "the hook names the refused request on stderr:\n{stderr}"
+        );
+    }
+
     /// FL-INV-07: a frontier row whose council had no answer, or which ran past a
     /// structural limit, is a non-answer. Only a disagreement or a kernel
     /// rejection is a failure.
@@ -17043,6 +17217,33 @@ mod tests {
                     }) if usage.is_genuine_exhaustion()
                 ),
                 "a structural limit must be a genuine exhaustion, got {verdict:?}"
+            );
+        }
+
+        for error in [
+            OleanCheckError::HostMemory { requested: 8 << 30 },
+            OleanCheckError::AllocationFailure {
+                resource: "olean frontier rows",
+                requested: 3,
+            },
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                index: 2,
+                error: Box::new(EngineAdmissionError::AllocationFailure {
+                    resource: "admission batch",
+                    requested: 5,
+                }),
+            }),
+        ] {
+            let verdict = super::frontier_error_verdict(error);
+            assert!(
+                matches!(
+                    &verdict,
+                    super::OleanModuleVerdict::Inconclusive(Inconclusive {
+                        cause: InconclusiveCause::DependencyUnavailable { what },
+                        ..
+                    }) if what.text().starts_with("host memory: ")
+                ),
+                "a refused allocation is a non-answer, never a refusal, got {verdict:?}"
             );
         }
 

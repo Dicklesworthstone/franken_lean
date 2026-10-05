@@ -4326,7 +4326,8 @@ fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str,
         | fln::OleanCheckError::TotalBytesLimit { .. }
         | fln::OleanCheckError::DeclarationLimit { .. }
         | fln::OleanCheckError::DependencyPresentationLimit { .. }
-        | fln::OleanCheckError::AllocationFailure { .. } => ("resource", false, 3),
+        | fln::OleanCheckError::AllocationFailure { .. }
+        | fln::OleanCheckError::HostMemory { .. } => ("resource", false, 3),
         fln::OleanCheckError::Decode(_) | fln::OleanCheckError::ModuleDecode { .. } => {
             ("decode", false, 1)
         }
