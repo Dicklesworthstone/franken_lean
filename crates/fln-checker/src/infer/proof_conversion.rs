@@ -140,8 +140,30 @@ impl PairAnswers {
         }
     }
 }
-/// How many stuck recursor majors `nested_k_reduction` follows down.
+/// How many stuck recursor majors and projected structures `nested_k_reduction`
+/// follows down.
 const MAX_NESTED_K_DEPTH: usize = 8;
+
+/// Which steps `nested_k_reduction` may take down from a term.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Recursor majors only: the eager rule, tried on every pair that gets there.
+    Majors,
+    /// Recursor majors and projected structures: only from a side whose spine
+    /// head is a projection the other side's spine head does not share. Run on
+    /// every projection-headed pair, whnf-ing the projected structure cost
+    /// BVDecide's `Udiv` lemmas 21% and `DHashMap.Lemmas` 11% (sequential, same
+    /// base); a shared projection head goes to congruence instead.
+    MajorsAndProjections,
+}
+
+/// How `nested_k_reduction` reached the next term down from the current one.
+enum Descent {
+    /// The recursor's major premise, at this spine position.
+    Major(usize),
+    /// The structure of the projection at the head of the spine.
+    Projection,
+}
 type Result<T> = std::result::Result<T, Box<InferenceOutcome>>;
 impl Probe<'_> {
     fn progress(&self) -> InferenceProgress {
@@ -698,35 +720,179 @@ impl Probe<'_> {
     /// stuck inside another recursor's major still reduces. Untyped reduction
     /// has no types for the K gate, and `k_reduction` examines only the head:
     /// `decide` on a `Rat` equality stuck as `Decidable.rec … (Eq.rec … h)`
-    /// was deferred. Follow the chain of stuck majors down to the first K
-    /// recursor `k_reduction` accepts, and rebuild the chain around it. The gate
-    /// is the caller's, exactly as for `k_reduction`.
+    /// was deferred. A projection is reduced the same way: the pin's
+    /// `whnf_core` reduces a projection's structure before projecting, with K
+    /// available to the recursor steps there. Structure eta splits a
+    /// constructor against a stuck cast into its fields against projections
+    /// of the cast, `(Eq.rec … h).1`, which `k_reduction` alone cannot see
+    /// (fln-4o0g: `CategoryTheory.Cat.bicategory.strict`). Follow the chain of
+    /// stuck majors and projected structures down to the first K recursor
+    /// `k_reduction` accepts, and rebuild the chain around it. The gate is the
+    /// caller's, exactly as for `k_reduction`.
     fn nested_k_reduction(
         &mut self,
         s: &WireExpr,
         context: &InferenceContext,
+        reach: Reach,
     ) -> Result<Option<((WireExpr, WireExpr), WireExpr)>> {
-        let mut chain: Vec<(WireExpr, usize)> = Vec::new();
+        let mut chain: Vec<(WireExpr, Descent)> = Vec::new();
         let mut current = s.clone();
         for _ in 0..MAX_NESTED_K_DEPTH {
-            let Some((index, major)) = self.recursor_major(&current, context)? else {
+            let (descent, inner) =
+                if let Some((index, major)) = self.recursor_major(&current, context)? {
+                    (Descent::Major(index), major)
+                } else if reach == Reach::MajorsAndProjections
+                    && let Some(structure) = self.projected_structure(&current)?
+                {
+                    (Descent::Projection, structure)
+                } else {
+                    return Ok(None);
+                };
+            let inner = self.piece(&current, inner)?;
+            let Some(inner) = self.whnf(&inner, context)? else {
                 return Ok(None);
             };
-            let major = self.piece(&current, major)?;
-            let Some(major) = self.whnf(&major, context)? else {
-                return Ok(None);
-            };
-            chain.push((current, index));
-            if let Some((gate, reduced)) = self.k_reduction(&major, context)? {
+            chain.push((current, descent));
+            if let Some((gate, reduced)) = self.k_reduction(&inner, context)? {
                 let mut rebuilt = reduced;
-                for (term, index) in chain.into_iter().rev() {
-                    rebuilt = self.with_argument(&term, index, &rebuilt)?;
+                for (term, descent) in chain.into_iter().rev() {
+                    rebuilt = match descent {
+                        Descent::Major(index) => self.with_argument(&term, index, &rebuilt)?,
+                        Descent::Projection => self.with_projected_structure(&term, &rebuilt)?,
+                    };
                 }
                 return Ok(Some((gate, rebuilt)));
             }
-            current = major;
+            current = inner;
         }
         Ok(None)
+    }
+    /// Whether the chain below `s` reaches a K-like recursor at a spine head:
+    /// through the structure of a projection head and the major of a recursor
+    /// head, read in place, with no whnf and no copy. The comparands reaching
+    /// the KR-317 rules are already in whnf, so a stuck cast is already at the
+    /// head of its projection's structure; a chain that does not end at one
+    /// cannot fire, and skipping it spares the projected structure's whnf
+    /// (BVDecide's `Udiv` lemmas paid 8.7% for it without this check).
+    fn reaches_k_recursor(&mut self, s: &WireExpr, context: &InferenceContext) -> Result<bool> {
+        let constants = context.constants();
+        let mut id = s.root();
+        for _ in 0..MAX_NESTED_K_DEPTH {
+            let mut arguments = Vec::new();
+            let mut head = id;
+            while let Some(ExprNode::Apply { function, argument }) = s.node(head) {
+                self.tick()?;
+                arguments.push(*argument);
+                head = *function;
+            }
+            arguments.reverse();
+            match s.node(head) {
+                Some(ExprNode::Projection { expression, .. }) => id = *expression,
+                Some(ExprNode::Constant { name, .. }) => {
+                    let Some(recursor) = constants.find(name).and_then(|d| d.recursor_metadata())
+                    else {
+                        return Ok(false);
+                    };
+                    if recursor.k() {
+                        return Ok(true);
+                    }
+                    let major = [
+                        recursor.num_parameters(),
+                        recursor.num_motives(),
+                        recursor.num_minors(),
+                        recursor.num_indices(),
+                    ]
+                    .into_iter()
+                    .map(|count| count as usize)
+                    .sum::<usize>();
+                    let Some(&next) = arguments.get(major) else {
+                        return Ok(false);
+                    };
+                    id = next;
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+    /// The structure name and field index of the projection at the head of
+    /// `s`'s spine, when that head is a projection.
+    fn projection_head(&mut self, s: &WireExpr) -> Result<Option<(WireName, u64)>> {
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, .. }) = s.node(id) {
+            self.tick()?;
+            id = *function;
+        }
+        Ok(match s.node(id) {
+            Some(ExprNode::Projection {
+                structure_name,
+                index,
+                ..
+            }) => Some((structure_name.clone(), *index)),
+            _ => None,
+        })
+    }
+    /// The structure of the projection at the head of `s`'s spine, when that
+    /// head is a projection.
+    fn projected_structure(&mut self, s: &WireExpr) -> Result<Option<ExprId>> {
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, .. }) = s.node(id) {
+            self.tick()?;
+            id = *function;
+        }
+        Ok(match s.node(id) {
+            Some(ExprNode::Projection { expression, .. }) => Some(*expression),
+            _ => None,
+        })
+    }
+    /// `s` with the structure of the projection at the head of its spine
+    /// replaced by `replacement`, built by extending a copy of `s`'s arena.
+    fn with_projected_structure(
+        &mut self,
+        s: &WireExpr,
+        replacement: &WireExpr,
+    ) -> Result<WireExpr> {
+        let mut arguments = Vec::new();
+        let mut id = s.root();
+        while let Some(ExprNode::Apply { function, argument }) = s.node(id) {
+            self.tick()?;
+            arguments.push(*argument);
+            id = *function;
+        }
+        let Some(ExprNode::Projection {
+            structure_name,
+            index,
+            ..
+        }) = s.node(id)
+        else {
+            return Err(self.fault(InferenceFault::LiteralTypeAllocation));
+        };
+        let (structure_name, index) = (structure_name.clone(), *index);
+        let mut nodes = s.nodes().to_vec();
+        let mut levels = s.levels().to_vec();
+        let replacement = append_arena(&mut nodes, &mut levels, replacement)
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        let mut root = push_node(
+            &mut nodes,
+            ExprNode::Projection {
+                structure_name,
+                index,
+                expression: replacement,
+            },
+        )
+        .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        for &argument in arguments.iter().rev() {
+            self.tick()?;
+            root = push_node(
+                &mut nodes,
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+            )
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        }
+        Ok(WireExpr::from_parts(nodes, levels, root))
     }
     /// The position and node of `s`'s major premise, when `s`'s head is a
     /// recursor applied far enough to have one.
@@ -1157,7 +1323,31 @@ impl Probe<'_> {
             // `nested_k_reduction`.
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
                 if let Some(((major_type, constructor_type), reduced)) =
-                    self.nested_k_reduction(s, &context)?
+                    self.nested_k_reduction(s, &context, Reach::Majors)?
+                    && self.run(&major_type, &constructor_type, &context, false)?
+                {
+                    let (a, b) = if s_on_left {
+                        (reduced, t.clone())
+                    } else {
+                        (t.clone(), reduced)
+                    };
+                    work.push(Work::Pair(a, b, context.clone()));
+                    continue 'work;
+                }
+            }
+            // KR-317 through a projection (see `Reach`): only from a side whose
+            // spine head is a projection the other side's does not share.
+            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
+                let Some(head) = self.projection_head(s)? else {
+                    continue;
+                };
+                if self.projection_head(t)? == Some(head)
+                    || !self.reaches_k_recursor(s, &context)?
+                {
+                    continue;
+                }
+                if let Some(((major_type, constructor_type), reduced)) =
+                    self.nested_k_reduction(s, &context, Reach::MajorsAndProjections)?
                     && self.run(&major_type, &constructor_type, &context, false)?
                 {
                     let (a, b) = if s_on_left {

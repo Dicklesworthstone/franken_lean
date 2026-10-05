@@ -416,3 +416,68 @@ fn a_nested_k_recursor_stays_stuck_when_the_major_type_differs() {
         "a nested cast whose indices differ must not reduce: {outcome:?}"
     );
 }
+
+/// `F3 ((KEq.rec (motive := fun _ _ => S) (S.mk dv p) x major).1)` for
+/// `a := S.mk first p`, in an environment with `wd3 : F3 dv`.
+fn projected_cast(first: Expr, major: &str) -> (ConstantEnvironment, Expr) {
+    let mut rows = vec![
+        axiom("A", ty()),
+        axiom("Pp", prop()),
+        axiom("p", c("Pp")),
+        axiom("a0", c("A")),
+        axiom("dv", c("A")),
+        axiom("F3", pi(c("A"), ty())),
+        axiom("wd3", app(c("F3"), [c("dv")])),
+    ];
+    rows.extend(keq_entries());
+    rows.extend(structure_entries());
+    rows.extend([
+        axiom("x", c("S")),
+        axiom("h", keq(c("S"), rebuilt(first_of_x()), c("x"))),
+        axiom("h_other", keq(c("S"), rebuilt(c("a0")), c("x"))),
+    ]);
+    let a = rebuilt(first);
+    let cast = app(
+        Expr::const_(Name::from_components(["KEq", "rec"]), vec![Level::one()]),
+        [
+            c("S"),
+            a.clone(),
+            lam(c("S"), lam(keq(c("S"), a, bv(0)), c("S"))),
+            rebuilt(c("dv")),
+            c("x"),
+            c(major),
+        ],
+    );
+    let projected = Expr::proj(primary_name("S"), 0, cast);
+    (environment_of(rows), app(c("F3"), [projected]))
+}
+
+/// A K recursor under a projection reduces there too, as the pin's `whnf_core`
+/// reduces a projection's structure with K available to the recursor step.
+/// The cast `KEq.rec (motive := fun _ _ => S) (S.mk dv p) x h` reduces to
+/// `S.mk dv p` only by K, so its first field is `dv` and `wd3 : F3 dv` has
+/// type `F3 (cast).1`. The lane tried K at the head and down recursor majors,
+/// never through a projection, and deferred; Mathlib hit this when structure
+/// eta split a constructor against a stuck `Eq.rec` into its fields against
+/// projections of that cast (fln-4o0g, `CategoryTheory.Cat.bicategory.strict`).
+#[test]
+fn a_k_recursor_under_a_projection_reduces() {
+    let (env, declared) = projected_cast(first_of_x(), "h");
+    let candidate = definition("projected_k", decoded(&declared), decoded(&c("wd3")));
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(outcome, Verdict::Admitted(_)), "{outcome:?}");
+}
+
+/// The projected reduction keeps the head reduction's gate: with
+/// `a := S.mk a0 p` the major's type does not convert with the constructor's,
+/// so K must not fire through the projection either.
+#[test]
+fn a_projected_k_recursor_stays_stuck_when_the_major_type_differs() {
+    let (env, declared) = projected_cast(c("a0"), "h_other");
+    let candidate = definition("projected_k_other", decoded(&declared), decoded(&c("wd3")));
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(
+        !matches!(outcome, Verdict::Admitted(_)),
+        "a projected cast whose indices differ must not reduce: {outcome:?}"
+    );
+}
