@@ -4361,7 +4361,10 @@ mod tests {
 
         // A different term is a different digest, including a swapped pair.
         let other = merkle_pair(build(), merkle_const("a"));
-        assert_ne!(ExprMerkle::new().root(&once), ExprMerkle::new().root(&other));
+        assert_ne!(
+            ExprMerkle::new().root(&once),
+            ExprMerkle::new().root(&other)
+        );
         let swapped = merkle_pair(merkle_const("a"), build());
         assert_ne!(
             ExprMerkle::new().root(&other),

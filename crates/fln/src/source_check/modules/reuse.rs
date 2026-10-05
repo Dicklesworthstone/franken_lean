@@ -1587,7 +1587,11 @@ mod tests {
         // A pre-Merkle record differs only in its schema line and is correctly sealed,
         // so it is refused for its format, not for damage.
         let text = String::from_utf8(bytes).expect("records are UTF-8");
-        let body_end = text.trim_end_matches('\n').rfind('\n').expect("a seal line") + 1;
+        let body_end = text
+            .trim_end_matches('\n')
+            .rfind('\n')
+            .expect("a seal line")
+            + 1;
         let old_body = text[..body_end].replacen(RECORD_SCHEMA, "fln.import-reuse-record/1", 1);
         assert_ne!(old_body, text[..body_end]);
         let old = format!("{old_body}seal {}\n", seal(old_body.as_bytes()).to_hex());

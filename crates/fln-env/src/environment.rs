@@ -4549,7 +4549,10 @@ mod tests {
         assert_eq!(measured, modeled_canonical_bytes(&info));
         // 21 value nodes and one type node, each record well under a hundred bytes:
         // the tree's 2^20 leaves are nowhere in it.
-        assert!(measured < 4096, "a 22-node preimage measured {measured} bytes");
+        assert!(
+            measured < 4096,
+            "a 22-node preimage measured {measured} bytes"
+        );
         assert_eq!(
             Environment::decl_content_digest(&info),
             hash(Domain::DeclContent, &bytes)

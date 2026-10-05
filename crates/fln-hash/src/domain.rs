@@ -383,12 +383,20 @@ mod tests {
                 .iter()
                 .map(|input| hash(domain, input).to_hex())
                 .collect();
-            let row = format!("{}|{}|{}", row_name(domain), domain.tag(), digests.join("|"));
+            let row = format!(
+                "{}|{}|{}",
+                row_name(domain),
+                domain.tag(),
+                digests.join("|")
+            );
             println!("fln-domain-vector-row {row}");
             fixture.push_str(&row);
             fixture.push('\n');
         }
-        assert_eq!(check_domain_vector_contract(&fixture), Ok(Domain::ALL.len()));
+        assert_eq!(
+            check_domain_vector_contract(&fixture),
+            Ok(Domain::ALL.len())
+        );
     }
 
     #[test]
