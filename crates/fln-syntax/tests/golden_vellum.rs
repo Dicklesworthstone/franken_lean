@@ -117,7 +117,12 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// green on the committed tree, said +5 before the commit was made. **Prefer a main-reachable sha
 /// when writing an immutable comment: a bead comment cannot be edited, so every abbreviated
 /// pre-rewrite sha in one is a permanent allowance row.**
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 187;
+///
+/// **187 -> 188 is that lesson again, from a rebase rather than a rewrite.** A pane cited its own
+/// checker-exhaustion commit in two bead comments (fln-r0yh, fln-checker-exhaustion-roots-1mr1)
+/// by the sha it had before `git rebase origin/main`; the commit landed on main under its rebased
+/// sha, and the local pre-rebase object remains. Cite a commit only after it is pushed.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 188;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -217,6 +222,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "7882e-312",
     "7a493-32a",
     "7b788-f7d",
+    "7c240-e9b",
     "7e07d-6d",
     "8177e-ccd",
     "828d9-488",
