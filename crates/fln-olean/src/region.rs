@@ -791,6 +791,21 @@ impl<'a> OleanView<'a> {
         Err(RegionError::PtrOutOfBounds { ptr, resolved })
     }
 
+    /// Does a location returned by [`deref`](Self::deref) name an object
+    /// stored in THIS file's payload, rather than one owned by a dependency
+    /// region?
+    ///
+    /// `deref` answers in two number spaces: a file offset for this payload,
+    /// and the absolute compacted address for a dependency. The two cannot
+    /// meet, because [`parse_with_dependencies`](Self::parse_with_dependencies)
+    /// refuses any dependency range that starts below this file's length, so a
+    /// payload-range test is exact. A view with no dependencies owns every
+    /// location `deref` can return.
+    pub(crate) fn owns(&self, location: u64) -> bool {
+        let start = self.payload_offset as u64;
+        location >= start && location - start < self.payload_len as u64
+    }
+
     /// Read a compacted `lean_object` header at a file offset: `m_rc` (i32),
     /// then the packed bitfield word `m_cs_sz:16 | m_other:8 | m_tag:8`
     /// (low-to-high, per the generated `LEAN_OBJECT_FIELDS` order).

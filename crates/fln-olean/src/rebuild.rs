@@ -22,6 +22,21 @@
 //! relocation-table words are re-derived, and library identifiers are a separate
 //! declared copy class, never padding. Nonempty closure-relocation tables remain
 //! a typed refusal: byte identity must not certify unimplemented code relocation.
+//!
+//! # Module-system companion parts
+//!
+//! A module-system module is up to three physical parts written in load order:
+//! the exported `.olean`, then `.olean.server`, then `.olean.private`. Lean
+//! compacts each later part against the earlier ones, so a companion stores
+//! ordinary pointers holding an EARLIER part's compacted addresses and does not
+//! re-emit the objects they name. A companion is therefore not a standalone
+//! region and [`rebuild`] refuses it. [`rebuild_with_dependencies`] rebuilds it
+//! in the address space [`OleanView::parse_with_dependencies`] binds: objects
+//! the part owns are re-derived and emitted exactly as above, while a pointer
+//! into an earlier part is re-derived from its validated compacted address, its
+//! target must carry a persistent object header there, and that object is left
+//! to the part that owns it. [`rebuild_module_parts`] rebuilds a whole ordered
+//! chain that way.
 
 use crate::format;
 use crate::region::{OleanView, RegionError, WalkBudget};
@@ -45,12 +60,16 @@ pub struct SerializationFreedom {
 
 /// THE EXHAUSTIVE ENUMERATION, and the exhaustiveness is measured rather than
 /// asserted: one row, because the corpus sweep
-/// (`every_shipped_stdlib_olean_rebuilds_byte_identical`, all 2,433 shipped
-/// oleans) reproduced every byte from parsed semantics plus declared content
-/// classes with ZERO findings — no nonzero padding, no capacity surprises, no
-/// undeclared byte class anywhere at the pin. A new freedom cannot enter
-/// silently: it would surface as a byte divergence or a named finding in that
-/// same sweep.
+/// (`every_shipped_stdlib_olean_rebuilds_byte_identical`: all 2,433 shipped
+/// module images, 7,295 physical parts counting the 2,431 module-system
+/// chains' `.olean.server` and `.olean.private` companions) reproduced every
+/// byte from parsed semantics plus declared content classes with ZERO
+/// findings — no nonzero padding, no capacity surprises, no undeclared byte
+/// class anywhere at the pin. A new freedom cannot enter silently: it would
+/// surface as a byte divergence or a named finding in that same sweep. The
+/// companions add no row: each part keeps its own `base_addr`, and a pointer
+/// into an earlier part holds that part's address, which the same policy
+/// already reproduces.
 pub const SERIALIZATION_FREEDOMS: &[SerializationFreedom] = &[SerializationFreedom {
     name: "base_addr",
     class: "per-emission mmap placement: six different values across six shipped \
@@ -92,6 +111,11 @@ pub struct RebuildReport {
     pub nonzero_padding_bytes: u64,
     /// Unused array/string capacity slack measured (capacity beyond size).
     pub slack_bytes: u64,
+    /// Pointer words (the root slot included) re-derived as references to an
+    /// object owned by an earlier part of the module chain. Always zero for a
+    /// standalone image. Those words are part of `rederived_bytes`; this only
+    /// counts how many crossed into a dependency region.
+    pub dependency_pointers: u64,
     pub findings: Vec<String>,
 }
 
@@ -188,8 +212,49 @@ fn rebuild_v3_trailer(
 ///
 /// Supports v2 and v3 payload framing. Closure/code relocations are deliberately
 /// refused until their semantic reconstruction is implemented.
+///
+/// The file must be a standalone region. A module-system companion
+/// (`.olean.server`, `.olean.private`) points into earlier parts and is
+/// refused here; rebuild it with [`rebuild_with_dependencies`].
 pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
-    let view = OleanView::parse(bytes)?;
+    rebuild_with_dependencies(bytes, &[])
+}
+
+/// Rebuild every physical part of one module image, in load order: the
+/// exported `.olean`, then `.olean.server`, then `.olean.private`.
+///
+/// Part `i` is rebuilt against parts `0..i`, the address space Lean loads it
+/// in. The result has one `(bytes, report)` entry per input part, in input
+/// order, and the caller byte-diffs each against its original. A refusal names
+/// no part; rebuild the parts one at a time with [`rebuild_with_dependencies`]
+/// to attribute it.
+pub fn rebuild_module_parts(parts: &[&[u8]]) -> Result<Vec<(Vec<u8>, RebuildReport)>, RegionError> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(loaded, bytes)| rebuild_with_dependencies(bytes, &parts[..loaded]))
+        .collect()
+}
+
+/// Rebuild one physical part of a module image against the earlier parts it
+/// was compacted after, supplied in load order.
+///
+/// `dependencies` is the same list [`OleanView::parse_with_dependencies`]
+/// takes: empty for the exported `.olean` (exactly [`rebuild`]), the exported
+/// part for `.olean.server`, and the exported and server parts for
+/// `.olean.private`. Only objects stored in `bytes` are emitted. A pointer
+/// into a dependency is re-derived from its validated compacted address and
+/// must name a persistent object header there; the object itself belongs to
+/// the dependency's own rebuild.
+pub fn rebuild_with_dependencies(
+    bytes: &[u8],
+    dependencies: &[&[u8]],
+) -> Result<(Vec<u8>, RebuildReport), RegionError> {
+    let view = if dependencies.is_empty() {
+        OleanView::parse(bytes)?
+    } else {
+        OleanView::parse_with_dependencies(bytes, dependencies)?
+    };
     // OleanView uses this same parser, so failures have already been mapped to
     // its precise public errors above. Reuse the authoritative payload bounds
     // rather than assuming that the fixed header is followed by the root slot.
@@ -224,7 +289,16 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
         } else if raw == 0 {
             Ok(0)
         } else {
-            encode_ptr(view.deref(raw)?)
+            let location = view.deref(raw)?;
+            if view.owns(location) {
+                encode_ptr(location)
+            } else {
+                // `deref` answers a dependency hit with the compacted address
+                // it validated: word-aligned, inside exactly one earlier
+                // part's payload. That address IS the stored form, because
+                // each part keeps its own base_addr (freedom-table row 1).
+                Ok(location)
+            }
         }
     };
 
@@ -245,6 +319,16 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             continue;
         }
         let off = view.deref(ptr)?;
+        if !view.owns(off) {
+            // An earlier part's object: its pointer word was re-derived where
+            // it was read, and the object is emitted by that part's rebuild.
+            // Still require a persistent object header at the target, so a
+            // pointer into the middle of a foreign object is refused rather
+            // than reproduced.
+            view.obj_header(off)?;
+            report.dependency_pointers += 1;
+            continue;
+        }
         if !seen.insert(off) {
             continue;
         }
@@ -604,9 +688,12 @@ mod tests {
 
     #[test]
     fn every_shipped_stdlib_olean_rebuilds_byte_identical() {
-        // The corpus-scale half of acceptance (a): EVERY shipped olean — no
-        // sampling, because a filter that continues is a sampler — rebuilds
-        // byte-identical, with every finding named. Typed skip without the pin.
+        // The corpus-scale half of acceptance (a): EVERY shipped module image —
+        // no sampling, because a filter that continues is a sampler — rebuilds
+        // byte-identical in EVERY physical part, with every finding named. A
+        // module-system chain's `.olean.server` and `.olean.private` are
+        // rebuilt against the earlier parts, the address space Lean loads them
+        // in (bead franken_lean-etj.1). Typed skip without the pin.
         let Some(lib) = reference_lib() else {
             eprintln!("SKIP: pinned Reference stdlib not installed");
             return;
@@ -624,51 +711,226 @@ mod tests {
             }
         }
         paths.sort();
-        assert!(
-            paths.len() > 2000,
-            "anti-vacuity: the pinned stdlib ships >2400 oleans, found {}",
-            paths.len()
+        // The pin's population, held exactly: 2,433 module images, of which
+        // 2,431 are module-system chains (`.olean`, `.olean.server`,
+        // `.olean.private`), so 7,295 physical parts and 4,862 companions.
+        assert_eq!(
+            paths.len(),
+            2_433,
+            "the pinned v4.32.0 stdlib ships 2,433 module images"
         );
-        let mut identical = 0usize;
-        let mut failures: Vec<String> = Vec::new();
-        let mut findings: Vec<String> = Vec::new();
-        for p in &paths {
-            let bytes = std::fs::read(p).expect("readable olean");
-            match rebuild(&bytes) {
-                Ok((out, report)) => {
-                    if out == bytes {
-                        identical += 1;
-                    } else {
-                        let first = out
-                            .iter()
-                            .zip(bytes.iter())
-                            .position(|(a, b)| a != b)
-                            .map(|i| i as i64)
-                            .unwrap_or(-1);
-                        failures.push(format!("{}: diverges at byte {first}", p.display()));
+        // The private parts alone are ~1.3 GiB at the pin, four times the
+        // exported parts, so the images are swept on scoped threads. Every
+        // image is still visited; only the tallies are merged.
+        #[derive(Default)]
+        struct Sweep {
+            chains: usize,
+            physical_parts: usize,
+            identical: usize,
+            companions_identical: usize,
+            // Pointer words crossing into an earlier part, by load position.
+            dependency_pointers: [u64; 3],
+            failures: Vec<String>,
+            findings: Vec<String>,
+        }
+        fn sweep(images: &[std::path::PathBuf]) -> Sweep {
+            let companion = |exported: &std::path::Path, suffix: &str| {
+                let mut name = exported.as_os_str().to_os_string();
+                name.push(suffix);
+                std::path::PathBuf::from(name)
+            };
+            let mut s = Sweep::default();
+            for p in images {
+                let server = companion(p, ".server");
+                let private = companion(p, ".private");
+                let part_paths = match (server.is_file(), private.is_file()) {
+                    (false, false) => vec![p.clone()],
+                    (true, true) => {
+                        s.chains += 1;
+                        vec![p.clone(), server, private]
                     }
-                    for f in report.findings {
-                        findings.push(format!("{}: {f}", p.display()));
+                    _ => {
+                        s.failures
+                            .push(format!("{}: partial module-system chain", p.display()));
+                        continue;
+                    }
+                };
+                let originals: Vec<Vec<u8>> = part_paths
+                    .iter()
+                    .map(|path| std::fs::read(path).expect("readable olean part"))
+                    .collect();
+                let loaded: Vec<&[u8]> = originals.iter().map(Vec::as_slice).collect();
+                s.physical_parts += originals.len();
+                for (index, (path, original)) in part_paths.iter().zip(&originals).enumerate() {
+                    // Each part against exactly the parts Lean loads before it.
+                    match rebuild_with_dependencies(original, &loaded[..index]) {
+                        Ok((out, report)) => {
+                            if out == *original {
+                                s.identical += 1;
+                                s.companions_identical += usize::from(index > 0);
+                            } else {
+                                let first = out
+                                    .iter()
+                                    .zip(original.iter())
+                                    .position(|(a, b)| a != b)
+                                    .map(|i| i as i64)
+                                    .unwrap_or(-1);
+                                s.failures
+                                    .push(format!("{}: diverges at byte {first}", path.display()));
+                            }
+                            s.dependency_pointers[index] += report.dependency_pointers;
+                            for f in report.findings {
+                                s.findings.push(format!("{}: {f}", path.display()));
+                            }
+                        }
+                        Err(e) => s
+                            .failures
+                            .push(format!("{}: refused: {e:?}", path.display())),
                     }
                 }
-                Err(e) => failures.push(format!("{}: refused: {e:?}", p.display())),
+                if s.failures.len() > 10 {
+                    break; // ten named failures is a report, not a sampler
+                }
             }
-            if failures.len() > 10 {
-                break; // ten named failures is a report, not a sampler
+            s
+        }
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(16));
+        let swept: Vec<Sweep> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .chunks(paths.len().div_ceil(workers))
+                .map(|images| scope.spawn(move || sweep(images)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sweep worker"))
+                .collect()
+        });
+        let mut chains = 0usize;
+        let mut physical_parts = 0usize;
+        let mut identical = 0usize;
+        let mut companions_identical = 0usize;
+        let mut dependency_pointers = [0u64; 3];
+        let mut failures: Vec<String> = Vec::new();
+        let mut findings: Vec<String> = Vec::new();
+        for s in swept {
+            chains += s.chains;
+            physical_parts += s.physical_parts;
+            identical += s.identical;
+            companions_identical += s.companions_identical;
+            for (total, part) in dependency_pointers.iter_mut().zip(s.dependency_pointers) {
+                *total += part;
             }
+            failures.extend(s.failures);
+            findings.extend(s.findings);
         }
         assert!(
             failures.is_empty(),
-            "rebuild failures ({} of {} identical):\n{}",
+            "rebuild failures ({} of {} physical parts identical):\n{}",
             identical,
-            paths.len(),
+            physical_parts,
             failures.join("\n")
         );
-        assert_eq!(identical, paths.len());
+        assert_eq!(chains, 2_431, "module-system chains at the pin");
+        assert_eq!(physical_parts, 7_295, "physical parts at the pin");
+        assert_eq!(identical, physical_parts);
+        assert_eq!(companions_identical, 2 * chains, "every companion part");
+        // Anti-vacuity for the companion path: an exported part owns every
+        // object it names, and both companion kinds really do point into
+        // earlier parts, so the cross-part re-derivation is what was measured.
+        assert_eq!(dependency_pointers[0], 0, "exported parts are standalone");
+        assert!(
+            dependency_pointers[1] > 0 && dependency_pointers[2] > 0,
+            "companions never crossed into an earlier part: {dependency_pointers:?}"
+        );
+        eprintln!(
+            "rebuilt {physical_parts} parts byte-identical: {} module images, {chains} chains, \
+             {companions_identical} companion parts; dependency pointers server={} private={}",
+            paths.len(),
+            dependency_pointers[1],
+            dependency_pointers[2]
+        );
         assert!(
             findings.is_empty(),
             "named findings (candidate freedom rows):\n{}",
             findings.join("\n")
+        );
+    }
+
+    /// A companion part built against the committed pilot, which stands in for
+    /// the exported part: the root is a local one-field constructor whose
+    /// field is `field`, a word the companion stores but whose target it does
+    /// not own.
+    fn pilot_companion(field: u64) -> Vec<u8> {
+        let pilot = OleanView::parse(PILOT).expect("pilot").header.base_addr;
+        // Two alignment units above the pilot's base, which keeps the two
+        // address ranges disjoint only while the pilot is shorter than two
+        // units: asserted, not assumed.
+        let base = pilot + 2 * format::REGION_ALIGN as u64;
+        assert!(
+            PILOT.len() < 2 * format::REGION_ALIGN,
+            "pilot outgrew the gap"
+        );
+        let base_field = format::OLEAN_HEADER_FIELDS
+            .iter()
+            .find(|field| field.name == "base_addr")
+            .expect("generated base_addr field");
+        let mut file = PILOT[..format::OLEAN_HEADER_SIZE].to_vec();
+        file[base_field.offset..base_field.offset + 8].copy_from_slice(&base.to_le_bytes());
+        let ctor = base + format::OLEAN_HEADER_SIZE as u64 + 8;
+        file.extend_from_slice(&ctor.to_le_bytes());
+        file.extend_from_slice(&header_word(0, 1, 16).to_le_bytes());
+        file.extend_from_slice(&field.to_le_bytes());
+        file
+    }
+
+    fn pilot_root() -> u64 {
+        let root = format::OLEAN_HEADER_SIZE;
+        u64::from_le_bytes(PILOT[root..root + 8].try_into().expect("root word"))
+    }
+
+    #[test]
+    fn a_companion_rebuilds_against_its_predecessor_and_never_emits_its_objects() {
+        let sidecar = pilot_companion(pilot_root());
+
+        // Standalone, the pointer into the pilot is out of bounds: this is
+        // the shape that kept every companion from round-tripping.
+        assert!(
+            matches!(
+                rebuild(&sidecar),
+                Err(RegionError::PtrOutOfBounds { ptr, .. }) if ptr == pilot_root()
+            ),
+            "a companion is not a standalone region"
+        );
+
+        let (out, report) =
+            rebuild_with_dependencies(&sidecar, &[PILOT]).expect("companion rebuild");
+        assert_eq!(out, sidecar);
+        assert_eq!(report.objects, 1, "only the companion's own constructor");
+        assert_eq!(report.dependency_pointers, 1, "its one field crosses");
+        assert_eq!(report.padding_bytes, 0);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+        // The chain door rebuilds both parts, each in its own address space,
+        // and the exported part's accounting is exactly the standalone one.
+        let chain = rebuild_module_parts(&[PILOT, &sidecar]).expect("chain rebuild");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].0, PILOT);
+        assert_eq!(chain[0].1, rebuild(PILOT).expect("pilot").1);
+        assert_eq!(chain[0].1.dependency_pointers, 0);
+        assert_eq!((&chain[1].0, &chain[1].1), (&out, &report));
+    }
+
+    #[test]
+    fn a_companion_pointer_into_the_middle_of_a_foreign_object_is_refused() {
+        // Word-aligned and inside the pilot's payload, so `deref` accepts it;
+        // but it names the root object's first field, not an object.
+        let sidecar = pilot_companion(pilot_root() + 8);
+        assert!(
+            matches!(
+                rebuild_with_dependencies(&sidecar, &[PILOT]),
+                Err(RegionError::NonPersistentRc { offset, .. }) if offset == pilot_root() + 8
+            ),
+            "a mid-object pointer must refuse, never be reproduced"
         );
     }
 

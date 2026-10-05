@@ -10,7 +10,9 @@
 //! under explicit object/byte budgets, preserving expression allocation sharing through
 //! the shared runtime compactor. [`extension_write`] adds typed persistent extension
 //! graphs, with sharing and the same whole-module budgets, without executing extensions.
-//! [`rebuild`] handles v2 and v3 framing with explicit relocation-metadata accounting.
+//! [`rebuild`] handles v2 and v3 framing with explicit relocation-metadata accounting, and
+//! rebuilds a module-system module's `.olean.server` and `.olean.private` companions against
+//! the earlier parts whose compacted addresses they store.
 //! [`ilean`] is a budgeted, typed codec whose emitter recreates the pinned Reference's
 //! compact field ordering and omission rules. [`artifact`] stages, verifies, binds, and
 //! atomically activates immutable multi-file generations behind one content root. The
