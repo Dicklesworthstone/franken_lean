@@ -13,9 +13,9 @@ root fln_kernel::check
 crate fln_bignum items=85 symbols=95
 crate fln_core items=164 symbols=181
 crate fln_env items=84 symbols=131
-crate fln_hash items=52 symbols=52
+crate fln_hash items=64 symbols=65
 crate fln_kernel items=276 symbols=523
-total items=661 adjacent-items=385 toolchain-symbols=5050 non-rust-symbols=11
+total items=673 adjacent-items=397 toolchain-symbols=5183 non-rust-symbols=11
 budget adjacent-items<=400
 item fln_bignum <fln_bignum::nat::BigNat as core::clone::Clone>::clone
 item fln_bignum <fln_bignum::nat::BigNat as core::cmp::Ord>::cmp
@@ -350,16 +350,17 @@ item fln_env fln_env::terms::children
 item fln_env fln_env::terms::exhausted
 item fln_env fln_env::terms::expanded_weight
 item fln_env fln_env::terms::node_key
-item fln_hash <fln_core::expr::Expr as fln_hash::canon::Canonical>::write_body
 item fln_hash <fln_core::level::Level as fln_hash::canon::Canonical>::write_body
 item fln_hash <fln_core::name::Name as fln_hash::canon::Canonical>::write_body
 item fln_hash <fln_core::name::Name as fln_hash::canon::NameLeafExt>::leaf
 item fln_hash <fln_core::options::KVMap as fln_hash::canon::Canonical>::write_body
+item fln_hash <fln_hash::blake3::ChunkState as core::clone::Clone>::clone
 item fln_hash <fln_hash::blake3::ChunkState>::len
 item fln_hash <fln_hash::blake3::ChunkState>::new
 item fln_hash <fln_hash::blake3::ChunkState>::output
 item fln_hash <fln_hash::blake3::ChunkState>::start_flag
 item fln_hash <fln_hash::blake3::ChunkState>::update
+item fln_hash <fln_hash::blake3::Hasher as core::clone::Clone>::clone
 item fln_hash <fln_hash::blake3::Hasher>::add_chunk_chaining_value
 item fln_hash <fln_hash::blake3::Hasher>::finalize
 item fln_hash <fln_hash::blake3::Hasher>::finalize_xof
@@ -376,17 +377,27 @@ item fln_hash <fln_hash::canon::CanonHasher>::new
 item fln_hash <fln_hash::canon::CanonWriter as core::default::Default>::default
 item fln_hash <fln_hash::canon::CanonWriter>::bool
 item fln_hash <fln_hash::canon::CanonWriter>::bytes
+item fln_hash <fln_hash::canon::CanonWriter>::clear
 item fln_hash <fln_hash::canon::CanonWriter>::counting
+item fln_hash <fln_hash::canon::CanonWriter>::digest
 item fln_hash <fln_hash::canon::CanonWriter>::i64
-item fln_hash <fln_hash::canon::CanonWriter>::overflowed
+item fln_hash <fln_hash::canon::CanonWriter>::new
 item fln_hash <fln_hash::canon::CanonWriter>::put
+item fln_hash <fln_hash::canon::CanonWriter>::stored
 item fln_hash <fln_hash::canon::CanonWriter>::str
 item fln_hash <fln_hash::canon::CanonWriter>::u32
 item fln_hash <fln_hash::canon::CanonWriter>::u64
 item fln_hash <fln_hash::canon::CanonWriter>::u8
 item fln_hash <fln_hash::canon::CanonWriter>::written
+item fln_hash <fln_hash::canon::ExprMerkle>::new
+item fln_hash <fln_hash::canon::ExprMerkle>::node_digest
+item fln_hash <fln_hash::canon::ExprMerkle>::record_bytes
+item fln_hash <fln_hash::canon::ExprMerkle>::root
 item fln_hash <fln_hash::domain::Digest as core::clone::Clone>::clone
+item fln_hash <fln_hash::domain::Digest as core::cmp::PartialEq>::eq
+item fln_hash <fln_hash::domain::Digest as core::hash::Hash>::hash
 item fln_hash <fln_hash::domain::Domain>::tag
+item fln_hash <fln_hash::domain::DomainHasher as core::clone::Clone>::clone
 item fln_hash <fln_hash::domain::DomainHasher>::finalize
 item fln_hash <fln_hash::domain::DomainHasher>::new
 item fln_hash <fln_hash::domain::DomainHasher>::update
@@ -400,6 +411,7 @@ item fln_hash fln_hash::blake3::round
 item fln_hash fln_hash::blake3::words_from_le_block
 item fln_hash fln_hash::blake3::words_from_le_key
 item fln_hash fln_hash::canon::binder_info_tag
+item fln_hash fln_hash::canon::merkle_children
 item fln_hash fln_hash::canon::write_data_value
 item fln_hash fln_hash::domain::hash
 item fln_kernel <fln_kernel::Declaration>::level_params
