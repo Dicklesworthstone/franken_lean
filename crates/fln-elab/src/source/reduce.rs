@@ -103,6 +103,19 @@ impl Context {
                                     UnificationTransparency::Abbreviations => {
                                         definition.hints == ReducibilityHints::Abbrev
                                     }
+                                    UnificationTransparency::Instances => {
+                                        definition.hints == ReducibilityHints::Abbrev
+                                            || crate::reducibility::table(&self.txn.env)
+                                                .map_err(|error| {
+                                                    failure(SourceInferenceError::Unification(
+                                                        Box::new(UnificationError::Reducibility(
+                                                            error,
+                                                        )),
+                                                    ))
+                                                })?
+                                                .status(name)
+                                                .unfolds_at_instances()
+                                    }
                                     UnificationTransparency::SafeDefinitions => true,
                                 }
                             {

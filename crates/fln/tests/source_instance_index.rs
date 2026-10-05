@@ -6,7 +6,8 @@
 //! lists come from the pinned `lean` with `prelude`, the same import, and
 //! `set_option trace.Meta.synthInstance.instances true`. And the filter loses no
 //! candidate: with every imported instance's own type as a goal, each global
-//! candidate the search's selection step applies is one the tree admits.
+//! candidate the search's selection step applies is one the tree admits, apart
+//! from an exact, pin-traced set the pin's own tree never offers.
 #![forbid(unsafe_code)]
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
@@ -185,9 +186,72 @@ fn decidable_comparisons_on_nat_narrow_to_the_pins_list_under_init_core() {
     });
 }
 
+/// Goals whose applicable candidates the pin's own index never offers (bead
+/// `fln-gkhu`). Selection runs at the `instances` transparency, where a `Nat` or
+/// `BitVec` decision procedure unifies with an order goal on a wrapper type by
+/// unfolding that type's `LE`/`LT` instance; the pin's tree keys the goal by the
+/// wrapper type and never tries it.
+///
+/// Each row is the pin's own answer, measured on 2026-10-05 with the pinned
+/// `lean`, `set_option trace.Meta.synthInstance true`, on `Decidable (a ≤ b)` or
+/// `Decidable (a < b)` over `Fin 5`, `UInt32` and `BitVec 8`: `offers` is the
+/// instance list that trace printed, and `never_offered` the candidates this
+/// selection applies that the list leaves out. Both halves are checked: each
+/// offered instance the closure holds must be kept, and the loss set must equal
+/// the `never_offered` union exactly, so any other loss fails and so does one of
+/// these becoming kept. A pin-extracted `getUnify` fixture for every goal is the
+/// lasting form of this check; when it lands this table goes stale and leaves.
+struct PinTracedGoal {
+    goal: &'static str,
+    offers: [&'static str; 3],
+    never_offered: &'static [&'static str],
+}
+
+const PIN_TRACED_GOALS: [PinTracedGoal; 6] = [
+    PinTracedGoal {
+        goal: "Fin.decLe",
+        offers: ["instDecidableRelLe", "Std.instDecidableLE", "Fin.decLe"],
+        never_offered: &["Nat.decLe"],
+    },
+    PinTracedGoal {
+        goal: "Fin.decLt",
+        offers: ["instDecidableRelLt", "Std.instDecidableLT", "Fin.decLt"],
+        never_offered: &["Nat.decLt"],
+    },
+    PinTracedGoal {
+        goal: "UInt32.decLe",
+        offers: ["instDecidableRelLe", "Std.instDecidableLE", "UInt32.decLe"],
+        never_offered: &["Nat.decLe", "instDecidableLeBitVec"],
+    },
+    PinTracedGoal {
+        goal: "UInt32.decLt",
+        offers: ["instDecidableRelLt", "Std.instDecidableLT", "UInt32.decLt"],
+        never_offered: &["Nat.decLt", "instDecidableLtBitVec"],
+    },
+    PinTracedGoal {
+        goal: "instDecidableLeBitVec",
+        offers: [
+            "instDecidableRelLe",
+            "Std.instDecidableLE",
+            "instDecidableLeBitVec",
+        ],
+        never_offered: &["Nat.decLe"],
+    },
+    PinTracedGoal {
+        goal: "instDecidableLtBitVec",
+        offers: [
+            "instDecidableRelLt",
+            "Std.instDecidableLT",
+            "instDecidableLtBitVec",
+        ],
+        never_offered: &["Nat.decLt"],
+    },
+];
+
 /// Every imported instance of `Init.Core`'s closure, its own type as the goal:
-/// no candidate that the selection step applies is filtered out, and each
-/// instance that is a candidate of its own goal is admitted for it.
+/// no candidate that the selection step applies is filtered out unless the pin's
+/// own index never offers it (`PIN_TRACED_GOALS`), and each instance that is a
+/// candidate of its own goal is admitted for it.
 #[test]
 fn the_filter_keeps_every_candidate_the_selection_step_applies_under_init_core() {
     let Some(lib) = pinned_lib() else {
@@ -209,6 +273,7 @@ fn the_filter_keeps_every_candidate_the_selection_step_applies_under_init_core()
         let (mut goals, mut skipped, mut candidates, mut kept, mut applies, mut open) =
             (0, 0, 0, 0, 0, 0);
         let mut lost = Vec::new();
+        let (mut traced_goals, mut offered_kept) = (0, 0);
         for instance in &instances {
             let type_ = env
                 .find(instance)
@@ -240,14 +305,67 @@ fn the_filter_keeps_every_candidate_the_selection_step_applies_under_init_core()
                     lost.push((instance.clone(), row.declaration.clone()));
                 }
             }
+            // The pin's own list for this goal: every offered instance the
+            // closure holds is a candidate, and the filter keeps it.
+            let display = instance.to_display_string();
+            if let Some(traced) = PIN_TRACED_GOALS
+                .iter()
+                .find(|traced| traced.goal == display)
+            {
+                traced_goals += 1;
+                for offered in traced.offers {
+                    let offered = n(offered);
+                    if env.find(&offered).is_none() {
+                        continue;
+                    }
+                    let row = audit
+                        .candidates
+                        .iter()
+                        .find(|row| row.declaration == offered)
+                        .unwrap_or_else(|| {
+                            panic!("{display}: the pin offers {offered:?}, absent here")
+                        });
+                    assert!(
+                        row.admitted,
+                        "{display}: the pin offers {offered:?}, filtered out"
+                    );
+                    offered_kept += 1;
+                }
+            }
         }
         eprintln!(
             "Init.Core: {} instances, {goals} goals audited, {skipped} not started; \
              {candidates} candidates before the filter, {kept} after; \
-             {applies} applied, {open} inconclusive",
+             {applies} applied, {open} inconclusive; {traced_goals} pin-traced goals, \
+             {offered_kept} pin-offered instances kept",
             instances.len()
         );
-        assert!(lost.is_empty(), "filtered out but applicable: {lost:?}");
+        let lost: BTreeSet<(String, String)> = lost
+            .iter()
+            .map(|(goal, candidate)| (goal.to_display_string(), candidate.to_display_string()))
+            .collect();
+        let never_offered: BTreeSet<(String, String)> = PIN_TRACED_GOALS
+            .iter()
+            .flat_map(|traced| {
+                traced
+                    .never_offered
+                    .iter()
+                    .map(|candidate| (traced.goal.to_owned(), (*candidate).to_owned()))
+            })
+            .collect();
+        assert_eq!(
+            traced_goals,
+            PIN_TRACED_GOALS.len(),
+            "every pin-traced goal is audited"
+        );
+        assert!(
+            offered_kept >= PIN_TRACED_GOALS.len(),
+            "{offered_kept} pin-offered instances checked: at least each goal's own"
+        );
+        assert_eq!(
+            lost, never_offered,
+            "filtered out but applicable, beyond what the pin's own index never offers"
+        );
         assert!(
             goals > 100 && kept < candidates,
             "{goals} goals, {kept} of {candidates}"

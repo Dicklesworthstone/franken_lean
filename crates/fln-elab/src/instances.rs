@@ -349,6 +349,19 @@ impl InstanceRegistry {
         self.imported.instances.get(name)
     }
 
+    /// Instances declared here rather than activated from an import, scoped ones
+    /// included. The pin's `instance` command marks each `implicitReducible`
+    /// (vendored `src/Lean/Meta/Instances.lean`, `addInstance` for the command);
+    /// an imported instance's status is its module's own `reducibilityCore` entry.
+    pub fn native_instances(&self) -> impl Iterator<Item = &Name> {
+        self.instances
+            .values()
+            .chain(self.scoped.values().flat_map(|classes| classes.values()))
+            .flatten()
+            .map(|entry| &entry.declaration)
+            .filter(|name| !self.imported.instances.contains_key(*name))
+    }
+
     /// Namespaces with dormant instances. Opening names and activating scoped
     /// registrations are separate operations on the source-scope plane.
     pub fn instance_namespaces(&self) -> impl Iterator<Item = &Name> {
@@ -430,6 +443,17 @@ struct RegistryKey {
     rows: Option<[u8; 32]>,
     imported: Option<[u8; 32]>,
     constants: usize,
+}
+
+/// The identity of what [`InstanceRegistry::read`] reads: the native row journal
+/// and the imported metadata journal. A cache keyed on it, with the constant
+/// count, is re-read exactly when the registry can have changed.
+pub(crate) fn registry_identity(env: &Environment) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
+    (
+        env.extension(&extension_name())
+            .map(|extension| extension.content_digest().0),
+        imported::journal_digest(env),
+    )
 }
 
 impl RegistryCache {

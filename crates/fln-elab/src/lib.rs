@@ -35,6 +35,7 @@ pub mod mvar;
 pub mod perturbation;
 pub mod protected_names;
 pub mod records;
+pub mod reducibility;
 pub mod scheduler;
 pub mod seed;
 pub mod source;

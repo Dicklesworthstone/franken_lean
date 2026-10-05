@@ -692,7 +692,16 @@ impl Context {
         pairs: &[(Expr, Expr)],
         allow_delta: bool,
     ) -> Result<Result<(), UnificationError>, NatDefinitionElabError> {
-        let mut result = self.unify_pending(pairs, UnificationBudget::new(self.kernel))?;
+        let mut budget = UnificationBudget::new(self.kernel);
+        if !allow_delta {
+            // A selection query (an instance candidate against its goal) is one
+            // `isDefEq` at the pin's `instances` transparency (vendored
+            // Lean/Meta/SynthInstance.lean `tryResolve`, :356; configured at :879),
+            // which also unfolds `implicitReducible` definitions such as
+            // `instOfNatNat` (bead fln-gkhu).
+            budget.transparency = UnificationTransparency::Instances;
+        }
+        let mut result = self.unify_pending(pairs, budget)?;
         if allow_delta && retries_with_delta(&result) {
             let mut budget = UnificationBudget::new(self.kernel);
             budget.transparency = UnificationTransparency::SafeDefinitions;

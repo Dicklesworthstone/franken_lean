@@ -523,6 +523,19 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record one imported reducibility status in the environment being
+    /// activated ([`crate::reducibility::register`]). The reducibility journal is
+    /// not one this activation keeps or reads, so the kept class and instance
+    /// state stays exact.
+    pub fn register_reducibility(
+        mut self,
+        declaration: &Name,
+        status: crate::reducibility::Reducibility,
+    ) -> Result<Self, crate::reducibility::ReducibilityError> {
+        self.env = crate::reducibility::register(&self.env, declaration, status)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {
