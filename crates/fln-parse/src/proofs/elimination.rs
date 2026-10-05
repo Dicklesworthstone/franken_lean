@@ -953,7 +953,8 @@ mod tests {
             "theorem t : 0 = 0 := by cases _ : (f x)",
             "theorem t : 0 = 0 := by cases «equation name» : (f «argument name») with | false => rfl | true => rfl",
             "theorem t : 0 = 0 := by cases (match b with | .false => false | .true => true) with | false => rfl | true => rfl",
-            "theorem t (generalizing : Bool) : 0 = 0 := by cases generalizing with | false => rfl | true => rfl",
+            // `generalizing` is a keyword at the pin; a local of that name is escaped.
+            "theorem t («generalizing» : Bool) : 0 = 0 := by cases «generalizing» with | false => rfl | true => rfl",
             "theorem t : 0 = 0 := by cases h : f n with\n  | false =>\n    cases h : g n with | false => rfl | true => rfl\n  | true => rfl",
         ] {
             let parsed =

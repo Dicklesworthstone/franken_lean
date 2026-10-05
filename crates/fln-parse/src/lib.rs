@@ -520,13 +520,14 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
     Syntax::node(state::null_kind(), args)
 }
 
-/// The production lexer's table: the pin's table for an ordinary file (implicit `import Init`),
-/// derived from `contracts/REFERENCE_GRAMMAR_CENSUS.txt` by [`reference_tokens`]. It replaced a
-/// hand-written list of about 80 tokens that refused `⟨`, `≤`, `×`, `>` and `$`, carried `|-`,
-/// which is no token at the pin, and let builtin keywords such as `at`, `do` and `from` lex
-/// as identifiers (beads `fln-vokf`, `fln-notation-from-imports-0edr`).
+/// The production lexer's table for declaration bodies: the pin's table for an ordinary file
+/// (implicit `import Init`), derived from `contracts/REFERENCE_GRAMMAR_CENSUS.txt` by
+/// [`reference_tokens`], minus its declared six-keyword remainder. It replaced a hand-written
+/// list of about 80 tokens that refused `⟨`, `≤`, `×`, `>` and `$`, carried `|-`, which is no
+/// token at the pin, and let builtin keywords such as `at`, `do` and `from` lex as identifiers
+/// (beads `fln-vokf`, `fln-notation-from-imports-0edr`).
 fn source_module_token_table() -> &'static TokenTable {
-    reference_tokens::implicit_init_table()
+    reference_tokens::production_table()
 }
 
 fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option<BoundedInfix> {
@@ -1368,6 +1369,31 @@ fn initial_bounded_frames(
     Ok((frames, cursor))
 }
 
+/// If `index` is the `break`/`continue` keyword the innermost do element was classified as,
+/// push its leaf onto that element's empty frame. Out of line and infallible on purpose: the
+/// driver below runs on small host stacks (its deep-nesting tests use 96 KiB threads), and a
+/// match arm of its own, with its `?` temporaries, measurably grew the driver's debug frame past
+/// that bound.
+#[inline(never)]
+fn push_jump_keyword(leaves: &Leaves, frames: &mut [BoundedTermFrame], index: usize) -> bool {
+    let Some(frame) = frames.last_mut() else {
+        return false;
+    };
+    let jump = frame.application.is_empty()
+        && frame
+            .prefix
+            .as_ref()
+            .and_then(term_locals::Prefix::jump_keyword)
+            == Some(index);
+    match leaves.leaf(index) {
+        Ok(leaf) if jump => {
+            frame.application.push((leaf, index));
+            true
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bounded_term_frames(
     leaves: &Leaves,
@@ -1496,24 +1522,6 @@ fn bounded_term_frames(
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
-            // A do element classified as `break`/`continue` (builtin tokens at the pin) puts
-            // its own keyword on its empty frame as the one leaf `item` requires.
-            _ if grammar == DefinitionGrammar::Scalar
-                && frames.last().is_some_and(|frame| {
-                    frame.application.is_empty()
-                        && frame
-                            .prefix
-                            .as_ref()
-                            .and_then(term_locals::Prefix::jump_keyword)
-                            == Some(index)
-                }) =>
-            {
-                frames
-                    .last_mut()
-                    .expect("jump frame")
-                    .application
-                    .push((leaves.leaf(index)?, index));
-            }
             _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
                 let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
                 frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
@@ -1841,6 +1849,12 @@ fn bounded_term_frames(
                 push_bounded_infix(view, tokens, frame, grammar, operator, index, syntax)?;
             }
             _ => {
+                // A do element classified as `break`/`continue` (tokens at the pin) puts its
+                // own keyword on its empty frame as the one leaf `item` requires.
+                if grammar == DefinitionGrammar::Scalar && push_jump_keyword(leaves, &mut frames, index)
+                {
+                    continue;
+                }
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: original_position(view, tokens, index),
                     expected: grammar.value_expectation(),

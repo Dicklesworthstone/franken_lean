@@ -895,7 +895,8 @@ mod local_declaration_tests {
     #[test]
     fn local_declarations_preserve_comments_newlines_and_quantified_types() {
         for source in [
-            "def have (n : Nat) : Nat := n",
+            // `have` is a keyword at the pin: a declaration named `have` escapes it.
+            "def «have» (n : Nat) : Nat := n",
             "theorem t (n : Nat) : n = n := by\r\n  have /- local -/ h : forall x : Nat, x = x := by\r\n    intro x\r\n    rfl -- proof\r\n  exact h n\r\n",
             "theorem t (n : Nat) : n = n := by have : n = n := rfl; exact this",
             "theorem t (n : Nat) : n = n := by have := (rfl : n = n); exact this",
@@ -911,6 +912,8 @@ mod local_declaration_tests {
                 source.replace("\r\n", "\n").as_bytes()
             );
         }
+        // The bare spelling is refused, as the Reference refuses it (`expected identifier`).
+        assert!(parse_definition(b"def have (n : Nat) : Nat := n").is_err());
     }
 
     #[test]
@@ -1144,9 +1147,9 @@ mod simpa_tests {
             "simpa only []",
             "simpa using p",
             "simpa only [h, *] using (f p)",
-            "simpa [using, -N.rule] /- 🦀 -/ using «using»",
+            // `using` is a keyword at the pin, so a lemma named `using` is escaped.
+            "simpa [«using», -N.rule] /- 🦀 -/ using «using»",
             "simpa only [(N.rule.{u} x)] using p",
-            "simpa using p at h",
         ] {
             let source = format!("theorem t (P : Prop) (p : P) : P := by\r\n  {tail}\r\n");
             let parsed = parse_definition(source.as_bytes()).unwrap();
@@ -1165,11 +1168,16 @@ mod simpa_tests {
             "simpa using (p",
             "simpa only [by rfl]",
             "simpa using (by rfl)",
+            // `at` is a keyword at the pin, so the `using` term stops before it and the
+            // Reference refuses the trailing `at h`; the hand table read `p at h` as one term.
+            "simpa using p at h",
         ] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{tail}");
         }
-        assert!(parse_definition(b"def simpa (using : Nat) := using").is_ok());
+        // `using` is a keyword at the pin: escaped it is an ordinary name, bare it is refused.
+        assert!(parse_definition("def simpa («using» : Nat) := «using»".as_bytes()).is_ok());
+        assert!(parse_definition(b"def simpa (using : Nat) := using").is_err());
     }
     #[test]
     fn deeply_grouped_using_evidence_uses_the_bounded_heap_parser() {

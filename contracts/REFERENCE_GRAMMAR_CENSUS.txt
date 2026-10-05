@@ -6,14 +6,16 @@
 schema	fln-reference-grammar-census/1
 reference	v4.32.0	8c9756b28d64dab099da31a4c09229a9e6a2ef35	tree=15bccb750e9d73cd2a40f488bec389504a87896c
 suite-lock-sha256	8bf6d145edad5c613d34827a146fded761f5713361d0cf05a83c47955df35cb2
-generator-sha256	96db5b851eaeed643362ea75e79f63c90b72bf5cd0ec3fed1d05ef862b83eabc
-driver-sha256	e0df88b5ecad5c39a380a873b8f5296f867c9ec74bf9066a4ad6cd3717edd7c8
+generator-sha256	356b4e0cd316854732298bc6ce9c3a6ca05738dad6599236e8018160af0a2787
+driver-sha256	dd449d044d44931b9fac394b8532591e0efb9fa448592bacb9e981a9a07445af
 count	registrations	3868
 count	builtin-parsers	239
 count	keyed-registrations	1461
 count	builtin-tokens	238
 count	header-only-tokens	3
 count	builtin-node-kinds	810
+count	header-node-kinds	20
+count	syntax-node-kind-constants	14
 count	categories	10
 count	init-std-modules	1077
 count	init-std-syntax-decls	957
@@ -2826,6 +2828,40 @@ builtin-node-kind	scientific.antiquot
 builtin-node-kind	sepBy.antiquot_scope
 builtin-node-kind	str
 builtin-node-kind	str.antiquot
+header-node-kind	Lean.Parser.Module.all
+header-node-kind	Lean.Parser.Module.all.antiquot
+header-node-kind	Lean.Parser.Module.header
+header-node-kind	Lean.Parser.Module.header.antiquot
+header-node-kind	Lean.Parser.Module.import
+header-node-kind	Lean.Parser.Module.import.antiquot
+header-node-kind	Lean.Parser.Module.meta
+header-node-kind	Lean.Parser.Module.meta.antiquot
+header-node-kind	Lean.Parser.Module.moduleTk
+header-node-kind	Lean.Parser.Module.moduleTk.antiquot
+header-node-kind	Lean.Parser.Module.prelude
+header-node-kind	Lean.Parser.Module.prelude.antiquot
+header-node-kind	Lean.Parser.Module.public
+header-node-kind	Lean.Parser.Module.public.antiquot
+header-node-kind	antiquotName
+header-node-kind	antiquotNestedExpr
+header-node-kind	ident.antiquot
+header-node-kind	many.antiquot_scope
+header-node-kind	null
+header-node-kind	optional.antiquot_scope
+syntax-node-kind-constant	Lean.charLitKind	char
+syntax-node-kind-constant	Lean.choiceKind	choice
+syntax-node-kind-constant	Lean.fieldIdxKind	fieldIdx
+syntax-node-kind-constant	Lean.groupKind	group
+syntax-node-kind-constant	Lean.hexnumKind	hexnum
+syntax-node-kind-constant	Lean.hygieneInfoKind	hygieneInfo
+syntax-node-kind-constant	Lean.identKind	ident
+syntax-node-kind-constant	Lean.interpolatedStrKind	interpolatedStrKind
+syntax-node-kind-constant	Lean.interpolatedStrLitKind	interpolatedStrLitKind
+syntax-node-kind-constant	Lean.nameLitKind	name
+syntax-node-kind-constant	Lean.nullKind	null
+syntax-node-kind-constant	Lean.numLitKind	num
+syntax-node-kind-constant	Lean.scientificLitKind	scientific
+syntax-node-kind-constant	Lean.strLitKind	str
 module	Init	imports=Init.BinderNameHint Init.BinderPredicates Init.ByCases Init.CbvSimproc Init.Control Init.Conv Init.Core Init.Data Init.Dynamic Init.Ext Init.Grind Init.GrindInstances Init.Guard Init.Hints Init.Internal Init.LawfulBEqTactics Init.MacroTrace Init.Meta Init.MetaTypes Init.MethodSpecsSimp Init.Notation Init.NotationExtra Init.Omega Init.Prelude Init.PropLemmas Init.RCases Init.ShareCommon Init.SimpLemmas Init.Simproc Init.SizeOfLemmas Init.Sym Init.Syntax Init.System Init.Tactics Init.TacticsExtra Init.Task Init.Try Init.Util Init.WF Init.WFComputable Init.WFTactics Init.While
 module	Init.BinderNameHint	imports=Init.Prelude Init.Tactics
 module	Init.BinderPredicates	imports=Init.Grind.Tactics Init.Meta.Defs Init.Notation Init.NotationExtra
@@ -4042,6 +4078,47 @@ module-kinds	Init.Tactics	global	Lean.Parser.Attr.cbv_eval Lean.Parser.Attr.meth
 module-kinds	Init.TacticsExtra	global	Lean.Parser.Tactic.configItem Lean.Parser.Tactic.configItem.antiquot Lean.Parser.Tactic.location Lean.Parser.Tactic.location.antiquot Lean.Parser.Tactic.locationHyp Lean.Parser.Tactic.locationHyp.antiquot Lean.Parser.Tactic.locationType Lean.Parser.Tactic.locationType.antiquot Lean.Parser.Tactic.locationWildcard Lean.Parser.Tactic.locationWildcard.antiquot Lean.Parser.Tactic.negConfigItem Lean.Parser.Tactic.negConfigItem.antiquot Lean.Parser.Tactic.optConfig Lean.Parser.Tactic.optConfig.antiquot Lean.Parser.Tactic.posConfigItem Lean.Parser.Tactic.posConfigItem.antiquot Lean.Parser.Tactic.rwRule Lean.Parser.Tactic.rwRule.antiquot Lean.Parser.Tactic.rwRuleSeq Lean.Parser.Tactic.rwRuleSeq.antiquot Lean.Parser.Tactic.tacticApply_mod_cast_ Lean.Parser.Tactic.tacticExact_mod_cast_ Lean.Parser.Tactic.tacticIterate____ Lean.Parser.Tactic.tacticRw_mod_cast___ Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot Lean.Parser.Tactic.valConfigItem Lean.Parser.Tactic.valConfigItem.antiquot antiquotName antiquotNestedExpr group ident.antiquot many.antiquot_scope null num.antiquot optional.antiquot_scope patternIgnore sepBy.antiquot_scope token.«⊢» token.«⊢».antiquot
 module-kinds	Init.Try	global	Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot Lean.Parser.Command.registerTryTactic Lean.Parser.Tactic.attemptAll Lean.Parser.Tactic.attemptAllPar Lean.Parser.Tactic.configItem Lean.Parser.Tactic.configItem.antiquot Lean.Parser.Tactic.firstPar Lean.Parser.Tactic.negConfigItem Lean.Parser.Tactic.negConfigItem.antiquot Lean.Parser.Tactic.optConfig Lean.Parser.Tactic.optConfig.antiquot Lean.Parser.Tactic.posConfigItem Lean.Parser.Tactic.posConfigItem.antiquot Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot Lean.Parser.Tactic.tryResult Lean.Parser.Tactic.tryTrace Lean.Parser.Tactic.tryTraceWith Lean.Parser.Tactic.valConfigItem Lean.Parser.Tactic.valConfigItem.antiquot antiquotName antiquotNestedExpr group ident.antiquot many.antiquot_scope null num.antiquot optional.antiquot_scope sepBy.antiquot_scope «tactic∎» «term∎»
 module-kinds	Init.WFTactics	global	Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot antiquotName antiquotNestedExpr null sepBy.antiquot_scope tacticClean_wf tacticDecreasing_tactic tacticDecreasing_trivial tacticDecreasing_trivial_pre_omega tacticDecreasing_with_ tacticSimp_wf
+module-kinds	Lean.Compiler.LCNF.Basic	global	Lean.Compiler.LCNF.tacticPurity_tac
+module-kinds	Lean.Compiler.LCNF.Types	global	Lean.Compiler.«term◾»
+module-kinds	Lean.Data.Json.Elab	global	Lean.Json.jsonFalse Lean.Json.jsonField Lean.Json.jsonField.antiquot Lean.Json.jsonIdent Lean.Json.jsonIdent.antiquot Lean.Json.jsonNull Lean.Json.jsonTrue Lean.Json.json_ Lean.Json.«json-__1» Lean.Json.«json-_» Lean.Json.«json[_]» Lean.Json.«json{_}» Lean.Json.«termJson%_» Lean.Parser.Term.quot antiquotName antiquotNestedExpr ident.antiquot json.quot null num.antiquot optional.antiquot_scope scientific.antiquot sepBy.antiquot_scope str.antiquot
+module-kinds	Lean.Data.Options	global	Lean.Option.registerBuiltinOption Lean.Option.registerOption Lean.Parser.Command.declModifiers Lean.Parser.Command.declModifiers.antiquot Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot Lean.Parser.Command.meta Lean.Parser.Command.meta.antiquot Lean.Parser.Command.noncomputable Lean.Parser.Command.noncomputable.antiquot Lean.Parser.Command.nonrec Lean.Parser.Command.nonrec.antiquot Lean.Parser.Command.partial Lean.Parser.Command.partial.antiquot Lean.Parser.Command.private Lean.Parser.Command.private.antiquot Lean.Parser.Command.protected Lean.Parser.Command.protected.antiquot Lean.Parser.Command.public Lean.Parser.Command.public.antiquot Lean.Parser.Command.unsafe Lean.Parser.Command.unsafe.antiquot Lean.Parser.Command.visibility.pseudo.antiquot Lean.Parser.Term.attrInstance Lean.Parser.Term.attrInstance.antiquot Lean.Parser.Term.attrKind Lean.Parser.Term.attrKind.antiquot Lean.Parser.Term.attributes Lean.Parser.Term.attributes.antiquot Lean.Parser.Term.local Lean.Parser.Term.local.antiquot Lean.Parser.Term.scoped Lean.Parser.Term.scoped.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope sepBy.antiquot_scope
+module-kinds	Lean.DocString.Syntax	global	Lean.Doc.Syntax.anon Lean.Doc.Syntax.arg_ident Lean.Doc.Syntax.arg_num Lean.Doc.Syntax.arg_str Lean.Doc.Syntax.blockquote Lean.Doc.Syntax.bold Lean.Doc.Syntax.code Lean.Doc.Syntax.codeblock Lean.Doc.Syntax.command Lean.Doc.Syntax.desc Lean.Doc.Syntax.directive Lean.Doc.Syntax.display_math Lean.Doc.Syntax.dl Lean.Doc.Syntax.emph Lean.Doc.Syntax.flag_off Lean.Doc.Syntax.flag_on Lean.Doc.Syntax.footnote Lean.Doc.Syntax.footnote_ref Lean.Doc.Syntax.header Lean.Doc.Syntax.image Lean.Doc.Syntax.inline_math Lean.Doc.Syntax.li Lean.Doc.Syntax.linebreak Lean.Doc.Syntax.link Lean.Doc.Syntax.link_ref Lean.Doc.Syntax.metadata_block Lean.Doc.Syntax.named Lean.Doc.Syntax.named_no_paren Lean.Doc.Syntax.ol Lean.Doc.Syntax.para Lean.Doc.Syntax.ref Lean.Doc.Syntax.role Lean.Doc.Syntax.text Lean.Doc.Syntax.ul Lean.Doc.Syntax.url Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot Lean.Parser.Term.binderDefault Lean.Parser.Term.binderDefault.antiquot Lean.Parser.Term.binderTactic Lean.Parser.Term.binderTactic.antiquot Lean.Parser.Term.bracketedBinder.pseudo.antiquot Lean.Parser.Term.explicitBinder Lean.Parser.Term.explicitBinder.antiquot Lean.Parser.Term.hole Lean.Parser.Term.hole.antiquot Lean.Parser.Term.implicitBinder Lean.Parser.Term.implicitBinder.antiquot Lean.Parser.Term.instBinder Lean.Parser.Term.instBinder.antiquot Lean.Parser.Term.quot Lean.Parser.Term.strictImplicitBinder Lean.Parser.Term.strictImplicitBinder.antiquot Lean.Parser.Term.structInstArrayRef Lean.Parser.Term.structInstArrayRef.antiquot Lean.Parser.Term.structInstField Lean.Parser.Term.structInstField.antiquot Lean.Parser.Term.structInstFieldBinder.pseudo.antiquot Lean.Parser.Term.structInstFields Lean.Parser.Term.structInstLVal Lean.Parser.Term.structInstLVal.antiquot Lean.Parser.Term.typeSpec Lean.Parser.Term.typeSpec.antiquot antiquotName antiquotNestedExpr arg_val.quot block.quot desc_item.quot doc_arg.quot fieldIdx.antiquot group ident.antiquot inline.quot link_target.quot list_item.quot many.antiquot_scope null num.antiquot optional.antiquot_scope sepBy.antiquot_scope str.antiquot
+module-kinds	Lean.Elab.AuxDef	global	Lean.Elab.Command.aux_def Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot Lean.Parser.Command.private Lean.Parser.Command.private.antiquot Lean.Parser.Command.public Lean.Parser.Command.public.antiquot Lean.Parser.Command.visibility.pseudo.antiquot Lean.Parser.Term.attrInstance Lean.Parser.Term.attrInstance.antiquot Lean.Parser.Term.attrKind Lean.Parser.Term.attrKind.antiquot Lean.Parser.Term.attributes Lean.Parser.Term.attributes.antiquot Lean.Parser.Term.local Lean.Parser.Term.local.antiquot Lean.Parser.Term.scoped Lean.Parser.Term.scoped.antiquot antiquotName antiquotNestedExpr ident.antiquot many.antiquot_scope null optional.antiquot_scope sepBy.antiquot_scope
+module-kinds	Lean.Elab.ConfigEval.Commands	global	Lean.Elab.ConfigEval.configEntries Lean.Elab.ConfigEval.configEntries.antiquot Lean.Elab.ConfigEval.configEntry Lean.Elab.ConfigEval.configEntry.antiquot Lean.Elab.ConfigEval.configEntryHandler Lean.Elab.ConfigEval.configEntryHandler.antiquot Lean.Elab.ConfigEval.configEntryHandlerKey Lean.Elab.ConfigEval.configEntryHandlerKey.antiquot Lean.Elab.ConfigEval.configEntryHandlerKeyPrefix Lean.Elab.ConfigEval.configEntryHandlerKeyPrefix.antiquot Lean.Elab.ConfigEval.configEntryHandlerKeyWildcard Lean.Elab.ConfigEval.configEntryHandlerKeyWildcard.antiquot Lean.Elab.ConfigEval.configEntryOmit Lean.Elab.ConfigEval.configEntryOmit.antiquot Lean.Elab.ConfigEval.declareCommandConfig Lean.Elab.ConfigEval.declareCoreConfigElab Lean.Elab.ConfigEval.declareTacticConfig Lean.Elab.ConfigEval.declareTermConfigElab Lean.Elab.ConfigEval.defEvalConfigItemCmd Lean.Elab.ConfigEval.deriveEvalExprUsingMeta Lean.Elab.ConfigEval.ensureEvalExprInstance Lean.Elab.ConfigEval.ensureEvalTermExprInstances Lean.Elab.ConfigEval.ensureEvalTermInstance Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot Lean.Parser.Command.private Lean.Parser.Command.private.antiquot Lean.Parser.Command.public Lean.Parser.Command.public.antiquot Lean.Parser.Command.visibility.pseudo.antiquot Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot Lean.Parser.Term.attrKind Lean.Parser.Term.attrKind.antiquot Lean.Parser.Term.binderDefault Lean.Parser.Term.binderDefault.antiquot Lean.Parser.Term.binderTactic Lean.Parser.Term.binderTactic.antiquot Lean.Parser.Term.bracketedBinder.pseudo.antiquot Lean.Parser.Term.explicitBinder Lean.Parser.Term.explicitBinder.antiquot Lean.Parser.Term.hole Lean.Parser.Term.hole.antiquot Lean.Parser.Term.implicitBinder Lean.Parser.Term.implicitBinder.antiquot Lean.Parser.Term.instBinder Lean.Parser.Term.instBinder.antiquot Lean.Parser.Term.local Lean.Parser.Term.local.antiquot Lean.Parser.Term.scoped Lean.Parser.Term.scoped.antiquot Lean.Parser.Term.strictImplicitBinder Lean.Parser.Term.strictImplicitBinder.antiquot antiquotName antiquotNestedExpr group ident.antiquot many.antiquot_scope null optional.antiquot_scope sepBy.antiquot_scope
+module-kinds	Lean.Elab.Quotation	global	Lean.Elab.Term.Quotation.commandElab_stx_quot_ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Elab.Tactic.Config	global	Lean.Elab.Tactic.commandConfigElab Lean.Elab.Tactic.configElab Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope
+module-kinds	Lean.Elab.Tactic.Grind.Config	global	_private.Lean.Elab.Tactic.Grind.Config.0.Lean.Elab.Tactic.commandMake_elab_grind_config__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Elab.Tactic.Simp	global	_private.Lean.Elab.Tactic.Simp.0.Lean.Elab.Tactic.commandMake_elab_simp_config__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Exception	global	Lean.termThrowErrorAt____ Lean.termThrowError__ antiquotName antiquotNestedExpr interpolatedStrKind.antiquot
+module-kinds	Lean.LabelAttribute	global	Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot Lean._root_.Lean.Parser.Command.registerLabelAttr antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope
+module-kinds	Lean.Linter.EnvLinter.Basic	global	Lean.Linter.EnvLinter.builtin_env_linter antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Linter.Sets	global	Lean.Linter.«command_Register_linter_set_:=_» Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot antiquotName antiquotNestedExpr ident.antiquot many.antiquot_scope null optional.antiquot_scope
+module-kinds	Lean.Message	global	Lean.termM!_ antiquotName antiquotNestedExpr interpolatedStrKind.antiquot
+module-kinds	Lean.Meta.Sym.DSimp.EvalGround	global	Lean.Meta.Sym.DSimp.commandDeclare_eval_bin__ Lean.Meta.Sym.DSimp.commandDeclare_eval_bin_bitwise__ Lean.Meta.Sym.DSimp.commandDeclare_eval_bin_bool_pred__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Sym.Simp.EvalGround	global	Lean.Meta.Sym.Simp.commandDeclare_eval_bin__ Lean.Meta.Sym.Simp.commandDeclare_eval_bin_bitwise__ Lean.Meta.Sym.Simp.commandDeclare_eval_bin_bool_pred__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Sym.Simp.RegisterCommand	global	Lean.Meta.Sym.Simp._root_.Lean.Parser.Command.registerSymSimpAttr Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope
+module-kinds	Lean.Meta.Sym.SymM	global	Lean.Meta.Sym.doElemReportDbgIssue!__ Lean.Meta.Sym.doElemReportIssue!__ antiquotName antiquotNestedExpr interpolatedStrKind.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.AC.Eq	global	_private.Lean.Meta.Tactic.Grind.AC.Eq.0.Lean.Meta.Grind.AC.commandGen_cnstr_fns_ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.AC.Proof	global	_private.Lean.Meta.Tactic.Grind.AC.Proof.0.Lean.Meta.Grind.AC.termDeclare!__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.AC.Seq	global	_private.Lean.Meta.Tactic.Grind.AC.Seq.0.Lean.Grind.AC.«term_::_»
+module-kinds	Lean.Meta.Tactic.Grind.Arith.CommRing.Proof	global	_private.Lean.Meta.Tactic.Grind.Arith.CommRing.Proof.0.Lean.Meta.Grind.Arith.CommRing.termDeclare!__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.Arith.Cutsat.Proof	global	_private.Lean.Meta.Tactic.Grind.Arith.Cutsat.Proof.0.Lean.Meta.Grind.Arith.Cutsat.termDeclare!__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.Arith.Linear.Proof	global	_private.Lean.Meta.Tactic.Grind.Arith.Linear.Proof.0.Lean.Meta.Grind.Arith.Linear.termDeclare!__ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.EMatch	global	Lean.Meta.Grind.EMatch.doElemReportEMatchIssue!__ antiquotName antiquotNestedExpr interpolatedStrKind.antiquot
+module-kinds	Lean.Meta.Tactic.Grind.RegisterCommand	global	Lean.Meta.Grind._root_.Lean.Parser.Command.registerGrindAttr Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope
+module-kinds	Lean.Meta.Tactic.Grind.Types	global	Lean.Meta.Grind.«doElemTrace_goal[_]__» antiquotName antiquotNestedExpr ident.antiquot interpolatedStrKind.antiquot
+module-kinds	Lean.Meta.Tactic.Simp.BuiltinSimprocs.SInt	global	antiquotName antiquotNestedExpr commandDeclare_sint_simprocs_ ident.antiquot
+module-kinds	Lean.Meta.Tactic.Simp.BuiltinSimprocs.UInt	global	antiquotName antiquotNestedExpr commandDeclare_uint_simprocs_ ident.antiquot
+module-kinds	Lean.Meta.Tactic.Simp.RegisterCommand	global	Lean.Meta.Simp._root_.Lean.Parser.Command.registerSimpAttr Lean.Parser.Command.docComment Lean.Parser.Command.docComment.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope
+module-kinds	Lean.Parser.Command	global	Lean.Parser.Command.InternalSyntax.end_local_scope antiquotName antiquotNestedExpr num.antiquot
+module-kinds	Lean.Parser.Do	global	Lean.Parser.Term.InternalSyntax.doSkip
+module-kinds	Lean.Parser.Extra	global	Lean.«termRegister_parser_alias(Kind:=_)______» antiquotName antiquotNestedExpr group ident.antiquot null optional.antiquot_scope str.antiquot
+module-kinds	Lean.PrettyPrinter.Delaborator.Basic	global	Lean.PrettyPrinter.Delaborator.attrApp_delab_ antiquotName antiquotNestedExpr ident.antiquot
+module-kinds	Lean.Server.Test.Cancel	global	Lean.Server.Test.Cancel.commandWait_for_cancel_once_command_ Lean.Server.Test.Cancel.tacticBlock_until_cancelled_ Lean.Server.Test.Cancel.tacticUnblock Lean.Server.Test.Cancel.tacticWait_for_cancel_once Lean.Server.Test.Cancel.tacticWait_for_cancel_once_async Lean.Server.Test.Cancel.tacticWait_for_main_cancel_once_async Lean.Server.Test.Cancel.tacticWait_for_sync_ Lean.Server.Test.Cancel.tacticWait_for_test_task_ Lean.Server.Test.Cancel.tacticWait_for_unblock Lean.Server.Test.Cancel.tacticWait_for_unblock_async antiquotName antiquotNestedExpr num.antiquot str.antiquot
+module-kinds	Lean.Util.Reprove	global	Lean.Elab.Command.reprove Lean.Parser.Tactic.tacticSeq Lean.Parser.Tactic.tacticSeq.antiquot Lean.Parser.Tactic.tacticSeq1Indented Lean.Parser.Tactic.tacticSeq1Indented.antiquot Lean.Parser.Tactic.tacticSeqBracketed Lean.Parser.Tactic.tacticSeqBracketed.antiquot antiquotName antiquotNestedExpr ident.antiquot many.antiquot_scope null sepBy.antiquot_scope
+module-kinds	Lean.Util.TestExtern	global	testExternCmd
+module-kinds	Lean.Util.Trace	global	Lean.«doElemTrace[_]__» antiquotName antiquotNestedExpr ident.antiquot interpolatedStrKind.antiquot
+module-kinds	Lean.Widget.Commands	global	Lean.Parser.Term.attrKind Lean.Parser.Term.attrKind.antiquot Lean.Parser.Term.local Lean.Parser.Term.local.antiquot Lean.Parser.Term.scoped Lean.Parser.Term.scoped.antiquot Lean.Widget.addWidgetSpec Lean.Widget.addWidgetSpec.antiquot Lean.Widget.eraseWidgetSpec Lean.Widget.eraseWidgetSpec.antiquot Lean.Widget.showPanelWidgetsCmd Lean.Widget.showWidgetSpec Lean.Widget.showWidgetSpec.antiquot Lean.Widget.widgetCmd Lean.Widget.widgetInstanceSpec Lean.Widget.widgetInstanceSpec.antiquot antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope sepBy.antiquot_scope
 module-kinds	Std.Data.DHashMap.Basic	global	Std.DHashMap.«term_~m_»
 module-kinds	Std.Data.DHashMap.Internal.RawLemmas	global	Std.DHashMap.Internal.Raw₀.tacticEmpty Std.DHashMap.Internal.Raw₀.tacticWf_trivial Std.DHashMap.Internal.Raw₀.«tacticSimp_to_model[_]Using_» antiquotName antiquotNestedExpr ident.antiquot null optional.antiquot_scope sepBy.antiquot_scope
 module-kinds	Std.Data.DHashMap.Raw	global	Std.DHashMap.Raw.«term_~m_»
@@ -4088,6 +4165,14 @@ module-category	Init.Sym.DSimp.DSimprocDSL	sym_dsimproc	Lean.Parser.Category.sym
 module-category	Init.Sym.Simp.SimprocDSL	sym_discharger	Lean.Parser.Category.sym_discharger	both	global
 module-category	Init.Sym.Simp.SimprocDSL	sym_simp_field	Lean.Parser.Category.sym_simp_field	both	global
 module-category	Init.Sym.Simp.SimprocDSL	sym_simproc	Lean.Parser.Category.sym_simproc	both	global
+module-category	Lean.Data.Json.Elab	json	Lean.Parser.Category.json	symbol	global
+module-category	Lean.DocString.Syntax	arg_val	Lean.Parser.Category.arg_val	default	global
+module-category	Lean.DocString.Syntax	block	Lean.Parser.Category.block	default	global
+module-category	Lean.DocString.Syntax	desc_item	Lean.Parser.Category.desc_item	default	global
+module-category	Lean.DocString.Syntax	doc_arg	Lean.Parser.Category.doc_arg	default	global
+module-category	Lean.DocString.Syntax	inline	Lean.Parser.Category.inline	default	global
+module-category	Lean.DocString.Syntax	link_target	Lean.Parser.Category.link_target	default	global
+module-category	Lean.DocString.Syntax	list_item	Lean.Parser.Category.list_item	default	global
 module-category	Std.Tactic.Do.Syntax	mcasesPat	Lean.Parser.Category.mcasesPat	default	global
 module-category	Std.Tactic.Do.Syntax	mintroPat	Lean.Parser.Category.mintroPat	default	global
 module-category	Std.Tactic.Do.Syntax	mrefinePat	Lean.Parser.Category.mrefinePat	default	global

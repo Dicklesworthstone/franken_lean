@@ -19,8 +19,8 @@
 
 use fln_core::name::Name;
 use fln_parse::reference_tokens::{
-    CensusError, GRAMMAR_CENSUS, TokenCensus, UnknownModule, header_table, implicit_init_table,
-    reference_census,
+    CensusError, GRAMMAR_CENSUS, SEED_IDENTIFIER_ALLOWANCE, TokenCensus, UnknownModule,
+    header_table, implicit_init_table, production_table, reference_census,
 };
 use fln_parse::{NatDefinitionParseError, parse_definition, parse_source_command};
 use fln_syntax::source::{BytePos, SourceText};
@@ -58,17 +58,32 @@ fn module(name: &str) -> Name {
 fn the_production_table_is_exactly_the_census_table_for_an_ordinary_file() {
     let census = reference_census();
     let derived = census.tokens_for(false, &[]).expect("Init is in the census");
-    let production: BTreeSet<String> = implicit_init_table()
+    let scope: BTreeSet<String> = implicit_init_table()
         .tokens()
         .into_iter()
         .map(str::to_string)
         .collect();
     assert_eq!(
-        production, derived,
-        "the production lexer table must be the census table, with nothing added by hand"
+        scope, derived,
+        "the scope table must be the census table, with nothing added by hand"
     );
+    // Declaration bodies: the same table minus exactly the declared remainder, nothing else.
+    let production: BTreeSet<String> = production_table()
+        .tokens()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut expected = derived.clone();
+    for (word, _) in SEED_IDENTIFIER_ALLOWANCE {
+        assert!(expected.remove(*word), "allowance member {word} is not a token at the pin");
+    }
+    assert_eq!(production, expected);
     for token in census.builtin_tokens() {
-        assert!(production.contains(token), "builtin token {token} missing");
+        assert!(
+            production.contains(token)
+                || SEED_IDENTIFIER_ALLOWANCE.iter().any(|(word, _)| word == &token),
+            "builtin token {token} missing"
+        );
     }
     // The measured symptoms (2026-10-04): builtin and Init tokens the hand table refused.
     for token in ["⟨", "⟩", "$", "▸", "⋯", "≤", "≥", ">", "≠", "×", "∃", "<|", "|>", "∘", "&&", "||", "sorry"] {
@@ -248,22 +263,99 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     }
 }
 
+/// Programs the pinned Reference refuses at a keyword used as a name, with its first error
+/// verbatim. Frozen fixture, captured by running `lean <file>` with the toolchain `SUITE.lock`
+/// pins (v4.32.0, commit `8c9756b2`) on 2026-10-05; there is no update mode. The hand-written
+/// table parsed all five (each keyword was an identifier there); the derived table refuses each
+/// at the token the Reference names. The escaped spelling the Reference accepts parses.
+const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
+    ("def at : Nat := 1", "1:3: error: unexpected token 'at'; expected identifier"),
+    (
+        "def f (from : Nat) : Nat := from",
+        "1:7: error: unexpected token 'from'; expected '_' or identifier",
+    ),
+    (
+        "theorem show : True := trivial",
+        "1:7: error: unexpected token 'show'; expected identifier",
+    ),
+    (
+        "def g (exists : Nat) : Nat := exists",
+        "1:7: error: unexpected token 'exists'; expected '_' or identifier",
+    ),
+    (
+        "def h (using : Nat) : Nat := using",
+        "1:7: error: unexpected token 'using'; expected '_' or identifier",
+    ),
+];
+
 #[test]
-fn a_builtin_keyword_is_no_longer_an_identifier() {
-    // `at`, `from` and `show` are tokens wherever `Init` is imported; the Reference refuses
-    // them as declaration names, and so does the derived table (z8j.1.6.2's direction).
-    for keyword in ["at", "from", "show", "exists", "using"] {
-        let source = format!("def {keyword} : Nat := 1");
+fn keyword_refusals_agree_with_the_pinned_reference() {
+    for (source, reference) in REFERENCE_KEYWORD_REFUSALS {
+        let token = reference
+            .split('\'')
+            .nth(1)
+            .expect("the Reference message names the token");
+        // The Reference reports the end of the preceding token; the refused token is the first
+        // occurrence after it.
+        let column: usize = reference
+            .split(':')
+            .nth(1)
+            .and_then(|column| column.parse().ok())
+            .expect("line:column");
+        let at = column + source[column..].find(token).expect("token after the column");
+        match parse_definition(source.as_bytes()) {
+            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) => {
+                assert_eq!(refused, BytePos(at), "{source}: refused at the Reference's token");
+            }
+            other => panic!("{source}: the Reference refuses ({reference}), got {other:?}"),
+        }
         assert!(
-            parse_definition(source.as_bytes()).is_err(),
-            "{source} must be refused: `{keyword}` is a keyword at the pin"
+            !SEED_IDENTIFIER_ALLOWANCE.iter().any(|(word, _)| word == &token),
+            "{token} is reserved in production"
+        );
+        // Escaped, the same word is an identifier and the Reference accepts the program.
+        let escaped = source.replace(token, &format!("«{token}»"));
+        assert!(
+            parse_definition(escaped.as_bytes()).is_ok(),
+            "{escaped} must parse"
         );
     }
-    // An escaped keyword is an identifier, exactly as upstream.
-    assert!(matches!(
-        lex_one(implicit_init_table(), "«at»"),
-        Ok(TokenKind::Ident(_))
-    ));
+}
+
+/// The declared remainder is one-way and each member still has the file that needs it.
+#[test]
+fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
+    // Pinned to these six. Growing the set (any other word, or a duplicate) fails here;
+    // removing a member once its example is repaired is allowed and needs no edit to this list.
+    const PERMITTED: [&str; 6] = ["end", "local", "prefix", "repeat", "scoped", "universe"];
+    let members: BTreeSet<&str> = SEED_IDENTIFIER_ALLOWANCE.iter().map(|(word, _)| *word).collect();
+    assert_eq!(members.len(), SEED_IDENTIFIER_ALLOWANCE.len(), "no duplicate members");
+    for word in &members {
+        assert!(
+            PERMITTED.contains(word),
+            "`{word}` would grow the allowance: the pinned Reference reserves it, so reserve it"
+        );
+    }
+    let root = fln_core::checked_manifest_dir!().join("../..");
+    let scope = implicit_init_table();
+    for (word, file) in SEED_IDENTIFIER_ALLOWANCE {
+        // A member that stopped being a keyword at the pin is stale.
+        assert!(
+            matches!(lex_one(scope, word), Ok(TokenKind::Symbol(symbol)) if symbol == *word),
+            "{word} is no longer a token at the pin"
+        );
+        // Production still reads it as an identifier.
+        assert!(matches!(lex_one(production_table(), word), Ok(TokenKind::Ident(_))));
+        // The named file still uses it as a name; once the file is repaired the row must go.
+        let text = std::fs::read_to_string(root.join(file)).expect("the named example exists");
+        let used = text.match_indices(word).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '«')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '»')
+        });
+        assert!(used, "{file} no longer uses `{word}`: drop it from the allowance");
+    }
 }
 
 /// Totality of the kind-use census, against the grammar census.

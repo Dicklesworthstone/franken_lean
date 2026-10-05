@@ -59,22 +59,31 @@ fn nested_assertions_use_heap_frames_on_a_small_stack() {
 }
 #[test]
 fn scalar_extensions_do_not_widen_the_nat_only_driver() {
-    // The older driver still reads contextual words as ordinary identifiers,
-    // not as the richer source form. Its grammar and vocabulary are unchanged.
+    // The older driver does not have the richer source form. `show` and `from` are keywords
+    // at the pin (derived token table), so it refuses them rather than reading `show Nat from
+    // 0` as an application of identifiers, which the hand-written table used to do.
     let source = b"def x : Nat := show Nat from 0";
-    let plain = fln_parse::parse_nat_definition(source).unwrap();
+    assert!(fln_parse::parse_nat_definition(source).is_err());
     let extended = parse_definition(source).unwrap();
-    assert_ne!(plain.syntax(), extended.syntax());
-    assert_eq!(plain.reconstruct_original(), source);
+    assert_eq!(extended.reconstruct_original(), source);
     assert!(fln_parse::parse_nat_definition(b"def x : Nat := have h : Nat := 0; h").is_err());
 }
 
 #[test]
 fn contextual_keywords_do_not_steal_declaration_or_escaped_names() {
+    // `have`, `show` and `from` are keywords at the pin: the Reference refuses them as
+    // declaration names, and so does the derived token table.
     for source in [
         "def have (n : Nat) : Nat := n",
         "def show (n : Nat) : Nat := n",
         "def from (n : Nat) : Nat := n",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+    for source in [
+        "def «have» (n : Nat) : Nat := n",
+        "def «show» (n : Nat) : Nat := n",
+        "def «from» (n : Nat) : Nat := n",
         "def value («have» : Nat) : Nat := «have»",
         "def value («show» : Nat) : Nat := «show»",
         "def value («from» : Nat) : Nat := «from»",

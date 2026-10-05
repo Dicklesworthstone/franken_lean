@@ -41,6 +41,20 @@
 //! [`TokenCensus::table_for`] computes the faithful table for any header whose closure the
 //! census covers, and refuses one it does not; threading it into the body parsers is the step
 //! that retires the first gap.
+//!
+//! ## The declared remainder: six keywords still lexed as identifiers
+//!
+//! Declaration bodies are lexed against [`production_table`], which is
+//! [`implicit_init_table`] minus [`SEED_IDENTIFIER_ALLOWANCE`]. Every other keyword at the pin is
+//! reserved, as in the Reference (bead `franken_lean-z8j.1.6.2`). The six are keywords at the
+//! pin too: this is a one-way allowance preserving frozen seed-dialect behavior, not Lean
+//! compatibility. Each member is a name in a frozen seed-corpus example that the Reference
+//! rejects for exactly that reason (ledger class `fln-defect`), and tests outside this crate
+//! assert FrankenLean's present verdict on that file. Reserving the word would flip that verdict, so the example, its ledger row and those
+//! tests have to move in the same change, and they belong to the corpus owner. The scope-command
+//! layer lexes against the full implicit-Init table, as it did when it carried its own keyword
+//! list. The list may only shrink, and `tests/reference_grammar_census.rs` binds each member to
+//! the file that still needs it.
 
 use fln_core::name::Name;
 use fln_syntax::token::TokenTable;
@@ -52,6 +66,25 @@ use std::sync::OnceLock;
 pub const GRAMMAR_CENSUS: &str = include_str!("../../../contracts/REFERENCE_GRAMMAR_CENSUS.txt");
 
 const SCHEMA: &str = "fln-reference-grammar-census/1";
+
+/// A declared one-way allowance preserving frozen seed-dialect behavior. It is NOT Lean
+/// compatibility.
+///
+/// The pinned Reference lexes all six as keywords, so a seed-dialect example that uses one as a
+/// name is not Lean: the Reference rejects each file named here (`expected identifier`, ledger
+/// class `fln-defect`). Declaration bodies still lex these six as identifiers only so that
+/// those frozen examples, and the tests asserting FrankenLean's present verdict on them, keep
+/// their current behavior until their owner repairs them. The lexer cannot tell a seed-dialect
+/// file from a Lean file, so the allowance applies to every source body. It may shrink, never
+/// grow (`tests/reference_grammar_census.rs`).
+pub const SEED_IDENTIFIER_ALLOWANCE: &[(&str, &str)] = &[
+    ("end", "examples/native_index_refinement.lean"),
+    ("local", "examples/native_tactic_repetition.lean"),
+    ("prefix", "examples/native_closure_data.lean"),
+    ("repeat", "examples/native_recursion.lean"),
+    ("scoped", "examples/native_decidable_cases.lean"),
+    ("universe", "examples/native_default_simp.lean"),
+];
 
 /// A floor on the builtin table. The pin has 238; a census that parses but yields far fewer was
 /// truncated or mis-generated, and an empty table would make every symbol a lexical refusal.
@@ -353,16 +386,33 @@ pub fn reference_census() -> &'static TokenCensus {
     })
 }
 
-/// The table of an ordinary file — no `prelude`, so exactly the implicit `import Init` — which
-/// production lexes every source body against. See the module docs for what this is not.
-pub fn implicit_init_table() -> &'static TokenTable {
-    static TABLE: OnceLock<TokenTable> = OnceLock::new();
-    TABLE.get_or_init(|| match reference_census().table_for(false, &[]) {
-        Ok(table) => table,
+fn implicit_init_tokens() -> BTreeSet<String> {
+    match reference_census().tokens_for(false, &[]) {
+        Ok(tokens) => tokens,
         Err(UnknownModule(module)) => panic!(
             "invariant: the grammar census lacks the implicit import {}",
             module.to_display_string()
         ),
+    }
+}
+
+/// The table of an ordinary file — no `prelude`, so exactly the implicit `import Init`. The
+/// scope-command layer lexes against it. See the module docs for what this is not.
+pub fn implicit_init_table() -> &'static TokenTable {
+    static TABLE: OnceLock<TokenTable> = OnceLock::new();
+    TABLE.get_or_init(|| TokenTable::from_tokens(implicit_init_tokens()))
+}
+
+/// The table declaration bodies are lexed against: [`implicit_init_table`] minus the declared
+/// [`SEED_IDENTIFIER_ALLOWANCE`].
+pub fn production_table() -> &'static TokenTable {
+    static TABLE: OnceLock<TokenTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut tokens = implicit_init_tokens();
+        for (word, _) in SEED_IDENTIFIER_ALLOWANCE {
+            tokens.remove(*word);
+        }
+        TokenTable::from_tokens(tokens)
     })
 }
 

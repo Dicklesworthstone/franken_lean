@@ -23,11 +23,13 @@ pub enum ScopeCommand {
     Trivia,
 }
 
-/// The body table: the derived production table. Every scope keyword this layer recognises
-/// (`namespace`, `end`, `open`, `in`, `omit`, …) is a builtin token at the pin, so nothing is
-/// added here; `prelude` is a header-only token and lives in `imports`' header table.
+/// The scope layer's table: the full implicit-Init table. Every scope keyword this layer
+/// recognises (`namespace`, `end`, `open`, `universe`, `scoped`, `omit`, …) is a token at the
+/// pin, so nothing is added by hand; `prelude` is header-only and lives in `imports`' header
+/// table. Declaration bodies use the production table, which still lexes the declared
+/// remainder (`reference_tokens::SEED_IDENTIFIER_ALLOWANCE`) as identifiers.
 fn table() -> &'static TokenTable {
-    source_module_token_table()
+    crate::reference_tokens::implicit_init_table()
 }
 fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
     let run = lex_run(view.normalized(), table());
@@ -300,11 +302,16 @@ mod tests {
             "def choose (x : Nat) : Nat := match x with | Nat.zero => 0 | Nat.succ end => end",
             "def choose (end : Nat) : Nat :=\n  end",
             "def choose (namespace section open universe : Nat) : Nat := open",
+            "def choose («namespace» «section» «open» universe : Nat) : Nat := «open»",
         ] {
             let file = format!("namespace Example\n{source}\nend Example");
             let commands = partition(file.as_bytes()).unwrap();
             assert_eq!(commands.len(), 3, "{file}");
-            assert!(parse_definition(commands[1].1).is_ok(), "{file}");
+            // `namespace`, `section` and `open` are keywords at the pin and the Reference refuses
+            // them as binder names; `end` and `universe` are still lexed as identifiers in
+            // declarations (reference_tokens::SEED_IDENTIFIER_ALLOWANCE).
+            let reserved = source.contains("(namespace");
+            assert_eq!(parse_definition(commands[1].1).is_ok(), !reserved, "{file}");
             assert_eq!(
                 parse(commands[2].1).unwrap(),
                 Some(ScopeCommand::End(Some(Name::from_components(["Example"]))))

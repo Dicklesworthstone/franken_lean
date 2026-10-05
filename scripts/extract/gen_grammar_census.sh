@@ -104,8 +104,14 @@ emit_grammar() { # <dest>
     note "the extractor refused (exit $status); nothing published"
     exit 3
   fi
+  # A run that completed must carry its own totality receipts; an empty or truncated body
+  # (a full disk, a killed oracle) is refused rather than published.
+  if [ "$(grep -c '^closure-check' "$body")" -lt 6 ] || ! grep -q '^builtin-token' "$body"; then
+    note "the extractor's output is incomplete ($body); nothing published"
+    exit 3
+  fi
   { provenance fln-reference-grammar-census/1 REFERENCE_GRAMMAR_CENSUS.txt; cat "$body"; } >"$1"
-  rm -f "$body"
+  # The scratch body is left in TMPDIR, as the other extractors leave theirs.
 }
 
 source_list() { # Init.lean, Std.lean and every file below src/Init, src/Std, as "<path>\t<module>"
@@ -131,10 +137,14 @@ emit_kind_use() { # <dest>
     note "a replay faulted (xargs exit $status); see $work/*.err"
     exit 3
   fi
+  # Every listed file must have produced exactly one record: a lost write (a full disk) leaves
+  # an empty output with a zero exit, and a census missing a file is not a smaller stdlib.
+  expected="$(wc -l <"$work/all.tsv")"
   {
     provenance fln-reference-syntax-kind-use/1 REFERENCE_SYNTAX_KIND_USE.txt
     cat "$work"/[0-9]*.out | python3 -I -S -c '
 import sys
+expected = int(sys.argv[1])
 blocks, current = {}, None
 for line in sys.stdin.read().splitlines():
     fields = line.split("\t")
@@ -147,6 +157,8 @@ for line in sys.stdin.read().splitlines():
         sys.exit("replay output does not start with a file record")
     blocks[current].append(line)
 files = len(blocks)
+if files != expected:
+    sys.exit("replay produced %d file records for %d listed files" % (files, expected))
 commands = errors = faults = 0
 kinds, syntax_commands = set(), {}
 for rows in blocks.values():
@@ -173,9 +185,9 @@ for kind in sorted(syntax_commands):
 for module in sorted(blocks):
     for row in blocks[module]:
         print(row)
-'
+' "$expected"
   } >"$1"
-  rm -rf "$work"
+  # The per-file replay outputs stay in $work (TMPDIR) for inspection.
 }
 
 publish() { # <candidate> <final>
@@ -204,7 +216,6 @@ case "$MODE" in
       emit_kind_use "$SCRATCH/kind_use.txt"
       if ! diff -u "$KIND_USE" "$SCRATCH/kind_use.txt" >&2; then drift=1; fi
     fi
-    rm -rf "$SCRATCH"
     if [ "$drift" -ne 0 ]; then
       note "DRIFT: the published census does not match the pin (diff above)"
       exit 1
