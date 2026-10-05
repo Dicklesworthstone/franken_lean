@@ -311,7 +311,7 @@ fn an_editor_session_checks_and_hovers_against_imported_oleans() {
     assert!(
         unimported
             .diagnostics
-            .contains("source reference does not name a known constant"),
+            .contains("source reference `Ext.B` does not name a known constant"),
         "{}",
         unimported.diagnostics
     );

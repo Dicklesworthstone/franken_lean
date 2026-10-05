@@ -87,9 +87,11 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
-            Self::UnknownConstant(_) => {
-                write!(f, "source reference does not name a known constant")
-            }
+            Self::UnknownConstant(name) => write!(
+                f,
+                "source reference `{}` does not name a known constant",
+                name.to_display_string()
+            ),
             Self::InvalidNamedArgument(name) => write!(
                 f,
                 "invalid argument name `{}` for this application",

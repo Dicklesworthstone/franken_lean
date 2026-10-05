@@ -2717,3 +2717,35 @@ fn installed_proposition_conditionals_retain_invalid_unselected_branches() {
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
+
+/// A reference to an unknown constant is refused with that constant's name. The
+/// message used to read "source reference does not name a known constant" with no
+/// name at all, from term position and from an application head alike.
+#[test]
+fn an_unknown_constant_is_refused_by_its_name() {
+    for (source, name) in [
+        (
+            "theorem keep (P : Prop) (h : P) : P := notHere P h\n",
+            "notHere",
+        ),
+        (
+            "def again (A : Type) (a : A) : A := Missing.thing\n",
+            "Missing.thing",
+        ),
+    ] {
+        let path = file(source);
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .arg("check-source")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "source reference `{name}` does not name a known constant"
+            )),
+            "{stderr}"
+        );
+    }
+}
