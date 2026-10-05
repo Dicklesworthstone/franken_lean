@@ -373,6 +373,40 @@ fn imported_metadata_a_module_leaves_alone_is_not_charged_as_examined_bytes() {
 }
 
 #[test]
+fn imported_metadata_a_module_leaves_alone_is_not_charged_as_module_work() {
+    // `import Init` carries more imported extension entries than the whole
+    // module work budget; a module that touches none of them must not pay for them.
+    let instances: String = (0..400)
+        .map(|i| format!("instance i{i} : Inhabited Nat := Inhabited.mk {i}\n"))
+        .collect();
+    let base = engine()
+        .check_source_files(&[instances.as_bytes()], &KVMap::new(), limits().source)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let imported: usize = base
+        .environment()
+        .extensions()
+        .map(|(_, state)| state.entries().count())
+        .sum();
+    assert!(
+        imported >= 400,
+        "the base must carry 400 imported entries, has {imported}"
+    );
+    let mut small = limits();
+    small.max_work = 200;
+    check_with(
+        &base,
+        &[("Main", "theorem keep (P : Prop) (h : P) : P := h")],
+        small,
+    )
+    .unwrap_or_else(|error| panic!("{imported} untouched imported entries were charged: {error:?}"))
+    .into_complete()
+    .unwrap();
+}
+
+#[test]
 fn extension_budgets_and_mid_replay_cancellation_retain_the_original_engine() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
