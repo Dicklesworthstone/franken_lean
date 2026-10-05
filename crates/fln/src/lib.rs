@@ -1072,12 +1072,13 @@ struct FrontierAccepted {
     index: usize,
     position: usize,
     name: Name,
-    /// The engine after checking the module: its closure's environment plus
-    /// what it admitted.
-    engine: Engine,
     /// Every constant the module added, with the digest its engine computed.
     admitted: Vec<EnvironmentEntry>,
-    /// The module's transitive import closure, itself included.
+}
+
+/// The accepted import a module's closure engine starts from, and its closure.
+struct FrontierBase {
+    engine: std::sync::Arc<Engine>,
     closure: std::sync::Arc<BTreeSet<usize>>,
 }
 
@@ -1086,9 +1087,8 @@ struct FrontierJob {
     index: usize,
     position: usize,
     name: Name,
-    closure_members: std::sync::Arc<BTreeSet<usize>>,
     artifact: DecodedOlean,
-    imports: Vec<std::sync::Arc<FrontierAccepted>>,
+    base: Option<FrontierBase>,
     closure: Vec<std::sync::Arc<FrontierAccepted>>,
     /// Keep what [`Engine::check_olean_modules_scheduled`] reassembles the serial
     /// result from; the frontier itself keeps only verdicts.
@@ -1099,20 +1099,148 @@ struct FrontierDone {
     index: usize,
     verdict: OleanModuleVerdict,
     accepted: Option<FrontierAccepted>,
+    /// The engine after checking an accepted module: its closure's environment
+    /// plus what it admitted. A scheduler keeps it only while a module not yet
+    /// dispatched will start from it ([`FrontierEngines`]).
+    engine: Option<Engine>,
     elapsed: std::time::Duration,
     /// Present only for a [`FrontierJob::retain`] job that completed or failed.
     retained: Option<FrontierRetained>,
 }
 
-/// A retaining frontier job's own record: the decoded artifact and checker rows of
-/// a module whose check completed, or the exact error its check returned, which the
-/// frontier's verdict reclassifies.
+/// A retaining frontier job's own record: what the serial result is reassembled
+/// from for a module whose check completed (its decoded artifact and checker
+/// rows; for each decoded constant, the digest its own engine holds under that
+/// name; each admitted constant's checker entry), or the exact error its check
+/// returned, which the frontier's verdict reclassifies.
 enum FrontierRetained {
     Checked {
         decoded: Box<DecodedOlean>,
         declarations: Vec<OleanCheckedDeclaration>,
+        closure_digests: Vec<Option<fln_hash::domain::Digest>>,
+        checker_entries: BTreeMap<Name, Result<CheckerConstantEntry, &'static str>>,
     },
     Failed(OleanCheckError),
+}
+
+/// The import a frontier module's closure engine starts from: the import with
+/// the largest closure, the earlier on a tie. It depends only on the import
+/// graph, so a scheduler can count each engine's future users before any check.
+fn frontier_base_of(
+    dependencies: &[BTreeSet<usize>],
+    closures: &[std::sync::Arc<BTreeSet<usize>>],
+    position: impl Fn(usize) -> usize,
+    index: usize,
+) -> Option<usize> {
+    dependencies[index]
+        .iter()
+        .copied()
+        .filter(|dependency| *dependency != index)
+        .max_by(|left, right| {
+            closures[*left]
+                .len()
+                .cmp(&closures[*right].len())
+                .then(position(*right).cmp(&position(*left)))
+        })
+}
+
+/// Each admitted constant's checker entry in `engine`'s retained projection,
+/// which a scheduled module set reassembles its serial projection from. A
+/// constant without one is recorded as the invariant the reassembly reports.
+fn frontier_checker_entries(
+    engine: &Engine,
+    admitted: &[EnvironmentEntry],
+    limits: OleanCheckLimits,
+) -> BTreeMap<Name, Result<CheckerConstantEntry, &'static str>> {
+    admitted
+        .iter()
+        .map(|entry| {
+            let name = entry.declaration().name().clone();
+            let checker = engine
+                .checker_environment
+                .as_ref()
+                .ok_or("a module that admitted constants retains no checker projection")
+                .and_then(|projection| {
+                    let wire = decode_checker_name(&name, limits.admission.checker.decode)
+                        .map_err(|_| "an admitted constant has no checker name")?;
+                    let declaration = projection
+                        .find(&wire)
+                        .ok_or("an admitted constant is missing from its checker projection")?;
+                    Ok(CheckerConstantEntry::new(wire, declaration.clone()))
+                });
+            (name, checker)
+        })
+        .collect()
+}
+
+/// Accepted engines a frontier still needs. Each module's engine is kept only
+/// while a module not yet dispatched (or decided without a check) will start
+/// from it; every other module of a closure contributes only its admitted
+/// entries. Without this, every accepted module's whole engine, with the
+/// checker terms it decoded for itself, lived until the run ended.
+struct FrontierEngines {
+    base_of: Vec<Option<usize>>,
+    users: Vec<usize>,
+    engines: Vec<Option<std::sync::Arc<Engine>>>,
+}
+
+impl FrontierEngines {
+    fn new(base_of: Vec<Option<usize>>) -> Self {
+        let mut users = vec![0_usize; base_of.len()];
+        for base in base_of.iter().flatten() {
+            users[*base] += 1;
+        }
+        let engines = (0..base_of.len()).map(|_| None).collect();
+        Self {
+            base_of,
+            users,
+            engines,
+        }
+    }
+
+    /// Keep an accepted module's engine if some later module starts from it.
+    fn keep(&mut self, index: usize, engine: Option<Engine>) {
+        if self.users[index] > 0 {
+            self.engines[index] = engine.map(std::sync::Arc::new);
+        }
+    }
+
+    /// `index` leaves the schedule: dispatched (`take` its base) or decided
+    /// without a check. Its base loses a user and is dropped at the last one.
+    fn release(
+        &mut self,
+        index: usize,
+        closures: &[std::sync::Arc<BTreeSet<usize>>],
+        take: bool,
+    ) -> Result<Option<FrontierBase>, OleanCheckError> {
+        let Some(base) = self.base_of[index] else {
+            return Ok(None);
+        };
+        self.users[base] =
+            self.users[base]
+                .checked_sub(1)
+                .ok_or(OleanCheckError::InternalInvariant {
+                    detail: "a frontier base engine lost more users than it had",
+                })?;
+        let engine = if take {
+            Some(
+                self.engines[base]
+                    .clone()
+                    .ok_or(OleanCheckError::InternalInvariant {
+                        detail: "a dispatched module's base engine was not kept",
+                    })?,
+            )
+        } else {
+            None
+        };
+        if self.users[base] == 0 {
+            self.engines[base] = None;
+        }
+        Ok(engine.map(|engine| FrontierBase {
+            engine,
+            closure: std::sync::Arc::clone(&closures[base]),
+        }))
+    }
 }
 
 /// One module of a scheduled set whose check completed, with what the serial result
@@ -1121,6 +1249,10 @@ struct ScheduledOleanModule {
     module: std::sync::Arc<FrontierAccepted>,
     decoded: DecodedOlean,
     declarations: Vec<OleanCheckedDeclaration>,
+    /// For each of `decoded.constants`, the digest the module's own engine held
+    /// under that name after its check.
+    closure_digests: Vec<Option<fln_hash::domain::Digest>>,
+    checker_entries: BTreeMap<Name, Result<CheckerConstantEntry, &'static str>>,
 }
 
 /// The rows the serial planner gives a module checked after `before`, the
@@ -3402,6 +3534,11 @@ impl Engine {
         let mut pending_rows: Vec<Option<OleanFrontierRow>> = (0..count).map(|_| None).collect();
         let mut decided = vec![false; count];
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
+        let mut engines = FrontierEngines::new(
+            (0..count)
+                .map(|index| frontier_base_of(&dependencies, &closures, |i| position[i], index))
+                .collect(),
+        );
         let mut rows = Vec::with_capacity(count);
         let threads = jobs.threads.get();
 
@@ -3445,10 +3582,12 @@ impl Engine {
                  running: &mut Vec<bool>,
                  decided: &mut Vec<bool>,
                  accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                 engines: &mut FrontierEngines,
                  pending_rows: &mut Vec<Option<OleanFrontierRow>>| {
                     running[done.index] = false;
                     decided[done.index] = true;
                     accepted[done.index] = done.accepted.map(std::sync::Arc::new);
+                    engines.keep(done.index, done.engine);
                     pending_rows[done.index] = Some(OleanFrontierRow {
                         name: modules[done.index].name.clone(),
                         verdict: done.verdict,
@@ -3493,6 +3632,7 @@ impl Engine {
                         }),
                     };
                     decided[index] = true;
+                    engines.release(index, &closures, false)?;
                     pending_rows[index] = Some(OleanFrontierRow {
                         name: modules[index].name.clone(),
                         verdict,
@@ -3526,10 +3666,7 @@ impl Engine {
                             detail: "a ready frontier module has no decoded artifact",
                         });
                     };
-                    let imports: Vec<_> = dependencies[index]
-                        .iter()
-                        .filter_map(|dependency| accepted[*dependency].clone())
-                        .collect();
+                    let base = engines.release(index, &closures, true)?;
                     let mut closure: Vec<_> = closures[index]
                         .iter()
                         .filter(|member| **member != index)
@@ -3548,9 +3685,8 @@ impl Engine {
                         index,
                         position: position[index],
                         name: modules[index].name.clone(),
-                        closure_members: std::sync::Arc::clone(&closures[index]),
                         artifact,
-                        imports,
+                        base,
                         closure,
                         retain: false,
                     };
@@ -3564,6 +3700,7 @@ impl Engine {
                             &mut running,
                             &mut decided,
                             &mut accepted,
+                            &mut engines,
                             &mut pending_rows,
                         );
                         break;
@@ -3599,6 +3736,7 @@ impl Engine {
                     &mut running,
                     &mut decided,
                     &mut accepted,
+                    &mut engines,
                     &mut pending_rows,
                 );
             }
@@ -3728,8 +3866,12 @@ impl Engine {
 
         let threads = jobs.threads.get();
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
-        let mut retained: Vec<Option<(DecodedOlean, Vec<OleanCheckedDeclaration>)>> =
-            (0..count).map(|_| None).collect();
+        let mut engines = FrontierEngines::new(
+            (0..count)
+                .map(|index| frontier_base_of(&dependencies, &closures, |i| i, index))
+                .collect(),
+        );
+        let mut retained: Vec<Option<FrontierRetained>> = (0..count).map(|_| None).collect();
         let mut decided = vec![false; count];
         let mut running = vec![false; count];
         // The first position whose check did not complete, and how it ended.
@@ -3790,10 +3932,7 @@ impl Engine {
                                 detail: "a ready module-set member has no decoded artifact",
                             });
                         };
-                        let imports = dependencies[index]
-                            .iter()
-                            .filter_map(|dependency| accepted[*dependency].clone())
-                            .collect();
+                        let base = engines.release(index, &closures, true)?;
                         let mut closure: Vec<_> = closures[index]
                             .iter()
                             .filter(|member| **member != index)
@@ -3806,9 +3945,8 @@ impl Engine {
                             index,
                             position: index,
                             name: names[index].clone(),
-                            closure_members: std::sync::Arc::clone(&closures[index]),
                             artifact,
-                            imports,
+                            base,
                             closure,
                             retain: true,
                         };
@@ -3838,21 +3976,17 @@ impl Engine {
                     index,
                     verdict,
                     accepted: module,
+                    engine,
                     retained: kept,
                     ..
                 } = done;
                 running[index] = false;
                 decided[index] = true;
                 match (module, kept) {
-                    (
-                        Some(module),
-                        Some(FrontierRetained::Checked {
-                            decoded,
-                            declarations,
-                        }),
-                    ) => {
+                    (Some(module), Some(checked @ FrontierRetained::Checked { .. })) => {
                         accepted[index] = Some(std::sync::Arc::new(module));
-                        retained[index] = Some((*decoded, declarations));
+                        engines.keep(index, engine);
+                        retained[index] = Some(checked);
                     }
                     (Some(_), _) => {
                         return Err(OleanCheckError::InternalInvariant {
@@ -3889,15 +4023,26 @@ impl Engine {
         }
         let mut scheduled = Vec::with_capacity(count);
         for (module, kept) in accepted.into_iter().zip(retained) {
-            let (Some(module), Some((decoded, declarations))) = (module, kept) else {
+            let (
+                Some(module),
+                Some(FrontierRetained::Checked {
+                    decoded,
+                    declarations,
+                    closure_digests,
+                    checker_entries,
+                }),
+            ) = (module, kept)
+            else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "a decided module-set member lost its checked record",
                 });
             };
             scheduled.push(ScheduledOleanModule {
                 module,
-                decoded,
+                decoded: *decoded,
                 declarations,
+                closure_digests,
+                checker_entries,
             });
         }
         Ok(Outcome::Complete(scheduled))
@@ -3933,7 +4078,14 @@ impl Engine {
                 module,
                 decoded,
                 declarations,
+                closure_digests,
+                checker_entries,
             } = scheduled;
+            if closure_digests.len() != decoded.constants.len() {
+                return Err(invariant(
+                    "a module's closure digests do not cover its constants",
+                ));
+            }
             let module_base_root = root;
             // A constant the serial environment already holds, while this module's
             // closure did not (or held another copy), is planned differently there.
@@ -3942,16 +4094,16 @@ impl Engine {
                 .iter()
                 .map(|entry| entry.declaration().name())
                 .collect();
-            let repeats = decoded.constants.iter().any(|info| {
-                environment.entry(info.name()).is_some_and(|present| {
-                    own.contains(info.name())
-                        || module
-                            .engine
-                            .environment
-                            .entry(info.name())
-                            .is_none_or(|copy| copy.digest() != present.digest())
-                })
-            });
+            let repeats = decoded
+                .constants
+                .iter()
+                .zip(&closure_digests)
+                .any(|(info, copy)| {
+                    environment.entry(info.name()).is_some_and(|present| {
+                        own.contains(info.name())
+                            || copy.is_none_or(|copy| copy != present.digest())
+                    })
+                });
             let declarations = if repeats {
                 serial_olean_rows(&environment, &decoded, declarations, limits)?
             } else {
@@ -3972,16 +4124,16 @@ impl Engine {
             if !added.is_empty() {
                 admitted_any = true;
                 root = environment.logical_root(options);
-                let projection = module.engine.checker_environment.as_ref().ok_or_else(|| {
-                    invariant("a module that admitted constants retains no checker projection")
-                })?;
                 for name in added {
-                    let wire = decode_checker_name(&name, limits.admission.checker.decode)
-                        .map_err(|_| invariant("an admitted constant has no checker name"))?;
-                    let declaration = projection.find(&wire).ok_or_else(|| {
-                        invariant("an admitted constant is missing from its checker projection")
-                    })?;
-                    candidates.push(CheckerConstantEntry::new(wire, declaration.clone()));
+                    match checker_entries.get(&name) {
+                        Some(Ok(entry)) => candidates.push(entry.clone()),
+                        Some(Err(detail)) => return Err(invariant(detail)),
+                        None => {
+                            return Err(invariant(
+                                "an admitted constant is missing from its checker projection",
+                            ));
+                        }
+                    }
                 }
             }
             checked_modules.push(CheckedOleanModule {
@@ -4061,13 +4213,17 @@ impl Engine {
         let index = job.index;
         let retain = job.retain;
         let finish = |verdict: OleanModuleVerdict,
-                      accepted: Option<FrontierAccepted>,
-                      retained: Option<FrontierRetained>| FrontierDone {
-            index,
-            verdict,
-            accepted,
-            elapsed: started.elapsed(),
-            retained,
+                      accepted: Option<(FrontierAccepted, Engine)>,
+                      retained: Option<FrontierRetained>| {
+            let (accepted, engine) = accepted.unzip();
+            FrontierDone {
+                index,
+                verdict,
+                accepted,
+                engine,
+                elapsed: started.elapsed(),
+                retained,
+            }
         };
         let failed = |error: OleanCheckError| {
             let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
@@ -4081,7 +4237,7 @@ impl Engine {
         match engine.check_decoded_olean_unrooted(job.artifact, options, limits) {
             Ok(Outcome::Complete(checked)) => {
                 let declarations = checked.declarations.len();
-                let admitted = checked
+                let admitted: Vec<EnvironmentEntry> = checked
                     .decoded
                     .constants
                     .iter()
@@ -4093,19 +4249,27 @@ impl Engine {
                 imported.insert(job.name.clone());
                 engine.imported_modules = std::sync::Arc::new(imported);
                 let retained = retain.then(|| FrontierRetained::Checked {
+                    closure_digests: checked
+                        .decoded
+                        .constants
+                        .iter()
+                        .map(|info| engine.environment.entry(info.name()).map(|e| e.digest()))
+                        .collect(),
+                    checker_entries: frontier_checker_entries(&engine, &admitted, limits),
                     decoded: Box::new(checked.decoded),
                     declarations: checked.declarations,
                 });
                 finish(
                     OleanModuleVerdict::Accepted { declarations },
-                    Some(FrontierAccepted {
-                        index,
-                        position: job.position,
-                        name: job.name,
+                    Some((
+                        FrontierAccepted {
+                            index,
+                            position: job.position,
+                            name: job.name,
+                            admitted,
+                        },
                         engine,
-                        admitted,
-                        closure: job.closure_members,
-                    }),
+                    )),
                     retained,
                 )
             }
@@ -4122,15 +4286,10 @@ impl Engine {
     /// The engine a frontier module is checked with: its import with the largest
     /// closure (the earlier on a tie), plus what the rest of its closure admitted.
     fn frontier_closure_engine(&self, job: &FrontierJob) -> Result<Engine, OleanCheckError> {
-        let Some(base) = job.imports.iter().max_by(|left, right| {
-            left.closure
-                .len()
-                .cmp(&right.closure.len())
-                .then(right.position.cmp(&left.position))
-        }) else {
+        let Some(base) = &job.base else {
             return Ok(self.clone());
         };
-        let mut engine = base.engine.clone();
+        let mut engine = (*base.engine).clone();
         let mut environment = engine.environment.clone();
         let mut imported = (*engine.imported_modules).clone();
         for module in &job.closure {
@@ -12455,6 +12614,53 @@ mod tests {
         )
         .expect_err("the old unit bound stops before the spine is decoded");
         assert!(refusal.contains("ProducedUnits"), "{refusal}");
+    }
+
+    #[test]
+    fn frontier_engines_keep_a_base_only_while_a_later_module_starts_from_it() {
+        use super::{FrontierEngines, frontier_base_of};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        // 1 and 2 import 0; 3 imports 1 and 2, whose closures tie in size, so 3
+        // starts from the earlier, 1. Neither 2 nor 3 is anyone's base.
+        let dependencies: Vec<BTreeSet<usize>> = vec![
+            BTreeSet::new(),
+            BTreeSet::from([0]),
+            BTreeSet::from([0]),
+            BTreeSet::from([1, 2]),
+        ];
+        let closures: Vec<Arc<BTreeSet<usize>>> = vec![
+            Arc::new(BTreeSet::from([0])),
+            Arc::new(BTreeSet::from([0, 1])),
+            Arc::new(BTreeSet::from([0, 2])),
+            Arc::new(BTreeSet::from([0, 1, 2, 3])),
+        ];
+        let base_of: Vec<_> = (0..4)
+            .map(|index| frontier_base_of(&dependencies, &closures, |p| p, index))
+            .collect();
+        assert_eq!(base_of, vec![None, Some(0), Some(0), Some(1)]);
+        let mut engines = FrontierEngines::new(base_of);
+        for index in 0..4 {
+            engines.keep(index, Some(Engine::builder().build_empty()));
+        }
+        let kept = |engines: &FrontierEngines| -> Vec<bool> {
+            engines.engines.iter().map(Option::is_some).collect()
+        };
+        assert_eq!(kept(&engines), [true, true, false, false]);
+        // 1 is dispatched from 0, which 2 still needs.
+        assert!(engines.release(1, &closures, true).unwrap().is_some());
+        assert_eq!(kept(&engines), [true, true, false, false]);
+        // 2 is decided without a check (blocked): 0 has no user left.
+        assert!(engines.release(2, &closures, false).unwrap().is_none());
+        assert_eq!(kept(&engines), [false, true, false, false]);
+        let base = engines
+            .release(3, &closures, true)
+            .unwrap()
+            .expect("3 starts from 1");
+        assert_eq!(*base.closure, BTreeSet::from([0, 1]));
+        assert_eq!(kept(&engines), [false, false, false, false]);
+        // A module released twice is an invariant failure, never a silent reuse.
+        assert!(engines.release(3, &closures, true).is_err());
     }
 
     #[test]
