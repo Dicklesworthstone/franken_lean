@@ -203,7 +203,7 @@ fn cleanup_annotations(mut e: Expr) -> Expr {
     }
 }
 
-fn spine(e: &Expr) -> (Expr, Vec<Expr>) {
+pub(super) fn spine(e: &Expr) -> (Expr, Vec<Expr>) {
     let mut head = e.clone();
     let mut args = Vec::new();
     while let ExprNode::App { f, a } = head.node() {

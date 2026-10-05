@@ -1032,11 +1032,14 @@ fn finish_bounded_application(
     if terms.len() == 1 {
         return Ok(terms.pop().expect("the nonempty term has one member").0);
     }
-    if !matches!(
-        tokens.get(*first_index).map(|token| &token.kind),
-        Some(TokenKind::Ident(_))
-    ) && !(grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@")))
+    // `.c a b`: a dotted identifier heads an application (`Term.app (Term.dotIdent …)`).
+    if !(grammar == DefinitionGrammar::Scalar && dotted_head(&terms))
+        && !matches!(
+            tokens.get(*first_index).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        )
+        && !(grammar == DefinitionGrammar::Scalar
+            && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@")))
     {
         let at = terms.get(1).map_or(*first_index, |(_, index)| *index);
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -1396,6 +1399,67 @@ fn push_jump_keyword(leaves: &Leaves, frames: &mut [BoundedTermFrame], index: us
     }
 }
 
+/// Whether an application's head is a `Term.dotIdent`. Out of line for the same stack budget.
+#[inline(never)]
+fn dotted_head(terms: &[(Syntax, usize)]) -> bool {
+    terms.first().and_then(|(head, _)| head.kind()) == Some(&parser_kind(&["Term", "dotIdent"]))
+}
+
+/// A `.` at `index` followed by the identifier at `cursor`, pushed onto `frame`'s application.
+///
+/// Where a term begins it is the pin's leading `Term.dotIdent`, `"." >> checkNoWsBefore >>
+/// rawIdent` (`Lean/Parser/Term.lean:924`): a `.` begins a term when it opens the term,
+/// opens an empty application, or follows whitespace. Otherwise it is the trailing
+/// projection `e.f`, whose `.` must touch `e` (`Term.proj`'s `checkNoWsBefore`). A beginning
+/// `.` not followed, without whitespace, by an identifier is the pin's `·` (`Term.cdot`),
+/// which is not parsed here and is refused like a malformed projection.
+///
+/// Out of line: `bounded_term_frames`' frame is held to a fixed host-stack budget
+/// (`deep_quantifier_bodies_use_heap_frames`).
+#[inline(never)]
+fn dot_term(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frame: &mut BoundedTermFrame,
+    range: std::ops::Range<usize>,
+    index: usize,
+    cursor: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, index),
+        expected: NatDefinitionExpectation::RecordField,
+    };
+    let touches_identifier = cursor < range.end
+        && tokens[index].extent.end() == tokens[cursor].extent.start()
+        && matches!(&tokens[cursor].kind, TokenKind::Ident(_));
+    if !touches_identifier {
+        return Err(refusal());
+    }
+    let begins = index == range.start
+        || frame.application.is_empty()
+        || tokens[index - 1].extent.end() != tokens[index].extent.start();
+    if begins {
+        frame.application.push((
+            Syntax::node(
+                parser_kind(&["Term", "dotIdent"]),
+                vec![leaves.leaf(index)?, leaves.leaf(cursor)?],
+            ),
+            index,
+        ));
+        return Ok(());
+    }
+    let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
+    frame.application.push((
+        Syntax::node(
+            parser_kind(&["Term", "proj"]),
+            vec![receiver, leaves.leaf(index)?, leaves.leaf(cursor)?],
+        ),
+        start,
+    ));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bounded_term_frames(
     leaves: &Leaves,
@@ -1681,27 +1745,15 @@ fn bounded_term_frames(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "." =>
             {
-                let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(view, tokens, index),
-                    expected: NatDefinitionExpectation::RecordField,
-                };
-                if index == range.start
-                    || cursor >= range.end
-                    || tokens[index - 1].extent.end() != tokens[index].extent.start()
-                    || tokens[index].extent.end() != tokens[cursor].extent.start()
-                    || !matches!(&tokens[cursor].kind, TokenKind::Ident(_))
-                {
-                    return Err(refusal());
-                }
-                let frame = frames.last_mut().expect("root term frame");
-                let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
-                frame.application.push((
-                    Syntax::node(
-                        parser_kind(&["Term", "proj"]),
-                        vec![receiver, leaves.leaf(index)?, leaves.leaf(cursor)?],
-                    ),
-                    start,
-                ));
+                dot_term(
+                    leaves,
+                    view,
+                    tokens,
+                    frames.last_mut().expect("root term frame"),
+                    range.clone(),
+                    index,
+                    cursor,
+                )?;
                 cursor += 1;
             }
             Some(TokenKind::Symbol(symbol))

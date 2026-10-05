@@ -136,6 +136,56 @@ const ANONYMOUS_CONSTRUCTORS: &[Accepted] = &[
     },
 ];
 
+/// `.c`: `Term.dotIdent`, `"." >> checkNoWsBefore >> rawIdent` (`Lean/Parser/Term.lean:924`),
+/// as a value, an application head, an argument, a `fun` body, a list element, and with a
+/// dotted name (which the parser takes whole and the elaborator refuses as non-atomic). The
+/// rows were captured after `inductive T where | leaf | node (l r : T)`, and the `theorem`
+/// row is the last line of the stage-2 target I04 (`(T.node .leaf .leaf).size`).
+const DOTTED_IDENTIFIERS: &[Accepted] = &[
+    Accepted {
+        source: "def x : T := .leaf",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `x []) (Command.optDeclSig [] [(Term.typeSpec ":" `T)]) (Command.declValSimple ":=" (Term.dotIdent "." `leaf) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def y : T := .node .leaf (.node .leaf .leaf)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `y []) (Command.optDeclSig [] [(Term.typeSpec ":" `T)]) (Command.declValSimple ":=" (Term.app (Term.dotIdent "." `node) [(Term.dotIdent "." `leaf) (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app (Term.dotIdent "." `node) [(Term.dotIdent "." `leaf) (Term.dotIdent "." `leaf)]) ")")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def z : Option Nat := .some 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `z []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `Option [`Nat]))]) (Command.declValSimple ":=" (Term.app (Term.dotIdent "." `some) [(num "1")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f : Nat → T := fun _ => .leaf",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `T))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [(Term.hole "_")] [] "=>" (Term.dotIdent "." `leaf))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def g : Nat → Option Nat := .some",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `g []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.app `Option [`Nat])))]) (Command.declValSimple ":=" (Term.dotIdent "." `some) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem t : (T.node .leaf .leaf).size = 3 := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.proj (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `T.node [(Term.dotIdent "." `leaf) (Term.dotIdent "." `leaf)]) ")") "." `size) "=" (num "3")))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def k : List T := [.leaf, .node .leaf .leaf]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `k []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `List [`T]))]) (Command.declValSimple ":=" («term[_]» "[" [(Term.dotIdent "." `leaf) "," (Term.app (Term.dotIdent "." `node) [(Term.dotIdent "." `leaf) (Term.dotIdent "." `leaf)])] "]") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def s : T := .leaf.x",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s []) (Command.optDeclSig [] [(Term.typeSpec ":" `T)]) (Command.declValSimple ":=" (Term.dotIdent "." `leaf.x) (Termination.suffix [] []) []) []))"#,
+    },
+    // The boundary with the trailing projection: a `.` touching the term before it is
+    // `Term.proj`; after whitespace it begins an argument.
+    Accepted {
+        source: "def p : Nat := (x).f",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `p []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.proj (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `x ")") "." `f) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def q := f (x) .g",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `q []) (Command.optDeclSig [] []) (Command.declValSimple ":=" (Term.app `f [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `x ")") (Term.dotIdent "." `g)]) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 /// Malformed `⟨…⟩`, refused at the pin's token. Captured as above (the pin's columns count
 /// code points; `at` is the byte offset in `source`).
 const ANONYMOUS_CONSTRUCTOR_REFUSALS: &[Refused] = &[
@@ -242,6 +292,13 @@ fn anonymous_constructors_produce_the_pins_trees() {
     }
 }
 
+#[test]
+fn dotted_identifiers_produce_the_pins_trees() {
+    for row in DOTTED_IDENTIFIERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
 #[test]
 fn modifiers_out_of_order_are_refused_at_the_pins_token() {
     refusals_agree(MODIFIER_REFUSALS);

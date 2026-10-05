@@ -13,6 +13,8 @@ mod calc;
 mod coercions;
 mod collections;
 mod do_notation;
+mod dotted_ident;
+pub use dotted_ident::DottedIdentError;
 mod eliminator;
 pub mod scope;
 use scope::SourceScope;
@@ -93,6 +95,8 @@ pub enum SourceInferenceError {
     Unification(Box<UnificationError>),
     /// `⟨…⟩` could not be expanded (`elabAnonymousCtor`).
     AnonymousCtor(AnonymousCtorError),
+    /// `.c` could not be resolved against its expected type (`resolveDottedIdentFn`).
+    DottedIdent(DottedIdentError),
 }
 
 impl std::fmt::Display for SourceInferenceError {
@@ -163,6 +167,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Universe(error) => write!(f, "{error}"),
             Self::Unification(error) => write!(f, "{error}"),
             Self::AnonymousCtor(error) => write!(f, "{error}"),
+            Self::DottedIdent(error) => write!(f, "{error}"),
         }
     }
 }
@@ -422,6 +427,9 @@ impl Context {
             return Ok(literal);
         }
         if let Syntax::Node { kind, args, .. } = syntax {
+            if kind == &parser_kind(&["Term", "dotIdent"]) {
+                return self.dotted_identifier(args, expected);
+            }
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
@@ -1988,6 +1996,17 @@ impl Context {
                                     tasks.push(Task::Projection(
                                         field, arguments, expected, explicit, true,
                                     ));
+                                }
+                                // `.c a b`: the head resolves against the expected type
+                                // of the whole application (`elabAppFn`'s dotIdent case).
+                                None if head.kind()
+                                    == Some(&parser_kind(&["Term", "dotIdent"])) =>
+                                {
+                                    let Syntax::Node { args, .. } = head else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    values.push(self.dotted_identifier(args, expected.as_ref())?);
+                                    tasks.push(Task::Function(arguments, expected, explicit));
                                 }
                                 None => {
                                     tasks.push(Task::Function(arguments, expected, explicit));
