@@ -431,7 +431,10 @@ implicit Prelude processing, general Lean elaboration, or diagnostic-text parity
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned
 epoch; `fln olean verify-rebuild` re-derives that artifact from decoded semantics
-and requires byte identity; and `fln olean diff LEFT RIGHT` compares two decoded
+and requires byte identity, and for a module-system module it rebuilds every
+present part of the `.olean`, `.olean.server`, `.olean.private` chain against the
+parts loaded before it, reporting each part and refusing a part whose predecessor
+is absent; and `fln olean diff LEFT RIGHT` compares two decoded
 artifacts without collapsing byte, header, module-metadata, or declaration-order
 identity into one claim. Diff output is deterministic and bounded (at most 256
 changed names, with explicit omission counts), and `--max-bytes` bounds the two

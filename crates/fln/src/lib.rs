@@ -620,11 +620,62 @@ impl From<OleanDeclarationError> for OleanDecodeError {
     }
 }
 
+/// One physical part of a module image, in the Reference's load order: the
+/// exported `.olean`, then `.olean.server`, then `.olean.private`
+/// (`saveModuleDataParts` writes them in that order, and each later part is
+/// compacted against the earlier ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OleanModulePart {
+    Exported,
+    Server,
+    Private,
+}
+
+impl OleanModulePart {
+    /// Every part, in load order.
+    pub const LOAD_ORDER: [Self; 3] = [Self::Exported, Self::Server, Self::Private];
+
+    /// What the Reference appends to the exported file name to name this part
+    /// (`OLeanLevel.adjustFileName`): nothing, `.server`, or `.private`.
+    pub const fn file_suffix(self) -> &'static str {
+        match self {
+            Self::Exported => "",
+            Self::Server => ".server",
+            Self::Private => ".private",
+        }
+    }
+}
+
+impl fmt::Display for OleanModulePart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Exported => ".olean",
+            Self::Server => ".olean.server",
+            Self::Private => ".olean.private",
+        })
+    }
+}
+
 /// Typed refusal from the public pinned `.olean` rebuild path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OleanRebuildError {
+    /// The artifact, or a module chain's parts together, exceed the byte bound.
     ArtifactTooLarge { bytes: usize, limit: usize },
+    /// A standalone artifact refused by the region rebuild.
     Region(OleanRegionError),
+    /// One part of a module chain refused by the region rebuild, in the
+    /// address space of the parts loaded before it.
+    PartRegion {
+        part: OleanModulePart,
+        error: OleanRegionError,
+    },
+    /// `part` was supplied without `missing`, a part the Reference loads
+    /// before it. A companion stores pointers into its predecessors, so it
+    /// cannot be rebuilt without them.
+    MissingPredecessor {
+        part: OleanModulePart,
+        missing: OleanModulePart,
+    },
 }
 
 impl fmt::Display for OleanRebuildError {
@@ -634,11 +685,37 @@ impl fmt::Display for OleanRebuildError {
                 write!(f, ".olean artifact has {bytes} bytes; limit is {limit}")
             }
             Self::Region(error) => write!(f, ".olean rebuild: {error}"),
+            Self::PartRegion { part, error } => write!(f, "{part} rebuild: {error}"),
+            Self::MissingPredecessor { part, missing } => write!(
+                f,
+                "{part} cannot be rebuilt without its predecessor {missing}, the part \
+                 it was compacted after"
+            ),
         }
     }
 }
 
 impl std::error::Error for OleanRebuildError {}
+
+impl OleanRebuildError {
+    /// Whether this refusal is solely an explicit byte/object budget rather
+    /// than malformed or incomplete input.
+    pub const fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::ArtifactTooLarge { .. }
+                | Self::Region(
+                    OleanRegionError::BudgetExhausted { .. }
+                        | OleanRegionError::PayloadBudgetExhausted { .. }
+                )
+                | Self::PartRegion {
+                    error: OleanRegionError::BudgetExhausted { .. }
+                        | OleanRegionError::PayloadBudgetExhausted { .. },
+                    ..
+                }
+        )
+    }
+}
 
 impl From<OleanRegionError> for OleanRebuildError {
     fn from(error: OleanRegionError) -> Self {
@@ -653,6 +730,10 @@ impl From<OleanRegionError> for OleanRebuildError {
 /// copies only declared content classes. Callers compare the returned bytes to
 /// the input and inspect the accounting report. It is not fresh `.olean`
 /// emission and does not resolve imports or kernel-check declarations.
+///
+/// The artifact must be a standalone region. A module-system companion
+/// (`.olean.server`, `.olean.private`) points into the parts written before
+/// it and is refused here; rebuild it with [`rebuild_olean_module_artifacts`].
 pub fn rebuild_olean_artifact(
     artifact: &[u8],
     max_bytes: usize,
@@ -664,6 +745,91 @@ pub fn rebuild_olean_artifact(
         });
     }
     fln_olean::rebuild::rebuild(artifact).map_err(OleanRebuildError::from)
+}
+
+/// The physical parts of one module image handed to
+/// [`rebuild_olean_module_artifacts`]. The exported `.olean` is required; a
+/// companion is supplied only when the caller has it.
+#[derive(Debug, Clone, Copy)]
+pub struct OleanModuleParts<'a> {
+    pub exported: &'a [u8],
+    pub server: Option<&'a [u8]>,
+    pub private: Option<&'a [u8]>,
+}
+
+/// One re-derived physical part of a module image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OleanPartRebuild {
+    pub part: OleanModulePart,
+    pub bytes: Vec<u8>,
+    pub report: OleanRebuildReport,
+}
+
+/// Re-derive every supplied part of one module image, in load order.
+///
+/// This is [`rebuild_olean_artifact`]'s door for module-system chains. Each
+/// part is rebuilt in the address space the Reference loads it in: the
+/// exported part alone, `.olean.server` against the exported part, and
+/// `.olean.private` against both. Bytes a part owns are re-derived exactly as
+/// for a standalone image; a pointer into an earlier part is re-derived from
+/// its validated address there, and the object it names is left to the part
+/// that owns it. The result has one entry per supplied part, in load order, and
+/// the caller compares each entry's bytes with that part's input.
+///
+/// Supplied parts must be a load-order prefix, the shape the Reference's
+/// `readModuleDataParts` accepts: a private part without the server part is
+/// [`OleanRebuildError::MissingPredecessor`]. `max_bytes` bounds the supplied
+/// parts together and is checked before any parsing. A region refusal names
+/// the part it came from, and the first refusal in load order stops the
+/// rebuild. Like [`rebuild_olean_artifact`], this is not fresh emission, does
+/// not resolve imports or kernel-check declarations, and does not establish
+/// that the parts came from one build.
+pub fn rebuild_olean_module_artifacts(
+    parts: OleanModuleParts<'_>,
+    max_bytes: usize,
+) -> Result<Vec<OleanPartRebuild>, OleanRebuildError> {
+    if parts.private.is_some() && parts.server.is_none() {
+        return Err(OleanRebuildError::MissingPredecessor {
+            part: OleanModulePart::Private,
+            missing: OleanModulePart::Server,
+        });
+    }
+    let supplied: Vec<(OleanModulePart, &[u8])> = [
+        (OleanModulePart::Exported, Some(parts.exported)),
+        (OleanModulePart::Server, parts.server),
+        (OleanModulePart::Private, parts.private),
+    ]
+    .into_iter()
+    .filter_map(|(part, bytes)| bytes.map(|bytes| (part, bytes)))
+    .collect();
+    let bytes = supplied
+        .iter()
+        .try_fold(0_usize, |total, (_, bytes)| total.checked_add(bytes.len()))
+        .ok_or(OleanRebuildError::ArtifactTooLarge {
+            bytes: usize::MAX,
+            limit: max_bytes,
+        })?;
+    if bytes > max_bytes {
+        return Err(OleanRebuildError::ArtifactTooLarge {
+            bytes,
+            limit: max_bytes,
+        });
+    }
+    // Each part sees exactly the parts loaded before it, never itself or a
+    // later one.
+    let mut loaded: Vec<&[u8]> = Vec::with_capacity(supplied.len());
+    let mut rebuilt = Vec::with_capacity(supplied.len());
+    for (part, bytes) in supplied {
+        let (part_bytes, report) = fln_olean::rebuild::rebuild_with_dependencies(bytes, &loaded)
+            .map_err(|error| OleanRebuildError::PartRegion { part, error })?;
+        rebuilt.push(OleanPartRebuild {
+            part,
+            bytes: part_bytes,
+            report,
+        });
+        loaded.push(bytes);
+    }
+    Ok(rebuilt)
 }
 
 /// Audit and decode one `.olean` produced by the pinned Reference epoch.
@@ -11756,6 +11922,135 @@ mod tests {
             rebuild_olean_artifact(&malformed, malformed.len()),
             Err(OleanRebuildError::Region(OleanRegionError::BadMagic))
         ));
+    }
+
+    /// The committed `prelude.olean` chain, byte-identical to the pinned
+    /// v4.32.0 stdlib's `Init/Prelude` exported, server and private parts
+    /// (fln-cli's `olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude`
+    /// holds that against the installed pin), read from the invoking tree.
+    fn pinned_prelude_chain() -> [Vec<u8>; 3] {
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("cargo identifies the invoking crate directory");
+        let dir = manifest_dir.join("../fln-conformance/fixtures/tag_attributes");
+        ["", ".server", ".private"].map(|suffix| {
+            let path = dir.join(format!("prelude.olean{suffix}"));
+            std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+        })
+    }
+
+    #[test]
+    fn public_olean_module_rebuild_door_rederives_a_real_chain_per_part() {
+        use super::{
+            OleanModulePart, OleanModuleParts, OleanPartRebuild, rebuild_olean_module_artifacts,
+        };
+        let [exported, server, private] = pinned_prelude_chain();
+        let total = exported.len() + server.len() + private.len();
+
+        // The standalone door cannot rebuild a companion: its pointers into
+        // the earlier parts resolve nowhere in its own region.
+        for companion in [&server, &private] {
+            assert!(matches!(
+                rebuild_olean_artifact(companion, companion.len()),
+                Err(OleanRebuildError::Region(
+                    OleanRegionError::PtrOutOfBounds { .. }
+                ))
+            ));
+        }
+
+        let chain = OleanModuleParts {
+            exported: &exported,
+            server: Some(&server),
+            private: Some(&private),
+        };
+        let rebuilt = rebuild_olean_module_artifacts(chain, total)
+            .expect("the real pinned chain rebuilds at exactly its own size");
+        assert_eq!(
+            rebuilt.iter().map(|part| part.part).collect::<Vec<_>>(),
+            OleanModulePart::LOAD_ORDER,
+            "one answer per part, in load order"
+        );
+        for (
+            OleanPartRebuild {
+                part,
+                bytes,
+                report,
+            },
+            original,
+        ) in rebuilt.iter().zip([&exported, &server, &private])
+        {
+            assert!(bytes == original, "{part} rebuilds byte-identically");
+            assert!(report.findings.is_empty(), "{part}: {:?}", report.findings);
+            assert_eq!(report.nonzero_padding_bytes, 0, "{part}");
+            if *part == OleanModulePart::Exported {
+                assert_eq!(
+                    report.dependency_pointers, 0,
+                    "the exported part is standalone"
+                );
+            } else {
+                assert!(
+                    report.dependency_pointers > 0,
+                    "{part} never crossed into a predecessor"
+                );
+            }
+        }
+
+        // A load-order prefix is what the Reference's reader accepts too.
+        let prefix = OleanModuleParts {
+            private: None,
+            ..chain
+        };
+        let rebuilt = rebuild_olean_module_artifacts(prefix, total).expect("a prefix rebuilds");
+        assert_eq!(rebuilt.len(), 2);
+        assert!(rebuilt[1].part == OleanModulePart::Server && rebuilt[1].bytes == server);
+
+        // Typed refusals: a gap in load order, the byte bound over the parts
+        // together, and a corrupted companion named as itself.
+        let gap = OleanModuleParts {
+            server: None,
+            ..chain
+        };
+        let refusal = rebuild_olean_module_artifacts(gap, total)
+            .expect_err("a private part without its server part is refused");
+        assert_eq!(
+            refusal,
+            OleanRebuildError::MissingPredecessor {
+                part: OleanModulePart::Private,
+                missing: OleanModulePart::Server,
+            }
+        );
+        assert!(!refusal.is_resource_exhaustion());
+
+        let refusal = rebuild_olean_module_artifacts(chain, total - 1)
+            .expect_err("one byte under the chain's size is refused");
+        assert_eq!(
+            refusal,
+            OleanRebuildError::ArtifactTooLarge {
+                bytes: total,
+                limit: total - 1,
+            }
+        );
+        assert!(refusal.is_resource_exhaustion());
+
+        let mut corrupted = private.clone();
+        corrupted[0] ^= u8::MAX;
+        let refusal = rebuild_olean_module_artifacts(
+            OleanModuleParts {
+                private: Some(&corrupted),
+                ..chain
+            },
+            total,
+        )
+        .expect_err("a corrupted private part is refused");
+        assert_eq!(
+            refusal,
+            OleanRebuildError::PartRegion {
+                part: OleanModulePart::Private,
+                error: OleanRegionError::BadMagic,
+            }
+        );
+        assert!(!refusal.is_resource_exhaustion());
     }
 
     fn nat_type() -> Expr {
