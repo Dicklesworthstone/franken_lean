@@ -21,13 +21,8 @@ pub(super) fn split(
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;
             }
-            TokenKind::Ident(name)
-                if depth == 0
-                    && name == &Name::from_components(["at"])
-                    && &view.normalized().as_str()
-                        [tokens[at].extent.start().0..tokens[at].extent.end().0]
-                        == "at" =>
-            {
+            // `at` is a token at the pin, so an escaped `«at»` is an identifier and never this.
+            TokenKind::Symbol(s) if depth == 0 && s == "at" => {
                 suffix = Some(at);
                 break;
             }
@@ -52,15 +47,49 @@ pub(super) fn split(
         )
     } else {
         let mut names = Vec::new();
-        for index in at + 1..range.end {
+        let mut index = at + 1;
+        while index < range.end {
             let leaf = leaves.leaf(index)?;
             names.push(match &tokens[index].kind {
                 TokenKind::Ident(_) => leaf,
-                TokenKind::Symbol(symbol) if symbol == "⊢" || symbol == "|-" => {
+                TokenKind::Symbol(symbol) if symbol == "⊢" => {
                     Syntax::node(parser_kind(&["Tactic", "locationType"]), vec![leaf])
+                }
+                // The pin's `locationType := patternIgnore(atomic("|" noWs "-") <|> "⊢")`:
+                // `|-` is not a token, it is `|` and `-` with nothing between them. The
+                // goal marker keeps its one-atom shape, spanning both tokens exactly.
+                TokenKind::Symbol(symbol)
+                    if symbol == "|"
+                        && index + 1 < range.end
+                        && matches!(&tokens[index + 1].kind, TokenKind::Symbol(s) if s == "-")
+                        && tokens[index].extent.end() == tokens[index + 1].extent.start() =>
+                {
+                    let (
+                        SourceInfo::Original { leading, pos, .. },
+                        SourceInfo::Original {
+                            trailing, end_pos, ..
+                        },
+                    ) = (leaf.info(), leaves.leaf(index + 1)?.info())
+                    else {
+                        return Err(refusal(view, tokens, index));
+                    };
+                    index += 1;
+                    Syntax::node(
+                        parser_kind(&["Tactic", "locationType"]),
+                        vec![Syntax::atom(
+                            SourceInfo::Original {
+                                leading,
+                                pos,
+                                trailing,
+                                end_pos,
+                            },
+                            "|-",
+                        )],
+                    )
                 }
                 _ => return Err(refusal(view, tokens, index)),
             });
+            index += 1;
         }
         Syntax::node(
             parser_kind(&["Tactic", "locationHyp"]),
@@ -94,8 +123,9 @@ mod tests {
             "theorem t : True := by\r\n  simp only [h] /- goal -/ at «⊢» ⊢ h₂\r\n  assumption",
             "theorem t : True := by rewrite [← h, k] at hx hy",
             "theorem t : True := by simp only [h] at hx",
-            "theorem t : True := by\r\n  simp only [f (at), ← h] /- suffix -/ at «h.x» h₂\r\n  assumption",
-            "theorem t : True := by\r\n  rw [at, f (at)] /- location -/ at «h.x» h₂\r\n  assumption",
+            // `at` is a token at the pin, so a rule naming a local called `at` escapes it.
+            "theorem t : True := by\r\n  simp only [f («at»), ← h] /- suffix -/ at «h.x» h₂\r\n  assumption",
+            "theorem t : True := by\r\n  rw [«at», f («at»)] /- location -/ at «h.x» h₂\r\n  assumption",
         ] {
             let parsed = parse_source_command(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());

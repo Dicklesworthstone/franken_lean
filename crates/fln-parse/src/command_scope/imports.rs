@@ -34,15 +34,17 @@ pub fn parse_source_header(source: &[u8]) -> Result<SourceHeader, DefinitionPars
 fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = table();
+    // The Reference lexes the header before any import exists: builtin tokens plus the
+    // header parser's own (`prelude`, `module`, `all`), never the body's imported notation.
+    let table = crate::reference_tokens::header_table();
     // Import discovery is not whole-file validation. Once the first body token
     // is observed, do not lex its unfinished terms, comments, or later commands.
     // The ordinary body parser/checker still refuses those exact bytes when
     // checking the file; no recovered body is installed or called valid here.
-    let first = next_header_token(&view, &table, BytePos(0))?;
+    let first = next_header_token(&view, table, BytePos(0))?;
     let (prelude, mut next) = match first {
         Some(token) if matches!(&token.kind, TokenKind::Symbol(s) if s == "prelude") => {
-            (true, next_header_token(&view, &table, token.extent.end())?)
+            (true, next_header_token(&view, table, token.extent.end())?)
         }
         token => (false, token),
     };
@@ -55,7 +57,7 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
         if symbol != "import" {
             break;
         }
-        next = next_header_token(&view, &table, extent.end())?;
+        next = next_header_token(&view, table, extent.end())?;
         let begin = imports.len();
         while let Some(LexedToken {
             kind: TokenKind::Ident(name),
@@ -63,7 +65,7 @@ fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
         }) = &next
         {
             imports.push(name.clone());
-            next = next_header_token(&view, &table, extent.end())?;
+            next = next_header_token(&view, table, extent.end())?;
         }
         if imports.len() == begin {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {

@@ -121,7 +121,7 @@ mod tests {
     }
 
     fn tokens(view: &SourceView) -> Vec<LexedToken> {
-        let run = lex_run(view.normalized(), &source_module_token_table());
+        let run = lex_run(view.normalized(), source_module_token_table());
         assert!(run.diagnostics().is_empty());
         run.events
             .into_iter()

@@ -23,31 +23,14 @@ pub enum ScopeCommand {
     Trivia,
 }
 
-fn table() -> TokenTable {
-    let mut table = source_module_token_table();
-    for keyword in [
-        "prelude",
-        "mutual",
-        "namespace",
-        "section",
-        "end",
-        "open",
-        "universe",
-        "scoped",
-        "in",
-        "hiding",
-        "renaming",
-        "attribute",
-        "variable",
-        "include",
-        "omit",
-    ] {
-        table.insert(keyword);
-    }
-    table
+/// The body table: the derived production table. Every scope keyword this layer recognises
+/// (`namespace`, `end`, `open`, `in`, `omit`, …) is a builtin token at the pin, so nothing is
+/// added here; `prelude` is a header-only token and lives in `imports`' header table.
+fn table() -> &'static TokenTable {
+    source_module_token_table()
 }
 fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    let run = lex_run(view.normalized(), &table());
+    let run = lex_run(view.normalized(), table());
     let diagnostics: Vec<_> = run
         .diagnostics()
         .into_iter()

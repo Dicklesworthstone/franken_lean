@@ -79,8 +79,10 @@ enum Task {
     Bind(Binding),
     FinishBinding(Binding),
 }
+/// A tactic word. Some are tokens at the pin (`try`, `repeat`, `have`, `using`,
+/// `generalizing`) and the rest identifiers (`cases`, `exact`), so both forms are accepted.
 fn word(tokens: &[LexedToken], at: usize, text: &str) -> bool {
-    matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components([text]))
+    crate::term_locals::word(tokens, at, text)
 }
 fn symbol(tokens: &[LexedToken], at: usize, text: &str) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text)

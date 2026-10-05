@@ -241,6 +241,14 @@ impl TokenTable {
             .unwrap_or(0)
     }
 
+    /// Every token in the table, in byte order. This is what lets a caller prove a table holds
+    /// exactly the tokens it was derived from and nothing added by hand.
+    pub fn tokens(&self) -> Vec<&str> {
+        TrieNodes::new(&self.root)
+            .filter_map(|node| node.value.as_deref())
+            .collect()
+    }
+
     pub fn contains(&self, token: &str) -> bool {
         let mut node = &self.root;
         for byte in token.as_bytes() {

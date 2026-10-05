@@ -232,6 +232,13 @@ impl Prefix {
         Ok(Self::Assertion(Box::new(assertion)))
     }
 
+    /// See [`term_do::Prefix::jump_keyword`].
+    pub(super) fn jump_keyword(&self) -> Option<usize> {
+        match self {
+            Prefix::Do(prefix) => prefix.jump_keyword(),
+            Prefix::Binders(_) | Prefix::Assertion(_) => None,
+        }
+    }
     pub(super) fn body(&self) -> bool {
         match self {
             Self::Do(_) => false,

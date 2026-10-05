@@ -247,9 +247,10 @@ impl Prefix {
                 position: original_position(view, tokens, at),
             };
         } else if word(tokens, at, "break") || word(tokens, at, "continue") {
-            // Leave the keyword on the ordinary term frame. `item` requires
-            // that frame to contain exactly this original leaf, so a jump
-            // cannot swallow an argument, ascription or trailing expression.
+            // Leave the keyword on the ordinary term frame (the driver pushes its
+            // leaf: see `jump_keyword`). `item` requires that frame to contain
+            // exactly this original leaf, so a jump cannot swallow an argument,
+            // ascription or trailing expression.
             self.statement = Statement::Jump {
                 keyword: at,
                 is_break: word(tokens, at, "break"),
@@ -275,6 +276,15 @@ impl Prefix {
     }
     pub(super) fn done(&self) -> bool {
         self.phase == Phase::Done
+    }
+    /// The token index of the `break`/`continue` this element is, if it is a jump. Both are
+    /// builtin tokens at the pin (`doBreak`, `doContinue`), so the ordinary term frame cannot
+    /// read them as an identifier leaf; the driver hands the keyword to the frame itself.
+    pub(super) fn jump_keyword(&self) -> Option<usize> {
+        match self.statement {
+            Statement::Jump { keyword, .. } => Some(keyword),
+            _ => None,
+        }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self.phase {

@@ -28,6 +28,7 @@ pub mod macro_expand;
 pub mod macro_txn;
 pub mod pratt;
 pub mod recovery;
+pub mod reference_tokens;
 pub mod registry;
 pub mod state;
 
@@ -519,177 +520,13 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
     Syntax::node(state::null_kind(), args)
 }
 
-fn nat_definition_token_table() -> TokenTable {
-    TokenTable::from_tokens([
-        "inductive",
-        "|",
-        "structure",
-        "inductive",
-        "match",
-        "if",
-        "then",
-        "else",
-        "|",
-        "class",
-        "where",
-        "with",
-        "extends",
-        "deriving",
-        "def",
-        "example",
-        "let",
-        "(",
-        ")",
-        ":",
-        ":=",
-        ";",
-        "=",
-        "==",
-        "|||",
-        "^^^",
-        "&&&",
-        "+",
-        "-",
-        "++",
-        "::",
-        "*",
-        "/",
-        "%",
-        "<<<",
-        ">>>",
-        "^",
-        "<=",
-        "<",
-        "Type",
-        "Sort",
-        ".{",
-        "Prop",
-        "_",
-        "?",
-        "@",
-        "@[",
-        "{",
-        ".",
-        "}",
-        "⦃",
-        "⦄",
-        "->",
-        "→",
-        "∧",
-        "/\\",
-        "∨",
-        "\\/",
-        "↔",
-        "<->",
-        "¬",
-        "fun",
-        "λ",
-        "forall",
-        "∀",
-        "=>",
-        "↦",
-        "theorem",
-        "instance",
-        "by",
-        "calc",
-        "[",
-        "]",
-        ",",
-        "←",
-        "·",
-        "<;>",
-        "⊢",
-        "|-",
-        "<-",
-    ])
-}
-
-fn source_module_token_table() -> TokenTable {
-    TokenTable::from_tokens([
-        "inductive",
-        "|",
-        "structure",
-        "inductive",
-        "match",
-        "if",
-        "then",
-        "else",
-        "|",
-        "class",
-        "where",
-        "with",
-        "extends",
-        "deriving",
-        "import",
-        "def",
-        "example",
-        "#eval",
-        "#check",
-        "let",
-        "(",
-        ")",
-        ":",
-        ":=",
-        ";",
-        "=",
-        "==",
-        "|||",
-        "^^^",
-        "&&&",
-        "+",
-        "-",
-        "++",
-        "::",
-        "*",
-        "/",
-        "%",
-        "<<<",
-        ">>>",
-        "^",
-        "<=",
-        "<",
-        "Type",
-        "Sort",
-        ".{",
-        "Prop",
-        "_",
-        "?",
-        "@",
-        "@[",
-        "{",
-        ".",
-        "}",
-        "⦃",
-        "⦄",
-        "->",
-        "→",
-        "∧",
-        "/\\",
-        "∨",
-        "\\/",
-        "↔",
-        "<->",
-        "¬",
-        "fun",
-        "λ",
-        "forall",
-        "∀",
-        "=>",
-        "↦",
-        "theorem",
-        "instance",
-        "by",
-        "calc",
-        "[",
-        "]",
-        ",",
-        "←",
-        "·",
-        "<;>",
-        "⊢",
-        "|-",
-        "<-",
-    ])
+/// The production lexer's table: the pin's table for an ordinary file (implicit `import Init`),
+/// derived from `contracts/REFERENCE_GRAMMAR_CENSUS.txt` by [`reference_tokens`]. It replaced a
+/// hand-written list of about 80 tokens that refused `⟨`, `≤`, `×`, `>` and `$`, carried `|-`,
+/// which is no token at the pin, and let builtin keywords such as `at`, `do` and `from` lex
+/// as identifiers (beads `fln-vokf`, `fln-notation-from-imports-0edr`).
+fn source_module_token_table() -> &'static TokenTable {
+    reference_tokens::implicit_init_table()
 }
 
 fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option<BoundedInfix> {
@@ -1659,6 +1496,24 @@ fn bounded_term_frames(
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
+            // A do element classified as `break`/`continue` (builtin tokens at the pin) puts
+            // its own keyword on its empty frame as the one leaf `item` requires.
+            _ if grammar == DefinitionGrammar::Scalar
+                && frames.last().is_some_and(|frame| {
+                    frame.application.is_empty()
+                        && frame
+                            .prefix
+                            .as_ref()
+                            .and_then(term_locals::Prefix::jump_keyword)
+                            == Some(index)
+                }) =>
+            {
+                frames
+                    .last_mut()
+                    .expect("jump frame")
+                    .application
+                    .push((leaves.leaf(index)?, index));
+            }
             _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
                 let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
                 frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
@@ -2040,7 +1895,7 @@ pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionPar
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), &source_module_token_table());
+    let run = lex_run(view.normalized(), source_module_token_table());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -2294,8 +2149,7 @@ fn parse_definition_with_grammar(
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = nat_definition_token_table();
-    let run = lex_run(view.normalized(), &table);
+    let run = lex_run(view.normalized(), source_module_token_table());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -2620,8 +2474,7 @@ pub fn partition_definition_commands(
 ) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = source_module_token_table();
-    let run = lex_run(view.normalized(), &table);
+    let run = lex_run(view.normalized(), source_module_token_table());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -2687,7 +2540,7 @@ pub fn partition_source_module(
 ) -> Result<PartitionedSourceModule<'_>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), &source_module_token_table());
+    let run = lex_run(view.normalized(), source_module_token_table());
     let diagnostics = run
         .diagnostics()
         .into_iter()

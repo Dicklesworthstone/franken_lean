@@ -512,13 +512,8 @@ fn simpa(
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;
             }
-            TokenKind::Ident(name)
-                if depth == 0
-                    && name == &Name::from_components(["using"])
-                    && &view.normalized().as_str()
-                        [tokens[at].extent.start().0..tokens[at].extent.end().0]
-                        == "using" =>
-            {
+            // `using` is a token at the pin, so an escaped `«using»` is an identifier and never this.
+            TokenKind::Symbol(s) if depth == 0 && s == "using" => {
                 using_at = Some(at);
                 break;
             }
