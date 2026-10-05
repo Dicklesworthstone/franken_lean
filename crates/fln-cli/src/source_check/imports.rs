@@ -569,6 +569,68 @@ pub(super) fn load_build_base(
         .map(|(_, base)| base.map(|base| (base.receipt, base.report)))
 }
 
+/// An editor session's `.olean` import world (bead `fln-uyuz`): the closure as
+/// `check-source` resolves it, read afresh, with an identity over every byte.
+pub(in crate::source_check) struct EditorWorld {
+    /// Process-local: the closure's bytes and roots, under a fixed label in place of
+    /// a checker identity. It decides only whether the session's world is the same
+    /// world; the record store keys and checks admissions separately.
+    pub(in crate::source_check) identity: fln_hash::domain::Digest,
+    loaded: Loaded,
+}
+
+impl EditorWorld {
+    pub(in crate::source_check) fn read(roots: &[Name], root: &Path) -> Result<Self, Failure> {
+        let oleans = load_olean_closure(roots, root)?;
+        let inputs: Vec<fln::OleanModuleInput<'_>> = oleans
+            .iter()
+            .map(|import| {
+                let [exported, server, private] = &import.parts;
+                fln::OleanModuleInput {
+                    name: &import.name,
+                    artifact: exported,
+                    server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                    private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+                }
+            })
+            .collect();
+        let identity = fln::source_check::modules::reuse::ImportClosureKey::compute(
+            &inputs,
+            roots,
+            &fln::KVMap::new(),
+            fln::source_check::modules::reuse::CheckerIdentity::of_executable(
+                b"fln.editor-import-world/1",
+            ),
+        )
+        .digest();
+        drop(inputs);
+        Ok(Self {
+            identity,
+            loaded: Loaded {
+                inputs: Inputs::Files(Vec::new()),
+                total_bytes: 0,
+                oleans,
+                olean_roots: roots.to_vec(),
+            },
+        })
+    }
+
+    /// Admit the world, or re-prove an earlier admission's record, under `posture`.
+    pub(in crate::source_check) fn admit(
+        &self,
+        jobs: std::num::NonZeroUsize,
+        posture: ImportPosture,
+    ) -> Result<(SourceOleanImport, ImportPostureReport), Failure> {
+        let (_, base) = self.loaded.base_engine(
+            || Err(Failure::input("an .olean world has no seed")),
+            jobs,
+            posture,
+        )?;
+        let base = base.ok_or_else(|| Failure::input("an .olean world has no modules"))?;
+        Ok((base.receipt, base.report))
+    }
+}
+
 /// One external `.olean` module as a build input (bead `franken_lean-z8j.1.2`).
 pub(crate) struct ExternalInput {
     pub(crate) name: Name,

@@ -43,18 +43,31 @@ impl Dependencies {
     pub(super) fn no_imports(&mut self, uri: &str) {
         self.remember(uri, BTreeSet::new());
     }
-    pub(super) fn loaded(&mut self, uri: &str, source_uris: &[String]) {
+    /// `absent` are where `.olean` imports' source files would be: a source
+    /// appearing there changes how the importer resolves (bead `fln-uyuz`).
+    pub(super) fn loaded(&mut self, uri: &str, source_uris: &[String], absent: &[PathBuf]) {
         let mut paths = BTreeSet::new();
         let mut bytes = 0usize;
+        let mut observe = |path: PathBuf| {
+            bytes = bytes.saturating_add(path.as_os_str().len());
+            if bytes > self.max_bytes || paths.len() >= self.max_paths {
+                return false;
+            }
+            paths.insert(path);
+            true
+        };
         for imported in source_uris.iter().skip(1) {
             let Ok(path) = editor::document_path(imported) else {
                 return;
             };
-            bytes = bytes.saturating_add(path.as_os_str().len());
-            if bytes > self.max_bytes || paths.len() >= self.max_paths {
+            if !observe(path) {
                 return;
             }
-            paths.insert(path);
+        }
+        for path in absent {
+            if !observe(path.clone()) {
+                return;
+            }
         }
         self.remember(uri, paths);
     }

@@ -1,6 +1,13 @@
 //! Native proof-library diagnostics on a long-lived, stack-calibrated worker.
+//!
+//! A document whose imports include `.olean` modules is checked against that import
+//! world, resolved and obtained exactly as `fln check-source` obtains it, under the
+//! `reuse-verified` posture (bead `fln-uyuz`). The world's bytes are read afresh on
+//! every check; the worker keeps its session only while they are byte-identical.
+use super::imports::EditorWorld;
 use super::imports::editor::{self, Sources};
 use super::*;
+use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
@@ -38,9 +45,12 @@ impl Worker {
         let (responses, output) = sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("fln-lsp-proof-check".to_owned())
-            .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+            // `.olean` worlds are admitted, or their records re-proved, on this thread
+            // under the `.olean` depth budget, as `lake build`'s worker does. Source
+            // checking keeps its own calibrated budget.
+            .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES.max(SOURCE_RUN_KERNEL_STACK_BYTES))
             .spawn(move || {
-                let mut session = None;
+                let mut session = Sessions::default();
                 while let Ok(Some(request)) = requests.recv() {
                     let response = match request {
                         Request::Check(sources) => {
@@ -116,7 +126,8 @@ impl Checker {
                 return project(uri, text, &snapshot);
             }
         };
-        self.dependencies.loaded(uri, &sources.uris);
+        self.dependencies
+            .loaded(uri, &sources.uris, &sources.absent_sources);
         if self.worker.is_none() {
             match Worker::new() {
                 Ok(worker) => self.worker = Some(worker),
@@ -214,24 +225,122 @@ fn failure(
     }
 }
 
-fn check_sources(session: &mut Option<SourceModuleSession>, sources: &Sources) -> Vec<String> {
+/// The worker's sessions: one over the native seed for documents without `.olean`
+/// imports, and at most one over an `.olean` world.
+#[derive(Default)]
+struct Sessions {
+    seed: Option<SourceModuleSession>,
+    world: Option<World>,
+}
+
+/// An `.olean` world's session, kept while the world's bytes are unchanged.
+struct World {
+    identity: fln_hash::domain::Digest,
+    report: ImportPostureReport,
+    session: SourceModuleSession,
+}
+
+/// How a check's `.olean` world was obtained, for `$/frankenLean/sourceCheck`.
+struct WorldUse {
+    /// The posture fields of the admission or reuse that produced the world.
+    imports: String,
+    /// Kept from an earlier check of this server, rather than obtained by this one.
+    retained: bool,
+}
+
+enum Unavailable {
+    Snapshot(Box<ProjectionSnapshot>),
+    Failure(super::imports::Failure),
+}
+
+fn check_limits() -> SourceModuleCheckLimits {
+    let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
+        SOURCE_RUN_KERNEL_STACK_BYTES,
+    ));
+    let mut limits = fln::SourceCheckLimits::new(admission);
+    limits.max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
+    SourceModuleCheckLimits::new(limits)
+}
+
+/// The session a document is checked in. With `.olean` imports, the world is read
+/// afresh and kept only if its bytes are identical; otherwise the old world is
+/// dropped before the new one is admitted, so two are never resident.
+fn select<'a>(
+    sessions: &'a mut Sessions,
+    sources: &Sources,
+) -> Result<(&'a mut SourceModuleSession, Option<WorldUse>), Unavailable> {
+    if sources.olean_roots.is_empty() {
+        ensure_session(&mut sessions.seed).map_err(Unavailable::Snapshot)?;
+        return Ok((
+            sessions.seed.as_mut().expect("initialized seed session"),
+            None,
+        ));
+    }
+    let world =
+        EditorWorld::read(&sources.olean_roots, &sources.root).map_err(Unavailable::Failure)?;
+    let retained = sessions
+        .world
+        .as_ref()
+        .is_some_and(|kept| kept.identity == world.identity);
+    if !retained {
+        sessions.world = None;
+        let jobs = std::thread::available_parallelism()
+            .ok()
+            .and_then(|n| std::num::NonZeroUsize::new(n.get().min(8)))
+            .unwrap_or(std::num::NonZeroUsize::MIN);
+        let (receipt, report) = world
+            .admit(jobs, ImportPosture::ReuseVerified)
+            .map_err(Unavailable::Failure)?;
+        sessions.world = Some(World {
+            identity: world.identity,
+            report,
+            session: SourceModuleSession::from_imports(
+                receipt,
+                fln::KVMap::new(),
+                check_limits(),
+                SourceModuleCacheLimits::default(),
+            ),
+        });
+    }
+    let kept = sessions.world.as_mut().expect("admitted world");
+    let imports = format!("{{{}}}", posture_json(&kept.report));
+    Ok((&mut kept.session, Some(WorldUse { imports, retained })))
+}
+
+fn check_sources(sessions: &mut Sessions, sources: &Sources) -> Vec<String> {
     let uri = &sources.uris[0];
     // Source bytes came from validated UTF-8 editor text or the native lexer.
     let text = std::str::from_utf8(&sources.sources[0]).expect("editor source is UTF-8");
-    if let Err(snapshot) = ensure_session(session) {
-        return project(uri, text, &snapshot);
-    }
+    let (session, world) = match select(sessions, sources) {
+        Ok(selected) => selected,
+        Err(Unavailable::Snapshot(snapshot)) => return project(uri, text, &snapshot),
+        Err(Unavailable::Failure(failure)) => {
+            return project(
+                uri,
+                text,
+                &self::failure(uri, text.as_bytes(), 0, failure.class, &failure.detail),
+            );
+        }
+    };
+    let world = match world {
+        Some(world) => format!(
+            ",\"importWorld\":{},\"imports\":[{}]",
+            json_string(if world.retained {
+                "retained"
+            } else {
+                "obtained"
+            }),
+            world.imports
+        ),
+        None => ",\"imports\":[]".to_owned(),
+    };
     let inputs: Vec<_> = sources
         .names
         .iter()
         .zip(&sources.sources)
         .map(|(name, source)| fln::SourceModuleInput { name, source })
         .collect();
-    match session
-        .as_mut()
-        .expect("initialized checker")
-        .check(&inputs, &sources.names[0])
-    {
+    match session.check(&inputs, &sources.names[0]) {
         Ok(fln::Outcome::Complete(result)) => {
             let mut messages = project(
                 uri,
@@ -241,7 +350,7 @@ fn check_sources(session: &mut Option<SourceModuleSession>, sources: &Sources) -
                 },
             );
             messages.insert(0, format!(
-                "{{\"jsonrpc\":\"2.0\",\"method\":\"$/frankenLean/sourceCheck\",\"params\":{{\"uri\":{},\"files\":{},\"commands\":{},\"theorems\":{},\"reusedModules\":{},\"elaboratedModules\":{},\"replayedDeclarations\":{},\"executed\":false}}}}",
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"$/frankenLean/sourceCheck\",\"params\":{{\"uri\":{},\"files\":{},\"commands\":{},\"theorems\":{},\"reusedModules\":{},\"elaboratedModules\":{},\"replayedDeclarations\":{},\"executed\":false{world}}}}}",
                 json_string(uri), result.checked.checked.files, result.checked.checked.commands,
                 result.checked.checked.theorems, result.reused_modules, result.elaborated_modules,
                 result.checked.replayed_declarations,
@@ -349,12 +458,10 @@ fn ensure_session(
             }
             Err(error) => return Err(Box::new(fault("seed-admission", &error.to_string()))),
         };
-        let mut limits = fln::SourceCheckLimits::new(admission);
-        limits.max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
         *session = Some(SourceModuleSession::new(
             engine,
             fln::KVMap::new(),
-            SourceModuleCheckLimits::new(limits),
+            check_limits(),
             SourceModuleCacheLimits::default(),
         ));
     }
@@ -362,12 +469,18 @@ fn ensure_session(
 }
 
 fn inspect_sources(
-    session: &mut Option<SourceModuleSession>,
+    sessions: &mut Sessions,
     sources: &Sources,
     offset: usize,
     kind: QueryKind,
 ) -> Result<Option<Answer>, String> {
-    ensure_session(session).map_err(|_| "native seed admission did not complete".to_owned())?;
+    let session = match select(sessions, sources) {
+        Ok((session, _)) => session,
+        Err(Unavailable::Snapshot(_)) => {
+            return Err("native seed admission did not complete".to_owned());
+        }
+        Err(Unavailable::Failure(failure)) => return Err(failure.detail),
+    };
     let inputs: Vec<_> = sources
         .names
         .iter()
@@ -378,25 +491,13 @@ fn inspect_sources(
         QueryKind::Goals => ObservationKind::Goals,
         QueryKind::Hover => ObservationKind::Term,
         QueryKind::Definition => {
-            return navigation::definition(
-                session.as_mut().expect("initialized semantic session"),
-                sources,
-                &inputs,
-                offset,
-            );
+            return navigation::definition(session, sources, &inputs, offset);
         }
         QueryKind::Completion => {
-            return completion::complete(
-                session.as_mut().expect("initialized semantic session"),
-                sources,
-                &inputs,
-                offset,
-            );
+            return completion::complete(session, sources, &inputs, offset);
         }
     };
     let result = session
-        .as_mut()
-        .expect("initialized semantic session")
         .inspect(&inputs, &sources.names[0], offset, wanted)
         .map_err(|e| e.to_string())?;
     let inspected = match result {

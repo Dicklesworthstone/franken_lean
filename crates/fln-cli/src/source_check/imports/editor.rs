@@ -6,6 +6,15 @@ pub(in crate::source_check) struct Sources {
     pub(in crate::source_check) names: Vec<Name>,
     pub(in crate::source_check) sources: Vec<Vec<u8>>,
     pub(in crate::source_check) uris: Vec<String>,
+    /// The entry's directory, against which `.olean` imports are resolved.
+    pub(in crate::source_check) root: PathBuf,
+    /// Imports with no open buffer and no source file under the root, in Lean's
+    /// import order: `.olean` modules on the search path, as `check-source` resolves
+    /// them (bead `fln-uyuz`).
+    pub(in crate::source_check) olean_roots: Vec<Name>,
+    /// Where each `.olean` import's source file would be. A file appearing there
+    /// turns the import into a source import, so its importer must be rechecked.
+    pub(in crate::source_check) absent_sources: Vec<PathBuf>,
 }
 
 fn hex(byte: u8) -> Option<u8> {
@@ -124,6 +133,9 @@ pub(in crate::source_check) fn load(
             names: vec![Name::from_components(["__document"])],
             sources: vec![text.as_bytes().to_vec()],
             uris: vec![uri.to_owned()],
+            root: PathBuf::new(),
+            olean_roots: Vec::new(),
+            absent_sources: Vec::new(),
         });
     }
     let entry_path = document_path(uri)?;
@@ -164,7 +176,12 @@ pub(in crate::source_check) fn load(
         names: vec![entry_name.clone()],
         sources: vec![text.as_bytes().to_vec()],
         uris: vec![uri.to_owned()],
+        root: root.to_path_buf(),
+        olean_roots: Vec::new(),
+        absent_sources: Vec::new(),
     };
+    let mut external: Vec<Name> = Vec::new();
+    let mut source_imports = BTreeMap::new();
     let mut by_name = BTreeMap::from([(entry_name.clone(), 0usize)]);
     let mut by_path = BTreeMap::from([(entry_path.clone(), entry_name)]);
     let mut total_bytes = text.len();
@@ -177,8 +194,17 @@ pub(in crate::source_check) fn load(
             .checked_add(header.imports.len())
             .filter(|n| *n <= MAX_IMPORTS)
             .ok_or_else(|| Failure::resource("source import count exceeds 4096"))?;
+        source_imports.insert(result.names[cursor].clone(), header.imports.clone());
         for name in header.imports {
-            if by_name.contains_key(&name) {
+            if by_name.contains_key(&name) || external.contains(&name) {
+                continue;
+            }
+            // No open buffer and no source file: an `.olean` import, decided exactly
+            // as `check-source` decides it. An unsaved buffer still wins.
+            let (candidate, _) = module_file(root, &name, "lean")?;
+            if !overlays.contains_key(&candidate) && !local_source_exists(root, &name)? {
+                external.push(name);
+                result.absent_sources.push(candidate);
                 continue;
             }
             if result.sources.len() >= MAX_MODULES {
@@ -236,5 +262,7 @@ pub(in crate::source_check) fn load(
         }
         cursor += 1;
     }
+    // Lean's import order, walking the source headers left to right.
+    result.olean_roots = super::metadata::ordered_roots(&source_imports, &result.names[..1]);
     Ok(result)
 }

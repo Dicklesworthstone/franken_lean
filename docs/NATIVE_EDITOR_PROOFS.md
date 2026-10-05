@@ -22,7 +22,31 @@ on every check. Quoted structural names, percent-escaped file URIs and Unicode
 source positions retain their identities. Path traversal components, symlinked
 imports and ambiguous open URI aliases are refused. Import-free and untitled
 documents require no filesystem resolution. Resolution is not a race-proof
-filesystem sandbox or a Lake/LEAN_PATH package resolver.
+filesystem sandbox.
+
+An import with no open buffer and no source file beneath the entry's directory
+is an `.olean` import, resolved exactly as `fln check-source` resolves it: on
+`LEAN_PATH`, else the pinned toolchain's `lib/lean` (bead `fln-uyuz`). The world
+is obtained under the `reuse-verified` posture, with no explicit `Init` added,
+as for `check-source`:
+- An earlier admission of the identical bytes by this binary has a record. The
+  record is read back and the closure rebuilt and re-proved by logical root.
+- Otherwise both checkers admit the closure and the admission is recorded.
+
+Every check reads the closure's bytes afresh. The worker keeps the world's
+session only while those bytes are identical, and holds at most one `.olean`
+world at a time, beside the seed session for import-free documents. A rebuilt
+or replaced `.olean` is obtained again on the next check; a damaged one is
+refused, never answered from the previous world. `.olean` files are not
+watched, so the change takes effect at the importer's next check.
+
+Where an `.olean` import's source file would live is part of the importer's
+dependency set. Creating or opening that file turns the import into a source
+import and rechecks the importer. `$/frankenLean/sourceCheck` reports:
+- `importWorld`: `obtained` by this check, or `retained` from an earlier one;
+- `imports[]`: the posture fields of the admission that produced the world
+  (`trust`, `admission`, `closureKey`, `record`, `recordWrite`). `imports` is
+  empty when the document has no `.olean` import.
 
 Accepted dependency opens, changes and saves, rejected edits that invalidate
 source, and closes now automatically recheck affected open importers before

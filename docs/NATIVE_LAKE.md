@@ -56,7 +56,9 @@ reaches the environment is the import posture (bead `fln-uyuz`), and every
 report names it per closure (`import_posture`, and `imports[]` with `trust`,
 `admission`, `closureKey`, `record`, `recordWrite`):
 
-- `--import-posture reuse-verified`, the default here and for `fln check-source`.
+- `--import-posture reuse-verified`, the default here, for `fln check-source`, and
+  for editor sessions (`fln serve-lsp`, `lean --server`; see
+  NATIVE_EDITOR_PROOFS.md).
   The closure is keyed by one digest over every byte of every imported part, the
   import roots, the options and the running binary's own bytes. If this binary
   admitted those exact bytes before, its record is read back, the closure is
