@@ -1286,15 +1286,21 @@ pub enum OleanFrontierEvent<'a> {
 }
 
 /// Per-module result of checking a closed `.olean` set without stopping at the first
-/// failure. `engine` holds exactly the accepted modules.
+/// failure.
 #[derive(Debug)]
 pub struct OleanFrontier {
-    pub engine: Engine,
+    /// One engine holding exactly the accepted modules, if one can exist. Two
+    /// accepted modules that never import each other may declare different
+    /// constants under one name: Lean permits it (each of two executables has its
+    /// own `main`), and no single environment holds both. Then this is the
+    /// `DuplicateDeclaration` that stops the merge, and every row still stands.
+    pub engine: Result<Engine, OleanCheckError>,
     pub rows: Vec<OleanFrontierRow>,
 }
 
 /// How a frontier run spreads its modules over threads. Neither field changes a
-/// row or the returned engine; see [`Engine::check_olean_frontier_scheduled`].
+/// row or the returned engine (or its absence); see
+/// [`Engine::check_olean_frontier_scheduled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleanFrontierJobs {
     /// Modules checked at once. One checks every module on the calling thread.
@@ -3999,23 +4005,33 @@ impl Engine {
             Ok(())
         })?;
 
-        // The returned engine holds exactly the accepted modules, merged by the
-        // same rule as every closure.
+        // A merge conflict between modules that never meet is not an error of the
+        // run: every row above is already decided (fln-elp6's stdlib run lost its
+        // whole --json to two executables' `main`).
+        let engine = self
+            .frontier_union_engine(order.iter().filter_map(|index| accepted[*index].as_deref()));
+        Ok(OleanFrontier { engine, rows })
+    }
+
+    /// One engine holding exactly these accepted modules, merged in this order by
+    /// the same rule as every closure, or the duplicate that rules it out.
+    fn frontier_union_engine<'a>(
+        &self,
+        accepted: impl IntoIterator<Item = &'a FrontierAccepted>,
+    ) -> Result<Engine, OleanCheckError> {
         let mut engine = self.clone();
         let mut environment = self.environment.clone();
         let mut imported = (*self.imported_modules).clone();
-        for index in &order {
-            if let Some(module) = &accepted[*index] {
-                for entry in &module.admitted {
-                    environment = merge_frontier_entry(environment, entry)?;
-                }
-                imported.insert(module.name.clone());
+        for module in accepted {
+            for entry in &module.admitted {
+                environment = merge_frontier_entry(environment, entry)?;
             }
+            imported.insert(module.name.clone());
         }
         engine.environment = environment;
         engine.checker_environment = None;
         engine.imported_modules = std::sync::Arc::new(imported);
-        Ok(OleanFrontier { engine, rows })
+        Ok(engine)
     }
 
     /// [`Engine::check_olean_modules`] over `jobs.threads` modules at once, returning
@@ -13131,6 +13147,53 @@ mod tests {
         ));
     }
 
+    /// The frontier's union engine exists only when the accepted modules merge:
+    /// two modules that never import each other may each declare a different
+    /// `main`, and then the union is that duplicate, never a lost run.
+    #[test]
+    fn the_union_of_accepted_modules_is_refused_only_for_a_real_duplicate() {
+        use super::{ConstantInfo, FrontierAccepted};
+        let main = || Name::from_components(["main"]);
+        let axiom = |name: Name, type_: Expr| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name,
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            })
+        };
+        let module = |index: usize, label: &str, type_: Expr| FrontierAccepted {
+            index,
+            position: index,
+            name: Name::from_components([label]),
+            admitted: vec![
+                Environment::new()
+                    .add_decl(axiom(main(), type_))
+                    .expect("unique")
+                    .entry(&main())
+                    .expect("present"),
+            ],
+        };
+        let engine = Engine::from_environment(Environment::new());
+        let prop = Expr::sort(Level::zero());
+        let ty = Expr::sort(Level::one());
+
+        let same = engine
+            .frontier_union_engine([&module(0, "A", prop.clone()), &module(1, "B", prop.clone())])
+            .expect("an identical declaration merges");
+        assert!(same.environment.entry(&main()).is_some());
+        assert_eq!(
+            same.imported_modules().iter().cloned().collect::<Vec<_>>(),
+            [Name::from_components(["A"]), Name::from_components(["B"])]
+        );
+        assert!(matches!(
+            engine.frontier_union_engine([&module(0, "A", prop), &module(1, "B", ty)]),
+            Err(OleanCheckError::DuplicateDeclaration { name }) if name == main()
+        ));
+    }
+
     #[test]
     fn terms_cross_to_the_checker_as_their_dag() {
         use fln_hash::canon::Canonical;
@@ -17113,7 +17176,18 @@ mod tests {
             super::install_host_allocation_failure_hook();
             let done = super::frontier_guarded(7, true, std::time::Instant::now(), || {
                 let block = std::hint::black_box(vec![0_u8; std::hint::black_box(REQUESTED)]);
-                panic!("{} bytes were allocated under a 4 GiB limit", block.len());
+                // Reached only if the limit did not hold: an accepted row fails the
+                // assertions below.
+                super::FrontierDone {
+                    index: 7,
+                    verdict: super::OleanModuleVerdict::Accepted {
+                        declarations: block.len(),
+                    },
+                    accepted: None,
+                    engine: None,
+                    elapsed: std::time::Duration::ZERO,
+                    retained: None,
+                }
             });
             assert_eq!(done.index, 7);
             assert!(done.accepted.is_none() && done.engine.is_none());
