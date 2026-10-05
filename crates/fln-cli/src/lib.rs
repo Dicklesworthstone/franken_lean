@@ -15512,7 +15512,10 @@ mod tests {
 
     #[test]
     fn lean_personality_preserves_typed_source_failures_without_fln_framing() {
-        let source = repository_path("crates/fln-conformance/fixtures/g04_reference_fixture.lean");
+        // A source the pin itself refuses at its lexer. (This used g04_reference_fixture.lean,
+        // which the hand-written token table refused; with the derived table every byte of it
+        // lexes, and it is refused at `import Lean` as a module-graph input instead.)
+        let source = repository_path("crates/fln-cli/tests/fixtures/lexical_refusal.lean");
         let refused = run_lean([source.into_os_string()]);
         assert_eq!(refused.exit_code, 1);
         assert!(refused.stdout.is_empty());
@@ -16381,7 +16384,9 @@ mod tests {
 
     #[test]
     fn source_run_preserves_frontend_refusal_as_an_authoritative_error() {
-        let source = repository_path("crates/fln-conformance/fixtures/g04_reference_fixture.lean");
+        // See lean_personality_preserves_typed_source_failures_without_fln_framing for why
+        // this is not g04_reference_fixture.lean any more.
+        let source = repository_path("crates/fln-cli/tests/fixtures/lexical_refusal.lean");
         let output = run([
             OsString::from("run"),
             OsString::from("--json"),

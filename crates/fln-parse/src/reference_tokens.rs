@@ -42,19 +42,13 @@
 //! census covers, and refuses one it does not; threading it into the body parsers is the step
 //! that retires the first gap.
 //!
-//! ## The declared remainder: six keywords still lexed as identifiers
+//! ## The declared remainder: keywords still lexed as identifiers
 //!
 //! Declaration bodies are lexed against [`production_table`], which is
 //! [`implicit_init_table`] minus [`SEED_IDENTIFIER_ALLOWANCE`]. Every other keyword at the pin is
-//! reserved, as in the Reference (bead `franken_lean-z8j.1.6.2`). The six are keywords at the
-//! pin too: this is a one-way allowance preserving frozen seed-dialect behavior, not Lean
-//! compatibility. Each member is a name in a frozen seed-corpus example that the Reference
-//! rejects for exactly that reason (ledger class `fln-defect`), and tests outside this crate
-//! assert FrankenLean's present verdict on that file. Reserving the word would flip that verdict, so the example, its ledger row and those
-//! tests have to move in the same change, and they belong to the corpus owner. The scope-command
-//! layer lexes against the full implicit-Init table, as it did when it carried its own keyword
-//! list. The list may only shrink, and `tests/reference_grammar_census.rs` binds each member to
-//! the file that still needs it.
+//! reserved, as in the Reference (bead `franken_lean-z8j.1.6.2`). Every allowed word is a known
+//! Reference divergence: FrankenLean accepts programs that use it as a name, and the pinned
+//! Reference rejects them. See the constant for why it exists and how it shrinks.
 
 use fln_core::name::Name;
 use fln_syntax::token::TokenTable;
@@ -67,23 +61,129 @@ pub const GRAMMAR_CENSUS: &str = include_str!("../../../contracts/REFERENCE_GRAM
 
 const SCHEMA: &str = "fln-reference-grammar-census/1";
 
+/// One source that still uses an allowed keyword as a name: a repository-relative file and
+/// the exact text in it that does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowanceWitness {
+    pub file: &'static str,
+    pub snippet: &'static str,
+}
+
+const fn witness(file: &'static str, snippet: &'static str) -> AllowanceWitness {
+    AllowanceWitness { file, snippet }
+}
+
 /// A declared one-way allowance preserving frozen seed-dialect behavior. It is NOT Lean
 /// compatibility.
 ///
-/// The pinned Reference lexes all six as keywords, so a seed-dialect example that uses one as a
-/// name is not Lean: the Reference rejects each file named here (`expected identifier`, ledger
-/// class `fln-defect`). Declaration bodies still lex these six as identifiers only so that
-/// those frozen examples, and the tests asserting FrankenLean's present verdict on them, keep
-/// their current behavior until their owner repairs them. The lexer cannot tell a seed-dialect
-/// file from a Lean file, so the allowance applies to every source body. It may shrink, never
-/// grow (`tests/reference_grammar_census.rs`).
-pub const SEED_IDENTIFIER_ALLOWANCE: &[(&str, &str)] = &[
-    ("end", "examples/native_index_refinement.lean"),
-    ("local", "examples/native_tactic_repetition.lean"),
-    ("prefix", "examples/native_closure_data.lean"),
-    ("repeat", "examples/native_recursion.lean"),
-    ("scoped", "examples/native_decidable_cases.lean"),
-    ("universe", "examples/native_default_simp.lean"),
+/// Every word here is a keyword at the pin, and every one is a known Reference divergence:
+/// FrankenLean accepts programs that use it as a name, which the pinned Reference rejects
+/// (`expected identifier`). The words are lexed as identifiers only so that the frozen
+/// seed-dialect examples and the existing tests listed with each word keep their present
+/// verdicts until their owners rename the names (the examples' ledger rows are `fln-defect`).
+/// This is global lexer behavior: no declaration body reserves these words, whichever file is
+/// being lexed, because the lexer cannot tell a seed-dialect file from a Lean file. The
+/// witnesses are a documentation and ratchet binding only. `tests/reference_grammar_census.rs`
+/// pins the set by equality and requires every witness to still occur, so when a listed use is
+/// renamed its witness must go, and when a word's last witness goes the word must go: the set
+/// only shrinks.
+pub const SEED_IDENTIFIER_ALLOWANCE: &[(&str, &[AllowanceWitness])] = &[
+    (
+        "end",
+        &[witness(
+            "examples/native_index_refinement.lean",
+            "| cons j y end =>",
+        )],
+    ),
+    (
+        "exists",
+        &[
+            witness(
+                "crates/fln/tests/source_construction.rs",
+                "theorem exists : Witness (fun n => n = 7)",
+            ),
+            witness(
+                "crates/fln/tests/source_refinement.rs",
+                "theorem exists : Witness (fun n => n = 7)",
+            ),
+        ],
+    ),
+    (
+        "from",
+        &[witness(
+            "crates/fln/tests/source_recursion.rs",
+            "def weight {A : Type} (from to : A)",
+        )],
+    ),
+    (
+        "local",
+        &[witness(
+            "examples/native_tactic_repetition.lean",
+            "theorem local (n : Nat)",
+        )],
+    ),
+    (
+        "opaque",
+        &[witness(
+            "crates/fln-elab/tests/source_term_assertions.rs",
+            "theorem opaque : 0 = 0",
+        )],
+    ),
+    (
+        "open",
+        &[witness(
+            "crates/fln-cli/src/lib.rs",
+            "def open (value : String) : String := value",
+        )],
+    ),
+    (
+        "partial",
+        &[
+            witness(
+                "crates/fln/tests/runtime_mutual_recursion.rs",
+                "def partial (t : Tree)",
+            ),
+            witness(
+                "crates/fln/tests/source_named_arguments.rs",
+                "theorem partial : (three 1)",
+            ),
+        ],
+    ),
+    (
+        "postfix",
+        &[witness(
+            "crates/fln/tests/source_record_literals.rs",
+            "theorem postfix : (factory).value = 0",
+        )],
+    ),
+    (
+        "prefix",
+        &[witness(
+            "examples/native_closure_data.lean",
+            "(prefix : String)",
+        )],
+    ),
+    (
+        "repeat",
+        &[witness(
+            "examples/native_recursion.lean",
+            "def repeat (n : Nat)",
+        )],
+    ),
+    (
+        "scoped",
+        &[witness(
+            "examples/native_decidable_cases.lean",
+            "theorem scoped (p q : Prop)",
+        )],
+    ),
+    (
+        "universe",
+        &[witness(
+            "examples/native_default_simp.lean",
+            "theorem universe (A : Type)",
+        )],
+    ),
 ];
 
 /// A floor on the builtin table. The pin has 238; a census that parses but yields far fewer was

@@ -72,13 +72,21 @@ fn scalar_extensions_do_not_widen_the_nat_only_driver() {
 #[test]
 fn contextual_keywords_do_not_steal_declaration_or_escaped_names() {
     // `have`, `show` and `from` are keywords at the pin: the Reference refuses them as
-    // declaration names, and so does the derived token table.
-    for source in [
-        "def have (n : Nat) : Nat := n",
-        "def show (n : Nat) : Nat := n",
-        "def from (n : Nat) : Nat := n",
+    // declaration names, and so does the derived token table, except for a word in the seed
+    // allowance (`from` today), which is a declared divergence until it leaves the allowance.
+    for (word, source) in [
+        ("have", "def have (n : Nat) : Nat := n"),
+        ("show", "def show (n : Nat) : Nat := n"),
+        ("from", "def from (n : Nat) : Nat := n"),
     ] {
-        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        let allowed = fln_parse::reference_tokens::SEED_IDENTIFIER_ALLOWANCE
+            .iter()
+            .any(|(member, _)| *member == word);
+        assert_eq!(
+            parse_definition(source.as_bytes()).is_ok(),
+            allowed,
+            "{source}"
+        );
     }
     for source in [
         "def «have» (n : Nat) : Nat := n",

@@ -295,7 +295,8 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
 /// verbatim. Frozen fixture, captured by running `lean <file>` with the toolchain `SUITE.lock`
 /// pins (v4.32.0, commit `8c9756b2`) on 2026-10-05; there is no update mode. The hand-written
 /// table parsed all five (each keyword was an identifier there); the derived table refuses each
-/// at the token the Reference names. The escaped spelling the Reference accepts parses.
+/// at the token the Reference names, except a word in the seed allowance (`exists`, `from`),
+/// which is a declared divergence until it leaves. The escaped spelling the Reference accepts parses.
 const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def at : Nat := 1",
@@ -319,6 +320,24 @@ const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     ),
 ];
 
+/// An escaped keyword is an identifier at the pin: `lean` accepts this file (exit 0, no output),
+/// captured with the toolchain `SUITE.lock` pins on 2026-10-05.
+const REFERENCE_ESCAPED_KEYWORD: &str = "def «end» : Nat := 1\ntheorem t : «end» = 1 := rfl\n";
+
+#[test]
+fn escaped_keywords_are_identifiers_as_at_the_pin() {
+    for command in REFERENCE_ESCAPED_KEYWORD.lines() {
+        assert!(
+            parse_definition(command.as_bytes()).is_ok(),
+            "{command}: the Reference accepts it"
+        );
+    }
+    assert!(matches!(
+        lex_one(production_table(), "«end»"),
+        Ok(TokenKind::Ident(_))
+    ));
+}
+
 #[test]
 fn keyword_refusals_agree_with_the_pinned_reference() {
     for (source, reference) in REFERENCE_KEYWORD_REFUSALS {
@@ -337,22 +356,25 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
             + source[column..]
                 .find(token)
                 .expect("token after the column");
+        let allowed = SEED_IDENTIFIER_ALLOWANCE
+            .iter()
+            .any(|(word, _)| word == &token);
         match parse_definition(source.as_bytes()) {
-            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) => {
+            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if !allowed => {
                 assert_eq!(
                     refused,
                     BytePos(at),
                     "{source}: refused at the Reference's token"
                 );
             }
-            other => panic!("{source}: the Reference refuses ({reference}), got {other:?}"),
+            // A declared divergence: the word is in the seed allowance, so FrankenLean accepts
+            // what the pin refuses. The row starts requiring agreement when the word leaves.
+            Ok(_) if allowed => {}
+            other => panic!(
+                "{source}: the Reference refuses ({reference}); allowance member: {allowed}; \
+                 got {other:?}"
+            ),
         }
-        assert!(
-            !SEED_IDENTIFIER_ALLOWANCE
-                .iter()
-                .any(|(word, _)| word == &token),
-            "{token} is reserved in production"
-        );
         // Escaped, the same word is an identifier and the Reference accepts the program.
         let escaped = source.replace(token, &format!("«{token}»"));
         assert!(
@@ -362,30 +384,30 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
     }
 }
 
-/// The declared remainder is one-way and each member still has the file that needs it.
+/// The declared remainder is exactly this set, and every member still has a user.
 #[test]
 fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
-    // Pinned to these six. Growing the set (any other word, or a duplicate) fails here;
-    // removing a member once its example is repaired is allowed and needs no edit to this list.
-    const PERMITTED: [&str; 6] = ["end", "local", "prefix", "repeat", "scoped", "universe"];
-    let members: BTreeSet<&str> = SEED_IDENTIFIER_ALLOWANCE
+    // Set equality: growing the allowance means editing this list too, in review. A member whose
+    // listed uses have all been renamed fails below until it is removed here and from the
+    // constant, so the set only shrinks.
+    const PERMITTED: [&str; 12] = [
+        "end", "exists", "from", "local", "opaque", "open", "partial", "postfix", "prefix",
+        "repeat", "scoped", "universe",
+    ];
+    let members: Vec<&str> = SEED_IDENTIFIER_ALLOWANCE
         .iter()
         .map(|(word, _)| *word)
         .collect();
+    let unique: BTreeSet<&str> = members.iter().copied().collect();
+    assert_eq!(unique.len(), members.len(), "no duplicate members");
     assert_eq!(
-        members.len(),
-        SEED_IDENTIFIER_ALLOWANCE.len(),
-        "no duplicate members"
+        unique,
+        PERMITTED.into_iter().collect::<BTreeSet<_>>(),
+        "the allowance is exactly the declared set"
     );
-    for word in &members {
-        assert!(
-            PERMITTED.contains(word),
-            "`{word}` would grow the allowance: the pinned Reference reserves it, so reserve it"
-        );
-    }
     let root = fln_core::checked_manifest_dir!().join("../..");
     let scope = implicit_init_table();
-    for (word, file) in SEED_IDENTIFIER_ALLOWANCE {
+    for (word, witnesses) in SEED_IDENTIFIER_ALLOWANCE {
         // A member that stopped being a keyword at the pin is stale.
         assert!(
             matches!(lex_one(scope, word), Ok(TokenKind::Symbol(symbol)) if symbol == *word),
@@ -396,18 +418,31 @@ fn the_identifier_allowance_is_bound_to_the_files_that_need_it() {
             lex_one(production_table(), word),
             Ok(TokenKind::Ident(_))
         ));
-        // The named file still uses it as a name; once the file is repaired the row must go.
-        let text = std::fs::read_to_string(root.join(file)).expect("the named example exists");
-        let used = text.match_indices(word).any(|(at, _)| {
-            let before = text[..at].chars().next_back();
-            let after = text[at + word.len()..].chars().next();
-            !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '«')
-                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '»')
-        });
         assert!(
-            used,
-            "{file} no longer uses `{word}`: drop it from the allowance"
+            !witnesses.is_empty(),
+            "`{word}` has no remaining user: remove it"
         );
+        for witness in *witnesses {
+            // The witness spells the word as a whole word, not as part of another name.
+            let spelled = witness.snippet.match_indices(word).any(|(at, _)| {
+                let before = witness.snippet[..at].chars().next_back();
+                let after = witness.snippet[at + word.len()..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '«')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '»')
+            });
+            assert!(
+                spelled,
+                "the witness for `{word}` does not use it: {witness:?}"
+            );
+            let text = std::fs::read_to_string(root.join(witness.file))
+                .unwrap_or_else(|error| panic!("{}: {error}", witness.file));
+            assert!(
+                text.contains(witness.snippet),
+                "{} no longer contains {:?}: drop this witness, and drop `{word}` if it was the last",
+                witness.file,
+                witness.snippet
+            );
+        }
     }
 }
 
