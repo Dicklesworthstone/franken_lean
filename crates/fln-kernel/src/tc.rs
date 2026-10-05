@@ -25,6 +25,7 @@
 //! linear in the touched region only.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fln_bignum::interop::{bignat_from_literal, literal_from_bignat};
 use fln_bignum::nat::BigNat;
@@ -130,6 +131,8 @@ const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY: usize = 256;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES: usize = 33_554_432;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY: usize = 65_536;
+/// Rows a `FreeVars` memo holds before the next scan starts it over.
+const FREE_VARS_MAX_ROWS: usize = 262_144;
 /// Bounded outcome memo for the lazy-delta loop (bead `fln-4hol` item 2):
 /// verbatim pair re-entry inside one checker — measured at 26,583 revisits
 /// of six pairs in a single invocation on Vector.swap_swap while the pin
@@ -211,27 +214,26 @@ impl DependencyScanSeen {
         }
     }
 
-    /// `true` when an identical subterm was already recorded; `false` when the
-    /// subterm is new and the caller must charge one visit. The walk refuses —
-    /// `None` — only when a genuinely unbounded scan exhausts its allowance,
-    /// never because one hash bucket ran out of slots.
-    fn admit(&mut self, current: &Expr) -> Option<bool> {
+    /// The identical subterm already recorded, if any: `None` when the subterm
+    /// is new and the caller must charge one visit. Never refuses because one
+    /// hash bucket ran out of slots.
+    fn admit(&mut self, current: &Expr) -> Option<Expr> {
         if !self.degraded {
             let bucket = self
                 .structural
                 .entry(current.data().0)
                 .or_insert_with(|| std::array::from_fn(|_| None));
-            if bucket
+            if let Some(earlier) = bucket
                 .iter()
                 .flatten()
-                .any(|candidate| candidate == current)
+                .find(|candidate| *candidate == current)
             {
-                return Some(true);
+                return Some(earlier.clone());
             }
             match bucket.iter_mut().find(|candidate| candidate.is_none()) {
                 Some(vacant) => {
                     *vacant = Some(current.clone());
-                    return Some(false);
+                    return None;
                 }
                 None => self.degraded = true,
             }
@@ -240,7 +242,152 @@ impl DependencyScanSeen {
             .allocations
             .insert(current.allocation_identity(), ())
             .is_some();
-        Some(was_present)
+        was_present.then(|| current.clone())
+    }
+}
+
+/// The free variables of the terms dependency scans have walked, kept for the
+/// life of their owner (bead `fln-checker-associator-time-y8wc`).
+///
+/// A term's free variables are a property of the term alone, so a subterm met
+/// again in a later scan contributes its recorded set instead of being walked
+/// again. On `LinearMap.lTensor_tensor` 97% of the subterms the scans walked
+/// had been walked before, and the repeats used up the scans' lifetime
+/// allowance, after which no result with a free variable was cached.
+///
+/// Rows are keyed by allocation identity, the repeat that occurs and a cheap
+/// lookup; each holds its term, so an identity is never reused while it is a
+/// key, and no two terms can share a row. A separately built equal term met in
+/// the same scan is matched by `DependencyScanSeen` and answered from the row
+/// of the term it equals. A set names its variables by their index in `ids`,
+/// in the order the memo first met them, so unions compare integers, not names.
+///
+/// A scan's walks read the sets of the subterms they recorded earlier in it,
+/// so the memo is never cleared during a scan. Once it holds
+/// `FREE_VARS_MAX_ROWS` rows, the next scan starts it over (`start_scan`). A
+/// scan records at most four rows per subterm its allowance pays for, so the
+/// memo stays bounded.
+#[derive(Default)]
+struct FreeVars {
+    rows: HashMap<usize, (Expr, Rc<[u32]>)>,
+    index: HashMap<FVarId, u32>,
+    ids: Vec<FVarId>,
+}
+
+impl FreeVars {
+    /// Called once as every scan begins.
+    fn start_scan(&mut self) {
+        if self.rows.len() >= FREE_VARS_MAX_ROWS {
+            *self = FreeVars::default();
+        }
+    }
+
+    fn get(&self, expr: &Expr) -> Option<Rc<[u32]>> {
+        let (_, set) = self.rows.get(&expr.allocation_identity())?;
+        Some(Rc::clone(set))
+    }
+
+    fn record(&mut self, expr: &Expr, set: &Rc<[u32]>) {
+        let row = (expr.clone(), Rc::clone(set));
+        self.rows.insert(expr.allocation_identity(), row);
+    }
+
+    /// The index standing for `id`, assigned when the memo first meets it.
+    fn intern(&mut self, id: &FVarId) -> Option<u32> {
+        if let Some(&index) = self.index.get(id) {
+            return Some(index);
+        }
+        let index = u32::try_from(self.ids.len()).ok()?;
+        self.ids.push(id.clone());
+        self.index.insert(id.clone(), index);
+        Some(index)
+    }
+
+    /// The free variables of `root`, which has some.
+    ///
+    /// Every subterm the scan examines costs one unit of `nodes_left` unless
+    /// `seen` has met it in this scan, exactly as the walk before this memo
+    /// charged. The memo only prunes: a subterm it holds is examined and not
+    /// descended into. Subterms it lacks are walked children first and recorded.
+    /// `None` when the allowance runs out or a set holds more than the per-entry
+    /// number of dependencies.
+    fn of(
+        &mut self,
+        root: &Expr,
+        seen: &mut DependencyScanSeen,
+        nodes_left: &mut usize,
+    ) -> Option<Rc<[u32]>> {
+        let mut pending = vec![(root.clone(), false)];
+        while let Some((current, built)) = pending.pop() {
+            // In the order the walk before this memo met them.
+            let children: [Option<&Expr>; 3] = match current.node() {
+                ExprNode::App { f, a } => [Some(a), Some(f), None],
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => [Some(body), Some(binder_type), None],
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => [Some(body), Some(value), Some(type_)],
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    [Some(expr), None, None]
+                }
+                _ => [None, None, None],
+            };
+            let children = children.into_iter().flatten();
+            if !built {
+                let earlier = seen.admit(&current);
+                if earlier.is_none() {
+                    *nodes_left = nodes_left.checked_sub(1)?;
+                }
+                if self.get(&current).is_some() {
+                    continue;
+                }
+                // An equal term met earlier in this scan has the same free
+                // variables; keep them for this allocation too.
+                if let Some(set) = earlier.as_ref().and_then(|earlier| self.get(earlier)) {
+                    self.record(&current, &set);
+                    continue;
+                }
+                pending.push((current.clone(), true));
+                for child in children.rev() {
+                    if child.has_fvar() {
+                        pending.push((child.clone(), false));
+                    } else if seen.admit(child).is_none() {
+                        *nodes_left = nodes_left.checked_sub(1)?;
+                    }
+                }
+                continue;
+            }
+            let set: Rc<[u32]> = match current.node() {
+                ExprNode::FVar { id } => Rc::from([self.intern(id)?]),
+                _ => {
+                    let mut parts = Vec::new();
+                    for child in children.filter(|child| child.has_fvar()) {
+                        parts.push(self.get(child)?);
+                    }
+                    let (first, rest) = parts.split_first()?;
+                    let mut merged = first.to_vec();
+                    for &index in rest.iter().flat_map(|part| part.iter()) {
+                        if !merged.contains(&index) {
+                            merged.push(index);
+                            if merged.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                                return None;
+                            }
+                        }
+                    }
+                    if merged.len() == first.len() {
+                        Rc::clone(first)
+                    } else {
+                        Rc::from(merged)
+                    }
+                }
+            };
+            self.record(&current, &set);
+        }
+        self.get(root)
     }
 }
 
@@ -277,68 +424,31 @@ impl DependencyScanRefusal {
     }
 }
 
+/// Add the free variables of `expr` to `ids`, each once. `false` when the
+/// allowance runs out or there are more than the per-entry number of them.
 fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
-    seen_ids: &mut HashMap<FVarId, ()>,
-    seen_nodes: &mut DependencyScanSeen,
+    seen_ids: &mut HashMap<u32, ()>,
+    scan: (&mut FreeVars, &mut DependencyScanSeen),
     nodes_left: &mut usize,
 ) -> bool {
     if !expr.has_fvar() {
         return true;
     }
-    let mut pending = vec![expr.clone()];
-    while let Some(current) = pending.pop() {
-        let Some(is_known) = seen_nodes.admit(&current) else {
-            return false;
-        };
-        if is_known {
-            continue;
-        }
-        let Some(remaining) = nodes_left.checked_sub(1) else {
-            return false;
-        };
-        *nodes_left = remaining;
-        if !current.has_fvar() {
-            continue;
-        }
-        match current.node() {
-            ExprNode::FVar { id } => {
-                if seen_ids.insert(id.clone(), ()).is_none() {
-                    ids.push(id.clone());
-                    if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
-                        return false;
-                    }
-                }
+    let (free_vars, seen_nodes) = scan;
+    let Some(set) = free_vars.of(expr, seen_nodes, nodes_left) else {
+        return false;
+    };
+    for &index in set.iter() {
+        if seen_ids.insert(index, ()).is_none() {
+            let Some(id) = free_vars.ids.get(index as usize) else {
+                return false;
+            };
+            ids.push(id.clone());
+            if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                return false;
             }
-            ExprNode::App { f, a } => {
-                pending.push(f.clone());
-                pending.push(a.clone());
-            }
-            ExprNode::Lam {
-                binder_type, body, ..
-            }
-            | ExprNode::ForallE {
-                binder_type, body, ..
-            } => {
-                pending.push(binder_type.clone());
-                pending.push(body.clone());
-            }
-            ExprNode::LetE {
-                type_, value, body, ..
-            } => {
-                pending.push(type_.clone());
-                pending.push(value.clone());
-                pending.push(body.clone());
-            }
-            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
-                pending.push(expr.clone());
-            }
-            ExprNode::BVar { .. }
-            | ExprNode::MVar { .. }
-            | ExprNode::Sort { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::Lit { .. } => {}
         }
     }
     true
@@ -348,19 +458,16 @@ fn local_dependencies(
     expressions: &[&Expr],
     locals: &[LocalDecl],
     local_positions: &HashMap<FVarId, usize>,
+    free_vars: &mut FreeVars,
     nodes_left: &mut usize,
 ) -> Result<Vec<LocalDependency>, DependencyScanRefusal> {
+    free_vars.start_scan();
     let mut ids = Vec::new();
     let mut seen_ids = HashMap::new();
     let mut seen_nodes = DependencyScanSeen::new();
     for expression in expressions {
-        if !collect_fvar_ids(
-            expression,
-            &mut ids,
-            &mut seen_ids,
-            &mut seen_nodes,
-            nodes_left,
-        ) {
+        let scan = (&mut *free_vars, &mut seen_nodes);
+        if !collect_fvar_ids(expression, &mut ids, &mut seen_ids, scan, nodes_left) {
             return Err(DependencyScanRefusal::Permanent);
         }
     }
@@ -381,17 +488,18 @@ fn local_dependencies(
         let local = locals
             .get(position)
             .ok_or(DependencyScanRefusal::Permanent)?;
-        if !collect_fvar_ids(
-            &local.type_,
-            &mut ids,
-            &mut seen_ids,
-            &mut seen_nodes,
-            nodes_left,
-        ) {
+        let scan = (&mut *free_vars, &mut seen_nodes);
+        if !collect_fvar_ids(&local.type_, &mut ids, &mut seen_ids, scan, nodes_left) {
             return Err(DependencyScanRefusal::Permanent);
         }
         if let Some(value) = &local.value
-            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, &mut seen_nodes, nodes_left)
+            && !collect_fvar_ids(
+                value,
+                &mut ids,
+                &mut seen_ids,
+                (&mut *free_vars, &mut seen_nodes),
+                nodes_left,
+            )
         {
             return Err(DependencyScanRefusal::Permanent);
         }
@@ -491,6 +599,7 @@ struct ExprResultCache {
     /// Inserts since the last dead-row reclaim, and the reclaims run.
     inserts_since_reclaim: usize,
     dead_row_reclaims: usize,
+    free_vars: FreeVars,
 }
 
 impl ExprResultCache {
@@ -526,6 +635,7 @@ impl ExprResultCache {
             rollover_on_saturation: false,
             inserts_since_reclaim: 0,
             dead_row_reclaims: 0,
+            free_vars: FreeVars::default(),
         }
     }
 
@@ -696,8 +806,13 @@ impl ExprResultCache {
             .saturating_sub(self.priority_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
         let mut nodes_left = scan_limit;
-        let dependencies =
-            local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
+        let dependencies = local_dependencies(
+            &[&key, &value],
+            locals,
+            local_positions,
+            &mut self.free_vars,
+            &mut nodes_left,
+        );
         self.priority_scan_nodes += scan_limit - nodes_left;
         let dependencies = match dependencies {
             Ok(dependencies) => dependencies,
@@ -872,8 +987,13 @@ impl ExprResultCache {
             .saturating_sub(self.local_dependency_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
         let mut nodes_left = scan_limit;
-        let dependencies =
-            local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
+        let dependencies = local_dependencies(
+            &[&key, &value],
+            locals,
+            local_positions,
+            &mut self.free_vars,
+            &mut nodes_left,
+        );
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
         let dependencies = match dependencies {
             Ok(dependencies) => dependencies,
@@ -959,6 +1079,7 @@ struct PositiveDefEqCache {
     /// Inserts since the last dead-row reclaim, and the reclaims run.
     inserts_since_reclaim: usize,
     dead_row_reclaims: usize,
+    free_vars: FreeVars,
 }
 
 struct PositiveDefEqCacheEntry {
@@ -990,6 +1111,7 @@ impl PositiveDefEqCache {
             max_bucket_entries,
             inserts_since_reclaim: 0,
             dead_row_reclaims: 0,
+            free_vars: FreeVars::default(),
         }
     }
 
@@ -1221,8 +1343,13 @@ impl PositiveDefEqCache {
             .saturating_sub(self.local_dependency_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
         let mut nodes_left = scan_limit;
-        let dependencies =
-            local_dependencies(&[&left, &right], locals, local_positions, &mut nodes_left);
+        let dependencies = local_dependencies(
+            &[&left, &right],
+            locals,
+            local_positions,
+            &mut self.free_vars,
+            &mut nodes_left,
+        );
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
         let dependencies = match dependencies {
             Ok(dependencies) => dependencies,
@@ -1795,6 +1922,8 @@ pub(crate) struct TypeChecker<'a> {
     /// lazy delta to unfold this pair. Retaining that fact prevents a repeated
     /// proof-producing argument comparison from being re-run at every retry.
     regular_app_def_eq_failure_cache: PositiveDefEqCache,
+    /// Free variables for this checker's own dependency scans (`FreeVars`).
+    free_vars: FreeVars,
     instantiate_cache: InstantiateCache,
     instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
@@ -1847,6 +1976,7 @@ impl<'a> TypeChecker<'a> {
             lazy_delta_outcome_scan_nodes: 0,
             lazy_delta_replay_hits: 0,
             regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
+            free_vars: FreeVars::default(),
             instantiate_cache: InstantiateCache::new(),
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
@@ -3646,6 +3776,7 @@ impl<'a> TypeChecker<'a> {
                 &[major][..],
                 &self.locals,
                 &self.local_positions,
+                &mut self.free_vars,
                 &mut nodes_left,
             ) {
                 Ok(deps) => {
@@ -4430,6 +4561,7 @@ impl<'a> TypeChecker<'a> {
                 &[&t, &s],
                 &self.locals,
                 &self.local_positions,
+                &mut self.free_vars,
                 &mut nodes_left,
             ) {
                 Ok(deps) => {
@@ -9687,9 +9819,14 @@ mod tests {
             shared = Expr::app(shared.clone(), shared);
         }
         let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
-        let dependencies =
-            local_dependencies(&[&shared], &tc.locals, &tc.local_positions, &mut nodes_left)
-                .expect("shared nodes are scanned once, not expanded as a tree");
+        let dependencies = local_dependencies(
+            &[&shared],
+            &tc.locals,
+            &tc.local_positions,
+            &mut FreeVars::default(),
+            &mut nodes_left,
+        )
+        .expect("shared nodes are scanned once, not expanded as a tree");
 
         assert!(
             dependencies
@@ -9742,6 +9879,7 @@ mod tests {
                 &[expression],
                 &tc.locals,
                 &tc.local_positions,
+                &mut FreeVars::default(),
                 &mut nodes_left,
             )
             .expect("sharing cannot change dependency-scan admission");
@@ -9796,6 +9934,7 @@ mod tests {
             &[&application],
             &tc.locals,
             &tc.local_positions,
+            &mut FreeVars::default(),
             &mut nodes_left,
         )
         .expect("a packed-data collision cannot suppress dependency discovery");
@@ -9811,6 +9950,151 @@ mod tests {
                 .iter()
                 .any(|dependency| dependency.id == right_id)
         );
+    }
+
+    /// Two locals whose terms share a packed data word, the collision the
+    /// free-variable memo must never answer across (bead
+    /// `fln-checker-associator-time-y8wc`).
+    fn colliding_locals(tc: &mut TypeChecker<'_>) -> (FVarId, Expr, FVarId, Expr) {
+        let left_id = FVarId(Name::num_overflowing(Name::anonymous(), u64::MAX - 1));
+        let right_id = FVarId(Name::num_overflowing(Name::anonymous(), u64::MAX));
+        let (left, right) = (Expr::fvar(left_id.clone()), Expr::fvar(right_id.clone()));
+        assert!(left != right && left.data() == right.data());
+        tc.adopt_local(left_id.clone(), Expr::sort(Level::zero()));
+        tc.adopt_local(right_id.clone(), Expr::sort(Level::zero()));
+        (left_id, left, right_id, right)
+    }
+
+    #[test]
+    fn the_free_variable_memo_never_answers_one_term_for_a_colliding_other() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let (left_id, left, right_id, right) = colliding_locals(&mut tc);
+        let head = Expr::const_(Name::str(Name::anonymous(), "f"), vec![]);
+        let (on_left, on_right) = (
+            Expr::app(head.clone(), left.clone()),
+            Expr::app(head, right.clone()),
+        );
+        assert!(
+            on_left.data() == on_right.data(),
+            "the applications collide too"
+        );
+        let mut memo = FreeVars::default();
+        assert_eq!(memo_set(&mut memo, &on_left), vec![left_id.clone()]);
+        assert_eq!(memo_set(&mut memo, &on_right), vec![right_id.clone()]);
+        assert_eq!(memo_set(&mut memo, &left), vec![left_id]);
+        assert_eq!(memo_set(&mut memo, &right), vec![right_id]);
+    }
+
+    /// The variables `memo` reports for `term`, by name.
+    fn memo_set(memo: &mut FreeVars, term: &Expr) -> Vec<FVarId> {
+        let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+        let set = memo
+            .of(term, &mut DependencyScanSeen::new(), &mut nodes_left)
+            .expect("a small term is scanned");
+        set.iter()
+            .map(|&index| memo.ids.get(index as usize).cloned())
+            .collect::<Option<Vec<_>>>()
+            .expect("every index the memo hands out names a variable")
+    }
+
+    /// A full memo starts over before the next scan, and starts over whole. Its
+    /// sets name variables by index, so a set kept past a reset of the indices
+    /// would answer for whichever variable took its index next.
+    #[test]
+    fn a_full_free_variable_memo_starts_over_whole() {
+        let (a, b) = (
+            FVarId(Name::str(Name::anonymous(), "a")),
+            FVarId(Name::str(Name::anonymous(), "b")),
+        );
+        let head = Expr::const_(Name::str(Name::anonymous(), "f"), vec![]);
+        let on_a = Expr::app(head.clone(), Expr::fvar(a.clone()));
+        let on_b = Expr::app(head, Expr::fvar(b.clone()));
+        let mut memo = FreeVars::default();
+        assert_eq!(memo_set(&mut memo, &on_a), vec![a.clone()]);
+        memo.start_scan();
+        // The application and the variable; `f` has no free variable.
+        assert_eq!(memo.rows.len(), 2, "a memo with room keeps its rows");
+        // Fill it with placeholder rows under keys no live allocation has.
+        let filler: Rc<[u32]> = Rc::from([]);
+        for key in 0..FREE_VARS_MAX_ROWS {
+            memo.rows
+                .entry(key)
+                .or_insert_with(|| (Expr::sort(Level::zero()), Rc::clone(&filler)));
+        }
+        memo.start_scan();
+        assert!(
+            memo.rows.is_empty() && memo.ids.is_empty(),
+            "a full memo starts over"
+        );
+        assert_eq!(memo_set(&mut memo, &on_b), vec![b]);
+        assert_eq!(
+            memo_set(&mut memo, &on_a),
+            vec![a],
+            "a term scanned before the reset is answered afresh"
+        );
+    }
+
+    /// A result whose dependency the memo misattributed would outlive its
+    /// binder. Rebinding the right local retires its generation, so its result
+    /// must miss while the left local's result stays live.
+    #[test]
+    fn a_rebound_local_retires_results_scanned_through_the_free_variable_memo() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let (_, left, right_id, right) = colliding_locals(&mut tc);
+        let head = Expr::const_(Name::str(Name::anonymous(), "f"), vec![]);
+        let (on_left, on_right) = (
+            Expr::app(head.clone(), left.clone()),
+            Expr::app(head, right.clone()),
+        );
+        let mut cache = ExprResultCache::new();
+        cache.insert(on_left.clone(), left, &tc.locals, &tc.local_positions);
+        cache.insert(on_right.clone(), right, &tc.locals, &tc.local_positions);
+        tc.drop_local();
+        tc.adopt_local(right_id, Expr::sort(Level::one()));
+        assert!(
+            cache
+                .get(&on_right, &tc.locals, &tc.local_positions)
+                .is_none(),
+            "a result over a retired binding must not be returned"
+        );
+        assert!(
+            cache
+                .get(&on_left, &tc.locals, &tc.local_positions)
+                .is_some(),
+            "the control: the left binding is unchanged, so its result stays live"
+        );
+    }
+
+    #[test]
+    fn a_term_scanned_again_is_examined_at_its_root_only() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "memoized"));
+        let mut shared = Expr::fvar(id.clone());
+        tc.adopt_local(id, Expr::sort(Level::zero()));
+        for _ in 0..17 {
+            shared = Expr::app(shared.clone(), shared);
+        }
+        let mut memo = FreeVars::default();
+        let mut charged = || {
+            let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+            local_dependencies(
+                &[&shared],
+                &tc.locals,
+                &tc.local_positions,
+                &mut memo,
+                &mut nodes_left,
+            )
+            .expect("the scan completes");
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left
+        };
+        // The first scan walks the DAG's 18 subterms (the local's type has no
+        // free variables and is not scanned); the second finds the root in the
+        // memo and descends no further.
+        assert_eq!(charged(), 18);
+        assert_eq!(charged(), 1);
     }
 
     #[test]
@@ -9850,6 +10134,7 @@ mod tests {
             &[&expression],
             &tc.locals,
             &tc.local_positions,
+            &mut FreeVars::default(),
             &mut nodes_left,
         )
         .expect("a saturated bucket degrades to exact dedup instead of refusing");
@@ -9937,6 +10222,7 @@ mod tests {
                 &[&oversized_scan],
                 &fvar_saturated.locals,
                 &fvar_saturated.local_positions,
+                &mut FreeVars::default(),
                 &mut one_node_left,
             )
             .is_err(),

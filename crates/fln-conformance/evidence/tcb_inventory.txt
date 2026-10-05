@@ -14,8 +14,8 @@ crate fln_bignum items=85
 crate fln_core items=164
 crate fln_env items=83
 crate fln_hash items=64
-crate fln_kernel items=276
-total items=672 adjacent-items=396
+crate fln_kernel items=282
+total items=678 adjacent-items=396
 budget adjacent-items<=400
 item fln_bignum <fln_bignum::nat::BigNat as core::clone::Clone>::clone
 item fln_bignum <fln_bignum::nat::BigNat as core::cmp::Ord>::cmp
@@ -476,6 +476,12 @@ item fln_kernel <fln_kernel::tc::ExprResultCache>::new
 item fln_kernel <fln_kernel::tc::ExprResultCache>::reclaim_dead_rows
 item fln_kernel <fln_kernel::tc::ExprResultCache>::record_cross_scope_with_collision_policy
 item fln_kernel <fln_kernel::tc::ExprResultCache>::rolling
+item fln_kernel <fln_kernel::tc::FreeVars as core::default::Default>::default
+item fln_kernel <fln_kernel::tc::FreeVars>::get
+item fln_kernel <fln_kernel::tc::FreeVars>::intern
+item fln_kernel <fln_kernel::tc::FreeVars>::of
+item fln_kernel <fln_kernel::tc::FreeVars>::record
+item fln_kernel <fln_kernel::tc::FreeVars>::start_scan
 item fln_kernel <fln_kernel::tc::InferMode as core::cmp::PartialEq>::eq
 item fln_kernel <fln_kernel::tc::InstantiateCache>::bounded
 item fln_kernel <fln_kernel::tc::InstantiateCache>::get
