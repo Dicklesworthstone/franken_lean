@@ -1,0 +1,155 @@
+{
+ "bead": "fln-elp6",
+ "command": "fln check-olean --continue --jobs 16 --progress --json --max-bytes 17179869184 ~/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean",
+ "limits": "ulimit -v 104857600 (KiB: 100 GiB)",
+ "binary": {
+  "sha256": "906c51a56e7391b4d589d44100ef5db837c6d1bfad474d5947a7691aee88363a",
+  "source_commit": "a8d0032f039b02b0c7324008871505f58ee914b4",
+  "profile": "release",
+  "target": "fln-cli bin fln"
+ },
+ "identity": {
+  "schema": "fln.identity/1",
+  "version": "0.0.0",
+  "productRoot": "sound",
+  "modes": [
+   "faithful",
+   "sound",
+   "frontier"
+  ],
+  "reference": {
+   "tag": "v4.32.0",
+   "commit": "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+  },
+  "corpus": {
+   "tag": "v4.32.0",
+   "commit": "81a5d257c8e410db227a6665ed08f64fea08e997"
+  },
+  "rustChannel": "nightly-2026-08-31"
+ },
+ "host": {
+  "uname": "Linux sensedemobox 7.0.0-30-generic #30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026 x86_64 GNU/Linux",
+  "cpus": 64,
+  "memory": "251 123 (total/used GiB at launch)",
+  "captured_utc": "2026-10-05T06:10:32Z"
+ },
+ "exit": "exit=0 elapsed=3908s",
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "complete",
+  "authority": true,
+  "trust": "recheck",
+  "modules": 2433,
+  "accepted": 2433,
+  "failed": 0,
+  "inconclusive": 0,
+  "internalFault": 0,
+  "blocked": 0,
+  "acceptedDeclarations": 215136
+ },
+ "result_file": "v4.32.0.json (the run's --json, verbatim)",
+ "slowest_modules": [
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Expr",
+   "elapsedMs": 973718,
+   "declarations": 61
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Operations.Udiv",
+   "elapsedMs": 784434,
+   "declarations": 27
+  },
+  {
+   "module": "Init.Data.Array.Extract",
+   "elapsedMs": 466210,
+   "declarations": 123
+  },
+  {
+   "module": "Init.Data.BitVec.Lemmas",
+   "elapsedMs": 434478,
+   "declarations": 2040
+  },
+  {
+   "module": "Init.Data.Vector.Extract",
+   "elapsedMs": 374092,
+   "declarations": 69
+  },
+  {
+   "module": "Std.Data.DHashMap.Lemmas",
+   "elapsedMs": 346068,
+   "declarations": 1100
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Expr",
+   "elapsedMs": 344819,
+   "declarations": 258
+  },
+  {
+   "module": "Std.Data.DTreeMap.Internal.Balancing",
+   "elapsedMs": 235697,
+   "declarations": 369
+  },
+  {
+   "module": "Std.Data.DTreeMap.Lemmas",
+   "elapsedMs": 228720,
+   "declarations": 1419
+  },
+  {
+   "module": "Init.Data.BitVec.Bitblast",
+   "elapsedMs": 196679,
+   "declarations": 795
+  },
+  {
+   "module": "Std.Data.ExtDHashMap.Lemmas",
+   "elapsedMs": 174653,
+   "declarations": 867
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas",
+   "elapsedMs": 152743,
+   "declarations": 5
+  },
+  {
+   "module": "Std.Data.HashMap.Lemmas",
+   "elapsedMs": 152139,
+   "declarations": 750
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Substructure",
+   "elapsedMs": 143828,
+   "declarations": 50
+  },
+  {
+   "module": "Init.Data.Int.DivMod.Lemmas",
+   "elapsedMs": 123384,
+   "declarations": 957
+  },
+  {
+   "module": "Std.Data.DTreeMap.Internal.Operations",
+   "elapsedMs": 111388,
+   "declarations": 744
+  },
+  {
+   "module": "Init.Data.String.Lemmas.Pattern.String.ForwardSearcher",
+   "elapsedMs": 101575,
+   "declarations": 229
+  },
+  {
+   "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Operations.Cpop",
+   "elapsedMs": 99210,
+   "declarations": 168
+  },
+  {
+   "module": "Init.Data.Dyadic.Basic",
+   "elapsedMs": 98080,
+   "declarations": 301
+  },
+  {
+   "module": "Std.Data.HashMap.RawLemmas",
+   "elapsedMs": 97798,
+   "declarations": 736
+  }
+ ],
+ "progress_stream": "not retained: its decided events are the result file's rows, in the same order with the same elapsedMs; its started events carry no verdict",
+ "not_established": "one run at one width (16 threads); determinism across thread counts and PG-1 throughput are not measured. The host also ran the S22 combined Mathlib frontier (--jobs 24) and test suites, so per-module times are inflated by contention."
+}
