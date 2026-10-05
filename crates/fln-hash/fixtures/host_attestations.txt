@@ -7,7 +7,7 @@
 # EARNED — multi-HOST identity on the certified target. Every row below was produced by
 # running domain::tests::emit_host_attestation on a distinct physical machine, and all
 # rows agree on both digests. `fixture_digest` covers the whole of domain_vectors.txt, so
-# it carries all nineteen domain tags and all seventy-six frozen vectors in one field: if any
+# it carries all twenty domain tags and all eighty frozen vectors in one field: if any
 # domain's tag or any vector differed on another host, that host's digest would differ.
 # `logical_root` is a LogicalRoot over a fixed closure of eight declarations and one
 # extension delta, built from constants so it depends on nothing but the code.
@@ -35,5 +35,10 @@
 # PROVENANCE: sensedemobox and hetzner2 are distinct physical machines on the same
 # target triple and exact pinned nightly from SUITE.lock. Re-recorded 2026-08-12 after
 # the FLBC sidecar added three registered artifact domains to the frozen fixture.
-x86_64-linux-unix-64bit-le|sensedemobox|242828065c2ce3c4fdb9859b05f2f72390552dcf64496e88fe54691bb6b56e45|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
-x86_64-linux-unix-64bit-le|hetzner2|242828065c2ce3c4fdb9859b05f2f72390552dcf64496e88fe54691bb6b56e45|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
+# Re-recorded 2026-10-05 for the Merkle DeclContent digest (bead
+# fln-merkle-decl-digest-80ni: tag decl-content-dag/1 and the new ExprNode domain):
+# sensedemobox locally, and hetzner2 through `rch exec --base <sha> --clean-overlay
+# --no-overlay`, which ships a git baseline rather than a working tree, so the fixture it
+# digested is the one whose digest both rows carry.
+x86_64-linux-unix-64bit-le|sensedemobox|f4bffeebfd3875365135a840883964cac0d87434a2b293d478facdc1b33abd7e|c14e1ec8134901d4fb9d2ab942316f01eacb8f71e8e948c7d82bc6833792bcb7
+x86_64-linux-unix-64bit-le|hetzner2|f4bffeebfd3875365135a840883964cac0d87434a2b293d478facdc1b33abd7e|c14e1ec8134901d4fb9d2ab942316f01eacb8f71e8e948c7d82bc6833792bcb7

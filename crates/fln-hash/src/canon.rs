@@ -455,6 +455,24 @@ impl CanonWriter {
         self.str(id.name);
         self.u16(id.version);
     }
+
+    /// A digest's 32 bytes, fixed width and unprefixed.
+    pub fn digest(&mut self, digest: &crate::domain::Digest) {
+        self.put(&digest.0);
+    }
+
+    /// The bytes a storing writer holds; empty for a counting writer, and a buffered
+    /// tail for a hashing one.
+    pub fn stored(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Empty a storing writer for reuse, keeping its allocation and its limit.
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.written = 0;
+        self.overflowed = false;
+    }
 }
 
 /// A canonical writer whose encoding is hashed as it is written: its digest is
@@ -1433,6 +1451,232 @@ impl Canonical for Expr {
         // nested but tiny hostile encoding — e.g. a chain of `App` tags
         // (franken_lean-fnj, D8/FL-INV-07).
         read_expr_iter(r)
+    }
+}
+
+// ---- Merkle expression digests (bead fln-merkle-decl-digest-80ni) ---------------------
+
+/// Digests of expressions taken as DAGs. A node's digest is `hash(ExprNode, record)`,
+/// where the record holds the node's own fields in their canonical encodings and its
+/// children's 32-byte digests, never their encodings. So a subterm shared a million
+/// times is hashed once, where the tree encoding spelled it out a million times (the
+/// pinned Init closure: 752.8M tree nodes, 12.76M distinct).
+///
+/// The digest is of the term, not of its sharing: equal subterms have equal records
+/// and therefore equal digests however they are held in memory. Node identity is only
+/// the memo key, and the `'roots` borrow keeps every keyed node alive while the memo
+/// exists, so no address is reused under it.
+///
+/// [`ExprMerkle::record_bytes`] counts each *distinct content* record once, keyed by
+/// its digest, so it too is a function of the terms alone.
+pub struct ExprMerkle<'roots> {
+    memo: std::collections::HashMap<*const ExprNode, crate::domain::Digest>,
+    distinct: std::collections::HashSet<crate::domain::Digest>,
+    record_bytes: u64,
+    hashed_nodes: u64,
+    record: CanonWriter,
+    base: crate::domain::DomainHasher,
+    roots: std::marker::PhantomData<&'roots Expr>,
+}
+
+impl Default for ExprMerkle<'_> {
+    fn default() -> Self {
+        ExprMerkle::new()
+    }
+}
+
+impl<'roots> ExprMerkle<'roots> {
+    pub fn new() -> ExprMerkle<'roots> {
+        ExprMerkle {
+            memo: std::collections::HashMap::new(),
+            distinct: std::collections::HashSet::new(),
+            record_bytes: 0,
+            hashed_nodes: 0,
+            record: CanonWriter::new(),
+            // Derived once: `derive_key` hashes the context string, and a node's own
+            // record is usually a single block.
+            base: crate::domain::DomainHasher::new(crate::domain::Domain::ExprNode),
+            roots: std::marker::PhantomData,
+        }
+    }
+
+    /// Bytes of every distinct node record hashed so far, each counted once.
+    pub fn record_bytes(&self) -> u64 {
+        self.record_bytes
+    }
+
+    /// Node hashes computed so far: one per distinct node held in memory, however
+    /// often it occurs in the terms.
+    pub fn hashed_nodes(&self) -> u64 {
+        self.hashed_nodes
+    }
+
+    /// The digest of `expr`, hashing each node not already memoized exactly once.
+    ///
+    /// Iterative post-order, so a deep term cannot overflow the call stack.
+    pub fn root(&mut self, expr: &'roots Expr) -> crate::domain::Digest {
+        let mut pending: Vec<(&'roots Expr, bool)> = vec![(expr, false)];
+        while let Some((node, expanded)) = pending.pop() {
+            let key = std::ptr::from_ref(node.node());
+            if self.memo.contains_key(&key) {
+                continue;
+            }
+            if expanded {
+                let digest = self.node_digest(node);
+                self.memo.insert(key, digest);
+                continue;
+            }
+            pending.push((node, true));
+            for child in merkle_children(node).into_iter().flatten() {
+                if !self.memo.contains_key(&std::ptr::from_ref(child.node())) {
+                    pending.push((child, false));
+                }
+            }
+        }
+        self.memo[&std::ptr::from_ref(expr.node())]
+    }
+
+    /// Hash one node whose children are all memoized.
+    fn node_digest(&mut self, node: &Expr) -> crate::domain::Digest {
+        let ExprMerkle {
+            memo,
+            distinct,
+            record_bytes,
+            hashed_nodes,
+            record,
+            base,
+            ..
+        } = self;
+        *hashed_nodes = hashed_nodes.saturating_add(1);
+        record.clear();
+        let child = |e: &Expr| memo[&std::ptr::from_ref(e.node())];
+        match node.node() {
+            ExprNode::BVar { idx } => {
+                record.u8(EXPR_BVAR);
+                record.u32(*idx);
+            }
+            ExprNode::FVar { id } => {
+                record.u8(EXPR_FVAR);
+                id.0.write_body(record);
+            }
+            ExprNode::MVar { id } => {
+                record.u8(EXPR_MVAR);
+                id.0.write_body(record);
+            }
+            ExprNode::Sort { level } => {
+                record.u8(EXPR_SORT);
+                level.write_body(record);
+            }
+            ExprNode::Const { name, levels } => {
+                record.u8(EXPR_CONST);
+                name.write_body(record);
+                record.u64(levels.len() as u64);
+                for level in levels {
+                    level.write_body(record);
+                }
+            }
+            ExprNode::App { f, a } => {
+                record.u8(EXPR_APP);
+                record.digest(&child(f));
+                record.digest(&child(a));
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                record.u8(EXPR_LAM);
+                binder_name.write_body(record);
+                record.u8(binder_info_tag(*binder_info));
+                record.digest(&child(binder_type));
+                record.digest(&child(body));
+            }
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                record.u8(EXPR_FORALL);
+                binder_name.write_body(record);
+                record.u8(binder_info_tag(*binder_info));
+                record.digest(&child(binder_type));
+                record.digest(&child(body));
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                record.u8(EXPR_LET);
+                decl_name.write_body(record);
+                record.bool(*non_dep);
+                record.digest(&child(type_));
+                record.digest(&child(value));
+                record.digest(&child(body));
+            }
+            ExprNode::Lit { literal } => match literal {
+                Literal::Nat(n) => {
+                    record.u8(EXPR_LIT_NAT);
+                    record.u64(n.limbs_le().len() as u64);
+                    for limb in n.limbs_le() {
+                        record.u64(*limb);
+                    }
+                }
+                Literal::Str(text) => {
+                    record.u8(EXPR_LIT_STR);
+                    record.str(text);
+                }
+            },
+            ExprNode::MData { data, expr } => {
+                record.u8(EXPR_MDATA);
+                data.write_body(record);
+                record.digest(&child(expr));
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                record.u8(EXPR_PROJ);
+                struct_name.write_body(record);
+                record.u64(*idx);
+                record.digest(&child(expr));
+            }
+        }
+        let mut hasher = base.clone();
+        hasher.update(record.stored());
+        let digest = hasher.finalize();
+        if distinct.insert(digest) {
+            *record_bytes = record_bytes.saturating_add(record.written() as u64);
+        }
+        digest
+    }
+}
+
+/// A node's children, in record order.
+fn merkle_children(expr: &Expr) -> [Option<&Expr>; 3] {
+    match expr.node() {
+        ExprNode::App { f, a } => [Some(f), Some(a), None],
+        ExprNode::Lam {
+            binder_type, body, ..
+        }
+        | ExprNode::ForallE {
+            binder_type, body, ..
+        } => [Some(binder_type), Some(body), None],
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => [Some(type_), Some(value), Some(body)],
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
+        ExprNode::BVar { .. }
+        | ExprNode::FVar { .. }
+        | ExprNode::MVar { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Lit { .. } => [None, None, None],
     }
 }
 
@@ -4090,5 +4334,79 @@ mod tests {
         let mut other = CanonHasher::new(Domain::DeclContent);
         other.str("chunk");
         assert_ne!(other.finish(), hash(Domain::DeclContent, &bytes));
+    }
+
+    fn merkle_const(text: &str) -> Expr {
+        Expr::const_(Name::str(Name::anonymous(), text), Vec::new())
+    }
+
+    fn merkle_pair(left: Expr, right: Expr) -> Expr {
+        Expr::app(Expr::app(merkle_const("pair"), left), right)
+    }
+
+    /// Bead fln-merkle-decl-digest-80ni: the digest is of the term, not of its
+    /// sharing. One `x` held twice and two separately built equal `x`s are one term.
+    #[test]
+    fn equal_terms_have_one_merkle_digest_however_they_are_shared() {
+        let build = || Expr::app(merkle_const("f"), merkle_const("a"));
+        let shared = build();
+        let once = merkle_pair(shared.clone(), shared);
+        let twice = merkle_pair(build(), build());
+        let mut left = ExprMerkle::new();
+        let mut right = ExprMerkle::new();
+        assert_eq!(left.root(&once), right.root(&twice));
+        // Sharing changes only how many nodes are hashed, never what is counted.
+        assert_eq!(left.record_bytes(), right.record_bytes());
+        assert!(left.hashed_nodes() < right.hashed_nodes());
+
+        // A different term is a different digest, including a swapped pair.
+        let other = merkle_pair(build(), merkle_const("a"));
+        assert_ne!(ExprMerkle::new().root(&once), ExprMerkle::new().root(&other));
+        let swapped = merkle_pair(merkle_const("a"), build());
+        assert_ne!(
+            ExprMerkle::new().root(&other),
+            ExprMerkle::new().root(&swapped)
+        );
+    }
+
+    /// A doubling DAG has 2^40 leaves as a tree and 41 distinct nodes; the tree
+    /// encoding could never be hashed, and the Merkle digest hashes each node once.
+    #[test]
+    fn a_doubling_dag_is_hashed_once_per_distinct_node() {
+        let mut term = merkle_const("leaf");
+        for _ in 0..40 {
+            term = Expr::app(term.clone(), term);
+        }
+        let mut merkle = ExprMerkle::new();
+        let digest = merkle.root(&term);
+        assert_eq!(merkle.hashed_nodes(), 41);
+        // A second root over the same nodes hashes nothing new.
+        assert_eq!(merkle.root(&term), digest);
+        assert_eq!(merkle.hashed_nodes(), 41);
+        // Built again from fresh nodes, it is still the same term.
+        let mut rebuilt = merkle_const("leaf");
+        for _ in 0..40 {
+            rebuilt = Expr::app(rebuilt.clone(), rebuilt);
+        }
+        assert_eq!(ExprMerkle::new().root(&rebuilt), digest);
+    }
+
+    /// A node's digest is domain-separated from every other use of the same bytes.
+    #[test]
+    fn expression_node_records_are_hashed_in_their_own_domain() {
+        let leaf = merkle_const("leaf");
+        let mut record = CanonWriter::new();
+        record.u8(EXPR_CONST);
+        Name::str(Name::anonymous(), "leaf").write_body(&mut record);
+        record.u64(0);
+        let digest = ExprMerkle::new().root(&leaf);
+        assert_eq!(
+            digest,
+            crate::domain::hash(crate::domain::Domain::ExprNode, record.stored())
+        );
+        assert_ne!(
+            digest,
+            crate::domain::hash(crate::domain::Domain::DeclContent, record.stored())
+        );
     }
 }

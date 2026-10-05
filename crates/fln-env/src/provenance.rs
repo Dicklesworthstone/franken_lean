@@ -3314,7 +3314,8 @@ mod tests {
         assert!(Domain::ALL.contains(&Domain::ArtifactClosureComponent));
         assert!(Domain::ALL.contains(&Domain::ArtifactClosure));
         assert!(Domain::ALL.contains(&Domain::ArtifactProduct));
-        assert_eq!(Domain::ALL.len(), 19);
+        assert!(Domain::ALL.contains(&Domain::ExprNode));
+        assert_eq!(Domain::ALL.len(), 20);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")

@@ -61,7 +61,7 @@ fn a_real_prelude_import_is_council_admitted_and_journaled() {
     // the source base root, which now also includes native metadata replay.
     assert!(
         stdout.contains(
-            "\"declarationLogicalRoot\":\"a6ddda2c686b7badff7fb82388f59c1ccf821019684d8dbd19abe5066f874203\""
+            "\"declarationLogicalRoot\":\"ce452c45bc263fe4d5abad6ead8952db93611e364e5930f884860c9f96ced44b\""
         ),
         "{stdout}"
     );

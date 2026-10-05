@@ -16,7 +16,7 @@ use fln_core::expr::Expr;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
-use fln_hash::canon::{CanonHasher, CanonWriter, Canonical};
+use fln_hash::canon::{CanonHasher, CanonWriter, Canonical, ExprMerkle};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
 
@@ -1362,36 +1362,49 @@ impl Environment {
     /// deterministic projection the logical root aggregates. Byte-level olean parity
     /// is the codec's business; this digest is FrankenLean's own identity.
     #[forbid(clippy::as_conversions)]
-    /// Hashed as it is encoded: a heavily shared expression's tree encoding can
-    /// run to gigabytes, and materializing it made one declaration's digest a
-    /// multi-gigabyte allocation (bead fln-frontier-oom-abort-w9dx).
+    /// Each expression enters as its Merkle root ([`ExprMerkle`]), so a heavily
+    /// shared term is hashed once per distinct node rather than once per occurrence:
+    /// its tree encoding ran to hundreds of megabytes (bead
+    /// fln-merkle-decl-digest-80ni), and materializing that encoding had made one
+    /// digest a multi-gigabyte allocation (bead fln-frontier-oom-abort-w9dx).
     pub fn decl_content_digest(info: &ConstantInfo) -> Digest {
+        let mut merkle = ExprMerkle::new();
         let mut w = CanonHasher::new(Domain::DeclContent);
-        Environment::write_decl_content(info, &mut w);
+        Environment::write_decl_content(info, &mut w, &mut merkle);
         w.finish()
     }
 
-    /// The length of [`Self::decl_content_bytes`], counted without storing them.
+    /// The bytes the digest is over: the declaration's own stream, plus each distinct
+    /// expression-node record once. A function of the declaration's content, not of
+    /// how its terms are shared in memory.
     fn decl_content_len(info: &ConstantInfo) -> usize {
+        let mut merkle = ExprMerkle::new();
         let mut w = CanonWriter::counting();
-        Environment::write_decl_content(info, &mut w);
-        w.written()
+        Environment::write_decl_content(info, &mut w, &mut merkle);
+        let records = usize::try_from(merkle.record_bytes()).unwrap_or(usize::MAX);
+        w.written().saturating_add(records)
     }
 
-    /// The canonical `Domain::DeclContent` byte stream for one constant.
+    /// The declaration's own `Domain::DeclContent` stream, with each expression as its
+    /// 32-byte Merkle root.
     ///
     /// One encoder, so the digest and the canonical-byte usage fact cannot diverge — a
     /// measured byte count taken from a second implementation would be a fact about the
     /// wrong bytes (bead `franken_lean-j8h`).
     #[cfg(test)]
     fn decl_content_bytes(info: &ConstantInfo) -> Vec<u8> {
+        let mut merkle = ExprMerkle::new();
         let mut w = CanonWriter::new();
-        Environment::write_decl_content(info, &mut w);
+        Environment::write_decl_content(info, &mut w, &mut merkle);
         w.into_bytes()
     }
 
     /// The one encoder behind the digest, the length and the stored bytes.
-    fn write_decl_content(info: &ConstantInfo, w: &mut CanonWriter) {
+    fn write_decl_content<'info>(
+        info: &'info ConstantInfo,
+        w: &mut CanonWriter,
+        merkle: &mut ExprMerkle<'info>,
+    ) {
         w.str(info.kind_name());
         info.name().write_body(w);
         let base = info.constant_val();
@@ -1399,11 +1412,11 @@ impl Environment {
         for p in &base.level_params {
             p.write_body(w);
         }
-        base.type_.write_body(w);
+        w.digest(&merkle.root(&base.type_));
         match info {
             ConstantInfo::Axiom(v) => w.bool(v.is_unsafe),
             ConstantInfo::Defn(v) => {
-                v.value.write_body(w);
+                w.digest(&merkle.root(&v.value));
                 match v.hints {
                     ReducibilityHints::Opaque => w.u8(0),
                     ReducibilityHints::Abbrev => w.u8(1),
@@ -1416,11 +1429,11 @@ impl Environment {
                 write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Thm(v) => {
-                v.value.write_body(w);
+                w.digest(&merkle.root(&v.value));
                 write_mutual_membership(w, &v.all);
             }
             ConstantInfo::Opaque(v) => {
-                v.value.write_body(w);
+                w.digest(&merkle.root(&v.value));
                 w.bool(v.is_unsafe);
                 write_mutual_membership(w, &v.all);
             }
@@ -1460,7 +1473,7 @@ impl Environment {
                 for rule in &v.rules {
                     rule.ctor.write_body(w);
                     w.u32(rule.nfields);
-                    rule.rhs.write_body(w);
+                    w.digest(&merkle.root(&rule.rhs));
                 }
                 // The mutual block is content here too (mirrors `Defn`/`Thm`).
                 write_mutual_membership(w, &v.all);
@@ -1498,7 +1511,7 @@ mod tests {
         RecursorRule, RecursorVal, TheoremVal,
     };
     use crate::pmap::CollisionResource;
-    use fln_core::expr::Expr;
+    use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal};
     use fln_core::level::Level;
     use fln_core::options::DataValue;
     use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
@@ -1732,33 +1745,33 @@ mod tests {
         /// independent in-file model from silently redefining declaration identity.
         const fn golden_stream_bytes(self) -> usize {
             match self {
-                DeclarationTagCase::Definition(_) => 286,
-                DeclarationTagCase::Quotient(_) => 157,
+                DeclarationTagCase::Definition(_) => 207,
+                DeclarationTagCase::Quotient(_) => 116,
             }
         }
 
         const fn golden_stream_hash(self) -> &'static str {
             match self {
                 DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
-                    "157d1d61733828db775de4ee898c84ab608f57ca609965b7d8aba3ef9e3a1a5e"
+                    "d8f66eaebe3bd757c3a9652473dc9fa0a176f80acdb66dd3becf01e272c01b61"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
-                    "e3a242872a3ffd8c515331f5821c1b42f81780060413feb33f2d63ca8aeb697d"
+                    "fd3c2b8314cc3b300d047f6cbdbf52bb78a2b17296818044499d9fc00e6d215c"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
-                    "00a37c5b26ce2df45b79a0e5ddc0b32fe7ba3fd16e2267a8b199a3a2a5421f52"
+                    "c7f605e2ecbec5e4e6a69ecbec079bae8f9049ed8a7b6cb7ef5751b39f290a5b"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Type) => {
-                    "d85f3e7116bf264784bad45e2d9a9acc9ad69ca15c2387f73d390b51c1a52674"
+                    "4af4ecc976ea4749b561074b54556e693941a868883abde3f472344c18d289ce"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ctor) => {
-                    "7a209bee80a459d0eddd0e82ced0b96345895dfdf11cb420729783eff42fe0a0"
+                    "74e8869f947fbf6e78a156484956373630c445c919e30b02eb2d960ebf5c3673"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Lift) => {
-                    "706326aa022cfa4b76f80ea32c04ad0aef70d796da8762b86771b3b4d42937ad"
+                    "e3202ab09a1f795c7e35b25538f91f02f5bda4027b1ef9305bfff01c796d659a"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ind) => {
-                    "32cecea0df45330f5ea249486eb8c0dd4ff236dc27ca90e79122de9f7e3d365a"
+                    "ccfeaea2498cd2bf2c1f50d46bf545c0b704fec82af39dc3c3a6c1251d9d21f2"
                 }
             }
         }
@@ -1766,25 +1779,25 @@ mod tests {
         const fn golden_digest(self) -> &'static str {
             match self {
                 DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
-                    "e6e48d3267b42c87425ac704373120f0c4624c591f6c3218412cdfd5464443ab"
+                    "6b9c01d69ac98d8de525153a28bb2c3dace1bfe9eb8caa09ceae520dcdaf0b41"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
-                    "5995ca5cc9f678192cb1700abb6bc18a87af673a6f3285cc9d55caa9b20bb6b0"
+                    "c78070291d6aad45f3d5390df51e10a0d0d4e73505efdfda2b9449a4f01c23fe"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
-                    "5a313316b29da1dab36b88cd02d1d52b96b025a3cb6b9682d0ba10eb59ae76d1"
+                    "03efd291a665a8375ad9a0f3d7bc1a5ad39d093848c019b97f4585669654bab9"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Type) => {
-                    "64a010c5b799b51b464f4394db8f06a4d7f0c8f98a89bc634cddf3936f3a431f"
+                    "3d1d324b37f2bacc705787d214429add28f6a42352c5b8c7fda574c5e02115b1"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ctor) => {
-                    "d8fc3394629ba859ee37b56dd6d937d787aa86b607b02941091a8699983e0589"
+                    "cd43341a2e2aeef6ad17c9c70ace92e58c32e004843094b9f66a06881d76bf23"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Lift) => {
-                    "804e0ddc5baea6f095d63662b95d303a11c7f33cc92c8d5c77efeb96df021706"
+                    "1013d270748d2a98ff9b30b3c3ad13bad4fdda441de46a8dde82e9fd72a9c83c"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ind) => {
-                    "7e0d5346e053845bda23a4fb2f3edf80f7daa3f86898a129d66d0531e0e22066"
+                    "0e2a8e5c34cf117dba3f9d915087cff93b0f6c6e8c8da1363ae490e68d758ab0"
                 }
             }
         }
@@ -1792,25 +1805,25 @@ mod tests {
         const fn golden_root(self) -> &'static str {
             match self {
                 DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
-                    "87d17589cf2a1222d19498e2c4b398107043556cf546281992f223cb9f5a94a9"
+                    "99507b7f9cb3e1a321a43a46ba60cc9a0eb2aedf19891e95c8f8d380ae7651e9"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
-                    "69a4eda482d75712ead5edea8d70692319ac48b9b532b9944bd681e5d94b19ac"
+                    "b92b714e41fc4b41a0ecff382f48b6857291261b23a41a6d27846c024965dcf2"
                 }
                 DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
-                    "d234cc1f558ec38a8a8c6ba090236f2239dcd3694b38ea955262cb709016ec47"
+                    "7971023b6d09e3609f82bee0239b688b3298ba61ba03325c53ce8699f531bb7f"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Type) => {
-                    "4bf46c6cd5c5282272a303bed04d36d4a5c3d84684b3b588e821564368e10a54"
+                    "647c82d4da863383fccdc25777ec77a0dd8cd2a86c4fcd3ebe91265d8452b12e"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ctor) => {
-                    "05b8fe41a9783da42b03c43ec645d7fd239f924ac1996c2112819d7046aa26fe"
+                    "53f7eb479d59238029cfdd7e3bd9dbdcc7d7519e4284ed8bb29d760a2e4a475e"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Lift) => {
-                    "08dc046203aec4b81143baad0afcebd7655e77e9a4fc813d61fd67fb304edae5"
+                    "ba13ccf0f8446ab1a928c7681361566df7a605b39003caa25e8b5b1a8eb05b66"
                 }
                 DeclarationTagCase::Quotient(QuotKind::Ind) => {
-                    "4edbf7598d4cbc73861526c523b02b126a13eaaa29e5f16b6a4a5b55e39b6414"
+                    "75f1abec47787570ff269b71c83d2f34f4bed05b521e4d771fda3acece30ac1c"
                 }
             }
         }
@@ -1854,6 +1867,149 @@ mod tests {
             }),
             DeclarationTagCase::Quotient(kind) => ConstantInfo::Quot(QuotVal { base, kind }),
         }
+    }
+
+    /// An independent model of an expression's Merkle digest (bead
+    /// fln-merkle-decl-digest-80ni): plain recursion with no memo, with the record tags
+    /// written out here, sharing only the primitive codecs and the registered hash with
+    /// production. Fixture terms are small, so the tree recursion is cheap.
+    fn modeled_expr_digest(expr: &Expr) -> Digest {
+        modeled_expr_record(expr, &mut HashSet::new())
+    }
+
+    /// [`modeled_expr_digest`], also collecting every node record into `records`.
+    fn modeled_expr_record(expr: &Expr, records: &mut HashSet<Vec<u8>>) -> Digest {
+        let binder = |info: BinderInfo| u8::try_from(info.to_u64()).expect("binder tags fit u8");
+        let mut w = CanonWriter::new();
+        match expr.node() {
+            ExprNode::BVar { idx } => {
+                w.u8(0);
+                w.u32(*idx);
+            }
+            ExprNode::FVar { id } => {
+                w.u8(1);
+                id.0.write_body(&mut w);
+            }
+            ExprNode::MVar { id } => {
+                w.u8(2);
+                id.0.write_body(&mut w);
+            }
+            ExprNode::Sort { level } => {
+                w.u8(3);
+                level.write_body(&mut w);
+            }
+            ExprNode::Const { name, levels } => {
+                w.u8(4);
+                name.write_body(&mut w);
+                w.u64(usize_to_u64(levels.len()));
+                for level in levels {
+                    level.write_body(&mut w);
+                }
+            }
+            ExprNode::App { f, a } => {
+                w.u8(5);
+                w.digest(&modeled_expr_record(f, records));
+                w.digest(&modeled_expr_record(a, records));
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                w.u8(6);
+                binder_name.write_body(&mut w);
+                w.u8(binder(*binder_info));
+                w.digest(&modeled_expr_record(binder_type, records));
+                w.digest(&modeled_expr_record(body, records));
+            }
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                w.u8(7);
+                binder_name.write_body(&mut w);
+                w.u8(binder(*binder_info));
+                w.digest(&modeled_expr_record(binder_type, records));
+                w.digest(&modeled_expr_record(body, records));
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                w.u8(8);
+                decl_name.write_body(&mut w);
+                w.bool(*non_dep);
+                w.digest(&modeled_expr_record(type_, records));
+                w.digest(&modeled_expr_record(value, records));
+                w.digest(&modeled_expr_record(body, records));
+            }
+            ExprNode::Lit { literal } => match literal {
+                Literal::Nat(n) => {
+                    w.u8(9);
+                    w.u64(usize_to_u64(n.limbs_le().len()));
+                    for limb in n.limbs_le() {
+                        w.u64(*limb);
+                    }
+                }
+                Literal::Str(text) => {
+                    w.u8(10);
+                    w.str(text);
+                }
+            },
+            ExprNode::MData { data, expr } => {
+                w.u8(11);
+                data.write_body(&mut w);
+                w.digest(&modeled_expr_record(expr, records));
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                w.u8(12);
+                struct_name.write_body(&mut w);
+                w.u64(*idx);
+                w.digest(&modeled_expr_record(expr, records));
+            }
+        }
+        let record = w.into_bytes();
+        let digest = hash(Domain::ExprNode, &record);
+        records.insert(record);
+        digest
+    }
+
+    /// The bytes a declaration's digest is over, modelled: its own stream plus each
+    /// content-distinct expression-node record once.
+    fn modeled_canonical_bytes(info: &ConstantInfo) -> u64 {
+        let mut records = HashSet::new();
+        modeled_expr_record(&info.constant_val().type_, &mut records);
+        match info {
+            ConstantInfo::Defn(value) => {
+                modeled_expr_record(&value.value, &mut records);
+            }
+            ConstantInfo::Thm(value) => {
+                modeled_expr_record(&value.value, &mut records);
+            }
+            ConstantInfo::Opaque(value) => {
+                modeled_expr_record(&value.value, &mut records);
+            }
+            ConstantInfo::Rec(value) => {
+                for rule in &value.rules {
+                    modeled_expr_record(&rule.rhs, &mut records);
+                }
+            }
+            _ => {}
+        }
+        let stream = usize_to_u64(Environment::decl_content_bytes(info).len());
+        records
+            .iter()
+            .fold(stream, |total, record| total + usize_to_u64(record.len()))
     }
 
     fn write_modeled_declaration_tag(
@@ -1911,10 +2067,10 @@ mod tests {
         ) {
             write_modeled_declaration_tag(&mut w, case, model);
         }
-        base.type_.write_body(&mut w);
+        w.digest(&modeled_expr_digest(&base.type_));
         match (case, info) {
             (DeclarationTagCase::Definition(_), ConstantInfo::Defn(value)) => {
-                value.value.write_body(&mut w);
+                w.digest(&modeled_expr_digest(&value.value));
                 let move_tag_across_adjacent_field =
                     matches!(model, DeclarationTagDigestModel::MoveTagAcrossAdjacentField);
                 if move_tag_across_adjacent_field {
@@ -2141,10 +2297,10 @@ mod tests {
         for parameter in &base.level_params {
             parameter.write_body(&mut w);
         }
-        base.type_.write_body(&mut w);
+        w.digest(&modeled_expr_digest(&base.type_));
         match info {
             ConstantInfo::Defn(value) => {
-                value.value.write_body(&mut w);
+                w.digest(&modeled_expr_digest(&value.value));
                 match value.hints {
                     ReducibilityHints::Opaque => w.u8(0),
                     ReducibilityHints::Abbrev => w.u8(1),
@@ -2162,11 +2318,11 @@ mod tests {
                 write_membership_model(&mut w, &value.all, membership_model);
             }
             ConstantInfo::Thm(value) => {
-                value.value.write_body(&mut w);
+                w.digest(&modeled_expr_digest(&value.value));
                 write_membership_model(&mut w, &value.all, membership_model);
             }
             ConstantInfo::Opaque(value) => {
-                value.value.write_body(&mut w);
+                w.digest(&modeled_expr_digest(&value.value));
                 w.bool(value.is_unsafe);
                 write_membership_model(&mut w, &value.all, membership_model);
             }
@@ -2194,7 +2350,7 @@ mod tests {
                 for rule in &value.rules {
                     rule.ctor.write_body(&mut w);
                     w.u32(rule.nfields);
-                    rule.rhs.write_body(&mut w);
+                    w.digest(&modeled_expr_digest(&rule.rhs));
                 }
                 write_membership_model(&mut w, &value.all, membership_model);
             }
@@ -4367,12 +4523,12 @@ mod tests {
     /// asserts that directly against every all-bearing variant rather than trusting the
     /// refactor — a byte count taken from a second implementation would be a fact about
     /// the wrong bytes, which is the failure mode the shared encoder exists to remove.
-    /// A heavily shared value: its tree encoding is megabytes from a few dozen
-    /// nodes, as in the Std BVDecide circuit lemmas whose digests made 8-64 GiB
-    /// allocations. The streamed digest and the counted length must be those of
-    /// the stored encoding.
+    /// A heavily shared value: as a tree it is 2^20 leaves, as in the Std BVDecide
+    /// circuit lemmas whose tree digests made 8-64 GiB allocations. As a DAG it is 21
+    /// nodes, and both the digest and the byte fact are taken over those (bead
+    /// fln-merkle-decl-digest-80ni).
     #[test]
-    fn a_shared_value_is_digested_and_measured_without_storing_its_tree() {
+    fn a_shared_value_is_digested_and_measured_per_distinct_node() {
         let mut value = Expr::const_(n("leaf"), vec![]);
         for _ in 0..20 {
             value = Expr::app(value.clone(), value);
@@ -4389,12 +4545,11 @@ mod tests {
             all: vec![n("shared")],
         });
         let bytes = Environment::decl_content_bytes(&info);
-        assert!(
-            bytes.len() > 16 * fln_hash::canon::HASH_CHUNK,
-            "the tree encoding must span many hashing chunks, was {}",
-            bytes.len()
-        );
-        assert_eq!(Environment::decl_content_len(&info), bytes.len());
+        let measured = usize_to_u64(Environment::decl_content_len(&info));
+        assert_eq!(measured, modeled_canonical_bytes(&info));
+        // 21 value nodes and one type node, each record well under a hundred bytes:
+        // the tree's 2^20 leaves are nowhere in it.
+        assert!(measured < 4096, "a 22-node preimage measured {measured} bytes");
         assert_eq!(
             Environment::decl_content_digest(&info),
             hash(Domain::DeclContent, &bytes)
@@ -4408,8 +4563,8 @@ mod tests {
             let bytes = Environment::decl_content_bytes(&info);
             assert_eq!(
                 row_usage(&info).canonical_bytes,
-                usize_to_u64(bytes.len()),
-                "the reported byte count must be the encoder's own length ({})",
+                modeled_canonical_bytes(&info),
+                "the reported byte count must be the stream plus each distinct node record ({})",
                 kind.label()
             );
             // And those bytes are the digest's preimage, not a parallel encoding.

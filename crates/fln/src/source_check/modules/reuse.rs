@@ -271,7 +271,11 @@ impl std::fmt::Display for ImportReuseRefusal {
     }
 }
 
-const RECORD_SCHEMA: &str = "fln.import-reuse-record/1";
+/// Version 2: the recorded roots are over Merkle `DeclContent` digests
+/// ("decl-content-dag/1", bead fln-merkle-decl-digest-80ni). A version-1 record's roots
+/// are over the retired tree digests, so it is refused by its schema line rather than
+/// left to fail on a root comparison.
+const RECORD_SCHEMA: &str = "fln.import-reuse-record/2";
 const RECORD_SEAL_PREFIX: &[u8] = b"fln.import-reuse-record-seal/1\0";
 /// The checker-row schemas a record can carry, one letter each: the `.olean` council's
 /// own and the independent checker's admission observation. An admission with a row of
@@ -1579,5 +1583,17 @@ mod tests {
         }
         assert!(ImportReuseRecord::parse(b"").is_err());
         assert!(ImportReuseRecord::parse(&[0xff; 64]).is_err());
+
+        // A pre-Merkle record differs only in its schema line and is correctly sealed,
+        // so it is refused for its format, not for damage.
+        let text = String::from_utf8(bytes).expect("records are UTF-8");
+        let body_end = text.trim_end_matches('\n').rfind('\n').expect("a seal line") + 1;
+        let old_body = text[..body_end].replacen(RECORD_SCHEMA, "fln.import-reuse-record/1", 1);
+        assert_ne!(old_body, text[..body_end]);
+        let old = format!("{old_body}seal {}\n", seal(old_body.as_bytes()).to_hex());
+        assert_eq!(
+            ImportReuseRecord::parse(old.as_bytes()),
+            Err(ImportReuseRefusal::Malformed("unknown schema"))
+        );
     }
 }
