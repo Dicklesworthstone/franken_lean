@@ -624,7 +624,12 @@ Compile-tested spikes and executed decisions; no W2–W12 interface freezes unti
 
 ### 22.3 The convergence gates
 
-**G1 — "The Independent Judge."** Marrow+Grimoire+Crucible check **every mathlib olean at the pin** with zero acceptance divergence against the Reference toolchain; PG-1 met; `fln check-olean` ships as a standalone auditor. The program's first public artifact is the strongest independent verification the Lean world has ever had — before FrankenLean has elaborated a single file.
+**G1 — "The Independent Judge."** Split into two gates by operator decision on 2026-10-05 (bead `fln-g1-gate-decision-rysb`), so the first public artifact is not held hostage by hardware:
+
+- **G1-correctness.** Marrow+Grimoire+Crucible decide **every module of the pinned toolchain library, mathlib and its dependency packages** — K1 plus the independent checker under the `release` policy — with zero acceptance divergence against the Reference toolchain; every non-accepted root is triaged against `leanchecker`, and the run is retained with the `fln` binary's identity; `fln check-olean` ships as a standalone auditor. The program's first public artifact is the strongest independent verification the Lean world has ever had — before FrankenLean has elaborated a single file.
+- **G1-performance (PG-1).** PG-1 measured with claim state `OBSERVED` on a declared, named host profile, its qualification failures stated. Ratification on the two bare-metal profiles of §19.1 is an open W1 obligation (`fln-544`), not a G1 prerequisite. *What this does not establish:* an `OBSERVED` PG-1 on a shared or unqualified host is not the ratified baseline, and no PG-1 figure is published as ratified until `fln-544` closes.
+
+G1 rests on the G0 spikes it actually uses (G0-1, G0-2, G0-5, G0-10). The Mirror and K2 spikes (G0-7, G0-8) gate the construction that depends on them, not the Judge.
 
 **G2 — "The Golem Wakes."** User-class compiled Lean code executes on Golem with `#eval`/IO/Task parity on the fixture corpus; Reference-built plugins load and run (ABI door, inbound); initialization ordering proven; PG-7 interpreter floor met on early corpora; the intrinsic census fully populated with fixtures.
 
