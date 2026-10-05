@@ -417,7 +417,11 @@ fn every_key_kind_decodes_and_forged_keys_refuse() {
         ]
     );
     // FrankenLean's own artifacts store no path; that instance is left unindexed.
-    assert!(read(&with_keys(vec![])).unwrap().instances[0].keys.is_empty());
+    assert!(
+        read(&with_keys(vec![])).unwrap().instances[0]
+            .keys
+            .is_empty()
+    );
     let head = || Obj::mk_ctor(4, vec![name("Decidable"), Obj::mk_nat(1)], &[]);
     for (why, forged) in [
         ("`lit` as a scalar", vec![head(), Obj::mk_nat(2)]),
