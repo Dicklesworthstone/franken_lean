@@ -39,6 +39,68 @@ struct Probe<'a> {
     incongruent: PairSet,
     /// The untyped converter's answers in this run (`PairAnswers`).
     answers: PairAnswers,
+    /// The local each binder and eta task opened (`OpenedLocals`).
+    opened: OpenedLocals,
+}
+/// The local each binder and eta task of one run opened, by the task's key.
+///
+/// A failed congruence attempt gives back the tasks it took, so a later
+/// decomposition opens the same binder pair again. On `MvPolynomial.degrees_def`
+/// (bead `fln-kiq3`) 42% of 48,000 descents repeated one already made. Each
+/// opened a fresh local, which made every pair below it new to `taken`,
+/// `answers` and `incongruent`, so a repeat cost as much as the first descent
+/// and the run never ended.
+///
+/// Opening the pair again at the local it was opened at before is opening it at
+/// a fresh local, so nothing the lane concludes changes: that local does not
+/// occur in the pair, since it was fresh for exactly this pair; it has the type
+/// the pair's binder gives it, as before; and it is reused only when the context
+/// does not already hold it. A local name thus still means one thing throughout
+/// the run, as `taken` and `answers` require.
+#[derive(Default)]
+struct OpenedLocals {
+    buckets: std::collections::HashMap<u64, Vec<(Taken, WireExpr, WireExpr, WireName)>>,
+    nodes: usize,
+}
+impl OpenedLocals {
+    /// The keys' share of memory, as for one `PairAnswers` generation. Past it
+    /// new tasks open fresh locals, as before.
+    const MAX_NODES: usize = 1 << 21;
+    fn get(
+        &self,
+        fingerprint: u64,
+        kind: Taken,
+        left: &WireExpr,
+        right: &WireExpr,
+    ) -> Option<&WireName> {
+        self.buckets
+            .get(&fingerprint)?
+            .iter()
+            .find(|(k, l, r, _)| *k == kind && l == left && r == right)
+            .map(|(_, _, _, name)| name)
+    }
+    fn insert(
+        &mut self,
+        fingerprint: u64,
+        kind: Taken,
+        left: &WireExpr,
+        right: &WireExpr,
+        name: WireName,
+    ) {
+        let nodes = left.nodes().len().saturating_add(right.nodes().len());
+        if self.nodes.saturating_add(nodes) > Self::MAX_NODES
+            || self.get(fingerprint, kind, left, right).is_some()
+        {
+            return;
+        }
+        self.buckets.entry(fingerprint).or_default().push((
+            kind,
+            left.clone(),
+            right.clone(),
+            name,
+        ));
+        self.nodes += nodes;
+    }
 }
 /// A set of term pairs, looked up without copying the terms.
 #[derive(Default)]
@@ -271,14 +333,58 @@ impl Probe<'_> {
                 .checked_add(1)
                 .ok_or_else(|| self.fault(InferenceFault::FreshLocalIdentityExhausted))?;
             if self.reserved.insert(name.clone()) {
-                let root = ExprId::from_index(0)
-                    .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
-                return Ok((
-                    name.clone(),
-                    WireExpr::from_parts(vec![ExprNode::Free { name }], vec![], root),
-                ));
+                let local = self.free_local(&name)?;
+                return Ok((name, local));
             }
         }
+    }
+    fn free_local(&self, name: &WireName) -> Result<WireExpr> {
+        let root = ExprId::from_index(0)
+            .ok_or_else(|| self.fault(InferenceFault::LiteralTypeAllocation))?;
+        Ok(WireExpr::from_parts(
+            vec![ExprNode::Free { name: name.clone() }],
+            vec![],
+            root,
+        ))
+    }
+    /// The local to open the binder or eta task `(kind, left, right)` at, and
+    /// `context` extended by it as an assumption of type `domain`: the local the
+    /// task opened before, unless `context` holds it (see `OpenedLocals`), else
+    /// a fresh one.
+    fn open_local(
+        &mut self,
+        kind: Taken,
+        left: &WireExpr,
+        right: &WireExpr,
+        domain: WireExpr,
+        context: &InferenceContext,
+    ) -> Result<(WireName, WireExpr, InferenceContext)> {
+        let fingerprint = PairSet::fingerprint(left, right);
+        let (name, local) = match self.opened.get(fingerprint, kind, left, right) {
+            Some(name) if context.local(name).is_none() => {
+                let name = name.clone();
+                self.tick()?;
+                let local = self.free_local(&name)?;
+                (name, local)
+            }
+            _ => {
+                let (name, local) = self.local()?;
+                self.opened
+                    .insert(fingerprint, kind, left, right, name.clone());
+                (name, local)
+            }
+        };
+        let mut locals = context.locals().to_vec();
+        locals.push(LocalDeclaration::assumption(name.clone(), domain));
+        let context = InferenceContext::new_with_projection_rules(
+            locals,
+            context.level_parameters().to_vec(),
+            context.projection_rules().to_vec(),
+            context.constants().clone(),
+        )
+        .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() }))?
+        .admitting(context.scope());
+        Ok((name, local, context))
     }
     fn infer(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<Option<WireExpr>> {
         let budget = self.budget;
@@ -1166,17 +1272,8 @@ impl Probe<'_> {
                     continue;
                 }
                 Work::Binders(left, right, lb, rb, domain, context) => {
-                    let (name, local) = self.local()?;
-                    let mut locals = context.locals().to_vec();
-                    locals.push(LocalDeclaration::assumption(name.clone(), domain));
-                    let context = InferenceContext::new_with_projection_rules(
-                        locals,
-                        context.level_parameters().to_vec(),
-                        context.projection_rules().to_vec(),
-                        context.constants().clone(),
-                    )
-                    .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name }))?
-                    .admitting(context.scope());
+                    let (_, local, context) =
+                        self.open_local(Taken::Binders, &left, &right, domain, &context)?;
                     let left = self.open(&left, lb, &local)?;
                     let right = self.open(&right, rb, &local)?;
                     work.push(Work::Pair(left, right, context));
@@ -1190,19 +1287,13 @@ impl Probe<'_> {
                     lambda_on_left,
                     context,
                 } => {
-                    let (name, local) = self.local()?;
-                    let mut locals = context.locals().to_vec();
-                    locals.push(LocalDeclaration::assumption(name.clone(), domain));
-                    let context = InferenceContext::new_with_projection_rules(
-                        locals,
-                        context.level_parameters().to_vec(),
-                        context.projection_rules().to_vec(),
-                        context.constants().clone(),
-                    )
-                    .map_err(|_| {
-                        self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() })
-                    })?
-                    .admitting(context.scope());
+                    let (name, local, context) = self.open_local(
+                        Taken::Eta(lambda_on_left),
+                        &lambda,
+                        &other,
+                        domain,
+                        &context,
+                    )?;
                     let opened = self.open(&lambda, body, &local)?;
                     let applied = self.apply_to_free(&other, name)?;
                     let (left, right) = if lambda_on_left {
@@ -1629,6 +1720,7 @@ pub(crate) fn proof_conversion_with(
         next: 0,
         incongruent: PairSet::default(),
         answers: PairAnswers::default(),
+        opened: OpenedLocals::default(),
     };
     match probe.run(left, right, context, true) {
         Ok(equal) => ProofConversionOutcome::Complete {

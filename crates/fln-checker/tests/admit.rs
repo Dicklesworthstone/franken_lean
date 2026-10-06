@@ -32,6 +32,8 @@ mod quotient_computation;
 mod recursor_conversion;
 #[path = "admit/reduced_telescopes.rs"]
 mod reduced_telescopes;
+#[path = "admit/repeated_descent.rs"]
+mod repeated_descent;
 #[path = "admit/structure_eta.rs"]
 mod structure_eta;
 #[path = "admit/unit_like.rs"]
