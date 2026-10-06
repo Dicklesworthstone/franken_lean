@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":578,"projection_hash":"76469337aaa5b8f21f77ccec21fefdd8ababca056a9f51f3856f9cd20f393977"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":579,"projection_hash":"8d7ca21b9077a5a98313754cc401d87006d6fec6cbbc0c7a6012daabf3f4c196"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -87,6 +87,7 @@
 {"id":"fln-attribute-native-state-m7l"}
 {"id":"fln-attribute-real-fixtures-epj"}
 {"id":"fln-attribute-state-census-h14"}
+{"id":"fln-azxg"}
 {"id":"fln-bench-apparatus-empty-referent-bkw6"}
 {"id":"fln-boundary-api-no-admission-argument-discarded-ez07"}
 {"id":"fln-bz4h"}
