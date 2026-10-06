@@ -1370,6 +1370,455 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
 const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
 const PINNED_DECODED_DECL_FLOOR: u64 = 215_136;
 const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 211_524;
+/// The rows of the pinned present-olean corpus that the inventory counts
+/// oracle-applicable but the differential cannot compare, as
+/// `(module, declaration, reason)`. Every one is an auto-generated theorem
+/// (`eq_N`, `eq_def`, `congr_simp`, `induct_unfolding`) that a second module
+/// declares again; the Reference's replay keeps it once, so the repeat gets no
+/// verdict (`reference_replay_duplicate_theorem`, the typing that closed
+/// `franken_lean-sxsk`). Measured at `c43130c9`: 211,462 compared + these 62 =
+/// the inventory's 211,524 (bead `fln-hvrk`, comment 3229).
+///
+/// The differential checks this set EXACTLY and checks that conservation (see
+/// [`check_context_skip_census`]), so its compared floor is not a lowered
+/// number: a new non-comparable row, a row that stops being one, and a row
+/// silently dropped from comparison each fail.
+const PINNED_REPLAY_DUPLICATE_THEOREM_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "Init.Data.Array.Int",
+        "List.max.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Int",
+        "List.min.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Nat",
+        "List.max.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Nat",
+        "List.min.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.OfFn",
+        "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Iterators.Lemmas.Combinators.FlatMap",
+        "Std.Iter.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "Option.guard.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Nat.InsertIdx",
+        "List.insertIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Nat.Modify",
+        "List.modify.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Perm",
+        "List.insertIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Nat.Sqrt.Basic",
+        "dite.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Option.Attach",
+        "Option.toList.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Option.Attach",
+        "Option.toList.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Range.Polymorphic.UInt",
+        "BitVec.ofNatLT.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Basic",
+        "False.elim.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.revSkipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.revSkipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.skipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.skipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Split.Char",
+        "String.Slice.Pattern.Model.split._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Split.Char",
+        "String.Slice.Pattern.Model.split.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.revSkipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.revSkipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.skipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.skipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Modify",
+        "String.Pos.byte.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Search",
+        "String.pos.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Substring",
+        "String.pos.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.GetElem",
+        "dite.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "Array.anyM.loop.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "Array.foldlM.loop.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lake.Util.Version",
+        "String.Slice.mk.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lean.Compiler.NameMangling",
+        "Eq.ndrec_symm.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lean.Elab.Tactic.Omega.MinNatAbs",
+        "Ne.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Balancing",
+        "False.elim.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Operations",
+        "cast.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Zipper",
+        "Std.IterM.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Internal.List.Associative",
+        "cast.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Iterators.Lemmas.Combinators.Monadic.TakeWhile",
+        "Std.IterM.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Iterators.Lemmas.Equivalence.StepCongr",
+        "Quot.lift.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+];
+
+/// The rows a lane could not compare although its inventory counts them
+/// oracle-applicable, against the lane's declared set: the two sets must be
+/// equal, and `compared` plus the declared rows must equal `applicable`. A row
+/// dropped from comparison for any other reason breaks the second law, so it
+/// cannot hide behind the first. The error names every row on either side.
+fn check_context_skip_census(
+    expected: &[(&str, &str, &str)],
+    observed: &[(String, String, &'static str)],
+    compared: u64,
+    applicable: u64,
+) -> Result<(), String> {
+    let expected = expected
+        .iter()
+        .map(|(module, declaration, reason)| {
+            (
+                (*module).to_string(),
+                (*declaration).to_string(),
+                (*reason).to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let observed_set = observed
+        .iter()
+        .map(|(module, declaration, reason)| {
+            (module.clone(), declaration.clone(), (*reason).to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut findings = Vec::new();
+    if observed_set.len() != observed.len() {
+        findings.push(format!(
+            "{} observed rows are repeats of another observed row",
+            observed.len() - observed_set.len()
+        ));
+    }
+    let unexpected = observed_set.difference(&expected).collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        findings.push(format!(
+            "{} rows the run could not compare are not declared: {unexpected:?}",
+            unexpected.len()
+        ));
+    }
+    let missing = expected.difference(&observed_set).collect::<Vec<_>>();
+    if !missing.is_empty() {
+        findings.push(format!(
+            "{} declared rows were not among those the run could not compare: {missing:?}",
+            missing.len()
+        ));
+    }
+    let declared = expected.len() as u64;
+    if compared.checked_add(declared) != Some(applicable) {
+        findings.push(format!(
+            "compared {compared} + declared non-comparable {declared} != applicable \
+             {applicable}: rows left comparison for an undeclared reason"
+        ));
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings.join("; "))
+    }
+}
+
+#[test]
+fn the_context_skip_census_accepts_exactly_its_declared_rows() {
+    let declared: &[(&str, &str, &str)] = &[
+        ("M", "a.eq_1", "reference_replay_duplicate_theorem"),
+        ("N", "b.congr_simp", "reference_replay_duplicate_theorem"),
+    ];
+    let observed = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .map(|(module, declaration)| {
+                (
+                    (*module).to_string(),
+                    (*declaration).to_string(),
+                    "reference_replay_duplicate_theorem",
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let both = observed(&[("M", "a.eq_1"), ("N", "b.congr_simp")]);
+    assert_eq!(check_context_skip_census(declared, &both, 98, 100), Ok(()));
+    // A row dropped from comparison for an undeclared reason.
+    let finding = check_context_skip_census(declared, &both, 97, 100)
+        .expect_err("a compared row lost elsewhere must fail");
+    assert!(
+        finding.contains("97 + declared non-comparable 2 != applicable 100"),
+        "{finding}"
+    );
+    // A new non-comparable row the lane has not declared.
+    let extra = observed(&[("M", "a.eq_1"), ("N", "b.congr_simp"), ("O", "c.eq_def")]);
+    let finding = check_context_skip_census(declared, &extra, 97, 100)
+        .expect_err("an undeclared non-comparable row must fail");
+    assert!(
+        finding.contains("c.eq_def") && finding.contains("not declared"),
+        "{finding}"
+    );
+    // A declared row the run compared after all (the set shrank).
+    let fewer = observed(&[("M", "a.eq_1")]);
+    let finding = check_context_skip_census(declared, &fewer, 99, 100)
+        .expect_err("a declared row that stopped being non-comparable must fail");
+    assert!(
+        finding.contains("b.congr_simp") && finding.contains("were not among"),
+        "{finding}"
+    );
+    // The same name in another module is another row.
+    let moved = observed(&[("M", "a.eq_1"), ("O", "b.congr_simp")]);
+    assert!(check_context_skip_census(declared, &moved, 98, 100).is_err());
+}
+
+/// The declared rows are the measured ones: 62, all typed as replay
+/// duplicates, none listed twice, and their count closes the gap between the
+/// inventory's applicable floor and the differential's compared floor.
+#[test]
+fn the_declared_replay_duplicate_rows_are_well_formed() {
+    let rows = PINNED_REPLAY_DUPLICATE_THEOREM_ROWS;
+    assert_eq!(rows.len(), 62, "the measured set at c43130c9 has 62 rows");
+    assert!(
+        rows.iter()
+            .all(|(_, _, reason)| *reason == "reference_replay_duplicate_theorem")
+    );
+    let distinct = rows.iter().collect::<BTreeSet<_>>();
+    assert_eq!(distinct.len(), rows.len(), "a row is declared twice");
+}
 /// Anti-vacuity floor for the retained v1 matrix observation. That observation
 /// predates module-part decoding and therefore measured the 158,608 declarations
 /// visible in public `.olean` regions. It remains historical bounded-model evidence,
@@ -3720,7 +4169,7 @@ fn score_accepted_reference_module(
     shadowed: &HashSet<usize>,
     prep: &PreparedReplay,
     run: &MatrixRun,
-) -> CorpusCounts {
+) -> (CorpusCounts, Vec<(String, String, &'static str)>) {
     assert_eq!(
         prep.items.len(),
         run.outcomes.len(),
@@ -3862,6 +4311,10 @@ fn score_accepted_reference_module(
             oracle_omitted.iter().take(5).collect::<Vec<_>>()
         );
     }
+    let oracle_context_skips = oracle_omitted
+        .iter()
+        .map(|(declaration, reason)| (module.name.clone(), declaration.clone(), *reason))
+        .collect();
     if !subject_omitted.is_empty() {
         counts.unscorable += subject_omitted.len() as u64;
         counts.subject_no_answer += subject_omitted.len() as u64;
@@ -3883,7 +4336,7 @@ fn score_accepted_reference_module(
         );
     }
     counts.assert_conservation(&module.name);
-    counts
+    (counts, oracle_context_skips)
 }
 
 #[test]
@@ -15301,6 +15754,7 @@ fn whole_mathlib_kernel_differential() {
                 seed_modules,
                 receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
             }),
+            expected_context_skips: None,
         },
     );
 }
@@ -15308,14 +15762,20 @@ fn whole_mathlib_kernel_differential() {
 /// The executable corpus obligation. Oracle-skipped unsafe/partial rows are a
 /// 7odd-classified bound on the Reference replay filter, not a harness
 /// failure; they are named per declaration and excluded from the compared
-/// denominator. The remaining `subject_no_answer` rows are owned by
-/// `fln-4hol`. Enabling this gate while those remain would make every
-/// ordinary `cargo test` unusable. Run explicitly:
+/// denominator. The rows the run cannot compare beyond those are declared
+/// exactly in [`PINNED_REPLAY_DUPLICATE_THEOREM_ROWS`].
 ///
-/// `cargo test -p fln-conformance --test kernel_replay \
+/// At `c43130c9` K1 answered every compared row (`subject_no_answer=0`, 0
+/// disagreements; bead `fln-hvrk`, comment 3229), so it is no longer ignored for
+/// `fln-4hol`'s non-answers. It stays ignored for its cost: about 23 minutes in
+/// a release build on a 64-way host, the pinned Reference library is required,
+/// and the leanchecker oracle alone takes about 260 s of its 300 s budget. Run
+/// explicitly:
+///
+/// `cargo test --release -p fln-conformance --test kernel_replay \
 ///  pinned_present_olean_kernel_differential -- --ignored --exact --nocapture`
 #[test]
-#[ignore = "remaining subject_no_answer rows are owned by fln-4hol; 7odd-classified oracle skips are reported per declaration and are not a gate failure"]
+#[ignore = "costs about 23 minutes (release) and needs the pinned Reference library; 7odd-classified oracle skips are reported per declaration and are not a gate failure"]
 fn pinned_present_olean_kernel_differential() {
     let reference_lib =
         reference_lib().expect("pinned Reference stdlib required for the live corpus differential");
@@ -15331,12 +15791,14 @@ fn pinned_present_olean_kernel_differential() {
         CorpusDifferentialScope {
             module_floor: PINNED_PRESENT_OLEAN_FLOOR,
             decoded_floor: PINNED_DECODED_DECL_FLOOR,
-            compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR,
+            compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR
+                - PINNED_REPLAY_DUPLICATE_THEOREM_ROWS.len() as u64,
             oracle_total_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             oracle_process_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             oracle_modules_per_process: usize::MAX,
             label: "pinned-reference-library",
             receipt: None,
+            expected_context_skips: Some(PINNED_REPLAY_DUPLICATE_THEOREM_ROWS),
         },
     );
 }
@@ -15354,6 +15816,10 @@ struct CorpusDifferentialScope {
     /// `SUITE.lock`'s corpus commit would name a revision it never read, and a
     /// receipt whose provenance field is about another input is worse than none.
     receipt: Option<CorpusReceiptSpec>,
+    /// `Some` for a lane that declares, by module and declaration, every row its
+    /// inventory counts oracle-applicable but the run cannot compare; see
+    /// [`check_context_skip_census`].
+    expected_context_skips: Option<&'static [(&'static str, &'static str, &'static str)]>,
 }
 
 /// What a receipt-retaining lane must name about itself before it may file a row.
@@ -15387,6 +15853,7 @@ fn run_accepted_corpus_kernel_differential(
         oracle_modules_per_process,
         label: corpus_label,
         receipt: receipt_spec,
+        expected_context_skips,
     } = scope;
     let started = Instant::now();
     assert!(
@@ -15480,6 +15947,7 @@ fn run_accepted_corpus_kernel_differential(
         .collect::<HashMap<_, _>>();
     let mut states = BTreeMap::<String, CorpusFixtureState>::new();
     let mut total = CorpusCounts::default();
+    let mut oracle_context_skips = Vec::new();
     for (index, module_name) in order.iter().enumerate() {
         let module = &inventory.modules[module_name];
         let decoded_module = decode_corpus_module(&module.path, &module.name)
@@ -15552,18 +16020,17 @@ fn run_accepted_corpus_kernel_differential(
             // CLAIM-CLASS row below and in the matrix test's own census.
             let threads = CORPUS_CENSUS_WIDTH;
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
-            (
-                score_accepted_reference_module(
-                    module,
-                    &infos,
-                    &active_infos,
-                    &active_to_decoded,
-                    &shadowed,
-                    &prep,
-                    &run,
-                ),
-                run.stream_digest,
-            )
+            let (counts, context_skips) = score_accepted_reference_module(
+                module,
+                &infos,
+                &active_infos,
+                &active_to_decoded,
+                &shadowed,
+                &prep,
+                &run,
+            );
+            oracle_context_skips.extend(context_skips);
+            (counts, run.stream_digest)
         } else {
             let dynamic_oracle_skips = shadowed
                 .iter()
@@ -15739,6 +16206,14 @@ fn run_accepted_corpus_kernel_differential(
         }
     }
 
+    if let Some(expected) = expected_context_skips {
+        let applicable = inventory.decoded - inventory.oracle_skipped;
+        if let Err(finding) =
+            check_context_skip_census(expected, &oracle_context_skips, total.compared, applicable)
+        {
+            panic!("{corpus_label}: {finding}");
+        }
+    }
     assert!(
         total.compared >= compared_floor,
         "kernel differential coverage silently stopped: {} < {} scoreable declarations",
@@ -15775,8 +16250,8 @@ fn run_accepted_corpus_kernel_differential(
 ///
 /// **No oracle is involved, deliberately.** Comparing our own stream digests across widths
 /// needs no Reference verdict at all, so this lane is reachable while
-/// `pinned_present_olean_kernel_differential` stays ignored for `fln-4hol`'s
-/// remaining subject non-answers. Removing that attribute to get a
+/// `pinned_present_olean_kernel_differential` stays ignored for its cost. Removing that
+/// attribute to get a
 /// matrix running would have coupled the matrix half to the oracle half for no reason.
 ///
 /// **What a green run earns, stated because the whole bead is about not overclaiming.**
