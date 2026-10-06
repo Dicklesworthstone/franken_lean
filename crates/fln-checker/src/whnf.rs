@@ -1063,6 +1063,8 @@ struct Reducer<'a, 'c> {
     /// This run's materialized input, which a result that changed nothing
     /// reuses (`Reducer::unchanged_input`).
     entry: Option<Arc<WireExpr>>,
+    /// Whether the result is this module's own copy of a term (`WhnfInput::Copied`).
+    copied_result: bool,
 }
 
 /// The reported-progress counters when a recursor frame starts normalizing
@@ -3251,27 +3253,43 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
     }
 
-    fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
-        let current = self.materialize_term(input, root, WhnfPhase::Initial)?;
+    /// The result, and whether its term is this module's own copy of a term.
+    fn run(mut self, input: WhnfInput<'_>, root: ExprId) -> Result<(WhnfResult, bool), Halt> {
+        let current = match input {
+            // The copy would reproduce this arena node for node (the copy is
+            // idempotent: `tests::the_input_copy_reproduces_its_own_output`),
+            // and could not stop on its budget, so it is taken as is (bead
+            // `fln-checker-associator-time-y8wc`, comment 3170). The step the
+            // copy charges first is still charged.
+            WhnfInput::Copied(arena)
+                if root == arena.root()
+                    && copy_cannot_stop(arena, self.control.budget.materialization) =>
+            {
+                self.control.step(root.index(), self.cancelled)?;
+                Cursor::closed(Arc::clone(arena), root)
+            }
+            WhnfInput::Copied(arena) => self.materialize_term(arena, root, WhnfPhase::Initial)?,
+            WhnfInput::Borrowed(term) => self.materialize_term(term, root, WhnfPhase::Initial)?,
+        };
         self.entry = Some(Arc::clone(&current.arena));
         let Some(memo) = self.context.source.memo() else {
             return self.normalize(current);
         };
         let (delta_mode, budget) = (self.delta_mode, self.control.budget);
-        if let Some(result) = memo.recall(&current.arena, delta_mode, &budget) {
-            return Ok(result);
+        if let Some(remembered) = memo.recall(&current.arena, delta_mode, &budget) {
+            return Ok(remembered);
         }
         let input = Arc::clone(&current.arena);
-        let result = self.normalize(current)?;
-        memo.remember(input, delta_mode, budget.materialization, &result);
-        Ok(result)
+        let (result, copied) = self.normalize(current)?;
+        memo.remember(input, delta_mode, budget.materialization, &result, copied);
+        Ok((result, copied))
     }
 
     /// The reduction loop. Out of line so the initial materialization in `run`
     /// executes on a small frame: unoptimized, this loop's frame is about 11 KiB,
     /// and the 64 KiB stack tests reach materialization from inside inference.
     #[inline(never)]
-    fn normalize(mut self, mut current: Cursor) -> Result<WhnfResult, Halt> {
+    fn normalize(mut self, mut current: Cursor) -> Result<(WhnfResult, bool), Halt> {
         let mut pending_arguments = VecDeque::<Cursor>::new();
         let mut frames = Vec::new();
 
@@ -3496,7 +3514,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     current = next.head;
                     pending_arguments = next.args;
                 }
-                Resumed::Stuck(stuck) => return self.finish(stuck),
+                Resumed::Stuck(stuck) => {
+                    let result = self.finish(stuck)?;
+                    return Ok((result, self.copied_result));
+                }
             }
         }
     }
@@ -3750,11 +3771,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     self.control.step(stuck.head.root.index(), self.cancelled)?;
                 }
                 self.control.step(input.root().index(), self.cancelled)?;
+                // The input is the input copy's output, or a copied term taken
+                // as is because it is one.
+                self.copied_result = true;
                 WireExpr::clone(&input)
             }
             None => {
                 let current = self.build_spine(stuck)?;
                 if current.env.is_empty() {
+                    self.copied_result = true;
                     self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?
                 } else {
                     self.close(&current, WhnfPhase::Final)?
@@ -4892,11 +4917,106 @@ fn whnf_at_mode_with(
     head_nat: NatReductionScope,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
+    whnf_input_at_mode_with(
+        WhnfInput::Borrowed(term),
+        root,
+        context,
+        budget,
+        delta_mode,
+        head_nat,
+        cancelled,
+    )
+    .0
+}
+
+/// A term to reduce. `Copied` is this module's own copy of a term: the input
+/// copy's output or the final copy's, as a result flagged copied reports. Copying
+/// such an arena from its root reproduces it node for node, so `Reducer::run`
+/// takes it as is when the copy could not have stopped. Only a flag this module
+/// returned may mark a term copied.
+#[derive(Clone, Copy)]
+pub(crate) enum WhnfInput<'a> {
+    Borrowed(&'a WireExpr),
+    Copied(&'a Arc<WireExpr>),
+}
+
+/// Whether copying `arena` from its root is sure to complete under `budget`.
+/// A pure copy visits each expression node and each level at most once, charging
+/// one step and that node's owned units for each and adding at most one output
+/// node, so these sums bound everything it can charge.
+fn copy_cannot_stop(arena: &WireExpr, budget: TermBudget) -> bool {
+    let items = u64::try_from(arena.nodes().len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(arena.levels().len()).unwrap_or(u64::MAX));
+    if items > budget.max_steps || items > budget.max_arena_nodes.min(u64::from(u32::MAX)) {
+        return false;
+    }
+    if budget.max_output_units == u64::MAX {
+        return true;
+    }
+    let units = arena
+        .nodes()
+        .iter()
+        .map(expression_owned_units)
+        .chain(arena.levels().iter().map(level_owned_units))
+        .fold(0_u64, u64::saturating_add);
+    units <= budget.max_output_units
+}
+
+/// The weak head normal form without delta (`whnf_core_at_with`), and whether
+/// its term is this module's own copy of a term.
+pub(crate) fn whnf_core_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> (WhnfOutcome, bool) {
+    whnf_input_at_mode_with(
+        input,
+        root,
+        context,
+        budget,
+        DeltaMode::Disabled,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
+}
+
+/// One delta step (`whnf_delta_step_at_with`), and whether its term is this
+/// module's own copy of a term.
+pub(crate) fn whnf_delta_step_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> (WhnfOutcome, bool) {
+    whnf_input_at_mode_with(
+        input,
+        root,
+        context,
+        budget,
+        DeltaMode::Once,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
+}
+
+fn whnf_input_at_mode_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> (WhnfOutcome, bool) {
     let mut control = Control::new(budget);
     let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
         Ok(prepared) => prepared,
         Err(halt) => {
-            return outcome(Err(halt));
+            return (outcome(Err(halt)), false);
         }
     };
     let reducer = Reducer {
@@ -4919,13 +5039,279 @@ fn whnf_at_mode_with(
         bodies: std::collections::HashMap::new(),
         keyed_thunks: std::collections::HashMap::new(),
         entry: None,
+        copied_result: false,
     };
-    outcome(reducer.run(term, root))
+    match reducer.run(input, root) {
+        Ok((result, copied)) => (outcome(Ok(result)), copied),
+        Err(halt) => (outcome(Err(halt)), false),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::BinderStyle;
+
+    fn text(name: &str) -> WireName {
+        WireName::from_parts(vec![NamePart::Text(name.to_owned())])
+    }
+
+    /// Appends `node` and returns its id.
+    fn push(nodes: &mut Vec<ExprNode>, node: ExprNode) -> ExprId {
+        nodes.push(node);
+        ExprId::from_index(nodes.len() - 1).expect("small arena")
+    }
+
+    /// `(fun y => y) (g (g ... (g x)))`, `depth` applications of free `g`.
+    fn identity_over_tower(depth: usize) -> WireExpr {
+        let mut nodes = Vec::new();
+        let mut tower = push(&mut nodes, ExprNode::Free { name: text("x") });
+        let g = push(&mut nodes, ExprNode::Free { name: text("g") });
+        for _ in 0..depth {
+            tower = push(
+                &mut nodes,
+                ExprNode::Apply {
+                    function: g,
+                    argument: tower,
+                },
+            );
+        }
+        let domain = push(&mut nodes, ExprNode::Free { name: text("A") });
+        let body = push(&mut nodes, ExprNode::Bound { index: 0 });
+        let identity = push(
+            &mut nodes,
+            ExprNode::Lambda {
+                binder_name: text("y"),
+                binder_type: domain,
+                body,
+                style: BinderStyle::Default,
+            },
+        );
+        let root = push(
+            &mut nodes,
+            ExprNode::Apply {
+                function: identity,
+                argument: tower,
+            },
+        );
+        WireExpr::from_parts(nodes, Vec::new(), root)
+    }
+
+    fn core_with_polls(
+        input: WhnfInput<'_>,
+        root: ExprId,
+        budget: WhnfBudget,
+    ) -> (WhnfOutcome, bool, u64) {
+        let mut polls = 0_u64;
+        let (outcome, copied) =
+            whnf_core_of_with(input, root, &WhnfContext::default(), budget, &mut || {
+                polls += 1;
+                false
+            });
+        (outcome, copied, polls)
+    }
+
+    /// A result the module reports as its own copy is normalized again without
+    /// the input copy, and nothing else changes: the same outcome, steps
+    /// included (bead `fln-checker-associator-time-y8wc`, comment 3170).
+    #[test]
+    fn a_copied_result_is_normalized_again_without_the_input_copy() {
+        let redex = identity_over_tower(2_000);
+        let (outcome, copied, _) = core_with_polls(
+            WhnfInput::Borrowed(&redex),
+            redex.root(),
+            WhnfBudget::unlimited(),
+        );
+        let WhnfOutcome::Complete(result) = outcome else {
+            panic!("the redex reduces: {outcome:?}");
+        };
+        assert!(
+            copied,
+            "a result built by the final copy is the module's copy"
+        );
+        let tower = Arc::new(result.term);
+        let nodes = u64::try_from(tower.nodes().len()).expect("small");
+
+        let (borrowed, borrowed_copied, borrowed_polls) = core_with_polls(
+            WhnfInput::Borrowed(&tower),
+            tower.root(),
+            WhnfBudget::unlimited(),
+        );
+        let (taken, taken_copied, taken_polls) = core_with_polls(
+            WhnfInput::Copied(&tower),
+            tower.root(),
+            WhnfBudget::unlimited(),
+        );
+        assert_eq!(taken, borrowed, "the same outcome, steps included");
+        assert_eq!(taken_copied, borrowed_copied);
+        // Measured on 2,002 nodes: 4,011 polls copying the input, 7 without.
+        assert!(
+            taken_polls + nodes < borrowed_polls,
+            "{taken_polls} polls taking a {nodes}-node copied term against {borrowed_polls} \
+             copying it: the input copy was not skipped"
+        );
+    }
+
+    /// The input copy is skipped only when it could not have stopped. Under a
+    /// materialization budget it would exceed, a copied term is copied, and stops
+    /// exactly as a borrowed one does.
+    #[test]
+    fn a_copied_term_is_still_copied_when_the_copy_could_stop() {
+        let redex = identity_over_tower(50);
+        let (outcome, _, _) = core_with_polls(
+            WhnfInput::Borrowed(&redex),
+            redex.root(),
+            WhnfBudget::unlimited(),
+        );
+        let WhnfOutcome::Complete(result) = outcome else {
+            panic!("the redex reduces: {outcome:?}");
+        };
+        let tower = Arc::new(result.term);
+        let tight = WhnfBudget::new(u64::MAX, u64::MAX, TermBudget::new(10, u64::MAX));
+        let (borrowed, _, _) = core_with_polls(WhnfInput::Borrowed(&tower), tower.root(), tight);
+        let (taken, _, _) = core_with_polls(WhnfInput::Copied(&tower), tower.root(), tight);
+        assert!(
+            matches!(
+                borrowed,
+                WhnfOutcome::Inconclusive(WhnfStop::Materialization { .. })
+            ),
+            "the control: the input copy stops on this budget: {borrowed:?}"
+        );
+        assert_eq!(taken, borrowed);
+    }
+
+    /// The input copy reproduces its own output node for node, levels included,
+    /// which is what lets `Reducer::run` take a copied term as is. The input
+    /// here is not a copy: it carries an unreachable node, its levels are out of
+    /// reference order, and a subterm and a level are shared.
+    #[test]
+    fn the_input_copy_reproduces_its_own_output() {
+        let level = |index: usize| LevelId::from_index(index).expect("small");
+        let levels = vec![
+            LevelNode::Parameter(text("u")),
+            LevelNode::Zero,
+            LevelNode::Succ(level(1)),
+            LevelNode::Max(level(2), level(0)),
+        ];
+        let mut nodes = Vec::new();
+        let _unreachable = push(&mut nodes, ExprNode::Free { name: text("lost") });
+        let sort = push(&mut nodes, ExprNode::Sort { level: level(3) });
+        let head = push(
+            &mut nodes,
+            ExprNode::Constant {
+                name: text("c"),
+                levels: vec![level(0), level(3)],
+            },
+        );
+        let shared = push(
+            &mut nodes,
+            ExprNode::Apply {
+                function: head,
+                argument: sort,
+            },
+        );
+        let body = push(&mut nodes, ExprNode::Bound { index: 0 });
+        let binder = push(
+            &mut nodes,
+            ExprNode::Lambda {
+                binder_name: text("y"),
+                binder_type: shared,
+                body,
+                style: BinderStyle::Implicit,
+            },
+        );
+        let twice = push(
+            &mut nodes,
+            ExprNode::Apply {
+                function: shared,
+                argument: shared,
+            },
+        );
+        let root = push(
+            &mut nodes,
+            ExprNode::Apply {
+                function: binder,
+                argument: twice,
+            },
+        );
+        let input = WireExpr::from_parts(nodes, levels, root);
+        let copy = |term: &WireExpr| match copy_subterm_with(
+            term,
+            term.root(),
+            TermBudget::unlimited(),
+            &mut || false,
+        ) {
+            TermOutcome::Complete(copy) => copy,
+            other => panic!("the copy completes: {other:?}"),
+        };
+        let once = copy(&input);
+        assert_ne!(once, input, "the control: the input is not already a copy");
+        assert_eq!(copy(&once), once);
+        // And for the outputs of the module's own reductions.
+        let redex = identity_over_tower(30);
+        let (outcome, copied, _) = core_with_polls(
+            WhnfInput::Borrowed(&redex),
+            redex.root(),
+            WhnfBudget::unlimited(),
+        );
+        let WhnfOutcome::Complete(result) = outcome else {
+            panic!("the redex reduces: {outcome:?}");
+        };
+        assert!(copied);
+        assert_eq!(copy(&result.term), result.term);
+    }
+
+    /// Only the input copy's and the final copy's outputs are reported as the
+    /// module's copy. A term built under an environment (`Reducer::close`) is
+    /// not one, so it is never taken as is.
+    #[test]
+    fn a_result_built_under_an_environment_is_not_reported_as_a_copy() {
+        // `(fun x => fun y => x) a` reduces to `fun y => a`, a lambda under the
+        // environment that binds `x`.
+        let mut nodes = Vec::new();
+        let a = push(&mut nodes, ExprNode::Free { name: text("a") });
+        let domain = push(&mut nodes, ExprNode::Free { name: text("A") });
+        let x = push(&mut nodes, ExprNode::Bound { index: 1 });
+        let inner = push(
+            &mut nodes,
+            ExprNode::Lambda {
+                binder_name: text("y"),
+                binder_type: domain,
+                body: x,
+                style: BinderStyle::Default,
+            },
+        );
+        let outer = push(
+            &mut nodes,
+            ExprNode::Lambda {
+                binder_name: text("x"),
+                binder_type: domain,
+                body: inner,
+                style: BinderStyle::Default,
+            },
+        );
+        let root = push(
+            &mut nodes,
+            ExprNode::Apply {
+                function: outer,
+                argument: a,
+            },
+        );
+        let redex = WireExpr::from_parts(nodes, Vec::new(), root);
+        let (outcome, copied, _) =
+            core_with_polls(WhnfInput::Borrowed(&redex), root, WhnfBudget::unlimited());
+        assert!(
+            matches!(&outcome, WhnfOutcome::Complete(result) if matches!(
+                result.term.node(result.term.root()),
+                Some(ExprNode::Lambda { .. })
+            )),
+            "the redex reduces to a lambda: {outcome:?}"
+        );
+        assert!(
+            !copied,
+            "a term built under an environment is not the module's copy"
+        );
+    }
 
     #[test]
     fn private_arena_corruption_is_an_internal_fault() {
