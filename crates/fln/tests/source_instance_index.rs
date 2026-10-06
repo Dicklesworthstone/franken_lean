@@ -149,6 +149,50 @@ fn admitted(env: &Environment, goal: &Expr) -> (BTreeSet<String>, usize) {
     (names, audit.candidates.len())
 }
 
+/// A numeral argument keys as its literal (bead `fln-eeew`). On `Init.Data.NeZero`'s
+/// closure the pin offers nothing for `NeZero 10`: with `prelude`, `import
+/// Init.Data.NeZero` and `set_option trace.Meta.synthInstance true`, `#synth NeZero
+/// (10 : Nat)` traces `[Meta.synthInstance.instances] #[]`. The closure's `NeZero`
+/// instances (for `if`, `n + m` twice and `n * m`) are keyed by `ite`, `HAdd.hAdd` and
+/// `HMul.hMul`, never by a literal. `OfNat.ofNat` has no recorded status here; the pin's
+/// is semireducible, so its `reduce` keeps the numeral whole and `toNatLit?` keys it as
+/// `10`. Querying the numeral's unfolding as well, a projection and so a star, offered
+/// every one of them.
+#[test]
+fn a_numeral_argument_narrows_as_its_literal_under_init_data_nezero() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    on_stack(move || {
+        let engine = import_closure(&lib, "Init.Data.NeZero");
+        let literal = |value: u64| Expr::lit(Literal::Nat(NatLit::from_u64(value)));
+        let numeral = |value: u64| {
+            [
+                constant("Nat", 0),
+                literal(value),
+                Expr::app(constant("instOfNatNat", 0), literal(value)),
+            ]
+            .into_iter()
+            .fold(constant("OfNat.ofNat", 1), Expr::app)
+        };
+        let zero = Expr::app(
+            Expr::app(constant("Zero.ofOfNat0", 1), constant("Nat", 0)),
+            Expr::app(constant("instOfNatNat", 0), literal(0)),
+        );
+        let goal = [constant("Nat", 0), zero, numeral(10)]
+            .into_iter()
+            .fold(constant("NeZero", 1), Expr::app);
+        let (names, total) = admitted(engine.environment(), &goal);
+        eprintln!("NeZero 10 under Init.Data.NeZero: {total} candidates, admitted {names:?}");
+        assert_eq!(names, BTreeSet::new(), "the pin offers none");
+        assert!(
+            total >= 4,
+            "the class has the closure's NeZero instances: {total}"
+        );
+    });
+}
+
 /// Against `Init.Core`, the pin returns `Nat.decLt` alone for both `n < 5` and
 /// `n > 5` (`GT.gt` is reducible, so the pin keys `5 < n`), out of every
 /// `Decidable` instance in the closure. And `if n < 5` asks for that decision as
