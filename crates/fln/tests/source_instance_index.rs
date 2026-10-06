@@ -11,11 +11,12 @@
 #![forbid(unsafe_code)]
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    BinderInfo, Budget, Engine, EngineAdmissionLimits, Environment, Expr, KVMap, Level, Literal,
-    Name, NatLit, OleanCheckLimits, OleanDecodeLimits, OleanModuleInput, Outcome,
+    BinderInfo, Budget, Engine, EngineAdmissionLimits, Environment, Expr, ExprNode, KVMap, Level,
+    Literal, Name, NatLit, OleanCheckLimits, OleanDecodeLimits, OleanModuleInput, Outcome,
     SourceCheckLimits, olean_module_imports,
 };
-use fln_elab::source::inspect::{Selection, audit_instance_goal};
+use fln_elab::source::inspect::{Choice, Selection, audit_instance_goal};
+use fln_env::constants::ConstantInfo;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -370,5 +371,188 @@ fn the_filter_keeps_every_candidate_the_selection_step_applies_under_init_core()
             goals > 100 && kept < candidates,
             "{goals} goals, {kept} of {candidates}"
         );
+    });
+}
+
+/// One goal of a pin-extracted instance-choice fixture
+/// (`scripts/extract/gen_instance_choices.sh`).
+struct PinChoice {
+    goal: String,
+    /// `getInstances` for the goal, in the array's order; the pin tries it from the end.
+    offered: Vec<String>,
+    /// The pin's selected instance, or `None` when its search has no answer.
+    chosen: Option<String>,
+}
+
+fn pin_choices(module: &str) -> Vec<PinChoice> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/instance_choices")
+        .join(format!("{module}.tsv"));
+    let text = std::fs::read_to_string(&path).expect("the pin-extracted fixture");
+    let mut lines = text.lines().filter(|line| !line.starts_with('#'));
+    assert_eq!(lines.next(), Some("schema fln-instance-choices/1"));
+    lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [goal, priority, offered, chosen] = fields[..] else {
+                panic!("a malformed fixture record: {line:?}");
+            };
+            assert!(priority.parse::<u32>().is_ok(), "{line:?}");
+            assert!(
+                !chosen.starts_with('!'),
+                "the pin's search threw on {goal}: {chosen}"
+            );
+            PinChoice {
+                goal: goal.to_owned(),
+                offered: offered
+                    .split(',')
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                chosen: (chosen != "-").then(|| chosen.to_owned()),
+            }
+        })
+        .collect()
+}
+
+/// Every imported instance of `Init.Core`'s closure, its own type as the goal, against
+/// the pin's own answer for that goal (bead `fln-vm35`). Two checks per goal: the
+/// search tries the pin's candidates in the pin's order (`getInstances`, tried from
+/// the end), and a full search selects the pin's instance.
+#[test]
+fn the_search_tries_the_pins_order_and_selects_the_pins_instance_under_init_core() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    on_stack(move || {
+        let engine = import_closure(&lib, "Init.Core");
+        let env = engine.environment();
+        let pins = pin_choices("Init.Core");
+        let (mut goals, mut not_started, mut ordered, mut agreed) = (0, 0, 0, 0);
+        let (mut answered, mut contested, mut extra) = (0, 0, 0);
+        let mut order_differs = Vec::new();
+        let mut choice_differs = Vec::new();
+        for pin in &pins {
+            let type_ = env
+                .find(&n(&pin.goal))
+                .unwrap_or_else(|| panic!("the fixture's goal {} is in the closure", pin.goal))
+                .constant_val()
+                .type_
+                .clone();
+            let audit = audit_instance_goal(env, &type_, Budget::for_stack_bytes(STACK))
+                .unwrap_or_else(|error| panic!("{}: {error:?}", pin.goal));
+            let Some(audit) = audit else {
+                not_started += 1;
+                continue;
+            };
+            goals += 1;
+            // The pin's candidates in the order its generator tries them. Ours may
+            // hold more (the filter keeps what it cannot place); they are counted.
+            let pin_order: Vec<String> = pin.offered.iter().rev().cloned().collect();
+            extra += audit.order.len().saturating_sub(pin_order.len());
+            answered += usize::from(pin.chosen.is_some());
+            contested += usize::from(pin.chosen.is_some() && pin.offered.len() > 1);
+            let ours: Vec<String> = audit
+                .order
+                .iter()
+                .map(Name::to_display_string)
+                .filter(|name| pin.offered.contains(name))
+                .collect();
+            if ours == pin_order {
+                ordered += 1;
+            } else {
+                order_differs.push(format!("{}: ours {ours:?}, pin {pin_order:?}", pin.goal));
+            }
+            let choice = match &audit.choice {
+                Choice::Instance(name) => Some(name.to_display_string()),
+                Choice::NoAnswer => None,
+                Choice::Inconclusive => Some("<inconclusive>".to_owned()),
+            };
+            if choice == pin.chosen {
+                agreed += 1;
+            } else {
+                choice_differs.push(format!(
+                    "{}: ours {choice:?}, pin {:?}",
+                    pin.goal, pin.chosen
+                ));
+            }
+        }
+        eprintln!(
+            "Init.Core: {} pin goals, {goals} audited, {not_started} not started; \
+             {ordered} in the pin's order ({extra} candidates kept beyond the pin's lists); \
+             {agreed} agree on the choice, of which the pin answered {answered} \
+             ({contested} with two or more candidates offered)",
+            pins.len()
+        );
+        for line in order_differs.iter().chain(&choice_differs) {
+            eprintln!("  {line}");
+        }
+        assert!(
+            goals == pins.len() && answered > 100 && contested > 50,
+            "{goals} of {} goals audited, {answered} answered, {contested} contested",
+            pins.len()
+        );
+        assert!(
+            order_differs.is_empty(),
+            "{} goals out of the pin's order",
+            order_differs.len()
+        );
+        assert!(
+            choice_differs.is_empty(),
+            "{} goals choosing differently",
+            choice_differs.len()
+        );
+    });
+}
+
+/// Two goals with two applicable candidates each, as source, against the pin's own
+/// elaboration of the same declarations (bead `fln-vm35`). Measured with the pinned
+/// `lean` on `prelude`, `import Init.Core`, these two declarations,
+/// `set_option trace.Meta.synthInstance.instances true` and, under `pp.explicit`,
+/// `#print`:
+///
+/// - `SizeOf Nat`, two priorities: the pin offers `#[instSizeOfDefault, instSizeOfNat]`
+///   (priorities 100 and 1000) and elaborates `instSizeOfNat`.
+/// - `LawfulBEq Bool`, one priority: the pin offers `#[@instLawfulBEq,
+///   instLawfulBEqBool]`, tries the later and more specific `instLawfulBEqBool`
+///   first, and elaborates it. In registry order, newest first, this search chose
+///   `instLawfulBEq`.
+#[test]
+fn two_applicable_candidates_select_the_pins_instance_under_init_core() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    on_stack(move || {
+        let engine = import_closure(&lib, "Init.Core");
+        let limits =
+            SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+        let source = "def s : SizeOf Nat := inferInstance\n\
+                      theorem l : LawfulBEq Bool := inferInstance\n";
+        let checked = match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), limits) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("{source} must be admitted: {other:?}"),
+        };
+        let env = checked.engine.environment();
+        for (declaration, pin) in [("s", "instSizeOfNat"), ("l", "instLawfulBEqBool")] {
+            let value = match env.find(&n(declaration)) {
+                Some(ConstantInfo::Defn(definition)) => definition.value.clone(),
+                Some(ConstantInfo::Thm(theorem)) => theorem.value.clone(),
+                other => panic!("{declaration} is checked: {other:?}"),
+            };
+            // `@inferInstance T inst`: the instance is the last argument.
+            let ExprNode::App { a: instance, .. } = value.node() else {
+                panic!("{declaration} := {value:?}");
+            };
+            let mut head = instance;
+            while let ExprNode::App { f, .. } = head.node() {
+                head = f;
+            }
+            let ExprNode::Const { name, .. } = head.node() else {
+                panic!("{declaration}'s instance {instance:?}");
+            };
+            assert_eq!(name.to_display_string(), pin, "{declaration}");
+        }
     });
 }

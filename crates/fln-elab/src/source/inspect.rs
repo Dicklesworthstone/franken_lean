@@ -8,7 +8,7 @@ use std::ops::Range;
 
 /// The discrimination-tree filter's read-only audit (bead `fln-52qv`).
 pub use super::instances::audit::{
-    CandidateAudit, InstanceGoalAudit, Selection, audit_instance_goal,
+    CandidateAudit, Choice, InstanceGoalAudit, Selection, audit_instance_goal,
 };
 
 /// Which elaboration boundary the caller wants to observe.

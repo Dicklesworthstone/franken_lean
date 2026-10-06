@@ -71,7 +71,9 @@ impl std::error::Error for InstanceRegistryError {}
 pub struct InstanceEntry {
     pub declaration: Name,
     pub priority: u32,
-    /// Monotone registration order; newer equal-priority entries are tried first.
+    /// Monotone registration order. [`InstanceRegistry::candidates`] lists newer
+    /// equal-priority entries first; instance search reorders the candidates the
+    /// pin's index positions (`discr_tree`, bead `fln-vm35`).
     pub order: usize,
 }
 

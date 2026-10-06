@@ -47,6 +47,26 @@
 //! Instances without a stored path (those FrankenLean registered itself), paths
 //! that name a free variable, and paths whose root is not the goal's are never
 //! filtered. A query that exhausts its step allowance filters nothing.
+//!
+//! # Candidate order (bead `fln-vm35`)
+//!
+//! The pin takes `getUnify`'s matches in traversal order, sorts them stably by
+//! priority ascending, and its generator tries that array from the end
+//! (`getInstances`, and `generate` at vendored `SynthInstance.lean:547-582`). So
+//! [`InstanceIndex::narrow`] returns candidates in the order they are tried:
+//! priority descending, then the later traversal position first. The traversal
+//! is the pin's: at a node the star child before the goal's own key, children in
+//! `Key.lt` order, and a leaf's values in insertion order, which is the imported
+//! instances' registration order. Where the pin's own index has no position for
+//! a candidate (FrankenLean's own registrations, and paths rooted elsewhere), the
+//! candidate is tried before every indexed candidate of its priority, newest
+//! first: the pin inserts a module's own instances after its imports.
+//!
+//! Two orders are FrankenLean's choice, because the pin has nothing to compare:
+//! where a goal key is uncertain and several alternatives are queried, their
+//! subtrees are visited in the order the alternatives are listed; and a goal
+//! whose root is a star visits the root's children in key order, where the pin
+//! folds a hash map.
 use super::{
     InstanceEntry, InstanceRegistry, InstanceRegistryError, MAX_ENTRY_BYTES, beta, read_name, take,
     write_name,
@@ -302,7 +322,18 @@ impl IndexCell {
 impl InstanceIndex {
     fn build(registry: &InstanceRegistry) -> Self {
         let mut index = Self::default();
-        for (declaration, parameters) in &registry.imported.instances {
+        // A leaf keeps its values in insertion order, which for the pin is the
+        // order the instances were registered.
+        let registered: BTreeMap<&Name, usize> = registry
+            .instances
+            .values()
+            .chain(registry.scoped.values().flat_map(BTreeMap::values))
+            .flatten()
+            .map(|row| (&row.declaration, row.order))
+            .collect();
+        let mut imported: Vec<_> = registry.imported.instances.iter().collect();
+        imported.sort_by_key(|(declaration, _)| registered.get(declaration).copied());
+        for (declaration, parameters) in imported {
             let keys = &parameters.keys;
             let Some(first) = keys.first() else {
                 continue;
@@ -322,8 +353,9 @@ impl InstanceIndex {
     }
 
     /// The rows of `rows` that the pin's `getUnify` may return for `goal`, in
-    /// their given order. Unindexed rows, and rows whose stored root is not
-    /// the goal's, are kept; so is every row when the query runs out of steps.
+    /// the order the pin tries them (see the module documentation). Unindexed
+    /// rows, and rows whose stored root is not the goal's, are kept. When the
+    /// query runs out of steps every row is kept, in its given order.
     pub(crate) fn narrow<'r>(
         &self,
         env: &Environment,
@@ -343,51 +375,72 @@ impl InstanceIndex {
         let Some(matched) = self.get_unify(&mut query, &roots) else {
             return rows.iter().collect();
         };
-        rows.iter()
-            .filter(|row| match self.roots.get(&row.declaration) {
-                None => true,
-                Some(stored) => {
-                    matched.contains(&row.declaration)
-                        || !roots.iter().any(|(key, _)| key == stored)
-                }
+        let position: BTreeMap<&Name, usize> = matched
+            .iter()
+            .enumerate()
+            .map(|(at, name)| (name, at))
+            .collect();
+        // `None`: no position in the pin's index for this goal.
+        let mut kept: Vec<(&'r InstanceEntry, Option<usize>)> = rows
+            .iter()
+            .filter_map(|row| match self.roots.get(&row.declaration) {
+                None => Some((row, None)),
+                Some(stored) => match position.get(&row.declaration) {
+                    Some(at) => Some((row, Some(*at))),
+                    None => (!roots.iter().any(|(key, _)| key == stored)).then_some((row, None)),
+                },
             })
-            .collect()
+            .collect();
+        // Stable: unpositioned rows keep their given (newest-first) order.
+        kept.sort_by(|(a, at_a), (b, at_b)| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| at_a.is_some().cmp(&at_b.is_some()))
+                .then_with(|| at_b.cmp(at_a))
+        });
+        kept.into_iter().map(|(row, _)| row).collect()
     }
 
-    /// `getUnify`, over the root alternatives of the goal.
-    fn get_unify(
-        &self,
-        query: &mut Query<'_>,
-        roots: &[(Key, Vec<Expr>)],
-    ) -> Option<BTreeSet<Name>> {
-        let mut result = BTreeSet::new();
+    /// `getUnify`, over the root alternatives of the goal: the matched values
+    /// in the pin's traversal order, each once.
+    fn get_unify(&self, query: &mut Query<'_>, roots: &[(Key, Vec<Expr>)]) -> Option<Vec<Name>> {
+        let mut result = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut emit = |values: &[Name], result: &mut Vec<Name>| {
+            for value in values {
+                if seen.insert(value.clone()) {
+                    result.push(value.clone());
+                }
+            }
+        };
+        // `process`, depth first with an explicit stack: each node's visits are
+        // pushed in reverse, so the first is finished before the second starts.
         let mut work: Vec<(usize, Vec<Expr>, &Node)> = Vec::new();
         if roots.iter().any(|(key, _)| *key == Key::Star) {
-            for (key, child) in &self.root.children {
+            for (key, child) in self.root.children.iter().rev() {
                 work.push((key.arity(), Vec::new(), child));
             }
         } else {
             // `getStarResult`: values whose whole path is a star.
             if let Some(star) = self.root.child(&Key::Star) {
-                result.extend(star.values.iter().cloned());
+                emit(&star.values, &mut result);
             }
-            for (key, args) in roots {
+            for (key, args) in roots.iter().rev() {
                 if let Some(child) = self.root.child(key) {
                     work.push((0, args.clone(), child));
                 }
             }
         }
-        // `process`, iteratively: the result is a set, so visiting order is free.
         while let Some((skip, mut todo, node)) = work.pop() {
             query.spend()?;
             if skip > 0 {
-                for (key, child) in &node.children {
+                for (key, child) in node.children.iter().rev() {
                     work.push((skip - 1 + key.arity(), todo.clone(), child));
                 }
                 continue;
             }
             let Some(next) = todo.pop() else {
-                result.extend(node.values.iter().cloned());
+                emit(&node.values, &mut result);
                 continue;
             };
             if node.children.is_empty() {
@@ -395,21 +448,24 @@ impl InstanceIndex {
             }
             let alternatives = query.keys(&next, false)?;
             if alternatives.iter().any(|(key, _)| *key == Key::Star) {
-                for (key, child) in &node.children {
+                for (key, child) in node.children.iter().rev() {
                     work.push((key.arity(), todo.clone(), child));
                 }
                 continue;
             }
+            // The star child first (`visitStar`), then the goal's own key.
+            let mut visits = Vec::new();
             if let Some((Key::Star, child)) = node.children.first() {
-                work.push((0, todo.clone(), child));
+                visits.push((0, todo.clone(), child));
             }
             for (key, args) in alternatives {
                 if let Some(child) = node.child(&key) {
                     let mut todo = todo.clone();
                     todo.extend(args);
-                    work.push((0, todo, child));
+                    visits.push((0, todo, child));
                 }
             }
+            work.extend(visits.into_iter().rev());
         }
         Some(result)
     }
@@ -958,22 +1014,66 @@ mod tests {
         assert_eq!(matched(&index, &env, &lctx, &goal), ["decAny"]);
     }
 
+    /// `getUnify`'s matches in the pin's traversal order, unsorted.
+    fn traversal(
+        index: &InstanceIndex,
+        env: &Environment,
+        lctx: &LocalContext,
+        goal: &Expr,
+    ) -> Vec<String> {
+        let mut query = Query {
+            env,
+            lctx,
+            folded: &index.folded,
+            steps: MAX_STEPS,
+        };
+        let roots = query.keys(goal, true).unwrap();
+        index
+            .get_unify(&mut query, &roots)
+            .unwrap()
+            .iter()
+            .map(Name::to_display_string)
+            .collect()
+    }
+
     #[test]
-    fn narrow_keeps_order_unindexed_rows_and_rows_rooted_elsewhere() {
+    fn get_unify_visits_the_star_child_first_and_a_leaf_in_insertion_order() {
+        // Values sharing a leaf stay in the order they were inserted.
+        let path = vec![k("Inhabited", 1), k("Nat", 0)];
+        let shared = index(&[("second", path.clone()), ("first", path)]);
         let (index, env, lctx, x, _) = fixture();
-        let row = |name: &str, order: usize| InstanceEntry {
+        let lt = |a: Expr, b: Expr| app(c("LT.lt"), &[c("Nat"), c("instLTNat"), a, b]);
+        let decidable = |p: Expr| app(c("Decidable"), &[p]);
+        // `decAny` is the `Decidable` node's star child; `decLtAny` the star
+        // child at the `Nat` position, ahead of `decLt` under `Nat` itself.
+        assert_eq!(
+            traversal(
+                &index,
+                &env,
+                &lctx,
+                &decidable(lt(Expr::fvar(x.clone()), lit(5)))
+            ),
+            ["decAny", "decLtAny", "decLt"]
+        );
+        // At the last argument the star (`decLt`) precedes the literal `0`.
+        assert_eq!(
+            traversal(&index, &env, &lctx, &decidable(lt(Expr::fvar(x), lit(0)))),
+            ["decAny", "decLtAny", "decLt", "decLtZero"]
+        );
+        assert_eq!(
+            traversal(&shared, &env, &lctx, &app(c("Inhabited"), &[c("Nat")])),
+            ["second", "first"]
+        );
+    }
+
+    #[test]
+    fn narrow_returns_the_pins_try_order_with_unindexed_rows_first_in_their_priority() {
+        let (index, env, lctx, x, _) = fixture();
+        let row = |name: &str, priority: u32, order: usize| InstanceEntry {
             declaration: n(name),
-            priority: 1000,
+            priority,
             order,
         };
-        let rows = [
-            row("decLtFin", 0),
-            row("native", 1),
-            row("decLt", 2),
-            row("inhabited", 3),
-            row("decEq", 4),
-            row("decAny", 5),
-        ];
         let goal = app(
             c("Decidable"),
             &[app(
@@ -981,12 +1081,33 @@ mod tests {
                 &[c("Nat"), c("instLTNat"), Expr::fvar(x), lit(5)],
             )],
         );
-        let kept: Vec<String> = index
-            .narrow(&env, &lctx, &goal, &rows)
-            .into_iter()
-            .map(|row| row.declaration.to_display_string())
-            .collect();
-        assert_eq!(kept, ["native", "decLt", "inhabited", "decAny"]);
+        let kept = |rows: &[InstanceEntry]| -> Vec<String> {
+            index
+                .narrow(&env, &lctx, &goal, rows)
+                .into_iter()
+                .map(|row| row.declaration.to_display_string())
+                .collect()
+        };
+        // Equal priorities: the rows the index cannot place (`native` has no
+        // path, `inhabited` is rooted elsewhere) in their given order, then the
+        // traversal `decAny`, `decLt` from its end.
+        let rows = [
+            row("decLtFin", 1000, 0),
+            row("native", 1000, 1),
+            row("decLt", 1000, 2),
+            row("inhabited", 1000, 3),
+            row("decEq", 1000, 4),
+            row("decAny", 1000, 5),
+        ];
+        assert_eq!(kept(&rows), ["native", "inhabited", "decLt", "decAny"]);
+        // Priority comes first, placed or not.
+        let rows = [
+            row("decAny", 2000, 0),
+            row("native", 1000, 1),
+            row("decLt", 1000, 2),
+            row("low", 10, 3),
+        ];
+        assert_eq!(kept(&rows), ["decAny", "native", "decLt", "low"]);
         // Out of steps, nothing is filtered.
         let mut query = Query {
             env: &env,

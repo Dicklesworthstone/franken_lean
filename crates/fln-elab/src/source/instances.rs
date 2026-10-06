@@ -479,8 +479,8 @@ impl Context {
         } else {
             // The pin tries only the global instances its discrimination tree
             // returns for the goal (`getInstances`, vendored
-            // Lean/Meta/SynthInstance.lean:201-240), in registry order here
-            // (bead fln-52qv). A hole left uninstantiated only widens the query.
+            // Lean/Meta/SynthInstance.lean:201-240, bead fln-52qv), and in its
+            // order (bead fln-vm35). A hole left uninstantiated only widens the query.
             let goal = self
                 .txn
                 .instantiate_expr(&prepared.target)
