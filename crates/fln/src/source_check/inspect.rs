@@ -128,25 +128,29 @@ pub(super) fn module(
                 .source_view()
                 .from_original(fln_parse::BytePos(offset - prefix_end))
             {
-                observation = fln_elab::source::inspect::declaration(
-                    parsed.syntax(),
-                    environment,
-                    limits.source.admission.kernel,
-                    &scope,
-                    position.0,
-                    kind,
-                )
-                .map_err(|error| SourceModuleCheckError::Source {
-                    module: entry.clone(),
-                    error: SourceCheckError::Command {
-                        file: 0,
-                        command: command_index,
-                        offset: prefix_end,
-                        error: Box::new(EngineExecutionError::Frontend(
-                            DefinitionFrontendError::Elaborate(error),
-                        )),
-                    },
-                })?;
+                let inspected =
+                    source_records::elaboration_outcome(fln_elab::source::inspect::declaration(
+                        parsed.syntax(),
+                        environment,
+                        limits.source.admission.kernel,
+                        &scope,
+                        position.0,
+                        kind,
+                    ))
+                    .map_err(|error| SourceModuleCheckError::Source {
+                        module: entry.clone(),
+                        error: SourceCheckError::Command {
+                            file: 0,
+                            command: command_index,
+                            offset: prefix_end,
+                            error: Box::new(error),
+                        },
+                    })?;
+                observation = match inspected {
+                    Outcome::Complete(observation) => observation,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
                 if let Some(observation) = &mut observation {
                     let range = match observation {
                         SourceObservation::Goals { range, .. }

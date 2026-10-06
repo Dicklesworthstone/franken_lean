@@ -133,11 +133,259 @@ fn dependent_wrong_type_is_vetoed_instead_of_retyping_the_field() {
 #[test]
 fn resource_nonanswers_are_preserved_for_literal_declarations() {
     let base = check(&engine(), "structure Point where\n  x : Nat").engine;
+    let root = base.logical_root(&KVMap::new());
     let mut limited = limits();
     limited.kernel = limited.kernel.narrowed(0, limited.kernel.depth);
-    let result =
-        base.admit_source_declaration(b"def p : Point := { x := 1 }", &KVMap::new(), limited);
-    assert!(matches!(result, Ok(Outcome::Inconclusive(_))), "{result:?}");
+    let source = b"def p : Point := { x := 1 }";
+    let parsed = fln_parse::parse_definition(source).unwrap();
+    // Witness the actual elaboration-time K1 stop, before facade admission.
+    let raw = fln_elab::elaborate_definition_in_with_budget(
+        parsed.syntax(),
+        base.environment(),
+        limited.kernel,
+    )
+    .unwrap_err();
+    let fln_elab::NatDefinitionElabError::Inference(
+        fln_elab::source::SourceInferenceError::Unification(error),
+    ) = raw
+    else {
+        panic!("expected assignment checking to reach K1: {raw:?}");
+    };
+    let fln_elab::constraint::unify::UnificationError::AssignmentCheck { outcome, .. } = *error
+    else {
+        panic!("expected a kernel assignment outcome: {error:?}");
+    };
+    let Outcome::Inconclusive(expected) = *outcome else {
+        panic!("expected a kernel resource stop: {outcome:?}");
+    };
+    let result = base.admit_source_declaration(source, &KVMap::new(), limited);
+    let Ok(Outcome::Inconclusive(actual)) = result else {
+        panic!("expected facade nonanswer: {result:?}");
+    };
+    assert_eq!(actual, expected);
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    check(
+        &base,
+        "def p : Point := { x := 1 }\ntheorem recovered : p.x = 1 := by rfl",
+    );
+}
+
+#[test]
+fn public_source_entry_points_agree_on_kernel_budget_stops_and_retry() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{EngineExecutionLimits, SourceModuleInput};
+    use fln_core::outcome::InconclusiveCause;
+
+    fn erase<T, E: std::fmt::Debug>(result: Result<Outcome<T>, E>) -> Result<Outcome<()>, String> {
+        result
+            .map(|outcome| outcome.map_complete(|_| ()))
+            .map_err(|error| format!("{error:?}"))
+    }
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let module = Name::from_components(["Main"]);
+    let definition = b"def value : Nat := 1";
+    let modules = [SourceModuleInput {
+        name: &module,
+        source: definition,
+    }];
+    let terminal = b"#check (1 : Nat)";
+    let terminal_modules = [SourceModuleInput {
+        name: &module,
+        source: terminal,
+    }];
+    for stopped in [true, false] {
+        let mut admission = limits();
+        if stopped {
+            admission.kernel = admission.kernel.narrowed(0, admission.kernel.depth);
+        }
+        let execution = EngineExecutionLimits::new(admission.kernel);
+        let source_limits = SourceCheckLimits::new(admission);
+        let results = [
+            (
+                "declaration",
+                erase(base.admit_source_declaration(definition, &options, admission)),
+            ),
+            (
+                "command",
+                erase(base.admit_source_command(definition, &options, admission)),
+            ),
+            (
+                "files",
+                erase(base.check_source_files(&[definition], &options, source_limits)),
+            ),
+            (
+                "check",
+                erase(base.check_source_command(terminal, &options, admission)),
+            ),
+            (
+                "execute definition",
+                erase(base.execute_source_definition(definition, &options, execution)),
+            ),
+            (
+                "execute definitions",
+                erase(base.execute_source_definitions(&[definition], &options, execution)),
+            ),
+            (
+                "execute nat",
+                erase(base.execute_nat_definition(definition, &options, execution)),
+            ),
+            (
+                "execute nats",
+                erase(base.execute_nat_definitions(&[definition], &options, execution)),
+            ),
+            (
+                "mixed stream",
+                erase(base.execute_source_commands_with_checks(
+                    b"#eval (1 : Nat)",
+                    &options,
+                    execution,
+                )),
+            ),
+            (
+                "terminal",
+                erase(base.check_terminal_source_command(terminal, &options, execution)),
+            ),
+            (
+                "execute modules",
+                erase(base.execute_source_modules(&modules, &module, &options, execution)),
+            ),
+            (
+                "terminal modules",
+                erase(base.check_terminal_source_modules(
+                    &terminal_modules,
+                    &module,
+                    &options,
+                    execution,
+                )),
+            ),
+            (
+                "mixed modules",
+                erase(base.execute_source_modules_with_entry_checks(
+                    &terminal_modules,
+                    &module,
+                    &options,
+                    execution,
+                )),
+            ),
+            (
+                "check modules",
+                erase(base.check_source_modules(
+                    &modules,
+                    &module,
+                    &options,
+                    SourceModuleCheckLimits::new(source_limits),
+                )),
+            ),
+        ];
+        for (route, result) in results {
+            if stopped {
+                let Ok(Outcome::Inconclusive(reason)) = result else {
+                    panic!("{route} lost the kernel nonanswer: {result:?}");
+                };
+                let InconclusiveCause::ResourceExhausted { usage } = reason.cause else {
+                    panic!("{route} changed the cause: {reason:?}");
+                };
+                assert_eq!(usage.allowed, 0, "{route}");
+                assert!(usage.observed > usage.allowed, "{route}");
+            } else {
+                assert!(
+                    matches!(result, Ok(Outcome::Complete(()))),
+                    "{route}: {result:?}"
+                );
+            }
+        }
+        assert_eq!(base.logical_root(&options), root);
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["value"]))
+        );
+    }
+    // Semantic errors keep their error channel after an exhausted attempt.
+    assert!(
+        base.admit_source_declaration(b"def wrong : Nat := true", &options, limits())
+            .is_err()
+    );
+    assert!(
+        base.check_source_command(b"#check missing", &options, limits())
+            .is_err()
+    );
+}
+
+#[test]
+fn scoped_records_inductives_variables_and_inspection_keep_kernel_nonanswers() {
+    use fln::SourceModuleInput;
+    use fln::source_check::inspect::ObservationKind;
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let module = Name::from_components(["Main"]);
+    let mut limited = limits();
+    limited.kernel = limited.kernel.narrowed(0, limited.kernel.depth);
+    for source in [
+        "structure Cell where\n value : Nat := 1",
+        "inductive Cell where | mk (value : Nat)",
+        "mutual\n inductive Cell where | mk (value : Nat)\nend",
+        "mutual\n inductive Cell where | mk (value : Nat)\n inductive Other where | mk (value : Nat)\nend",
+        "example : 1 = 1 := by rfl",
+        "namespace Here\ndef value : Nat := 1\nend Here",
+        "section\nvariable (n : Nat)\ndef value : Nat := n\nend",
+    ] {
+        let result = base.check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limited),
+        );
+        assert!(
+            matches!(result, Ok(Outcome::Inconclusive(_))),
+            "{source}: {result:?}"
+        );
+        check(&base, source);
+        assert_eq!(base.logical_root(&options), root);
+    }
+    let source = b"theorem pending (P : Prop) (h : P) : P := by exact h";
+    for admission in [limited, limits()] {
+        let mut session = SourceModuleSession::new(
+            base.clone(),
+            options.clone(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),
+            SourceModuleCacheLimits::default(),
+        );
+        let result = session.inspect(
+            &[SourceModuleInput {
+                name: &module,
+                source,
+            }],
+            &module,
+            source.len(),
+            ObservationKind::Goals,
+        );
+        if admission.kernel == limited.kernel {
+            match result {
+                Ok(Outcome::Inconclusive(_)) => {}
+                Ok(Outcome::Complete(_)) => panic!("inspection bypassed the kernel budget"),
+                other => panic!("inspection lost its kernel nonanswer: {other:?}"),
+            }
+        } else {
+            let complete = result.unwrap().into_complete().unwrap();
+            assert!(complete.observation.is_some());
+            assert!(
+                !complete
+                    .prefix
+                    .checked
+                    .checked
+                    .engine
+                    .environment()
+                    .contains(&Name::from_components(["pending"]))
+            );
+        }
+    }
+    assert_eq!(base.logical_root(&options), root);
 }
 
 #[test]

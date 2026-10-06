@@ -508,14 +508,17 @@ fn simp_only_arithmetic_resource_stop_remains_inconclusive() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let error = base
+    let result = base
         .check_source_files(
             &[b"theorem bounded : (1 <<< 18446744073709551616) = 0 := by simp only []"],
             &options,
             fln::SourceCheckLimits::new(limits()),
         )
-        .unwrap_err();
-    assert_eq!(error.disposition(), ("inconclusive", false, 3));
+        .unwrap();
+    assert!(
+        matches!(result, fln::Outcome::Inconclusive(_)),
+        "{result:?}"
+    );
     assert_eq!(base.logical_root(&options), root);
 }
 

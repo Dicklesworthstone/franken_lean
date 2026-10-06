@@ -5713,6 +5713,8 @@ impl Engine {
     /// Parse, elaborate and dual-check one source definition or theorem without
     /// attempting to compile or execute a proof. Publication remains the same
     /// immutable K1-plus-independent-checker transition as `admit_declaration`.
+    /// Kernel nonanswers during elaboration use the same `Outcome` arms as
+    /// admission; semantic frontend errors remain in the `Err` channel.
     pub fn admit_source_declaration(
         &self,
         source: &[u8],
@@ -5722,13 +5724,17 @@ impl Engine {
         let parsed = fln_parse::parse_definition(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
-        let declaration = fln_elab::elaborate_definition_in_with_budget(
-            parsed.syntax(),
-            self.environment(),
-            limits.kernel,
-        )
-        .map_err(DefinitionFrontendError::Elaborate)
-        .map_err(EngineExecutionError::Frontend)?;
+        let declaration = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_in_with_budget(
+                parsed.syntax(),
+                self.environment(),
+                limits.kernel,
+            ),
+        )? {
+            Outcome::Complete(declaration) => declaration,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let registration = fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -5832,10 +5838,13 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
-        let declaration =
-            fln_elab::elaborate_nat_definition_in(parsed.syntax(), self.environment())
-                .map_err(NatDefinitionFrontendError::Elaborate)
-                .map_err(EngineExecutionError::Frontend)?;
+        let declaration = match source_records::elaboration_outcome(
+            fln_elab::elaborate_nat_definition_in(parsed.syntax(), self.environment()),
+        )? {
+            Outcome::Complete(declaration) => declaration,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         self.execute_definition(declaration, options, limits)
     }
 
@@ -5903,7 +5912,7 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
         let name = fresh_generated_command_name(self.environment(), command_index)?;
-        let declaration = match parsed.kind() {
+        let declaration = source_records::elaboration_outcome(match parsed.kind() {
             SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
                 parsed.syntax(),
                 name,
@@ -5918,9 +5927,12 @@ impl Engine {
                 limits.kernel,
             ),
             _ => return Err(EngineExecutionError::StandaloneCheckRequired),
-        }
-        .map_err(DefinitionFrontendError::Elaborate)
-        .map_err(EngineExecutionError::Frontend)?;
+        })?;
+        let declaration = match declaration {
+            Outcome::Complete(declaration) => declaration,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let checked_type = match &declaration {
             Declaration::Defn(definition) => definition.base.type_.clone(),
             _ => {
@@ -6181,7 +6193,7 @@ impl Engine {
             }
 
             let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
-            let declaration = match parsed.kind() {
+            let declaration = source_records::elaboration_outcome(match parsed.kind() {
                 fln_parse::SourceCommandKind::Evaluation => {
                     let name = fresh_generated_command_name(engine.environment(), command_index)
                         .map_err(|error| EngineExecutionError::BatchCommand {
@@ -6195,13 +6207,6 @@ impl Engine {
                         engine.environment(),
                         limits.kernel,
                     )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
                 }
                 fln_parse::SourceCommandKind::Definition => {
                     fln_elab::elaborate_definition_in_with_budget(
@@ -6209,19 +6214,22 @@ impl Engine {
                         engine.environment(),
                         limits.kernel,
                     )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
                 }
                 fln_parse::SourceCommandKind::Check | fln_parse::SourceCommandKind::Example => {
                     return Err(EngineExecutionError::UnexpectedPublication {
                         detail: "source check escaped its scratch-only command branch",
                     });
                 }
+            })
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: command_index,
+                error: Box::new(error),
+                at: Some(original_offset),
+            })?;
+            let declaration = match declaration {
+                Outcome::Complete(declaration) => declaration,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
@@ -6714,13 +6722,17 @@ impl Engine {
                 ),
             ));
         }
-        let declaration = fln_elab::elaborate_definition_in_with_budget(
-            parsed.syntax(),
-            self.environment(),
-            limits.kernel,
-        )
-        .map_err(DefinitionFrontendError::Elaborate)
-        .map_err(EngineExecutionError::Frontend)?;
+        let declaration = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_in_with_budget(
+                parsed.syntax(),
+                self.environment(),
+                limits.kernel,
+            ),
+        )? {
+            Outcome::Complete(declaration) => declaration,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         self.execute_definition(declaration, options, limits)
     }
 

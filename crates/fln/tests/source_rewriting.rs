@@ -112,14 +112,17 @@ fn rw_arithmetic_resource_stop_is_not_an_unsolved_goal_or_rejection() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let error = base
+    let result = base
         .check_source_files(
             &[b"theorem bounded (x : Nat) (h : x = 0) : (1 <<< 18446744073709551616) = x := by rw [h]"],
             &options,
             fln::SourceCheckLimits::new(limits()),
         )
-        .unwrap_err();
-    assert_eq!(error.disposition(), ("inconclusive", false, 3));
+        .unwrap();
+    assert!(
+        matches!(result, fln::Outcome::Inconclusive(_)),
+        "{result:?}"
+    );
     assert_eq!(base.logical_root(&options), root);
     assert!(
         !base
