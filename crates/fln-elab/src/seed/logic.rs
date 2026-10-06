@@ -399,7 +399,7 @@ pub fn logical_seed_declarations() -> [Declaration; 12] {
         projection("Iff", "mpr", 1),
         composite_instance("And", "instDecidableAnd"),
         composite_instance("Or", "instDecidableOr"),
-        composite_instance("Implies", "instDecidableImplies"),
+        composite_instance("Implies", "instDecidableForall"),
         composite_instance("Iff", "instDecidableIff"),
     ]
 }

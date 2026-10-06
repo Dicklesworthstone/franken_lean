@@ -181,10 +181,17 @@ impl SourceScope {
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
-        mut exists: impl FnMut(&Name) -> bool,
+        exists: impl FnMut(&Name) -> bool,
         aliases: &AliasTable,
         protected: &ProtectedNames,
     ) -> Result<Option<Name>, ScopeError> {
+        // A seed constant the pin does not have, under a name that resolves to nothing
+        // there, is no candidate in any tier: naming it is the pin's "Unknown
+        // identifier" (`crate::seed::protected::source_unreachable`).
+        let mut declared = exists;
+        let mut exists = |candidate: &Name| {
+            !crate::seed::protected::source_unreachable(candidate) && declared(candidate)
+        };
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
             let absolute = Name::from_components(parts[1..].iter().map(String::as_str));

@@ -63,6 +63,120 @@ const ACCEPTED: &[&str] = &[
     "open Nat in\ndef u : Nat := Nat.add 1 2",
 ];
 
+/// Seed constants the pin does not have (`absent` in the generated table), named from
+/// source. Each was accepted here until fln-ew20: the seed defined it, so a program
+/// naming it was a false accept. Refused by the pin, each run headerless on
+/// 2026-10-06, with the first error quoted. Three were seed instances under names of
+/// FrankenLean's own; they now carry the pin's (below), and the fourth, an internal
+/// dictionary with no pin counterpart, is refused by name
+/// (`fln_elab::seed::protected::source_unreachable`). The class is FrankenLean's own:
+/// an `attribute` naming nothing is an `input` refusal, a term naming nothing an
+/// `elaboration` one.
+const REFUSED_ABSENT: &[(&str, &str, &str)] = &[
+    (
+        "attribute [instance] instDecidableEqOption",
+        "Unknown constant `instDecidableEqOption`",
+        "input",
+    ),
+    (
+        "attribute [instance] instInhabitedString",
+        "Unknown constant `instInhabitedString`",
+        "input",
+    ),
+    (
+        "attribute [instance] instDecidableImplies",
+        "Unknown constant `instDecidableImplies`",
+        "input",
+    ),
+    (
+        "def b : BEq String := _fln_numeric.beqString",
+        "Unknown identifier `_fln_numeric.beqString`",
+        "elaboration",
+    ),
+    (
+        "attribute [instance] _fln_numeric.beqString",
+        "Unknown constant `_fln_numeric.beqString`",
+        "input",
+    ),
+];
+
+/// Accepted by the pin (exit 0), run as above: the pin's own names for the three
+/// renamed seed instances, and `decide` and `default`, which the pin has only as
+/// `export` aliases (status `alias` in the table, so never refused by name).
+const ACCEPTED_PIN_NAMES: &[&str] = &[
+    "attribute [instance] Option.instDecidableEq",
+    "attribute [instance] String.instInhabited",
+    "attribute [instance] instDecidableForall",
+    "def d : Bool := decide (1 = 1)",
+    "def e : Nat := default",
+];
+
+#[test]
+fn seed_names_the_pin_does_not_have_are_refused_as_the_pin_refuses_them() {
+    let engine = seed();
+    for (source, wording, expected_class) in REFUSED_ABSENT {
+        let error = engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        let text = error.to_string();
+        assert!(
+            text.contains(wording),
+            "{source} must be refused with `{wording}`, as the pin refuses it: {text}"
+        );
+        let (class, authority, _) = error.disposition();
+        assert_eq!(
+            (class, authority),
+            (*expected_class, false),
+            "{source}: {error}"
+        );
+    }
+    for source in ACCEPTED_PIN_NAMES {
+        let checked = engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(
+            matches!(checked, Ok(Outcome::Complete(_))),
+            "{source} must be admitted, as the pin admits it: {checked:?}"
+        );
+    }
+}
+
+/// Every seed constant the table marks `absent` is refused by name, and nothing else
+/// is: the refusal is derived from the table, never listed. `decide` and `default`
+/// are `alias` rows, reachable at the pin through `export`, so they stay reachable.
+#[test]
+fn exactly_the_tables_absent_rows_are_source_unreachable() {
+    let rows = seed_pin_statuses().expect("the generated table reads");
+    let mut absent = 0;
+    for (name, status) in &rows {
+        assert_eq!(
+            fln_elab::seed::protected::source_unreachable(name),
+            *status == PinStatus::Absent,
+            "{}: {status:?}",
+            name.to_display_string()
+        );
+        absent += usize::from(*status == PinStatus::Absent);
+    }
+    assert!(
+        absent > 0,
+        "the table has an absent row; a scan finding none is broken"
+    );
+    for alias in ["decide", "default"] {
+        assert!(
+            rows.iter()
+                .any(|(name, status)| *name == Name::from_components([alias])
+                    && *status == PinStatus::Alias),
+            "the pin reaches `{alias}` only as an export alias"
+        );
+    }
+}
+
 #[test]
 fn the_pins_refusals_of_protected_seed_names_are_refused_at_elaboration() {
     let engine = seed();

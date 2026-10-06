@@ -42,14 +42,13 @@ pub(super) fn apply(
                 offset,
                 message: error.to_string(),
             })?
+            // The pin's words for a name nothing resolves (`realizeGlobalConstNoOverload`):
+            // the name as written, measured with plain, dotted and namespaced names.
             .ok_or_else(|| SourceCheckError::Scope {
                 file,
                 command,
                 offset,
-                message: format!(
-                    "unknown instance declaration `{}`",
-                    requested.to_display_string()
-                ),
+                message: format!("Unknown constant `{}`", requested.to_display_string()),
             })?;
         // The standalone attribute does not acquire the `instance` command's
         // implicitReducible default (Lean/ReducibilityAttrs.lean:205–220).

@@ -615,6 +615,14 @@ impl Context {
             let resolved = self
                 .resolve_source_name(name)?
                 .unwrap_or_else(|| name.clone());
+            // The fallback to the name as written must not reach a seed constant the pin
+            // does not have: resolution already refused it (`source_unreachable`), and the
+            // direct lookup below would otherwise find it anyway.
+            if crate::seed::protected::source_unreachable(&resolved) {
+                return Err(failure(SourceInferenceError::UnknownConstant(
+                    resolved.clone(),
+                )));
+            }
             if !scope::is_root_qualified(name)
                 && let Some(local) = self.txn.lctx.find_by_user_name(&resolved)
             {

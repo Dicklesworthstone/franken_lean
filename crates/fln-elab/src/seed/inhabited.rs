@@ -277,7 +277,7 @@ pub fn scalar_inhabited_seed_declaration(scalar: &str) -> Declaration {
             Expr::lit(Literal::Nat(NatLit::from_u64(0))),
         ),
         "String" => (
-            "instInhabitedString",
+            "String.instInhabited",
             Expr::lit(Literal::Str(String::new())),
         ),
         "Bool" => (

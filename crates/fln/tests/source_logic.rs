@@ -170,7 +170,7 @@ fn logical_seed_additions_have_checked_bodies_or_inductive_rules_not_axioms() {
         "Iff.mpr",
         "instDecidableAnd",
         "instDecidableOr",
-        "instDecidableImplies",
+        "instDecidableForall",
         "instDecidableIff",
     ] {
         assert!(

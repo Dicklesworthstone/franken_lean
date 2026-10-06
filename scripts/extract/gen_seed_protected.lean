@@ -18,8 +18,10 @@ is printed per name, tab-separated, in the input's order:
 - `protected`: the pin has the constant and `isProtected` (vendored
   src/Lean/Modifiers.lean) holds for it;
 - `unprotected`: the pin has the constant and it is not protected;
-- `absent`: the pin has no constant of that name (a seed constant with no
-  counterpart), which therefore cannot be protected there.
+- `alias`: the pin has no constant of that name, but an `export` alias resolves
+  it to another constant (`getAliases`), as `decide` resolves to `Decidable.decide`;
+- `absent`: the pin has no constant of that name and nothing resolves it (a seed
+  constant with no counterpart), so naming it there is "Unknown identifier".
 
 A name containing a tab or a newline is refused rather than escaped.
 -/
@@ -44,7 +46,10 @@ unsafe def main (args : List String) : IO Unit := do
     if name.toString (escape := false) != line then
       throw <| IO.userError s!"seed name {line} does not round-trip as a Name"
     let status :=
-      if !env.contains name then "absent"
+      if !env.contains name then
+        -- An `export` alias (`getAliases`, vendored src/Lean/ResolveName.lean:85) still
+        -- resolves the name, to another constant: `decide` names `Decidable.decide`.
+        if (getAliases env name (skipProtected := false)).isEmpty then "absent" else "alias"
       else if isProtected env name then "protected"
       else "unprotected"
     IO.println s!"{line}\t{status}"

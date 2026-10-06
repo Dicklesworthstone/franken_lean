@@ -3785,21 +3785,21 @@ impl EngineBuilder {
         }
         for name in [
             "instInhabitedNat",
-            "instInhabitedString",
+            "String.instInhabited",
             "instInhabitedBool",
             "instDecidableTrue",
             "instDecidableFalse",
             "instDecidableNot",
             "instDecidableAnd",
             "instDecidableOr",
-            "instDecidableImplies",
+            "instDecidableForall",
             "instDecidableIff",
             "instDecidableEqBool",
             "instDecidableEqNat",
         ] {
             engine.environment = fln_elab::instances::register_instance(
                 &engine.environment,
-                &Name::from_components([name]),
+                &Name::from_components(name.split('.')),
                 1000,
             )
             .map_err(|_| EngineAdmissionError::UnexpectedPublication {

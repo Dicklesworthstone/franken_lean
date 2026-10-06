@@ -86,7 +86,7 @@ examples/native_mutual_groups.lean	reject	accept	n/a	fln-defect	Reference 5: Inv
 examples/native_mutual_indexed.lean	reject	accept	n/a	fln-defect	Reference 11: Application type mismatch: The argument | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
 examples/native_nat_recursion.lean	accept	accept	match	agree	
 examples/native_nested_lets.lean	accept	accept	match	agree	
-examples/native_option_decide.lean	reject	check-only	n/a	fln-defect	Reference 3: Unknown constant `instDecidableEqOption` | the seed names a constant the Reference does not have; landed without a row after the 09-23 freeze (fln-ew20)
+examples/native_option_decide.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts. Was a false accept naming the seed's instDecidableEqOption, which the Reference does not have; the seed's instance now carries the pin's name Option.instDecidableEq (fln-ew20)
 examples/native_parameterized_recursion.lean	reject	accept	n/a	missing-prelude	Reference 1: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_pattern_functions.lean	accept	accept	match	agree	
 examples/native_pattern_matching.lean	reject	check-only	n/a	fln-defect	Reference 37: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
