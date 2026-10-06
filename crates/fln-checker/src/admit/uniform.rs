@@ -525,6 +525,113 @@ impl Audit<'_> {
         }
         Ok(term)
     }
+    /// Whether parameter `parameter` of `constructor` has the family's domain.
+    /// The pin converts the two (`is_def_eq`, vendored `inductive.cpp:430`),
+    /// with the earlier parameters instantiated as the family's locals:
+    /// Mathlib's `Cat.FreeReflRel` binds its third parameter, an index Lean
+    /// promoted, as `X : V` in `mk` and as `X : Paths V` in the family, equal
+    /// only by unfolding `Paths V := V`. The domains as written are compared
+    /// first. When they differ the conversion runs as KR-974's does: untyped,
+    /// then the typed lane for a pair that defers. Only a completed mismatch
+    /// rejects; a deferral, stop, refusal or fault keeps its own outcome.
+    #[allow(clippy::too_many_arguments)]
+    fn parameter_domain_converts(
+        &mut self,
+        environment: &ConstantEnvironment,
+        locals: &[LocalDeclaration],
+        levels: &[WireName],
+        constructor: &WireName,
+        parameter: usize,
+        actual: &WireExpr,
+        expected: &WireExpr,
+    ) -> Result<bool, InductiveVerdict> {
+        if self.equal(actual, expected)? {
+            return Ok(true);
+        }
+        let actual = self.open(actual, locals)?;
+        let expected = self.open(expected, locals)?;
+        let context = InferenceContext::new(locals.to_vec(), levels.to_vec(), environment.clone())
+            .map_err(|_| overflow())?
+            .admitting(self.checking_safety());
+        let deferred = || {
+            InductiveVerdict::Deferred(InductiveSupportLimit::ParameterConversion {
+                constructor: constructor.clone(),
+                parameter,
+            })
+        };
+        match def_eq_before_typed_with(
+            &actual,
+            &expected,
+            context.reduction(),
+            self.budget.conversion,
+            &mut *self.cancelled,
+        ) {
+            DefEqOutcome::Equal(_) => Ok(true),
+            DefEqOutcome::NotEqual { .. } => Ok(false),
+            DefEqOutcome::Refused { side, refusal, .. } => Err(InductiveVerdict::Rejected(
+                InductiveRejection::ParameterConversionRefused {
+                    constructor: constructor.clone(),
+                    parameter,
+                    side,
+                    refusal: Box::new(refusal),
+                },
+            )),
+            DefEqOutcome::Inconclusive(stop) => Err(InductiveVerdict::Inconclusive(
+                InductiveStop::ParameterConversion {
+                    constructor: constructor.clone(),
+                    parameter,
+                    stop: Box::new(stop),
+                },
+            )),
+            DefEqOutcome::InternalFault(fault) => Err(InductiveVerdict::InternalFault(
+                InductiveFault::ParameterConversion {
+                    constructor: constructor.clone(),
+                    parameter,
+                    fault: Box::new(fault),
+                },
+            )),
+            DefEqOutcome::Deferred { .. } => {
+                let mut budget = self.budget.inference;
+                budget.defeq = self.budget.conversion;
+                match crate::infer::proof_conversion_with(
+                    &actual,
+                    &expected,
+                    &context,
+                    InferenceMode::Checking {
+                        declaration_safety: self.checking_safety(),
+                    },
+                    budget,
+                    &mut *self.cancelled,
+                ) {
+                    crate::infer::ProofConversionOutcome::Complete { equal: true, .. } => Ok(true),
+                    crate::infer::ProofConversionOutcome::Complete { equal: false, .. } => {
+                        Err(deferred())
+                    }
+                    crate::infer::ProofConversionOutcome::Halted(outcome) => match *outcome {
+                        InferenceOutcome::Inconclusive(stop) => {
+                            Err(InductiveVerdict::Inconclusive(
+                                InductiveStop::ParameterProofConversion {
+                                    constructor: constructor.clone(),
+                                    parameter,
+                                    stop: Box::new(stop),
+                                },
+                            ))
+                        }
+                        InferenceOutcome::InternalFault { fault, .. } => {
+                            Err(InductiveVerdict::InternalFault(
+                                InductiveFault::ParameterProofConversion {
+                                    constructor: constructor.clone(),
+                                    parameter,
+                                    fault: Box::new(fault),
+                                },
+                            ))
+                        }
+                        _ => Err(deferred()),
+                    },
+                }
+            }
+        }
+    }
     fn append_local(
         &mut self,
         locals: &mut Vec<LocalDeclaration>,
@@ -1217,8 +1324,16 @@ fn check(
         declared_type_is_a_type(&staged, ctor_name, decl, &audit.budget, audit.cancelled)
             .map_err(|v| map_member_preamble(ctor_name, v))?;
         let (ctor_params, field_tail) = audit.peel(decl.type_(), p)?;
-        for (actual, expected) in ctor_params.iter().zip(&parameters) {
-            if !audit.equal(&actual.domain, &expected.domain)? {
+        for (parameter, (actual, expected)) in ctor_params.iter().zip(&parameters).enumerate() {
+            if !audit.parameter_domain_converts(
+                &staged,
+                &locals[..parameter],
+                levels,
+                ctor_name,
+                parameter,
+                &actual.domain,
+                &expected.domain,
+            )? {
                 return Err(constructor_error(ctor_name));
             }
         }

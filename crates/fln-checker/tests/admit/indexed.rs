@@ -1,7 +1,7 @@
 //! Indexed recursor reconstruction uses constructor-derived index expressions.
 #![forbid(unsafe_code)]
 use super::*;
-use fln_checker::admit::{InductiveRejection, InductiveVerdict};
+use fln_checker::admit::{InductiveRejection, InductiveStop, InductiveVerdict};
 use fln_core::expr::FVarId;
 
 #[derive(Clone)]
@@ -363,4 +363,174 @@ fn an_index_must_not_contain_an_occurrence_of_the_family() {
         EnvironmentBudget::unlimited(),
     );
     assert!(!verdict.is_admitted(), "{verdict:?}");
+}
+
+/// `W.{v} (α : Type v) : Type v := α`.
+fn w_entry() -> ConstantEntry {
+    let v = Level::param(primary_name("v"));
+    let alpha = B::new("α", Expr::sort(v.succ().unwrap()));
+    ConstantEntry::new(
+        checker_name("W"),
+        ConstantDeclaration::definition(
+            vec![checker_name("v")],
+            decoded(&close(
+                std::slice::from_ref(&alpha),
+                alpha.ty.clone(),
+                false,
+            )),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&close(std::slice::from_ref(&alpha), alpha.e(), true)),
+                ReducibilityHint::Regular(1),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    )
+}
+/// `KR.{v} : (α : Type v) → (a : W α) → α → Prop`, two parameters and one
+/// index, with `KR.refl : (α : Type v) → (a : α) → KR α a a`. The family binds
+/// its second parameter at `W α` and the constructor at `α`, as Mathlib's
+/// `Cat.FreeReflRel` binds a promoted index at `Paths V` and at `V`.
+fn promoted_parameter_family() -> Vec<ConstantEntry> {
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let levels = [v.clone()];
+    let alpha = B::new("α", Expr::sort(v.clone().succ().unwrap()));
+    let a_family = B::new("a", call(&["W"], &levels, &[alpha.e()]));
+    let a_constructor = B::new("a", alpha.e());
+    let b = B::new("b", alpha.e());
+    let family = |a: &B, b: Expr| call(&["KR"], &levels, &[alpha.e(), a.e(), b]);
+    let major = B::new("h", family(&a_family, b.e()));
+    let motive = B::new(
+        "motive",
+        close(&[b.clone(), major.clone()], Expr::sort(u.clone()), false),
+    );
+    let refl = |a: &B| call(&["KR", "refl"], &levels, &[alpha.e(), a.e()]);
+    let minor = B::new(
+        "refl_case",
+        apply(motive.e(), &[a_family.e(), refl(&a_family)]),
+    );
+    let prefix = [
+        alpha.clone(),
+        a_family.clone(),
+        motive.clone(),
+        minor.clone(),
+    ];
+    let rec_type = close(
+        &prefix,
+        close(
+            &[b.clone(), major.clone()],
+            apply(motive.e(), &[b.e(), major.e()]),
+            false,
+        ),
+        false,
+    );
+    let family_name = checker_name("KR");
+    let refl_name = checker_qualified(&["KR", "refl"]);
+    let safe = ConstantSafety::Safe;
+    vec![
+        ConstantEntry::new(
+            family_name.clone(),
+            ConstantDeclaration::inductive(
+                vec![checker_name("v")],
+                decoded(&close(
+                    &[alpha.clone(), a_family.clone(), b.clone()],
+                    Expr::sort(Level::zero()),
+                    false,
+                )),
+                safe,
+                InductiveDeclaration::new(
+                    2,
+                    1,
+                    vec![family_name.clone()],
+                    vec![refl_name.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            refl_name.clone(),
+            ConstantDeclaration::constructor(
+                vec![checker_name("v")],
+                decoded(&close(
+                    &[alpha.clone(), a_constructor.clone()],
+                    family(&a_constructor, a_constructor.e()),
+                    false,
+                )),
+                safe,
+                ConstructorDeclaration::new(family_name.clone(), 0, 2, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["KR", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u"), checker_name("v")],
+                decoded(&rec_type),
+                safe,
+                RecursorDeclaration::new(
+                    vec![family_name],
+                    2,
+                    1,
+                    1,
+                    1,
+                    vec![RecursorRule::new(
+                        refl_name,
+                        0,
+                        decoded(&close(&prefix, minor.e(), true)),
+                    )],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+/// The pin converts each constructor parameter's domain with the family's
+/// (`is_def_eq`, vendored `inductive.cpp:430`); comparing them as written
+/// rejected `Cat.FreeReflRel`, whose constructor binds `X : V` where the
+/// family has `X : Paths V`, though K1 and the pin accept it (S23,
+/// `Mathlib.CategoryTheory.Category.ReflQuiv`).
+#[test]
+fn a_constructor_parameter_domain_that_converts_with_the_familys_is_admitted() {
+    let verdict = admit_inductive(
+        &environment_of(vec![w_entry()]),
+        &promoted_parameter_family(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "{verdict:?}");
+}
+/// That conversion runs on the admission's conversion budget, and a stop there
+/// is a typed non-answer for that parameter, never a rejection. The quick
+/// budget stays whole: the structural comparisons before it spend that one.
+#[test]
+fn a_starved_parameter_domain_conversion_is_inconclusive() {
+    let unlimited = InferenceBudget::unlimited().defeq;
+    let budget = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget::new(
+            unlimited.quick,
+            0,
+            0,
+            u64::MAX,
+            u64::MAX,
+            WhnfBudget::new(0, 0, TermBudget::unlimited()),
+        ),
+    );
+    let verdict = admit_inductive(
+        &environment_of(vec![w_entry()]),
+        &promoted_parameter_family(),
+        budget,
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            InductiveVerdict::Inconclusive(InductiveStop::ParameterConversion { parameter: 1, .. })
+        ),
+        "{verdict:?}"
+    );
 }

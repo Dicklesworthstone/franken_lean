@@ -2174,6 +2174,13 @@ pub enum InductiveSupportLimit {
         name: WireName,
         requirement: Box<AdmissionDeferred>,
     },
+    /// A constructor's parameter domain is not the family's as written, and
+    /// their conversion (the pin's `is_def_eq`, vendored `inductive.cpp:430`)
+    /// deferred.
+    ParameterConversion {
+        constructor: WireName,
+        parameter: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2212,6 +2219,14 @@ pub enum InductiveRejection {
         name: WireName,
         refusal: Box<EnvironmentRefusal>,
     },
+    /// The conversion of a constructor's parameter domain with the family's
+    /// refused: malformed reduction input, not a mismatch.
+    ParameterConversionRefused {
+        constructor: WireName,
+        parameter: usize,
+        side: DefEqSide,
+        refusal: Box<WhnfRefusal>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2230,6 +2245,19 @@ pub enum InductiveFault {
         name: WireName,
     },
     ExpectedArenaOverflow,
+    /// The untyped conversion of a constructor's parameter domain with the
+    /// family's faulted.
+    ParameterConversion {
+        constructor: WireName,
+        parameter: usize,
+        fault: Box<DefEqFault>,
+    },
+    /// The typed lane's conversion of the same pair faulted.
+    ParameterProofConversion {
+        constructor: WireName,
+        parameter: usize,
+        fault: Box<InferenceFault>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2243,6 +2271,19 @@ pub enum InductiveStop {
     Environment {
         name: WireName,
         stop: Box<EnvironmentStop>,
+    },
+    /// The untyped conversion of a constructor's parameter domain with the
+    /// family's stopped.
+    ParameterConversion {
+        constructor: WireName,
+        parameter: usize,
+        stop: Box<DefEqStop>,
+    },
+    /// The typed lane's conversion of the same pair stopped.
+    ParameterProofConversion {
+        constructor: WireName,
+        parameter: usize,
+        stop: Box<InferenceStop>,
     },
 }
 
