@@ -5,8 +5,11 @@
 //! application would also unfold an untagged user conversion such as `Nat.cast`
 //! and change the term produced by `Lean.Meta.expandCoe`.
 //!
-//! This covers the twelve builtin coercion projections. Importing arbitrary
-//! user `coe_decl` tags and recording extra-module uses remain separate work.
+//! This covers the twelve builtin projections and the two monadic bridges.
+//! Importing arbitrary user `coe_decl` tags and recording extra-module uses
+//! remain separate work.
+mod monad;
+
 use super::*;
 use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
@@ -229,6 +232,9 @@ impl Context {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
+        if let Some(value) = self.expand_monadic_helper(name, levels, args)? {
+            return Ok(Some(value));
+        }
         let Some(class) = builtin_projection(name) else {
             return Ok(None);
         };

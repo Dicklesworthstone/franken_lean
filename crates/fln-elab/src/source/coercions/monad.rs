@@ -1,9 +1,9 @@
-//! Insert registered `MonadLiftT` actions without evaluating or duplicating them.
+//! Insert monadic lifts and result coercions without executing an action.
 //!
-//! This is the direct `liftM` branch of the pin's `coerceMonadLift?`
-//! (`Lean/Meta/Coe.lean`). It does not require either constructor to have a
-//! `Monad` instance. Mapping a coercion over the result of an action is a
-//! separate operation and is not guessed here.
+//! The three branches of the pin's `coerceMonadLift?` (Lean/Meta/Coe.lean):
+//! `coeM` within one monad, direct `liftM`, then `liftCoeM` when both a lift
+//! and a result coercion are needed. These are applications of admitted
+//! library definitions, not new runtime primitives or proof rules.
 use super::*;
 
 impl Context {
@@ -14,6 +14,18 @@ impl Context {
         name: &str,
         arguments: impl IntoIterator<Item = Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        self.monadic_application(name, arguments.into_iter().map(Some))
+    }
+
+    /// `None` asks ordinary instance search for this exact instance binder.
+    /// In particular, the result dictionary is `forall a, CoeT alpha a beta`:
+    /// finding a coercion for one specific value is not sufficient. Never
+    /// invent a value for a non-instance argument or silently leave a hole.
+    fn monadic_application(
+        &mut self,
+        name: &str,
+        arguments: impl IntoIterator<Item = Option<Expr>>,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let name = Name::from_components(name.split('.'));
         if !self.txn.env.contains(&name) {
             return Ok(None);
@@ -23,10 +35,24 @@ impl Context {
             self.tick()?;
             let signature = self.whnf(&result.type_)?;
             let ExprNode::ForallE {
-                binder_type, body, ..
+                binder_type,
+                body,
+                binder_info,
+                ..
             } = signature.node()
             else {
                 return Ok(None);
+            };
+            let argument = match argument {
+                Some(argument) => argument,
+                None if *binder_info == BinderInfo::InstImplicit => {
+                    let target = self.instantiate(binder_type)?;
+                    let Some(instance) = self.coercion_instance(target)? else {
+                        return Ok(None);
+                    };
+                    instance
+                }
+                None => return Ok(None),
             };
             let Some(actual) = self.known_type(&argument)? else {
                 return Ok(None);
@@ -42,6 +68,41 @@ impl Context {
         Ok(Some(result))
     }
 
+    fn monad_dictionary(
+        &mut self,
+        constructor: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        if !self.has_coercion_class("Monad")? {
+            return Ok(None);
+        }
+        let Some(target) = self.lift_application("Monad", [constructor.clone()])? else {
+            return Ok(None);
+        };
+        self.coercion_instance(target.value)
+    }
+
+    /// Expansion is selective: keep user functions folded, and unfold only
+    /// the coercion helpers and projections tagged in the pin. Re-infer after
+    /// expansion rather than asserting that the requested target was produced.
+    fn finish_monadic_coercion(
+        &mut self,
+        result: Typed,
+        expected: &Expr,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let value = self.instantiate(&result.value)?;
+        let value = self.expand_coercions(&value)?;
+        let Some(type_) = self.known_type(&value)? else {
+            return Ok(None);
+        };
+        if !self.coercion_eq(&type_, expected)? {
+            return Ok(None);
+        }
+        Ok(Some(Typed {
+            value: self.instantiate(&value)?,
+            type_: self.instantiate(&type_)?,
+        }))
+    }
+
     /// The speculative implementation. The caller owns rollback, including
     /// assignments made while inferring the lifted action's element type.
     fn monad_lift(
@@ -50,14 +111,6 @@ impl Context {
         expected: &Expr,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         self.tick()?;
-        if !self
-            .txn
-            .options
-            .get_bool(&Name::from_components(["autoLift"]), true)
-            || !self.has_coercion_class("MonadLiftT")?
-        {
-            return Ok(None);
-        }
         // Recover the value's own type: application elaboration may already
         // have normalized Typed.type_ to a function. Like the pin's
         // `isTypeApp?`, reduce aliases, not ordinary monad definitions such
@@ -80,14 +133,45 @@ impl Context {
                 f: from,
                 a: element,
             },
-            ExprNode::App { f: to, .. },
+            ExprNode::App {
+                f: to,
+                a: expected_element,
+            },
         ) = (actual.node(), target.node())
         else {
             return Ok(None);
         };
-        // A lift can infer the result element, but must not select an unknown
-        // source or destination constructor by instance search.
-        if from.has_expr_mvar() || to.has_expr_mvar() || self.defeq_guarded(from, to)? {
+        // Instance search must not choose an unknown monad constructor.
+        if from.has_expr_mvar() || to.has_expr_mvar() {
+            return Ok(None);
+        }
+        if self.defeq_guarded(from, to)? {
+            // `autoLift` controls changing monads, not coercing a result in
+            // the same monad. No MonadLiftT dictionary is needed in this branch.
+            let Some(monad) = self.monad_dictionary(to)? else {
+                return Ok(None);
+            };
+            let Some(result) = self.monadic_application(
+                "Lean.Internal.coeM",
+                [
+                    Some(from.clone()),
+                    Some(element.clone()),
+                    Some(expected_element.clone()),
+                    None,
+                    Some(monad),
+                    Some(term.value.clone()),
+                ],
+            )? else {
+                return Ok(None);
+            };
+            return self.finish_monadic_coercion(result, expected);
+        }
+        if !self
+            .txn
+            .options
+            .get_bool(&Name::from_components(["autoLift"]), true)
+            || !self.has_coercion_class("MonadLiftT")?
+        {
             return Ok(None);
         }
         let Some(class) = self.lift_application("MonadLiftT", [from.clone(), to.clone()])? else {
@@ -101,21 +185,42 @@ impl Context {
             [
                 from.clone(),
                 to.clone(),
-                instance,
+                instance.clone(),
                 element.clone(),
                 term.value.clone(),
             ],
-        )?
-        else {
+        )? else {
             return Ok(None);
         };
-        if !self.coercion_eq(&result.type_, expected)? {
-            return Ok(None);
+        // A failed direct-result probe must not constrain the fallback's
+        // output type. The successful lift dictionary remains available.
+        if self.defeq_guarded(&result.type_, expected)? {
+            return Ok(Some(Typed {
+                value: self.instantiate(&result.value)?,
+                type_: self.instantiate(&result.type_)?,
+            }));
         }
-        Ok(Some(Typed {
-            value: self.instantiate(&result.value)?,
-            type_: self.instantiate(&result.type_)?,
-        }))
+        // Only the destination must be a Monad. The source merely needs its
+        // registered lift; the action occurs once in the admitted helper body.
+        let Some(monad) = self.monad_dictionary(to)? else {
+            return Ok(None);
+        };
+        let Some(result) = self.monadic_application(
+            "Lean.Internal.liftCoeM",
+            [
+                Some(from.clone()),
+                Some(to.clone()),
+                Some(element.clone()),
+                Some(expected_element.clone()),
+                Some(instance),
+                None,
+                Some(monad),
+                Some(term.value.clone()),
+            ],
+        )? else {
+            return Ok(None);
+        };
+        self.finish_monadic_coercion(result, expected)
     }
 
     /// Failed search or type matching never leaks dictionaries, universes,
@@ -144,6 +249,7 @@ impl Context {
 #[cfg(test)]
 mod tests {
     mod constructors;
+    mod results;
 
     use super::*;
     use crate::instances::register_class;

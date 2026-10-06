@@ -275,6 +275,7 @@ impl Context {
         if !self.has_coercion_class("CoeT")?
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
+            && !self.has_coercion_class("Monad")?
         {
             return self.constrain_type(actual, expected);
         }
@@ -441,6 +442,7 @@ impl Context {
             && !self.has_coercion_class("CoeSort")?
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
+            && !self.has_coercion_class("Monad")?
         {
             // No coercion can exist: a rigid mismatch is final here.
             self.refute_rigid_mismatch(&term.type_, expected)?;
