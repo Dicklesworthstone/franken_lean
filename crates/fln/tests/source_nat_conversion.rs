@@ -70,6 +70,26 @@ fn invalid_symbolic_offsets_refuse_without_publishing() {
 }
 
 #[test]
+fn tactic_reflexivity_keeps_nested_arithmetic_for_native_reduction() {
+    let base = engine();
+    for proof in ["rfl", "by rfl", "by exact rfl"] {
+        checked(
+            &base,
+            &format!(
+                "theorem nested : 3 + (7 + 11) = 21 := {proof}\n\
+                 theorem larger : Nat.add 3 (Nat.add 70 110) = 183 := {proof}\n\
+                 theorem compact : (1000000000000000000000000000000 + 7) + 11 = 1000000000000000000000000000018 := {proof}"
+            ),
+        );
+        refused_conversion(
+            &base,
+            &format!("theorem wrong : 3 + (7 + 11) = 22 := {proof}"),
+        );
+    }
+    checked(&base, "theorem recovery : 3 + (7 + 11) = 21 := by rfl");
+}
+
+#[test]
 fn course_of_values_addition_is_not_replaced_by_a_direct_fold() {
     let base = engine();
     // Check the model declaration independently. A Nat.rec parser or motive

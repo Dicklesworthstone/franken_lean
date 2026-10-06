@@ -62,19 +62,11 @@ impl Context {
     ) -> Result<Conversion, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
-        // Keep the original carrier when assigning an unknown, including
-        // dependent projections, just as constrain_type does. The pin's quick
-        // assignment precedes delta reduction; class selection observes it.
-        let actual = if matches!(expected.node(), ExprNode::MVar { .. }) {
-            actual
-        } else {
-            self.whnf(&actual)?
-        };
-        let expected = if matches!(actual.node(), ExprNode::MVar { .. }) {
-            expected
-        } else {
-            self.whnf(&expected)?
-        };
+        // Compare the original terms with the ordinary Default reducer. Its
+        // quick assignments preserve named carriers, and its native Nat rung
+        // runs before delta (the pin's WHNF.lean). Source WHNF here would first
+        // expand Nat.add's course-of-values body, hiding arithmetic from that
+        // bounded evaluator and exhausting small nested reflexivity proofs.
         let mut budget = UnificationBudget::new(self.kernel);
         budget.transparency = UnificationTransparency::Default;
         // The pin's `isDefEq` here synthesizes an instance its unification has
