@@ -58,8 +58,23 @@ impl Context {
         {
             return Ok(None);
         }
-        let actual = self.whnf(&term.type_)?;
-        let target = self.whnf(expected)?;
+        // Recover the value's own type: application elaboration may already
+        // have normalized Typed.type_ to a function. Like the pin's
+        // `isTypeApp?`, reduce aliases, not ordinary monad definitions such
+        // as function-backed state/reader transformers.
+        let Some(actual) = self.known_type(&term.value)? else {
+            return Ok(None);
+        };
+        let actual = self.whnf_with_transparency(
+            &actual,
+            UnificationTransparency::Abbreviations,
+            true,
+        )?;
+        let target = self.whnf_with_transparency(
+            expected,
+            UnificationTransparency::Abbreviations,
+            true,
+        )?;
         let (
             ExprNode::App {
                 f: from,
@@ -128,6 +143,8 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
+    mod constructors;
+
     use super::*;
     use crate::instances::register_class;
     use crate::records::{RecordBudget, RecordSpec, record_declarations};
