@@ -1812,3 +1812,124 @@ mod annotation_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod parameter_domain_tests {
+    use super::*;
+
+    /// `Type`, i.e. `Sort 1`.
+    fn type_zero() -> WireExpr {
+        WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: LevelId::from_index(1).expect("the second level id"),
+            }],
+            vec![LevelNode::Zero, LevelNode::Succ(LevelId::ZERO)],
+            ExprId::ZERO,
+        )
+    }
+
+    /// `Prop`, i.e. `Sort 0`.
+    fn prop() -> WireExpr {
+        WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: LevelId::ZERO,
+            }],
+            vec![LevelNode::Zero],
+            ExprId::ZERO,
+        )
+    }
+
+    fn constant(text: &str) -> WireExpr {
+        WireExpr::from_parts(
+            vec![ExprNode::Constant {
+                name: checker_atom(text),
+                levels: Vec::new(),
+            }],
+            Vec::new(),
+            ExprId::ZERO,
+        )
+    }
+
+    /// Two unrelated types, `A B : Type`.
+    fn environment() -> ConstantEnvironment {
+        let axiom = |text: &str| {
+            ConstantEntry::new(
+                checker_atom(text),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    type_zero(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            )
+        };
+        match ConstantEnvironment::build(
+            vec![axiom("A"), axiom("B")],
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("the test environment must build: {other:?}"),
+        }
+    }
+
+    fn compare(
+        environment: &ConstantEnvironment,
+        actual: &WireExpr,
+        expected: &WireExpr,
+    ) -> Result<bool, InductiveVerdict> {
+        let budget = AdmissionBudget::unlimited();
+        let mut control = StructuralComparisonControl::new(budget.conversion.quick);
+        let mut poll = || false;
+        let mut audit = Audit {
+            safety: ConstantSafety::Safe,
+            budget,
+            comparison: &mut control,
+            cancelled: &mut poll,
+        };
+        audit.parameter_domain_converts(
+            environment,
+            &[],
+            &[],
+            &checker_atom("mk"),
+            0,
+            actual,
+            expected,
+        )
+    }
+
+    /// The soundness half of fln-aemn. The pin refuses a constructor whose
+    /// parameter domain does not convert with the family's ("does not match
+    /// inductive datatypes parameters", vendored `inductive.cpp:430-432`); the
+    /// route turns `false` here into `ConstructorShape`.
+    ///
+    /// Admission cannot reach these answers: a constructor's own type is checked
+    /// first (`declared_type_is_a_type`), and its result `I p1 … pn …`
+    /// type-checks only when each domain already converts with the family's.
+    /// So the comparison is tested directly. Without this, a conversion that
+    /// came back unequal and was accepted anyway would go unseen.
+    #[test]
+    fn a_parameter_domain_that_does_not_convert_with_the_familys_is_refused() {
+        let environment = environment();
+        // `Type` against `Prop`: the untyped converter refutes it.
+        assert!(
+            matches!(compare(&environment, &type_zero(), &prop()), Ok(false)),
+            "Type and Prop must not convert"
+        );
+        // Two unrelated types: the untyped converter defers and the typed lane,
+        // which is sufficient only, cannot equate them. Not admitted either way.
+        assert!(
+            matches!(
+                compare(&environment, &constant("A"), &constant("B")),
+                Err(InductiveVerdict::Deferred(
+                    InductiveSupportLimit::ParameterConversion { parameter: 0, .. }
+                ))
+            ),
+            "an undecided pair is a typed non-answer"
+        );
+        // The control: a domain converts with itself.
+        assert!(matches!(
+            compare(&environment, &constant("A"), &constant("A")),
+            Ok(true)
+        ));
+    }
+}
