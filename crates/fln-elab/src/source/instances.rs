@@ -162,6 +162,13 @@ impl Context {
     }
 }
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
+    // A refuted rigid mismatch is the plainest non-match: a speculative trial moves on.
+    if matches!(
+        error,
+        NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })
+    ) {
+        return true;
+    }
     let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error else {
         return false;
     };

@@ -4,6 +4,7 @@
 use super::instances::{nonmatch, registry_error};
 use super::*;
 use crate::instances::InstanceRegistry;
+use fln_env::constants::ConstantInfo;
 
 mod expand;
 mod function;
@@ -402,6 +403,8 @@ impl Context {
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
         {
+            // No coercion can exist: a rigid mismatch is final here.
+            self.refute_rigid_mismatch(&term.type_, expected)?;
             self.constrain_expected_type(&term.type_, expected)?;
             return Ok(term);
         }
@@ -458,9 +461,112 @@ impl Context {
             *self = trial;
             return Ok(candidate);
         }
-        // No path: retain the original diagnostic boundary. Closed mismatches
-        // still reach K1, while an unification/resource nonanswer stays typed.
+        // No path. A rigid mismatch is the pin's elaboration-time `Type mismatch`; any
+        // other closed mismatch still reaches K1, while an unification/resource
+        // nonanswer stays typed.
+        self.refute_rigid_mismatch(&term.type_, expected)?;
         self.constrain_expected_type(&term.type_, expected)?;
         Ok(term)
+    }
+
+    /// Refuse, with the pin's `Type mismatch`, a term whose type is rigidly not its expected
+    /// type (see [`Self::rigid_type_mismatch`]); any other pair is left to the caller.
+    fn refute_rigid_mismatch(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        match self.rigid_type_mismatch(actual, expected)? {
+            Some((actual, expected)) => Err(failure(SourceInferenceError::TypeMismatch {
+                actual,
+                expected,
+            })),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `actual` and `expected` are certainly not definitionally equal, described for
+    /// the message. They are when, with no metavariables, their weak head normal forms (safe
+    /// definitions and local lets unfolded) have rigid heads that differ: two distinct
+    /// constants that never reduce (inductive types and axioms), or two of a sort, a Π-type and
+    /// such a constant. Once reduction reaches
+    /// such a head the kernel's own reduction ends at the same head, and distinct rigid heads
+    /// are never definitionally equal, so every pair refuted here is one K1 would reject too:
+    /// refutation moves the refusal to elaboration and never changes a verdict. Anything else,
+    /// a `Sort u` against a `Sort v` or a head that is not rigid, is `None`.
+    pub(in crate::source) fn rigid_type_mismatch(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<Option<(String, String)>, NatDefinitionElabError> {
+        let actual = self.instantiate(actual)?;
+        let expected = self.instantiate(expected)?;
+        if [&actual, &expected]
+            .iter()
+            .any(|type_| type_.has_expr_mvar() || type_.has_level_mvar())
+        {
+            return Ok(None);
+        }
+        let actual = self.whnf(&actual)?;
+        let expected = self.whnf(&expected)?;
+        if [&actual, &expected]
+            .iter()
+            .any(|type_| type_.has_expr_mvar() || type_.has_level_mvar())
+        {
+            return Ok(None);
+        }
+        let (Some(left), Some(right)) = (self.rigid_shape(&actual), self.rigid_shape(&expected))
+        else {
+            return Ok(None);
+        };
+        let distinct = match (&left, &right) {
+            (RigidShape::Constant(a, _), RigidShape::Constant(b, _)) => a != b,
+            (RigidShape::Sort, RigidShape::Sort) | (RigidShape::Pi, RigidShape::Pi) => false,
+            _ => true,
+        };
+        Ok(distinct.then(|| (left.describe(), right.describe())))
+    }
+
+    fn rigid_shape(&self, type_: &Expr) -> Option<RigidShape> {
+        match type_.node() {
+            ExprNode::Sort { .. } => return Some(RigidShape::Sort),
+            ExprNode::ForallE { .. } => return Some(RigidShape::Pi),
+            _ => {}
+        }
+        let mut head = type_;
+        let mut applied = false;
+        while let ExprNode::App { f, .. } = head.node() {
+            head = f;
+            applied = true;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return None;
+        };
+        // An inductive type or an axiom (the source seed's `String`) never reduces. Anything
+        // else (a definition whnf stopped at, an opaque, a quotient) is left undecided.
+        matches!(
+            self.txn.env.find(name),
+            Some(ConstantInfo::Induct(_) | ConstantInfo::Axiom(_))
+        )
+        .then(|| RigidShape::Constant(name.clone(), applied))
+    }
+}
+
+/// A type's head after reduction, when it is rigid: no reduction can change it.
+enum RigidShape {
+    Sort,
+    Pi,
+    /// An inductive type or an axiom, and whether it is applied to arguments.
+    Constant(Name, bool),
+}
+
+impl RigidShape {
+    fn describe(&self) -> String {
+        match self {
+            Self::Sort => "Sort …".to_owned(),
+            Self::Pi => "… → …".to_owned(),
+            Self::Constant(name, false) => name.to_display_string(),
+            Self::Constant(name, true) => format!("{} …", name.to_display_string()),
+        }
     }
 }

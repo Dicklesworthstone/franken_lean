@@ -138,11 +138,13 @@ fn proposition_valued_matches_build_proofs_for_every_branch() {
 #[test]
 fn all_branches_are_checked_even_when_the_discriminant_is_a_literal() {
     // `(1 : String)` is refused while elaborating, as the pin refuses it (no
-    // `OfNat String 1`); the other false branches reach K1. Each twin must check.
+    // `OfNat String 1`), and so is `"wrong"` where a `Nat` is expected (the pin's
+    // "Type mismatch", a rigid mismatch: fln-azxg). The false proposition reaches K1.
+    // Each twin must check.
     for (text, refusal, twin) in [
         (
             "def bad : Nat := match true with | true => 1 | false => \"wrong\"",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "def bad : Nat := match true with | true => 1 | false => 7",
         ),
         (
@@ -830,11 +832,14 @@ fn refined_field_indices_do_not_equate_distinct_inputs_or_drop_bad_annotations()
             )
             .expect_err("refinement must retain all checking obligations");
         if body.contains("String") {
+            // The pin: "Type mismatch", `Nat` is not `String`. A rigid mismatch, refused
+            // while elaborating (fln-azxg).
             assert_eq!(
                 rejected.disposition(),
-                ("kernel-rejection", true, 1),
+                ("elaboration", false, 1),
                 "{rejected:?}"
             );
+            assert!(rejected.to_string().contains("Type mismatch"), "{rejected}");
         } else {
             assert!(
                 matches!(

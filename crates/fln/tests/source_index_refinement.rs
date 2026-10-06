@@ -423,10 +423,11 @@ fn induction_resource_stops_preserve_the_original_engine() {
 }
 
 #[test]
-fn promoted_index_induction_keeps_ignored_argument_annotations_kernel_checked() {
+fn promoted_index_induction_keeps_ignored_argument_annotations_checked() {
     // The pin refuses the annotation while elaborating ("Type mismatch: `child`
-    // has type `Walk 3` but is expected to have type `Nat`"); here the kernel
-    // still refuses it. `control` is a pin prelude name, so the twin is `kept`.
+    // has type `Walk 3` but is expected to have type `Nat`"), and so does the
+    // elaborator: `Walk 3` against `Nat` is a rigid mismatch (fln-azxg).
+    // `control` is a pin prelude name, so the twin is `kept`.
     let prefix = format!("{WALK}def ignore (x : Nat) : 0 = 0 := rfl\n");
     check(&format!(
         "{prefix}theorem kept (w : Walk 3) : 0 = 0 := by induction w with | done => rfl | step child ih => exact ignore 0"
@@ -447,11 +448,8 @@ fn promoted_index_induction_keeps_ignored_argument_annotations_kernel_checked() 
             SourceCheckLimits::new(limits),
         )
         .expect_err("the ignored value must remain in the checked branch");
-    assert_eq!(
-        error.disposition(),
-        ("kernel-rejection", true, 1),
-        "{error:?}"
-    );
+    assert_eq!(error.disposition().0, "elaboration", "{error:?}");
+    assert!(error.to_string().contains("Type mismatch"), "{error}");
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 #[test]

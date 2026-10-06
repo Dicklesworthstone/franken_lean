@@ -142,12 +142,24 @@ fn expected_result_infers_an_implicit_with_no_explicit_value_argument() {
 #[test]
 fn wrong_closed_result_still_receives_the_ordinary_kernel_rejection() {
     let env = env();
-    let result = check_definition_source(b"def bad : Nat := polyId Nat", &env, budget()).unwrap();
+    // `polyId Type : Type 1` under `Type`: two sorts, not a rigid mismatch, so the
+    // body reaches the kernel, which rejects it (the pin: "Application type mismatch").
+    let result = check_definition_source(b"def bad : Type := polyId Type", &env, budget()).unwrap();
     assert!(matches!(
         result.outcome,
         Outcome::Complete(Verdict::Rejected { .. })
     ));
     assert_eq!(check(&env, &result.declaration, budget()), result.outcome);
+    // `polyId Nat : Type` under `Nat` is rigidly not `Nat`: refused while elaborating, as
+    // the pin refuses it (fln-azxg).
+    assert!(matches!(
+        check_definition_source(b"def bad : Nat := polyId Nat", &env, budget()),
+        Err(DefinitionFrontendError::Elaborate(
+            NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::TypeMismatch { .. }
+            )
+        ))
+    ));
 }
 #[test]
 fn unresolved_implicit_is_not_defaulted_or_published() {

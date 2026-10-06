@@ -72,13 +72,13 @@ fn invalid_defaults_are_rejected_even_when_never_used() {
             SourceCheckLimits::new(limits()),
         )
     };
-    // A numeral with no `OfNat` instance at its type is refused while
-    // elaborating, as the pin refuses it; the string default reaches K1. Each
-    // twin must check.
+    // Each is refused while elaborating, as the pin refuses it: a numeral with no
+    // `OfNat` instance at its type, and a string default where a `Nat` is expected
+    // (the pin's "Type mismatch", a rigid mismatch: fln-azxg). Each twin must check.
     for (text, disposition, twin) in [
         (
             "structure Bad where\n  value : Nat := \"wrong\"",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "structure Bad where\n  value : Nat := 7",
         ),
         (

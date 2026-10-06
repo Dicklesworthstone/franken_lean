@@ -26,6 +26,12 @@
 //! - the coercion classes were imported from the pin's library, so the coercion
 //!   search that found nothing searched the pin's own instances.
 //!
+//! The elaborator's own "Type mismatch" (a rigid mismatch with no coercion,
+//! `coercions::rigid_type_mismatch`, bead fln-azxg) is the same evidence reached
+//! sooner: the two types are rigidly not definitionally equal, and the coercion
+//! search found nothing. It too rules an interpretation out only when the coercion
+//! classes are the pin's.
+//!
 //! Every other non-success leaves the interpretation undetermined, and the identifier
 //! is refused rather than resolved by guessing:
 //! - an elaboration refusal;
@@ -113,8 +119,19 @@ impl Context {
     ) -> Result<Option<Result<Typed, String>>, NatDefinitionElabError> {
         let term = match self.term_prepared(syntax, expected.cloned()) {
             Ok(term) => term,
-            Err(error) if !super::operators::probe_says_no(&error) => return Err(error),
-            Err(_) => return Ok(None),
+            Err(error) => {
+                let mismatch = matches!(
+                    error,
+                    NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })
+                );
+                if mismatch && self.coercions_are_the_pins()? {
+                    return Ok(Some(Err("type mismatch".to_owned())));
+                }
+                if !super::operators::probe_says_no(&error) {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
         };
         let Some(expected) = expected else {
             return Ok(Some(Ok(term)));

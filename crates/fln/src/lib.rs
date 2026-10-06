@@ -17603,14 +17603,18 @@ mod tests {
                 &options,
                 test_limits(),
             )
-            .expect_err("K1 must check an explicit let type against its value");
+            .expect_err("an explicit let type is checked against its value");
+        // `String` against `Nat` is a rigid mismatch: refused at elaboration, as the pinned
+        // lean does ("Type mismatch \"wrong\" has type String but is expected to have type
+        // Nat", fln-azxg), never handed to K1 as a typed body.
         assert!(
             matches!(
                 &mismatch,
-                EngineExecutionError::KernelRejected {
-                    class: RejectClass::TypeMismatch,
-                    ..
-                }
+                EngineExecutionError::Frontend(super::DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::TypeMismatch { .. }
+                    )
+                ))
             ),
             "unexpected explicit let mismatch: {mismatch:?}"
         );

@@ -106,7 +106,10 @@ fn invalid_record_result_ascriptions_are_authoritative_rejections_not_successes(
     ));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("Invalid.lean");
-    let source = "variable (A : Type)\nstructure Bad : (Type : Nat) where\n  value : A";
+    // The pin: "Type mismatch", `Type : Type 1` is not a `Type`. Two sorts are not a
+    // rigid mismatch, so the ascription reaches K1's authoritative check. (`Type : Nat`
+    // is now refused while elaborating: fln-azxg.)
+    let source = "variable (A : Type)\nstructure Bad : (Type : Type) where\n  value : A";
     std::fs::write(&path, source).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
