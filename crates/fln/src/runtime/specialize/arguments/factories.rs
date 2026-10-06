@@ -28,7 +28,7 @@ impl Preparation<'_> {
     /// Return an inert value, not a kernel normal form. This private result is
     /// substituted only for a static instance argument after source admission;
     /// the specialization key retains the caller's exact original argument.
-    pub(in crate::runtime::specialize) fn instance_factory_value(
+    pub(in crate::runtime) fn instance_factory_value(
         &mut self,
         input: &Expr,
     ) -> Result<Option<Expr>, IngressError> {

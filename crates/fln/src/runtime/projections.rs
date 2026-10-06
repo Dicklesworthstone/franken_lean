@@ -76,14 +76,13 @@ impl Preparation<'_> {
             if index + 1 == arity {
                 receiver_type = Some(binder_type.clone());
             }
+            // Earlier value parameters may themselves be checked dictionaries,
+            // as ForIn' carries its Membership dictionary before the receiver.
+            // Only inert factory values may disappear with projection metadata;
+            // a computed parameter keeps the ordinary strict runtime path.
             if index + 1 != arity
                 && !self.type_parameter(binder_type)?
-                && !matches!(
-                    argument.node(),
-                    ExprNode::Lit {
-                        literal: Literal::Nat(_)
-                    }
-                )
+                && self.instance_factory_value(argument)?.is_none()
             {
                 return Ok(None);
             }
@@ -566,6 +565,54 @@ mod tests {
             assert!(prep.constructors.is_empty());
         }
     }
+
+    #[test]
+    fn dictionary_metadata_is_static_only_when_all_its_fields_are_inert() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .check_source_files(
+                &[br#"
+structure Token where
+  value : Nat
+class Action (token : Token) where
+  call : Nat -> Nat
+def token : Token := { value := 7 }
+instance selected : Action token := { call := fun n => n }
+def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1
+def computedToken : Token := { value := count 30 }
+instance computed : Action computedToken := { call := fun n => n }
+"#],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let constant = |label| Expr::const_(name(label), vec![]);
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let selected = prep
+            .projection_call(
+                &constant("Action.call"),
+                &[constant("token"), constant("selected")],
+            )
+            .unwrap();
+        assert!(matches!(selected, Some(value) if matches!(value.node(), ExprNode::Lam { .. })));
+        // Even though this parameter lives only in the selected field's type,
+        // discovering its dictionary must not drop the count computation.
+        assert!(
+            prep.projection_call(
+                &constant("Action.call"),
+                &[constant("computedToken"), constant("computed")],
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
     #[test]
     fn private_variant_projection_keys_must_belong_to_the_selected_family() {
         let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
