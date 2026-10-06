@@ -34,6 +34,8 @@ mod olean_imports;
 pub mod source_check;
 mod source_execution;
 mod source_records;
+#[cfg(test)]
+mod source_seed_names;
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
 pub use fln_checker::admit::{
@@ -3376,7 +3378,38 @@ impl EngineBuilder {
     }
 
     /// Construct a bounded source-seed engine using the specified admission limits.
+    ///
+    /// The seed's constants carry the pin's `protected` marks (bead `fln-8xz8`): a
+    /// headerless file is checked against this seed rather than an imported closure,
+    /// so without them `open Nat` would make the pin's protected `Nat.add` available
+    /// as `add`. The marks are the generated `fln_elab::seed::protected` table, one
+    /// journal entry, as one imported module's tags are.
     pub fn build_with_source_seed(
+        &self,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Engine>, EngineAdmissionError> {
+        let mut engine = match self.build_unmarked_source_seed(limits)? {
+            Outcome::Complete(engine) => engine,
+            other => return Ok(other),
+        };
+        let protected = fln_elab::seed::protected::seed_protected_names().map_err(|_| {
+            EngineAdmissionError::UnexpectedPublication {
+                detail: "source seed protected table is malformed",
+            }
+        })?;
+        engine.environment =
+            fln_elab::protected_names::register_module(&engine.environment, &protected).map_err(
+                |_| EngineAdmissionError::UnexpectedPublication {
+                    detail: "source seed protected registration failed",
+                },
+            )?;
+        Ok(Outcome::Complete(engine))
+    }
+
+    /// The source seed's constants and registrations, without the `protected` marks:
+    /// what `scripts/extract/gen_seed_protected.sh` asks the pin about, so a seed that
+    /// gained or lost constants can still be listed for regeneration.
+    fn build_unmarked_source_seed(
         &self,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Engine>, EngineAdmissionError> {

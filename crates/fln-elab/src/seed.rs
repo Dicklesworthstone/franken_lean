@@ -45,6 +45,7 @@ mod heterogeneous;
 mod quotient;
 pub use quotient::{quotient_seed_declaration, quotient_sound_seed_declaration};
 pub mod inhabited;
+pub mod protected;
 pub use equality::{eq_seed_declaration, heq_seed_declaration, rfl_seed_declaration};
 
 use fln_core::expr::{BinderInfo, Expr};
