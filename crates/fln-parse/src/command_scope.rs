@@ -6,6 +6,7 @@ pub mod imports;
 pub mod instances;
 pub mod modifiers;
 pub mod mutual;
+pub mod reducibility;
 pub mod variables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum ScopeCommand {
     Omit(Vec<Name>),
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
+    Reducibility(reducibility::ReducibilityAttribute),
     /// `open A B in <command>` (`Lean.Parser.Command.in`): the pin's macro elaborates it as
     /// `section open A B <command> end`. `body` is the byte offset, within this command's own
     /// source, where the inner command starts.
@@ -109,6 +111,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     if keyword == "attribute" {
         if let Some(attribute) = instances::parse(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Instance(attribute)));
+        }
+        if let Some(attribute) = reducibility::parse(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::Reducibility(attribute)));
         }
         return attributes::parse(source).map(|attribute| attribute.map(ScopeCommand::Simp));
     }

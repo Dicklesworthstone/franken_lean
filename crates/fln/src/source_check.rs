@@ -3,6 +3,7 @@ use super::*;
 pub mod inspect;
 mod instance_attributes;
 pub mod modules;
+mod reducibility;
 mod scopes;
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +141,13 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
                 | UnificationError::NodeLimit { .. }
                 | UnificationError::AssignmentLimit { .. }
                 | UnificationError::HeartbeatLimit => ("resource", false, 3),
+                UnificationError::Reducibility(
+                    fln_elab::reducibility::ReducibilityError::Limit
+                    | fln_elab::reducibility::ReducibilityError::Instances(
+                        fln_elab::instances::InstanceRegistryError::Limit,
+                    ),
+                ) => ("resource", false, 3),
+                UnificationError::Reducibility(_) => ("internal-fault", false, 4),
                 UnificationError::Cancelled => ("cancelled", false, 3),
                 UnificationError::Universe(
                     UniverseInstantiationError::VisitLimit { .. }
@@ -208,6 +216,9 @@ impl Engine {
         let mut theorems = 0;
         let mut final_scope = fln_elab::source::scope::SourceScope::default();
         for (file, source) in sources.iter().enumerate() {
+            // Global reducibility attributes may change only definitions authored
+            // in this file, never declarations supplied by its predecessor.
+            let file_base = engine.environment.clone();
             let mut scopes = scopes::Scopes::new(engine.environment());
             let commands = partition_commands(source, file, count)?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
@@ -286,6 +297,18 @@ impl Engine {
                             file,
                             count,
                             start.0,
+                        )?;
+                        count += 1;
+                        continue;
+                    }
+                    if let fln_parse::command_scope::ScopeCommand::Reducibility(attribute) = control
+                    {
+                        engine.environment = reducibility::apply(
+                            engine.environment(),
+                            &file_base,
+                            &scopes.current,
+                            attribute,
+                            (file, count, start.0),
                         )?;
                         count += 1;
                         continue;

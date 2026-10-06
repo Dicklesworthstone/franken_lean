@@ -270,3 +270,295 @@ fn updates_replay_across_imports_and_invalidate_cached_consumers() {
         cold.checked.result_logical_root
     );
 }
+
+#[test]
+fn global_reducibility_attributes_control_real_instance_conversion() {
+    let checked = checked(
+        &engine(),
+        "def namedOne : Nat := 1\n\
+         attribute [reducible] namedOne\n\
+         def literalAtNamedIndex {A : Type} [OfNat A namedOne] : A := 1",
+    );
+    assert_eq!(
+        fln_elab::reducibility::known_status(checked.environment(), &n("namedOne")),
+        Ok(Some(fln_elab::reducibility::Reducibility::Reducible)),
+    );
+    let control = engine().check_source_files(
+        &[b"def namedOne : Nat := 1\n\
+            def literalAtNamedIndex {A : Type} [OfNat A namedOne] : A := 1"],
+        &KVMap::new(),
+        limits(),
+    );
+    let error = control.unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+}
+
+#[test]
+fn global_reducibility_resolves_exact_names_and_survives_the_file() {
+    let base = engine();
+    let one = b"namespace Visibility\n\
+        def hidden : Nat := 4\n\
+        def \xc2\xabpart.name\xc2\xbb : Nat := 5\n\
+        end Visibility\n\
+        open Visibility\n\
+        attribute [irreducible] hidden \xc2\xabpart.name\xc2\xbb";
+    let result = base
+        .check_source_files(
+            &[one.as_slice(), b"def nextFile : Nat := 6"],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for name in [
+        n("Visibility.hidden"),
+        Name::from_components(["Visibility", "part.name"]),
+    ] {
+        assert_eq!(
+            fln_elab::reducibility::known_status(result.engine.environment(), &name),
+            Ok(Some(fln_elab::reducibility::Reducibility::Irreducible)),
+        );
+    }
+    assert!(
+        fln_elab::reducibility::ReducibilityTable::read(base.environment())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reducibility_validation_rejects_invalid_transitions_and_nondefinitions() {
+    // Pin authority: Lean/ReducibilityAttrs.lean's `validate`, also exercised by
+    // tests/elab/reducibilityAttrValidation.lean. Global semireducible is never
+    // a reset operation under the default options.
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for tail in [
+        "attribute [semireducible] value",
+        "attribute [reducible] value\nattribute [reducible] value",
+        "attribute [irreducible] value\nattribute [irreducible] value",
+        "attribute [reducible] value\nattribute [irreducible] value",
+        "attribute [irreducible] value\nattribute [reducible] value",
+        "attribute [irreducible] reflexive",
+        "attribute [irreducible] Nat",
+        "attribute [reducible] Nat.zero",
+        "attribute [scoped irreducible] value",
+        "namespace Scope\nattribute [scoped reducible] value\nend Scope",
+    ] {
+        let source = format!("def value : Nat := 4\ntheorem reflexive : 0 = 0 := rfl\n{tail}");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reducibility"),
+            "{tail}: {error}"
+        );
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+}
+
+#[test]
+fn global_reducibility_cannot_rewrite_declarations_from_earlier_files() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for attribute in ["reducible", "irreducible", "semireducible"] {
+        let command = format!("attribute [{attribute}] importedValue");
+        let error = base
+            .check_source_files(
+                &[b"def importedValue : Nat := 4", command.as_bytes()],
+                &KVMap::new(),
+                limits(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("this file"), "{error}");
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+}
+
+#[test]
+fn reducibility_updates_replay_through_native_source_module_imports() {
+    let names = [n("NamedIndex"), n("IndexConsumer")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"prelude\ndef namedOne : Nat := 1\nattribute [reducible] namedOne",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"prelude\nimport NamedIndex\n\
+                def importedIndex {A : Type} [OfNat A namedOne] : A := 1",
+        },
+    ];
+    let result = engine()
+        .check_source_modules(
+            &inputs,
+            &names[1],
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        result
+            .checked
+            .engine
+            .environment()
+            .contains(&n("importedIndex"))
+    );
+    assert_eq!(
+        fln_elab::reducibility::known_status(result.checked.engine.environment(), &n("namedOne")),
+        Ok(Some(fln_elab::reducibility::Reducibility::Reducible)),
+    );
+}
+
+#[test]
+fn late_reducibility_failures_and_oversized_lists_leave_no_prefix() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for suffix in ["missing", "Nat.zero", "value"] {
+        let source = format!("def value : Nat := 4\nattribute [irreducible] value {suffix}");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert!(error.to_string().contains("reducibility"), "{error}");
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    let source = format!(
+        "def value : Nat := 4\nattribute [irreducible] {}",
+        "value ".repeat(4097),
+    );
+    let error = base
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("resource", false, 3));
+    assert_eq!(before, base.logical_root(&KVMap::new()));
+    checked(&base, "theorem recovery : 4 = 4 := rfl");
+}
+
+#[test]
+fn standalone_instance_attributes_preserve_reducibility_until_explicitly_changed() {
+    for attribute in ["implicit_reducible", "instance_reducible", "reducible"] {
+        let source = format!(
+            "def dictionary : Inhabited Nat := Inhabited.mk 7\n\
+             attribute [instance 2000] dictionary\n\
+             attribute [{attribute}] dictionary\n\
+             theorem selected : default = 7 := rfl"
+        );
+        let result = checked(&engine(), &source);
+        assert_eq!(
+            fln_elab::reducibility::known_status(result.environment(), &n("dictionary")),
+            Ok(Some(if attribute == "reducible" {
+                fln_elab::reducibility::Reducibility::Reducible
+            } else {
+                fln_elab::reducibility::Reducibility::ImplicitReducible
+            })),
+        );
+    }
+    let result = checked(
+        &engine(),
+        "def dictionary : Inhabited Nat := Inhabited.mk 7\n\
+         attribute [instance 2000] dictionary",
+    );
+    assert_eq!(
+        fln_elab::reducibility::known_status(result.environment(), &n("dictionary")),
+        Ok(Some(fln_elab::reducibility::Reducibility::Semireducible)),
+    );
+    let result = checked(
+        &engine(),
+        "instance dictionary : Inhabited Nat := Inhabited.mk 7\n\
+         attribute [irreducible] dictionary",
+    );
+    assert_eq!(
+        fln_elab::reducibility::known_status(result.environment(), &n("dictionary")),
+        Ok(Some(fln_elab::reducibility::Reducibility::Irreducible)),
+    );
+}
+
+#[test]
+fn local_reducibility_is_explicitly_refused_without_persisting_the_override() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    let error = base
+        .check_source_files(
+            &[b"def value : Nat := 4\nattribute [local irreducible] value"],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("lexical restoration"), "{error}");
+    assert_eq!(error.disposition(), ("input", false, 1));
+    assert_eq!(before, base.logical_root(&KVMap::new()));
+}
+
+#[test]
+fn generated_projection_statuses_distinguish_class_fields_and_default_helpers() {
+    use fln_elab::reducibility::{Reducibility, known_status};
+    let source = "structure Plain where\n  value : Nat\n\
+        class Choice where\n  value : Nat := 4";
+    let base = engine();
+    let result = checked(&base, source);
+    assert_eq!(
+        known_status(result.environment(), &n("Plain.value")),
+        Ok(Some(Reducibility::Reducible)),
+    );
+    assert_eq!(
+        known_status(result.environment(), &n("Choice.value")),
+        Ok(Some(Reducibility::Semireducible)),
+    );
+    let helper = fln_elab::records::defaults::helper_name(&n("Choice"), &n("value"));
+    assert_eq!(
+        known_status(result.environment(), &helper),
+        Ok(Some(Reducibility::Semireducible)),
+    );
+    for attribute in ["reducible", "irreducible", "implicit_reducible"] {
+        let source = format!("{source}\nattribute [{attribute}] Plain.value");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert!(error.to_string().contains("transition"), "{error}");
+    }
+    let source = format!("{source}\nattribute [irreducible] Choice.value");
+    let result = checked(&base, &source);
+    assert_eq!(
+        known_status(result.environment(), &n("Choice.value")),
+        Ok(Some(Reducibility::Irreducible)),
+    );
+}
+
+#[test]
+fn proof_projections_are_checked_as_theorems_and_cannot_receive_reducibility_attributes() {
+    let source = "structure Witness where\n  value : Nat\n  equal : value = 7\n\
+        class Evidence (p : Prop) where\n  proof : p\n\
+        structure DefaultProof where\n  proof : 0 = 0 := rfl\n\
+        structure InheritedProof extends DefaultProof\n\
+        def witness : Witness := { equal := rfl, value := 7 }\n\
+        theorem useProjection (w : Witness) : w.value = 7 := w.equal\n\
+        theorem useInherited (w : InheritedProof) : 0 = 0 := w.proof\n\
+        theorem useExplicit (p : Prop) (w : Evidence p) : p := w.proof";
+    let base = engine();
+    let result = checked(&base, source);
+    for name in ["Witness.equal", "Evidence.proof", "DefaultProof.proof"] {
+        assert!(
+            matches!(
+                result.environment().find(&n(name)),
+                Some(fln::ConstantInfo::Thm(_))
+            ),
+            "{name} must be a checked theorem",
+        );
+    }
+    let helper = fln_elab::records::defaults::helper_name(&n("DefaultProof"), &n("proof"));
+    assert!(matches!(
+        result.environment().find(&helper),
+        Some(fln::ConstantInfo::Defn(_)),
+    ));
+    for name in ["Witness.equal", "Evidence.proof", "DefaultProof.proof"] {
+        let source = format!("{source}\nattribute [irreducible] {name}");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert!(error.to_string().contains("not a definition"), "{error}");
+    }
+    assert!(!base.environment().contains(&n("Witness")));
+}

@@ -51,6 +51,16 @@ pub(super) fn apply(
                     requested.to_display_string()
                 ),
             })?;
+        // The standalone attribute does not acquire the `instance` command's
+        // implicitReducible default (Lean/ReducibilityAttrs.lean:205–220).
+        // Preserve an unrecorded declaration's previous status before the
+        // registry's native-instance fallback can start treating it as one.
+        let statuses = fln_elab::reducibility::table(&next)
+            .map_err(|error| reducibility::registry_error(error, (file, command, offset)))?;
+        let unrecorded_status = statuses
+            .get(&name)
+            .is_none()
+            .then(|| statuses.status(&name));
         next = if attribute.scoped {
             fln_elab::instances::scoped::register(
                 &next,
@@ -71,6 +81,10 @@ pub(super) fn apply(
                 )),
             )),
         })?;
+        if let Some(status) = unrecorded_status {
+            next = fln_elab::reducibility::register(&next, &name, status)
+                .map_err(|error| reducibility::registry_error(error, (file, command, offset)))?;
+        }
     }
     // A late name/type/registry refusal drops this entire speculative successor.
     Ok(next)

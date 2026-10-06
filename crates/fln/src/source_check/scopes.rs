@@ -190,6 +190,9 @@ impl Scopes {
             ScopeCommand::Instance(_) => {
                 return Err("instance attributes require an environment transition".into());
             }
+            ScopeCommand::Reducibility(_) => {
+                return Err("reducibility attributes require an environment transition".into());
+            }
             ScopeCommand::OpenScoped(_) => {
                 return Err("scoped opening requires an environment transition".into());
             }

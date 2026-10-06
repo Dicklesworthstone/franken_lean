@@ -1,6 +1,7 @@
 //! One source command may expand to multiple mutually dependent declarations.
 //! Preserve the ordinary per-declaration evidence and publish only a full batch.
 use super::*;
+use fln_kernel::verdict::Verdict;
 
 /// Elaboration and admission share the same kernel nonanswer convention.
 /// Preserve the kernel's complete cause; other frontend errors stay
@@ -313,7 +314,7 @@ impl Engine {
                 },
             );
         }
-        let record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
+        let mut record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
             parsed.syntax(),
             self.environment(),
             limits.kernel,
@@ -324,11 +325,104 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let result = self
+        let mut result = self
             .admit_declarations(&record.declarations, options, limits)
             .map_err(EngineExecutionError::from)?;
+        if let Outcome::Complete(batch) = &result {
+            // The pin emits proof projections as theorems, not definitions
+            // (Lean/Meta/Structure.lean:99–116). Ask K1 under its supplied budget
+            // against each projection's exact, already checked predecessor;
+            // the actual declaration name is still fresh in that environment.
+            // Defaults are ordinary definitions even when they return proofs.
+            let mut predecessor = self;
+            let mut proof_projection = false;
+            for (index, admission) in batch.admissions.iter().enumerate() {
+                if let Declaration::Defn(definition) = &admission.declaration
+                    && !record
+                        .defaults
+                        .iter()
+                        .any(|default| default.helper == definition.base.name)
+                {
+                    let theorem = Declaration::Thm(TheoremVal {
+                        base: definition.base.clone(),
+                        value: definition.value.clone(),
+                        all: definition.all.clone(),
+                    });
+                    match fln_kernel::check(predecessor.environment(), &theorem, limits.kernel) {
+                        Outcome::Complete(Verdict::Accepted { .. }) => {
+                            record.declarations[index] = theorem;
+                            proof_projection = true;
+                        }
+                        Outcome::Complete(Verdict::Rejected {
+                            class: RejectClass::TheoremNotProp,
+                            ..
+                        }) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                        other => {
+                            return Err(EngineExecutionError::Frontend(
+                                DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::TypeObligation(
+                                            Box::new(other),
+                                        ),
+                                    ),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                predecessor = &admission.engine;
+            }
+            if proof_projection {
+                // The classification probe grants no publication authority.
+                // Recheck the corrected batch from the original predecessor so
+                // both checkers certify every final declaration's actual kind.
+                result = self
+                    .admit_declarations(&record.declarations, options, limits)
+                    .map_err(EngineExecutionError::from)?;
+            }
+        }
         Ok(match result {
             Outcome::Complete(mut batch) => {
+                // Projection hints and reducibility status are different facts.
+                // Non-class data projections are reducible, class fields remain
+                // semireducible, and parent instances are implicitReducible.
+                // Default helpers remain semireducible despite Abbrev hints
+                // (Lean/Elab/Structure.lean:1363–1386).
+                for declaration in &record.declarations {
+                    let Declaration::Defn(definition) = declaration else {
+                        continue;
+                    };
+                    let status = if record.parent_instances.contains(&definition.base.name) {
+                        fln_elab::reducibility::Reducibility::ImplicitReducible
+                    } else if record.is_class
+                        || record
+                            .defaults
+                            .iter()
+                            .any(|default| default.helper == definition.base.name)
+                    {
+                        fln_elab::reducibility::Reducibility::Semireducible
+                    } else {
+                        fln_elab::reducibility::Reducibility::Reducible
+                    };
+                    batch.engine.environment = fln_elab::reducibility::register(
+                        batch.engine.environment(),
+                        &definition.base.name,
+                        status,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::Unification(Box::new(
+                                    fln_elab::constraint::unify::UnificationError::Reducibility(
+                                        error,
+                                    ),
+                                )),
+                            ),
+                        ))
+                    })?;
+                }
                 batch.engine.environment = fln_elab::records::defaults::register_defaults(
                     batch.engine.environment(),
                     &record.defaults,
