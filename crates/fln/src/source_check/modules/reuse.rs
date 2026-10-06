@@ -1391,7 +1391,10 @@ mod tests {
                 "the council read every artifact itself"
             );
             assert!(
-                matches!(right.decoded.independent, crate::IndependentReading::Unread(_)),
+                matches!(
+                    right.decoded.independent,
+                    crate::IndependentReading::Unread(_)
+                ),
                 "the rebuild makes no checker reading"
             );
             let mut council_decode = left.decoded.clone();

@@ -75,11 +75,24 @@ fn anonymous_constructor_refusals_carry_the_pins_message() {
 /// `Point.mk 1 ⟨2, 3⟩`, which it then rejects because `Nat` has more than one constructor).
 /// That rewrite is not implemented: it is refused, never approximated.
 #[test]
-fn extra_arguments_are_refused_rather_than_nested() {
+fn extra_arguments_nest_into_the_last_field() {
+    // The pin nests `3` with `2` into `y`'s place: `⟨1, ⟨2, 3⟩⟩`. `y : Nat` has two
+    // constructors, so the inner `⟨…⟩` is the pin's own refusal for that case.
     let source = format!("{POINT}def p : Point := ⟨1, 2, 3⟩");
     let error = check(&source).expect_err(&source);
     assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
-    assert!(error.to_string().contains("not implemented"), "{error}");
+    assert!(
+        error.to_string().contains("has more than one constructor"),
+        "{error}"
+    );
+    // A nested structure field takes the extra arguments.
+    let source = format!(
+        "{POINT}structure Seg where\n  a : Point\n  b : Point\ndef s : Seg := ⟨⟨0, 0⟩, 1, 2⟩"
+    );
+    assert!(
+        matches!(check(&source), Ok(Outcome::Complete(_))),
+        "{source}"
+    );
 }
 
 /// Not yet: `[⟨1, 2⟩, ⟨3, 4⟩] : List Point`. The pin accepts it because `elabAppArgs`

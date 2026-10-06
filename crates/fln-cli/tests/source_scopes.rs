@@ -108,3 +108,42 @@ fn scope_depth_limit_is_reported_as_resource_not_kernel_rejection() {
     assert!(error.contains("\"outcome\":\"resource\""), "{error}");
     assert!(error.contains("\"authority\":false"), "{error}");
 }
+
+/// The drop-in `lean` door keeps the same scopes as `check-source`: declarations are
+/// named in their namespace, `open` and `open … in` (the pin's `section open … end`)
+/// resolve names for `#eval` and `#check`, and leaving a scope forgets its opens. The
+/// expected output is the pinned Reference's `lean <file>`, byte for byte.
+#[test]
+fn the_lean_door_evaluates_and_checks_under_namespaces_and_opens() {
+    let path = file(
+        "namespace A\ndef x : Nat := 1\nnamespace B\ndef y : Nat := x + 1\nend B\nend A\n\
+         #eval A.B.y\nsection S\nopen A\n#eval x\nend S\nopen A in\n#eval B.y\n#check A.x\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "2\n1\n2\nA.x : Nat\n"
+    );
+    assert!(output.stderr.is_empty());
+
+    // After `end A`, `x` is unknown again (the pin: "Unknown identifier `x`").
+    let closed = file("namespace A\ndef x : Nat := 1\nend A\n#eval x\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&closed)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Unknown identifier `x`"),
+        "{output:?}"
+    );
+}

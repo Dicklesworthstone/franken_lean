@@ -4,7 +4,7 @@ pub mod inspect;
 mod instance_attributes;
 pub mod modules;
 mod reducibility;
-mod scopes;
+pub(crate) mod scopes;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceCheckLimits {

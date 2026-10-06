@@ -6328,6 +6328,17 @@ impl Engine {
                 limits.kernel,
                 scope,
             ),
+            SourceCommandKind::Check
+                if scope != &fln_elab::source::scope::SourceScope::default() =>
+            {
+                fln_elab::elaborate_check_in_scope_with_budget(
+                    parsed.syntax(),
+                    name,
+                    self.environment(),
+                    limits.kernel,
+                    scope,
+                )
+            }
             SourceCommandKind::Check => fln_elab::elaborate_check_in_with_budget(
                 parsed.syntax(),
                 name,
@@ -6478,7 +6489,123 @@ impl Engine {
             })?;
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
-        for (command_index, (original_offset, command_source)) in commands.into_iter().enumerate() {
+        // Lexical scopes (`namespace`, `section`, `open`, `open … in`), as `check-source`
+        // keeps them: they change name resolution and declaration names, never the
+        // environment. `open A in c` is the pin's `section open A c end`.
+        enum Step<'s> {
+            Command(usize, fln_parse::BytePos, &'s [u8]),
+            Scope(usize, fln_parse::command_scope::ScopeCommand),
+        }
+        let mut scopes = source_check::scopes::Scopes::new(engine.environment());
+        let mut queue: std::collections::VecDeque<Step<'_>> = commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, (offset, source))| Step::Command(index, offset, source))
+            .collect();
+        let scope_error = |index: usize, at: fln_parse::BytePos, message: String| {
+            EngineExecutionError::BatchCommand {
+                index,
+                error: Box::new(EngineExecutionError::ScopeTransition { message }),
+                at: Some(at),
+            }
+        };
+        while let Some(step) = queue.pop_front() {
+            let (command_index, original_offset, command_source) = match step {
+                Step::Command(index, offset, source) => (index, offset, source),
+                Step::Scope(index, transition) => {
+                    scopes
+                        .check_limits(&transition)
+                        .map_err(|(resource, limit)| {
+                            scope_error(
+                                index,
+                                fln_parse::BytePos(0),
+                                format!("{resource} limit {limit} exceeded"),
+                            )
+                        })?;
+                    scopes
+                        .transition(transition, engine.environment())
+                        .map_err(|error| {
+                            scope_error(index, fln_parse::BytePos(0), error.message())
+                        })?;
+                    continue;
+                }
+            };
+            let control = fln_parse::command_scope::parse(command_source)
+                .map_err(|error| error.with_original_offset(original_offset))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(error)),
+                    at: Some(original_offset),
+                })?;
+            if let Some(control) = control {
+                use fln_parse::command_scope::ScopeCommand;
+                match control {
+                    ScopeCommand::Trivia => {}
+                    ScopeCommand::OpenIn {
+                        names,
+                        scoped,
+                        body,
+                    } => {
+                        let open = if scoped {
+                            ScopeCommand::OpenScoped(names)
+                        } else {
+                            ScopeCommand::Open(names)
+                        };
+                        for step in [
+                            Step::Scope(command_index, ScopeCommand::Section(None)),
+                            Step::Scope(command_index, open),
+                            Step::Command(
+                                command_index,
+                                fln_parse::BytePos(original_offset.0 + body),
+                                &command_source[body..],
+                            ),
+                            Step::Scope(command_index, ScopeCommand::End(None)),
+                        ]
+                        .into_iter()
+                        .rev()
+                        {
+                            queue.push_front(step);
+                        }
+                    }
+                    ScopeCommand::Namespace(_)
+                    | ScopeCommand::Section(_)
+                    | ScopeCommand::End(_)
+                    | ScopeCommand::Open(_)
+                    | ScopeCommand::OpenScoped(_)
+                    | ScopeCommand::Universe(_) => {
+                        scopes.check_limits(&control).map_err(|(resource, limit)| {
+                            scope_error(
+                                command_index,
+                                original_offset,
+                                format!("{resource} limit {limit} exceeded"),
+                            )
+                        })?;
+                        scopes
+                            .transition(control, engine.environment())
+                            .map_err(|error| {
+                                scope_error(command_index, original_offset, error.message())
+                            })?;
+                    }
+                    ScopeCommand::Variable(_)
+                    | ScopeCommand::Include(_)
+                    | ScopeCommand::Omit(_)
+                    | ScopeCommand::Simp(_)
+                    | ScopeCommand::Instance(_)
+                    | ScopeCommand::Reducibility(_) => {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::UnsupportedDeclaration {
+                                kind: "section variable or attribute command",
+                            }),
+                            at: Some(original_offset),
+                        });
+                    }
+                }
+                continue;
+            }
+            let scope = scopes.current.clone();
+            let scoped = scope != fln_elab::source::scope::SourceScope::default();
             if fln_parse::command_scope::mutual::parse(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -6493,7 +6620,12 @@ impl Engine {
                 // admission path. Never publish members sequentially or treat
                 // declarations as VM executions merely to advance the stream.
                 let admission = match engine
-                    .admit_source_command(command_source, options, limits.admission())
+                    .admit_source_command_in_scope(
+                        command_source,
+                        options,
+                        limits.admission(),
+                        &scope,
+                    )
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -6503,6 +6635,9 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                for row in &admission.admissions {
+                    scopes.admitted(&row.declaration);
+                }
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -6530,11 +6665,12 @@ impl Engine {
                         at: Some(original_offset),
                     });
                 }
-                let checked = match engine.check_parsed_source_command(
+                let checked = match engine.check_parsed_source_command_in_scope(
                     parsed,
                     options,
                     limits.admission(),
                     command_index,
+                    &scope,
                 ) {
                     Ok(Outcome::Complete(checked)) => checked,
                     Ok(Outcome::Inconclusive(reason)) => {
@@ -6582,7 +6718,12 @@ impl Engine {
                 || is_instance
             {
                 let admission = match engine
-                    .admit_source_command(command_source, options, limits.admission())
+                    .admit_source_command_in_scope(
+                        command_source,
+                        options,
+                        limits.admission(),
+                        &scope,
+                    )
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -6592,6 +6733,9 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                for row in &admission.admissions {
+                    scopes.admitted(&row.declaration);
+                }
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -6609,11 +6753,29 @@ impl Engine {
                             error: Box::new(error),
                             at: Some(original_offset),
                         })?;
-                    fln_elab::elaborate_evaluation_in_with_budget(
+                    if scoped {
+                        fln_elab::elaborate_evaluation_in_scope_with_budget(
+                            parsed.syntax(),
+                            name,
+                            engine.environment(),
+                            limits.kernel,
+                            &scope,
+                        )
+                    } else {
+                        fln_elab::elaborate_evaluation_in_with_budget(
+                            parsed.syntax(),
+                            name,
+                            engine.environment(),
+                            limits.kernel,
+                        )
+                    }
+                }
+                fln_parse::SourceCommandKind::Definition if scoped => {
+                    fln_elab::elaborate_definition_in_scope_with_budget(
                         parsed.syntax(),
-                        name,
                         engine.environment(),
                         limits.kernel,
+                        &scope,
                     )
                 }
                 fln_parse::SourceCommandKind::Definition => {
@@ -6657,6 +6819,9 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                for row in &admission.admissions {
+                    scopes.admitted(&row.declaration);
+                }
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -6678,6 +6843,9 @@ impl Engine {
                     });
                 }
             };
+            if !is_evaluation {
+                scopes.admitted(&execution.declaration);
+            }
             let execution_index = executions.len();
             engine = execution.engine.clone();
             executions.push(execution);
@@ -10368,6 +10536,11 @@ pub enum EngineExecutionError {
     },
     StandaloneCheckRequired,
     TerminalCheckRequired,
+    /// A `namespace`/`section`/`end`/`open` command the scope stack refused (an
+    /// unmatched `end`, an unknown namespace), in the pin's words where it has them.
+    ScopeTransition {
+        message: String,
+    },
     TerminalCheckDefinitionPrefix {
         index: usize,
     },
@@ -10433,6 +10606,7 @@ impl fmt::Display for EngineExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
+            Self::ScopeTransition { message } => formatter.write_str(message),
             Self::SourceModuleLimit { observed, limit } => write!(
                 formatter,
                 "source set contains {observed} modules; planning limit is {limit}"

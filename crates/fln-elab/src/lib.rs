@@ -573,6 +573,47 @@ pub fn elaborate_evaluation_in_with_budget(
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
+/// [`elaborate_evaluation_in_with_budget`] with names resolved in a source scope
+/// (enclosing namespaces and `open` declarations).
+pub fn elaborate_evaluation_in_scope_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    source::scope::elaborate_evaluation(syntax, generated_name, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// [`elaborate_definition_in_with_budget`] with names declared and resolved in a
+/// source scope.
+pub fn elaborate_definition_in_scope_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    source::scope::elaborate_definition(syntax, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// A `#check` candidate with names resolved in a source scope.
+pub fn elaborate_check_in_scope_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    match source::scope::elaborate_check(syntax, generated_name, environment, budget, scope) {
+        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
+            _,
+        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
+        result => result,
+    }
+}
+
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
 /// definition candidate used only for dual-checker validation.
 ///

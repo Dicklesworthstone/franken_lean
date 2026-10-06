@@ -3088,7 +3088,23 @@ fn definition_in_context_named(
         None
     };
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
-    let (body, termination, where_clause) = if equations {
+    let struct_instance;
+    let empty_suffix;
+    let empty_where;
+    let (body, termination, where_clause) = if is_instance
+        && definition[3].kind() == Some(&parser_kind(&["Command", "whereStructInst"]))
+    {
+        struct_instance = where_struct_instance(&definition[3])?;
+        empty_suffix = Syntax::node(
+            parser_kind(&["Termination", "suffix"]),
+            vec![
+                Syntax::node(Name::from_components(["null"]), Vec::new()),
+                Syntax::node(Name::from_components(["null"]), Vec::new()),
+            ],
+        );
+        empty_where = Syntax::node(Name::from_components(["null"]), Vec::new());
+        (&struct_instance, &empty_suffix, &empty_where)
+    } else if equations {
         let parts = expect_node(
             &definition[3],
             &parser_kind(&["Command", "declValEqns"]),
@@ -3242,6 +3258,32 @@ pub(super) fn query(
     kernel: Budget,
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    query_in(syntax, name, Context::new(environment, kernel), evaluate)
+}
+
+/// [`query`] with names resolved in a source scope (namespaces, `open`).
+pub(super) fn query_scoped(
+    syntax: &Syntax,
+    name: Name,
+    environment: &Environment,
+    kernel: Budget,
+    evaluate: bool,
+    scope: &scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    query_in(
+        syntax,
+        name,
+        Context::scoped(environment, kernel, scope),
+        evaluate,
+    )
+}
+
+fn query_in(
+    syntax: &Syntax,
+    name: Name,
+    mut context: Context,
+    evaluate: bool,
+) -> Result<Declaration, NatDefinitionElabError> {
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return Err(if evaluate {
             NatDefinitionElabError::InvalidGeneratedEvaluationName
@@ -3264,7 +3306,6 @@ pub(super) fn query(
         if evaluate { "#eval" } else { "#check" },
         "query keyword",
     )?;
-    let mut context = Context::new(environment, kernel);
     let term = context.term(&parts[1], None)?;
     let term = context.finish(term)?;
     Ok(Declaration::Defn(DefinitionVal {
@@ -3415,4 +3456,97 @@ fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefiniti
         );
     }
     Ok(result)
+}
+
+/// `instance … where fields` (`Command.whereStructInst`) as the structure instance
+/// `{ fields }` it elaborates to; a field's binders (`area q := …`) become a `fun` over
+/// its value, as the pin's `structInstField` expansion does.
+fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Command", "whereStructInst"]),
+        3,
+        "instance where block",
+    )?;
+    expect_atom(&parts[0], "where", "instance where keyword")?;
+    expect_empty_null(&parts[2], "instance deriving clause")?;
+    let fields = expect_node(
+        &parts[1],
+        &parser_kind(&["Term", "structInstFields"]),
+        1,
+        "instance fields",
+    )?;
+    let items = expect_null_args(&fields[0], "instance field list")?;
+    let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+    let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+    let mut rows = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        if index % 2 == 1 {
+            expect_empty_null(item, "instance field separator")?;
+            rows.push(atom(","));
+            continue;
+        }
+        let field = expect_node(
+            item,
+            &parser_kind(&["Term", "structInstField"]),
+            2,
+            "instance field",
+        )?;
+        let payload = expect_null_args(&field[1], "instance field payload")?;
+        let [binders, type_, definition] = payload else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_empty_null(type_, "instance field type")?;
+        let binders = expect_null_args(binders, "instance field binders")?;
+        let definition = if binders.is_empty() {
+            definition.clone()
+        } else {
+            let parts = expect_node(
+                definition,
+                &parser_kind(&["Term", "structInstFieldDef"]),
+                3,
+                "instance field definition",
+            )?;
+            let value = Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![
+                    atom("fun"),
+                    Syntax::node(
+                        parser_kind(&["Term", "basicFun"]),
+                        vec![
+                            null(binders.to_vec()),
+                            null(Vec::new()),
+                            atom("=>"),
+                            parts[2].clone(),
+                        ],
+                    ),
+                ],
+            );
+            Syntax::node(
+                parser_kind(&["Term", "structInstFieldDef"]),
+                vec![parts[0].clone(), parts[1].clone(), value],
+            )
+        };
+        rows.push(Syntax::node(
+            parser_kind(&["Term", "structInstField"]),
+            vec![
+                field[0].clone(),
+                null(vec![null(Vec::new()), null(Vec::new()), definition]),
+            ],
+        ));
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Term", "structInst"]),
+        vec![
+            atom("{"),
+            null(Vec::new()),
+            Syntax::node(parser_kind(&["Term", "structInstFields"]), vec![null(rows)]),
+            Syntax::node(
+                parser_kind(&["Term", "optEllipsis"]),
+                vec![null(Vec::new())],
+            ),
+            null(Vec::new()),
+            atom("}"),
+        ],
+    ))
 }

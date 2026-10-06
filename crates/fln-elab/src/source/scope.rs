@@ -376,6 +376,29 @@ pub fn elaborate_definition(
     super::definition_scoped(syntax, env, kernel, scope)
 }
 
+/// An `#eval` candidate (a generated definition) with names resolved in `scope`. As for
+/// [`elaborate_definition`], only a candidate: the caller admits it like any other.
+pub fn elaborate_evaluation(
+    syntax: &Syntax,
+    generated_name: Name,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    super::query_scoped(syntax, generated_name, env, kernel, true, scope)
+}
+
+/// A `#check` candidate with names resolved in `scope`.
+pub fn elaborate_check(
+    syntax: &Syntax,
+    generated_name: Name,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    super::query_scoped(syntax, generated_name, env, kernel, false, scope)
+}
+
 /// Elaborate an anonymous example as a definition candidate of any sort.
 ///
 /// The pin's `mkDefViewOfExample` reuses ordinary definition elaboration, and

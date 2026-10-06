@@ -11,18 +11,25 @@ struct Frame {
     saved: SourceScope,
 }
 #[derive(Default)]
-pub(super) struct Scopes {
+pub(crate) struct Scopes {
     pub current: SourceScope,
     stack: Vec<Frame>,
     namespaces: BTreeSet<Name>,
 }
 
-pub(super) enum TransitionError {
+pub(crate) enum TransitionError {
     Scope(String),
     Registry(fln_elab::instances::InstanceRegistryError),
 }
 
 impl TransitionError {
+    /// The refusal as a message, for a front door without per-file coordinates.
+    pub fn message(self) -> String {
+        match self {
+            Self::Scope(message) => message,
+            Self::Registry(error) => format!("{error:?}"),
+        }
+    }
     pub fn into_source(self, file: usize, command: usize, offset: usize) -> SourceCheckError {
         match self {
             Self::Scope(message) => SourceCheckError::Scope {

@@ -58,31 +58,7 @@ pub(super) fn syntax(
     tokens: &[LexedToken],
     keyword: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let first = keyword + 1;
-    if !matches!(
-        tokens.get(first).map(|t| &t.kind),
-        Some(TokenKind::Ident(_))
-    ) {
-        return Err(refuse(view, tokens, first));
-    }
-    // Declaration boundaries: a name at the first declaration's column, on a later line,
-    // outside every bracket.
-    let indent = column(view, tokens, first);
-    let mut starts = vec![first];
-    let mut depth = 0usize;
-    for at in first + 1..tokens.len() {
-        if opens(tokens, at) {
-            depth += 1;
-        } else if closes(tokens, at) {
-            depth = depth.saturating_sub(1);
-        } else if depth == 0
-            && matches!(tokens[at].kind, TokenKind::Ident(_))
-            && line(view, tokens, at) > line(view, tokens, at - 1)
-            && column(view, tokens, at) == indent
-        {
-            starts.push(at);
-        }
-    }
+    let starts = declaration_starts(view, tokens, keyword)?;
     let mut items = Vec::with_capacity(starts.len() * 2);
     for (index, &name) in starts.iter().enumerate() {
         let end = starts.get(index + 1).copied().unwrap_or(tokens.len());
@@ -175,4 +151,108 @@ fn declaration(
             ),
         ],
     ))
+}
+
+/// `instance … where fields` (`Command.whereStructInst`, `"where" structInstFields
+/// optDeriving`): one `structInstField` per field, `name binders := value`, delimited like
+/// `where` declarations. The elaborator reads it as the structure instance `{ fields }`,
+/// with a field's binders abstracted over its value.
+pub(super) fn struct_instance(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let starts = declaration_starts(view, tokens, keyword)?;
+    let mut fields = Vec::with_capacity(starts.len() * 2);
+    for (index, &name) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(tokens.len());
+        if index > 0 {
+            fields.push(null_node(Vec::new()));
+        }
+        // `name binder* := value`, binders bare names only.
+        let mut cursor = name + 1;
+        let mut binders = Vec::new();
+        while cursor < end
+            && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
+            && !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=")
+        {
+            binders.push(leaves.leaf(cursor)?);
+            cursor += 1;
+        }
+        if cursor >= end || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=") {
+            return Err(refuse(view, tokens, cursor.min(end)));
+        }
+        if cursor + 1 >= end {
+            return Err(refuse(view, tokens, end));
+        }
+        let value = bounded_term(
+            leaves,
+            view,
+            tokens,
+            cursor + 1..end,
+            DefinitionGrammar::Scalar,
+        )?;
+        fields.push(Syntax::node(
+            parser_kind(&["Term", "structInstField"]),
+            vec![
+                Syntax::node(
+                    parser_kind(&["Term", "structInstLVal"]),
+                    vec![leaves.leaf(name)?, null_node(Vec::new())],
+                ),
+                null_node(vec![
+                    null_node(binders),
+                    null_node(Vec::new()),
+                    Syntax::node(
+                        parser_kind(&["Term", "structInstFieldDef"]),
+                        vec![leaves.leaf(cursor)?, null_node(Vec::new()), value],
+                    ),
+                ]),
+            ],
+        ));
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Command", "whereStructInst"]),
+        vec![
+            leaves.leaf(keyword)?,
+            Syntax::node(
+                parser_kind(&["Term", "structInstFields"]),
+                vec![null_node(fields)],
+            ),
+            null_node(Vec::new()),
+        ],
+    ))
+}
+
+/// The first token of each item of a `where` block: a name at the first item's column,
+/// on a later line, outside every bracket.
+fn declaration_starts(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+) -> Result<Vec<usize>, NatDefinitionParseError> {
+    let first = keyword + 1;
+    if !matches!(
+        tokens.get(first).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(view, tokens, first));
+    }
+    let indent = column(view, tokens, first);
+    let mut starts = vec![first];
+    let mut depth = 0usize;
+    for at in first + 1..tokens.len() {
+        if opens(tokens, at) {
+            depth += 1;
+        } else if closes(tokens, at) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0
+            && matches!(tokens[at].kind, TokenKind::Ident(_))
+            && line(view, tokens, at) > line(view, tokens, at - 1)
+            && column(view, tokens, at) == indent
+        {
+            starts.push(at);
+        }
+    }
+    Ok(starts)
 }

@@ -2514,6 +2514,10 @@ fn parse_definition_with_grammar(
         cursor += 1;
         let start = cursor;
         cursor = type_end(&tokens, start, ":=");
+        if is_instance && grammar == DefinitionGrammar::Scalar {
+            // `instance : C where …` (`Command.whereStructInst`).
+            cursor = cursor.min(type_end(&tokens, start, "where"));
+        }
         if grammar == DefinitionGrammar::Scalar {
             let pipe = type_end(&tokens, start, "|");
             // A leading unparenthesized match belongs to the result type.
@@ -2538,7 +2542,12 @@ fn parse_definition_with_grammar(
     let equations = grammar == DefinitionGrammar::Scalar
         && matches!(tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == "|");
+    let instance_where = is_instance
+        && grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "where");
     if !equations
+        && !instance_where
         && !matches!(
             tokens.get(assignment_index).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":="
@@ -2555,7 +2564,7 @@ fn parse_definition_with_grammar(
     let where_index = (!equations && !is_instance && grammar == DefinitionGrammar::Scalar)
         .then(|| where_decls::start(&tokens, value_index))
         .flatten();
-    let (let_bindings, body_start) = if equations {
+    let (let_bindings, body_start) = if equations || instance_where {
         (Vec::new(), assignment_index)
     } else {
         bounded_let_bindings(&view, &tokens, value_index)?
@@ -2608,7 +2617,9 @@ fn parse_definition_with_grammar(
         ]),
         vec![null_node(parameters), result_type],
     );
-    let value = if equations {
+    let value = if instance_where {
+        null_node(Vec::new())
+    } else if equations {
         matching::declaration_equations(
             &leaves,
             &view,
@@ -2634,7 +2645,9 @@ fn parse_definition_with_grammar(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let declaration_value = if equations {
+    let declaration_value = if instance_where {
+        where_decls::struct_instance(&leaves, &view, &tokens, assignment_index)?
+    } else if equations {
         // `declValEqns := matchAltsWhereDecls` (`Lean/Parser/Command.lean`): the
         // alternatives, termination hints and `where` block sit in one node.
         Syntax::node(
