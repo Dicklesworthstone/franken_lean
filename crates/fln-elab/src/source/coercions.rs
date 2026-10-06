@@ -5,6 +5,8 @@ use super::instances::{nonmatch, registry_error};
 use super::*;
 use crate::instances::InstanceRegistry;
 
+mod monad;
+
 impl Context {
     /// Expected function types expose domain/codomain universe constraints that
     /// a single sort equality can hide behind max/imax. Generate them inside
@@ -228,7 +230,7 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        if !self.has_coercion_class("CoeT")? {
+        if !self.has_coercion_class("CoeT")? && !self.has_coercion_class("MonadLiftT")? {
             return self.constrain_type(actual, expected);
         }
         self.coercion_eq(actual, expected).map(|_| ())
@@ -389,7 +391,10 @@ impl Context {
         term: Typed,
         expected: &Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
-        if !self.has_coercion_class("CoeT")? && !self.has_coercion_class("CoeSort")? {
+        if !self.has_coercion_class("CoeT")?
+            && !self.has_coercion_class("CoeSort")?
+            && !self.has_coercion_class("MonadLiftT")?
+        {
             self.constrain_expected_type(&term.type_, expected)?;
             return Ok(term);
         }
@@ -415,6 +420,10 @@ impl Context {
             Ok(false) => {}
             Err(error) if nonmatch(&error) => {}
             Err(error) => return Err(error),
+        }
+        // The pin tries a registered monad lift before ordinary value coercions.
+        if let Some(lifted) = self.try_monad_lift(&term, expected)? {
+            return Ok(lifted);
         }
         let mut trial = self.clone();
         let result = (|| {
