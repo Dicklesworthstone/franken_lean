@@ -50,7 +50,7 @@
 //! to frankensqlite changes neither the trust semantics nor any key.
 use super::imported::{SourceOleanImport, SourceOleanImportError, SourceOleanImportLimits};
 use crate::*;
-use fln_env::environment::{DeclarationCommitted, DeclarationPlan};
+use fln_env::environment::{DeclarationCommitted, DeclarationPlan, MeasuredDeclaration};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -882,6 +882,7 @@ impl Engine {
             modules,
             options,
             limits.check,
+            limits.jobs,
             record,
             cancellation,
         ) {
@@ -934,6 +935,7 @@ impl Engine {
         modules: &[OleanModuleInput<'_>],
         options: &KVMap,
         limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
         record: &ImportReuseRecord,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<std::result::Result<CheckedOleanSet, ImportReuseRefusal>> {
@@ -941,7 +943,12 @@ impl Engine {
         if !self.environment.is_empty() || !self.imported_modules.is_empty() {
             return refuse(ImportReuseRefusal::NonEmptyBase);
         }
-        let ordered = match self.decode_olean_module_set(modules, limits) {
+        let ordered = match self.decode_olean_module_set(
+            modules,
+            limits,
+            crate::CheckerReading::Skip,
+            jobs,
+        ) {
             Ok(ordered) => ordered,
             Err(error) => return refuse(ImportReuseRefusal::Decode(Box::new(error))),
         };
@@ -961,41 +968,50 @@ impl Engine {
             });
         }
         let mut environment = self.environment.clone();
-        let mut root = base_logical_root;
         // Every module's root is the root of the environment after it. The base is
-        // empty and the olean path adds no extension state, so the roots can be
-        // accumulated: one builder gains each published (name, digest) pair and is
-        // finalized per module, instead of re-encoding every name already present
-        // for every one of the closure's modules (601 for `Init`). The final root is
-        // checked against `Environment::logical_root` below.
-        let mut roots = fln_hash::root::LogicalRootBuilder::new();
-        roots.set_options(options);
+        // empty and the olean path adds no extension state, so a module's root is
+        // the root over the (name, digest) pairs published by it and every module
+        // before it. Each module's pairs are kept here and the roots are computed
+        // once the closure is in place ([`module_roots`]): finalizing a cumulative
+        // builder per module re-encoded every earlier name for every one of the
+        // closure's modules (601 for `Init`), a sixth of a warm import. The final
+        // root is checked against `Environment::logical_root` below.
+        let mut deltas: Vec<Vec<(Vec<u8>, Digest)>> = Vec::with_capacity(ordered.len());
         let mut admitted_any = false;
-        let mut checked_modules = Vec::with_capacity(ordered.len());
-        for ((name, decoded), recorded) in ordered.into_iter().zip(&record.modules) {
+        let mut pending = Vec::with_capacity(ordered.len());
+        // Each declaration's digest and preflight read only the declaration, so they
+        // are measured for the whole closure at once; publication stays in order.
+        let mut measured = measure_closure(&ordered, jobs).into_iter();
+        for (name, decoded) in ordered {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module"));
             }
-            let module_base_root = root;
-            if module_base_root.0 != recorded.base_root {
-                return refuse(ImportReuseRefusal::Root {
-                    at: "module-base",
-                    module: Some(name),
-                });
-            }
-            let mut added = false;
+            let Some(mut module_measured) = measured.next().map(Vec::into_iter) else {
+                return Outcome::InternalFault(InternalFault::new(
+                    "import reuse",
+                    "a decoded module has no measurements",
+                ));
+            };
+            let mut delta = Vec::new();
             for info in &decoded.constants {
+                let Some(measurement) = module_measured.next() else {
+                    return Outcome::InternalFault(InternalFault::new(
+                        "import reuse",
+                        "a decoded declaration has no measurement",
+                    ));
+                };
                 if environment.contains(info.name()) {
                     // An identical or subsuming repeat: the council keeps the copy
                     // already present. A difference here is caught by the roots.
                     continue;
                 }
-                let plan = match environment.plan_add_decl(
-                    info.clone(),
-                    DeclarationBudget::UNBOUNDED,
-                    CollisionBudget::UNBOUNDED,
-                    cancellation,
-                ) {
+                let content = match measurement {
+                    Outcome::Complete(content) => content,
+                    Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                };
+                let plan = match environment.plan_measured_decl(content, CollisionBudget::UNBOUNDED)
+                {
                     Outcome::Complete(DeclarationPlan::Prepared(plan)) => plan,
                     Outcome::Complete(DeclarationPlan::DuplicateName { .. }) => {
                         return Outcome::InternalFault(InternalFault::new(
@@ -1008,7 +1024,7 @@ impl Engine {
                 };
                 environment = match plan.commit(&environment, cancellation) {
                     Outcome::Complete(DeclarationCommitted::Published(published)) => {
-                        roots.add_decl(info.name(), published.digest);
+                        delta.push((info.name().to_canonical_bytes(), published.digest));
                         published.environment
                     }
                     Outcome::Complete(DeclarationCommitted::DuplicateName { .. }) => {
@@ -1020,11 +1036,22 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
                 };
-                added = true;
             }
-            if added {
-                admitted_any = true;
-                root = roots.finalize();
+            admitted_any |= !delta.is_empty();
+            deltas.push(delta);
+            pending.push((name, decoded));
+        }
+        let roots = module_roots(base_logical_root, &deltas, options, jobs);
+        let mut checked_modules = Vec::with_capacity(pending.len());
+        let mut module_base_root = base_logical_root;
+        for (((name, decoded), recorded), root) in
+            pending.into_iter().zip(&record.modules).zip(roots)
+        {
+            if module_base_root.0 != recorded.base_root {
+                return refuse(ImportReuseRefusal::Root {
+                    at: "module-base",
+                    module: Some(name),
+                });
             }
             if root.0 != recorded.result_root {
                 return refuse(ImportReuseRefusal::Root {
@@ -1054,7 +1081,9 @@ impl Engine {
                 result_logical_root: root,
                 declarations,
             });
+            module_base_root = root;
         }
+        let root = module_base_root;
         if root.0 != record.declaration_root {
             return refuse(ImportReuseRefusal::Root {
                 at: "declarations",
@@ -1109,6 +1138,123 @@ impl Engine {
     }
 }
 
+/// [`Environment::measure_declaration`] for every declaration of every module, in
+/// module and table order, `jobs.threads` modules at once. A measurement reads only
+/// its declaration, so the result does not depend on `jobs`.
+fn measure_closure(
+    ordered: &[(Name, DecodedOlean)],
+    jobs: OleanFrontierJobs,
+) -> Vec<Vec<Outcome<MeasuredDeclaration>>> {
+    let measure_module = |decoded: &DecodedOlean| {
+        decoded
+            .constants
+            .iter()
+            .map(|info| {
+                Environment::measure_declaration(info.clone(), DeclarationBudget::UNBOUNDED, None)
+            })
+            .collect::<Vec<_>>()
+    };
+    let threads = jobs.threads.get().min(ordered.len());
+    if threads <= 1 {
+        return ordered
+            .iter()
+            .map(|(_, decoded)| measure_module(decoded))
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<Vec<Outcome<MeasuredDeclaration>>>> =
+        ordered.iter().map(|_| std::sync::OnceLock::new()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let module = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (Some(slot), Some((_, decoded))) = (slots.get(module), ordered.get(module))
+                    else {
+                        return;
+                    };
+                    let _ = slot.set(measure_module(decoded));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .zip(ordered)
+        .map(|(slot, (_, decoded))| slot.into_inner().unwrap_or_else(|| measure_module(decoded)))
+        .collect()
+}
+
+/// The logical root after each module of a rebuilt closure: module `k`'s root is the
+/// root over every pair published by modules `0..=k`, and `base` while none has
+/// published anything. This is exactly the root a builder accumulating those pairs
+/// would finalize to after module `k` ([`fln_hash::root::declaration_root`] is that
+/// encoding), so the result does not depend on `jobs`; only the wall time does.
+fn module_roots(
+    base: LogicalRoot,
+    deltas: &[Vec<(Vec<u8>, Digest)>],
+    options: &KVMap,
+    jobs: OleanFrontierJobs,
+) -> Vec<LogicalRoot> {
+    // Every published pair once, in canonical name order, tagged by its module.
+    let mut sorted: Vec<(&[u8], &Digest, usize)> = deltas
+        .iter()
+        .enumerate()
+        .flat_map(|(module, delta)| {
+            delta
+                .iter()
+                .map(move |(name, digest)| (name.as_slice(), digest, module))
+        })
+        .collect();
+    sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut published = 0_usize;
+    let counts: Vec<usize> = deltas
+        .iter()
+        .map(|delta| {
+            published += delta.len();
+            published
+        })
+        .collect();
+    let root_of = |module: usize| {
+        if counts[module] == 0 {
+            return base;
+        }
+        fln_hash::root::declaration_root(
+            counts[module],
+            sorted
+                .iter()
+                .filter(|(_, _, owner)| *owner <= module)
+                .map(|(name, digest, _)| (*name, *digest)),
+            Some(options),
+        )
+    };
+    let threads = jobs.threads.get().min(deltas.len());
+    if threads <= 1 {
+        return (0..deltas.len()).map(root_of).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<LogicalRoot>> =
+        deltas.iter().map(|_| std::sync::OnceLock::new()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let module = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(slot) = slots.get(module) else {
+                        return;
+                    };
+                    let _ = slot.set(root_of(module));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(module, slot)| slot.into_inner().unwrap_or_else(|| root_of(module)))
+        .collect()
+}
+
 /// The checked set `record` re-proves for `modules`, for tests elsewhere in the crate
 /// that need a second copy of a council-admitted closure without a second council.
 #[cfg(test)]
@@ -1122,6 +1268,7 @@ impl Engine {
             modules,
             &KVMap::new(),
             super::imported::tests::limits(1).check,
+            OleanFrontierJobs::SERIAL,
             record,
             None,
         ) {
@@ -1215,9 +1362,11 @@ mod tests {
         bytes[last] = if bytes[last] == b'z' { b'y' } else { b'z' };
     }
 
-    /// Everything the council's checked set and the reused one must share. The one field
-    /// that differs is stated, not skipped: the council retains its independent-checker
-    /// projection of every admitted declaration, the rebuild retains none.
+    /// Everything the council's checked set and the reused one must share. The fields
+    /// that differ are stated, not skipped: the council retains its independent-checker
+    /// projection of every admitted declaration, the rebuild retains none; and the
+    /// council's decode carries the checker's own reading of each artifact, which the
+    /// rebuild never consults and so never makes.
     fn assert_same_closure(council: &SourceOleanImport, reused: &SourceOleanImport) {
         let (left, right) = (&council.checked, &reused.checked);
         assert!(
@@ -1237,7 +1386,17 @@ mod tests {
         assert_eq!(left.modules.len(), right.modules.len());
         for (left, right) in left.modules.iter().zip(&right.modules) {
             assert_eq!(left.name, right.name);
-            assert!(left.decoded == right.decoded, "decoded artifacts");
+            assert!(
+                matches!(left.decoded.independent, crate::IndependentReading::Read(_)),
+                "the council read every artifact itself"
+            );
+            assert!(
+                matches!(right.decoded.independent, crate::IndependentReading::Unread(_)),
+                "the rebuild makes no checker reading"
+            );
+            let mut council_decode = left.decoded.clone();
+            council_decode.independent = right.decoded.independent.clone();
+            assert!(council_decode == right.decoded, "decoded artifacts");
             assert_eq!(left.base_logical_root, right.base_logical_root);
             assert_eq!(left.result_logical_root, right.result_logical_root);
             assert_eq!(left.declarations, right.declarations, "checker rows");

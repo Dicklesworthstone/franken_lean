@@ -215,6 +215,10 @@ pub(super) fn run(
                 });
                 format!("Checked {} source commands ({} theorems) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
+            // The process ends with this answer. Tearing down an imported closure
+            // (65,404 declarations for `Init`) node by node took seconds; the
+            // operating system reclaims it at exit in one step.
+            std::mem::forget((engine, olean_base, result, loaded));
             MultiplexerOutput::success(stdout)
         });
     match worker {

@@ -177,6 +177,22 @@ pub enum DeclarationCommitted {
 /// the twin of `ModuleGraphAdmissionPlan`/`PreparedAdmission` in
 /// [`crate::modules`] on purpose rather than a second invention: one plan shape in the
 /// crate, so a reader who has understood one has understood both.
+/// A declaration with its environment-independent admission facts, from
+/// [`Environment::measure_declaration`]. Only a plan can publish it.
+#[derive(Debug)]
+pub struct MeasuredDeclaration {
+    info: ConstantInfo,
+    provisional_digest: Digest,
+    usage: DeclarationUsage,
+}
+
+impl MeasuredDeclaration {
+    /// The declaration that was measured.
+    pub fn declaration(&self) -> &ConstantInfo {
+        &self.info
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedDeclarationAdmission {
     schema: u16,
@@ -1242,16 +1258,58 @@ impl Environment {
         if self.constants.contains_key(&name) {
             return Outcome::complete(DeclarationPlan::DuplicateName { name });
         }
+        match Environment::measure_declaration(info, budget, cancellation) {
+            Outcome::Complete(content) => self.plan_measured_decl(content, collision_budget),
+            Outcome::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        }
+    }
+
+    /// The facts [`Environment::plan_add_decl`] decides a declaration on that do not
+    /// depend on any environment: its provisional content digest and its exact
+    /// preflight usage under `budget`, or the non-answer that preflight reaches.
+    ///
+    /// It reads only `info`, so callers may measure many declarations at once (on
+    /// several threads) and plan each against the environment of its turn with
+    /// [`Environment::plan_measured_decl`]; the plan is the one `plan_add_decl`
+    /// would have made from the same declaration and budget.
+    pub fn measure_declaration(
+        info: ConstantInfo,
+        budget: DeclarationBudget,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<MeasuredDeclaration> {
         // One Merkle walk gives both the byte fact preflight budgets and the digest;
         // they used to be two walks. A refusal drops the digest unpublished.
         let (provisional_digest, canonical_bytes) = Environment::decl_content_digest_and_len(&info);
-        let usage =
-            match preflight_declaration_measured(&info, budget, cancellation, canonical_bytes)
-                .non_answer_for()
-            {
-                Ok(non_answer) => return non_answer,
-                Err(usage) => usage,
-            };
+        match preflight_declaration_measured(&info, budget, cancellation, canonical_bytes)
+            .non_answer_for()
+        {
+            Ok(non_answer) => non_answer,
+            Err(usage) => Outcome::complete(MeasuredDeclaration {
+                info,
+                provisional_digest,
+                usage,
+            }),
+        }
+    }
+
+    /// Plan a measured declaration against this environment: the duplicate-name
+    /// observation and the base binding of [`Environment::plan_add_decl`], with the
+    /// measurement taken from `content` instead of recomputed.
+    pub fn plan_measured_decl(
+        &self,
+        content: MeasuredDeclaration,
+        collision_budget: CollisionBudget,
+    ) -> Outcome<DeclarationPlan> {
+        let MeasuredDeclaration {
+            info,
+            provisional_digest,
+            usage,
+        } = content;
+        let name = info.name().clone();
+        if self.constants.contains_key(&name) {
+            return Outcome::complete(DeclarationPlan::DuplicateName { name });
+        }
         Outcome::complete(DeclarationPlan::Prepared(PreparedDeclarationAdmission {
             schema: DECLARATION_PLAN_SCHEMA,
             info: Arc::new(info),

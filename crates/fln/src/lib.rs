@@ -1363,6 +1363,43 @@ pub fn decode_olean_artifact(
     artifact: &[u8],
     limits: OleanDecodeLimits,
 ) -> Result<DecodedOlean, OleanDecodeError> {
+    decode_olean_artifact_with(artifact, limits, CheckerReading::Read)
+}
+
+/// Whether a decode also produces the independent checker's own reading of the
+/// bytes ([`independent_reading`]).
+///
+/// Only a council consults that reading. The `reuse-verified` rebuild admits no
+/// declaration through the checker in its run, so making it would be a second
+/// full decode of every module whose result is discarded; for the pinned `Init`
+/// closure it was a quarter of a warm import. A decode that skips it records
+/// [`IndependentReading::Unread`] with this reason, so a later attempt to consult
+/// it is refused by [`ArtifactReadings::new`] rather than silently satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckerReading {
+    Read,
+    Skip,
+}
+
+const CHECKER_READING_SKIPPED: &str =
+    "not read: this decode serves a reuse-verified rebuild, which consults no checker reading";
+
+fn checker_reading(
+    parts: &[&[u8]],
+    limits: OleanDecodeLimits,
+    mode: CheckerReading,
+) -> IndependentReading {
+    match mode {
+        CheckerReading::Read => independent_reading(parts, limits),
+        CheckerReading::Skip => IndependentReading::Unread(CHECKER_READING_SKIPPED.to_owned()),
+    }
+}
+
+fn decode_olean_artifact_with(
+    artifact: &[u8],
+    limits: OleanDecodeLimits,
+    reading: CheckerReading,
+) -> Result<DecodedOlean, OleanDecodeError> {
     if artifact.len() > limits.max_bytes {
         return Err(OleanDecodeError::ArtifactTooLarge {
             bytes: artifact.len(),
@@ -1382,7 +1419,7 @@ pub fn decode_olean_artifact(
         walk,
         module,
         constants,
-        independent: independent_reading(&[artifact], limits),
+        independent: checker_reading(&[artifact], limits, reading),
         companion_parts_loaded: false,
     })
 }
@@ -1429,6 +1466,22 @@ pub fn decode_olean_module_artifacts(
     server_artifact: &[u8],
     private_artifact: &[u8],
     limits: OleanDecodeLimits,
+) -> Result<DecodedOlean, OleanDecodeError> {
+    decode_olean_module_artifacts_with(
+        artifact,
+        server_artifact,
+        private_artifact,
+        limits,
+        CheckerReading::Read,
+    )
+}
+
+fn decode_olean_module_artifacts_with(
+    artifact: &[u8],
+    server_artifact: &[u8],
+    private_artifact: &[u8],
+    limits: OleanDecodeLimits,
+    reading: CheckerReading,
 ) -> Result<DecodedOlean, OleanDecodeError> {
     let bytes = artifact
         .len()
@@ -1568,7 +1621,11 @@ pub fn decode_olean_module_artifacts(
         walk,
         module,
         constants,
-        independent: independent_reading(&[artifact, server_artifact, private_artifact], limits),
+        independent: checker_reading(
+            &[artifact, server_artifact, private_artifact],
+            limits,
+            reading,
+        ),
         companion_parts_loaded: true,
     })
 }
@@ -3032,16 +3089,92 @@ fn olean_module_owners(
 
 /// Decode one module of a closed set, requiring the server and private parts exactly
 /// when the artifact is a module-system `.olean`.
+#[cfg(test)]
 fn decode_olean_module_input(
     module: &OleanModuleInput<'_>,
     limits: OleanCheckLimits,
 ) -> Result<DecodedOlean, OleanCheckError> {
-    match (module.server_artifact, module.private_artifact) {
-        (Some(server), Some(private)) => {
-            decode_olean_module_artifacts(module.artifact, server, private, limits.decode)
+    decode_olean_module_input_with(module, limits, CheckerReading::Read)
+}
+
+/// Decode every module of a set, `jobs.threads` at once, each result at its
+/// module's index.
+///
+/// A module's decode reads only its own parts, so the results do not depend on the
+/// thread count or on which worker took which module; only the wall time does. The
+/// outer `Err` is a failure to start a worker, never a property of an artifact.
+fn decode_olean_module_inputs(
+    modules: &[OleanModuleInput<'_>],
+    limits: OleanCheckLimits,
+    reading: CheckerReading,
+    jobs: OleanFrontierJobs,
+) -> Result<Vec<Result<DecodedOlean, OleanCheckError>>, OleanCheckError> {
+    let threads = jobs.threads.get().min(modules.len());
+    if threads <= 1 {
+        return Ok(modules
+            .iter()
+            .map(|module| decode_olean_module_input_with(module, limits, reading))
+            .collect());
+    }
+    /// The decoder is iterative; this only has to hold its ordinary frames.
+    const MIN_DECODE_STACK_BYTES: usize = 8 << 20;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<DecodedOlean, OleanCheckError>>>> = modules
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| -> Result<(), OleanCheckError> {
+        for worker in 0..threads {
+            let (next, slots) = (&next, &slots);
+            std::thread::Builder::new()
+                .name(format!("fln-olean-decode-{worker}"))
+                .stack_size(jobs.worker_stack_bytes.max(MIN_DECODE_STACK_BYTES))
+                .spawn_scoped(scope, move || {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(module) = modules.get(index) else {
+                            return;
+                        };
+                        let result = decode_olean_module_input_with(module, limits, reading);
+                        if let Ok(mut slot) = slots[index].lock() {
+                            *slot = Some(result);
+                        }
+                    }
+                })
+                .map_err(|_| OleanCheckError::InternalInvariant {
+                    detail: "could not start an .olean decode worker thread",
+                })?;
         }
+        Ok(())
+    })?;
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .ok()
+                .flatten()
+                .ok_or(OleanCheckError::InternalInvariant {
+                    detail: "an .olean decode worker left a module undecoded",
+                })
+        })
+        .collect()
+}
+
+fn decode_olean_module_input_with(
+    module: &OleanModuleInput<'_>,
+    limits: OleanCheckLimits,
+    reading: CheckerReading,
+) -> Result<DecodedOlean, OleanCheckError> {
+    match (module.server_artifact, module.private_artifact) {
+        (Some(server), Some(private)) => decode_olean_module_artifacts_with(
+            module.artifact,
+            server,
+            private,
+            limits.decode,
+            reading,
+        ),
         (server, private) => {
-            let decoded = decode_olean_artifact(module.artifact, limits.decode);
+            let decoded = decode_olean_artifact_with(module.artifact, limits.decode, reading);
             match decoded {
                 Ok(decoded) if decoded.module.is_module => {
                     return Err(OleanCheckError::MissingCompanionParts {
@@ -4241,7 +4374,12 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
-        let ordered = self.decode_olean_module_set(modules, limits)?;
+        let ordered = self.decode_olean_module_set(
+            modules,
+            limits,
+            CheckerReading::Read,
+            OleanFrontierJobs::SERIAL,
+        )?;
         let bound_base = (self.environment == Environment::new()
             || self
                 .imported_environment
@@ -4360,10 +4498,11 @@ impl Engine {
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
     ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
-        let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> = modules
-            .iter()
-            .map(|module| Some(decode_olean_module_input(module, limits)))
-            .collect();
+        let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> =
+            decode_olean_module_inputs(modules, limits, CheckerReading::Read, jobs)?
+                .into_iter()
+                .map(Some)
+                .collect();
 
         let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); modules.len()];
         for (index, entry) in decoded.iter_mut().enumerate() {
@@ -4753,7 +4892,7 @@ impl Engine {
         if jobs.threads.get() == 1 || !self.environment.is_empty() {
             return self.check_olean_modules(modules, options, limits);
         }
-        let ordered = self.decode_olean_module_set(modules, limits)?;
+        let ordered = self.decode_olean_module_set(modules, limits, CheckerReading::Read, jobs)?;
         let bound_base = (self.environment == Environment::new()
             || self
                 .imported_environment
@@ -5283,6 +5422,8 @@ impl Engine {
         &self,
         modules: &[OleanModuleInput<'_>],
         limits: OleanCheckLimits,
+        reading: CheckerReading,
+        jobs: OleanFrontierJobs,
     ) -> Result<Vec<(Name, DecodedOlean)>, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
 
@@ -5293,9 +5434,11 @@ impl Engine {
                 requested: modules.len(),
             }
         })?;
-        for module in modules {
-            let artifact = decode_olean_module_input(module, limits)?;
-            decoded.push(Some((module.name.clone(), artifact)));
+        for (module, artifact) in modules
+            .iter()
+            .zip(decode_olean_module_inputs(modules, limits, reading, jobs)?)
+        {
+            decoded.push(Some((module.name.clone(), artifact?)));
         }
 
         // The per-module companion guard (see `decode_olean_module_artifacts`)

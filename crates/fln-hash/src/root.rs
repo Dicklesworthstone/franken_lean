@@ -24,8 +24,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::canon::{CanonWriter, Canonical};
-use crate::domain::{Digest, Domain, DomainHasher, hash};
+use crate::canon::{CanonHasher, Canonical};
+use crate::domain::{Digest, Domain, hash};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 
@@ -141,28 +141,66 @@ impl LogicalRootBuilder {
     /// Finalize under [`Domain::LogicalRoot`]: a canonical stream of counts and
     /// sorted (key, digest) pairs.
     pub fn finalize(&self) -> LogicalRoot {
-        let mut stream = CanonWriter::new();
-        stream.u64(self.decls.len() as u64);
-        for (name_bytes, digest) in &self.decls {
-            stream.bytes(name_bytes);
-            stream.bytes(&digest.0);
-        }
-        stream.u64(self.extension_deltas.len() as u64);
-        for (ext_bytes, digest) in &self.extension_deltas {
-            stream.bytes(ext_bytes);
-            stream.bytes(&digest.0);
-        }
-        match &self.options {
-            Some(digest) => {
-                stream.u8(1);
-                stream.bytes(&digest.0);
-            }
-            None => stream.u8(0),
-        }
-        let mut hasher = DomainHasher::new(Domain::LogicalRoot);
-        hasher.update(&stream.into_bytes());
-        LogicalRoot(hasher.finalize())
+        root_of_sorted(
+            self.decls.len(),
+            self.decls
+                .iter()
+                .map(|(name, digest)| (name.as_slice(), digest)),
+            self.extension_deltas.len(),
+            self.extension_deltas
+                .iter()
+                .map(|(name, digest)| (name.as_slice(), digest)),
+            self.options.as_ref(),
+        )
     }
+}
+
+/// The root [`LogicalRootBuilder::finalize`] gives for a builder holding exactly
+/// `decls` and no extension deltas, with options digested as
+/// [`LogicalRootBuilder::set_options`] digests them.
+///
+/// `decls` must be strictly ascending by canonical name bytes, which is the
+/// builder's own iteration order, and `count` must be their number; anything else
+/// is a different stream and so a different root. This is the same encoding as
+/// `finalize`, written straight into the hasher, so a caller holding one sorted
+/// table can compute the root of many of its subsets without building a builder
+/// (and a copy of every name) for each.
+pub fn declaration_root<'a>(
+    count: usize,
+    decls: impl IntoIterator<Item = (&'a [u8], &'a Digest)>,
+    options: Option<&KVMap>,
+) -> LogicalRoot {
+    let options = options.map(|options| hash(Domain::OptionsSet, &options.to_canonical_bytes()));
+    root_of_sorted(count, decls, 0, std::iter::empty(), options.as_ref())
+}
+
+/// The one encoding of a logical root, hashed as it is written.
+fn root_of_sorted<'a, 'b>(
+    decl_count: usize,
+    decls: impl IntoIterator<Item = (&'a [u8], &'a Digest)>,
+    extension_count: usize,
+    extensions: impl IntoIterator<Item = (&'b [u8], &'b Digest)>,
+    options: Option<&Digest>,
+) -> LogicalRoot {
+    let mut stream = CanonHasher::new(Domain::LogicalRoot);
+    stream.u64(decl_count as u64);
+    for (name_bytes, digest) in decls {
+        stream.bytes(name_bytes);
+        stream.bytes(&digest.0);
+    }
+    stream.u64(extension_count as u64);
+    for (ext_bytes, digest) in extensions {
+        stream.bytes(ext_bytes);
+        stream.bytes(&digest.0);
+    }
+    match options {
+        Some(digest) => {
+            stream.u8(1);
+            stream.bytes(&digest.0);
+        }
+        None => stream.u8(0),
+    }
+    LogicalRoot(stream.finish())
 }
 
 /// Digest one declaration's content bytes under the declaration domain — the helper
@@ -194,6 +232,46 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// `declaration_root` is `finalize` for the same declarations, with and without
+    /// options, and moves when one digest does.
+    #[test]
+    fn declaration_root_is_the_builders_root() {
+        let entries = sample_entries();
+        let mut options = KVMap::new();
+        options.insert(name("pp.all"), DataValue::OfBool(true));
+        for options in [None, Some(&options)] {
+            let mut builder = LogicalRootBuilder::new();
+            if let Some(options) = options {
+                builder.set_options(options);
+            }
+            for (n, d) in &entries {
+                builder.add_decl(n, *d);
+            }
+            let mut sorted: Vec<(Vec<u8>, Digest)> = entries
+                .iter()
+                .map(|(n, d)| (n.to_canonical_bytes(), *d))
+                .collect();
+            sorted.sort();
+            let direct = declaration_root(
+                sorted.len(),
+                sorted.iter().map(|(n, d)| (n.as_slice(), d)),
+                options,
+            );
+            assert_eq!(direct, builder.finalize());
+            sorted[0].1 = decl_content_digest(b"moved");
+            let moved = declaration_root(
+                sorted.len(),
+                sorted.iter().map(|(n, d)| (n.as_slice(), d)),
+                options,
+            );
+            assert_ne!(moved, builder.finalize());
+        }
+        assert_eq!(
+            declaration_root(0, std::iter::empty(), None),
+            LogicalRootBuilder::new().finalize()
+        );
     }
 
     #[test]

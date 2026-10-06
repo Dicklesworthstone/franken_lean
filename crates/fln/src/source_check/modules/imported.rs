@@ -293,35 +293,17 @@ impl Engine {
         let mut reports = Vec::new();
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
+        // Each module's capture reads only its own parts, so the walks run
+        // `limits.jobs` at once; the cumulative byte allowance is charged below in
+        // replay order, exactly as when one walk followed another.
+        cancelled!("source-olean/capture");
+        let mut captures = capture_modules(&checked, &order, &inputs, &limits).into_iter();
         for &index in &order {
             cancelled!("source-olean/capture");
             let module = &checked.modules[index];
-            let input = inputs
-                .get(&module.name)
-                .ok_or(SourceOleanImportError::Internal(
-                    "checked module lost its artifact",
-                ))?;
-            let view = if module.decoded.module.is_module {
-                let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
-                else {
-                    return Err(SourceOleanImportError::Internal(
-                        "checked module lost its companions",
-                    ));
-                };
-                OleanView::parse_with_dependencies(private, &[input.artifact, server])
-            } else {
-                OleanView::parse(input.artifact)
-            }
-            .map_err(|error| SourceOleanImportError::Capture {
-                module: module.name.clone(),
-                error,
-            })?;
-            let captured = view
-                .extension_payloads(limits.capture, capture_left)
-                .map_err(|error| SourceOleanImportError::Capture {
-                    module: module.name.clone(),
-                    error,
-                })?;
+            let captured = captures.next().ok_or(SourceOleanImportError::Internal(
+                "a replayed module has no capture",
+            ))??;
             let mut report = SourceMetadataReport {
                 module: module.name.clone(),
                 classes: 0,
@@ -582,6 +564,70 @@ impl Engine {
             contexts,
         }))
     }
+}
+
+/// Every module's extension payloads, in replay `order`, `limits.jobs` modules at
+/// once. Each walk may use the whole capture allowance; the caller charges the
+/// cumulative allowance in order, so a closure over it is still refused.
+fn capture_modules(
+    checked: &CheckedOleanSet,
+    order: &[usize],
+    inputs: &BTreeMap<&Name, &OleanModuleInput<'_>>,
+    limits: &SourceOleanImportLimits,
+) -> Vec<Result<Vec<OpaqueExtensionBlock>>> {
+    let capture = |index: usize| -> Result<Vec<OpaqueExtensionBlock>> {
+        let module = &checked.modules[index];
+        let input = inputs
+            .get(&module.name)
+            .ok_or(SourceOleanImportError::Internal(
+                "checked module lost its artifact",
+            ))?;
+        let view = if module.decoded.module.is_module {
+            let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
+            else {
+                return Err(SourceOleanImportError::Internal(
+                    "checked module lost its companions",
+                ));
+            };
+            OleanView::parse_with_dependencies(private, &[input.artifact, server])
+        } else {
+            OleanView::parse(input.artifact)
+        }
+        .map_err(|error| SourceOleanImportError::Capture {
+            module: module.name.clone(),
+            error,
+        })?;
+        view.extension_payloads(limits.capture, limits.max_capture_bytes)
+            .map_err(|error| SourceOleanImportError::Capture {
+                module: module.name.clone(),
+                error,
+            })
+    };
+    let threads = limits.jobs.threads.get().min(order.len());
+    if threads <= 1 {
+        return order.iter().map(|&index| capture(index)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<Result<Vec<OpaqueExtensionBlock>>>> =
+        order.iter().map(|_| std::sync::OnceLock::new()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (Some(slot), Some(&index)) = (slots.get(at), order.get(at)) else {
+                        return;
+                    };
+                    let _ = slot.set(capture(index));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .zip(order)
+        .map(|(slot, &index)| slot.into_inner().unwrap_or_else(|| capture(index)))
+        .collect()
 }
 
 /// Who makes a closure's metadata registrations. Production makes them through one
