@@ -1150,6 +1150,7 @@ impl Context {
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
             MatrixScope(Vec<Name>),
+            CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
@@ -1283,6 +1284,10 @@ impl Context {
                             let term = values.last().expect("observed term visit");
                             self.observe_term(syntax, term.clone(), locals)?;
                         }
+                        Task::CaptureRecursiveContext => {
+                            let value = values.pop().expect("contextual match visit");
+                            values.push(self.capture_recursive_context(value)?);
+                        }
                         Task::Visit(syntax, expected, finish) => {
                             if self.observes_term(syntax) {
                                 tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
@@ -1297,6 +1302,14 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "recursiveContextCapture"]) {
+                                    let [body] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    tasks.push(Task::CaptureRecursiveContext);
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nativeDoForCollection"]) {
                                     let [collection] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));

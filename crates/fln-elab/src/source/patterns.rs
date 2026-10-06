@@ -242,7 +242,10 @@ impl Context {
         // They also satisfy the ordinary backend's unqualified-name invariant.
         Ok(Name::num(Name::anonymous(), id))
     }
-    fn copy_pattern_syntax(&mut self, syntax: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    pub(super) fn copy_pattern_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         let mut pending = vec![syntax];
         while let Some(syntax) = pending.pop() {
             self.tick()?;
@@ -355,7 +358,7 @@ impl Context {
         values.pop().ok_or_else(invalid)
     }
 
-    fn compile_pattern_matrix(
+    pub(super) fn compile_pattern_matrix(
         &mut self,
         syntax: &Syntax,
         required: &mut Vec<Name>,

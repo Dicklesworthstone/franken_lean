@@ -337,20 +337,11 @@ fn nondecreasing_and_escaping_calls_are_failure_atomic_even_when_unused() {
     );
 }
 #[test]
-fn recursive_match_under_application_is_a_known_completeness_gap() {
+fn recursive_match_under_application_computes_the_whole_body_at_each_step() {
     // Lean v4.32.0 accepts this and computes loop 3 = 4 (bcvq, comment 3172).
-    // Native lowering still refuses it; this is not a negative parity witness.
-    let base = engine();
-    let snapshot = base.environment().clone();
-    assert!(
-        base.check_source_files(
-            &[b"def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1"],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits())
-        )
-        .is_err()
+    check(
+        "def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1\ntheorem loopThree : loop 3 = 4 := rfl",
     );
-    assert_eq!(base.environment(), &snapshot);
 }
 #[test]
 fn recursion_can_change_a_leading_parameter_before_nat() {

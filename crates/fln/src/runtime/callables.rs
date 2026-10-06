@@ -9,6 +9,22 @@ use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
 impl Preparation<'_> {
+    /// Recognize a literal callable after strict local initializers without
+    /// evaluating, substituting, or discarding any of those initializers.
+    /// This selects annotation only; it does not make the operand inert.
+    pub(super) fn has_literal_callable_tail(&mut self, value: &Expr) -> Result<bool, IngressError> {
+        let mut value = value;
+        loop {
+            self.tick()?;
+            match value.node() {
+                ExprNode::LetE { body, .. } => value = body,
+                ExprNode::MData { expr, .. } => value = expr,
+                ExprNode::Lam { .. } => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+    }
+
     /// Adapt underapplication before separating an eliminator's returned
     /// closure from overapplication. Both forms keep the original recursor on
     /// the ordinary family-specific lowering path.

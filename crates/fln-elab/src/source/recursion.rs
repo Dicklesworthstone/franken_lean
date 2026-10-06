@@ -3,12 +3,14 @@
 //! A recursive name is a private local marker, never an environment declaration.
 //! Only calls on an immediate recursive constructor field, fully applied when
 //! function-valued, may replace that marker.
-//! The entire body must be the selected match: an induction hypothesis for an
-//! inner subexpression cannot stand for the whole function. Arguments retained
+//! The recursor computes the entire body: binder-free contexts around a selected
+//! match are distributed into its hygienic branches before motive construction.
+//! An inner subexpression's hypothesis cannot stand for the whole function. Arguments retained
 //! as fixed must be the original locals or their domain-checked eta expansions;
 //! changed arguments are generalized without conversion erasing their contents.
 use super::*;
 mod constrained;
+mod context;
 mod matrix;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
@@ -78,6 +80,7 @@ pub(super) struct Recursion {
     /// Source-ordered arguments universally quantified in each hypothesis.
     varying: Vec<usize>,
     family: Option<(Name, usize)>,
+    contextual_capture: Option<context::Capture>,
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
@@ -156,7 +159,8 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
-        let columns = self.recursion_columns(parameters, syntax)?;
+        let (selected, context) = self.contextual_recursive_match(parameters, syntax)?;
+        let columns = self.recursion_columns(parameters, selected)?;
         let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
         let mut first_error = None;
         for (column, decreasing) in columns {
@@ -169,7 +173,7 @@ impl Context {
                     .prepare_recursion(
                         name,
                         parameters,
-                        syntax,
+                        selected,
                         expected.as_ref(),
                         column,
                         &matched,
@@ -179,7 +183,37 @@ impl Context {
                             .as_mut()
                             .expect("prepared structural candidate")
                             .generalized_parameters = generalized.clone();
-                        self.term(syntax, expected.clone())
+                        if context.is_empty() {
+                            self.term(syntax, expected.clone())
+                        } else {
+                            let build = self.prepare_contextual_recursion(
+                                syntax,
+                                &context,
+                                expected.clone(),
+                            )?;
+                            let body =
+                                self.distribute_recursive_context(selected, column, &build)?;
+                            let mut value = self.term(&body, expected.clone())?;
+                            value.value = value
+                                .value
+                                .abstract_fvar(&build.helper.id, 0)
+                                .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            value.value = Expr::let_e(
+                                Name::anonymous(),
+                                build.helper.type_,
+                                build.helper.value.expect("typed context helper"),
+                                value.value,
+                                false,
+                            );
+                            value.value = Expr::let_e(
+                                Name::anonymous(),
+                                build.obligation.type_,
+                                build.obligation.value,
+                                value.value,
+                                false,
+                            );
+                            Ok(value)
+                        }
                     });
                 match result {
                     Ok(value) => return Ok(value),
@@ -366,6 +400,7 @@ impl Context {
             indices: Vec::new(),
             varying: (decreasing + 1..parameters.len()).collect(),
             family: None,
+            contextual_capture: None,
             equation_goals: HashMap::new(),
         });
         Ok(())

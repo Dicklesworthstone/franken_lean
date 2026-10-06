@@ -209,10 +209,7 @@ impl Preparation<'_> {
                             let (head, args) = self.spine(&expr)?;
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
-                            let local_callbacks = matches!(head.node(), ExprNode::BVar { .. })
-                                && args
-                                    .iter()
-                                    .any(|arg| matches!(arg.node(), ExprNode::Lam { .. }));
+                            let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
                             let mut callback_types = Vec::new();
                             for arg in &args {
                                 self.tick()?;
@@ -241,13 +238,14 @@ impl Preparation<'_> {
                                 if local_callbacks {
                                     // The checked local telescope is available here,
                                     // before proof erasure removes its dependent domains.
-                                    // Keep the runtime type of literal callback operands:
+                                    // Keep the runtime type of callback operands ending
+                                    // in a literal lambda, including leading strict lets:
                                     // later global-call annotation cannot recover a BVar's
                                     // type without this original local context.
                                     let callback_type = match &domain {
                                         Some(domain)
                                             if !static_type
-                                                && matches!(arg.node(), ExprNode::Lam { .. }) =>
+                                                && self.has_literal_callable_tail(arg)? =>
                                         {
                                             Some(self.erase_type_in(domain, &context)?)
                                         }
@@ -379,13 +377,13 @@ impl Preparation<'_> {
                         .next()
                         .ok_or_else(|| unsupported("proof application head"))?;
                     for (index, mut arg) in args.enumerate() {
-                        if matches!(arg.node(), ExprNode::Lam { .. })
-                            && let Some(Some(type_)) = callback_types.get(index)
+                        if let Some(Some(type_)) = callback_types.get(index)
                             && let Some(result @ ValueType::Closure(_)) = self.value_type(type_)?
                         {
                             // Proof operands have already become inert scalars. Only
-                            // executable lambdas receive ordinary typed let bindings,
-                            // preserving captures and left-to-right argument evaluation.
+                            // checked callable tails receive ordinary typed bindings.
+                            // Leading strict lets stay outside the closure, preserving
+                            // captures and left-to-right argument evaluation.
                             arg = self.typed_callable_result(arg, type_.clone(), result)?;
                         }
                         expr = Expr::app(expr, arg);

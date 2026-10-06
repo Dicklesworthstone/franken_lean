@@ -828,7 +828,7 @@ impl Preparation<'_> {
         }
         Ok(Some(result))
     }
-    /// Give literal callback arguments a checked type by sharing all arguments
+    /// Give literal callback tails a checked type by sharing all arguments
     /// in left-to-right lets. The ordinary closure converter then derives their
     /// interfaces, captures and ownership; no body is executed to infer a type.
     pub(super) fn annotate_call(
@@ -836,10 +836,14 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
-        if !args
-            .iter()
-            .any(|a| matches!(a.node(), ExprNode::Lam { .. }))
-        {
+        let mut needs_annotation = false;
+        for argument in args {
+            if self.has_literal_callable_tail(argument)? {
+                needs_annotation = true;
+                break;
+            }
+        }
+        if !needs_annotation {
             return Ok(None);
         }
         let Some(mut type_) = self.callable_type(head)? else {
