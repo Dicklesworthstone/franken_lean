@@ -10,6 +10,7 @@ pub use anonymous_ctor::AnonymousCtorError;
 mod application;
 mod binders;
 mod calc;
+mod cdot;
 mod coercions;
 mod collections;
 mod do_notation;
@@ -97,6 +98,8 @@ pub enum SourceInferenceError {
     AnonymousCtor(AnonymousCtorError),
     /// `.c` could not be resolved against its expected type (`resolveDottedIdentFn`).
     DottedIdent(DottedIdentError),
+    /// A `·` that no parentheses, tuple or ascription scopes (the pin's `elabCDot`).
+    CdotOutsideParentheses,
 }
 
 impl std::fmt::Display for SourceInferenceError {
@@ -168,6 +171,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Unification(error) => write!(f, "{error}"),
             Self::AnonymousCtor(error) => write!(f, "{error}"),
             Self::DottedIdent(error) => write!(f, "{error}"),
+            // The pin's words.
+            Self::CdotOutsideParentheses => f.write_str(
+                "invalid occurrence of `·` notation, it must be surrounded by parentheses (e.g. `(· + 1)`)",
+            ),
         }
     }
 }
@@ -434,6 +441,9 @@ impl Context {
         if let Syntax::Node { kind, args, .. } = syntax {
             if kind == &parser_kind(&["Term", "dotIdent"]) {
                 return self.dotted_identifier(args, expected);
+            }
+            if kind == &parser_kind(&["Term", "cdot"]) {
+                return Err(failure(SourceInferenceError::CdotOutsideParentheses));
             }
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {

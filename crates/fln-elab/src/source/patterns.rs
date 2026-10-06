@@ -793,6 +793,7 @@ impl Context {
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
+                || cdot::is_cdot(node)
                 || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
@@ -855,6 +856,8 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
+                    // `·` first: collection notation would turn a tuple into `Prod.mk`.
+                    let node = self.expand_cdot_node(node, pattern)?;
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let mut required = Vec::new();

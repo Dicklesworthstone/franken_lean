@@ -186,6 +186,52 @@ const DOTTED_IDENTIFIERS: &[Accepted] = &[
     },
 ];
 
+/// `·`: `Term.cdot`, `unicodeSymbol "·" "." >> hygieneInfo` (`Lean/Parser/Term.lean:174`), spelled
+/// `·` and `.`, alone and several, as an argument, under an ascription, nested, in a method
+/// argument on a list literal, and unscoped (the parser takes it; the elaborator refuses it).
+const CDOTS: &[Accepted] = &[
+    Accepted {
+        source: "def f : Nat → Nat := (· + 1)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.cdot "·" (hygieneInfo `[anonymous])) "+" (num "1")) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f : Nat → Nat := (. + 1)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.cdot "." (hygieneInfo `[anonymous])) "+" (num "1")) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f : Nat → Nat → Nat := (· + ·)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.arrow `Nat "→" `Nat)))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.cdot "·" (hygieneInfo `[anonymous])) "+" (Term.cdot "·" (hygieneInfo `[anonymous]))) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f : Nat → Nat := (Nat.add · 2)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `Nat.add [(Term.cdot "·" (hygieneInfo `[anonymous])) (num "2")]) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f := (· : Nat → Nat)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] []) (Command.declValSimple ":=" (Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.cdot "·" (hygieneInfo `[anonymous])) ":" [(Term.arrow `Nat "→" `Nat)] ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def g (h : (Nat → Nat) → Nat → Nat) : Nat → Nat := (h (· + 1) ·)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `g []) (Command.optDeclSig [(Term.explicitBinder "(" [`h] [":" (Term.arrow (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.arrow `Nat "→" `Nat) ")") "→" (Term.arrow `Nat "→" `Nat))] [] ")")] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `h [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.cdot "·" (hygieneInfo `[anonymous])) "+" (num "1")) ")") (Term.cdot "·" (hygieneInfo `[anonymous]))]) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def m : List Nat := [1, 2, 3].map (· * 2)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `m []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `List [`Nat]))]) (Command.declValSimple ":=" (Term.app (Term.proj («term[_]» "[" [(num "1") "," (num "2") "," (num "3")] "]") "." `map) [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_*_» (Term.cdot "·" (hygieneInfo `[anonymous])) "*" (num "2")) ")")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def b : Nat := · + 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `b []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term_+_» (Term.cdot "·" (hygieneInfo `[anonymous])) "+" (num "1")) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def x : Nat → Nat := fun x => (· + x) x",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `x []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [`x] [] "=>" (Term.app (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.cdot "·" (hygieneInfo `[anonymous])) "+" `x) ")") [`x]))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f : Nat → Nat := (·)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.cdot "·" (hygieneInfo `[anonymous])) ")") (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 /// Malformed `⟨…⟩`, refused at the pin's token. Captured as above (the pin's columns count
 /// code points; `at` is the byte offset in `source`).
 const ANONYMOUS_CONSTRUCTOR_REFUSALS: &[Refused] = &[
@@ -295,6 +341,14 @@ fn anonymous_constructors_produce_the_pins_trees() {
 #[test]
 fn dotted_identifiers_produce_the_pins_trees() {
     for row in DOTTED_IDENTIFIERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn cdots_produce_the_pins_trees() {
+    for row in CDOTS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

@@ -1032,7 +1032,7 @@ fn finish_bounded_application(
     if terms.len() == 1 {
         return Ok(terms.pop().expect("the nonempty term has one member").0);
     }
-    // `.c a b`: a dotted identifier heads an application (`Term.app (Term.dotIdent …)`).
+    // `.c a b` and `[1, 2].map f`: a dotted identifier or a projection heads an application.
     if !(grammar == DefinitionGrammar::Scalar && dotted_head(&terms))
         && !matches!(
             tokens.get(*first_index).map(|token| &token.kind),
@@ -1399,20 +1399,29 @@ fn push_jump_keyword(leaves: &Leaves, frames: &mut [BoundedTermFrame], index: us
     }
 }
 
-/// Whether an application's head is a `Term.dotIdent`. Out of line for the same stack budget.
+/// Whether an application's head is a `Term.dotIdent` (`.c a`) or a `Term.proj` (`[1, 2].map f`,
+/// whose first token is not an identifier). Out of line for the same stack budget.
 #[inline(never)]
 fn dotted_head(terms: &[(Syntax, usize)]) -> bool {
-    terms.first().and_then(|(head, _)| head.kind()) == Some(&parser_kind(&["Term", "dotIdent"]))
+    terms
+        .first()
+        .and_then(|(head, _)| head.kind())
+        .is_some_and(|kind| {
+            kind == &parser_kind(&["Term", "dotIdent"]) || kind == &parser_kind(&["Term", "proj"])
+        })
 }
 
-/// A `.` at `index` followed by the identifier at `cursor`, pushed onto `frame`'s application.
+/// The `.` or `·` at `index`, pushed onto `frame`'s application; `cursor` is the next token.
+/// Returns whether that next token (an identifier) was consumed too.
 ///
-/// Where a term begins it is the pin's leading `Term.dotIdent`, `"." >> checkNoWsBefore >>
-/// rawIdent` (`Lean/Parser/Term.lean:924`): a `.` begins a term when it opens the term,
-/// opens an empty application, or follows whitespace. Otherwise it is the trailing
-/// projection `e.f`, whose `.` must touch `e` (`Term.proj`'s `checkNoWsBefore`). A beginning
-/// `.` not followed, without whitespace, by an identifier is the pin's `·` (`Term.cdot`),
-/// which is not parsed here and is refused like a malformed projection.
+/// A `.` begins a term when it opens the term, opens an empty application, or follows
+/// whitespace. There:
+/// - touching an identifier, it is the pin's leading `Term.dotIdent`,
+///   `"." >> checkNoWsBefore >> rawIdent` (`Lean/Parser/Term.lean:924`);
+/// - otherwise it is `·` spelled `.` (`Term.cdot`, `unicodeSymbol "·" "."`, `:174`).
+///
+/// A `·` is always `Term.cdot`, and must begin a term. A `.` that does not begin a term is
+/// the trailing projection `e.f`, whose `.` must touch both `e` and `f` (`Term.proj`).
 ///
 /// Out of line: `bounded_term_frames`' frame is held to a fixed host-stack budget
 /// (`deep_quantifier_bodies_use_heap_frames`).
@@ -1425,7 +1434,7 @@ fn dot_term(
     range: std::ops::Range<usize>,
     index: usize,
     cursor: usize,
-) -> Result<(), NatDefinitionParseError> {
+) -> Result<bool, NatDefinitionParseError> {
     let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
         at: original_position(view, tokens, index),
         expected: NatDefinitionExpectation::RecordField,
@@ -1433,12 +1442,35 @@ fn dot_term(
     let touches_identifier = cursor < range.end
         && tokens[index].extent.end() == tokens[cursor].extent.start()
         && matches!(&tokens[cursor].kind, TokenKind::Ident(_));
-    if !touches_identifier {
-        return Err(refusal());
-    }
     let begins = index == range.start
         || frame.application.is_empty()
         || tokens[index - 1].extent.end() != tokens[index].extent.start();
+    let middle_dot = matches!(&tokens[index].kind, TokenKind::Symbol(s) if s == "·");
+    if middle_dot && !begins {
+        return Err(refusal());
+    }
+    if begins && (middle_dot || !touches_identifier) {
+        // `·`, or `.` spelling it (`unicodeSymbol "·" "."`): the pin's `Term.cdot`, a
+        // placeholder that the nearest enclosing parentheses, tuple or ascription turn
+        // into a function (`expandCDot?`). The atom keeps the source spelling.
+        frame.application.push((
+            Syntax::node(
+                parser_kind(&["Term", "cdot"]),
+                vec![
+                    leaves.leaf(index)?,
+                    Syntax::node(
+                        Name::str(Name::anonymous(), "hygieneInfo"),
+                        vec![hygiene_ident()],
+                    ),
+                ],
+            ),
+            index,
+        ));
+        return Ok(false);
+    }
+    if !touches_identifier {
+        return Err(refusal());
+    }
     if begins {
         frame.application.push((
             Syntax::node(
@@ -1447,7 +1479,7 @@ fn dot_term(
             ),
             index,
         ));
-        return Ok(());
+        return Ok(true);
     }
     let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
     frame.application.push((
@@ -1457,7 +1489,7 @@ fn dot_term(
         ),
         start,
     ));
-    Ok(())
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1743,9 +1775,9 @@ fn bounded_term_frames(
                 frames.push(term_binders::frame(prefix));
             }
             Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "." =>
+                if grammar == DefinitionGrammar::Scalar && (symbol == "." || symbol == "·") =>
             {
-                dot_term(
+                if dot_term(
                     leaves,
                     view,
                     tokens,
@@ -1753,8 +1785,9 @@ fn bounded_term_frames(
                     range.clone(),
                     index,
                     cursor,
-                )?;
-                cursor += 1;
+                )? {
+                    cursor += 1;
+                }
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
