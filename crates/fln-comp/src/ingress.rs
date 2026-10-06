@@ -4592,6 +4592,7 @@ const fn default_callable_result_ownership(
             crate::flbc::CallableResultOwnership::Scalar
         }
         fir::ValueType::Nat => crate::flbc::CallableResultOwnership::OwnedOrScalar,
+        fir::ValueType::Abi => crate::flbc::CallableResultOwnership::Erased,
         fir::ValueType::String
         | fir::ValueType::Float
         | fir::ValueType::Float32
@@ -4601,8 +4602,7 @@ const fn default_callable_result_ownership(
         | fir::ValueType::Ref
         | fir::ValueType::Thunk
         | fir::ValueType::Task
-        | fir::ValueType::Closure(_)
-        | fir::ValueType::Abi => crate::flbc::CallableResultOwnership::Owned,
+        | fir::ValueType::Closure(_) => crate::flbc::CallableResultOwnership::Owned,
     }
 }
 
@@ -5382,7 +5382,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
@@ -5511,7 +5511,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:unit = check_system 10:4c616b652e4275696c64\n",
@@ -5727,7 +5727,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
@@ -5866,7 +5866,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "constructor c1 tag=3 fields=[] scalar_bytes=0:\n",
                 "function f0 params=[] ownership=[] result=ctor result_ownership=owned\n",
@@ -6273,7 +6273,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "projection p0 constructor=c0 field=0\n",
                 "projection p1 constructor=c0 field=1\n",
@@ -6527,7 +6527,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
@@ -7114,7 +7114,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "closure_type s0 params=[string] ownership=[borrowed] result=string result_ownership=owned\n",
                 "intrinsic i0 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=string result_ownership=owned\n",

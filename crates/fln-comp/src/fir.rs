@@ -30,8 +30,9 @@ use std::fmt;
 /// 14 carries computed module-name values into that checkpoint; version 15
 /// carries canonical arbitrary-precision Nat literal limbs through lowering;
 /// version 16 adds exact constructor-shape tests for native case dispatch;
-/// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types.
-pub const FIR_SCHEMA_VERSION: u16 = 17;
+/// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types;
+/// version 18 adds an erased callable result contract restricted to ABI values.
+pub const FIR_SCHEMA_VERSION: u16 = 18;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,6 +263,9 @@ impl ValueType {
                 flbc::CallableResultOwnership::Scalar
                     | flbc::CallableResultOwnership::OwnedOrScalar
             ),
+            // An ABI signature may retain a concrete ownership refinement or
+            // explicitly transfer an erased value. Concrete types below do
+            // not admit Erased, so erasure cannot hide their return checks.
             Self::Abi => true,
             Self::String
             | Self::Float
@@ -4813,13 +4817,69 @@ mod tests {
     }
 
     #[test]
+    fn erased_callable_results_require_an_explicit_abi_type() {
+        let mut erased = boxing_program();
+        erased.functions[0].result = ValueType::Abi;
+        erased.functions[0].result_ownership = flbc::CallableResultOwnership::Erased;
+        erased.functions[0].blocks[0].bindings.pop();
+        erased.functions[0].blocks[0].terminator = Terminator::Return { value: v(1) };
+        let accepted = validate(erased, ValidationLimits::default())
+            .expect("an explicitly boxed return transfers its erased ABI value");
+        let lowered = lower_to_flbc(&accepted).expect("erased ownership survives lowering");
+        assert_eq!(
+            lowered.functions()[0].result_ownership,
+            flbc::CallableResultOwnership::Erased
+        );
+
+        for result in [
+            ValueType::Unit,
+            ValueType::Bool,
+            ValueType::Nat,
+            ValueType::String,
+            ValueType::Float,
+            ValueType::Float32,
+            ValueType::UInt32,
+            ValueType::UInt64,
+            ValueType::Constructor,
+            ValueType::Array,
+            ValueType::Ref,
+            ValueType::Thunk,
+            ValueType::Task,
+            ValueType::Closure(s(0)),
+        ] {
+            let mut concrete = all_operations_program();
+            concrete.functions[0].result = result;
+            concrete.functions[0].result_ownership = flbc::CallableResultOwnership::Erased;
+            assert_eq!(
+                validate(concrete, ValidationLimits::default()),
+                Err(ValidationError::FunctionResultOwnership {
+                    function: f(0),
+                    result,
+                    ownership: flbc::CallableResultOwnership::Erased,
+                }),
+                "a concrete result must retain its own return contract"
+            );
+        }
+        let mut concrete_closure = all_operations_program();
+        concrete_closure.closure_types[0].result_ownership = flbc::CallableResultOwnership::Erased;
+        assert_eq!(
+            validate(concrete_closure, ValidationLimits::default()),
+            Err(ValidationError::ClosureTypeResultOwnership {
+                closure_type: s(0),
+                result: ValueType::Nat,
+                ownership: flbc::CallableResultOwnership::Erased,
+            })
+        );
+    }
+
+    #[test]
     fn explicit_abi_boxing_is_canonical_and_lowers_without_conversion() {
         let validated = validate(boxing_program(), ValidationLimits::default())
             .expect("one explicit ABI round trip is valid");
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",

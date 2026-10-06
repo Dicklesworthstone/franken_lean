@@ -71,6 +71,7 @@ const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnershi
             CallableResultOwnership::Scalar
         }
         fir::ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
+        fir::ValueType::Abi => CallableResultOwnership::Erased,
         fir::ValueType::String
         | fir::ValueType::Float
         | fir::ValueType::Float32
@@ -80,8 +81,7 @@ const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnershi
         | fir::ValueType::Ref
         | fir::ValueType::Thunk
         | fir::ValueType::Task
-        | fir::ValueType::Closure(_)
-        | fir::ValueType::Abi => CallableResultOwnership::Owned,
+        | fir::ValueType::Closure(_) => CallableResultOwnership::Owned,
     }
 }
 
@@ -983,6 +983,312 @@ fn callable_nat_result_accepts_scalar_or_mpz_but_scalar_contract_refuses_mpz() {
             ..
         }) if function == fid(0)
     ));
+}
+
+#[test]
+fn erased_callable_results_transfer_through_calls_and_terminal_replay() {
+    let _guard = lock();
+    for kind in ["scalar", "mpz", "negative-mpz", "string", "constructor"] {
+        for dynamic in [false, true] {
+            for terminal in [false, true] {
+                let mut code = vec![Instruction::String {
+                    dst: r(1),
+                    value: "owned-child".to_string(),
+                }];
+                match kind {
+                    "scalar" => code.push(Instruction::Nat {
+                        dst: r(0),
+                        value: 42,
+                    }),
+                    "mpz" | "negative-mpz" => {
+                        code.push(Instruction::NatBig {
+                            dst: r(0),
+                            limbs_le: vec![0, 1],
+                        });
+                        if kind == "negative-mpz" {
+                            code.push(intrinsic(r(0), "extern:Int.neg", vec![r(0)]));
+                        }
+                    }
+                    "string" => code.push(Instruction::String {
+                        dst: r(0),
+                        value: "erased-string".to_string(),
+                    }),
+                    "constructor" => code.push(Instruction::Ctor {
+                        dst: r(0),
+                        tag: 3,
+                        fields: vec![r(1)],
+                        scalar_bytes: Vec::new(),
+                    }),
+                    _ => unreachable!(),
+                }
+                if dynamic {
+                    code.push(Instruction::Closure {
+                        dst: r(2),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    });
+                }
+                let args = vec![r(0)];
+                let argument_ownership = vec![ArgumentOwnership::Owned];
+                let result_ownership = CallableResultOwnership::Erased;
+                code.push(match (dynamic, terminal) {
+                    (false, false) => Instruction::Call {
+                        dst: r(3),
+                        function: fid(1),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (true, false) => Instruction::Apply {
+                        dst: r(3),
+                        closure: r(2),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (false, true) => Instruction::TailCall {
+                        function: fid(1),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (true, true) => Instruction::TailApply {
+                        closure: r(2),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                });
+                if !terminal {
+                    code.push(Instruction::Return { src: r(3) });
+                }
+                let source = validated(vec![
+                    function_with_callable_result(0, Vec::new(), result_ownership, 4, code),
+                    function_with_callable_result(
+                        1,
+                        vec![ArgumentOwnership::Owned],
+                        result_ownership,
+                        1,
+                        vec![Instruction::Return { src: r(0) }],
+                    ),
+                ]);
+                let owned = insert_ownership(&source, OwnershipLimits::default())
+                    .expect("erased values have a checked transfer graph");
+                assert!(owned.witness().canonical_text().contains("result=erased"));
+                let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+                let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+                assert!(decoded.functions().iter().all(|function| {
+                    function.result_ownership == CallableResultOwnership::Erased
+                }));
+                let replay = validate_ownership_candidate(
+                    &source,
+                    decoded,
+                    owned.witness().clone(),
+                    OwnershipLimits::default(),
+                )
+                .expect("canonical replay independently validates erased transfers");
+                shadow::enable();
+                for program in [&source, replay.program()] {
+                    let completed = returned(execute(
+                        program,
+                        ExecutionLimits {
+                            max_stack_depth: if terminal { 1 } else { 2 },
+                            ..ExecutionLimits::default()
+                        },
+                        None,
+                    ));
+                    assert_eq!(
+                        completed.usage.peak_stack_depth,
+                        if terminal { 1 } else { 2 }
+                    );
+                    match kind {
+                        "scalar" => assert_eq!(completed.value.unbox(), 42),
+                        "mpz" => assert_eq!(nat_limbs(&completed.value), vec![0, 1]),
+                        "negative-mpz" => {
+                            let (_, size, limbs) = completed.value.mpz_view();
+                            assert!(size < 0);
+                            assert_eq!(limbs, &[0, 1]);
+                        }
+                        "string" => assert_eq!(string_contents(&completed.value), "erased-string"),
+                        "constructor" => {
+                            assert_eq!(value_kind(&completed.value), ValueKind::Ctor(3));
+                            assert_eq!(
+                                string_contents(&completed.value.ctor_child(0)),
+                                "owned-child"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let (events, live) = shadow::disable_and_drain();
+                assert_eq!(live, 0, "{kind}, dynamic={dynamic}, terminal={terminal}");
+                assert!(events.iter().all(|event| !matches!(
+                    event.kind,
+                    shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+                )));
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_dynamic_contracts_do_not_authorize_mismatches_or_overapplication() {
+    let _guard = lock();
+    for terminal in [false, true] {
+        for (callee_result, call_result, extra_argument, expected, actual) in [
+            (
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Owned,
+                false,
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Owned,
+            ),
+            (
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+                false,
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+            ),
+            (
+                CallableResultOwnership::OwnedOrScalar,
+                CallableResultOwnership::Erased,
+                false,
+                CallableResultOwnership::OwnedOrScalar,
+                CallableResultOwnership::Erased,
+            ),
+            (
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Erased,
+                true,
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+            ),
+        ] {
+            let mut code = vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "retained-on-refusal".to_string(),
+                },
+                Instruction::Closure {
+                    dst: r(1),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+            ];
+            let mut args = vec![r(0)];
+            let mut argument_ownership = vec![ArgumentOwnership::Owned];
+            if extra_argument {
+                code.push(Instruction::String {
+                    dst: r(2),
+                    value: "extra-owned-argument".to_string(),
+                });
+                args.push(r(2));
+                argument_ownership.push(ArgumentOwnership::Owned);
+            }
+            code.push(if terminal {
+                Instruction::TailApply {
+                    closure: r(1),
+                    args,
+                    argument_ownership,
+                    result_ownership: call_result,
+                }
+            } else {
+                Instruction::Apply {
+                    dst: r(3),
+                    closure: r(1),
+                    args,
+                    argument_ownership,
+                    result_ownership: call_result,
+                }
+            });
+            if !terminal {
+                code.push(Instruction::Return { src: r(3) });
+            }
+            let source = validated(vec![
+                function_with_callable_result(0, Vec::new(), call_result, 4, code),
+                function_with_callable_result(
+                    1,
+                    vec![ArgumentOwnership::Owned],
+                    callee_result,
+                    1,
+                    vec![Instruction::Return { src: r(0) }],
+                ),
+            ]);
+            let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+            let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+            let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+            shadow::enable();
+            for program in [&source, &replay] {
+                assert!(matches!(execute(program, ExecutionLimits::default(), None),
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                            function, expected: got_expected, actual: got_actual,
+                        }, ..
+                    }) if function == fid(1) && got_expected == expected && got_actual == actual
+                ));
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(
+                live, 0,
+                "dynamic result refusal releases untransferred operands"
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+        }
+    }
+}
+
+#[test]
+fn nat_callable_union_still_refuses_strings_and_negative_mpz() {
+    let _guard = lock();
+    for negative_mpz in [false, true] {
+        let mut code = if negative_mpz {
+            vec![
+                Instruction::NatBig {
+                    dst: r(0),
+                    limbs_le: vec![0, 1],
+                },
+                intrinsic(r(1), "extern:Int.neg", vec![r(0)]),
+            ]
+        } else {
+            vec![Instruction::String {
+                dst: r(1),
+                value: "not-a-nat".to_string(),
+            }]
+        };
+        code.push(Instruction::Return { src: r(1) });
+        let source = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::OwnedOrScalar,
+            2,
+            code,
+        )]);
+        let expected_kind = if negative_mpz {
+            ValueKind::Mpz
+        } else {
+            ValueKind::String
+        };
+        shadow::enable();
+        assert!(matches!(execute(&source, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::CallableResultKind {
+                    function, expected: CallableResultOwnership::OwnedOrScalar, actual,
+                }, ..
+            }) if function == fid(0) && actual == expected_kind
+        ));
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "Nat result refusal releases non-Nat objects");
+        assert!(events.iter().all(|event| !matches!(
+            event.kind,
+            shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+        )));
+    }
 }
 
 #[test]
@@ -2546,7 +2852,7 @@ fn core_linear_ownership_drops_dead_heap_values_at_their_final_use() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear result=owned source=3 emitted=4 drops=1 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2662,7 +2968,7 @@ fn straight_line_register_reuse_releases_each_value_epoch_without_leaking() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear-reuse result=owned source=7 emitted=9 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2795,7 +3101,7 @@ fn acyclic_cfg_register_reuse_executes_both_value_epochs_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=owned source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -2893,7 +3199,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=owned source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3059,7 +3365,7 @@ fn preowned_flbc_is_checked_before_golem_and_preserves_transfer_events() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=validated-existing-ownership result=owned source=7 emitted=7 drops=0 moves=0 existing_drops=2 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -3256,7 +3562,7 @@ fn fir_acyclic_cfg_ownership_executes_both_edges_with_balanced_marrow() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg result=owned source=9 emitted=18 drops=5 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3397,7 +3703,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg result=owned source=8 emitted=15 drops=3 moves=0 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8868,7 +9174,7 @@ fn generated_array_ownership_transfers_exactly_and_refuses_drift_before_executio
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear result=owned source=6 emitted=8 drops=2 moves=0 redefs=0 edges=0 extern_consumes=2 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=2 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );

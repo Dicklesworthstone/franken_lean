@@ -3451,6 +3451,10 @@ fn finish_callable_result(
         // Schema v12: a Nat is a tagged scalar or a nonnegative mpz.
         // A String/Array/ctor is not a Nat just because the union exists.
         CallableResultOwnership::OwnedOrScalar => is_nat_abi(&value),
+        // Schema v16 explicitly permits any erased ABI representation. The
+        // register already owns this Obj; returning it transfers that handle
+        // without changing its tag, representation, or reference count.
+        CallableResultOwnership::Erased => true,
     };
     if !matches {
         return Err(VmRefusal::CallableResultKind {
