@@ -141,6 +141,45 @@ const ANONYMOUS_CONSTRUCTORS: &[Accepted] = &[
 /// dotted name (which the parser takes whole and the elaborator refuses as non-atomic). The
 /// rows were captured after `inductive T where | leaf | node (l r : T)`, and the `theorem`
 /// row is the last line of the stage-2 target I04 (`(T.node .leaf .leaf).size`).
+const NUMERIC_PROJECTIONS: &[Accepted] = &[
+    Accepted {
+        source: "theorem a (p q : Prop) (h : p ∧ q) : q := h.2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `a []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∧_» `p "∧" `q)] [] ")")] (Term.typeSpec ":" `q)) (Command.declValSimple ":=" (Term.proj `h "." (fieldIdx "2")) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b (p q r : Prop) (h : p ∧ q ∧ r) : q := h.2.1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b []) (Command.declSig [(Term.explicitBinder "(" [`p `q `r] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∧_» `p "∧" («term_∧_» `q "∧" `r))] [] ")")] (Term.typeSpec ":" `q)) (Command.declValSimple ":=" (Term.proj (Term.proj `h "." (fieldIdx "2")) "." (fieldIdx "1")) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem c (p q : Prop) (h : p ∧ q) : q ∧ p := ⟨h.2, h.1⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `c []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∧_» `p "∧" `q)] [] ")")] (Term.typeSpec ":" («term_∧_» `q "∧" `p))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(Term.proj `h "." (fieldIdx "2")) "," (Term.proj `h "." (fieldIdx "1"))] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `h ▸ e`, right-nested.
+const SUBSTITUTIONS: &[Accepted] = &[
+    Accepted {
+        source: "theorem a (x y z : Nat) (h1 : x = y) (h2 : y = z) : x = z := h1 ▸ h2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `a []) (Command.declSig [(Term.explicitBinder "(" [`x `y `z] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h1] [":" («term_=_» `x "=" `y)] [] ")") (Term.explicitBinder "(" [`h2] [":" («term_=_» `y "=" `z)] [] ")")] (Term.typeSpec ":" («term_=_» `x "=" `z))) (Command.declValSimple ":=" (Term.subst `h1 "▸" [`h2]) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b (x y z : Nat) (h1 : x = y) (h2 : y = z) (h : x = 0) : z = 0 := h2 ▸ h1 ▸ h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b []) (Command.declSig [(Term.explicitBinder "(" [`x `y `z] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h1] [":" («term_=_» `x "=" `y)] [] ")") (Term.explicitBinder "(" [`h2] [":" («term_=_» `y "=" `z)] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `x "=" (num "0"))] [] ")")] (Term.typeSpec ":" («term_=_» `z "=" (num "0")))) (Command.declValSimple ":=" (Term.subst `h2 "▸" [(Term.subst `h1 "▸" [`h])]) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `⟨…⟩` as a match pattern, nested or not.
+const ANONYMOUS_CONSTRUCTOR_PATTERNS: &[Accepted] = &[
+    Accepted {
+        source: "theorem g (p q : Prop) (h : p ∧ q) : q ∧ p := match h with | ⟨hp, hq⟩ => ⟨hq, hp⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `g []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∧_» `p "∧" `q)] [] ")")] (Term.typeSpec ":" («term_∧_» `q "∧" `p))) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `h)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.anonymousCtor "⟨" [`hp "," `hq] "⟩")]] "=>" (Term.anonymousCtor "⟨" [`hq "," `hp] "⟩"))])) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem k (p q r : Prop) (h : p ∧ (q ∧ r)) : r := match h with | ⟨_, ⟨_, hr⟩⟩ => hr",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `k []) (Command.declSig [(Term.explicitBinder "(" [`p `q `r] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∧_» `p "∧" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_∧_» `q "∧" `r) ")"))] [] ")")] (Term.typeSpec ":" `r)) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `h)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.anonymousCtor "⟨" [(Term.hole "_") "," (Term.anonymousCtor "⟨" [(Term.hole "_") "," `hr] "⟩")] "⟩")]] "=>" `hr)])) (Termination.suffix [] []) [])))"#,
+    },
+];
+
 const DOTTED_IDENTIFIERS: &[Accepted] = &[
     Accepted {
         source: "def x : T := .leaf",
@@ -408,6 +447,30 @@ fn anonymous_instances_produce_the_pins_trees() {
 #[test]
 fn anonymous_constructors_produce_the_pins_trees() {
     for row in ANONYMOUS_CONSTRUCTORS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn anonymous_constructor_patterns_produce_the_pins_trees() {
+    for row in ANONYMOUS_CONSTRUCTOR_PATTERNS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn substitutions_produce_the_pins_trees() {
+    for row in SUBSTITUTIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn numeric_projections_produce_the_pins_trees() {
+    for row in NUMERIC_PROJECTIONS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

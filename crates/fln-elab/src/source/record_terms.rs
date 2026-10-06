@@ -17,6 +17,13 @@ pub enum RecordTermError {
     UnknownField(Name),
     DuplicateField(Name),
     MissingField(Name),
+    /// `e.i` with `i` past the structure's field count (`fields` of them).
+    ProjectionIndex {
+        index: u64,
+        fields: usize,
+    },
+    /// `e.i` on a type that is not a one-constructor inductive.
+    ProjectionNotStructure,
 }
 impl std::fmt::Display for RecordTermError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +40,14 @@ impl std::fmt::Display for RecordTermError {
             Self::MissingField(name) => {
                 write!(f, "missing record field {}", name.to_display_string())
             }
+            // The pin's messages' first lines (`Lean/Elab/App.lean`, `resolveLValAux`).
+            Self::ProjectionIndex { index, fields } => write!(
+                f,
+                "Invalid projection: Index `{index}` is invalid for this structure; it must be between 1 and {fields}"
+            ),
+            Self::ProjectionNotStructure => f.write_str(
+                "Invalid projection: Projections extract constructor fields for one-constructor inductive types.",
+            ),
         }
     }
 }
@@ -98,10 +113,10 @@ impl Context {
         if syntax.kind() == Some(&kind) {
             let parts = expect_node(syntax, &kind, 3, "field projection")?;
             expect_atom(&parts[1], ".", "field dot")?;
-            let Syntax::Ident { val: field, .. } = &parts[2] else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            return Ok(Some(FieldReceiver::Syntax(&parts[0], field.clone())));
+            return Ok(Some(FieldReceiver::Syntax(
+                &parts[0],
+                projection_field(&parts[2])?,
+            )));
         }
         if let Syntax::Ident { val: name, .. } = syntax
             && let Some((receiver, path)) = self.qualified_field_receiver(name)?
@@ -193,6 +208,12 @@ impl Context {
         path: &Name,
         has_arguments: bool,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
+        if let LeafView::Num(index) = path.leaf_view()
+            && path.parent().is_anonymous()
+        {
+            let field = self.indexed_field(receiver.clone(), index)?;
+            return self.resolve_field(receiver, &field, has_arguments);
+        }
         let parts = scope::components(path).map_err(|_| failure(SourceInferenceError::Scope))?;
         let Some((last, prefix)) = parts.split_last() else {
             return Err(failure(SourceInferenceError::Scope));
@@ -393,6 +414,38 @@ impl Context {
     /// Apply admitted generated projections to the actual receiver. In
     /// particular, an instance-implicit class receiver must not be replaced by
     /// a dictionary selected from the surrounding context.
+    /// `e.i` (`fieldIdx`): the name of the `i`-th field, from one, of the structure
+    /// `e`'s type (`LValResolution.projIdx`, `Lean/Elab/App.lean`).
+    fn indexed_field(
+        &mut self,
+        receiver: Typed,
+        index: u64,
+    ) -> Result<Name, NatDefinitionElabError> {
+        let receiver = self.insert_implicits(receiver, ImplicitInsertion::FieldReceiver)?;
+        let target = self.whnf(&receiver.type_)?;
+        let mut head = &target;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(error(RecordTermError::ProjectionNotStructure));
+        };
+        let mut remaining = RecordBudget::default().max_nodes;
+        let fields = direct_fields(&self.txn.env, name, &mut remaining)
+            .map_err(|_| error(RecordTermError::ProjectionNotStructure))?;
+        let position = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| fields.get(index));
+        position.map(|(label, _)| label.clone()).ok_or_else(|| {
+            error(RecordTermError::ProjectionIndex {
+                index,
+                fields: fields.len(),
+            })
+        })
+    }
+
     pub(super) fn record_field(
         &mut self,
         receiver: Typed,
@@ -1070,5 +1123,25 @@ impl Context {
         state.constructor.value = Expr::app(state.constructor.value.clone(), value.value);
         state.remaining -= 1;
         Ok(())
+    }
+}
+
+/// A projection's field: an identifier, or a `fieldIdx` numeral read as `Name::num`.
+pub(super) fn projection_field(syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
+    match syntax {
+        Syntax::Ident { val, .. } => Ok(val.clone()),
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::str(Name::anonymous(), "fieldIdx") && args.len() == 1 =>
+        {
+            let Syntax::Atom { val, .. } = &args[0] else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            val.parse::<u64>()
+                .ok()
+                .filter(|index| *index > 0)
+                .map(|index| Name::num(Name::anonymous(), index))
+                .ok_or_else(|| failure(SourceInferenceError::Scope))
+        }
+        _ => Err(failure(SourceInferenceError::Scope)),
     }
 }

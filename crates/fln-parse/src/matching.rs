@@ -595,14 +595,20 @@ fn pattern(
         /// `p + k` with a numeral `k`: the pin's Nat offset pattern (`«term_+_»`), at the
         /// `+` and the numeral.
         Offset(usize, usize),
+        /// `⟨p, …⟩` (`Term.anonymousCtor`): the brackets, the separating commas, and the
+        /// number of element patterns on the value stack.
+        Anonymous(usize, usize, Vec<usize>, usize),
     }
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
     for at in range.clone() {
-        if is_symbol(tokens, at, "(") {
+        if is_symbol(tokens, at, "(") || is_symbol(tokens, at, "⟨") {
             opens.push(at);
-        } else if is_symbol(tokens, at, ")") {
+        } else if is_symbol(tokens, at, ")") || is_symbol(tokens, at, "⟩") {
             let open = opens.pop().ok_or_else(|| refuse(view, tokens, at))?;
+            if is_symbol(tokens, open, "(") != is_symbol(tokens, at, ")") {
+                return Err(refuse(view, tokens, at));
+            }
             pairs.insert(open, at);
         }
     }
@@ -628,6 +634,20 @@ fn pattern(
                             DefinitionGrammar::Scalar,
                         )?,
                     ],
+                ));
+            }
+            Task::Anonymous(open, close, commas, count) => {
+                let elements = values.split_off(values.len() - count);
+                let mut items = Vec::with_capacity(elements.len() * 2);
+                for (index, element) in elements.into_iter().enumerate() {
+                    if index > 0 {
+                        items.push(leaves.leaf(commas[index - 1])?);
+                    }
+                    items.push(element);
+                }
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "anonymousCtor"]),
+                    vec![leaves.leaf(open)?, null_node(items), leaves.leaf(close)?],
                 ));
             }
             Task::Group(open, close) => {
@@ -669,6 +689,27 @@ fn pattern(
                 {
                     tasks.push(Task::Offset(range.end - 2, range.end - 1));
                     tasks.push(Task::Parse(range.start..range.end - 2));
+                    continue;
+                }
+                if is_symbol(tokens, range.start, "⟨") {
+                    let close = pairs[&range.start];
+                    if close + 1 != range.end {
+                        return Err(refuse(view, tokens, close + 1));
+                    }
+                    let inner = range.start + 1..close;
+                    let elements = if inner.is_empty() {
+                        Vec::new()
+                    } else {
+                        columns(tokens, inner)
+                    };
+                    let commas = elements.iter().filter_map(|(_, comma)| *comma).collect();
+                    tasks.push(Task::Anonymous(range.start, close, commas, elements.len()));
+                    tasks.extend(
+                        elements
+                            .into_iter()
+                            .rev()
+                            .map(|(range, _)| Task::Parse(range)),
+                    );
                     continue;
                 }
                 if is_symbol(tokens, range.start, "(") {
@@ -719,7 +760,7 @@ fn pattern(
                 let mut arguments = Vec::new();
                 while cursor < range.end {
                     let begin = cursor;
-                    if is_symbol(tokens, cursor, "(") {
+                    if is_symbol(tokens, cursor, "(") || is_symbol(tokens, cursor, "⟨") {
                         cursor = pairs[&cursor] + 1;
                     } else if is_symbol(tokens, cursor, ".") {
                         cursor += 2;

@@ -854,7 +854,22 @@ impl Context {
             } else {
                 (pattern, &[][..])
             };
-            let constructor_name = if let Syntax::Node { kind, .. } = head
+            let constructor_name = if head == &patterns::anonymous_head() {
+                // `⟨…⟩` names the family's only constructor (`elabAnonymousCtor`).
+                match constructors {
+                    [only] => Some(only.clone()),
+                    [] => {
+                        return Err(failure(SourceInferenceError::AnonymousCtor(
+                            anonymous_ctor::AnonymousCtorError::NoConstructors,
+                        )));
+                    }
+                    _ => {
+                        return Err(failure(SourceInferenceError::AnonymousCtor(
+                            anonymous_ctor::AnonymousCtorError::ManyConstructors,
+                        )));
+                    }
+                }
+            } else if let Syntax::Node { kind, .. } = head
                 && kind == &parser_kind(&["Term", "dotIdent"])
             {
                 let fields = expect_node(head, kind, 2, "relative constructor")?;

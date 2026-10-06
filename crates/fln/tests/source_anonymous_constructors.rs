@@ -113,3 +113,79 @@ fn an_unknown_element_type_is_refused_until_expected_types_propagate() {
         "{error}"
     );
 }
+
+/// `e.i` (`Term.proj` with a `fieldIdx`) projects the `i`-th field of `e`'s structure type,
+/// counting from one; `h.2.1` is `(h.2).1`. The pin accepts each of these.
+#[test]
+fn numeric_projections_take_the_indexed_field() {
+    for source in [
+        "theorem t (p q : Prop) (h : p ∧ q) : q ∧ p := ⟨h.2, h.1⟩".to_string(),
+        "theorem t (p q r : Prop) (h : p ∧ q ∧ r) : q := h.2.1".to_string(),
+        format!("{POINT}theorem t : (⟨1, 2⟩ : Point).2 = 2 := rfl"),
+        format!("{POINT}def sum (p : Point) : Nat := p.1 + p.2\ntheorem t : sum ⟨3, 4⟩ = 7 := rfl"),
+    ] {
+        assert!(
+            matches!(check(&source), Ok(Outcome::Complete(_))),
+            "{source}: {:?}",
+            check(&source)
+        );
+    }
+}
+
+/// The pin refuses each of these with this first line.
+#[test]
+fn numeric_projection_refusals_carry_the_pins_message() {
+    for (source, message) in [
+        (
+            "theorem t (p q : Prop) (h : p ∧ q) : q := h.3",
+            "Invalid projection: Index `3` is invalid for this structure; it must be between 1 and 2",
+        ),
+        (
+            "def n (x : Nat) : Nat := x.1",
+            "Invalid projection: Projections extract constructor fields for one-constructor inductive types.",
+        ),
+    ] {
+        let error = check(source).expect_err(source);
+        assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
+        assert!(error.to_string().contains(message), "{source}: {error}");
+    }
+}
+
+/// `⟨p, …⟩` as a pattern names the matched type's only constructor, in `match` and in
+/// equations, nested or not. The pin accepts each of these.
+#[test]
+fn anonymous_constructor_patterns_match_the_only_constructor() {
+    for source in [
+        "theorem t (p q : Prop) (h : p ∧ q) : q ∧ p := match h with | ⟨hp, hq⟩ => ⟨hq, hp⟩"
+            .to_string(),
+        "theorem t (p q r : Prop) (h : p ∧ (q ∧ r)) : r := match h with | ⟨_, ⟨_, hr⟩⟩ => hr"
+            .to_string(),
+        format!(
+            "{POINT}def sum : Point → Nat\n  | ⟨a, b⟩ => a + b\ntheorem t : sum ⟨3, 4⟩ = 7 := rfl"
+        ),
+        format!(
+            "{POINT}def swap (p : Point) : Point := match p with | ⟨a, b⟩ => ⟨b, a⟩\ntheorem t : (swap ⟨1, 2⟩).x = 2 := rfl"
+        ),
+    ] {
+        assert!(
+            matches!(check(&source), Ok(Outcome::Complete(_))),
+            "{source}: {:?}",
+            check(&source)
+        );
+    }
+}
+
+/// The pin: "Invalid `⟨...⟩` notation: The expected type `Nat` has more than one
+/// constructor" (the type is omitted here).
+#[test]
+fn an_anonymous_constructor_pattern_on_a_many_constructor_type_is_refused() {
+    let source = "def k (n : Nat) : Nat := match n with | ⟨a⟩ => a";
+    let error = check(source).expect_err(source);
+    assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Invalid `⟨...⟩` notation: The expected type has more than one constructor"),
+        "{error}"
+    );
+}

@@ -303,6 +303,9 @@ enum BoundedInfix {
     BoolAnd,
     BoolOr,
     ListCons,
+    /// `h ▸ e` (`Term.subst`, `trailing_parser:75 " ▸ " >> sepBy1 (termParser 75) " ▸ "`):
+    /// the operand at precedence 75 makes it right-nested, like `infixr:75`.
+    Subst,
 }
 
 impl BoundedInfix {
@@ -340,6 +343,7 @@ impl BoundedInfix {
             Self::BoolAnd => "&&",
             Self::BoolOr => "||",
             Self::ListCons => "::",
+            Self::Subst => "▸",
         }
     }
     const fn precedence(self) -> u8 {
@@ -361,6 +365,7 @@ impl BoundedInfix {
             Self::BoolAnd => 35,
             Self::BoolOr => 30,
             Self::ListCons => 67,
+            Self::Subst => 75,
         }
     }
 
@@ -374,6 +379,7 @@ impl BoundedInfix {
                 | Self::Or
                 | Self::OrAscii
                 | Self::ListCons
+                | Self::Subst
         )
     }
 
@@ -584,6 +590,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
         "=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equality),
         "::" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ListCons),
+        "▸" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Subst),
         "|||" => Some(BoundedInfix::NatLor),
         "^^^" => Some(BoundedInfix::NatXor),
         "&&&" => Some(BoundedInfix::NatLand),
@@ -1147,13 +1154,18 @@ fn reduce_bounded_infix(
             expected: grammar.value_expectation(),
         });
     };
-    frame.operands.push((
+    let node = if operator.operator == BoundedInfix::Subst {
+        Syntax::node(
+            parser_kind(&["Term", "subst"]),
+            vec![left, operator.syntax, null_node(vec![right])],
+        )
+    } else {
         Syntax::node(
             operator.operator.syntax_kind(),
             vec![left, operator.syntax, right],
-        ),
-        left_at,
-    ));
+        )
+    };
+    frame.operands.push((node, left_at));
     Ok(())
 }
 
@@ -1512,6 +1524,29 @@ fn dot_term(
     let begins = index == range.start
         || frame.application.is_empty()
         || tokens[index - 1].extent.end() != tokens[index].extent.start();
+    // `e.2`: `Term.proj` with a `fieldIdx` field.
+    if !begins
+        && cursor < range.end
+        && tokens[index].extent.end() == tokens[cursor].extent.start()
+        && matches!(&tokens[cursor].kind, TokenKind::Literal(LiteralKind::Nat))
+    {
+        let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
+        frame.application.push((
+            Syntax::node(
+                parser_kind(&["Term", "proj"]),
+                vec![
+                    receiver,
+                    leaves.leaf(index)?,
+                    Syntax::node(
+                        Name::str(Name::anonymous(), "fieldIdx"),
+                        vec![leaves.leaf(cursor)?],
+                    ),
+                ],
+            ),
+            start,
+        ));
+        return Ok(true);
+    }
     let middle_dot = matches!(&tokens[index].kind, TokenKind::Symbol(s) if s == "·");
     if middle_dot && !begins {
         return Err(refusal());
@@ -1557,6 +1592,53 @@ fn dot_term(
         start,
     ));
     Ok(true)
+}
+
+/// The pin reads a projection's field index with `fieldIdx`, digits only, rather than
+/// with the token function: `h.2.1` is `(h.2).1`. The lexer here reads the `2.1` after the
+/// first projection dot as one scientific literal, so such a literal touching a dot that
+/// itself touches the preceding token is split back into `2`, `.`, `1`.
+fn split_field_indices(text: &SourceText, tokens: Vec<LexedToken>) -> Vec<LexedToken> {
+    let mut split = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let touches_dot = matches!(
+            split.as_slice(),
+            [.., previous, LexedToken { kind: TokenKind::Symbol(dot), extent }]
+                if dot == "."
+                    && extent.end() == token.extent.start()
+                    && previous.extent.end() == extent.start()
+        );
+        let spelling = &text.as_str()[token.extent.start().0..token.extent.end().0];
+        if touches_dot
+            && matches!(token.kind, TokenKind::Literal(LiteralKind::Scientific))
+            && spelling.split('.').count() >= 2
+            && spelling
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let mut at = token.extent.start().0;
+            let mut pieces = Vec::new();
+            for (index, part) in spelling.split('.').enumerate() {
+                if index > 0 {
+                    pieces.push((TokenKind::Symbol(".".to_owned()), at, at + 1));
+                    at += 1;
+                }
+                pieces.push((TokenKind::Literal(LiteralKind::Nat), at, at + part.len()));
+                at += part.len();
+            }
+            let mut spans = pieces.into_iter().map(|(kind, start, end)| {
+                ByteSpan::new(BytePos(start), BytePos(end))
+                    .map(|extent| LexedToken { kind, extent })
+            });
+            match spans.by_ref().collect::<Option<Vec<_>>>() {
+                Some(pieces) => split.extend(pieces),
+                None => split.push(token),
+            }
+        } else {
+            split.push(token);
+        }
+    }
+    split
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2420,6 +2502,7 @@ fn parse_definition_with_grammar(
             Event::Trivia(_) | Event::Refused { .. } => None,
         })
         .collect::<Vec<_>>();
+    let tokens = split_field_indices(view.normalized(), tokens);
 
     if grammar == DefinitionGrammar::Scalar
         && matches!(tokens.first().map(|token| &token.kind),

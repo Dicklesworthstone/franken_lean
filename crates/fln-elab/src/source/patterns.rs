@@ -167,6 +167,38 @@ fn complex(syntax: &Syntax, environment: &Environment) -> bool {
     })
 }
 
+/// The element patterns of `⟨p, …⟩`, if `syntax` is one.
+fn anonymous_elements(syntax: &Syntax) -> Result<Option<Vec<&Syntax>>, NatDefinitionElabError> {
+    let kind = parser_kind(&["Term", "anonymousCtor"]);
+    if syntax.kind() != Some(&kind) {
+        return Ok(None);
+    }
+    let parts = expect_node(syntax, &kind, 3, "anonymous constructor pattern")?;
+    expect_atom(&parts[0], "⟨", "anonymous constructor opener")?;
+    expect_atom(&parts[2], "⟩", "anonymous constructor closer")?;
+    let items = expect_null_args(&parts[1], "anonymous constructor fields")?;
+    let mut elements = Vec::with_capacity(items.len().div_ceil(2));
+    for (index, item) in items.iter().enumerate() {
+        if index % 2 == 0 {
+            elements.push(item);
+        } else {
+            expect_atom(item, ",", "anonymous constructor separator")?;
+        }
+    }
+    if items.len() % 2 == 0 && !items.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(elements))
+}
+
+/// The head standing for "the only constructor" in a generated match.
+pub(super) fn anonymous_head() -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "anonymousCtor"]),
+        vec![atom("⟨"), null(Vec::new()), atom("⟩")],
+    )
+}
+
 fn pattern_function(syntax: &Syntax) -> bool {
     matches!(syntax, Syntax::Node {kind,args,..}
         if kind == &parser_kind(&["Term","fun"])
@@ -266,7 +298,7 @@ impl Context {
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
-            Constructor(Head, &'a Syntax, usize),
+            Constructor(Head, Cow<'a, Syntax>, usize),
         }
         let mut pending = vec![Task::Visit(syntax)];
         let mut values = Vec::new();
@@ -278,13 +310,28 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
                         head,
-                        syntax: Cow::Borrowed(syntax),
+                        syntax,
                         fields,
                     }));
                 }
                 Task::Visit(syntax) => {
                     if let Some(inner) = parenthesized_inner(syntax)? {
                         pending.push(Task::Visit(inner));
+                        continue;
+                    }
+                    // `⟨p, …⟩`: a constructor pattern whose head is the column type's only
+                    // constructor. The head is the empty `⟨⟩`, which the ordinary match
+                    // backend resolves against the discriminant's family.
+                    if let Some(elements) = anonymous_elements(syntax)? {
+                        pending.push(Task::Constructor(
+                            Head {
+                                relative: true,
+                                name: Name::anonymous(),
+                            },
+                            Cow::Owned(anonymous_head()),
+                            values.len(),
+                        ));
+                        pending.extend(elements.into_iter().rev().map(Task::Visit));
                         continue;
                     }
                     let (head, arguments) = if let Syntax::Node { kind, args, .. } = syntax
@@ -342,7 +389,11 @@ impl Context {
                         _ => None,
                     };
                     if let Some(head_key) = constructor {
-                        pending.push(Task::Constructor(head_key, head, values.len()));
+                        pending.push(Task::Constructor(
+                            head_key,
+                            Cow::Borrowed(head),
+                            values.len(),
+                        ));
                         pending.extend(arguments.iter().rev().map(Task::Visit));
                     } else {
                         if !arguments.is_empty() {

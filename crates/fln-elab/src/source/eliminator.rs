@@ -542,7 +542,11 @@ impl Context {
 
     /// `kabstract`: every subterm structurally equal to `pattern` (after
     /// instantiation) becomes the variable of a new enclosing binder.
-    fn kabstract(&mut self, expr: &Expr, pattern: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn kabstract(
+        &mut self,
+        expr: &Expr,
+        pattern: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let expr = self.instantiate(expr)?;
         if expr.has_loose_bvars() {
             return Err(failure(SourceInferenceError::Scope));

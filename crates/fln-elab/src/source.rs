@@ -17,6 +17,8 @@ mod do_notation;
 mod dotted_ident;
 pub use dotted_ident::DottedIdentError;
 mod eliminator;
+mod subst;
+pub use subst::SubstError;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
@@ -119,6 +121,8 @@ pub enum SourceInferenceError {
     Unification(Box<UnificationError>),
     /// `⟨…⟩` could not be expanded (`elabAnonymousCtor`).
     AnonymousCtor(AnonymousCtorError),
+    /// `h ▸ e` could not be elaborated (`elabSubst`).
+    Subst(SubstError),
     /// `.c` could not be resolved against its expected type (`resolveDottedIdentFn`).
     DottedIdent(DottedIdentError),
     /// A `·` that no parentheses, tuple or ascription scopes (the pin's `elabCDot`).
@@ -337,6 +341,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Universe(error) => write!(f, "{error}"),
             Self::Unification(error) => write!(f, "{error}"),
             Self::AnonymousCtor(error) => write!(f, "{error}"),
+            Self::Subst(error) => write!(f, "{error}"),
             Self::DottedIdent(error) => write!(f, "{error}"),
             // The pin's words.
             Self::CdotOutsideParentheses => f.write_str(
@@ -1583,14 +1588,21 @@ impl Context {
                                     tasks.push(Task::Visit(discriminant, None, true));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "subst"]) {
+                                    let term = self.substitution(args, expected.as_ref())?;
+                                    values.push(if finish {
+                                        self.finish_term(term, expected.as_ref())?
+                                    } else {
+                                        term
+                                    });
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "proj"]) {
                                     let parts = expect_node(syntax, kind, 3, "field projection")?;
                                     expect_atom(&parts[1], ".", "field dot")?;
-                                    let Syntax::Ident { val: field, .. } = &parts[2] else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
+                                    let field = record_terms::projection_field(&parts[2])?;
                                     tasks.push(Task::Projection(
-                                        field.clone(),
+                                        field,
                                         &[],
                                         expected,
                                         false,
