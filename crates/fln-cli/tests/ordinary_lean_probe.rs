@@ -1,13 +1,19 @@
 //! Ordinary-Lean acceptance probe (bead fln-ordinary-lean-probe-g03u).
 //!
-//! Thirty-three ordinary Lean programs as people write them (implicit `Init`, no
+//! Thirty-seven ordinary Lean programs as people write them (implicit `Init`, no
 //! `prelude`) live in `fixtures/ordinary_lean_probe/`: set A is the 2026-09-27
 //! reality-check set, set B the 2026-10-04 one, and set C the 2026-10-05
 //! protected-name spellings (bead fln-eq4k): `add` under `open Nat`, as its own
 //! line and as `open Nat in`, which the pin rejects because `Nat.add` is
 //! `protected`, and the qualified `Nat.add` control it accepts. FrankenLean's
 //! `lean` refuses all three at parse today (it does not take `open`); they guard
-//! the class for the day it does. Its `manifest.tsv` names each
+//! the class for the day it does. Set C's two rejected programs end in `rfl`, which
+//! FrankenLean cannot yet prove, so `fln check-source` (which does take `open`)
+//! refuses them at the `rfl` while `add` itself resolves, and the guard would lapse
+//! the day `rfl` gets stronger. Set D (2026-10-06, bead fln-8xz8) closes that: the
+//! same `add` under `open Nat` and `open Nat in` in a `def`, and under `open Nat` in
+//! a `by decide` theorem, none of which depends on `rfl`, plus the unprotected
+//! `succ` control the pin accepts. Its `manifest.tsv` names each
 //! program's set and records what the pinned Reference `lean <file>` does when
 //! run from that directory: exit code, stdout and stderr.
 //!
@@ -46,9 +52,9 @@ use std::time::{Duration, Instant};
 
 const CORPUS: &str = "crates/fln-cli/tests/fixtures/ordinary_lean_probe";
 const MANIFEST: &str = "manifest.tsv";
-/// The declared population: 16 programs in set A, 14 in set B and 3 in set C. A
-/// scan that finds fewer is broken; it is never a smaller corpus.
-const CORPUS_FLOOR: usize = 33;
+/// The declared population: 16 programs in set A, 14 in set B, 3 in set C and 4 in
+/// set D. A scan that finds fewer is broken; it is never a smaller corpus.
+const CORPUS_FLOOR: usize = 37;
 const WORKERS: usize = 8;
 const PROGRAM_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -172,9 +178,9 @@ fn parse_manifest(text: &str) -> Result<Vec<Row>, Vec<String>> {
             ));
             continue;
         }
-        if !matches!(fields[1], "A" | "B" | "C") {
+        if !matches!(fields[1], "A" | "B" | "C" | "D") {
             problems.push(format!(
-                "{at}: set must be A, B or C, found {:?}",
+                "{at}: set must be A, B, C or D, found {:?}",
                 fields[1]
             ));
         }
@@ -493,7 +499,10 @@ fn the_checked_in_corpus_matches_its_manifest() {
         *sets.entry(row.set.as_str()).or_default() += 1;
         sets
     });
-    assert_eq!(sets, BTreeMap::from([("A", 16), ("B", 14), ("C", 3)]));
+    assert_eq!(
+        sets,
+        BTreeMap::from([("A", 16), ("B", 14), ("C", 3), ("D", 4)])
+    );
 }
 
 fn row(file: &str, exit: i32, stdout: &str) -> Row {
@@ -614,8 +623,9 @@ fn manifest_fields_round_trip_through_their_escapes() {
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].set.as_str(), rows[0].exit), ("B", 1));
     assert_eq!(rows[0].stdout, text);
-    // An undeclared set is refused (A, B and C are the declared ones).
-    assert!(parse_manifest("x.lean\tD\t0\t\t\n").is_err());
+    // An undeclared set is refused (A, B, C and D are the declared ones).
+    assert!(parse_manifest("x.lean\tE\t0\t\t\n").is_err());
     assert!(parse_manifest("x.lean\tC\t0\t\t\n").is_ok());
+    assert!(parse_manifest("x.lean\tD\t0\t\t\n").is_ok());
     assert!(parse_manifest("x.lean\tA\t0\t\n").is_err());
 }
