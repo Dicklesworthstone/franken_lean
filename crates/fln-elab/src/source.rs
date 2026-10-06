@@ -130,6 +130,95 @@ pub enum SourceInferenceError {
         actual: String,
         expected: String,
     },
+    /// A `mutual` block whose members' headers the pin refuses to combine.
+    MutualHeader(MutualHeaderError),
+}
+
+/// The pin's header checks across the members of a `mutual` inductive block
+/// (`Lean.Elab.Command`'s `withElaboratedHeaders` and `elabHeaders`, vendored
+/// `src/Lean/Elab/MutualInductive.lean`; parameters by `forallTelescopeCompatibleAux`,
+/// `src/Lean/Elab/DeclUtil.lean`). Each later member is compared with the first. A
+/// member is named as it was written, without its namespace (`shortDeclName`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutualHeaderError {
+    /// `InductiveElabStep1.checkLevelNames`. Each list is the member's universe names as
+    /// the pin prints them: its declared `.{…}` names, then the section's `universe`
+    /// names, each reversed, because `expandDeclId` conses them on.
+    UniverseParameters {
+        declaration: Name,
+        names: Vec<Name>,
+        first: Name,
+        first_names: Vec<Name>,
+    },
+    /// `checkNumParams`, which runs over every member before any parameter is compared.
+    ParameterCount {
+        declaration: Name,
+        count: usize,
+        first: Name,
+        first_count: usize,
+    },
+    /// The same parameter carries a different binder annotation.
+    BinderAnnotation { parameter: Name },
+    /// The same parameter is spelled differently. Exception: two anonymous instance
+    /// binders, whose names the pin generates with macro scopes (lean4#4310).
+    ParameterNames { found: Name, expected: Name },
+}
+
+impl std::fmt::Display for MutualHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |names: &[Name]| {
+            names
+                .iter()
+                .map(|name| format!("`{}`", name.to_display_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // The pin's words, including its trailing notes.
+        match self {
+            Self::UniverseParameters {
+                declaration,
+                names,
+                first,
+                first_names,
+            } => write!(
+                f,
+                "Universe parameter mismatch in mutually inductive types: `{}` has universe \
+                 parameters\n  {}\nbut the preceding declaration `{}` has\n  {}\n\nNote: All \
+                 inductive declarations in the same `mutual` block must have the same universe \
+                 level parameters",
+                declaration.to_display_string(),
+                list(names),
+                first.to_display_string(),
+                list(first_names)
+            ),
+            Self::ParameterCount {
+                declaration,
+                count,
+                first,
+                first_count,
+            } => write!(
+                f,
+                "Invalid mutually inductive types: `{}` has {count} parameter(s), but the \
+                 preceding type `{}` has {first_count}\n\nNote: All inductive types declared in \
+                 the same `mutual` block must have the same parameters",
+                declaration.to_display_string(),
+                first.to_display_string()
+            ),
+            Self::BinderAnnotation { parameter } => write!(
+                f,
+                "Invalid mutually inductive types: Binder annotations for parameter `{}` must \
+                 match",
+                parameter.to_display_string()
+            ),
+            Self::ParameterNames { found, expected } => write!(
+                f,
+                "Invalid mutually inductive types: Parameter names `{}` and `{}` differ but \
+                 were expected to match",
+                found.to_display_string(),
+                expected.to_display_string()
+            ),
+        }
+    }
 }
 
 /// An interpretation as the pin's message names it: a root declaration as `_root_.x`.
@@ -257,6 +346,7 @@ impl std::fmt::Display for SourceInferenceError {
                 f,
                 "Type mismatch: a term of type `{actual}` is expected to have type `{expected}`"
             ),
+            Self::MutualHeader(error) => write!(f, "{error}"),
         }
     }
 }

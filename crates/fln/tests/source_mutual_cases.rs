@@ -40,7 +40,7 @@ fn engine(families: &[&str]) -> (Engine, EngineAdmissionLimits) {
 }
 const FAMILIES: &[&str] = &[
     "inductive Tree (A : Type) where | node (value : A) (children : Forest A)",
-    "inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)",
+    "inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)",
 ];
 fn check(families: &[&str], source: &str) {
     let (engine, limits) = engine(families);
@@ -90,7 +90,7 @@ fn indexed_mutual_matches_keep_destination_indices_in_the_motive() {
     check(
         &[
             "inductive T (A : Type) : A -> Type where | node (x : A) (children : F A x) : T A x",
-            "inductive F (B : Type) : B -> Type where | nil (x : B) : F B x | cons (x : B) (t : T B x) : F B x",
+            "inductive F (A : Type) : A -> Type where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x",
         ],
         "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node y children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node y children => y\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
     );

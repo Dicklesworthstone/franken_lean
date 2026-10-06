@@ -85,12 +85,15 @@ fn forward_references_generate_both_families_and_reusable_constructors() {
         "def tree : Tree := Tree.node (Forest.cons (Tree.leaf 7) Forest.nil)\ntheorem good : tree = Tree.node (Forest.cons (Tree.leaf 7) Forest.nil) := by rfl",
     );
 }
+// Members spell their shared parameters alike: the pin refuses differing spellings
+// (`mutual_headers_are_refused_where_the_pin_refuses_them`). Both programs, with the
+// uses below, are accepted at the pin (lean v4.32.0, 2026-10-06).
 #[test]
 fn shared_polymorphic_parameters_are_rebound_without_capture() {
     let e = admit(
         &[
             "inductive Tree.{u} (A : Type u) where | leaf (value : A) | node (children : Forest A)",
-            "inductive Forest.{u} (B : Type u) where | nil | cons (head : Tree B) (tail : Forest B)",
+            "inductive Forest.{u} (A : Type u) where | nil | cons (head : Tree A) (tail : Forest A)",
         ],
         &SourceScope::default(),
     );
@@ -100,11 +103,11 @@ fn shared_polymorphic_parameters_are_rebound_without_capture() {
     );
 }
 #[test]
-fn dependent_shared_parameter_telescopes_align_by_identity_not_spelling() {
+fn dependent_shared_parameter_telescopes_align_by_identity() {
     let e = admit(
         &[
             "inductive Tree (A : Type) (P : A -> Type) where | leaf (x : A) (value : P x) | node (children : Forest A P)",
-            "inductive Forest (B : Type) (Q : B -> Type) where | nil | cons (head : Tree B Q) (tail : Forest B Q)",
+            "inductive Forest (A : Type) (P : A -> Type) where | nil | cons (head : Tree A P) (tail : Forest A P)",
         ],
         &SourceScope::default(),
     );
@@ -270,7 +273,7 @@ fn constructor_collisions_and_resource_stops_leave_the_original_engine_reusable(
 
 const MUTUAL_FILE: &str = "mutual
   inductive Tree (A : Type) where | node (value : A) (children : Forest A)
-  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)
+  inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)
 end
 ";
 
@@ -462,7 +465,7 @@ fn groups_preserve_namespace_and_universe_scope_and_single_member_groups_work() 
 universe u
 mutual
   inductive Tree (A : Type u) where | node (value : A) (xs : Forest A)
-  inductive Forest (B : Type u) where | nil | cons (t : Tree B)
+  inductive Forest (A : Type u) where | nil | cons (t : Tree A)
 end
 def tree : Tree Nat := Tree.node 7 (@Forest.nil Nat)
 end Demo
@@ -607,4 +610,113 @@ fn source_module_cache_reuses_and_invalidates_the_whole_mutual_unit() {
         changed.checked.checked.result_logical_root,
         cold.checked.checked.result_logical_root
     );
+}
+
+/// The pin's header checks across a `mutual` block, each refused with its own words.
+/// Every program was run headerless at the pin (lean v4.32.0) on 2026-10-06, and each
+/// wording is its first error, verbatim. The order is the pin's: universe names, then the
+/// parameter count over every member, then each later member's parameters (binder
+/// annotation before name) against the first's.
+const MUTUAL_HEADERS_REFUSED: &[(&str, &str)] = &[
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (B : Type) where\n  | nil\n  | cons (head : Tree B) (tail : Forest B)\nend\n",
+        "Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) (n : Nat) where\n  | node (children : Forest A n)\ninductive Forest (A : Type) (m : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: Parameter names `m` and `n` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) [i : Inhabited A] where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) [j : Inhabited A] where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "Invalid mutually inductive types: Parameter names `j` and `i` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive X (A : Type) where\n  | x (y : Y A)\ninductive Y (A : Type) where\n  | y (z : Z A)\n  | stop\ninductive Z (C : Type) where\n  | z (x : X C)\nend\n",
+        "Invalid mutually inductive types: Parameter names `C` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) (P : A -> Type) where | leaf (x : A) (value : P x) | node (children : Forest A P)\ninductive Forest (B : Type) (Q : B -> Type) where | nil | cons (head : Tree B Q) (tail : Forest B Q)\nend\n",
+        "Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest {A : Type} where\n  | nil\n  | cons (head : Tree A) (tail : @Forest A)\nend\n",
+        "Invalid mutually inductive types: Binder annotations for parameter `A` must match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest {B : Type} where\n  | nil\nend\n",
+        "Invalid mutually inductive types: Binder annotations for parameter `B` must match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) (n : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1\n\nNote: All inductive types declared in the same `mutual` block must have the same parameters",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest (B : Type) (n : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1",
+    ),
+    (
+        "namespace Ns\nmutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest (A : Type) (n : Nat) where\n  | nil\nend\nend Ns\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{v} (A : Type v) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "Universe parameter mismatch in mutually inductive types: `Forest` has universe parameters\n  `v`\nbut the preceding declaration `Tree` has\n  `u`\n\nNote: All inductive declarations in the same `mutual` block must have the same universe level parameters",
+    ),
+    (
+        "mutual\ninductive Tree.{u, v} (A : Type u) (B : Type v) where\n  | node (value : A) (children : Forest A B)\ninductive Forest.{v, u} (A : Type u) (B : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `u`, `v`\nbut the preceding declaration `Tree` has\n  `v`, `u`\n",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "`Forest` has universe parameters\n  \nbut the preceding declaration `Tree` has\n  `u`\n",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (children : Forest A)\ninductive Forest.{v} (B : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `v`\nbut the preceding declaration `Tree` has\n  `u`\n",
+    ),
+    (
+        "universe w x\nmutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{v} (A : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `v`, `x`, `w`\nbut the preceding declaration `Tree` has\n  `u`, `x`, `w`\n",
+    ),
+];
+
+/// Accepted at the pin (exit 0, run as above): the controls a too-strict check would
+/// refuse. Anonymous instance binders get generated names on both sides and are exempt
+/// (lean4#4310); index names are not parameters; auto-bound names agree by spelling.
+const MUTUAL_HEADERS_ACCEPTED: &[&str] = &[
+    "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree (A : Type) [Inhabited A] where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) [Inhabited A] where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{u} (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree : Nat \u{2192} Type where\n  | node (n : Nat) (children : Forest n) : Tree n\ninductive Forest : (m : Nat) \u{2192} Type where\n  | nil : Forest 0\nend\n",
+];
+
+#[test]
+fn mutual_headers_are_refused_where_the_pin_refuses_them() {
+    for (source, wording) in MUTUAL_HEADERS_REFUSED {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        let error = e
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        let text = error.to_string();
+        assert!(
+            text.contains(wording),
+            "{source}\nmust be refused as the pin refuses it, with\n{wording}\nbut was refused with\n{text}"
+        );
+        let (class, authority, _) = error.disposition();
+        assert_eq!(
+            (class, authority),
+            ("elaboration", false),
+            "{source}: {text}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root, "{source}");
+    }
+    for source in MUTUAL_HEADERS_ACCEPTED {
+        check(&engine(), source);
+    }
 }

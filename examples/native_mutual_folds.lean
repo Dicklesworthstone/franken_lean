@@ -2,9 +2,9 @@ mutual
 inductive Tree (A : Type) where
   | leaf (value : A)
   | node (children : Forest A)
-inductive Forest (B : Type) where
+inductive Forest (A : Type) where
   | nil
-  | cons (head : Tree B) (tail : Forest B)
+  | cons (head : Tree A) (tail : Forest A)
 end
 
 -- The Tree peer has an accumulator; the Forest peer returns a plain Nat.

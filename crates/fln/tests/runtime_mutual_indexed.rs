@@ -125,9 +125,9 @@ fn ground_type_parameters_and_proof_fields_preserve_distinct_layouts() {
 inductive Tree (A : Type u) : Nat -> Type u where
   | leaf (n : Nat) (value : A) (h : n = n) : Tree A n
   | node (n : Nat) (child : Forest A n) : Tree A n
-inductive Forest (B : Type u) : Nat -> Type u where
-  | nil (n : Nat) : Forest B n
-  | cons (n : Nat) (t : Tree B n) (rest : Forest B n) : Forest B n
+inductive Forest (A : Type u) : Nat -> Type u where
+  | nil (n : Nat) : Forest A n
+  | cons (n : Nat) (t : Tree A n) (rest : Forest A n) : Forest A n
 end
 def first {A : Type u} (fallback : A) (n : Nat) (t : Tree A n) : A :=
   @Tree.rec A (fun n t => A) (fun n xs => A)

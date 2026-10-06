@@ -17,7 +17,7 @@ fn engine() -> (Engine, EngineAdmissionLimits) {
 }
 const TREE: &[&str] = &[
     "inductive Tree (A : Type) where | node (value : A) (children : Forest A)",
-    "inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)",
+    "inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)",
 ];
 fn with_families(families: &[&str]) -> (Engine, EngineAdmissionLimits) {
     let (engine, limits) = engine();

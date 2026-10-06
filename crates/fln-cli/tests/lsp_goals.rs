@@ -267,7 +267,7 @@ fn queries_check_the_current_unsaved_import_closure() {
 fn mutual_import_goals_use_current_editor_text_and_recover_after_a_bad_group() {
     let data_uri = "file:///tmp/MutualGoalData.lean";
     let main_uri = "file:///tmp/MutualGoalMain.lean";
-    let library = "mutual\n  inductive Tree (A : Type) where | node (value : A) (children : Forest A)\n  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)\nend";
+    let library = "mutual\n  inductive Tree (A : Type) where | node (value : A) (children : Forest A)\n  inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)\nend";
     let source = "import MutualGoalData\ndef pending : Tree Nat := by";
     let branch = "import MutualGoalData\ntheorem pending (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by\n  cases t with\n  | node n xs => exact h";
     let messages = run(

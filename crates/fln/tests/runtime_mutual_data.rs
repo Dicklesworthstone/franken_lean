@@ -27,7 +27,7 @@ fn run(source: &str, expected: &str) -> u64 {
     );
     value.usage.steps
 }
-const TREE: &str = "mutual\ninductive Tree (A : Type) where | node (value : A) (children : Forest A)\ninductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)\nend\n";
+const TREE: &str = "mutual\ninductive Tree (A : Type) where | node (value : A) (children : Forest A)\ninductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)\nend\n";
 const HEAD: &str = "def value (t : Tree Nat) : Nat := match t with | .node n children => n\ndef first (xs : Forest Nat) : Nat := match xs with | .nil => 0 | .cons t rest => value t\n";
 
 #[test]

@@ -254,6 +254,8 @@ pub fn elaborate_inductive(
 struct Header<'a> {
     context: Context,
     name: Name,
+    /// The name as written, without the namespace: the pin's `shortDeclName`.
+    short_name: Name,
     parameters: Vec<LocalDecl>,
     indices: Vec<LocalDecl>,
     explicit: Option<Level>,
@@ -327,6 +329,7 @@ fn header<'a>(
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     let mut context = Context::scoped(env, kernel, scope);
+    let short_name = name.clone();
     let name = context.enter_declaration(name)?;
     if env.contains(&name) {
         return Err(invalid());
@@ -400,6 +403,7 @@ fn header<'a>(
     Ok(Header {
         context,
         name,
+        short_name,
         parameters,
         indices,
         explicit,
@@ -418,6 +422,7 @@ pub(super) fn elaborate_inductive_scoped(
     let Header {
         mut context,
         name,
+        short_name: _,
         mut parameters,
         mut indices,
         explicit,

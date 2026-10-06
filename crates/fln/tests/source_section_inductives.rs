@@ -200,9 +200,9 @@ mutual
   inductive Tree (x : A) where
     | leaf (value : P x)
     | node (children : Forest x)
-  inductive Forest (y : A) where
+  inductive Forest (x : A) where
     | nil
-    | cons (head : Tree y) (tail : Forest y)
+    | cons (head : Tree x) (tail : Forest x)
 end
 end
 end Nested

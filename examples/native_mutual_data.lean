@@ -1,9 +1,9 @@
 mutual
 inductive Tree (A : Type) where
   | node (value : A) (children : Forest A)
-inductive Forest (B : Type) where
+inductive Forest (A : Type) where
   | nil
-  | cons (head : Tree B) (tail : Forest B)
+  | cons (head : Tree A) (tail : Forest A)
 end
 
 def action (t : Tree Nat) : Nat -> Nat :=

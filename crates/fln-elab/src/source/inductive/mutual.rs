@@ -3,7 +3,33 @@
 //! for the ordinary kernel and independent-checker admission path.
 use super::*;
 use crate::inductive::mutual_inductive_declaration;
+use fln_core::name::LeafView;
 use std::collections::HashSet;
+
+fn header_error(error: MutualHeaderError) -> NatDefinitionElabError {
+    failure(SourceInferenceError::MutualHeader(error))
+}
+
+/// A member's universe names as the pin's mismatch message lists them: the declared
+/// `.{…}` names, then the section's `universe` names, each reversed (`expandDeclId`
+/// conses each onto `levelNames`). Measured at the pin: `universe w x` with
+/// `Forest.{v}` prints `` `v`, `x`, `w` ``.
+fn printed_levels(header: &Header<'_>, scope: &SourceScope) -> Vec<Name> {
+    let declared = &header.context.level_params[..header.context.explicit_levels];
+    declared
+        .iter()
+        .rev()
+        .chain(scope.universes.iter().rev())
+        .cloned()
+        .collect()
+}
+
+/// A binder name this elaborator generated (`Context::fresh_name`) for an anonymous
+/// binder. It stands for the macro-scoped name the pin generates there.
+fn generated(name: &Name) -> bool {
+    matches!(name.leaf_view(), LeafView::Num(_))
+        && name.parent() == Name::from_components(["_fln_source"])
+}
 
 fn family_type(
     header: &Header<'_>,
@@ -40,36 +66,39 @@ pub(in crate::source) fn elaborate_mutual(
         .map(|s| header(s, env, kernel, budget, scope))
         .collect::<Result<Vec<_>, _>>()?;
     let mut names = HashSet::new();
-    let mut explicit = None::<Level>;
-    let mut declared_levels = Vec::new();
     for h in &headers {
         if !names.insert(h.name.clone()) {
             return Err(invalid());
         }
-        if let Some(level) = &h.explicit {
-            let normalized = level.normalize_fixpoint();
-            // `checkResultingUniversePolymorphism` in the pin's source
-            // elaborator permits Prop or a definitely nonzero universe by
-            // default. Kernel-level generation also supports Sort u, but that
-            // does not enable the separate bootstrap option in source files.
-            if level.has_mvar()
-                || (!normalized.is_zero() && !normalized.is_never_zero())
-                || explicit
-                    .as_ref()
-                    .is_some_and(|other| other.normalize_fixpoint() != level.normalize_fixpoint())
-            {
-                return Err(failure(SourceInferenceError::Inductive(
-                    InductiveError::UnsupportedSort,
-                )));
-            }
-            explicit = Some(level.clone());
-        }
-        for name in &h.context.level_params[..h.context.explicit_levels] {
-            if !declared_levels.contains(name) {
-                declared_levels.push(name.clone());
-            }
+    }
+    // The pin's header checks, in its order: universe names, then the parameter count
+    // over every member, then each later member's parameters against the first's (below,
+    // binder annotation, name, type), and the result sort last.
+    let first_levels = printed_levels(&headers[0], scope);
+    for h in &headers[1..] {
+        let levels = printed_levels(h, scope);
+        if levels != first_levels {
+            return Err(header_error(MutualHeaderError::UniverseParameters {
+                declaration: h.short_name.clone(),
+                names: levels,
+                first: headers[0].short_name.clone(),
+                first_names: first_levels,
+            }));
         }
     }
+    for h in &headers[1..] {
+        if h.parameters.len() != headers[0].parameters.len() {
+            return Err(header_error(MutualHeaderError::ParameterCount {
+                declaration: h.short_name.clone(),
+                count: h.parameters.len(),
+                first: headers[0].short_name.clone(),
+                first_count: headers[0].parameters.len(),
+            }));
+        }
+    }
+    // Every member declares the same names (checked above).
+    let declared_levels =
+        headers[0].context.level_params[..headers[0].context.explicit_levels].to_vec();
     let mut levels = declared_levels.clone();
     for h in &headers {
         for level in &h.context.level_params {
@@ -80,9 +109,6 @@ pub(in crate::source) fn elaborate_mutual(
     }
     let mut common = Vec::<LocalDecl>::new();
     for (family, h) in headers.iter_mut().enumerate() {
-        if family != 0 && h.parameters.len() != common.len() {
-            return Err(invalid());
-        }
         let replacements: Vec<_> = h
             .parameters
             .iter()
@@ -122,7 +148,18 @@ pub(in crate::source) fn elaborate_mutual(
                 common.push(p.clone());
             } else {
                 if p.binder_info != common[i].binder_info {
-                    return Err(invalid());
+                    return Err(header_error(MutualHeaderError::BinderAnnotation {
+                        parameter: p.user_name.clone(),
+                    }));
+                }
+                let anonymous_instances = p.binder_info == BinderInfo::InstImplicit
+                    && generated(&p.user_name)
+                    && generated(&common[i].user_name);
+                if p.user_name != common[i].user_name && !anonymous_instances {
+                    return Err(header_error(MutualHeaderError::ParameterNames {
+                        found: p.user_name.clone(),
+                        expected: common[i].user_name.clone(),
+                    }));
                 }
                 h.context
                     .txn
@@ -139,6 +176,27 @@ pub(in crate::source) fn elaborate_mutual(
         }
         h.context.level_params = levels.clone();
         h.context.explicit_levels = declared_levels.len();
+    }
+    let mut explicit = None::<Level>;
+    for h in &headers {
+        if let Some(level) = &h.explicit {
+            let normalized = level.normalize_fixpoint();
+            // `checkResultingUniversePolymorphism` in the pin's source
+            // elaborator permits Prop or a definitely nonzero universe by
+            // default. Kernel-level generation also supports Sort u, but that
+            // does not enable the separate bootstrap option in source files.
+            if level.has_mvar()
+                || (!normalized.is_zero() && !normalized.is_never_zero())
+                || explicit
+                    .as_ref()
+                    .is_some_and(|other| other.normalize_fixpoint() != level.normalize_fixpoint())
+            {
+                return Err(failure(SourceInferenceError::Inductive(
+                    InductiveError::UnsupportedSort,
+                )));
+            }
+            explicit = Some(level.clone());
+        }
     }
     let provisional = explicit.clone().unwrap_or_else(Level::one);
     let ids: Vec<_> = (0..headers.len())
