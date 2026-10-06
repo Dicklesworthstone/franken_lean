@@ -2,6 +2,43 @@
 //! Preserve the ordinary per-declaration evidence and publish only a full batch.
 use super::*;
 
+/// Elaboration and admission share the same kernel nonanswer convention.
+/// Preserve the kernel's complete cause; other frontend errors stay
+/// in the error channel. In particular, a failed check is never a declaration.
+pub(crate) fn elaboration_outcome<T>(
+    result: Result<T, fln_elab::NatDefinitionElabError>,
+) -> Result<Outcome<T>, EngineExecutionError> {
+    use fln_elab::NatDefinitionElabError;
+    use fln_elab::constraint::unify::UnificationError;
+    use fln_elab::source::SourceInferenceError;
+
+    let error = match result {
+        Ok(value) => return Ok(Outcome::Complete(value)),
+        Err(error) => error,
+    };
+    let kernel = match &error {
+        NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)) => {
+            Some(outcome.as_ref())
+        }
+        NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) => {
+            match error.as_ref() {
+                UnificationError::AssignmentCheck { outcome, .. }
+                | UnificationError::ConversionCheck { outcome }
+                | UnificationError::ConstraintCheck { outcome, .. } => Some(outcome.as_ref()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match kernel {
+        Some(Outcome::Inconclusive(reason)) => Ok(Outcome::Inconclusive(reason.clone())),
+        Some(Outcome::InternalFault(fault)) => Ok(Outcome::InternalFault(fault.clone())),
+        _ => Err(EngineExecutionError::Frontend(
+            DefinitionFrontendError::Elaborate(error),
+        )),
+    }
+}
+
 impl EngineBuilder {
     /// Construct a bounded coercion-seed engine using the specified admission limits.
     pub fn build_with_coercion_seed(
@@ -120,7 +157,7 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        let candidate = if members.len() == 1 {
+        let candidate = elaboration_outcome(if members.len() == 1 {
             fln_elab::source::scope::elaborate_inductive(
                 &members[0],
                 self.environment(),
@@ -136,9 +173,12 @@ impl Engine {
                 fln_elab::records::RecordBudget::default(),
                 scope,
             )
-        }
-        .map_err(DefinitionFrontendError::Elaborate)
-        .map_err(EngineExecutionError::Frontend)?;
+        })?;
+        let candidate = match candidate {
+            Outcome::Complete(candidate) => candidate,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         self.admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)
     }
@@ -152,29 +192,35 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         if fln_elab::source::is_inductive(parsed.syntax()) {
-            let candidate = fln_elab::source::scope::elaborate_inductive(
-                parsed.syntax(),
-                self.environment(),
-                limits.kernel,
-                fln_elab::records::RecordBudget::default(),
-                scope,
-            )
-            .map_err(DefinitionFrontendError::Elaborate)
-            .map_err(EngineExecutionError::Frontend)?;
+            let candidate =
+                match elaboration_outcome(fln_elab::source::scope::elaborate_inductive(
+                    parsed.syntax(),
+                    self.environment(),
+                    limits.kernel,
+                    fln_elab::records::RecordBudget::default(),
+                    scope,
+                ))? {
+                    Outcome::Complete(candidate) => candidate,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
             return self
                 .admit_declarations(&[candidate], options, limits)
                 .map_err(EngineExecutionError::from);
         }
         if !fln_elab::source::is_record(parsed.syntax()) {
             if scope != &fln_elab::source::scope::SourceScope::default() {
-                let declaration = fln_elab::source::scope::elaborate_definition(
-                    parsed.syntax(),
-                    self.environment(),
-                    limits.kernel,
-                    scope,
-                )
-                .map_err(DefinitionFrontendError::Elaborate)
-                .map_err(EngineExecutionError::Frontend)?;
+                let declaration =
+                    match elaboration_outcome(fln_elab::source::scope::elaborate_definition(
+                        parsed.syntax(),
+                        self.environment(),
+                        limits.kernel,
+                        scope,
+                    ))? {
+                        Outcome::Complete(declaration) => declaration,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
                 let registration = fln_elab::source::instance_registration(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?;
@@ -267,15 +313,17 @@ impl Engine {
                 },
             );
         }
-        let record = fln_elab::source::scope::elaborate_record(
+        let record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
             parsed.syntax(),
             self.environment(),
             limits.kernel,
             fln_elab::records::RecordBudget::default(),
             scope,
-        )
-        .map_err(DefinitionFrontendError::Elaborate)
-        .map_err(EngineExecutionError::Frontend)?;
+        ))? {
+            Outcome::Complete(record) => record,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let result = self
             .admit_declarations(&record.declarations, options, limits)
             .map_err(EngineExecutionError::from)?;
@@ -389,4 +437,72 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::expr::MVarId;
+    use fln_core::outcome::{Inconclusive, InternalFault};
+    use fln_elab::NatDefinitionElabError;
+    use fln_elab::constraint::{ConstraintId, unify::UnificationError};
+    use fln_elab::source::SourceInferenceError;
+    use fln_kernel::verdict::{Consumption, RejectClass, Verdict};
+
+    #[test]
+    fn kernel_carriers_preserve_nonanswers_and_never_turn_verdict_errors_into_values() {
+        // Adapter coverage, including a planted internal fault and the currently
+        // unobserved source ConstraintCheck carrier; not live kernel-fault proof.
+        for outcome in [
+            Outcome::Inconclusive(Inconclusive::cancelled("kernel probe").with_progress("term")),
+            Outcome::InternalFault(
+                InternalFault::new("FL-INV-07", "probe").with_evidence("adapter test"),
+            ),
+            Outcome::Complete(Verdict::Rejected {
+                class: RejectClass::TypeMismatch,
+                message: "probe".into(),
+                consumption: Consumption::default(),
+            }),
+            Outcome::Complete(Verdict::Accepted {
+                consumption: Consumption::default(),
+            }),
+        ] {
+            for inference in [
+                SourceInferenceError::TypeObligation(Box::new(outcome.clone())),
+                SourceInferenceError::Unification(Box::new(UnificationError::AssignmentCheck {
+                    id: MVarId(Name::from_components(["probe"])),
+                    outcome: Box::new(outcome.clone()),
+                })),
+                SourceInferenceError::Unification(Box::new(UnificationError::ConversionCheck {
+                    outcome: Box::new(outcome.clone()),
+                })),
+                SourceInferenceError::Unification(Box::new(UnificationError::ConstraintCheck {
+                    id: ConstraintId(0),
+                    outcome: Box::new(outcome.clone()),
+                })),
+            ] {
+                let error = NatDefinitionElabError::Inference(inference);
+                let result = elaboration_outcome::<()>(Err(error.clone()));
+                match &outcome {
+                    Outcome::Inconclusive(reason) => assert!(
+                        matches!(result, Ok(Outcome::Inconclusive(ref actual)) if actual == reason)
+                    ),
+                    Outcome::InternalFault(fault) => assert!(
+                        matches!(result, Ok(Outcome::InternalFault(ref actual)) if actual == fault)
+                    ),
+                    Outcome::Complete(_) => assert!(
+                        matches!(result, Err(EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(ref actual))) if actual == &error)
+                    ),
+                }
+            }
+        }
+        let ordinary = NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit);
+        assert!(
+            matches!(elaboration_outcome::<()>(Err(ordinary.clone())), Err(EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(actual))) if actual == ordinary)
+        );
+        assert!(matches!(
+            elaboration_outcome(Ok(17)),
+            Ok(Outcome::Complete(17))
+        ));
+    }
 }

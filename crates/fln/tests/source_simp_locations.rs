@@ -116,10 +116,13 @@ fn hypothesis_premise_resource_stops_remain_nonanswers_even_inside_try() {
         let source = format!(
             "theorem bounded (P : Nat -> Prop) (x y : Nat) (h : (1 <<< 18446744073709551616) = 0 -> x = y) (hx : P x) : P y := by\n  {tactic}\n  exact hx"
         );
-        let error = base
+        let result = base
             .check_source_files(&[source.as_bytes()], &options, limits())
-            .unwrap_err();
-        assert_eq!(error.disposition(), ("inconclusive", false, 3), "{error}");
+            .unwrap();
+        assert!(
+            matches!(result, fln::Outcome::Inconclusive(_)),
+            "{result:?}"
+        );
         assert_eq!(root, base.logical_root(&options));
     }
 }

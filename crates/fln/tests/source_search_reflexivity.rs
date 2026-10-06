@@ -131,13 +131,12 @@ fn arithmetic_resource_stops_are_inconclusive_even_inside_search_alternatives() 
         "theorem bounded (p : Prop) (rule : (1 <<< 18446744073709551616) = 0 -> p) : p := by solve_by_elim",
         "theorem bounded : (1 <<< 18446744073709551616) = 0 := by first | solve_by_elim | fail",
     ] {
-        let problem = base
+        let result = base
             .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
-            .unwrap_err();
-        assert_eq!(
-            problem.disposition(),
-            ("inconclusive", false, 3),
-            "{source}: {problem:?}"
+            .unwrap();
+        assert!(
+            matches!(result, fln::Outcome::Inconclusive(_)),
+            "{source}: {result:?}"
         );
         assert_eq!(base.logical_root(&KVMap::new()), before);
     }

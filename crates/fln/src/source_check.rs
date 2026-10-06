@@ -257,20 +257,24 @@ impl Engine {
                         continue;
                     }
                     if let fln_parse::command_scope::ScopeCommand::Variable(syntax) = control {
-                        scopes.current.variables = fln_elab::source::scope::variables::declare(
-                            &syntax,
-                            engine.environment(),
-                            limits.admission.kernel,
-                            &scopes.current,
+                        let variables = source_records::elaboration_outcome(
+                            fln_elab::source::scope::variables::declare(
+                                &syntax,
+                                engine.environment(),
+                                limits.admission.kernel,
+                                &scopes.current,
+                            ),
                         )
-                        .map_err(|error| SourceCheckError::Command {
-                            file,
-                            command: count,
-                            offset: start.0,
-                            error: Box::new(EngineExecutionError::Frontend(
-                                DefinitionFrontendError::Elaborate(error),
-                            )),
-                        })?;
+                        .map_err(|error| command_error(file, count, start, error))?;
+                        scopes.current.variables = match variables {
+                            Outcome::Complete(variables) => variables,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
                         count += 1;
                         continue;
                     }
