@@ -107,7 +107,7 @@ fn eta_synthesizes_a_checked_pattern_assignment() {
     let before = tx.clone();
     let report = tx.unify(&expanded, &f, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![m.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let assignment = tx.mvars.get_assigned_expr(&m).unwrap().clone();
     assert!(!assignment.has_loose_bvars());
     tx.unify(&assignment, &f, budget()).unwrap();

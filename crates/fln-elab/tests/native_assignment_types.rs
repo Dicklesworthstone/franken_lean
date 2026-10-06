@@ -6,7 +6,7 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
 use fln_elab::constraint::ConstraintKind;
-use fln_elab::constraint::unify::{UnificationBudget, UnificationError};
+use fln_elab::constraint::unify::{UnificationBudget, UnificationError, UnificationTransparency};
 use fln_elab::mvar::MetavarKind;
 use fln_elab::seed::bootstrap_nat_environment;
 use fln_elab::txn::ElabTxn;
@@ -80,7 +80,7 @@ fn a_literal_assignment_infers_its_missing_type_in_both_orientations() {
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&nat()));
         assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&numeral(7)));
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert!(report.residual_metavariables.is_empty());
         assert_eq!(txn.env, env);
     }
@@ -99,7 +99,7 @@ fn inferred_types_propagate_their_universe_without_defaulting() {
         Level::one()
     );
     assert_eq!(report.universe_assignments, vec![u]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn a_neutral_value_infers_dependent_type_indices() {
     let x = goal(&mut txn, "value", expected);
     let report = txn.unify(&Expr::mvar(x), &value, budget()).unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&index), Some(&numeral(5)));
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn applied_patterns_infer_a_dependent_result_type_family() {
         BinderInfo::Default,
     );
     txn.unify(&Expr::mvar(f), &identity, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(report.residual_metavariables.is_empty());
 }
 
@@ -170,7 +170,7 @@ fn neutral_application_type_hints_do_not_skip_argument_checking() {
             );
             unchanged(&txn, &before);
         } else {
-            assert_eq!(outcome.unwrap().kernel_checks, 2);
+            assert_eq!(outcome.unwrap().kernel_checks, 4);
             assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&nat()));
         }
     }
@@ -192,7 +192,7 @@ fn sort_assignments_infer_successor_universes_not_cumulativity() {
         txn.mvars.get_assigned_expr(&a),
         Some(&Expr::sort(Level::one()))
     );
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn queued_type_inference_does_not_count_awakened_obligations_as_solved() {
         ConstraintKind::HasType { .. }
     ));
     assert_eq!(report.solved, vec![selected]);
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
     assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&nat()));
     assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&numeral(11)));
 }
@@ -343,4 +343,161 @@ fn a_closed_type_mismatch_retains_the_real_kernel_rejection() {
             if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })))
     );
     unchanged(&txn, &before);
+}
+
+fn carrier_alias(txn: &mut ElabTxn, text: &str, value: Expr) -> Expr {
+    use fln_env::constants::{
+        ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    };
+    let declaration = DefinitionVal {
+        base: ConstantVal {
+            name: name(text),
+            level_params: vec![],
+            type_: Expr::sort(Level::one()),
+        },
+        value,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![name(text)],
+    };
+    assert!(matches!(
+        fln_kernel::check(
+            &txn.env,
+            &fln_kernel::Declaration::Defn(declaration.clone()),
+            budget().kernel,
+        ),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    txn.env = txn.env.add_decl(ConstantInfo::Defn(declaration)).unwrap();
+    Expr::const_(name(text), vec![])
+}
+
+#[test]
+fn closed_assignment_types_preserve_default_opacity_and_batch_atomicity() {
+    let mut base = transaction();
+    let hidden = carrier_alias(&mut base, "HiddenCarrier", nat());
+    let wrapped = carrier_alias(&mut base, "CarrierWrapper", hidden.clone());
+    base.env = fln_elab::reducibility::register(
+        &base.env,
+        &name("HiddenCarrier"),
+        fln_elab::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    let visible = local(&mut base, "visible", nat());
+    let opaque = local(&mut base, "opaque", hidden.clone());
+    for (expected, value) in [
+        (hidden.clone(), visible.clone()),
+        (wrapped.clone(), visible),
+        (nat(), opaque.clone()),
+    ] {
+        for mode in [
+            UnificationTransparency::Abbreviations,
+            UnificationTransparency::Instances,
+            UnificationTransparency::Default,
+        ] {
+            for reverse in [false, true] {
+                let mut txn = base.clone();
+                let earlier = goal(&mut txn, "beforeFailure", nat());
+                let target = goal(&mut txn, "opaqueAssignment", expected.clone());
+                let pair = (Expr::mvar(target), value.clone());
+                let pair = if reverse { (pair.1, pair.0) } else { pair };
+                let before = txn.clone();
+                let mut limits = budget();
+                limits.transparency = mode;
+                assert!(matches!(
+                    txn.unify_many_with(
+                        &[(Expr::mvar(earlier), numeral(9)), pair],
+                        limits,
+                        &|| false,
+                    ),
+                    Err(UnificationError::Deferred(_))
+                ));
+                unchanged(&txn, &before);
+            }
+        }
+    }
+    for expected in [hidden, wrapped] {
+        let mut txn = base.clone();
+        let target = goal(&mut txn, "sameCarrier", expected);
+        txn.unify(&Expr::mvar(target), &opaque, budget()).unwrap();
+    }
+    let mut txn = base;
+    let target = goal(&mut txn, "explicitAll", nat());
+    let mut all = budget();
+    all.transparency = UnificationTransparency::SafeDefinitions;
+    txn.unify(&Expr::mvar(target), &opaque, all).unwrap();
+}
+
+#[test]
+fn closed_assignment_type_conversion_bumps_to_default_as_the_pin_does() {
+    let mut base = transaction();
+    let carrier = carrier_alias(&mut base, "OrdinaryCarrier", nat());
+    let value = local(&mut base, "value", nat());
+    for mode in [
+        UnificationTransparency::None,
+        UnificationTransparency::Abbreviations,
+        UnificationTransparency::Instances,
+        UnificationTransparency::Default,
+    ] {
+        let mut txn = base.clone();
+        let target = goal(&mut txn, "typed", carrier.clone());
+        let mut limits = budget();
+        limits.transparency = mode;
+        txn.unify(&Expr::mvar(target), &value, limits).unwrap();
+    }
+}
+
+#[test]
+fn equal_assignment_result_types_do_not_hide_opaque_argument_conversions() {
+    let mut base = transaction();
+    let hidden = carrier_alias(&mut base, "HiddenArgument", nat());
+    base.env = fln_elab::reducibility::register(
+        &base.env,
+        &name("HiddenArgument"),
+        fln_elab::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    let op = local(&mut base, "consume", pi(hidden.clone(), nat()));
+    let visible = local(&mut base, "visible", nat());
+    let opaque = local(&mut base, "opaque", hidden);
+    let invalid = Expr::app(op.clone(), visible);
+    for reverse in [false, true] {
+        let mut txn = base.clone();
+        let target = goal(&mut txn, "result", nat());
+        let pair = (Expr::mvar(target), invalid.clone());
+        let pair = if reverse { (pair.1, pair.0) } else { pair };
+        let before = txn.clone();
+        assert!(matches!(
+            txn.unify(&pair.0, &pair.1, budget()),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&txn, &before);
+    }
+    let mut txn = base;
+    let target = goal(&mut txn, "result", nat());
+    let valid = Expr::app(op, opaque);
+    let equations = [(Expr::mvar(target.clone()), valid.clone())];
+    let before = txn.clone();
+    let polls = Cell::new(0);
+    let report = txn
+        .unify_many_with(&equations, budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(txn.mvars.get_assigned_expr(&target), Some(&valid));
+    for stop in 0..polls.get() {
+        let mut cancelled = before.clone();
+        let reached = Cell::new(0);
+        assert!(matches!(
+            cancelled.unify_many_with(&equations, budget(), &|| {
+                let current = reached.get();
+                reached.set(current + 1);
+                current >= stop
+            }),
+            Err(UnificationError::Cancelled)
+        ));
+        unchanged(&cancelled, &before);
+    }
 }

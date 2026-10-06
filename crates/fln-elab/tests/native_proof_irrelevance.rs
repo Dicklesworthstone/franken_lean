@@ -10,6 +10,9 @@ use fln_elab::constraint::unify::{UnificationBudget, UnificationError, Unificati
 use fln_elab::mvar::MetavarKind;
 use fln_elab::seed::bootstrap_nat_environment;
 use fln_elab::txn::ElabTxn;
+use fln_env::constants::{
+    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+};
 use fln_kernel::verdict::Budget;
 
 fn name(s: &str) -> Name {
@@ -72,6 +75,114 @@ fn unchanged(tx: &ElabTxn, before: &ElabTxn) {
     assert_eq!(tx.constraints, before.constraints);
     assert_eq!(tx.seed, before.seed);
     assert_eq!(tx.options, before.options);
+}
+
+fn checked_constant(tx: &mut ElabTxn, declaration: fln_kernel::Declaration) {
+    assert!(matches!(
+        fln_kernel::check(&tx.env, &declaration, budget().kernel),
+        Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+    ));
+    let info = match declaration {
+        fln_kernel::Declaration::Axiom(value) => ConstantInfo::Axiom(value),
+        fln_kernel::Declaration::Defn(value) => ConstantInfo::Defn(value),
+        _ => unreachable!("this helper only installs checked axioms and definitions"),
+    };
+    tx.env = tx.env.add_decl(info).unwrap();
+}
+
+fn opaque_alias(tx: &mut ElabTxn, alias: &str, type_: Expr, value: Expr) -> Expr {
+    let declaration = name(alias);
+    checked_constant(
+        tx,
+        fln_kernel::Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: declaration.clone(),
+                level_params: vec![],
+                type_,
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![declaration.clone()],
+        }),
+    );
+    tx.env = fln_elab::reducibility::register(
+        &tx.env,
+        &declaration,
+        fln_elab::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    Expr::const_(declaration, vec![])
+}
+
+#[test]
+fn proof_irrelevance_preserves_closed_proposition_transparency_and_batch_atomicity() {
+    let mut tx = txn();
+    checked_constant(
+        &mut tx,
+        fln_kernel::Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: name("ClosedP"),
+                level_params: vec![],
+                type_: prop(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let p = Expr::const_(name("ClosedP"), vec![]);
+    let hidden = opaque_alias(&mut tx, "HiddenP", prop(), p.clone());
+    let h = local(&mut tx, "hiddenProof", hidden.clone());
+    let same = local(&mut tx, "anotherHiddenProof", hidden);
+    let k = local(&mut tx, "visibleProof", p);
+    let first = hole(&mut tx, "beforeFailure", nat(), MetavarKind::Natural);
+    let before = tx.clone();
+    let mut default = budget();
+    default.transparency = UnificationTransparency::Default;
+    for (left, right) in [(&h, &k), (&k, &h)] {
+        assert!(matches!(
+            tx.unify_many_with(
+                &[
+                    (Expr::mvar(first.clone()), num(9)),
+                    (left.clone(), right.clone())
+                ],
+                default,
+                &|| false,
+            ),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&tx, &before);
+    }
+    tx.unify(&h, &same, default).unwrap();
+    let mut all = default;
+    all.transparency = UnificationTransparency::SafeDefinitions;
+    tx.unify(&h, &k, all).unwrap();
+    unchanged(&tx, &before);
+}
+
+#[test]
+fn proof_lambda_type_inference_preserves_opaque_domains() {
+    let mut tx = txn();
+    let hidden = opaque_alias(&mut tx, "HiddenCarrier", Expr::sort(Level::one()), nat());
+    let p = local(&mut tx, "P", prop());
+    let h = local(&mut tx, "h", p.clone());
+    let function = local(&mut tx, "hiddenFunction", pi(hidden.clone(), p));
+    let exposed = lam(nat(), h.clone());
+    let retained = lam(hidden, h);
+    let before = tx.clone();
+    let mut default = budget();
+    default.transparency = UnificationTransparency::Default;
+    for (left, right) in [(&function, &exposed), (&exposed, &function)] {
+        assert!(matches!(
+            tx.unify(left, right, default),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&tx, &before);
+    }
+    tx.unify(&function, &retained, default).unwrap();
+    let mut all = default;
+    all.transparency = UnificationTransparency::SafeDefinitions;
+    tx.unify(&function, &exposed, all).unwrap();
+    unchanged(&tx, &before);
 }
 
 #[test]
@@ -197,7 +308,7 @@ fn later_assignments_reawaken_proof_comparison() {
         .unwrap();
     assert_eq!(tx.mvars.get_assigned_expr(&goal), Some(&h));
     assert_eq!(report.expression_assignments, vec![goal]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 3);
 }
 
 #[test]
@@ -310,7 +421,7 @@ fn missing_indices_are_inferred_from_proof_types_in_both_orientations() {
         assert_eq!(report.expression_assignments, vec![index.clone()]);
         assert_eq!(tx.mvars.get_assigned_expr(&index), Some(&num(7)));
         assert_eq!(
-            report.kernel_checks, 2,
+            report.kernel_checks, 3,
             "proof pair and inferred index are both checked"
         );
         assert_eq!(tx.env, env);
@@ -342,7 +453,7 @@ fn proof_types_drive_miller_pattern_inference_without_capturing_locals() {
     assert_eq!(report.expression_assignments, vec![function.clone()]);
     let assigned = tx.mvars.get_assigned_expr(&function).unwrap();
     assert!(!assigned.has_expr_mvar() && !assigned.has_loose_bvars());
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 3);
     // Function binder names are intentionally fresh, so compare by computation.
     tx.unify(&Expr::app(assigned.clone(), num(29)), &num(29), budget())
         .unwrap();
@@ -367,7 +478,7 @@ fn quantified_proof_types_infer_indices_under_a_shared_telescope() {
     let k = local(&mut tx, "k", k_type);
     let report = tx.unify(&h, &k, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![function.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 3);
     let assigned = tx.mvars.get_assigned_expr(&function).unwrap().clone();
     tx.unify(&Expr::app(assigned, num(13)), &num(13), budget())
         .unwrap();
@@ -506,7 +617,7 @@ fn final_barrier_cancellation_rolls_back_inferred_proof_indices() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 3);
     let stop = polls.get();
     let polls = Cell::new(0);
     let mut cancelled = initial.clone();

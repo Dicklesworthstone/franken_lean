@@ -90,7 +90,7 @@ fn beta_arguments_infer_a_kernel_checked_function_in_both_orientations() {
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.expression_assignments, vec![f.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert!(report.residual_metavariables.is_empty());
         assert!(!txn.mvars.get_assigned_expr(&f).unwrap().has_fvar());
         txn.unify(&Expr::app(Expr::mvar(f), number(37)), &number(37), budget())
@@ -132,7 +132,7 @@ fn local_let_arguments_obey_the_callers_zeta_delta_policy() {
         );
         if unfold {
             let report = result.unwrap();
-            assert_eq!(report.kernel_checks, 1);
+            assert_eq!(report.kernel_checks, 2);
             txn.unify(&Expr::app(Expr::mvar(f), number(8)), &number(8), budget())
                 .unwrap();
         } else {
@@ -161,7 +161,7 @@ fn dependent_pattern_domains_use_the_normalized_arguments() {
         ],
     );
     let report = txn.unify(&left, &x, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
     txn.unify(
         &app(Expr::mvar(f), &[nat(), number(19)]),
@@ -192,7 +192,7 @@ fn argument_order_is_preserved_when_rebuilding_the_spine() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     txn.unify(
         &app(Expr::mvar(f), &[number(7), number(9)]),
         &number(9),
@@ -350,7 +350,7 @@ fn successful_existing_patterns_get_first_choice_before_let_unfolding() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     txn.unify(
         &app(Expr::mvar(f), &[number(7), number(9)]),
         &number(7),
@@ -387,7 +387,7 @@ fn normalized_same_head_pruning_replays_the_original_equation() {
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.expression_assignments, vec![f.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
         assert!(!txn.mvars.is_assigned(&residual));
@@ -430,7 +430,7 @@ fn distinct_heads_share_the_normalized_intersection_in_each_argument_order() {
             (left, right)
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(report.expression_assignments.len(), 2);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
@@ -480,7 +480,7 @@ fn normalized_dependent_pruning_does_not_invent_an_inhabitant() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(report.residual_metavariables.len(), 1);
     let residual = report.residual_metavariables[0].clone();
     assert!(!txn.mvars.is_assigned(&residual));

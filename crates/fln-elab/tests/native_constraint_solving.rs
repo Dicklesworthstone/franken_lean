@@ -84,7 +84,7 @@ fn mixed_batches_infer_types_and_publish_only_selected_rows() {
             .solve_constraints_with(&selected, budget(), &|| false)
             .unwrap();
         assert_eq!(report.solved, vec![typing, equation]);
-        assert_eq!(report.unification.kernel_checks, 3);
+        assert_eq!(report.unification.kernel_checks, 6);
         assert_eq!(tx.mvars.get_assigned_expr(&ty), Some(&nat()));
         assert_eq!(tx.mvars.get_assigned_expr(&n), Some(&lit(4)));
         assert_eq!(
@@ -115,7 +115,7 @@ fn a_closed_expected_type_can_infer_an_open_values_declared_type() {
     assert_eq!(tx.mvars.get_assigned_expr(&ty), Some(&nat()));
     assert!(!tx.mvars.is_assigned(&value));
     assert_eq!(report.unification.residual_metavariables, vec![value]);
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
     assert_eq!(tx.mvars.len(), 2);
 }
 
@@ -137,7 +137,7 @@ fn checking_a_proof_holes_type_never_solves_the_proof() {
     assert_eq!(tx.mvars, before_mvars);
     assert_eq!(report.unification.residual_metavariables, vec![proof]);
     assert!(report.unification.expression_assignments.is_empty());
-    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(report.unification.kernel_checks, 2);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn structured_typing_and_chained_type_discoveries_use_the_same_worklist() {
         );
         assert!(report.unification.residual_metavariables.is_empty());
         assert_eq!(tx.lctx.len(), 1);
-        assert_eq!(report.unification.kernel_checks, 4);
+        assert_eq!(report.unification.kernel_checks, 8);
     }
 }
 
@@ -384,7 +384,7 @@ fn dependent_local_types_and_let_values_are_closed_without_escaping() {
         .unwrap();
     assert_eq!(tx.lctx, before_locals);
     assert!(tx.mvars.is_empty());
-    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(report.unification.kernel_checks, 2);
     let invalid = has_type(&mut tx, Expr::fvar(FVarId(name("not_in_scope"))), nat());
     let before = tx.clone();
     assert!(
@@ -450,7 +450,7 @@ fn delayed_assignment_abstracts_dependent_locals_and_replays_the_relation() {
         report.unification.expression_assignments,
         vec![function.clone()]
     );
-    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(report.unification.kernel_checks, 2);
     assert_eq!(tx.lctx, before_context);
     assert_eq!(tx.mvars.len(), 1);
     tx.unify(
@@ -484,7 +484,7 @@ fn typing_progress_revives_a_delayed_assignment_with_unknown_function_type() {
             .unwrap();
         assert_eq!(tx.mvars.get_assigned_expr(&ty), Some(&pi(nat(), nat())));
         assert!(tx.mvars.is_assigned(&function));
-        assert_eq!(report.unification.kernel_checks, 3);
+        assert_eq!(report.unification.kernel_checks, 6);
         assert!(report.unification.residual_metavariables.is_empty());
         tx.unify(&Expr::app(Expr::mvar(function), x.clone()), &x, budget())
             .unwrap();
@@ -511,7 +511,7 @@ fn delayed_values_wait_for_resolution_instead_of_assigning_the_wrong_hole() {
         .solve_constraints_with(&[row, solution], budget(), &|| false)
         .unwrap();
     assert_eq!(tx.mvars.get_assigned_expr(&outer), Some(&lit(9)));
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn preexisting_delayed_targets_are_checked_not_overwritten_or_trusted() {
             unchanged(&tx, &before);
         } else {
             let report = result.unwrap();
-            assert_eq!(report.unification.kernel_checks, 1);
+            assert_eq!(report.unification.kernel_checks, 2);
             assert!(report.unification.expression_assignments.is_empty());
             assert_eq!(tx.mvars, before.mvars);
         }

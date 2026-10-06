@@ -153,7 +153,7 @@ fn an_assignment_exposed_by_iota_still_passes_k1() {
     let env = txn.env.clone();
     let report = txn.unify(&expr, &constant("Bool.true"), budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![id.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         txn.mvars.get_assigned_expr(&id),
         Some(&constant("Bool.true"))
@@ -177,7 +177,7 @@ fn a_later_equation_wakes_a_blocked_recursor_major() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![id]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn cancellation_discards_speculative_assignments_but_keeps_spent_work() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let stop = polls.get();
     let calls = Cell::new(0_u64);
     let mut cancelled = initial.clone();
@@ -680,7 +680,7 @@ fn mutual_iota_exposes_result_holes_to_checked_assignment() {
         tx.mvars.get_assigned_expr(&id),
         Some(&constant("Bool.true"))
     );
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -716,7 +716,7 @@ fn mutual_iota_retries_when_a_later_equation_assigns_the_major() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![id.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         tx.mvars.get_assigned_expr(&id),
         Some(&constant("Even.zero"))

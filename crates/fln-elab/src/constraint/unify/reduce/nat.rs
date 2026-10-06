@@ -1,10 +1,13 @@
-//! Closed Nat computation for the ordinary term-conversion path.
+//! Nat computation and compact symbolic offsets for ordinary term conversion.
 //!
 //! The operation set and closed-operand rule come from the pinned
 //! `Lean/Meta/WHNF.lean` (`withNatValue`, `reduceNat?`) and
 //! `Lean/Meta/ExprDefEq.lean` (`isDefEqNat`). Operand evaluation uses the
 //! parent's heap continuations, never recursive host calls. All allocations
 //! and arithmetic work are bounded before entering the owned bignum routines.
+//! Symbolic offsets follow `Lean/Meta/Offset.lean`: peel `succ` and additions
+//! with known right operands, then cancel the common offset before comparing
+//! bases. An opaque base is never unfolded merely to collect an offset.
 
 use super::*;
 use fln_bignum::nat::{BigNat, BigNatView};
@@ -27,6 +30,31 @@ pub(super) enum NatOperation {
     Xor,
     ShiftLeft,
     ShiftRight,
+}
+
+struct NatOffset {
+    base: Expr,
+    value: NatLit,
+    found: bool,
+    literal: bool,
+}
+
+fn has_offset_head(expression: &Expr) -> bool {
+    let ExprNode::App { f, .. } = expression.node() else {
+        return false;
+    };
+    let (head, arity) = match f.node() {
+        ExprNode::App { f, .. } => (f, 2),
+        _ => (f, 1),
+    };
+    let ExprNode::Const { name, levels } = head.node() else {
+        return false;
+    };
+    levels.is_empty()
+        && matches!(
+            (NatOperation::from_name(name), arity),
+            (Some(NatOperation::Succ), 1) | (Some(NatOperation::Add), 2)
+        )
 }
 
 impl NatOperation {
@@ -117,6 +145,25 @@ impl Engine<'_> {
         head: &Expr,
         arguments: &mut [Expr],
     ) -> Result<Option<NatOperation>, UnificationError> {
+        let Some(operation) = self.nat_operation_kind(head, arguments.len())? else {
+            return Ok(None);
+        };
+        for argument in arguments {
+            if argument.has_expr_mvar() || argument.has_level_mvar() {
+                *argument = self.instantiate(argument)?;
+            }
+            if argument.has_expr_mvar() || argument.has_level_mvar() || argument.has_fvar() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(operation))
+    }
+
+    fn nat_operation_kind(
+        &mut self,
+        head: &Expr,
+        arity: usize,
+    ) -> Result<Option<NatOperation>, UnificationError> {
         // Keep the instance-selection and abbreviation-only approximation
         // unchanged. Ordinary source inference retries at Default explicitly.
         if !matches!(
@@ -131,7 +178,7 @@ impl Engine<'_> {
         let Some(operation) = NatOperation::from_name(name) else {
             return Ok(None);
         };
-        if !levels.is_empty() || arguments.len() != operation.arity() || !self.has_nat_literals()? {
+        if !levels.is_empty() || arity != operation.arity() || !self.has_nat_literals()? {
             return Ok(None);
         }
         let Some(info) = self.work.env.find(name) else {
@@ -181,15 +228,179 @@ impl Engine<'_> {
                 }
             }
         }
-        for argument in arguments {
-            if argument.has_expr_mvar() || argument.has_level_mvar() {
-                *argument = self.instantiate(argument)?;
-            }
-            if argument.has_expr_mvar() || argument.has_level_mvar() || argument.has_fvar() {
-                return Ok(None);
-            }
-        }
         Ok(Some(operation))
+    }
+
+    /// A single iteration peels one offset constructor. Closed right operands
+    /// use the existing heap-based evaluator; it never calls this collector.
+    fn nat_offset(
+        &mut self,
+        expression: &Expr,
+        locals: &LocalContext,
+    ) -> Result<NatOffset, UnificationError> {
+        let mut base = if expression.has_expr_mvar() || expression.has_level_mvar() {
+            self.instantiate(expression)?
+        } else {
+            expression.clone()
+        };
+        let mut value = NatLit::from_u64(0);
+        let mut found = false;
+        loop {
+            self.meter.node()?;
+            if let ExprNode::MData { expr, .. } = base.node() {
+                base = expr.clone();
+                continue;
+            }
+            let ExprNode::App { f, a } = base.node() else {
+                break;
+            };
+            let (next, increment) = if let ExprNode::App { f: head, a: left } = f.node() {
+                if !matches!(self.nat_operation_kind(head, 2)?, Some(NatOperation::Add))
+                    || a.has_expr_mvar()
+                    || a.has_level_mvar()
+                    || a.has_fvar()
+                {
+                    break;
+                }
+                let right = self.whnf(a, locals)?;
+                let Some(increment) = self.nat_operand(&right)? else {
+                    break;
+                };
+                (left.clone(), increment)
+            } else if matches!(self.nat_operation_kind(f, 1)?, Some(NatOperation::Succ)) {
+                (a.clone(), NatLit::from_u64(1))
+            } else {
+                break;
+            };
+            value = self.combine_nat_offsets(&value, &increment, false)?;
+            base = next;
+            found = true;
+        }
+        let literal = self.nat_operand(&base)?;
+        let is_literal = literal.is_some();
+        if let Some(literal) = literal {
+            value = self.combine_nat_offsets(&value, &literal, false)?;
+            base = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+        }
+        Ok(NatOffset {
+            base,
+            value,
+            found,
+            literal: is_literal,
+        })
+    }
+
+    fn combine_nat_offsets(
+        &mut self,
+        left: &NatLit,
+        right: &NatLit,
+        subtract: bool,
+    ) -> Result<NatLit, UnificationError> {
+        // Charge the arithmetic, owned result and literal copy before any of
+        // their proportional allocations. Offsets never expand to unary terms.
+        let width = (left.limbs_le().len() as u128)
+            .saturating_add(right.limbs_le().len() as u128)
+            .saturating_add(1);
+        self.charge_nat_work(width.saturating_mul(3))?;
+        let left = BigNatView::from_limbs_le(left.limbs_le());
+        let right = BigNatView::from_limbs_le(right.limbs_le());
+        let result = if subtract {
+            left.sub(right)
+        } else {
+            left.add(right)
+        };
+        Ok(fln_bignum::interop::literal_from_bignat(&result))
+    }
+
+    fn make_nat_offset(&mut self, base: Expr, value: &NatLit) -> Result<Expr, UnificationError> {
+        self.meter.node()?;
+        if BigNatView::from_limbs_le(value.limbs_le()).is_zero() {
+            return Ok(base);
+        }
+        if let Some(literal) = self.nat_operand(&base)? {
+            return Ok(Expr::lit(Literal::Nat(
+                self.combine_nat_offsets(&literal, value, false)?,
+            )));
+        }
+        for _ in 0..3 {
+            self.meter.node()?;
+        }
+        Ok(Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Nat", "add"]), Vec::new()),
+                base,
+            ),
+            Expr::lit(Literal::Nat(value.clone())),
+        ))
+    }
+
+    pub(in crate::constraint::unify) fn nat_offset_equation(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<(Expr, Expr)>, UnificationError> {
+        if !has_offset_head(left) && !has_offset_head(right) {
+            return Ok(None);
+        }
+        // The reconstructed compact form itself uses Nat.add. Require its
+        // complete operation signature and the actual Nat constructor laws.
+        let add = Expr::const_(Name::from_components(["Nat", "add"]), Vec::new());
+        if !matches!(self.nat_operation_kind(&add, 2)?, Some(NatOperation::Add)) {
+            return Ok(None);
+        }
+        let lhs = self.nat_offset(left, locals)?;
+        let rhs = self.nat_offset(right, locals)?;
+        if !lhs.found && !rhs.found {
+            return Ok(None);
+        }
+        // The pin cancels against another offset or a literal. A positive
+        // one-sided offset against a bare symbolic term gives no new equation.
+        // In particular, rewriting n = succ n to n = n+1 would cycle with delta
+        // on Nat.add. A zero offset may always remove its redundant wrapper.
+        if (lhs.found
+            && !rhs.found
+            && !rhs.literal
+            && !BigNatView::from_limbs_le(lhs.value.limbs_le()).is_zero())
+            || (rhs.found
+                && !lhs.found
+                && !lhs.literal
+                && !BigNatView::from_limbs_le(rhs.value.limbs_le()).is_zero())
+        {
+            return Ok(None);
+        }
+        self.charge_nat_work(
+            (lhs.value.limbs_le().len() as u128)
+                .saturating_add(rhs.value.limbs_le().len() as u128)
+                .saturating_add(1),
+        )?;
+        let ordering = lhs.value.cmp(&rhs.value);
+        // An offset cannot equal a smaller literal (Offset.lean:143–146,
+        // 153–156). Refuse directly: rebuilding x+1=0 would cycle when delta
+        // exposes succ x and the next offset pass puts the addition back.
+        if (lhs.found && rhs.literal && ordering == std::cmp::Ordering::Greater)
+            || (rhs.found && lhs.literal && ordering == std::cmp::Ordering::Less)
+        {
+            return Err(UnificationError::Deferred(
+                UnificationDeferred::UnsupportedEquation,
+            ));
+        }
+        let (new_left, new_right) = if ordering != std::cmp::Ordering::Greater {
+            let difference = self.combine_nat_offsets(&rhs.value, &lhs.value, true)?;
+            (lhs.base, self.make_nat_offset(rhs.base, &difference)?)
+        } else {
+            let difference = self.combine_nat_offsets(&lhs.value, &rhs.value, true)?;
+            (self.make_nat_offset(lhs.base, &difference)?, rhs.base)
+        };
+        // One-sided already canonical offsets make no progress. Returning the
+        // same equation would turn a rigid mismatch into an exhaustion loop.
+        if same_terms(left, &new_left, &mut self.meter)?
+            && same_terms(right, &new_right, &mut self.meter)?
+        {
+            Ok(None)
+        } else {
+            Ok(Some((new_left, new_right)))
+        }
     }
 
     pub(super) fn nat_operand(&mut self, expr: &Expr) -> Result<Option<NatLit>, UnificationError> {

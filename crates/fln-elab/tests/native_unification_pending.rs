@@ -126,7 +126,7 @@ fn a_stuck_hole_is_synthesized_from_the_batchs_own_progress_and_the_batch_comple
     assert_eq!(txn.mvars.get_assigned_expr(&input), Some(&numeral(5)));
     assert_eq!(txn.mvars.get_assigned_expr(&instance), Some(&numeral(5)));
     // Both assignments crossed K1, the owner's answer included.
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
 }
 
 #[test]

@@ -149,14 +149,6 @@ impl Engine<'_> {
                             head = operand;
                             continue;
                         }
-                        // The pin's `instances` transparency also unfolds what its
-                        // reducibility status marks `reducible` or `implicitReducible`.
-                        let status_unfolds = self.budget.transparency
-                            == UnificationTransparency::Instances
-                            && crate::reducibility::table(&self.work.env)
-                                .map_err(UnificationError::Reducibility)?
-                                .status(name)
-                                .unfolds_at_instances();
                         match self.work.env.find(name) {
                             Some(ConstantInfo::Defn(definition))
                                 if definition.safety == DefinitionSafety::Safe
@@ -165,11 +157,22 @@ impl Engine<'_> {
                                     && match self.budget.transparency {
                                         UnificationTransparency::None => false,
                                         UnificationTransparency::Abbreviations => {
-                                            definition.hints == ReducibilityHints::Abbrev
+                                            crate::reducibility::table(&self.work.env)
+                                                .map_err(UnificationError::Reducibility)?
+                                                .get(name)
+                                                .map_or(
+                                                    definition.hints == ReducibilityHints::Abbrev,
+                                                    |status| status == crate::reducibility::Reducibility::Reducible,
+                                                )
                                         }
                                         UnificationTransparency::Instances => {
-                                            definition.hints == ReducibilityHints::Abbrev
-                                                || status_unfolds
+                                            crate::reducibility::table(&self.work.env)
+                                                .map_err(UnificationError::Reducibility)?
+                                                .get(name)
+                                                .map_or(
+                                                    definition.hints == ReducibilityHints::Abbrev,
+                                                    crate::reducibility::Reducibility::unfolds_at_instances,
+                                                )
                                         }
                                         UnificationTransparency::Default => {
                                             crate::reducibility::table(&self.work.env)

@@ -978,6 +978,10 @@ impl Engine<'_> {
         if self.proof_irrelevance(&left, &right, locals, pending)? {
             return Ok(());
         }
+        if let Some((left, right)) = self.nat_offset_equation(&left, &right, locals)? {
+            pending.push_front((left, right, locals.clone()));
+            return Ok(());
+        }
         if let Some((left, right)) = self.lazy_delta(&left, &right)? {
             pending.push_front((left, right, locals.clone()));
             return Ok(());
@@ -1427,6 +1431,15 @@ impl Engine<'_> {
         let outcome = check(&self.work.env, &candidate, self.budget.kernel);
         match &outcome {
             Outcome::Complete(Verdict::Accepted { .. }) => {
+                let Declaration::Defn(candidate) = &candidate else {
+                    unreachable!("assignment validation builds a definition");
+                };
+                self.check_assignment_type_conversion(
+                    target,
+                    &candidate.value,
+                    &candidate.base.type_,
+                    &candidate.base.level_params,
+                )?;
                 for residual in residuals {
                     if !self.residuals.contains(&residual) {
                         self.residuals.push(residual);

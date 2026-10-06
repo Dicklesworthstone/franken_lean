@@ -36,6 +36,54 @@ enum TypeFrame {
 }
 
 impl Engine<'_> {
+    /// Keep the ordinary K1 typing verdict, then check the assignment's type
+    /// conversion at the pin's inference transparency. The pinned default for
+    /// `respectTransparency.types` is false, so `checkTypesAndAssign` uses
+    /// `withInferTypeConfig`: at least Default, including local let reduction.
+    /// This runs on the original, closed conditional obligation, before any
+    /// assignment or residual can be published.
+    pub(super) fn check_assignment_type_conversion(
+        &mut self,
+        target: &ValidationTarget,
+        value: &Expr,
+        expected: &Expr,
+        parameters: &[Name],
+    ) -> Result<(), UnificationError> {
+        // Even equal inferred result types cannot skip this query: a term's
+        // internal applications and annotations may require forbidden delta.
+        // Native type hints deliberately do not validate those arguments.
+        let reducibility =
+            crate::reducibility::table(&self.work.env).map_err(UnificationError::Reducibility)?;
+        let unrestricted = std::collections::BTreeSet::new();
+        let opaque_definitions =
+            if self.budget.transparency == UnificationTransparency::SafeDefinitions {
+                &unrestricted
+            } else {
+                reducibility.opaque_definitions()
+            };
+        self.meter.tick()?;
+        self.kernel_checks += 1;
+        match fln_kernel::check_type_with_unfolding(
+            &self.work.env,
+            parameters,
+            value,
+            expected,
+            self.budget.kernel,
+            fln_kernel::DefEqUnfolding {
+                opaque_definitions,
+                unfold_theorems: false,
+            },
+        ) {
+            Outcome::Complete(Verdict::Accepted { .. }) => self.meter.tick(),
+            Outcome::Complete(Verdict::Rejected { .. }) => {
+                Err(UnificationError::Deferred(target.unresolved()))
+            }
+            outcome => Err(UnificationError::ConversionCheck {
+                outcome: Box::new(outcome),
+            }),
+        }
+    }
+
     pub(super) fn assignment_type_equation(
         &mut self,
         expected: &Expr,
@@ -119,7 +167,7 @@ impl Engine<'_> {
     /// arguments, and zeta/beta hints may discard subterms. The original assigned
     /// value and the inferred type still pass the ordinary K1 barrier together.
     /// No new declaration, local-context mutation or hole assignment occurs here.
-    fn assignment_value_type(
+    pub(super) fn assignment_value_type(
         &mut self,
         value: &Expr,
         locals: &LocalContext,

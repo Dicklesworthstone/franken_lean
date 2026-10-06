@@ -20,7 +20,8 @@ impl Engine<'_> {
         // Neutral synthesis is a hint; the final guard still checks BOTH original
         // proofs. In particular, synthesizing an application type does not prove
         // that its arguments are well-typed.
-        let left_type = self.eta_neutral_type(left, locals)?;
+        let mut left_type = self.eta_neutral_type(left, locals)?;
+        let left_neutral = left_type.is_some();
         // A known non-proof type rules this rung out. In particular, do not
         // reconstruct the other side's entire recursor telescope for each
         // impossible rewrite occurrence. The final guard is unchanged for
@@ -30,34 +31,53 @@ impl Engine<'_> {
         {
             return Ok(false);
         }
-        let right_type = self.eta_neutral_type(right, locals)?;
-        let Some(proposition) = left_type.as_ref().or(right_type.as_ref()) else {
+        let mut right_type = self.eta_neutral_type(right, locals)?;
+        if left_type.is_none() {
+            let Some(right_type) = &right_type else {
+                return Ok(false);
+            };
+            if !self.proof_type_is_prop(right_type, locals)? {
+                return Ok(false);
+            }
+        }
+        // A proof lambda has no neutral type hint. Infer its actual telescope
+        // before using K1 as a guard; borrowing the other proof's type would
+        // let unrestricted kernel conversion hide a forbidden opaque domain.
+        if left_type.is_none() {
+            left_type = self.assignment_value_type(left, locals)?;
+        }
+        if right_type.is_none() {
+            right_type = self.assignment_value_type(right, locals)?;
+        }
+        let (Some(proposition), Some(_)) = (left_type.as_ref(), right_type.as_ref()) else {
             return Ok(false);
         };
         // A Pi can itself be a proposition by impredicativity. Opening its
         // codomain also lets type-directed inference work below dependent binders.
-        if left_type.is_none() && !self.proof_type_is_prop(proposition, locals)? {
+        if !left_neutral && !self.proof_type_is_prop(proposition, locals)? {
             return Ok(false);
         }
+        let mut closed_type_equation = None;
         if let (Some(left_type), Some(right_type)) = (&left_type, &right_type) {
             let left_type = self.instantiate(left_type)?;
             let right_type = self.instantiate(right_type)?;
-            if (left_type.has_expr_mvar()
-                || left_type.has_level_mvar()
-                || right_type.has_expr_mvar()
-                || right_type.has_level_mvar())
-                && !same_terms(&left_type, &right_type, &mut self.meter)?
-                && self.proof_type_is_prop(&right_type, locals)?
-            {
-                // Generate an ordinary equation, NOT a successful proof verdict.
-                // The original proof pair is postponed by the outer worklist and
-                // must return through check_proof_pair after assignments advance.
-                // If no generation advances, the normal fixed-point rule defers;
-                // there is no recursively re-entered solver or unbounded retry.
-                pending.push_front((left_type, right_type, locals.clone()));
-                return Err(UnificationError::Deferred(
-                    UnificationDeferred::UnsupportedEquation,
-                ));
+            if !same_terms(&left_type, &right_type, &mut self.meter)? {
+                if !self.proof_type_is_prop(&right_type, locals)? {
+                    return Ok(false);
+                }
+                if left_type.has_expr_mvar()
+                    || left_type.has_level_mvar()
+                    || right_type.has_expr_mvar()
+                    || right_type.has_level_mvar()
+                {
+                    // The original proof pair must return through the guard
+                    // after assignments advance; no unresolved proof disappears.
+                    pending.push_front((left_type, right_type, locals.clone()));
+                    return Err(UnificationError::Deferred(
+                        UnificationDeferred::UnsupportedEquation,
+                    ));
+                }
+                closed_type_equation = Some((left_type, right_type, locals.clone()));
             }
         }
         let proposition = self.instantiate(proposition)?;
@@ -70,7 +90,14 @@ impl Engine<'_> {
             // Type inference cannot erase a residual proof obligation.
             return Ok(false);
         }
-        self.check_proof_pair(proposition, left, right, locals)
+        let checked = self.check_proof_pair(proposition, left, right, locals)?;
+        if checked && let Some(equation) = closed_type_equation {
+            // K1 validates both original proofs but has broader delta rules.
+            // Publication also requires their types to compare at the caller's
+            // transparency, through the same transactional worklist.
+            pending.push_front(equation);
+        }
+        Ok(checked)
     }
 
     /// A metered selection hint, never a typing judgment. A definite Prop result

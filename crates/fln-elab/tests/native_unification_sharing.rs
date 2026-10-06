@@ -102,7 +102,7 @@ fn syntax_fact_reuse_does_not_freeze_a_metavariable_interpretation() {
             )
             .unwrap();
         assert_eq!(report.expression_assignments, vec![id.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&value));
         assert!(application.has_expr_mvar(), "input syntax is immutable");
         assert!(!txn.instantiate_expr(&application).unwrap().has_expr_mvar());

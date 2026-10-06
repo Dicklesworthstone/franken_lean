@@ -150,7 +150,7 @@ fn same_head_occurs_candidate_waits_for_a_later_function_assignment() {
                     .unify_many_with(&equations, budget(), &|| false)
                     .unwrap();
                 assert_eq!(report.expression_assignments, vec![f.clone()]);
-                assert_eq!(report.kernel_checks, 1);
+                assert_eq!(report.kernel_checks, 2);
                 assert!(report.residual_metavariables.is_empty());
                 assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&constant(9)));
                 assert_eq!(txn.env, env);
@@ -185,7 +185,7 @@ fn distinct_flexible_heads_do_not_force_distinct_arguments_equal() {
             let env = txn.env.clone();
             let report = txn.unify_many_with(&selected, budget(), &|| false).unwrap();
             assert_eq!(report.expression_assignments.len(), 2);
-            assert_eq!(report.kernel_checks, 2);
+            assert_eq!(report.kernel_checks, 4);
             assert!(report.residual_metavariables.is_empty());
             assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&constant(7)));
             assert_eq!(txn.mvars.get_assigned_expr(&g), Some(&constant(7)));
@@ -215,7 +215,7 @@ fn a_flexible_head_is_not_prematurely_assigned_the_rigid_head() {
             let report = txn
                 .unify_many_with(&equations, budget(), &|| false)
                 .unwrap();
-            assert_eq!(report.kernel_checks, 2);
+            assert_eq!(report.kernel_checks, 4);
             assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&constant(4)));
             assert_eq!(txn.mvars.get_assigned_expr(&n), Some(&numeral(3)));
         }
@@ -266,7 +266,7 @@ fn nested_constructors_resume_after_flexible_head_assignment() {
                 false
             })
             .unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(txn.mvars.get_assigned_expr(&n), Some(&numeral(7)));
         assert_eq!(txn.env, env);
     }
@@ -359,7 +359,7 @@ fn queued_flexible_equations_retry_without_losing_queue_authority() {
         .solve_defeq_constraints_with(&[ids[2], ids[0], ids[1], ids[0]], budget(), &|| false)
         .unwrap();
     assert_eq!(report.solved, ids);
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
     assert!(txn.constraints.constraints().is_empty());
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&constant(7)));
     assert_eq!(txn.mvars.get_assigned_expr(&g), Some(&constant(7)));
@@ -486,7 +486,7 @@ fn rigid_congruence_and_valid_miller_patterns_still_assign() {
         .unify(&Expr::app(Expr::mvar(f.clone()), x.clone()), &x, budget())
         .unwrap();
     assert_eq!(report.expression_assignments, vec![f]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
 }
 

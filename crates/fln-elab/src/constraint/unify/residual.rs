@@ -443,7 +443,7 @@ mod tests {
             .unify(&Expr::mvar(a.clone()), &Expr::mvar(b.clone()), budget())
             .unwrap();
         assert_eq!(report.residual_metavariables, vec![b.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(
             txn.mvars.get_assigned_expr(&a),
             Some(&Expr::mvar(b.clone()))

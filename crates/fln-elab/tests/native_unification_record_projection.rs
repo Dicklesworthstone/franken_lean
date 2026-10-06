@@ -175,7 +175,7 @@ fn a_singleton_projection_recovers_the_record_in_both_orientations() {
             mk("Box", [constant("Nat"), numeral(7)])
         );
         assert_eq!(report.expression_assignments, vec![r]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert!(report.residual_metavariables.is_empty());
     }
 }
@@ -262,7 +262,7 @@ fn applied_record_holes_are_solved_as_checked_lambda_patterns() {
         BinderInfo::Default,
     );
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&expected));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
 }
 
@@ -289,7 +289,7 @@ fn dependent_receiver_parameters_are_substituted_before_inversion() {
     let receiver = apply(Expr::mvar(f.clone()), [a_type, a.clone()]);
     let report = txn.unify(&proj("Box", 0, &receiver), &a, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![f.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let assigned = txn.mvars.get_assigned_expr(&f).unwrap();
     assert!(!assigned.has_fvar());
     assert!(!assigned.has_expr_mvar());
@@ -409,7 +409,7 @@ fn exhaustion_and_final_cancellation_leave_no_partial_reconstruction() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let mut step_limit = budget();
     step_limit.max_steps = report.unifier_steps - 1;
     let mut node_limit = budget();

@@ -15,7 +15,7 @@ use fln_env::environment::Environment;
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 const MAGIC: &[u8] = b"FLNREDUC\x01";
@@ -144,6 +144,7 @@ pub fn register(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReducibilityTable {
     statuses: HashMap<Name, Reducibility>,
+    opaque_definitions: BTreeSet<Name>,
 }
 
 impl ReducibilityTable {
@@ -176,6 +177,11 @@ impl ReducibilityTable {
             let status = Reducibility::from_tag(*tag).ok_or(ReducibilityError::Malformed)?;
             if !env.contains(&declaration) {
                 return Err(ReducibilityError::UnknownDeclaration(declaration));
+            }
+            if status == Reducibility::Irreducible {
+                table.opaque_definitions.insert(declaration.clone());
+            } else {
+                table.opaque_definitions.remove(&declaration);
             }
             table.statuses.insert(declaration, status);
         }
@@ -211,6 +217,13 @@ impl ReducibilityTable {
     /// to an instance declared here. `None` is "unknown", not "semireducible".
     pub fn get(&self, declaration: &Name) -> Option<Reducibility> {
         self.statuses.get(declaration).copied()
+    }
+
+    /// The immutable Default-transparency restriction for kernel equality
+    /// queries. Kept with the cached table so each conversion does not rebuild
+    /// the journal's set; a later status overrides membership in either direction.
+    pub(crate) fn opaque_definitions(&self) -> &BTreeSet<Name> {
+        &self.opaque_definitions
     }
 
     pub fn len(&self) -> usize {

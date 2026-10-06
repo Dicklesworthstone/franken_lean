@@ -85,7 +85,7 @@ fn ground_assignment_is_checked_without_publishing_a_declaration() {
         .unify(&Expr::mvar(id.clone()), &numeral(37), budget())
         .unwrap();
     assert_eq!(report.expression_assignments, vec![id.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&numeral(37)));
     assert_eq!(txn.env, env);
 }
@@ -124,7 +124,7 @@ fn a_distinct_local_pattern_synthesizes_a_lambda() {
     let report = txn
         .unify(&Expr::app(Expr::mvar(f.clone()), x.clone()), &x, budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let assignment = txn.mvars.get_assigned_expr(&f).unwrap();
     let ExprNode::Lam {
         body, binder_type, ..
@@ -149,7 +149,7 @@ fn dependent_pattern_rebinds_later_domains_capture_avoidantly() {
     let x = local(&mut txn, "x", a.clone());
     let lhs = Expr::app(Expr::app(Expr::mvar(f.clone()), a), x.clone());
     let report = txn.unify(&lhs, &x, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let assignment = txn.mvars.get_assigned_expr(&f).unwrap();
     let ExprNode::Lam { body, .. } = assignment.node() else {
         panic!("expected outer lambda");
@@ -222,7 +222,7 @@ fn later_equations_resolve_earlier_assignment_typing_dependencies() {
             &|| false,
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(txn.mvars.is_assigned(&type_hole));
     assert!(txn.mvars.is_assigned(&value_hole));
 }
@@ -237,7 +237,7 @@ fn assignment_values_determine_missing_types_without_an_extra_caller_equation() 
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&type_hole), Some(&nat()));
     assert_eq!(txn.mvars.get_assigned_expr(&value_hole), Some(&numeral(1)));
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(report.residual_metavariables.is_empty());
 }
 
@@ -540,7 +540,7 @@ fn function_universes_propagate_into_a_later_type_assignment() {
             &|| false,
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         txn.universes.instantiate(&Level::mvar(u)).unwrap(),
         Level::one()
@@ -645,7 +645,7 @@ fn enormous_nat_index_infers_one_compact_predecessor() {
     let report = txn
         .unify(&successor(Expr::mvar(id.clone())), &huge, budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(report.unifier_steps < 1000);
     assert_eq!(
         txn.mvars.get_assigned_expr(&id),
@@ -744,6 +744,20 @@ fn nat_operation(operation: &str, arguments: &[Expr]) -> Expr {
         Expr::const_(Name::from_components(["Nat", operation]), Vec::new()),
         Expr::app,
     )
+}
+
+fn publish_nat_add_axiom(txn: &mut ElabTxn) {
+    publish_in(
+        txn,
+        fln_kernel::Declaration::Axiom(fln_env::constants::AxiomVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::from_components(["Nat", "add"]),
+                level_params: Vec::new(),
+                type_: pi(nat(), pi(nat(), nat())),
+            },
+            is_unsafe: false,
+        }),
+    );
 }
 
 fn publish_number_definition(txn: &mut ElabTxn, text: &str, value: Expr, height: u32) -> Expr {
@@ -944,7 +958,7 @@ fn nat_computation_keeps_false_equations_scope_and_transactional_rollback() {
         .unwrap();
 
     let mut impostor = transaction();
-    publish_in(&mut impostor, fln_elab::seed::nat_add_seed_declaration());
+    publish_nat_add_axiom(&mut impostor);
     assert!(matches!(
         impostor.unify(
             &nat_operation("add", &[numeral(2), numeral(2)]),
@@ -1034,4 +1048,238 @@ fn nat_computation_bounds_growth_and_uses_heap_operand_continuations() {
         .unify(&nested, &numeral(2_000), default_budget())
         .unwrap();
     assert!(report.unifier_steps < 100_000, "{report:?}");
+}
+
+#[test]
+fn symbolic_nat_offsets_compute_without_opening_opaque_bases() {
+    let mut base = arithmetic_transaction();
+    let variable = local(&mut base, "offsetBase", nat());
+    let opaque = publish_number_definition(&mut base, "opaqueOffsetBase", numeral(4), 1);
+    base.env = fln_elab::reducibility::register(
+        &base.env,
+        &name("opaqueOffsetBase"),
+        fln_elab::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    for term in [variable, opaque.clone()] {
+        for (left, right) in [
+            (
+                nat_operation("add", &[term.clone(), numeral(0)]),
+                term.clone(),
+            ),
+            (
+                nat_operation(
+                    "add",
+                    &[
+                        nat_operation("add", &[term.clone(), numeral(2)]),
+                        numeral(3),
+                    ],
+                ),
+                nat_operation("add", &[term.clone(), numeral(5)]),
+            ),
+            (
+                nat_operation("add", &[term.clone(), numeral(2)]),
+                successor(successor(term.clone())),
+            ),
+        ] {
+            for (left, right) in [(&left, &right), (&right, &left)] {
+                let mut txn = base.clone();
+                let report = txn.unify(left, right, default_budget()).unwrap();
+                assert!(report.expression_assignments.is_empty());
+                assert_semantics_unchanged(&txn, &base);
+            }
+        }
+    }
+    assert!(matches!(
+        base.clone().unify(
+            &nat_operation("add", &[opaque, numeral(2)]),
+            &numeral(6),
+            default_budget()
+        ),
+        Err(UnificationError::Deferred(_)),
+    ));
+}
+
+#[test]
+fn symbolic_nat_constraints_cancel_offsets_before_assigning() {
+    for reverse in [false, true] {
+        for (left_offset, right_offset) in [(2, 3), (2, 2)] {
+            let mut txn = arithmetic_transaction();
+            let base = local(&mut txn, "offsetBase", nat());
+            let id = natural(&mut txn, "offsetUnknown", nat());
+            let left = nat_operation("add", &[Expr::mvar(id.clone()), numeral(left_offset)]);
+            let right = nat_operation("add", &[base.clone(), numeral(right_offset)]);
+            let (left, right) = if reverse {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            let report = txn.unify(&left, &right, default_budget()).unwrap();
+            assert_eq!(report.expression_assignments, std::slice::from_ref(&id));
+            assert_eq!(report.kernel_checks, 2);
+            let expected = if left_offset == right_offset {
+                base
+            } else {
+                nat_operation("add", &[base, numeral(right_offset - left_offset)])
+            };
+            assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&expected));
+        }
+        let mut txn = arithmetic_transaction();
+        let id = natural(&mut txn, "literalOffsetUnknown", nat());
+        let left = nat_operation("add", &[Expr::mvar(id.clone()), numeral(2)]);
+        let right = numeral(5);
+        let (left, right) = if reverse {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        txn.unify(&left, &right, default_budget()).unwrap();
+        assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&numeral(3)));
+    }
+}
+
+#[test]
+fn symbolic_nat_offsets_do_not_identify_different_bases_or_invalid_heads() {
+    let mut base = arithmetic_transaction();
+    let left = local(&mut base, "leftOffsetBase", nat());
+    let right = local(&mut base, "rightOffsetBase", nat());
+    for (left, right) in [
+        (
+            nat_operation("add", &[left.clone(), numeral(2)]),
+            nat_operation("add", &[right, numeral(2)]),
+        ),
+        (
+            nat_operation("add", &[left.clone(), numeral(2)]),
+            nat_operation("add", &[left.clone(), numeral(3)]),
+        ),
+        (
+            nat_operation("add", &[left.clone(), numeral(2)]),
+            numeral(1),
+        ),
+        (successor(left.clone()), numeral(0)),
+        (
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Nat", "add"]), vec![Level::one()]),
+                    left.clone(),
+                ),
+                numeral(0),
+            ),
+            left.clone(),
+        ),
+        (
+            Expr::app(
+                Expr::app(Expr::const_(name("Nat.add"), Vec::new()), left.clone()),
+                numeral(0),
+            ),
+            left,
+        ),
+    ] {
+        for (left, right) in [(&left, &right), (&right, &left)] {
+            let mut txn = base.clone();
+            assert!(matches!(
+                txn.unify(left, right, default_budget()),
+                Err(UnificationError::Deferred(_))
+            ));
+            assert_semantics_unchanged(&txn, &base);
+        }
+    }
+    let mut impostor = transaction();
+    publish_nat_add_axiom(&mut impostor);
+    let base = local(&mut impostor, "opaqueNatBase", nat());
+    let before = impostor.clone();
+    assert!(
+        impostor
+            .unify(
+                &nat_operation("add", &[base.clone(), numeral(0)]),
+                &base,
+                default_budget()
+            )
+            .is_err()
+    );
+    assert_semantics_unchanged(&impostor, &before);
+}
+
+#[test]
+fn symbolic_nat_offsets_stay_compact_and_use_bounded_iteration() {
+    let mut txn = arithmetic_transaction();
+    let base = local(&mut txn, "largeOffsetBase", nat());
+    let huge = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 0, 1])));
+    let combined = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![3, 0, 1])));
+    let report = txn
+        .unify(
+            &nat_operation(
+                "add",
+                &[nat_operation("add", &[base.clone(), huge]), numeral(3)],
+            ),
+            &nat_operation("add", &[base.clone(), combined]),
+            default_budget(),
+        )
+        .unwrap();
+    assert!(report.unifier_steps < 1_000, "{report:?}");
+    let mut nested = base.clone();
+    for _ in 0..2_000 {
+        nested = successor(nested);
+    }
+    let report = txn
+        .unify(
+            &nested,
+            &nat_operation("add", &[base, numeral(2_000)]),
+            default_budget(),
+        )
+        .unwrap();
+    assert!(report.unifier_steps < 100_000, "{report:?}");
+}
+
+#[test]
+fn symbolic_nat_offset_resource_stops_roll_back_prior_assignments() {
+    let mut initial = arithmetic_transaction();
+    let base = local(&mut initial, "resourceOffsetBase", nat());
+    let id = natural(&mut initial, "beforeOffset", nat());
+    let huge = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 0, 1])));
+    let combined = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![3, 0, 1])));
+    let equations = [
+        (Expr::mvar(id), numeral(8)),
+        (
+            nat_operation(
+                "add",
+                &[nat_operation("add", &[base.clone(), huge]), numeral(3)],
+            ),
+            nat_operation("add", &[base, combined]),
+        ),
+    ];
+    let calls = Cell::new(0_u64);
+    let report = initial
+        .clone()
+        .unify_many_with(&equations, default_budget(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+    let mut step_limit = default_budget();
+    step_limit.max_steps = report.unifier_steps - 1;
+    let mut node_limit = default_budget();
+    node_limit.max_visited_nodes = report.visited_nodes - 1;
+    for limits in [step_limit, node_limit] {
+        let mut txn = initial.clone();
+        assert!(matches!(
+            txn.unify_many_with(&equations, limits, &|| false),
+            Err(UnificationError::StepLimit { .. } | UnificationError::NodeLimit { .. })
+        ));
+        assert_semantics_unchanged(&txn, &initial);
+    }
+    let stop_at = calls.get() - 2;
+    calls.set(0);
+    let mut txn = initial.clone();
+    assert!(matches!(
+        txn.unify_many_with(&equations, default_budget(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == stop_at
+        }),
+        Err(UnificationError::Cancelled)
+    ));
+    assert_semantics_unchanged(&txn, &initial);
+    initial
+        .unify_many_with(&equations, default_budget(), &|| false)
+        .unwrap();
 }

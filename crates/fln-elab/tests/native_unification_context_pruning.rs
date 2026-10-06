@@ -89,7 +89,7 @@ fn nested_contexts_retain_a_dependent_result_and_common_witness() {
         let (left, right) = if reverse { (pair.1, pair.0) } else { pair };
         let env = t.env.clone();
         let report = t.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
         let decl = t.mvars.get_decl(&residual).unwrap();
@@ -134,7 +134,7 @@ fn sibling_contexts_capture_the_common_parent_not_either_private_branch() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     let residual = report.residual_metavariables[0].clone();
     assert_eq!(t.mvars.get_decl(&residual).unwrap().lctx, parent);
     for private in [left_private, right_private] {
@@ -308,7 +308,7 @@ fn bare_aliases_choose_the_scope_safe_orientation() {
         let report = t.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.expression_assignments, vec![inner.clone()]);
         assert_eq!(report.residual_metavariables, vec![outer.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(t.mvars.len(), before.mvars.len());
         assert!(!t.mvars.is_assigned(&outer));
         assert_eq!(
@@ -397,7 +397,7 @@ fn scope_refusal_can_wait_for_a_later_residual_assignment() {
             equations.reverse();
         }
         let report = t.unify_many_with(&equations, budget(), &|| false).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert!(report.residual_metavariables.is_empty());
         t.unify(&Expr::mvar(outer), &Expr::app(op, number(4)), budget())
             .unwrap();
@@ -544,7 +544,7 @@ fn bare_sibling_holes_share_only_the_common_lexical_context() {
         };
         let before = t.clone();
         let report = t.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(report.expression_assignments.len(), 2);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
@@ -588,7 +588,7 @@ fn a_bare_hole_and_an_applied_hole_can_share_a_scope_safe_result() {
         );
         let (left, right) = if reverse { (pair.1, pair.0) } else { pair };
         let report = t.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         let residual = report.residual_metavariables[0].clone();
         assert_eq!(t.mvars.get_decl(&residual).unwrap().lctx.len(), 1);
         t.unify(&Expr::mvar(residual), &witness, budget()).unwrap();
@@ -643,7 +643,7 @@ fn multiple_bare_scope_equations_reuse_the_common_residual() {
             &|| false,
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 3);
+    assert_eq!(report.kernel_checks, 6);
     assert_eq!(report.residual_metavariables.len(), 1);
     t.unify(
         &Expr::mvar(report.residual_metavariables[0].clone()),

@@ -45,7 +45,7 @@ fn an_alias_can_be_checked_universally_before_its_universe_is_known() {
     let report = txn
         .unify(&Expr::mvar(a.clone()), &Expr::mvar(b.clone()), budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(report.residual_metavariables, vec![b.clone()]);
     assert_eq!(
         txn.mvars.get_assigned_expr(&a),
@@ -95,7 +95,7 @@ fn alias_typing_reports_its_necessary_universe_equation() {
     );
     assert_eq!(report.residual_metavariables, vec![b.clone()]);
     assert!(!txn.mvars.is_assigned(&b));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
