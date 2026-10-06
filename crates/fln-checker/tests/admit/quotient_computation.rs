@@ -251,3 +251,99 @@ fn nested_quotient_majors_use_heap_continuations_on_a_small_stack() {
         .join()
         .unwrap();
 }
+
+/// A `Quot.lift` stuck on an opaque major is not compared by arguments first and
+/// does not unfold, so lazy delta has no step on it, and untyped conversion
+/// cannot identify proofs. Two such lifts that differ only in the proof that `f`
+/// respects `r` convert in the typed lane argument by argument, the two proofs
+/// by proof irrelevance, as the pin's `is_def_eq_app` compares them (vendored
+/// type_checker.cpp:1145; bead `fln-checker-associator-time-y8wc`).
+#[test]
+fn stuck_lifts_differing_only_in_their_proofs_convert_argument_by_argument() {
+    let x = |index: u32| Expr::bvar(index).expect("bound variable");
+    let k = |label: &str| Expr::const_(primary_name(label), Vec::new());
+    let arrow = |domain: Expr, body: Expr| {
+        Expr::forall_e(primary_name("x"), domain, body, BinderInfo::Default)
+    };
+    let axiom_of = |label: &str, ty: Expr| {
+        ConstantEntry::new(
+            checker_name(label),
+            header(
+                Vec::new(),
+                decoded(&ty),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        )
+    };
+    let eq = |a: Expr, b: Expr| {
+        apps(
+            Expr::const_(primary_name("Eq"), vec![Level::one()]),
+            [k("A"), a, b],
+        )
+    };
+    let respects = arrow(
+        k("A"),
+        arrow(
+            k("A"),
+            arrow(
+                apps(k("r"), [x(1), x(0)]),
+                eq(apps(k("f"), [x(2)]), apps(k("f"), [x(1)])),
+            ),
+        ),
+    );
+    let lifted = |proof: &str| {
+        apps(
+            primitive("lift", vec![Level::one(), Level::one()]),
+            [k("A"), k("r"), k("A"), k("f"), k(proof), k("q")],
+        )
+    };
+    let mut environment = equality_environment(false, false);
+    let quotient = quotient_entries();
+    assert!(admit_quotient(&environment, &quotient, AdmissionBudget::unlimited()).is_admitted());
+    let rows = quotient.into_iter().chain([
+        axiom_of("A", Expr::sort(Level::one())),
+        axiom_of("r", arrow(k("A"), arrow(k("A"), Expr::sort(Level::zero())))),
+        axiom_of("f", arrow(k("A"), k("A"))),
+        axiom_of("h₁", respects.clone()),
+        axiom_of("h₂", respects),
+        axiom_of(
+            "q",
+            apps(
+                Expr::const_(primary_name("Quot"), vec![Level::one()]),
+                [k("A"), k("r")],
+            ),
+        ),
+        axiom_of("T", arrow(k("A"), Expr::sort(Level::one()))),
+        axiom_of("w", apps(k("T"), [lifted("h₂")])),
+    ]);
+    for row in rows {
+        let EnvironmentOutcome::Complete {
+            environment: next, ..
+        } = environment.extend(row, EnvironmentBudget::unlimited())
+        else {
+            panic!("fixture row");
+        };
+        environment = next;
+    }
+    let untyped = def_eq(
+        &decoded(&lifted("h₁")),
+        &decoded(&lifted("h₂")),
+        &WhnfContext::new(Vec::new(), Vec::new(), environment.clone()),
+        DefEqBudget::unlimited(),
+    );
+    assert!(
+        matches!(untyped, DefEqOutcome::Deferred { .. }),
+        "untyped conversion must defer the lifts for this test to mean anything: {untyped:?}"
+    );
+    let candidate = definition(
+        "d",
+        decoded(&apps(k("T"), [lifted("h₁")])),
+        decoded(&k("w")),
+    );
+    let verdict = admit(&environment, &candidate, AdmissionBudget::unlimited());
+    assert!(
+        matches!(verdict, Verdict::Admitted(_)),
+        "the lifts differ only in proofs of one proposition: {verdict:?}"
+    );
+}
