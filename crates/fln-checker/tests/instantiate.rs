@@ -125,26 +125,110 @@ fn term_level_model(term: &WireExpr, id: LevelId) -> Model {
     }
 }
 
-fn frozen_substitute(model: &Model, parameters: &[String], values: &[Model]) -> Model {
+fn model_offset(mut model: &Model) -> (&Model, usize) {
+    let mut offset = 0;
+    while let Model::Succ(child) = model {
+        model = child;
+        offset += 1;
+    }
+    (model, offset)
+}
+
+fn model_nonzero(model: &Model) -> bool {
     match model {
-        Model::Zero => Model::Zero,
-        Model::Succ(child) => Model::Succ(Box::new(frozen_substitute(child, parameters, values))),
-        Model::Max(left, right) => Model::Max(
-            Box::new(frozen_substitute(left, parameters, values)),
-            Box::new(frozen_substitute(right, parameters, values)),
-        ),
-        Model::IMax(left, right) => Model::IMax(
-            Box::new(frozen_substitute(left, parameters, values)),
-            Box::new(frozen_substitute(right, parameters, values)),
-        ),
+        Model::Succ(_) => true,
+        Model::Max(left, right) => model_nonzero(left) || model_nonzero(right),
+        Model::IMax(_, right) => model_nonzero(right),
+        Model::Zero | Model::Parameter(_) | Model::Meta(_) => false,
+    }
+}
+
+fn model_max(left: Model, right: Model) -> Model {
+    let (left_base, left_offset) = model_offset(&left);
+    let (right_base, right_offset) = model_offset(&right);
+    if left_base == &Model::Zero && right_base == &Model::Zero {
+        return if left_offset >= right_offset {
+            left
+        } else {
+            right
+        };
+    }
+    if left == right || right == Model::Zero {
+        return left;
+    }
+    if left == Model::Zero {
+        return right;
+    }
+    if matches!(&right, Model::Max(a, b) if a.as_ref() == &left || b.as_ref() == &left) {
+        return right;
+    }
+    if matches!(&left, Model::Max(a, b) if a.as_ref() == &right || b.as_ref() == &right) {
+        return left;
+    }
+    if left_base == right_base {
+        return if left_offset > right_offset {
+            left
+        } else {
+            right
+        };
+    }
+    Model::Max(Box::new(left), Box::new(right))
+}
+
+fn model_imax(left: Model, right: Model) -> Model {
+    if model_nonzero(&right) {
+        model_max(left, right)
+    } else if right == Model::Zero
+        || left == Model::Zero
+        || left == Model::Succ(Box::new(Model::Zero))
+    {
+        right
+    } else if left == right {
+        left
+    } else {
+        Model::IMax(Box::new(left), Box::new(right))
+    }
+}
+
+// The frozen model originally copied every rebuilt Max/IMax literally. That
+// contradicted the pin's update_max, so the changed-ancestor rule now models
+// its smart constructors; no-op subjects and replacement values remain raw.
+fn frozen_substitute_changed(
+    model: &Model,
+    parameters: &[String],
+    values: &[Model],
+) -> (Model, bool) {
+    match model {
+        Model::Zero => (Model::Zero, false),
+        Model::Succ(child) => {
+            let (child, changed) = frozen_substitute_changed(child, parameters, values);
+            (Model::Succ(Box::new(child)), changed)
+        }
+        Model::Max(left, right) | Model::IMax(left, right) => {
+            let (left, changed_left) = frozen_substitute_changed(left, parameters, values);
+            let (right, changed_right) = frozen_substitute_changed(right, parameters, values);
+            let changed = changed_left || changed_right;
+            let output = match (model, changed) {
+                (Model::Max(..), true) => model_max(left, right),
+                (Model::IMax(..), true) => model_imax(left, right),
+                (Model::Max(..), false) => Model::Max(Box::new(left), Box::new(right)),
+                _ => Model::IMax(Box::new(left), Box::new(right)),
+            };
+            (output, changed)
+        }
         Model::Parameter(name) => parameters
             .iter()
             .position(|parameter| parameter == name)
             .and_then(|index| values.get(index))
             .cloned()
-            .unwrap_or_else(|| Model::Parameter(name.clone())),
-        Model::Meta(name) => Model::Meta(name.clone()),
+            .map(|value| (value, true))
+            .unwrap_or_else(|| (Model::Parameter(name.clone()), false)),
+        Model::Meta(name) => (Model::Meta(name.clone()), false),
     }
+}
+
+fn frozen_substitute(model: &Model, parameters: &[String], values: &[Model]) -> Model {
+    frozen_substitute_changed(model, parameters, values).0
 }
 
 fn generated_models() -> Vec<Model> {
@@ -166,6 +250,257 @@ fn generated_models() -> Vec<Model> {
         }
     }
     models
+}
+
+#[test]
+fn changed_universe_nodes_use_pinned_smart_constructors() {
+    // The pin rebuilds changed ancestors through update_max -> mk_max/mk_imax
+    // (vendor/lean4-src/src/kernel/level.cpp:81-123, 290-324). These expectations
+    // are literal results of those rules, not the generated model below.
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let w = Level::param(primary_name("w"));
+    let max = |a, b| Level::max(a, b).expect("shallow maximum");
+    let imax = |a, b| Level::imax(a, b).expect("shallow dependent maximum");
+    let succ = |a: &Level| a.clone().succ().expect("shallow successor");
+    let two = succ(&Level::one());
+    let three = succ(&two);
+    let cases = [
+        (
+            "explicit maximum",
+            max(u.clone(), two),
+            three.clone(),
+            three,
+        ),
+        (
+            "left zero",
+            max(u.clone(), v.clone()),
+            Level::zero(),
+            v.clone(),
+        ),
+        (
+            "right zero",
+            max(v.clone(), u.clone()),
+            Level::zero(),
+            v.clone(),
+        ),
+        (
+            "structurally equal operands",
+            max(u.clone(), v.clone()),
+            v.clone(),
+            v.clone(),
+        ),
+        (
+            "right maximum absorbs its left operand",
+            max(u.clone(), max(v.clone(), w.clone())),
+            v.clone(),
+            max(v.clone(), w.clone()),
+        ),
+        (
+            "left maximum absorbs its right operand",
+            max(max(v.clone(), w.clone()), u.clone()),
+            w.clone(),
+            max(v.clone(), w.clone()),
+        ),
+        (
+            "larger successor offset of the same base",
+            max(succ(&u), succ(&succ(&v))),
+            v.clone(),
+            succ(&succ(&v)),
+        ),
+        (
+            "imax right zero",
+            imax(v.clone(), u.clone()),
+            Level::zero(),
+            Level::zero(),
+        ),
+        (
+            "imax left zero",
+            imax(u.clone(), v.clone()),
+            Level::zero(),
+            v.clone(),
+        ),
+        (
+            "imax left one",
+            imax(u.clone(), v.clone()),
+            Level::one(),
+            v.clone(),
+        ),
+        (
+            "imax equal operands",
+            imax(u.clone(), v.clone()),
+            v.clone(),
+            v.clone(),
+        ),
+        (
+            "imax positive right operand",
+            imax(v.clone(), u.clone()),
+            succ(&w),
+            max(v.clone(), succ(&w)),
+        ),
+        (
+            "imax positivity traverses a raw replacement",
+            imax(v.clone(), u.clone()),
+            imax(w.clone(), Level::one()),
+            max(v.clone(), imax(w.clone(), Level::one())),
+        ),
+        (
+            "positive left operand does not establish right positivity",
+            imax(u.clone(), v.clone()),
+            succ(&w),
+            imax(succ(&w), v.clone()),
+        ),
+        (
+            "semantic equivalence does not replace structural equality",
+            max(u.clone(), max(v.clone(), w.clone())),
+            max(w.clone(), v.clone()),
+            max(max(w.clone(), v.clone()), max(v, w)),
+        ),
+    ];
+    for (label, subject, replacement, expected) in cases {
+        let output = complete(instantiate_level_parameters(
+            &decoded_level(&subject),
+            &[checker_name("u")],
+            &[decoded_level(&replacement)],
+            TermBudget::unlimited(),
+        ));
+        let expected = decoded_level(&expected);
+        assert_eq!(
+            wire_model(&output, output.root()),
+            wire_model(&expected, expected.root()),
+            "pinned constructor rule: {label}"
+        );
+    }
+}
+
+#[test]
+fn universe_instantiation_preserves_untouched_and_replacement_shapes() {
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let w = Level::param(primary_name("w"));
+    let raw = Level::imax(v, Level::zero()).expect("shallow raw dependent maximum");
+    let mixed = Level::max(u.clone(), raw.clone()).expect("shallow mixed subject");
+    let expected_mixed = Level::max(w.clone(), raw.clone()).expect("shallow mixed result");
+    for (subject, replacement, expected) in [
+        (raw.clone(), w.clone(), raw.clone()),
+        (u, raw.clone(), raw),
+        (mixed, w, expected_mixed),
+    ] {
+        let output = complete(instantiate_level_parameters(
+            &decoded_level(&subject),
+            &[checker_name("u")],
+            &[decoded_level(&replacement)],
+            TermBudget::unlimited(),
+        ));
+        let expected = decoded_level(&expected);
+        assert_eq!(
+            wire_model(&output, output.root()),
+            wire_model(&expected, expected.root()),
+            "only ancestors of a substituted parameter are rebuilt"
+        );
+    }
+}
+
+#[test]
+fn universe_rebuilding_preserves_budget_and_cancellation_nonanswers() {
+    let subject = decoded_level(
+        &Level::imax(
+            Level::param(primary_name("v")),
+            Level::param(primary_name("u")),
+        )
+        .expect("shallow subject"),
+    );
+    let pristine = subject.clone();
+    let parameters = [checker_name("u")];
+    let replacements = [decoded_level(&Level::zero())];
+    for budget in [
+        TermBudget::new(0, u64::MAX),
+        TermBudget::new(u64::MAX, 0),
+        TermBudget::unlimited().with_max_arena_nodes(1),
+    ] {
+        assert!(matches!(
+            instantiate_level_parameters(&subject, &parameters, &replacements, budget),
+            InstantiationOutcome::Inconclusive(TermStop::Resource { .. })
+        ));
+    }
+    let mut polls = 0;
+    assert!(matches!(
+        instantiate_level_parameters_with(
+            &subject,
+            &parameters,
+            &replacements,
+            TermBudget::unlimited(),
+            || {
+                polls += 1;
+                polls == 4
+            },
+        ),
+        InstantiationOutcome::Inconclusive(TermStop::Cancelled { .. })
+    ));
+    assert_eq!(subject, pristine);
+}
+
+#[test]
+fn delta_instantiation_exposes_prop_without_collapsing_unknown_universes() {
+    use fln_checker::environment::{
+        ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
+        DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    };
+    use fln_checker::whnf::{WhnfBudget, WhnfContext, WhnfOutcome, whnf};
+
+    // Exercise the actual delta consumer, which instantiates from roots in a
+    // shared expression arena rather than from standalone replacement levels.
+    let universe = Level::imax(
+        Level::param(primary_name("u")),
+        Level::param(primary_name("v")),
+    )
+    .expect("shallow universe");
+    let entry = ConstantEntry::new(
+        checker_name("PolySort"),
+        ConstantDeclaration::definition(
+            vec![checker_name("u"), checker_name("v")],
+            decoded_expr(&Expr::sort(universe.clone().succ().expect("shallow type"))),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded_expr(&Expr::sort(universe)),
+                ReducibilityHint::Abbrev,
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    );
+    let environment = match ConstantEnvironment::build(vec![entry], EnvironmentBudget::unlimited())
+    {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => panic!("polymorphic definition environment: {other:?}"),
+    };
+    let context = WhnfContext::new(Vec::new(), Vec::new(), environment);
+    let left = Level::param(primary_name("w"))
+        .succ()
+        .expect("shallow left universe");
+    for (right, expected) in [
+        (Level::zero(), Model::Zero),
+        (
+            Level::param(primary_name("x")),
+            Model::IMax(
+                Box::new(Model::Succ(Box::new(Model::Parameter("w".to_owned())))),
+                Box::new(Model::Parameter("x".to_owned())),
+            ),
+        ),
+    ] {
+        let input = decoded_expr(&Expr::const_(
+            primary_name("PolySort"),
+            vec![left.clone(), right],
+        ));
+        let result = match whnf(&input, &context, WhnfBudget::unlimited()) {
+            WhnfOutcome::Complete(result) => result,
+            other => panic!("polymorphic delta reduction: {other:?}"),
+        };
+        let Some(ExprNode::Sort { level }) = result.term.node(result.term.root()) else {
+            panic!("polymorphic delta reduction must expose a sort");
+        };
+        assert_eq!(term_level_model(&result.term, *level), expected);
+    }
 }
 
 #[test]
