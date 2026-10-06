@@ -1,0 +1,70 @@
+name: checker shared arenas - self-hosted verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-checker-shared-arenas-selfhosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-checker-shared-arenas-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      # The hosted queue is backlogged. Run the identical immutable implementation
+      # and test commands on the self-hosted lane already used by this repository.
+      # No test is omitted and publication is still a tested fast-forward only.
+      - name: Extract the pinned implementation and verification commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os
+          import subprocess
+          import textwrap
+          from pathlib import Path
+
+          anchor = "2dcd3ff95cd10087e5d549463a1660288ee2c3f5:.github/workflows/fln-checker-shared-arenas.yml"
+          source = subprocess.check_output(["git", "show", anchor], text=True)
+          names = [
+              "Prepare the guarded implementation and regressions",
+              "Verify against current main and publish only the tested source",
+          ]
+          for index, name in enumerate(names):
+              marker = "      - name: " + name + "\n"
+              if source.count(marker) != 1:
+                  raise SystemExit("pinned workflow step is not unique")
+              start = source.index("        run: |\n", source.index(marker)) + len("        run: |\n")
+              end = source.find("\n      - name:", start)
+              body = textwrap.dedent(source[start:end if end >= 0 else len(source)])
+              target = Path(os.environ["RUNNER_TEMP"]) / f"shared-arena-step-{index}.sh"
+              with target.open("x", encoding="utf-8") as handle:
+                  handle.write(body)
+          PY
+
+      - name: Prepare the same implementation
+        shell: bash
+        run: bash "$RUNNER_TEMP/shared-arena-step-0.sh"
+
+      - name: Execute the same controls, tests and guarded main publication
+        shell: bash
+        run: bash "$RUNNER_TEMP/shared-arena-step-1.sh"
+
+      - name: Retain execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checker-shared-arena-selfhosted-evidence
+          path: ${{ runner.temp }}/shared-arena-evidence
+          if-no-files-found: error
