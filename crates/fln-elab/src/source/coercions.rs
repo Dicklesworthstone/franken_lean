@@ -5,6 +5,7 @@ use super::instances::{nonmatch, registry_error};
 use super::*;
 use crate::instances::InstanceRegistry;
 
+mod expand;
 mod monad;
 
 impl Context {
@@ -297,6 +298,7 @@ impl Context {
             term = Expr::app(term, value);
         }
         term = self.instantiate(&term)?;
+        term = self.expand_coercions(&term)?;
         let Some(type_) = self.known_type(&term)? else {
             return Ok(None);
         };
