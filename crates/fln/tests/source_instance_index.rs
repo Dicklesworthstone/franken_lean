@@ -385,7 +385,7 @@ struct PinChoice {
 }
 
 fn pin_choices(module: &str) -> Vec<PinChoice> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = fln_core::checked_manifest_dir!()
         .join("tests/fixtures/instance_choices")
         .join(format!("{module}.tsv"));
     let text = std::fs::read_to_string(&path).expect("the pin-extracted fixture");

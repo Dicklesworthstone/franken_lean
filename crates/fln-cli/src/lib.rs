@@ -16849,8 +16849,8 @@ mod tests {
     /// `failed` count.
     #[test]
     fn a_decode_budget_stop_renders_as_inconclusive_with_its_allowance() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+        let fixture = fln_core::checked_workspace_root!()
+            .join("tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
         let bytes = std::fs::read(&fixture).expect("the C3 fixture is checked in");
         let name = fln::Name::from_components(["Init", "SizeOfLemmas"]);
         let inputs = [fln::OleanModuleInput {
