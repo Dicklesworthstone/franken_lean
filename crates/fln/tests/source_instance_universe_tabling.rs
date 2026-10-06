@@ -103,12 +103,14 @@ theorem recovered : result.value = 12 := by rfl"#,
 
 #[test]
 fn known_universe_and_output_types_remain_distinct_from_open_variants() {
+    // Pin v4.32.0 selects 7/7 without the explicit priority. With 1100 it
+    // selects high for the open goal and low for the known prerequisite.
     checked(
         &engine(),
         r#"class Carrier.{u} (A : outParam (Type u)) where
   value : Nat
 instance low : Carrier Nat := Carrier.mk 7
-instance high : Carrier Type := Carrier.mk 99
+instance (priority := 1100) high : Carrier Type := Carrier.mk 99
 class Root where
   openValue : Nat
   fixedValue : Nat
@@ -116,5 +118,46 @@ instance root.{u} {A : Type u} [first : Carrier A] [fixed : Carrier Nat] : Root 
 def result : Root := inferInstance
 theorem openValue : result.openValue = 99 := by rfl
 theorem fixedValue : result.fixedValue = 7 := by rfl"#,
+    );
+}
+
+#[test]
+fn known_prerequisite_outputs_filter_candidates_without_changing_root_selection() {
+    let base = checked(
+        &engine(),
+        r#"class Pick (A : outParam Type) where
+  value : Nat
+instance low : Pick Nat := Pick.mk 7
+instance (priority := 1100) high : Pick Bool := Pick.mk 99
+class Root where
+  openValue : Nat
+  natValue : Nat
+  boolValue : Nat
+instance root {A : Type} [first : Pick A] [nat : Pick Nat] [bool : Pick Bool] : Root := Root.mk first.value nat.value bool.value
+class Missing where
+  value : Nat
+instance missing [dict : Pick String] : Missing := Missing.mk dict.value"#,
+    );
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "def wrongRoot : Pick Nat := inferInstance",
+        "def wrongPrerequisite : Missing := inferInstance",
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "known outer outputs are still reconciled after selection, and an unsatisfied prerequisite cannot be fabricated"
+        );
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    checked(
+        &base,
+        r#"def result : Root := inferInstance
+theorem openValue : result.openValue = 99 := by rfl
+theorem natValue : result.natValue = 7 := by rfl
+theorem boolValue : result.boolValue = 99 := by rfl"#,
     );
 }

@@ -437,6 +437,7 @@ impl Context {
         registry: &InstanceRegistry,
         ambient: &LocalContext,
         default: Option<&Name>,
+        erase_known_outputs: bool,
     ) -> Result<Option<Frame>, NatDefinitionElabError> {
         let decl = self
             .txn
@@ -483,7 +484,9 @@ impl Context {
                 key: target,
             }
         } else {
-            let Some(prepared) = self.prepare_instance_target(&target, registry)? else {
+            let Some(prepared) =
+                self.prepare_instance_target(&target, registry, erase_known_outputs)?
+            else {
                 return Ok(None);
             };
             prepared
@@ -739,7 +742,7 @@ impl Context {
             .ok_or_else(|| failure(SourceInferenceError::Scope))?
             .lctx
             .clone();
-        let Some(first) = self.instance_frame(root, registry, &ambient, default)? else {
+        let Some(first) = self.instance_frame(root, registry, &ambient, default, true)? else {
             return Ok(SearchResult::Stuck);
         };
         let mut frames = vec![first];
@@ -763,7 +766,7 @@ impl Context {
                     }
                     remaining = true;
                     let mut trial = self.clone();
-                    let child = trial.instance_frame(id.clone(), registry, &ambient, None);
+                    let child = trial.instance_frame(id.clone(), registry, &ambient, None, false);
                     self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                     if let Some(child) = child? {
                         *self = trial;

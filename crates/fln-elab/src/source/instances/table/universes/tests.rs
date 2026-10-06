@@ -99,7 +99,7 @@ fn query(
     };
     let ambient = ctx.txn.lctx.clone();
     let frame = ctx
-        .instance_frame(id.clone(), registry, &ambient, None)
+        .instance_frame(id.clone(), registry, &ambient, None, true)
         .unwrap()
         .unwrap();
     (frame, u, alpha)

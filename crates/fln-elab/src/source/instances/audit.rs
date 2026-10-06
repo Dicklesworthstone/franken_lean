@@ -65,7 +65,7 @@ pub fn audit_instance_goal(
     };
     let ambient = context.txn.lctx.clone();
     let mut search = context.clone();
-    let Some(frame) = context.instance_frame(id.clone(), &registry, &ambient, None)? else {
+    let Some(frame) = context.instance_frame(id.clone(), &registry, &ambient, None, true)? else {
         return Ok(None);
     };
     search.txn.budget.heartbeats_consumed = 0;

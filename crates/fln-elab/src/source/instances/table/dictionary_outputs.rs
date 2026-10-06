@@ -110,7 +110,7 @@ fn query(ctx: &mut Context, registry: &InstanceRegistry) -> (Frame, MVarId, MVar
     };
     let ambient = ctx.txn.lctx.clone();
     let frame = ctx
-        .instance_frame(root.clone(), registry, &ambient, None)
+        .instance_frame(root.clone(), registry, &ambient, None, true)
         .unwrap()
         .unwrap();
     let ExprNode::MVar { id: alpha } = alpha.node() else {
@@ -287,7 +287,7 @@ fn dependent_key_aliases_use_saved_assignments_not_later_search_results() {
     };
     let ambient = ctx.txn.lctx.clone();
     let frame = ctx
-        .instance_frame(id.clone(), &registry, &ambient, None)
+        .instance_frame(id.clone(), &registry, &ambient, None, true)
         .unwrap()
         .unwrap();
     let before = key(&mut ctx, &frame, &path)
