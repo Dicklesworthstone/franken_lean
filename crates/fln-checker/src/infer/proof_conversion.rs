@@ -1730,3 +1730,59 @@ pub(crate) fn proof_conversion_with(
         Err(halt) => ProofConversionOutcome::Halted(halt),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn constant(text: &str) -> WireExpr {
+        WireExpr::from_parts(
+            vec![ExprNode::Constant {
+                name: WireName::from_parts(vec![NamePart::Text(text.into())]),
+                levels: Vec::new(),
+            }],
+            Vec::new(),
+            ExprId::from_index(0).expect("the first expression id"),
+        )
+    }
+
+    /// A recorded local belongs to exactly its task's key: the kind and both
+    /// terms. The fingerprint normally separates two keys before they are
+    /// compared, so each lookup here passes the SAME fingerprint, standing for
+    /// a collision; only the exact comparison can then tell the keys apart. A
+    /// key missing the second term would reopen an eta task at the local of
+    /// another with the same lambda, and one missing the kind would open a
+    /// binder pair at an eta task's local.
+    #[test]
+    fn an_opened_local_is_found_only_for_its_exact_key() {
+        let mut opened = OpenedLocals::default();
+        let (lambda, other, different) = (constant("lambda"), constant("a"), constant("b"));
+        let name = WireName::from_parts(vec![NamePart::Text("x".into())]);
+        let bucket = 7;
+        opened.insert(bucket, Taken::Eta(false), &lambda, &other, name.clone());
+        assert_eq!(
+            opened.get(bucket, Taken::Eta(false), &lambda, &other),
+            Some(&name)
+        );
+        assert_eq!(
+            opened.get(bucket, Taken::Eta(false), &lambda, &different),
+            None,
+            "the second term is part of the key"
+        );
+        assert_eq!(
+            opened.get(bucket, Taken::Eta(false), &different, &other),
+            None,
+            "the first term is part of the key"
+        );
+        assert_eq!(
+            opened.get(bucket, Taken::Eta(true), &lambda, &other),
+            None,
+            "the eta side is part of the key"
+        );
+        assert_eq!(
+            opened.get(bucket, Taken::Binders, &lambda, &other),
+            None,
+            "the task kind is part of the key"
+        );
+    }
+}
