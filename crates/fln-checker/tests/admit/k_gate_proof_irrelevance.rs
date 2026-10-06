@@ -17,6 +17,7 @@
 //! `f p1` and `f p2` are equal only by proof irrelevance.
 #![forbid(unsafe_code)]
 use super::*;
+use fln_checker::defeq::{DefEqOutcome, def_eq};
 use fln_checker::whnf::{WhnfContext, WhnfOutcome, whnf};
 use fln_checker::wire::ExprNode;
 
@@ -115,6 +116,12 @@ fn environment() -> ConstantEnvironment {
             eq_nat(f_at_v("q1"), f_at_v("q2")),
         ),
         axiom_of("h_data", vec![], eq_nat(g_of("n1"), g_of("n2"))),
+        // `hx : ∀ x : P, f p1 = f x`.
+        axiom_of(
+            "hx",
+            vec![],
+            pi(c("P"), eq_nat(f_of("p1"), app(c("f"), [bv(0)]))),
+        ),
     ]);
     environment_of(rows)
 }
@@ -183,5 +190,31 @@ fn a_k_gate_whose_sides_differ_in_data_does_not_pass() {
         matches!(&outcome, WhnfOutcome::Complete(result)
             if head_is(&result.term, &checker_qualified(&["Eq", "rec"]))),
         "the cast must stay stuck at Eq.rec: {outcome:?}"
+    );
+}
+
+/// Under a binder the untyped conversion keeps the bound variable loose, so a
+/// gate side can be open: here `f p1 = f #0` inside `fun x : P => …`. The typed
+/// conversion has no local to type `#0` with and is not run on such a side;
+/// the gate misses as it did before the typed fallback, and the comparison is
+/// left to conversion with types. Typing the open side would fault on the
+/// loose variable instead.
+#[test]
+fn a_k_gate_whose_sides_have_a_loose_bound_variable_is_not_typed() {
+    let body = cast(
+        app(c("f"), [c("p1")]),
+        app(c("f"), [bv(0)]),
+        app(c("hx"), [bv(0)]),
+    );
+    let context = WhnfContext::new(Vec::new(), Vec::new(), environment());
+    let outcome = def_eq(
+        &decoded(&lam(c("P"), body)),
+        &decoded(&lam(c("P"), c("w"))),
+        &context,
+        DefEqBudget::unlimited(),
+    );
+    assert!(
+        matches!(outcome, DefEqOutcome::Deferred { .. }),
+        "the open gate must miss and the pair defer, not fault: {outcome:?}"
     );
 }
