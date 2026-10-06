@@ -1,4 +1,4 @@
-//! Native construction of one complete mutual data-inductive block.
+//! Native construction of one complete mutual inductive block.
 //!
 //! Sibling occurrences are allowed only as uniform strictly-positive children.
 //! Each child uses its destination's motive, indices and recursor. The result
@@ -79,7 +79,7 @@ fn child(
     Ok(None)
 }
 
-/// Construct two to eight safe data families with one shared parameter and
+/// Construct two to eight safe families with one shared parameter and
 /// universe telescope. Parameter identities and types must agree across specs;
 /// each index/constructor telescope is otherwise scoped independently. Both
 /// admission engines still check all signatures, universes, types and rules.
@@ -107,7 +107,7 @@ pub fn mutual_inductive_declaration(
             return Err(InductiveError::InvalidTelescope);
         }
     }
-    if first.result_level.has_mvar() || !first.result_level.is_never_zero() {
+    if first.result_level.has_mvar() {
         return Err(InductiveError::UnsupportedSort);
     }
     let result_level = first.result_level.normalize_fixpoint();
@@ -219,13 +219,27 @@ pub fn mutual_inductive_declaration(
             });
         }
     }
-    let mut elim = Name::from_components(["u"]);
-    let mut ordinal = 0usize;
-    while universe_names.contains(&elim) {
-        builder.tick()?;
-        ordinal += 1;
-        elim = Name::from_components([format!("u_{ordinal}").as_str()]);
-    }
+    // The pin's `elim_only_at_universe_zero` (kernel/inductive.cpp) restricts
+    // every mutual family whose result universe may be zero to Prop. This
+    // includes a universe parameter, even at its nonzero instantiations. Such
+    // recursors have no fresh elimination-universe parameter, including in
+    // the recursive calls stored in their computation rules.
+    let elim = if result_level.is_never_zero() {
+        let mut name = Name::from_components(["u"]);
+        let mut ordinal = 0usize;
+        while universe_names.contains(&name) {
+            builder.tick()?;
+            ordinal += 1;
+            name = Name::from_components([format!("u_{ordinal}").as_str()]);
+        }
+        Some(name)
+    } else {
+        None
+    };
+    let elim_level = elim
+        .as_ref()
+        .map_or_else(Level::zero, |name| Level::param(name.clone()));
+    let rec_params: Vec<_> = elim.iter().chain(&first.level_params).cloned().collect();
     let mut majors = Vec::new();
     let mut motives = Vec::new();
     let prefixes: Vec<_> = specs
@@ -246,7 +260,7 @@ pub fn mutual_inductive_declaration(
         );
         let ty = builder.close(
             std::slice::from_ref(&major),
-            Expr::sort(Level::param(elim.clone())),
+            Expr::sort(elim_level.clone()),
             false,
             false,
         )?;
@@ -318,8 +332,7 @@ pub fn mutual_inductive_declaration(
         });
         cidx[entry.family] += 1;
     }
-    let mut rec_levels = vec![Level::param(elim.clone())];
-    rec_levels.extend(levels);
+    let rec_levels: Vec<_> = rec_params.iter().cloned().map(Level::param).collect();
     let rec_prefixes: Vec<_> = rec_names
         .iter()
         .map(|n| {
@@ -389,8 +402,6 @@ pub fn mutual_inductive_declaration(
         .any(|c| !c.telescope.arguments.is_empty());
     let mut types = Vec::new();
     let mut recursors = Vec::new();
-    let mut rec_params = vec![elim];
-    rec_params.extend(first.level_params.iter().cloned());
     for (family, spec) in specs.iter().enumerate() {
         let ty = builder.close(
             &spec.indices,

@@ -21,7 +21,7 @@ fn family_type(
         .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))
 }
 
-/// Elaborate two to eight uniform, positive data families as one indivisible
+/// Elaborate two to eight uniform, positive families as one indivisible
 /// candidate. This is source elaboration, not admission. Unsupported nested
 /// families, negative occurrences and nonuniform parameters are refused by the
 /// shared native inductive generator; no member is installed speculatively.
@@ -47,7 +47,13 @@ pub(in crate::source) fn elaborate_mutual(
             return Err(invalid());
         }
         if let Some(level) = &h.explicit {
-            if !level.is_never_zero()
+            let normalized = level.normalize_fixpoint();
+            // `checkResultingUniversePolymorphism` in the pin's source
+            // elaborator permits Prop or a definitely nonzero universe by
+            // default. Kernel-level generation also supports Sort u, but that
+            // does not enable the separate bootstrap option in source files.
+            if level.has_mvar()
+                || (!normalized.is_zero() && !normalized.is_never_zero())
                 || explicit
                     .as_ref()
                     .is_some_and(|other| other.normalize_fixpoint() != level.normalize_fixpoint())

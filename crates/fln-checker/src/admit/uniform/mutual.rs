@@ -7,7 +7,8 @@
 //! A block in Prop eliminates only into Prop, the pin's elimination level for
 //! every mutual block whose sort can be zero (`elim_only_at_universe_zero`).
 //! A block whose sort is `Sort u`, Prop at some universe and data at others,
-//! and nested recursion (translated first by the nested route) stay nonanswers.
+//! has the same Prop-only elimination policy but still obeys field-universe
+//! bounds. Nested recursion is translated first by the nested route.
 use super::*;
 use crate::whnf::{WhnfContext, WhnfOutcome, whnf_core_at_with};
 
@@ -33,8 +34,8 @@ struct Block<'a> {
     parameters: Vec<Binder>,
     families: Vec<Family<'a>>,
     minors: Vec<Minor<'a>>,
-    /// The recursors' extra universe; `None` for a block in Prop, whose
-    /// motives are `Sort 0` and whose recursors take exactly the block's levels.
+    /// The recursors' extra universe; `None` when the block's sort may be
+    /// zero. Its motives are Prop and its recursors take exactly the block's levels.
     motive_universe: Option<WireName>,
 }
 
@@ -538,8 +539,8 @@ pub(super) fn check(
         if binders > MAX_NONRECURSIVE_FIELDS {
             return Err(field_limit(binders));
         }
-        if !positive_result(declaration.type_(), (p + q) as u32)
-            && !proposition_result(declaration.type_(), (p + q) as u32)
+        if !peel_binders_at(declaration.type_(), declaration.type_().root(), p + q)
+            .is_some_and(|(_, tail)| is_sort_at(declaration.type_(), tail))
         {
             return Err(InductiveVerdict::Deferred(
                 InductiveSupportLimit::ResultUniverse,
@@ -616,12 +617,22 @@ pub(super) fn check(
         return Err(overflow());
     };
     let result_level = WireLevel::from_parts(sort.levels().to_vec(), *level);
-    // Every family shares this sort (compared above), so the block is either
-    // a proposition or data as a whole.
-    let proposition = normalize(&result_level)
-        .ok()
-        .and_then(|n| explicit_normal_universe(&n))
-        == Some(0);
+    // The pin separates `is_zero` (field-universe exemption) from `is_not_zero`
+    // (large elimination). Sort u may be Prop without being identically Prop:
+    // its fields must fit in u, but its recursors always eliminate into Prop.
+    let normal = normalize(&result_level).map_err(|_| overflow())?;
+    let proposition = explicit_normal_universe(&normal) == Some(0);
+    let mut positive = Vec::with_capacity(normal.nodes().len());
+    for node in normal.nodes() {
+        audit.tick()?;
+        positive.push(match node {
+            NormalNode::Succ(_) => true,
+            NormalNode::Max(a, b) => positive[a.index()] || positive[b.index()],
+            NormalNode::IMax(_, b) => positive[b.index()],
+            NormalNode::Zero | NormalNode::Parameter(_) | NormalNode::Meta(_) => false,
+        });
+    }
+    let large_elimination = positive[normal.root().index()];
     let mut staged = environment.clone();
     for family in &block.families {
         staged =
@@ -814,12 +825,12 @@ pub(super) fn check(
             .recursor_metadata()
             .ok_or_else(|| recursor_error(&name))?;
         let levels = declaration.level_parameters();
-        let level_policy = if proposition {
-            levels == block.levels.as_slice()
-        } else {
+        let level_policy = if large_elimination {
             levels.len() == block.levels.len() + 1
                 && levels[1..] == block.levels
                 && !block.levels.contains(&levels[0])
+        } else {
+            levels == block.levels.as_slice()
         };
         if declaration.safety() != audit.safety
             || !level_policy
@@ -833,8 +844,8 @@ pub(super) fn check(
         {
             return Err(recursor_error(&name));
         }
-        // A proposition's recursors have no extra universe (motives are `Sort 0`).
-        if !proposition {
+        // A possibly-Prop block has no extra universe (motives are `Sort 0`).
+        if large_elimination {
             if family == 0 {
                 block.motive_universe = Some(levels[0].clone());
             } else if block.motive_universe.as_ref() != Some(&levels[0]) {

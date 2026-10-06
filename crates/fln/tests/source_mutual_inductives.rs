@@ -274,6 +274,144 @@ const MUTUAL_FILE: &str = "mutual
 end
 ";
 
+const MUTUAL_PREDICATES: &str = "mutual
+  inductive Even : Nat -> Prop where
+    | zero : Even 0
+    | succ (n : Nat) (h : Odd n) : Even (Nat.succ n)
+  inductive Odd : Nat -> Prop where
+    | succ (n : Nat) (h : Even n) : Odd (Nat.succ n)
+end
+";
+
+#[test]
+fn mutual_predicates_support_constructor_proofs_and_all_recursion_motives() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let source = format!(
+        "{MUTUAL_PREDICATES}
+theorem evenTwo : Even 2 := Even.succ 1 (Odd.succ 0 Even.zero)
+theorem preserve (n : Nat) (h : Even n) : Even n :=
+  @Even.rec (fun n _ => Even n) (fun n _ => Odd n)
+    Even.zero (fun n h ih => Even.succ n ih) (fun n h ih => Odd.succ n ih) n h"
+    );
+    let checked = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_or_else(|error| panic!("mutual predicate source: {error:?}"))
+        .into_complete()
+        .expect("both checkers admit predicates and their proofs");
+    assert_eq!(checked.theorems, 2);
+    for name in ["Even.rec", "Odd.rec"] {
+        let Some(fln_env::constants::ConstantInfo::Rec(rec)) =
+            checked.engine.environment().find(&n(name))
+        else {
+            panic!("missing mutual recursor {name}");
+        };
+        assert!(rec.base.level_params.is_empty());
+        assert_eq!(rec.num_motives, 2);
+        assert!(!rec.k);
+    }
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn mutual_predicate_fields_may_live_in_higher_universes() {
+    check(
+        &engine(),
+        "universe u
+mutual
+  inductive Claim (A : Sort u) : Prop where
+    | datum (x : A)
+    | other (h : Other A)
+  inductive Other (A : Sort u) : Prop where
+    | claim (h : Claim A)
+end
+theorem carry (A : Sort u) (x : A) : Other A := Other.claim (Claim.datum x)
+theorem large : Other (Type 2) := Other.claim (Claim.datum (Type 1))",
+    );
+}
+
+const POSSIBLY_PROP: &str = "universe u
+mutual
+  inductive Reach (A : Sort u) : Sort u where
+    | here (value : A)
+    | next (step : Step A)
+  inductive Step (A : Sort u) : Sort u where
+    | back (reach : Reach A)
+end
+";
+
+#[test]
+fn source_rejects_possibly_zero_result_universes_under_the_pins_default_options() {
+    // The kernel permits these blocks, but the pinned source elaborator's
+    // default bootstrap.inductiveCheckResultingUniverse check refuses them.
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let refused = e
+        .check_source_files(
+            &[POSSIBLY_PROP.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.disposition(),
+        ("elaboration", false, 1),
+        "{refused:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    assert!(!e.environment().contains(&n("Reach")));
+}
+
+#[test]
+fn mutual_predicates_refuse_mixed_sorts_and_large_elimination_atomically() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let mixed = candidate(
+        &e,
+        &[
+            "inductive A : Prop where | mk (b : B)",
+            "inductive B : Type where | mk",
+        ],
+        &SourceScope::default(),
+        RecordBudget::default(),
+    );
+    assert!(matches!(
+        mixed,
+        Err(fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::Inductive(
+                fln_elab::inductive::InductiveError::UnsupportedSort
+            )
+        ))
+    ));
+    let source = format!(
+        "{MUTUAL_PREDICATES}
+def reveal (n : Nat) (h : Even n) : Nat :=
+  @Even.rec (fun _ _ => Nat) (fun _ _ => Nat)
+    0 (fun n h ih => ih) (fun n h ih => ih) n h"
+    );
+    let refused = e
+        .check_source_files(
+            &[b"def beforeMutual := 7", source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.disposition(),
+        ("elaboration", false, 1),
+        "{refused:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    for name in ["beforeMutual", "Even", "reveal"] {
+        assert!(!e.environment().contains(&n(name)));
+    }
+    check(&e, MUTUAL_PREDICATES);
+}
+
 #[test]
 fn source_files_admit_mutual_groups_before_using_their_eliminators() {
     let e = engine();

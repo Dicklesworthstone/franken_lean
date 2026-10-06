@@ -5,7 +5,7 @@
 mod fixtures;
 #[path = "support/safety.rs"]
 mod safety;
-use fixtures::{Fixture, Mutation, fixture, proposition_fixture};
+use fixtures::{Fixture, Mutation, fixture, proposition_fixture, sort_polymorphic_fixture};
 use fln_checker::admit::{
     AdmissionBudget, InductiveRejection, InductiveStop, InductiveSupportLimit, InductiveVerdict,
     admit_inductive, admit_inductive_with,
@@ -638,16 +638,14 @@ fn inconsistent_sorts_and_universe_telescopes_cannot_gain_mutual_admission() {
     // A Prop family beside a Type family: the pin requires one sort per block.
     f.types[1].ty = Expr::sort(Level::zero());
     assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
-    // A block in `Sort u` is Prop at u = 0 and data above it; it stays deferred.
+    // Adding a family universe without supplying it at constructor references
+    // is malformed, independently of Sort u's supported elimination policy.
     let mut f = fixture(false, false, false, 2, Mutation::None);
     f.levels = vec![fixtures::name("u")];
     for t in &mut f.types {
         t.ty = Expr::sort(Level::param(fixtures::name("u")));
     }
-    assert!(matches!(
-        verdict(&rows(&f)),
-        InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
-    ));
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
     let mut f = fixture(true, false, false, 2, Mutation::None);
     f.levels.push(fixtures::name("u"));
     assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
@@ -672,6 +670,109 @@ fn mutual_predicates_eliminate_only_into_prop_with_fields_in_any_universe() {
             generic, indexed, higher, families, mutation,
         ));
     }
+}
+
+#[test]
+fn sort_polymorphic_mutual_families_reconstruct_prop_only_recursors() {
+    for (indexed, higher, families, mutation) in [
+        (false, false, 2, Mutation::None),
+        (true, false, 2, Mutation::None),
+        (false, true, 3, Mutation::None),
+        (true, true, 2, Mutation::MultipleChildren),
+    ] {
+        accepts(&sort_polymorphic_fixture(
+            indexed, higher, families, mutation,
+        ));
+    }
+}
+
+#[test]
+fn sort_polymorphic_mutual_families_preserve_field_bounds_and_rule_checks() {
+    let valid = sort_polymorphic_fixture(false, false, 2, Mutation::None);
+    let mut widened = valid.clone();
+    widened.rec_levels.insert(0, fixtures::name("v"));
+    let mut large = valid.clone();
+    let data = fixture(true, false, false, 2, Mutation::None);
+    large.recs = data.recs;
+    large.rec_levels = data.rec_levels;
+    for f in [widened, large] {
+        assert!(matches!(
+            verdict(&rows(&f)),
+            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+        ));
+    }
+    for mutation in [
+        Mutation::WrongCallFamily,
+        Mutation::SwapMotives,
+        Mutation::MissingInductionHypothesis,
+        Mutation::WrongChildIndex,
+    ] {
+        let result = verdict(&rows(&sort_polymorphic_fixture(true, true, 2, mutation)));
+        assert!(
+            matches!(result, InductiveVerdict::Rejected(_)),
+            "{result:?}"
+        );
+    }
+    // Sort u is not identically Prop: fields in Sort (u+1) cannot borrow the
+    // Prop field-universe exemption. Keep all shared parameter domains aligned
+    // so the failed bound, rather than a telescope mismatch, decides this cell.
+    let mut too_high = valid;
+    for type_ in too_high
+        .types
+        .iter_mut()
+        .map(|t| &mut t.ty)
+        .chain(too_high.ctors.iter_mut().map(|c| &mut c.ty))
+    {
+        *type_ = map_parameter_domain(type_, 0, |_| {
+            Expr::sort(Level::succ(Level::param(fixtures::name("u"))).unwrap())
+        });
+    }
+    let result = verdict(&rows(&too_high));
+    assert!(
+        matches!(
+            result,
+            InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
+        ),
+        "an unproved symbolic field bound remains a typed nonanswer: {result:?}"
+    );
+}
+
+#[test]
+fn sort_polymorphic_mutual_reconstruction_can_be_cancelled_without_publication() {
+    let f = sort_polymorphic_fixture(true, true, 2, Mutation::MultipleChildren);
+    let rs = rows(&f);
+    let base = empty();
+    let mut polls = 0;
+    let complete = admit_inductive_with(
+        &base,
+        &rs,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+        || {
+            polls += 1;
+            false
+        },
+    );
+    assert!(complete.is_admitted(), "{complete:?}");
+    for stop in [1, polls / 2, polls - 1] {
+        let mut observed = 0;
+        let cancelled = admit_inductive_with(
+            &base,
+            &rs,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+            || {
+                observed += 1;
+                observed >= stop
+            },
+        );
+        assert!(
+            matches!(cancelled, InductiveVerdict::Inconclusive(_)),
+            "{cancelled:?}"
+        );
+        assert!(base.find(rs[0].name()).is_none());
+    }
+    assert!(verdict(&rs).is_admitted());
 }
 
 #[test]
