@@ -61,8 +61,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:3972` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3912`/`4519`/`6102` decide
+//!   directly as its verdict — `tc.rs:4005` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3945`/`4552`/`6135` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -72,9 +72,9 @@
 //!   `loose_bvar_range`, `has_fvar`, `has_expr_mvar`, `has_level_mvar`,
 //!   `has_level_param`, `approx_depth`. These are precomputed answers that the
 //!   kernel *skips work* on: `instantiate` returns early when
-//!   `loose_bvar_range() <= k` (`tc.rs:2131`), and the iterative
+//!   `loose_bvar_range() <= k` (`tc.rs:2146`), and the iterative
 //!   `abstract_fvar_set` and `replace_fvar` paths return early when
-//!   `!has_fvar()` (`tc.rs:5635`/`5830`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:5668`/`5863`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -388,7 +388,7 @@
 //! stay green — the tolerance is the distance between occurrences, and it is the reason
 //! `0f2ae0ba` shifted four of AGENTS.md's citations by 45 lines while only two reddened. A row
 //! whose construct recurs must therefore name the item the line sits inside, and that name is
-//! checked. `ExprNode::Sort { level }` occurs **7** times in `tc.rs` and `!e.has_fvar()` **2**,
+//! checked. `ExprNode::Sort { level }` occurs **9** times in `tc.rs` and `!e.has_fvar()` **2**,
 //! which is why exactly those five rows are sited and the other ten are not: where a construct
 //! occurs once, any shift already breaks containment, so a site check there could never fail
 //! and would be decoration reading as coverage.
@@ -402,13 +402,13 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:3972 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:3912 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:4519 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:6102 :: ExprNode::Sort { level } @@ fn finish_infer_proj
-//! cite crates/fln-kernel/src/tc.rs:2131 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:5635 :: !e.has_fvar() || active == 0
-//! cite crates/fln-kernel/src/tc.rs:5830 :: if !e.has_fvar() {
+//! cite crates/fln-kernel/src/tc.rs:4005 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:3945 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:4552 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:6135 :: ExprNode::Sort { level } @@ fn finish_infer_proj
+//! cite crates/fln-kernel/src/tc.rs:2146 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:5668 :: !e.has_fvar() || active == 0
+//! cite crates/fln-kernel/src/tc.rs:5863 :: if !e.has_fvar() {
 //! cite crates/fln-hash/src/canon.rs:1322 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:811 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
@@ -445,6 +445,11 @@
 //! line number, not by shifting the old numbers — a shift assumes they moved together, which is
 //! the assumption that produced the plausible-looking `witness.rs:479 (historical)` this
 //! registry exists to prevent.
+//!
+//! **A third rot, from `7318031d`:** all seven `tc.rs` rows moved (+15 for the
+//! `loose_bvar_range` row, +33 for the rest) and `ExprNode::Sort { level }` grew from 7
+//! occurrences to 9. Re-derived row by row, by construct and by enclosing item, never by
+//! applying the shift.
 #![forbid(unsafe_code)]
 
 pub mod admit;
