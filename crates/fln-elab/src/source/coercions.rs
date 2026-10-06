@@ -43,13 +43,10 @@ impl Context {
     ) -> Result<bool, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
-        // Keep named types when an unknown is assigned, just as constrain_type
-        // does. Eager alias unfolding here would change later class selection.
-        let actual = if matches!(expected.node(), ExprNode::MVar { .. })
-            && matches!(
-                actual.node(),
-                ExprNode::Const { .. } | ExprNode::FVar { .. }
-            ) {
+        // Keep the original carrier when assigning an unknown, including
+        // dependent projections, just as constrain_type does. The pin's quick
+        // assignment precedes delta reduction; class selection observes it.
+        let actual = if matches!(expected.node(), ExprNode::MVar { .. }) {
             actual
         } else {
             self.whnf(&actual)?
@@ -271,7 +268,7 @@ impl Context {
         let result = self.search_instance(id.clone(), &registry);
         self.txn.lctx = saved;
         self.equations = suspended;
-        if result? {
+        if result? == instances::SearchResult::Solved {
             self.instantiate(&hole).map(Some)
         } else {
             Ok(None)

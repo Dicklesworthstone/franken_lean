@@ -497,22 +497,19 @@ impl Context {
             return Err(error(RecordTermError::UnknownField(field.clone())));
         }
         let projection_name = name.append_core(field);
-        let Some(ConstantInfo::Defn(projection)) = self.txn.env.find(&projection_name).cloned()
-        else {
-            return Err(error(RecordTermError::UnknownField(field.clone())));
+        let projection = match self.txn.env.find(&projection_name).cloned() {
+            Some(ConstantInfo::Defn(projection)) if projection.safety == DefinitionSafety::Safe => {
+                projection.base
+            }
+            Some(ConstantInfo::Thm(projection)) => projection.base,
+            _ => return Err(error(RecordTermError::UnknownField(field.clone()))),
         };
-        if projection.safety != DefinitionSafety::Safe
-            || projection.base.level_params.len() != levels.len()
-        {
+        if projection.level_params.len() != levels.len() {
             return Err(error(RecordTermError::UnknownField(field.clone())));
         }
         let mut term = Typed {
             value: Expr::const_(projection_name, levels.clone()),
-            type_: self.instantiate_params(
-                &projection.base.type_,
-                &projection.base.level_params,
-                levels,
-            )?,
+            type_: self.instantiate_params(&projection.type_, &projection.level_params, levels)?,
         };
         params.push(receiver.value);
         for argument in params {
@@ -879,8 +876,29 @@ impl Context {
                 // structural initializer or refund the work it already spent.
                 let mut trial = self.clone();
                 let attempt = (|| {
+                    trial.flush(false)?;
+                    let registry = crate::instances::InstanceRegistry::read_with_scopes(
+                        &trial.txn.env,
+                        &trial.source_scope.instance_scopes,
+                    )
+                    .map_err(instances::registry_error)?;
+                    let saved = trial.txn.lctx.clone();
+                    let suspended = std::mem::take(&mut trial.equations);
                     let hole = trial.instance_hole(domain.clone())?;
-                    trial.resolve_instances(false)?;
+                    let ExprNode::MVar { id } = hole.node() else {
+                        unreachable!("fresh parent instance hole");
+                    };
+                    // Pinned StructInst.trySynthParent uses trySynthInstance:
+                    // a missing optional parent dictionary permits structural
+                    // defaults. It is not a required synthetic instance goal,
+                    // whose concrete failure resolve_instances must report.
+                    if trial.search_instance(id.clone(), &registry)?
+                        != instances::SearchResult::Solved
+                    {
+                        return Ok(None);
+                    }
+                    trial.txn.lctx = saved;
+                    trial.equations.extend(suspended);
                     let value = trial.instantiate(&hole)?;
                     Ok::<_, NatDefinitionElabError>(
                         (!value.has_expr_mvar() && !value.has_level_mvar()).then_some(Typed {

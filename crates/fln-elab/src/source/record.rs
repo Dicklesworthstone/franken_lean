@@ -379,11 +379,7 @@ pub(super) fn elaborate_record_scoped(
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
     declarations.extend(helpers);
-    let mut parent_instances = inheritance.instances;
-    for coercion in context.record_parent_coercions(&spec, &inheritance.parents, budget)? {
-        parent_instances.push(coercion.base.name.clone());
-        declarations.push(Declaration::Defn(coercion));
-    }
+    let parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
     Ok(SourceRecord {
         name: name.clone(),
         is_class,

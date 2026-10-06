@@ -9,6 +9,11 @@ use super::*;
 enum Task {
     Visit(Expr),
     Apply(Expr),
+    Projection {
+        structure: Name,
+        index: u64,
+        receiver: Expr,
+    },
     BinderDomain {
         name: Name,
         domain: Expr,
@@ -60,6 +65,18 @@ impl Context {
                             tasks.push(Task::Apply(a.clone()));
                             tasks.push(Task::Visit(f.clone()));
                         }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            tasks.push(Task::Projection {
+                                structure: struct_name.clone(),
+                                index: *idx,
+                                receiver: expr.clone(),
+                            });
+                            tasks.push(Task::Visit(expr.clone()));
+                        }
                         ExprNode::Lam {
                             binder_name,
                             binder_type,
@@ -94,6 +111,19 @@ impl Context {
                         return Ok(None);
                     };
                     types.push(self.substitute(body, &argument)?);
+                }
+                Task::Projection {
+                    structure,
+                    index,
+                    receiver,
+                } => {
+                    let receiver_type = types.pop().expect("receiver type precedes projection");
+                    let Some(type_) =
+                        self.projection_type(&structure, index, &receiver, &receiver_type)?
+                    else {
+                        return Ok(None);
+                    };
+                    types.push(type_);
                 }
                 Task::BinderDomain {
                     name,
@@ -158,6 +188,125 @@ impl Context {
             return Ok(None);
         }
         Ok(types.pop())
+    }
+
+    /// Pinned `Lean/Meta/InferType.lean::inferProjType`: instantiate the admitted
+    /// constructor telescope, replacing every preceding field by a projection
+    /// of this same receiver. Coercion expansion and other source operations
+    /// can expose these primitive projections, including dependent ones.
+    /// This reconstructs a type only; ordinary declaration admission still
+    /// checks the receiver and every projection.
+    fn projection_type(
+        &mut self,
+        structure: &Name,
+        index: u64,
+        receiver: &Expr,
+        receiver_type: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        use fln_env::constants::ConstantInfo;
+
+        let receiver_type = self.whnf(receiver_type)?;
+        let mut head = &receiver_type;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if name != structure {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name).cloned() else {
+            return Ok(None);
+        };
+        let arity = usize::try_from(u64::from(family.num_params) + u64::from(family.num_indices))
+            .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+        if family.ctors.len() != 1
+            || arguments.len() != arity
+            || levels.len() != family.base.level_params.len()
+        {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&family.ctors[0]).cloned()
+        else {
+            return Ok(None);
+        };
+        if constructor.induct != *structure
+            || constructor.num_params != family.num_params
+            || index >= u64::from(constructor.num_fields)
+            || levels.len() != constructor.base.level_params.len()
+        {
+            return Ok(None);
+        }
+        let mut telescope = self.instantiate_params(
+            &constructor.base.type_,
+            &constructor.base.level_params,
+            levels,
+        )?;
+        for argument in arguments.iter().rev().take(family.num_params as usize) {
+            self.tick()?;
+            telescope = self.whnf(&telescope)?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Ok(None);
+            };
+            telescope = self.substitute(body, argument)?;
+        }
+        for preceding in 0..index {
+            self.tick()?;
+            telescope = self.whnf(&telescope)?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Ok(None);
+            };
+            telescope = self.substitute(
+                body,
+                &Expr::proj(structure.clone(), preceding, receiver.clone()),
+            )?;
+        }
+        telescope = self.whnf(&telescope)?;
+        let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
+            return Ok(None);
+        };
+        self.projection_domain(binder_type.clone()).map(Some)
+    }
+
+    /// `inferProjType` consumes only outer type annotations, not the field's
+    /// own definitions or annotations nested inside a function type.
+    fn projection_domain(&mut self, mut domain: Expr) -> Result<Expr, NatDefinitionElabError> {
+        use fln_core::name::LeafView;
+
+        loop {
+            self.tick()?;
+            let ExprNode::App { f, a } = domain.node() else {
+                return Ok(domain);
+            };
+            domain = match f.node() {
+                ExprNode::Const { name, .. }
+                    if name.parent().is_anonymous()
+                        && matches!(
+                            name.leaf_view(),
+                            LeafView::Str("outParam" | "semiOutParam")
+                        ) =>
+                {
+                    a.clone()
+                }
+                ExprNode::App { f, a } => match f.node() {
+                    ExprNode::Const { name, .. }
+                        if name.parent().is_anonymous()
+                            && matches!(
+                                name.leaf_view(),
+                                LeafView::Str("optParam" | "autoParam")
+                            ) =>
+                    {
+                        a.clone()
+                    }
+                    _ => return Ok(domain),
+                },
+                _ => return Ok(domain),
+            };
+        }
     }
 }
 
@@ -232,6 +381,226 @@ impl Context {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::lctx::LocalDecl;
+    use crate::records::{RecordBudget, RecordSpec, record_declarations};
+    use fln_env::constants::{ConstantVal, DefinitionVal};
+    use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+    fn n(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    fn c(text: &str) -> Expr {
+        Expr::const_(n(text), Vec::new())
+    }
+
+    fn budget() -> Budget {
+        Budget::for_stack_bytes(2 * 1024 * 1024)
+    }
+
+    fn local(name: &str, type_: Expr, index: usize) -> LocalDecl {
+        LocalDecl {
+            id: FVarId(n(name)),
+            user_name: n(name),
+            type_,
+            value: None,
+            binder_info: BinderInfo::Default,
+            index,
+        }
+    }
+
+    fn environment() -> Environment {
+        let mut env = crate::seed::bootstrap_nat_environment(budget()).unwrap();
+        let parameter_sort = Level::param(n("u")).succ().unwrap();
+        let parameter = local("A", Expr::sort(parameter_sort.clone()), 0);
+        let carrier = local("carrier", Expr::sort(Level::one()), 2);
+        let declarations = record_declarations(
+            &RecordSpec {
+                name: n("Packet"),
+                level_params: vec![n("u")],
+                parameters: vec![parameter.clone()],
+                fields: vec![
+                    local("element", Expr::fvar(parameter.id), 1),
+                    carrier.clone(),
+                    local("payload", Expr::fvar(carrier.id), 3),
+                ],
+                result_level: Level::max(parameter_sort, Level::one().succ().unwrap()).unwrap(),
+                is_class: false,
+            },
+            RecordBudget::default(),
+        )
+        .unwrap();
+        for declaration in declarations {
+            let Outcome::Complete(admitted) = admit(&env, declaration, budget()) else {
+                panic!("record fixture did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("record fixture was not accepted");
+            };
+            env = match checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            ) {
+                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                    result,
+                ))) => result.environment,
+                Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+                other => panic!("record fixture publication failed: {other:?}"),
+            };
+        }
+        env
+    }
+
+    fn packet(level: Level, parameter: Expr) -> Expr {
+        Expr::app(Expr::const_(n("Packet"), vec![level]), parameter)
+    }
+
+    fn field(index: u64, receiver: Expr) -> Expr {
+        Expr::proj(n("Packet"), index, receiver)
+    }
+
+    #[test]
+    fn primitive_projection_types_instantiate_parameters_and_earlier_fields() {
+        let env = environment();
+        let mut context = Context::new(&env, budget());
+        let receiver = FVarId(n("p"));
+        context.txn.lctx.add_param(
+            receiver.clone(),
+            n("p"),
+            packet(Level::zero(), c("Nat")),
+            BinderInfo::Default,
+        );
+        let value = Expr::fvar(receiver);
+        assert_eq!(
+            context.known_type(&field(0, value.clone())).unwrap(),
+            Some(c("Nat"))
+        );
+        assert_eq!(
+            context.known_type(&field(1, value.clone())).unwrap(),
+            Some(Expr::sort(Level::one()))
+        );
+        assert_eq!(
+            context.known_type(&field(2, value.clone())).unwrap(),
+            Some(field(1, value))
+        );
+
+        let type_receiver = FVarId(n("types"));
+        context.txn.lctx.add_param(
+            type_receiver.clone(),
+            n("types"),
+            packet(Level::one(), Expr::sort(Level::one())),
+            BinderInfo::Default,
+        );
+        assert_eq!(
+            context
+                .known_type(&field(0, Expr::fvar(type_receiver)))
+                .unwrap(),
+            Some(Expr::sort(Level::one()))
+        );
+    }
+
+    #[test]
+    fn dependent_projection_under_a_binder_reconstructs_a_kernel_checked_type() {
+        let env = environment();
+        let mut context = Context::new(&env, budget());
+        let domain = packet(Level::zero(), c("Nat"));
+        let value = Expr::lam(
+            n("p"),
+            domain.clone(),
+            field(2, Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        let expected = Expr::forall_e(
+            n("p"),
+            domain,
+            field(1, Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        assert_eq!(context.known_type(&value).unwrap(), Some(expected.clone()));
+        assert!(context.txn.lctx.is_empty());
+        let declaration = Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("payload"),
+                level_params: Vec::new(),
+                type_: expected,
+            },
+            value,
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![n("payload")],
+        });
+        assert!(matches!(
+            fln_kernel::check(&env, &declaration, budget()),
+            Outcome::Complete(Verdict::Accepted { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_primitive_projections_do_not_acquire_an_inferred_type() {
+        let env = environment();
+        let mut context = Context::new(&env, budget());
+        let receiver = FVarId(n("p"));
+        context.txn.lctx.add_param(
+            receiver.clone(),
+            n("p"),
+            packet(Level::zero(), c("Nat")),
+            BinderInfo::Default,
+        );
+        let value = Expr::fvar(receiver);
+        for expression in [
+            Expr::proj(n("Other"), 0, value.clone()),
+            field(3, value.clone()),
+            field(u64::MAX, value),
+            field(0, c("Nat.zero")),
+        ] {
+            assert_eq!(context.known_type(&expression).unwrap(), None);
+        }
+        assert!(context.txn.mvars.assignments().is_empty());
+    }
+
+    #[test]
+    fn projection_budget_stops_restore_the_outer_local_context() {
+        let env = environment();
+        let domain = packet(Level::zero(), c("Nat"));
+        let expression = Expr::lam(
+            n("p"),
+            domain,
+            field(2, Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        let make_context = || {
+            let mut context = Context::new(&env, budget());
+            context.txn.lctx.add_param(
+                FVarId(n("ambient")),
+                n("ambient"),
+                c("Nat"),
+                BinderInfo::Default,
+            );
+            context
+        };
+        let mut completed = make_context();
+        assert!(completed.known_type(&expression).unwrap().is_some());
+        let used = completed.txn.budget.heartbeats_consumed;
+        assert!(used > 1);
+        for limit in 1..used {
+            let mut context = make_context();
+            let before = context.txn.lctx.clone();
+            context.txn.budget.max_heartbeats = limit;
+            assert!(context.known_type(&expression).is_err(), "budget {limit}");
+            assert_eq!(context.txn.lctx, before, "budget {limit}");
+            assert!(context.txn.mvars.assignments().is_empty(), "budget {limit}");
+        }
     }
 }
 

@@ -1,8 +1,8 @@
-//! A structure value is not a value of its parent: the pinned Lean has no automatic parent
-//! coercion, and refuses each such use at elaboration with "Type mismatch" (bead fln-azxg,
-//! comment 3217, every verdict below taken from the pinned lean v4.32.0). The parent is
-//! reached by its projection (`c.toBase`). A class's parents are a different mechanism: the
-//! parent projection is an instance, which the pin does have.
+//! Parent projections and explicitly registered conversions match the pin.
+//!
+//! `extends` alone does not install `Coe`/`CoeDep` instances in Lean 4.32.0.
+//! Keep the former automatic-conversion expectations as rejection regressions,
+//! alongside the same value-preservation checks with user-declared instances.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 use fln_core::name::Name;
@@ -29,9 +29,8 @@ fn checked(base: &Engine, text: &str) -> Engine {
     .engine
 }
 
-/// Refused during elaboration with the pin's "Type mismatch", never only by the kernel: an
-/// ill-typed body must not reach K1 as though elaboration had succeeded.
-fn refused_at_elaboration(base: &Engine, text: &str) {
+fn refused(base: &Engine, text: &str) {
+    let before = base.logical_root(&KVMap::new());
     let error = base
         .check_source_files(
             &[text.as_bytes()],
@@ -39,66 +38,91 @@ fn refused_at_elaboration(base: &Engine, text: &str) {
             SourceCheckLimits::new(limits()),
         )
         .expect_err(text);
+    // Retain main's rigid-mismatch diagnostic guarantee as well as refusal.
     assert_eq!(error.disposition().0, "elaboration", "{text}: {error}");
     assert!(
         error.to_string().contains("Type mismatch"),
         "{text}: {error}"
     );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
 }
 
-const BASE_CHILD: &str = "structure Base where\n  value : Nat\nstructure Child extends Base where\n  tag : Nat\ndef c : Child := { value := 37, tag := 9 }\ndef getV (b : Base) : Nat := b.value\n";
+#[test]
+fn structure_extends_does_not_install_automatic_parent_coercions() {
+    let base = checked(
+        &engine(),
+        "structure Base where\n  value : Nat\nstructure Child extends Base where\n  tag : Nat\ndef getValue (b : Base) : Nat := b.value\ndef c : Child := { value := 37, tag := 9 }",
+    );
+    for text in ["def asParent : Base := c", "def result : Nat := getValue c"] {
+        refused(&base, text);
+    }
+    checked(
+        &base,
+        "def asParent : Base := c.toBase\ndef result : Nat := getValue c.toBase\ntheorem result_ok : result = 37 := by rfl\ntheorem cast_ok : asParent.value = 37 := by rfl",
+    );
+    for class in ["Coe", "CoeDep"] {
+        assert!(
+            !InstanceRegistry::read(base.environment())
+                .unwrap()
+                .candidates(&Name::from_components([class]))
+                .iter()
+                .any(|row| row.declaration.parent()
+                    == Name::from_components(["Child", "_parentCoe"]))
+        );
+    }
+}
 
 #[test]
-fn a_child_value_is_not_a_parent_value_without_its_projection() {
-    // The pin: "Type mismatch c has type Child but is expected to have type Base", and
-    // "Application type mismatch" for the argument.
-    refused_at_elaboration(&engine(), &format!("{BASE_CHILD}def asParent : Base := c"));
-    refused_at_elaboration(&engine(), &format!("{BASE_CHILD}def r : Nat := getV c"));
-    // The pin accepts the projection.
+fn registered_parent_coercions_accept_child_values_in_parent_functions() {
     checked(
         &engine(),
-        &format!(
-            "{BASE_CHILD}def asParent : Base := c.toBase\ntheorem t : getV c.toBase = 37 := by rfl"
-        ),
+        "structure Base where\n  value : Nat\nstructure Child extends Base where\n  tag : Nat\ninstance childToBase : Coe Child Base := Coe.mk (fun x => x.toBase)\ndef getValue (b : Base) : Nat := b.value\ndef c : Child := { value := 37, tag := 9 }\ndef asParent : Base := c\ndef result : Nat := getValue c\ntheorem result_ok : result = 37 := by rfl\ntheorem cast_ok : asParent.value = 37 := by rfl",
     );
 }
 
 #[test]
-fn a_grandchild_value_reaches_its_ancestors_only_by_projection() {
-    let family = "structure Base (A : Type) where\n  value : A\nstructure Middle (A : Type) extends Base A where\n  tag : Nat\nstructure Leaf (A : Type) extends Middle A where\n  last : Nat\ndef getV (b : Base Nat) : Nat := b.value\ndef c : Leaf Nat := { value := 19, tag := 23, last := 29 }\n";
-    refused_at_elaboration(
+fn parameterized_and_transitive_parent_coercions_preserve_actual_fields() {
+    let base = checked(
         &engine(),
-        &format!("{family}def toMiddle : Middle Nat := c"),
+        "structure Base (A : Type) where\n  value : A\nstructure Middle (A : Type) extends Base A where\n  tag : Nat\nstructure Leaf (A : Type) extends Middle A where\n  last : Nat\ndef getValue (b : Base Nat) : Nat := b.value\ndef c : Leaf Nat := { value := 19, tag := 23, last := 29 }",
     );
-    refused_at_elaboration(&engine(), &format!("{family}def r : Nat := getV c"));
+    refused(&base, "def asBase : Base Nat := c");
+    refused(&base, "def toMiddle : Middle Nat := c");
     checked(
-        &engine(),
-        &format!(
-            "{family}theorem t : getV c.toBase = 19 := by rfl\ndef toMiddle : Middle Nat := c.toMiddle\ntheorem m : toMiddle.tag = 23 := by rfl"
-        ),
+        &base,
+        "def projectedMiddle : Middle Nat := c.toMiddle\ntheorem projected_base : getValue c.toBase = 19 := by rfl\ntheorem projected_middle : projectedMiddle.tag = 23 := by rfl",
+    );
+    checked(
+        &base,
+        "instance middleToBase (A : Type) : Coe (Middle A) (Base A) := Coe.mk (fun x => x.toBase)\ninstance leafToMiddle (A : Type) : Coe (Leaf A) (Middle A) := Coe.mk (fun x => x.toMiddle)\ntheorem transitive_ok : getValue c = 19 := by rfl\ndef toMiddle : Middle Nat := c\ntheorem middle_ok : toMiddle.tag = 23 := by rfl",
     );
 }
 
 #[test]
-fn a_dependent_parent_is_reached_by_its_projection() {
-    let both = "structure Carrier where\n  carrier : Type\nstructure Value (A : Type) where\n  value : A\nstructure Both extends Carrier, Value carrier where\n  tag : Nat\n";
-    // The pin: "Type mismatch b has type Both … but is expected to have type Value b.carrier".
-    refused_at_elaboration(
+fn dependent_parent_coercions_keep_target_types_tied_to_the_source_value() {
+    // The pin refuses a bare `31` at the semireducible type `b.carrier`
+    // (fln-5efd: OfNat synthesis uses instances transparency). Give the numeral
+    // its own Nat type before conversion, and also check a symbolic receiver
+    // so the dependent parent type cannot be replaced by this fixture's Nat.
+    let base = checked(
         &engine(),
-        &format!("{both}def castV (b : Both) : Value b.carrier := b"),
+        "structure Carrier where\n  carrier : Type\nstructure Value (A : Type) where\n  value : A\nstructure Both extends Carrier, Value carrier where\n  tag : Nat\ndef b : Both := { carrier := Nat, value := 31, tag := 37 }",
+    );
+    refused(&base, "def castParent (x : Both) : Value x.carrier := x");
+    checked(
+        &base,
+        "def castByProjection (x : Both) : Value x.carrier := x.toValue\ntheorem projected_value (x : Both) : (castByProjection x).value = x.value := rfl",
     );
     let result = checked(
-        &engine(),
-        &format!(
-            "{both}def castV (b : Both) : Value b.carrier := b.toValue\ntheorem t (b : Both) : (castV b).value = b.value := rfl"
-        ),
+        &base,
+        "instance bothToValue (x : Both) : CoeDep Both x (Value x.carrier) := CoeDep.mk x.toValue\ndef castParent (x : Both) : Value x.carrier := x\ntheorem dependent_ok : (castParent b).value = (31 : Nat) := by rfl\ntheorem parent_value (x : Both) : (castParent x).value = x.toValue.value := by rfl",
     );
     assert!(
         InstanceRegistry::read(result.environment())
             .unwrap()
             .candidates(&Name::from_components(["CoeDep"]))
             .iter()
-            .any(|row| row.declaration.parent() == Name::from_components(["Both", "_parentCoe"]))
+            .any(|row| row.declaration == Name::from_components(["bothToValue"]))
     );
 }
 
@@ -106,13 +130,13 @@ fn a_dependent_parent_is_reached_by_its_projection() {
 fn failed_parent_conversion_does_not_publish_partial_files_or_instances() {
     let base = checked(
         &engine(),
-        "structure Base where\n  value : Nat\nstructure Other where\n  value : Bool\nstructure Child extends Base where\n  tag : Nat\ndef c : Child := { value := 5, tag := 7 }",
+        "structure Base where\n  value : Nat\nstructure Other where\n  value : Bool\nstructure Child extends Base where\n  tag : Nat\ninstance childToBase : Coe Child Base := Coe.mk (fun x => x.toBase)\ndef c : Child := { value := 5, tag := 7 }",
     );
     let before = base.logical_root(&KVMap::new());
     for text in [
         "def bad : Other := c",
-        "structure Temporary extends Child where\n  more : Nat\ndef bad : Other := c",
-        "def prefix : Base := c\ndef bad : Child := Base.mk 7",
+        "structure Temporary extends Child where\n  more : Nat\ninstance temporaryToChild : Coe Temporary Child := Coe.mk (fun x => x.toChild)\ndef bad : Other := c",
+        "def validPrefix : Base := c\ndef bad : Child := Base.mk 7",
     ] {
         assert!(
             base.check_source_files(
@@ -132,13 +156,17 @@ fn failed_parent_conversion_does_not_publish_partial_files_or_instances() {
         assert!(
             !base
                 .environment()
-                .contains(&Name::from_components(["prefix"]))
+                .contains(&Name::from_components(["validPrefix"]))
+        );
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["temporaryToChild"]))
         );
     }
-    // The pin accepts the projection (and refuses `def valid : Base := c`).
     checked(
         &base,
-        "def valid : Base := c.toBase\ntheorem recovery : valid.value = 5 := by rfl",
+        "def valid : Base := c\ntheorem recovery : valid.value = 5 := by rfl",
     );
 }
 
@@ -151,9 +179,33 @@ fn omitted_class_parent_uses_instances_but_explicit_fields_override_them() {
 }
 
 #[test]
+fn class_parent_dictionary_instances_do_not_install_value_coercions() {
+    let base = checked(
+        &engine(),
+        "class Base where\n  value : Nat\nclass Child extends Base where\n  tag : Nat\ninstance child : Child := { value := 17, tag := 19 }\ndef parentValue [b : Base] : Nat := b.value\ntheorem inferred_parent : parentValue = 17 := by rfl",
+    );
+    assert!(
+        InstanceRegistry::read(base.environment())
+            .unwrap()
+            .candidates(&Name::from_components(["Base"]))
+            .iter()
+            .any(|row| row.declaration == Name::from_components(["Child", "toBase"]))
+    );
+    refused(&base, "def parentFromValue (x : Child) : Base := x");
+}
+
+#[test]
 fn parent_defaults_remain_available_after_failed_instance_search() {
     checked(
         &engine(),
         "class Base where\n  value : Nat := 17\nclass Child extends Base where\n  tag : Nat\ninstance fromDefault : Child := { tag := 19 }\ntheorem fallback : fromDefault.value = 17 := by rfl",
+    );
+}
+
+#[test]
+fn parent_defaults_remain_available_after_failed_instance_prerequisites() {
+    checked(
+        &engine(),
+        "class ParentPrerequisite where\n  witness : Nat\nclass Base where\n  value : Nat := 17\ninstance unavailable [ParentPrerequisite] : Base := Base.mk 99\nclass Child extends Base where\n  tag : Nat\ninstance fromDefault : Child := { tag := 19 }\ntheorem fallback : fromDefault.value = 17 := by rfl",
     );
 }

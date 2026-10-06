@@ -51,7 +51,7 @@ impl Context {
         trial.synth_pending_depth = trial.synth_pending_depth.saturating_add(1);
         let result = trial.search_instance(id.clone(), registry);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
-        if result? {
+        if result? == SearchResult::Solved {
             trial.txn.lctx = locals;
             trial.equations = equations;
             trial.synth_pending_depth = self.synth_pending_depth;

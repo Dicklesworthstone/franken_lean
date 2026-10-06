@@ -16,6 +16,17 @@ const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
 
+/// The pin distinguishes a failed search from a goal whose inputs are still
+/// unknown (`Meta.trySynthInstance`). Only the latter remains pending for
+/// default instances; a concrete failure must never be rescued by broader
+/// default-application conversion (`Elab.synthesizePendingInstMVar`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SearchResult {
+    Solved,
+    Stuck,
+    Failed,
+}
+
 /// The owner of this context's instance holes during one unification request:
 /// the pin's `synthPendingImp`. A stuck hole whose class inputs the request
 /// has determined is solved by the ordinary search below, on a copy holding
@@ -57,7 +68,7 @@ impl<'c> PendingInstances<'c> {
             );
         }
         let registry = self.registry.as_ref().expect("registry read above");
-        if !trial.search_instance(goal.clone(), registry)? {
+        if trial.search_instance(goal.clone(), registry)? != SearchResult::Solved {
             return Ok(None);
         }
         let value = trial.instantiate(&Expr::mvar(goal.clone()))?;
@@ -287,7 +298,7 @@ impl Context {
                 let result = trial.search_instance(id, &registry);
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                 match result {
-                    Ok(true) => {
+                    Ok(SearchResult::Solved) => {
                         trial.txn.lctx = saved;
                         // Resume with the now-available dictionary projections,
                         // without widening class-head matching transparency.
@@ -299,7 +310,10 @@ impl Context {
                         }
                         *self = trial;
                     }
-                    Ok(false) => {}
+                    Ok(SearchResult::Stuck) => {}
+                    Ok(SearchResult::Failed) => {
+                        return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -390,7 +404,7 @@ impl Context {
                         Some(&row.candidate.declaration),
                     );
                     self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
-                    if result? {
+                    if result? == SearchResult::Solved {
                         trial.txn.lctx = saved;
                         trial.equations.extend(suspended);
                         *self = trial;
@@ -695,7 +709,7 @@ impl Context {
         &mut self,
         root: MVarId,
         registry: &InstanceRegistry,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<SearchResult, NatDefinitionElabError> {
         self.search_instance_mode(root, registry, None)
     }
 
@@ -704,7 +718,7 @@ impl Context {
         root: MVarId,
         registry: &InstanceRegistry,
         default: Option<&Name>,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<SearchResult, NatDefinitionElabError> {
         let ambient = self
             .txn
             .mvars
@@ -713,7 +727,7 @@ impl Context {
             .lctx
             .clone();
         let Some(first) = self.instance_frame(root, registry, &ambient, default)? else {
-            return Ok(false);
+            return Ok(SearchResult::Stuck);
         };
         let mut frames = vec![first];
         let mut history = Vec::new();
@@ -811,7 +825,7 @@ impl Context {
                         let failed = frames.pop().expect("current instance frame");
                         self.discard_instance_choices(failed, &mut history)?;
                         if frames.is_empty() {
-                            return Ok(false);
+                            return Ok(SearchResult::Failed);
                         }
                         self.retry_instance_choice(&mut frames, &mut history)?;
                         continue;
@@ -875,7 +889,7 @@ impl Context {
                 table.exhausted(self, &failed, &frames)?;
                 self.discard_instance_choices(failed, &mut history)?;
                 if frames.is_empty() {
-                    return Ok(false);
+                    return Ok(SearchResult::Failed);
                 }
                 self.retry_instance_choice(&mut frames, &mut history)?;
                 continue;
@@ -899,6 +913,6 @@ impl Context {
                 Err(error) => return Err(error),
             }
         }
-        Ok(true)
+        Ok(SearchResult::Solved)
     }
 }

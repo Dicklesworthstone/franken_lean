@@ -13,7 +13,6 @@ pub(super) struct Inheritance {
     pub fields: Vec<LocalDecl>,
     pub aliases: Vec<LocalDecl>,
     pub parents: Vec<RecordParent>,
-    pub instances: Vec<Name>,
     pub labels: HashSet<Name>,
     pub level: Level,
 }
@@ -53,7 +52,6 @@ impl Context {
             fields: Vec::new(),
             aliases: Vec::new(),
             parents: Vec::new(),
-            instances: Vec::new(),
             labels: HashSet::new(),
             level: Level::one(),
         };
@@ -158,9 +156,6 @@ impl Context {
                 .lctx
                 .add_param(id.clone(), label.clone(), completed.value.clone(), style)
                 .clone();
-            if style == BinderInfo::InstImplicit {
-                result.instances.push(record.append_core(&label));
-            }
             result.parents.push(RecordParent {
                 record: record.clone(),
                 field: result.fields.len() as u32,
