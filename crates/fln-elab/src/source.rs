@@ -708,19 +708,15 @@ impl Context {
         // projections. Instance candidate matching retains its narrower policy.
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
-        // Preserve a named type when assigning an unknown expected type; its
-        // identity may determine which class instance is eligible.
-        let actual = if matches!(expected.node(), ExprNode::MVar { .. })
-            && matches!(
-                actual.node(),
-                ExprNode::Const { .. } | ExprNode::FVar { .. }
-            ) {
+        // Assign an unknown expected type before reducing the actual carrier.
+        // This includes dependent projection applications: unfolding their
+        // semireducible receiver here can change later instance selection.
+        let actual = if matches!(expected.node(), ExprNode::MVar { .. }) {
             actual
         } else {
             self.whnf(&actual)?
         };
-        // An unknown type must retain the named target it is assigned. Unfolding
-        // Alias here would make inferInstance accept a non-reducible class head.
+        // Preserve the original target for the reverse assignment as well.
         let expected = if matches!(actual.node(), ExprNode::MVar { .. }) {
             expected
         } else {
@@ -778,7 +774,7 @@ impl Context {
     /// Keep the abbreviation-only solution when it succeeds: eagerly unfolding
     /// named types can change later instance selection. Only ordinary typing
     /// equations that defer or encounter a syntactic occurs check receive one
-    /// safe-definition conversion retry. For example, ?A = Id ?A is reflexive
+    /// default-transparency conversion retry. For example, ?A = Id ?A is reflexive
     /// after delta reduction, not a cyclic assignment. A real cycle still fails
     /// the unchanged occurs check on the retry. Both attempts are transactional
     /// and retain spent work; resource failures and selection queries never retry.
@@ -792,7 +788,7 @@ impl Context {
                 .unify_many_with(pairs, UnificationBudget::new(self.kernel), &|| false);
         if allow_delta && retries_with_delta(&result) {
             let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::SafeDefinitions;
+            budget.transparency = UnificationTransparency::Default;
             result = self.txn.unify_many_with(pairs, budget, &|| false);
         }
         result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
@@ -817,7 +813,7 @@ impl Context {
         let mut result = self.unify_pending(pairs, budget)?;
         if allow_delta && retries_with_delta(&result) {
             let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::SafeDefinitions;
+            budget.transparency = UnificationTransparency::Default;
             result = self.unify_pending(pairs, budget)?;
         }
         Ok(result.map(|report| assert!(report.awakened.is_empty(), "private source queue")))

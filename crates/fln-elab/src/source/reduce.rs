@@ -116,6 +116,16 @@ impl Context {
                                                 .status(name)
                                                 .unfolds_at_instances()
                                     }
+                                    UnificationTransparency::Default => {
+                                        crate::reducibility::table(&self.txn.env)
+                                            .map_err(|error| {
+                                                failure(SourceInferenceError::Unification(
+                                                    Box::new(UnificationError::Reducibility(error)),
+                                                ))
+                                            })?
+                                            .status(name)
+                                            != crate::reducibility::Reducibility::Irreducible
+                                    }
                                     UnificationTransparency::SafeDefinitions => true,
                                 }
                             {

@@ -40,7 +40,10 @@ fn env() -> Environment {
     env
 }
 fn accepted(source: &str) -> Declaration {
-    let result = check_definition_source(source.as_bytes(), &env(), budget())
+    accepted_in(source, &env())
+}
+fn accepted_in(source: &str, environment: &Environment) -> Declaration {
+    let result = check_definition_source(source.as_bytes(), environment, budget())
         .unwrap_or_else(|e| panic!("{source}\n{e:?}"));
     assert!(
         matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),
@@ -73,6 +76,69 @@ fn reflexivity_works_as_a_tactic_and_an_inferred_proof_term() {
 fn rfl_uses_kernel_conversion_not_only_syntax_equality() {
     accepted("theorem reduce (x : Nat) : x = x := let y := x; by exact Eq.refl y");
     accepted("theorem arithmetic : 2 + 3 = 5 := by rfl");
+}
+#[test]
+fn term_reflexivity_computes_explicit_nat_addition() {
+    // fln-b65e records the pinned Reference accepting this term and the two
+    // cases below. `rfl` is an ordinary implicit-argument definition in the
+    // pin (Init/Prelude.lean), so these exercise default term unification.
+    accepted("theorem explicitSum : Nat.add 2 2 = 4 := rfl");
+}
+#[test]
+fn term_reflexivity_computes_overloaded_nat_addition() {
+    accepted("theorem sum : 2 + 2 = 4 := rfl");
+}
+#[test]
+fn term_reflexivity_computes_a_source_definition_value() {
+    let environment = env();
+    let result =
+        check_definition_source(b"def next (n : Nat) : Nat := n + 1", &environment, budget())
+            .unwrap();
+    assert!(matches!(
+        result.outcome,
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    let Outcome::Complete(admitted) = admit(&environment, result.declaration, budget()) else {
+        panic!("definition admission nonanswer");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("definition rejected");
+    };
+    let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(published))) =
+        checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        )
+    else {
+        panic!("definition publication failed");
+    };
+    accepted_in(
+        "theorem nextValue : next 3 = 4 := rfl",
+        &published.environment,
+    );
+}
+#[test]
+fn term_reflexivity_preserves_computation_and_name_scope_controls() {
+    accepted("theorem sum : 2 + 2 = 4 := by rfl");
+    accepted("theorem localWitness (rfl : 2 + 2 = 4) : 2 + 2 = 4 := rfl");
+    for source in [
+        "theorem false : 2 + 2 = 5 := rfl",
+        "theorem false : Nat.add 2 2 = 5 := rfl",
+        "theorem localWitness (rfl : Nat) : 2 + 2 = 4 := rfl",
+        "theorem escape (x y : Nat) : x = y := rfl",
+    ] {
+        let environment = env();
+        match check_definition_source(source.as_bytes(), &environment, budget()) {
+            Err(_) => {}
+            Ok(result) => assert!(
+                !matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                "{source}"
+            ),
+        }
+        assert!(!environment.contains(&Name::from_components(["false"])));
+        assert!(!environment.contains(&Name::from_components(["escape"])));
+    }
 }
 #[test]
 fn equality_premises_and_intro_are_real_proof_terms() {
