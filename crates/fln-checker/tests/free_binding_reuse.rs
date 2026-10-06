@@ -311,17 +311,20 @@ fn every_step_and_reduction_cutoff_remains_inconclusive() {
 
 #[test]
 fn cancellation_at_every_poll_never_publishes_a_success() {
-    let context = context(vec![("f", free("g")), ("g", identity())]);
+    // Each run gets a fresh context, and with it a fresh memo: a result
+    // remembered by an earlier run would answer in fewer polls, so the
+    // cancellation planted at a later poll would never be reached.
+    let fresh = || context(vec![("f", free("g")), ("g", identity())]);
     let input = decoded(&repeated(free("f"), atom("a")));
     let mut total_polls = 0usize;
-    complete(whnf_with(&input, &context, WhnfBudget::unlimited(), || {
+    complete(whnf_with(&input, &fresh(), WhnfBudget::unlimited(), || {
         total_polls += 1;
         false
     }));
     assert!(total_polls > 0);
     for stop_at in 1..=total_polls {
         let mut polls = 0usize;
-        let outcome = whnf_with(&input, &context, WhnfBudget::unlimited(), || {
+        let outcome = whnf_with(&input, &fresh(), WhnfBudget::unlimited(), || {
             polls += 1;
             polls == stop_at
         });
@@ -330,7 +333,51 @@ fn cancellation_at_every_poll_never_publishes_a_success() {
             "poll {stop_at}: {outcome:?}"
         );
     }
-    assert_atom(&repeated(free("f"), atom("a")), &context, &atom("a"));
+    assert_atom(&repeated(free("f"), atom("a")), &fresh(), &atom("a"));
+}
+
+/// The same property for a run the memo answers. One context throughout, so
+/// the first run's result is remembered under its let-bound locals and the
+/// second is served from it: that run polls fewer times, and a cancellation at
+/// each of ITS polls must still never publish a success. The range is taken
+/// from the remembered run's own count, so it cannot go vacuous; and since that
+/// count is non-zero, a cancellation requested before the memo answers is
+/// honoured.
+#[test]
+fn cancellation_at_every_poll_of_a_remembered_run_never_publishes_a_success() {
+    let context = context(vec![("f", free("g")), ("g", identity())]);
+    let input = decoded(&repeated(free("f"), atom("a")));
+    let mut computed_polls = 0usize;
+    let computed = complete(whnf_with(&input, &context, WhnfBudget::unlimited(), || {
+        computed_polls += 1;
+        false
+    }));
+    let mut remembered_polls = 0usize;
+    let remembered = complete(whnf_with(&input, &context, WhnfBudget::unlimited(), || {
+        remembered_polls += 1;
+        false
+    }));
+    assert_eq!(remembered, computed, "the memo returns the computed result");
+    assert!(
+        remembered_polls < computed_polls,
+        "the second run must be served from the memo: {remembered_polls} polls against \
+         {computed_polls}"
+    );
+    assert!(
+        remembered_polls > 0,
+        "a remembered run must still poll for cancellation"
+    );
+    for stop_at in 1..=remembered_polls {
+        let mut polls = 0usize;
+        let outcome = whnf_with(&input, &context, WhnfBudget::unlimited(), || {
+            polls += 1;
+            polls == stop_at
+        });
+        assert!(
+            matches!(outcome, WhnfOutcome::Inconclusive(_)),
+            "poll {stop_at} of {remembered_polls}: {outcome:?}"
+        );
+    }
 }
 
 #[test]
