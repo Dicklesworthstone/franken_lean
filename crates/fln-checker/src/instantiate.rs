@@ -2,10 +2,11 @@
 //!
 //! Substitution is simultaneous: a parameter found in the subject is replaced by
 //! the corresponding value, but parameters inside replacement values are copied
-//! verbatim. That is the KR-105 operation needed before the checker can unfold a
-//! declaration without borrowing K1's heap nodes or substitution implementation.
+//! verbatim. Changed maximum ancestors use the pin's smart constructors; the
+//! untouched subject is not normalized. That is the KR-105 operation needed
+//! before unfolding without borrowing K1's nodes or substitution implementation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::term::{TermBudget, TermLimit, TermStop};
 use crate::wire::{
@@ -149,11 +150,24 @@ impl<'a> Control<'a> {
     }
 }
 
-enum LevelPlan {
-    Ready(LevelNode),
-    Parameter,
-    Meta,
-    Replacement(usize),
+#[derive(Clone, Copy)]
+struct MappedLevel {
+    root: LevelId,
+    changed: bool,
+}
+
+enum BuiltLevel {
+    Existing(LevelId),
+    Fresh(LevelNode),
+}
+
+#[derive(Clone, Copy)]
+struct LevelFacts {
+    /// Identity of the literal structure, never of a normalized/equivalent level.
+    identity: LevelId,
+    base: LevelId,
+    offset: u32,
+    nonzero: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -193,6 +207,8 @@ struct Instantiator<'a, 'c> {
     values: ReplacementValues<'a>,
     control: Control<'c>,
     levels: Vec<LevelNode>,
+    level_facts: Vec<LevelFacts>,
+    level_identities: HashMap<LevelNode, LevelId>,
     /// Each replacement's copied root, once copied.
     replacement_maps: Vec<Option<LevelId>>,
 }
@@ -230,16 +246,18 @@ impl<'a, 'c> Instantiator<'a, 'c> {
             values,
             control,
             levels: Vec::new(),
+            level_facts: Vec::new(),
+            level_identities: HashMap::new(),
             replacement_maps,
         }))
     }
 
     fn prior_level(
-        mapping: &[LevelId],
+        mapping: &[MappedLevel],
         input: InstantiationInput,
         parent: usize,
         child: LevelId,
-    ) -> Result<LevelId, Halt> {
+    ) -> Result<MappedLevel, Halt> {
         if child.index() >= parent {
             return Err(Halt::Fault(InstantiationFault::NonBackwardLevelReference {
                 input,
@@ -261,8 +279,136 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         self.control.admit_arena_node(observed, at)?;
         let id = LevelId::from_index(self.levels.len())
             .ok_or_else(|| self.control.arena_nodes(observed, at))?;
+        // The output stays a literal arena. These auxiliary identities make
+        // structural comparisons and successor/nonzero queries constant-time
+        // without repeatedly traversing shared or deep universe subterms.
+        let (key, successor, nonzero) = match &node {
+            LevelNode::Succ(child) => {
+                let facts = self.facts(*child)?;
+                (
+                    LevelNode::Succ(facts.identity),
+                    // The u32 arena ceiling bounds every successor chain.
+                    Some((facts.base, facts.offset.saturating_add(1))),
+                    true,
+                )
+            }
+            LevelNode::Max(left, right) => {
+                let left = self.facts(*left)?;
+                let right = self.facts(*right)?;
+                (
+                    LevelNode::Max(left.identity, right.identity),
+                    None,
+                    left.nonzero || right.nonzero,
+                )
+            }
+            LevelNode::IMax(left, right) => {
+                let left = self.facts(*left)?;
+                let right = self.facts(*right)?;
+                (
+                    LevelNode::IMax(left.identity, right.identity),
+                    None,
+                    right.nonzero,
+                )
+            }
+            _ => (node.clone(), None, false),
+        };
+        let identity = *self.level_identities.entry(key).or_insert(id);
+        let (base, offset) = successor.unwrap_or((identity, 0));
         self.levels.push(node);
+        self.level_facts.push(LevelFacts {
+            identity,
+            base,
+            offset,
+            nonzero,
+        });
         Ok(id)
+    }
+
+    fn facts(&self, id: LevelId) -> Result<LevelFacts, Halt> {
+        self.level_facts.get(id.index()).copied().ok_or(Halt::Fault(
+            InstantiationFault::MissingLevel {
+                input: InstantiationInput::Subject,
+                index: id.index(),
+            },
+        ))
+    }
+
+    fn node(&self, id: LevelId) -> Result<&LevelNode, Halt> {
+        self.levels
+            .get(id.index())
+            .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
+                input: InstantiationInput::Subject,
+                index: id.index(),
+            }))
+    }
+
+    fn is_zero(&self, id: LevelId) -> Result<bool, Halt> {
+        Ok(matches!(self.node(id)?, LevelNode::Zero))
+    }
+
+    /// The pin's mk_max, not its universe normalizer. In particular, absorption
+    /// inspects only immediate Max children and equality is purely structural.
+    fn rebuild_max(&self, left: LevelId, right: LevelId) -> Result<BuiltLevel, Halt> {
+        let l = self.facts(left)?;
+        let r = self.facts(right)?;
+        if self.is_zero(l.base)? && self.is_zero(r.base)? {
+            return Ok(BuiltLevel::Existing(if l.offset >= r.offset {
+                left
+            } else {
+                right
+            }));
+        }
+        if l.identity == r.identity || self.is_zero(right)? {
+            return Ok(BuiltLevel::Existing(left));
+        }
+        if self.is_zero(left)? {
+            return Ok(BuiltLevel::Existing(right));
+        }
+        if let LevelNode::Max(a, b) = self.node(right)?
+            && (self.facts(*a)?.identity == l.identity || self.facts(*b)?.identity == l.identity)
+        {
+            return Ok(BuiltLevel::Existing(right));
+        }
+        if let LevelNode::Max(a, b) = self.node(left)?
+            && (self.facts(*a)?.identity == r.identity || self.facts(*b)?.identity == r.identity)
+        {
+            return Ok(BuiltLevel::Existing(left));
+        }
+        if l.base == r.base {
+            return Ok(BuiltLevel::Existing(if l.offset > r.offset {
+                left
+            } else {
+                right
+            }));
+        }
+        Ok(BuiltLevel::Fresh(LevelNode::Max(left, right)))
+    }
+
+    /// update_max invokes these constructors only after a child changes.
+    /// Replacement levels are already values and must not enter this route.
+    /// Authority: vendor/lean4-src/src/kernel/level.cpp, mk_max/mk_imax and
+    /// update_max/instantiate. No implementation is shared with the primary.
+    fn rebuild(&self, node: LevelNode) -> Result<BuiltLevel, Halt> {
+        match node {
+            LevelNode::Max(left, right) => self.rebuild_max(left, right),
+            LevelNode::IMax(left, right) => {
+                let l = self.facts(left)?;
+                let r = self.facts(right)?;
+                if r.nonzero {
+                    self.rebuild_max(left, right)
+                } else if self.is_zero(right)?
+                    || self.is_zero(left)?
+                    || (l.offset == 1 && self.is_zero(l.base)?)
+                {
+                    Ok(BuiltLevel::Existing(right))
+                } else if l.identity == r.identity {
+                    Ok(BuiltLevel::Existing(left))
+                } else {
+                    Ok(BuiltLevel::Fresh(LevelNode::IMax(left, right)))
+                }
+            }
+            _ => Ok(BuiltLevel::Fresh(node)),
+        }
     }
 
     fn replacement_root(&self, index: usize) -> Result<LevelId, Halt> {
@@ -359,84 +505,63 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         let mut mapping = Vec::new();
         for index in 0..source.len() {
             self.control.step(index)?;
-            let plan = {
-                let node =
-                    source
-                        .get(index)
-                        .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
-                            input,
-                            index,
-                        }))?;
-                match node {
-                    LevelNode::Zero => LevelPlan::Ready(LevelNode::Zero),
-                    LevelNode::Succ(child) => LevelPlan::Ready(LevelNode::Succ(Self::prior_level(
-                        &mapping, input, index, *child,
-                    )?)),
-                    LevelNode::Max(left, right) => LevelPlan::Ready(LevelNode::Max(
-                        Self::prior_level(&mapping, input, index, *left)?,
-                        Self::prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::IMax(left, right) => LevelPlan::Ready(LevelNode::IMax(
-                        Self::prior_level(&mapping, input, index, *left)?,
-                        Self::prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::Parameter(name) => self
-                        .parameters
-                        .get(name)
-                        .copied()
-                        .map(LevelPlan::Replacement)
-                        .unwrap_or(LevelPlan::Parameter),
-                    LevelNode::Meta(_) => LevelPlan::Meta,
-                }
-            };
-
-            if let LevelPlan::Replacement(value_index) = plan {
-                mapping.push(self.copy_replacement(value_index)?);
+            let node = source
+                .get(index)
+                .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
+                    input,
+                    index,
+                }))?;
+            if let LevelNode::Parameter(name) = node
+                && let Some(value_index) = self.parameters.get(name).copied()
+            {
+                mapping.push(MappedLevel {
+                    root: self.copy_replacement(value_index)?,
+                    // This API carries replacement values, not the pin's
+                    // cross-input allocation identity. Selecting a binding
+                    // rebuilds its ancestor path even for an equal structure.
+                    changed: true,
+                });
                 continue;
             }
-
-            let units = level_owned_units(source.get(index).ok_or(Halt::Fault(
-                InstantiationFault::MissingLevel { input, index },
-            ))?);
-            self.control.output(units, index)?;
-            let node =
-                match plan {
-                    LevelPlan::Ready(node) => node,
-                    LevelPlan::Parameter => {
-                        let LevelNode::Parameter(name) = source.get(index).ok_or(Halt::Fault(
-                            InstantiationFault::MissingLevel { input, index },
-                        ))?
-                        else {
-                            return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                                input,
-                                index,
-                            }));
-                        };
-                        LevelNode::Parameter(name.clone())
-                    }
-                    LevelPlan::Meta => {
-                        let LevelNode::Meta(name) = source.get(index).ok_or(Halt::Fault(
-                            InstantiationFault::MissingLevel { input, index },
-                        ))?
-                        else {
-                            return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                                input,
-                                index,
-                            }));
-                        };
-                        LevelNode::Meta(name.clone())
-                    }
-                    LevelPlan::Replacement(_) => {
-                        return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                            input,
-                            index,
-                        }));
-                    }
-                };
-            let id = self.push_level(node, index)?;
-            mapping.push(id);
+            let (mapped, changed) = match node {
+                LevelNode::Succ(child) => {
+                    let child = Self::prior_level(&mapping, input, index, *child)?;
+                    (LevelNode::Succ(child.root), child.changed)
+                }
+                LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
+                    let left = Self::prior_level(&mapping, input, index, *left)?;
+                    let right = Self::prior_level(&mapping, input, index, *right)?;
+                    let mapped = if matches!(node, LevelNode::Max(..)) {
+                        LevelNode::Max(left.root, right.root)
+                    } else {
+                        LevelNode::IMax(left.root, right.root)
+                    };
+                    (mapped, left.changed || right.changed)
+                }
+                _ => {
+                    self.control.output(level_owned_units(node), index)?;
+                    mapping.push(MappedLevel {
+                        root: self.push_level(node.clone(), index)?,
+                        changed: false,
+                    });
+                    continue;
+                }
+            };
+            let built = if changed {
+                self.rebuild(mapped)?
+            } else {
+                BuiltLevel::Fresh(mapped)
+            };
+            let root = match built {
+                BuiltLevel::Existing(root) => root,
+                BuiltLevel::Fresh(mapped) => {
+                    self.control.output(level_owned_units(node), index)?;
+                    self.push_level(mapped, index)?
+                }
+            };
+            mapping.push(MappedLevel { root, changed });
         }
-        Ok(mapping)
+        Ok(mapping.into_iter().map(|mapped| mapped.root).collect())
     }
 
     fn validate_child(parent: usize, child: ExprId) -> Result<(), Halt> {
