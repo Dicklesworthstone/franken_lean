@@ -1243,6 +1243,10 @@ impl Context {
         }
         enum Task<'a> {
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
+            DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
+            DoBindJoinBody(LocalContext, FVarId, Name, &'a Syntax, Expr),
+            DoBindJoinValue(LocalContext, FVarId, Name, Typed),
+            DoNestedAnnotation(&'a Syntax, Option<Expr>, bool),
             DoAction(&'a [Syntax], Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
@@ -1422,10 +1426,52 @@ impl Context {
                                     tasks.push(Task::Visit(suffix, expected, true));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "nativeDoBindJoin"]) {
+                                    let (name, continuation, body) = do_notation::join_parts(args)?;
+                                    let result_type = match expected {
+                                        Some(expected) => expected,
+                                        None => {
+                                            let sort = self.type_expected()?;
+                                            self.hole(sort)?
+                                        }
+                                    };
+                                    let annotation = do_notation::bind_join_domain(continuation)?;
+                                    tasks.push(Task::DoBindJoinStart(
+                                        name,
+                                        continuation,
+                                        body,
+                                        result_type,
+                                        annotation.is_some(),
+                                    ));
+                                    if let Some(annotation) = annotation {
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "nativeDoNestedAnnotation"]) {
+                                    let [annotation, body] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    tasks.push(Task::DoNestedAnnotation(body, expected, finish));
+                                    tasks.push(Task::Visit(
+                                        annotation,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nativeDoBind"])
                                     || kind == &parser_kind(&["Term", "nativeDoPure"])
+                                    || kind == &parser_kind(&["Term", "nativeDoNestedAction"])
                                 {
-                                    let bind = kind == &parser_kind(&["Term", "nativeDoBind"]);
+                                    let nested =
+                                        kind == &parser_kind(&["Term", "nativeDoNestedAction"]);
+                                    let bind =
+                                        nested || kind == &parser_kind(&["Term", "nativeDoBind"]);
                                     if args.len() != if bind { 2 } else { 1 } {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
@@ -1433,12 +1479,14 @@ impl Context {
                                         Some(type_) => self.do_monad(type_)?,
                                         None => None,
                                     };
-                                    if bind && monad.is_none() {
+                                    if bind && monad.is_none() && !nested {
                                         tasks.push(Task::DoAction(&args[1..], expected));
                                         tasks.push(Task::Visit(&args[0], None, true));
                                     } else {
                                         let function = self.do_operation(bind, monad)?;
-                                        let function = if bind {
+                                        let function = if nested {
+                                            self.do_nested_action_function(function, &args[1])?
+                                        } else if bind {
                                             function
                                         } else {
                                             self.do_pure_result(function, expected.as_ref())?
@@ -2380,6 +2428,7 @@ impl Context {
                                     && !codomain.has_loose_bvar(0)
                                     && let Some(expected) = &expected
                                 {
+                                    self.do_operation_result_hint(&function, &codomain, expected)?;
                                     self.constrain_result_hint(&codomain, expected)?;
                                 }
                                 tasks.push(Task::Argument(
@@ -2595,6 +2644,63 @@ impl Context {
                             );
                             tasks.push(Task::LetBody(saved, id, name, value, false));
                             tasks.push(Task::Visit(body, Some(result_type), true));
+                        }
+                        Task::DoBindJoinStart(name, continuation, body, result_type, annotated) => {
+                            let domain = if annotated {
+                                let annotation = values.pop().expect("nested do binder annotation");
+                                self.sort_level(&annotation)?;
+                                annotation.value
+                            } else {
+                                let sort = self.type_expected()?;
+                                self.hole(sort)?
+                            };
+                            let continuation_type = Expr::forall_e(
+                                Name::anonymous(),
+                                domain,
+                                result_type
+                                    .lift_loose(0, 1)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                                BinderInfo::Default,
+                            );
+                            // Check normal actions against an opaque parameter
+                            // first: their actual results determine its domain.
+                            // No suffix expression guesses a record receiver type.
+                            let saved = self.txn.lctx.clone();
+                            let id = FVarId(self.fresh_name()?);
+                            self.txn.lctx.add_param(
+                                id.clone(),
+                                name.clone(),
+                                continuation_type.clone(),
+                                BinderInfo::Default,
+                            );
+                            tasks.push(Task::DoBindJoinBody(
+                                saved,
+                                id,
+                                name,
+                                continuation,
+                                continuation_type,
+                            ));
+                            tasks.push(Task::Visit(body, Some(result_type), true));
+                        }
+                        Task::DoBindJoinBody(saved, id, name, continuation, continuation_type) => {
+                            let body = values.pop().expect("nested do body visit");
+                            self.flush(false)?;
+                            self.txn.lctx = saved.clone();
+                            // The suffix sees its original lexical scope and the
+                            // domain inferred from normal actions (or annotation).
+                            tasks.push(Task::DoBindJoinValue(saved, id, name, body));
+                            tasks.push(Task::Visit(continuation, Some(continuation_type), true));
+                        }
+                        Task::DoBindJoinValue(saved, id, name, body) => {
+                            let continuation = values.pop().expect("nested do continuation visit");
+                            values.push(body);
+                            tasks.push(Task::LetBody(saved, id, name, continuation, false));
+                        }
+                        Task::DoNestedAnnotation(body, expected, finish) => {
+                            let annotation =
+                                values.pop().expect("dead nested do binder annotation");
+                            self.sort_level(&annotation)?;
+                            tasks.push(Task::Visit(body, expected, finish));
                         }
                         Task::LetValue(name, annotation, body, expected, opaque) => {
                             let mut value = values.pop().expect("let value visit");

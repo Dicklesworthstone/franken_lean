@@ -8,8 +8,6 @@ fn engine() -> Engine {
     checked(
         &super::engine(),
         r#"
-inductive PUnit : Type where
-  | unit
 inductive ForInStep (A : Type) where
   | done (value : A)
   | yield (value : A)

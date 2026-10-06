@@ -77,15 +77,15 @@ fn nested_do_and_shadowing_preserve_their_own_result_monads() {
         &engine(),
         r#"
 def nested : Id Nat := do
-  let n : Nat ← do
+  let n : Nat ← (do
     let n ← (7 : Id Nat)
-    return (n + 1)
+    return (n + 1))
   let n ← (n + 2 : Id Nat)
   return n
 theorem nestedValue : nested = 10 := by rfl
 def privateBind (bind : Nat) : Id Nat := do
   let x ← (bind : Id Nat)
-  (1 : Id Nat)
+  let ignored ← (1 : Id Nat)
   return x
 theorem scopeValue : privateBind 7 = 7 := by rfl
 "#,
@@ -221,7 +221,7 @@ def selected (flag : Bool) : Reader Nat :=
 def nested (flag : Bool) : Id Nat :=
   match flag with
   | true => do
-    let n : Nat ← do return (40 : Nat)
+    let n : Nat ← (do return (40 : Nat))
     return (n + 2)
   | false => do return 7
 theorem readerBranch : selected true 40 = 42 := by rfl

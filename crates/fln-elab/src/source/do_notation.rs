@@ -12,6 +12,8 @@ mod for_loop;
 mod if_let;
 mod loop_returns;
 mod matching;
+mod nested;
+pub(super) use nested::bind_join_domain;
 mod pattern_binding;
 mod returns;
 pub(super) use returns::join_parts;

@@ -46,6 +46,8 @@ struct Block {
     require_unit: bool,
     terminal: bool,
     loop_scope: Option<loop_returns::LoopScope>,
+    completion: Option<Syntax>,
+    nested: bool,
 }
 impl Block {
     fn new(
@@ -64,6 +66,8 @@ impl Block {
             require_unit,
             terminal: true,
             loop_scope,
+            completion: None,
+            nested: false,
         })
     }
 }
@@ -84,6 +88,9 @@ impl Context {
             let Syntax::Node { kind, args, .. } = syntax else {
                 continue;
             };
+            if nested::sequence(syntax).is_some() {
+                return Ok(true);
+            }
             if kind == &parser_kind(&["Term", "doReturn"]) && branch {
                 return Ok(true);
             }
@@ -158,9 +165,12 @@ impl Context {
                 Option<Syntax>,
                 bool,
                 Option<loop_returns::LoopScope>,
+                Option<Syntax>,
+                bool,
             ),
+            FinishNested(Option<(Syntax, Syntax)>),
             FinishLoop(Box<loop_returns::LoopBuild>),
-            Finish(conditional::Header, usize, Option<(Syntax, Syntax)>),
+            Finish(conditional::Header, usize, Option<(Syntax, Syntax)>, bool),
             Value(Syntax),
         }
         let mut work = vec![Task::Block(Block::new(sequence, None, false, None)?)];
@@ -177,7 +187,34 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
-                    if element.kind() == Some(&parser_kind(&["Term", "nativeDoReturningFor"])) {
+                    if nested::sequence(&element).is_some() {
+                        let scope = SequenceScope {
+                            targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
+                            signal: false,
+                            require_unit: block.require_unit,
+                            allow_return: true,
+                        };
+                        let nested = self.prepare_nested_do(
+                            element,
+                            block.result.take(),
+                            block.completion.clone(),
+                            scope,
+                        )?;
+                        let mut inner =
+                            Block::new(nested.sequence, None, false, block.loop_scope.clone())?;
+                        inner.completion = nested.completion;
+                        inner.nested = true;
+                        work.push(Task::Resume(block));
+                        work.push(Task::FinishNested(nested.join));
+                        work.push(Task::Block(inner));
+                    } else if element.kind()
+                        == Some(&parser_kind(&["Term", "nativeDoReturningFor"]))
+                    {
+                        if block.result.is_none()
+                            && let Some(completion) = &block.completion
+                        {
+                            block.result = Some(nested::complete(skip(), completion.clone()));
+                        }
                         let mut element = node(element, "nativeDoReturningFor", 1)?;
                         let (build, sequence, scope, normal) = self.prepare_returning_loop(
                             element.pop().expect("retained loop"),
@@ -196,8 +233,18 @@ impl Context {
                         let suffix = block.result.take();
                         let require_unit = block.require_unit;
                         let loop_scope = block.loop_scope.clone();
+                        let completion =
+                            suffix.is_none().then(|| block.completion.clone()).flatten();
+                        let nested = block.nested;
                         work.push(Task::Resume(block));
-                        work.push(Task::Conditional(element, suffix, require_unit, loop_scope));
+                        work.push(Task::Conditional(
+                            element,
+                            suffix,
+                            require_unit,
+                            loop_scope,
+                            completion,
+                            nested,
+                        ));
                     } else {
                         if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
                             // Only an administrative join can be skipped. Source
@@ -219,12 +266,19 @@ impl Context {
                             require_unit: block.require_unit,
                             allow_return: true,
                         };
-                        block.result = Some(self.prepend_do_element(
-                            element,
-                            block.result,
-                            scope,
-                            terminal,
-                        )?);
+                        let completes = terminal
+                            && block.result.is_none()
+                            && element.kind() == Some(&parser_kind(&["Term", "doExpr"]));
+                        let value =
+                            self.prepend_do_element(element, block.result, scope, terminal)?;
+                        block.result = Some(if completes {
+                            match &block.completion {
+                                Some(completion) => nested::complete(value, completion.clone()),
+                                None => value,
+                            }
+                        } else {
+                            value
+                        });
                         work.push(Task::Block(block));
                     }
                 }
@@ -232,11 +286,29 @@ impl Context {
                     block.result = Some(values.pop().ok_or_else(invalid)?);
                     work.push(Task::Block(block));
                 }
+                Task::FinishNested(join) => {
+                    let body = values.pop().ok_or_else(invalid)?;
+                    values.push(match join {
+                        Some((name, continuation)) if self.do_syntax_uses(&body, &name)? => {
+                            term("nativeDoBindJoin", vec![name, continuation, body])
+                        }
+                        Some((_, continuation)) => match nested::bind_join_domain(&continuation)? {
+                            // The binder belongs to the reachable declaration,
+                            // even when the continuation body is dead. Check its
+                            // explicit type without imposing it on early returns.
+                            Some(annotation) => {
+                                term("nativeDoNestedAnnotation", vec![annotation.clone(), body])
+                            }
+                            None => body,
+                        },
+                        _ => body,
+                    });
+                }
                 Task::FinishLoop(build) => {
                     let body = values.pop().ok_or_else(invalid)?;
                     values.push(self.finish_returning_loop(*build, body)?);
                 }
-                Task::Conditional(syntax, suffix, require_unit, loop_scope) => {
+                Task::Conditional(syntax, suffix, require_unit, loop_scope, completion, nested) => {
                     let branches = conditional::split(self, syntax)?;
                     let require_unit = require_unit || suffix.is_some();
                     let join = suffix
@@ -244,25 +316,40 @@ impl Context {
                         .transpose()?;
                     // Only the constant-size call is copied, never source code.
                     let next = join.as_ref().map(|(name, _)| resume(name));
-                    work.push(Task::Finish(branches.header, values.len(), join));
+                    work.push(Task::Finish(branches.header, values.len(), join, nested));
                     for arm in branches.arms.into_iter().rev() {
                         self.tick()?;
                         work.push(match arm {
-                            Some(sequence) => Task::Block(Block::new(
-                                sequence,
-                                next.clone(),
-                                require_unit,
-                                loop_scope.clone(),
-                            )?),
-                            None => Task::Value(next.clone().unwrap_or_else(skip)),
+                            Some(sequence) => {
+                                let mut block = Block::new(
+                                    sequence,
+                                    next.clone(),
+                                    require_unit,
+                                    loop_scope.clone(),
+                                )?;
+                                block.completion = completion.clone();
+                                block.nested = nested;
+                                Task::Block(block)
+                            }
+                            None => {
+                                Task::Value(next.clone().unwrap_or_else(|| match &completion {
+                                    Some(completion) => {
+                                        nested::complete(skip(), completion.clone())
+                                    }
+                                    None => skip(),
+                                }))
+                            }
                         });
                     }
                 }
-                Task::Finish(header, start, join) => {
+                Task::Finish(header, start, join, nested) => {
                     let bodies = values.split_off(start);
                     let body = self.finish_do_condition(header, bodies)?;
                     values.push(match join {
-                        Some((name, suffix)) => term("nativeDoJoin", vec![name, suffix, body]),
+                        Some((name, suffix)) if !nested || self.do_syntax_uses(&body, &name)? => {
+                            term("nativeDoJoin", vec![name, suffix, body])
+                        }
+                        Some(_) => body,
                         None => body,
                     });
                 }

@@ -286,7 +286,11 @@ impl Context {
             && !self.has_coercion_class("MonadLiftT")?
             && !self.has_coercion_class("Monad")?
         {
-            return self.constrain_type(actual, expected);
+            // Keep the written applications for ordinary unification. Reducing
+            // `Id ?A` first exposes its hole and can assign the entire expected
+            // `Id Nat` to it, changing later numeral/instance selection. The
+            // original equation chooses `?A := Nat` before any delta retry.
+            return self.constrain(actual, expected);
         }
         self.coercion_eq(actual, expected).map(|_| ())
     }

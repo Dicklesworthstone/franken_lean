@@ -124,7 +124,7 @@ fn complete_source_files_register_dictionaries_and_execute_do() {
         &format!(
             "{ID}\ndef nested (seed : Nat) : Id Nat := do\n  let n ← do\n    let n ← (seed : Id Nat)\n    return (n + 1)\n  (10 : Id Nat)\n  let n ← (n + 1 : Id Nat)\n  return n\n#eval nested 40"
         ),
-        "42",
+        "41",
     );
     execute(
         &format!(

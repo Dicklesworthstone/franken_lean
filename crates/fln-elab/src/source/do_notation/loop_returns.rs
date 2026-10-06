@@ -58,6 +58,12 @@ impl Context {
             let Syntax::Node { kind, args, .. } = syntax else {
                 continue;
             };
+            if nested::sequence(syntax).is_some() {
+                // A value-bearing nested element also needs the enclosing
+                // continuation worklist. Keep this loop until that worklist
+                // owns its normal completion, break/continue and return paths.
+                return Ok(true);
+            }
             if kind == &parser_kind(&["Term", "doReturn"])
                 || kind == &parser_kind(&["Term", "nativeDoReturningFor"])
             {

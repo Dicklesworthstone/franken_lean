@@ -81,9 +81,9 @@ def empty : Id Nat := do
 theorem emptyValue : empty = 9 := by rfl
 def separate : Id Nat := do
   for x in true do
-    let value <- do
+    let value <- (do
       if true then return (x + 1)
-      return x
+      return x)
     Pure.pure (f := Id) PUnit.unit
   return 7
 theorem separateValue : separate = 7 := by rfl

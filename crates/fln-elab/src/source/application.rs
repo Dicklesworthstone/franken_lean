@@ -155,6 +155,7 @@ impl Context {
                     && !codomain.has_loose_bvar(0)
                     && let Some(expected) = &state.result_expected
                 {
+                    self.do_operation_result_hint(&state.function, &codomain, expected)?;
                     self.constrain_result_hint(&codomain, expected)?;
                 }
                 return Ok(Some(Argument {

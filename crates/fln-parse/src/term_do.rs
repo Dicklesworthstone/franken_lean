@@ -95,6 +95,19 @@ fn closing(tokens: &[LexedToken], at: usize) -> bool {
         Some(TokenKind::Symbol(s)) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ","))
 }
 
+// A bare `do` in do-element position shares the surrounding control scope.
+// Parenthesized terms retain their wrapper and therefore remain doExpr terms.
+fn do_element(mut value: Syntax) -> Syntax {
+    if let Syntax::Node { kind, .. } = &mut value
+        && kind == &parser_kind(&["Term", "do"])
+    {
+        *kind = parser_kind(&["Term", "doNested"]);
+        value
+    } else {
+        Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value])
+    }
+}
+
 fn is_failure_value(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "nativeDoFailureValue"]))
 }
@@ -338,7 +351,7 @@ impl Prefix {
         value: Syntax,
     ) -> Result<Syntax, NatDefinitionParseError> {
         Ok(match self.statement {
-            Statement::Action => Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]),
+            Statement::Action => do_element(value),
             Statement::Conditional { position } => conditional::element(value, position)?,
             Statement::Match { position } => {
                 if !matches!(&value, Syntax::Node { kind, args, .. }
@@ -534,7 +547,7 @@ impl Prefix {
                 ],
             )
         } else {
-            let action = Syntax::node(parser_kind(&["Term", "doExpr"]), vec![value]);
+            let action = do_element(value);
             let declaration = if let Some(pattern) = self.pattern.take() {
                 Syntax::node(
                     parser_kind(&["Term", "doPatDecl"]),
@@ -809,6 +822,20 @@ mod for_tests {
         assert_eq!(kinds(&parsed.syntax, "doFor"), 2);
         assert_eq!(kinds(&parsed.syntax, "do"), 2);
         assert_eq!(kinds(&parsed.syntax, "doReturn"), 2);
+    }
+
+    #[test]
+    fn bare_nested_elements_and_parenthesized_terms_have_different_kinds() {
+        for (body, ordinary, nested) in [
+            ("let n ← do { return 1 }; return n", 1, 1),
+            ("let n ← (do { return 1 }); return n", 2, 0),
+            ("do { return 1 }", 1, 1),
+        ] {
+            let source = format!("def value : Nat := do {{ {body} }}");
+            let parsed = parse_definition(source.as_bytes()).expect("nested do syntax");
+            assert_eq!(kinds(&parsed.syntax, "do"), ordinary, "{source}");
+            assert_eq!(kinds(&parsed.syntax, "doNested"), nested, "{source}");
+        }
     }
 
     #[test]

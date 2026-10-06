@@ -43,11 +43,11 @@ def nested : Id Nat := do {
   let y : Nat := x + 1;
   return (y + 24);
 }
-theorem nestedValue : nested = 42 := by rfl
+theorem nestedValue : nested = (42 : Nat) := by rfl
 def layout : Id Nat := do
-  let x ← do { return 41 }
+  let x ← (do { return 41 })
   return (x + 1)
-theorem layoutValue : layout = 42 := by rfl
+theorem layoutValue : layout = (42 : Nat) := by rfl
 def map {M : Type -> Type} [Pure M] [Bind M] {A B : Type} (f : A -> B) (action : M A) : M B := do { let x ← action; return (f x) }
 "#,
     );
