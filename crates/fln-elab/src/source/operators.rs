@@ -238,7 +238,7 @@ fn head_constant(e: &Expr) -> Option<Name> {
 /// The pin answers these probes with `try … catch _ => false` (or
 /// `isDefEqGuarded`), which does not catch runtime exhaustion. A resource stop
 /// or an internal fault is therefore never turned into a `false` here.
-fn probe_says_no(error: &NatDefinitionElabError) -> bool {
+pub(super) fn probe_says_no(error: &NatDefinitionElabError) -> bool {
     if nonmatch(error) {
         return true;
     }

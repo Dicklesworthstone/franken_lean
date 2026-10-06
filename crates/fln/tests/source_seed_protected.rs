@@ -144,9 +144,9 @@ fn the_seed_carries_exactly_the_pins_protected_marks() {
 /// Every seed constant the pin marks protected: never the resolution of its atomic
 /// name under `open` of its namespace or inside that namespace, and still reached by
 /// its full name. The control runs the same lookups with no marks, where the atomic
-/// name does reach the declaration inside its namespace, and under `open` too unless a
-/// root constant of that atomic name exists (the seed's root `decEq` beside the
-/// protected `Nat.decEq`), which the resolver takes first either way.
+/// name does reach the declaration: alone, or beside a root constant of that atomic
+/// name (the seed's root `decEq` beside the protected `Nat.decEq` under `open Nat`),
+/// which the pin pools with it as a candidate (bead `fln-wh2j`).
 #[test]
 fn every_protected_seed_declaration_is_held_back_from_its_atomic_name() {
     let engine = seed();
@@ -184,19 +184,11 @@ fn every_protected_seed_declaration_is_held_back_from_its_atomic_name() {
                 "{how} {prefix}: `{last}` must not reach the protected {spelled}: {resolved:?}"
             );
             let control = scope.resolve_with_aliases(&atomic, exists, &aliases, &unmarked);
-            if how == "open" && env.contains(&atomic) {
-                assert_eq!(
-                    control,
-                    Ok(Some(atomic.clone())),
-                    "{how} {prefix}: the root `{last}` is taken first, marked or not"
-                );
-            } else {
-                assert!(
-                    matches!(&control, Ok(Some(found)) if found == name)
-                        || matches!(&control, Err(ScopeError::Ambiguous(_, candidates)) if candidates.contains(name)),
-                    "{how} {prefix}: unmarked, `{last}` reaches {spelled}: {control:?}"
-                );
-            }
+            assert!(
+                matches!(&control, Ok(Some(found)) if found == name)
+                    || matches!(&control, Err(ScopeError::Ambiguous(_, candidates)) if candidates.contains(name)),
+                "{how} {prefix}: unmarked, `{last}` reaches {spelled}: {control:?}"
+            );
             assert_eq!(
                 scope.resolve_with_aliases(name, exists, &aliases, &protected),
                 Ok(Some(name.clone())),

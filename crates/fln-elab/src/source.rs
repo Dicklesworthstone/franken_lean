@@ -32,6 +32,7 @@ pub mod inspect;
 mod matching;
 mod numeric;
 mod operators;
+mod overload;
 mod patterns;
 mod record;
 mod record_terms;
@@ -55,6 +56,23 @@ pub enum SourceInferenceError {
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
+    /// More than one interpretation of an overloaded identifier elaborates against
+    /// the expected type (the pin's `elabAppAux`), listed in the order it tries them.
+    AmbiguousTerm {
+        name: Name,
+        interpretations: Vec<Name>,
+    },
+    /// Every interpretation of an overloaded identifier definitely fails.
+    OverloadFailed {
+        name: Name,
+        failures: Vec<(Name, String)>,
+    },
+    /// An interpretation of an overloaded identifier could be neither established nor
+    /// ruled out here, so none is chosen (`overload.rs`).
+    OverloadUndetermined {
+        name: Name,
+        candidate: Name,
+    },
     /// An unknown name with a proper prefix that is itself a constant (`Nat.nope` when `Nat`
     /// exists). The pin reads the rest as a member of that constant and words it
     /// `Unknown constant`, not `Unknown identifier`. Produced only where an error leaves the
@@ -102,6 +120,15 @@ pub enum SourceInferenceError {
     CdotOutsideParentheses,
 }
 
+/// An interpretation as the pin's message names it: a root declaration as `_root_.x`.
+fn interpretation_name(name: &Name) -> String {
+    if name.parent().is_anonymous() {
+        format!("_root_.{}", name.to_display_string())
+    } else {
+        name.to_display_string()
+    }
+}
+
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -117,6 +144,42 @@ impl std::fmt::Display for SourceInferenceError {
             Self::UnknownMemberConstant(name) => {
                 write!(f, "Unknown constant `{}`", name.to_display_string())
             }
+            // The pin's wording (`elabAppAux`), with each interpretation named as it
+            // names it: a root declaration as `_root_.x`.
+            Self::AmbiguousTerm {
+                name,
+                interpretations,
+            } => {
+                write!(
+                    f,
+                    "Ambiguous term `{}`; Possible interpretations:",
+                    name.to_display_string()
+                )?;
+                for (index, interpretation) in interpretations.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { ", " };
+                    write!(f, "{separator}`{}`", interpretation_name(interpretation))?;
+                }
+                Ok(())
+            }
+            Self::OverloadFailed { name, failures } => {
+                write!(f, "overloaded `{}`, errors:", name.to_display_string())?;
+                for (index, (candidate, reason)) in failures.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { "; " };
+                    write!(
+                        f,
+                        "{separator}`{}`: {reason}",
+                        interpretation_name(candidate)
+                    )?;
+                }
+                Ok(())
+            }
+            Self::OverloadUndetermined { name, candidate } => write!(
+                f,
+                "overloaded `{}`: the interpretation `{}` can be neither established nor \
+                 ruled out here, so none is chosen",
+                name.to_display_string(),
+                interpretation_name(candidate)
+            ),
             Self::InvalidNamedArgument(name) => write!(
                 f,
                 "invalid argument name `{}` for this application",
@@ -273,6 +336,8 @@ struct Context {
     // Nesting of pending instance synthesis started by unification, the pin's
     // `synthPendingDepth`. Bounded by `MAX_SYNTH_PENDING_DEPTH`.
     synth_pending_depth: u8,
+    // Nesting of overload trials (`overload.rs`). Bounded by `MAX_OVERLOAD_DEPTH`.
+    overload_depth: u8,
     level_params: Vec<Name>,
     explicit_levels: usize,
     infer_level_params: bool,
@@ -340,6 +405,7 @@ impl Context {
             stalled_flush: None,
             instance_goals: Vec::new(),
             synth_pending_depth: 0,
+            overload_depth: 0,
             level_params: Vec::new(),
             explicit_levels: 0,
             infer_level_params: false,
@@ -1620,7 +1686,27 @@ impl Context {
                                     continue;
                                 }
                             }
-                            let term = self.atom(syntax, expected.as_ref())?;
+                            let term = match self.atom(syntax, expected.as_ref()) {
+                                Ok(term) => term,
+                                Err(error) => {
+                                    // An identifier naming more than one declaration is
+                                    // overloaded: the pin's `elabAtom` -> `elabAppAux`.
+                                    if finish
+                                        && let Some((name, candidates)) =
+                                            overload::ambiguous_head(&error, syntax)
+                                    {
+                                        values.push(self.overloaded(
+                                            syntax,
+                                            None,
+                                            &name,
+                                            &candidates,
+                                            expected.as_ref(),
+                                        )?);
+                                        continue;
+                                    }
+                                    return Err(error);
+                                }
+                            };
                             values.push(if finish {
                                 // Numerals in this bounded frontend are Nat terms,
                                 // not an excuse to bypass OfNat by coercing them.
@@ -2008,7 +2094,28 @@ impl Context {
                             tasks.push(Task::Proof(proof));
                         }
                         Task::StartApplication(head, arguments, expected, explicit) => {
-                            match self.field_application_receiver(head)? {
+                            let receiver = match self.field_application_receiver(head) {
+                                Ok(receiver) => receiver,
+                                Err(error) => {
+                                    // An overloaded head: every interpretation of the
+                                    // whole application (the pin's `elabAppAux`).
+                                    if !explicit
+                                        && let Some((name, candidates)) =
+                                            overload::ambiguous_head(&error, head)
+                                    {
+                                        values.push(self.overloaded(
+                                            head,
+                                            Some(arguments),
+                                            &name,
+                                            &candidates,
+                                            expected.as_ref(),
+                                        )?);
+                                        continue;
+                                    }
+                                    return Err(error);
+                                }
+                            };
+                            match receiver {
                                 Some(record_terms::FieldReceiver::Syntax(receiver, field)) => {
                                     tasks.push(Task::Projection(
                                         field, arguments, expected, explicit, true,

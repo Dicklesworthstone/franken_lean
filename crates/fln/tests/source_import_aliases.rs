@@ -360,3 +360,133 @@ fn imported_protected_declarations_are_held_back_from_atomic_names() {
         .join()
         .expect("the checking thread completes");
 }
+
+/// Overloaded identifiers against the real `Init.Core` closure (bead `fln-wh2j`): a root
+/// declaration and an opened namespace's one are both interpretations, and the pin's
+/// `elabAppAux` keeps those that elaborate against the expected type. Each program is
+/// the pinned Reference's verdict, run alone after `prelude` and `import Init.Core`
+/// (2026-10-06). Refused: "Ambiguous term foo" with interpretations `_root_.foo : Nat`,
+/// `P.foo : Nat` (and `_root_.foo 1 : Nat`, `P.foo 1 : Nat` for the application).
+const OVERLOAD_AMBIGUOUS: &[&str] = &[
+    "def foo : Nat := 1\nnamespace P\ndef foo : Nat := 2\nend P\nopen P\ndef bar : Nat := foo",
+    "def foo (n : Nat) : Nat := n\nnamespace P\ndef foo (n : Nat) : Nat := n\nend P\nopen P\ndef bar : Nat := foo 1",
+];
+
+/// Accepted by the pin (exit 0), run as above: one interpretation has the expected type,
+/// either by type alone, or through the closure's `Bool` to `Prop` coercion, which the
+/// `Nat` interpretation has no counterpart of. The second element is the declaration the
+/// definition must reference.
+const OVERLOAD_BY_TYPE: &[(&str, &str)] = &[
+    (
+        "def foo : Nat := 1\nnamespace P\ndef foo : Bool := true\nend P\nopen P\ndef bar : Nat := foo",
+        "foo",
+    ),
+    (
+        "def foo (n : Nat) : Nat := n\nnamespace P\ndef foo (_n : Nat) : Bool := true\nend P\nopen P\ndef bar : Nat := foo 1",
+        "foo",
+    ),
+    (
+        "def foo : Bool := true\nnamespace P\ndef foo : Nat := 2\nend P\nopen P\ndef bar : Nat := foo",
+        "P.foo",
+    ),
+    (
+        "def foo : Bool := true\nnamespace P\ndef foo : Nat := 2\nend P\nopen P\ndef bar : Prop := foo",
+        "foo",
+    ),
+];
+
+/// Whether `expr` mentions the constant `name` anywhere.
+fn mentions(expr: &fln_core::expr::Expr, name: &Name) -> bool {
+    use fln_core::expr::ExprNode;
+    let mut pending = vec![expr.clone()];
+    while let Some(expr) = pending.pop() {
+        match expr.node() {
+            ExprNode::Const { name: found, .. } if found == name => return true,
+            ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type.clone(), body.clone()]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                pending.push(expr.clone())
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+#[test]
+fn imported_overloads_are_ambiguous_unless_the_type_chooses_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let (engine, _) = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let root = engine.logical_root(&KVMap::new());
+            for source in OVERLOAD_AMBIGUOUS {
+                let refused = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .expect_err(source);
+                assert_eq!(
+                    refused.disposition().0,
+                    "elaboration",
+                    "{source}: {refused}"
+                );
+                assert!(
+                    refused.to_string().contains(
+                        "Ambiguous term `foo`; Possible interpretations: `_root_.foo`, `P.foo`"
+                    ),
+                    "{source} must be refused as the pin refuses it: {refused}"
+                );
+            }
+            for (source, chosen) in OVERLOAD_BY_TYPE {
+                let checked =
+                    engine.check_source_files(&[source.as_bytes()], &KVMap::new(), limits);
+                assert!(
+                    matches!(checked, Ok(Outcome::Complete(_))),
+                    "{source} must be admitted, as the pin admits it: {checked:?}"
+                );
+                let checked = checked
+                    .expect("admitted")
+                    .into_complete()
+                    .expect("complete");
+                let value = match checked
+                    .engine
+                    .environment()
+                    .find(&Name::from_components(["bar"]))
+                {
+                    Some(fln_env::constants::ConstantInfo::Defn(bar)) => Some(bar.value.clone()),
+                    _ => None,
+                };
+                assert!(value.is_some(), "{source}: bar is admitted as a definition");
+                let value = value.expect("bar is a definition");
+                let chosen = Name::from_components(chosen.split('.'));
+                let other = if chosen == Name::from_components(["foo"]) {
+                    Name::from_components(["P", "foo"])
+                } else {
+                    Name::from_components(["foo"])
+                };
+                assert!(
+                    mentions(&value, &chosen) && !mentions(&value, &other),
+                    "{source}: bar must reference {} and not {}",
+                    chosen.to_display_string(),
+                    other.to_display_string()
+                );
+            }
+            assert_eq!(engine.logical_root(&KVMap::new()), root);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}

@@ -79,7 +79,7 @@ impl Context {
     /// irrelevance or polymorphic conversion. Before inserting a potentially
     /// observable conversion, ask the existing kernel equality query on closed
     /// terms. This grants no declaration authority and retains spent work.
-    fn coercion_kernel_eq(
+    pub(in crate::source) fn coercion_kernel_eq(
         &mut self,
         mut left: Expr,
         mut right: Expr,

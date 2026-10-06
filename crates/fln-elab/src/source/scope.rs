@@ -98,6 +98,25 @@ pub(super) fn is_root_qualified(name: &Name) -> bool {
     first == Name::from_components(["_root_"])
 }
 
+/// `eraseDups` (first occurrence kept), then one answer, none, or every candidate in
+/// the order the pin's elaborator tries them: `resolveGlobalName`'s list reversed.
+fn settle(name: &Name, found: Vec<Name>) -> Result<Option<Name>, ScopeError> {
+    let mut unique: Vec<Name> = Vec::new();
+    for candidate in found {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    match unique.len() {
+        0 => Ok(None),
+        1 => Ok(unique.pop()),
+        _ => {
+            unique.reverse();
+            Err(ScopeError::Ambiguous(name.clone(), unique))
+        }
+    }
+}
+
 impl SourceScope {
     pub fn declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         let parts = components(name)?;
@@ -114,9 +133,7 @@ impl SourceScope {
         }
     }
 
-    /// The current namespace (and its parents) wins before opened namespaces.
-    /// All open candidates are retained: a tie is a refusal, never an arbitrary
-    /// insertion-order choice. Expected-type overload resolution is separate.
+    /// [`Self::resolve_with_aliases`] with no aliases and nothing protected.
     pub fn resolve(
         &self,
         name: &Name,
@@ -130,25 +147,37 @@ impl SourceScope {
         )
     }
 
-    /// [`Self::resolve`], with imported `export` aliases beside declarations and
-    /// imported `protected` declarations held back, as the pin's
-    /// `resolveGlobalName` does (vendored `src/Lean/ResolveName.lean`).
+    /// The pin's `resolveGlobalName` (vendored `src/Lean/ResolveName.lean:194-217`), in
+    /// its three tiers:
     ///
-    /// - It consults `getAliases` at each namespace and in each opened
-    ///   namespace. At one namespace a real declaration (or local) wins; there
-    ///   an alias with two targets is a refusal, never a choice.
-    /// - `resolveQualifiedName` never resolves an atomic identifier `id` to a
-    ///   protected `ns ++ id`, at the current namespace, its parents or an
-    ///   opened namespace, and `getAliases ... (skipProtected := id.isAtomic)`
-    ///   drops protected alias targets. So under `open Nat` the atomic `add`
-    ///   does not reach the protected `Nat.add`, while `Nat.add`, or any other
-    ///   non-atomic name, still does.
-    /// - At the root the pin matches the name exactly, with no protection test
-    ///   (only its aliases are filtered), and `_root_.x` names `x` exactly, as
-    ///   the pin's `resolveExact` does.
+    /// 1. `resolveUsingNamespace`: the current namespace and its parents, innermost
+    ///    first, but never the root. At the first one where `resolveQualifiedName`
+    ///    finds anything, everything it finds there is the answer.
+    /// 2. `resolveExact`: a non-atomic name that names a declaration exactly is that
+    ///    declaration, before any opened namespace (`_root_.x` names `x` exactly).
+    /// 3. Otherwise every candidate is pooled: the root declaration of that name, each
+    ///    opened namespace's `resolveQualifiedName` (`resolveOpenDecls`) and the root
+    ///    aliases (`getAliases`). A root declaration is one candidate among them, never
+    ///    a winner over an opened namespace's: under `open P`, `foo` names both
+    ///    `_root_.foo` and `P.foo`, and only the elaborator's overload resolution by
+    ///    type (`elabAppAux`) may choose.
     ///
-    /// Not modelled: `open X (y)`, `open X hiding y` and `open X renaming`,
-    /// whose explicit names the pin resolves without the protection test.
+    /// `resolveQualifiedName env ns id` is `ns ++ id`, unless an atomic `id` would reach
+    /// a protected declaration that way, followed by the aliases named `ns ++ id`, with
+    /// protected targets dropped when `id` is atomic (`skipProtected := id.isAtomic`).
+    /// So under `open Nat` the atomic `add` does not reach the protected `Nat.add`,
+    /// while `Nat.add`, or any other non-atomic name, still does. The root
+    /// declaration is matched with no protection test, as the pin's
+    /// `containsDeclOrReserved env id` is.
+    ///
+    /// Two or more candidates are [`ScopeError::Ambiguous`], listed in the order the
+    /// pin's elaborator tries and reports them: the reverse of `resolveGlobalName`'s
+    /// list after `eraseDups`, so the root declaration first, then the opened
+    /// namespaces, most recently opened first.
+    ///
+    /// Not modelled: `open X (y)`, `open X hiding y` and `open X renaming`, whose
+    /// explicit names the pin resolves without the protection test, and the
+    /// projection fallback (`loop p (s::projs)`), which field notation handles.
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
@@ -162,51 +191,52 @@ impl SourceScope {
             return Ok(exists(&absolute).then_some(absolute));
         }
         let atomic = parts.len() == 1;
-        // `ns ++ id` for an atomic `id` under a namespace: not when protected.
-        let held_back = |candidate: &Name| atomic && protected.contains(candidate);
-        // `getAliases env (ns ++ id) (skipProtected := id.isAtomic)`.
-        let alias_targets = |candidate: &Name| -> Vec<Name> {
-            aliases
-                .targets(candidate)
-                .iter()
-                .filter(|target| !(atomic && protected.contains(target)))
-                .cloned()
-                .collect()
-        };
+        let qualified =
+            |namespace: &Name, found: &mut Vec<Name>, exists: &mut dyn FnMut(&Name) -> bool| {
+                let candidate = namespace.append_core(name);
+                if !(atomic && protected.contains(&candidate)) && exists(&candidate) {
+                    found.push(candidate.clone());
+                }
+                for target in aliases.targets(&candidate) {
+                    if !(atomic && protected.contains(target)) {
+                        found.push(target.clone());
+                    }
+                }
+            };
+        // 1. `resolveUsingNamespace env id ns`: never the root.
         let mut namespace = self.namespace.clone();
-        loop {
-            let candidate = namespace.append_core(name);
-            let at_root = namespace.is_anonymous();
-            if (at_root || !held_back(&candidate)) && exists(&candidate) {
-                return Ok(Some(candidate));
-            }
-            match alias_targets(&candidate).as_slice() {
-                [] => {}
-                [target] => return Ok(Some(target.clone())),
-                targets => return Err(ScopeError::Ambiguous(name.clone(), targets.to_vec())),
-            }
-            if at_root {
-                break;
+        while !namespace.is_anonymous() {
+            let mut found = Vec::new();
+            qualified(&namespace, &mut found, &mut exists);
+            if !found.is_empty() {
+                return settle(name, found);
             }
             namespace = namespace.parent();
         }
-        let mut candidates = Vec::new();
+        // 2. `resolveExact env id`: only a non-atomic name.
+        if !atomic && exists(name) {
+            return Ok(Some(name.clone()));
+        }
+        // 3. The root declaration, then `resolveOpenDecls` over the open declarations,
+        // most recent first, each prepending what it finds, then the root aliases.
+        let mut found = Vec::new();
+        if exists(name) {
+            found.push(name.clone());
+        }
         for opened in self.opened.iter().rev() {
-            let candidate = opened.append_core(name);
-            if !held_back(&candidate) && exists(&candidate) && !candidates.contains(&candidate) {
-                candidates.push(candidate.clone());
-            }
-            for target in alias_targets(&candidate) {
-                if !candidates.contains(&target) {
-                    candidates.push(target);
-                }
-            }
+            let mut here = Vec::new();
+            qualified(opened, &mut here, &mut exists);
+            here.append(&mut found);
+            found = here;
         }
-        match candidates.len() {
-            0 => Ok(None),
-            1 => Ok(candidates.pop()),
-            _ => Err(ScopeError::Ambiguous(name.clone(), candidates)),
-        }
+        let mut pooled: Vec<Name> = aliases
+            .targets(name)
+            .iter()
+            .filter(|target| !(atomic && protected.contains(target)))
+            .cloned()
+            .collect();
+        pooled.append(&mut found);
+        settle(name, pooled)
     }
 }
 
@@ -223,6 +253,17 @@ impl Context {
         &mut self,
         name: &Name,
     ) -> Result<Option<Name>, NatDefinitionElabError> {
+        self.resolve_source_candidates(name)?
+            .map_err(|candidates| error(ScopeError::Ambiguous(name.clone(), candidates)))
+    }
+
+    /// [`Self::resolve_source_name`], with the candidates of an ambiguous name handed
+    /// back, in the order the pin's elaborator tries them, for overload resolution by
+    /// type (`overload.rs`) rather than refused here.
+    pub(super) fn resolve_source_candidates(
+        &mut self,
+        name: &Name,
+    ) -> Result<Result<Option<Name>, Vec<Name>>, NatDefinitionElabError> {
         // The scope is externally supplied through the embeddable API as well.
         // Charge its complete search width before scanning even an empty env.
         for _ in 0..self
@@ -253,20 +294,45 @@ impl Context {
         let atomic = components(name).map_err(error)?.len() == 1;
         let held_back_recursion =
             |candidate: &Name| atomic && self.protected_declaration.as_ref() == Some(candidate);
-        self.source_scope
-            .resolve_with_aliases(
-                name,
-                |candidate| {
-                    self.txn.env.contains(candidate)
-                        || self.txn.lctx.find_by_user_name(candidate).is_some()
-                        || self.recursion.as_ref().is_some_and(|r| {
-                            &r.name == candidate && !held_back_recursion(candidate)
-                        })
-                },
-                &aliases,
-                &protected,
-            )
-            .map_err(error)
+        // The declaration being defined is a local of its own body at the pin (the
+        // auxiliary declaration `elabMutualDef` adds), before its recursion context
+        // exists here: `namespace A` / `def foo : Nat := foo` names `A.foo`, never a
+        // root `foo`, and `open P` never makes `foo` mean `P.foo` there.
+        let local = |candidate: &Name| {
+            self.txn.lctx.find_by_user_name(candidate).is_some()
+                || self
+                    .recursion
+                    .as_ref()
+                    .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
+                || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
+        };
+        // Locals first: the pin's `resolveLocalName` runs before `resolveGlobalName`
+        // (vendored `src/Lean/Elab/Term.lean`, `resolveName`), so a local, or the
+        // declaration's own recursive reference, named at the current namespace or a
+        // parent is never one candidate among globals. `_root_.x` names no local.
+        if !is_root_qualified(name) {
+            let mut namespace = self.source_scope.namespace.clone();
+            loop {
+                let candidate = namespace.append_core(name);
+                if local(&candidate) {
+                    return Ok(Ok(Some(candidate)));
+                }
+                if namespace.is_anonymous() {
+                    break;
+                }
+                namespace = namespace.parent();
+            }
+        }
+        match self.source_scope.resolve_with_aliases(
+            name,
+            |candidate| self.txn.env.contains(candidate) || local(candidate),
+            &aliases,
+            &protected,
+        ) {
+            Ok(found) => Ok(Ok(found)),
+            Err(ScopeError::Ambiguous(_, candidates)) => Ok(Err(candidates)),
+            Err(other) => Err(error(other)),
+        }
     }
 
     /// The pin's `mkDeclName` for a `protected` declaration (vendored
@@ -487,8 +553,19 @@ mod tests {
         };
         // A root alias, as `export Decidable (decide)` in the root namespace.
         assert_eq!(resolve("decide").unwrap(), Some(n("Decidable.decide")));
-        // At one namespace the real declaration wins over an alias there.
-        assert_eq!(resolve("mine").unwrap(), Some(n("Outer.mine")));
+        // At one namespace a declaration and an alias there are both candidates
+        // (`resolveQualifiedName` returns `resolvedId :: aliases`), listed alias
+        // first as the pin reports them. Pinned `lean` v4.32.0, 2026-10-06:
+        // `namespace Outer` / `def neg : Nat := 2` / `export Other (neg)` /
+        // `def x : Nat := neg` is "Ambiguous term neg", interpretations
+        // `Other.neg`, `Outer.neg`.
+        assert_eq!(
+            resolve("mine"),
+            Err(ScopeError::Ambiguous(
+                n("mine"),
+                vec![n("Bool.not"), n("Outer.mine")]
+            ))
+        );
         // An alias in an opened namespace is a candidate like a declaration.
         assert_eq!(resolve("neg").unwrap(), Some(n("Other.not")));
         // Two targets for one alias are a refusal, never a choice.
@@ -499,6 +576,68 @@ mod tests {
         assert_eq!(
             scope.resolve(&n("decide"), |x| env.contains(x)).unwrap(),
             None
+        );
+    }
+
+    /// The pin's `resolveGlobalName` tiers (vendored `src/Lean/ResolveName.lean:194-217`,
+    /// bead `fln-wh2j`): the current namespace and its parents first, never the root;
+    /// then a non-atomic name exactly; then the root declaration pooled with every opened
+    /// namespace's, listed root first and then most recently opened first, as the pin
+    /// lists "Possible interpretations" (pinned `lean` v4.32.0, 2026-10-06: `open P`,
+    /// `open Q` gives `_root_.foo`, `Q.foo`, `P.foo`).
+    #[test]
+    fn a_root_declaration_is_one_candidate_among_the_opened_ones() {
+        let env = ["foo", "P.foo", "Q.foo", "A.foo", "Q.P.foo", "R.only"]
+            .into_iter()
+            .fold(fln_env::environment::Environment::new(), |env, name| {
+                env.add_decl(fln_env::constants::ConstantInfo::Axiom(
+                    fln_env::constants::AxiomVal {
+                        base: fln_env::constants::ConstantVal {
+                            name: n(name),
+                            level_params: Vec::new(),
+                            type_: fln_core::expr::Expr::sort(fln_core::level::Level::one()),
+                        },
+                        is_unsafe: false,
+                    },
+                ))
+                .unwrap()
+            });
+        let scope = |namespace: &str, opened: &[&str]| SourceScope {
+            namespace: if namespace.is_empty() {
+                Name::anonymous()
+            } else {
+                n(namespace)
+            },
+            opened: opened.iter().map(|name| n(name)).collect(),
+            ..SourceScope::default()
+        };
+        let resolve =
+            |scope: &SourceScope, name: &str| scope.resolve(&n(name), |x| env.contains(x));
+        // The root declaration and an opened one: both, root first.
+        assert_eq!(
+            resolve(&scope("", &["P"]), "foo"),
+            Err(ScopeError::Ambiguous(n("foo"), vec![n("foo"), n("P.foo")]))
+        );
+        // Two opened namespaces: the most recently opened is listed first.
+        assert_eq!(
+            resolve(&scope("", &["P", "Q"]), "foo"),
+            Err(ScopeError::Ambiguous(
+                n("foo"),
+                vec![n("foo"), n("Q.foo"), n("P.foo")]
+            ))
+        );
+        // A name only an opened namespace provides, and one only the root provides.
+        assert_eq!(resolve(&scope("", &["R"]), "only"), Ok(Some(n("R.only"))));
+        assert_eq!(resolve(&scope("", &["R"]), "foo"), Ok(Some(n("foo"))));
+        // The current namespace is found before the root and the opened namespaces.
+        assert_eq!(resolve(&scope("A", &["P"]), "foo"), Ok(Some(n("A.foo"))));
+        // A non-atomic name naming a declaration exactly is that declaration, before
+        // an opened namespace's `Q.P.foo` (`resolveExact`).
+        assert_eq!(resolve(&scope("", &["Q"]), "P.foo"), Ok(Some(n("P.foo"))));
+        // `_root_.foo` names `foo` exactly.
+        assert_eq!(
+            resolve(&scope("", &["P"]), "_root_.foo"),
+            Ok(Some(n("foo")))
         );
     }
 
