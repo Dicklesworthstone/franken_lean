@@ -10694,6 +10694,30 @@ impl SourceFinalValue {
     }
 }
 
+/// The pin's `String.quote` (`Init/Data/Repr.lean:400`), which `#eval` prints a `String` with:
+/// each character through `Char.quoteCore` with `inString := true`. `\n`, `\t`, `\\` and `"`
+/// take a backslash escape; any other character up to U+001F, and U+007F, is `\x` and two
+/// lowercase hex digits; everything else, non-ASCII included, is written as itself. Rust's
+/// `{:?}` differs on `\r`, `\0`, the other control characters and some non-ASCII characters.
+fn lean_string_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            control if u32::from(control) <= 31 || control == '\x7f' => {
+                quoted.push_str(&format!("\\x{:02x}", u32::from(control)));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// The pin's `#eval` prints a `List` through `List.repr`, a fill layout at width 120: flat when
 /// the whole rendering fits in 120 columns (measured at 118 through 122), wrapped otherwise.
 /// Only the flat layout is implemented, so a wider list is refused rather than printed in a
@@ -10705,7 +10729,7 @@ impl std::fmt::Display for SourceFinalValue {
         match self {
             Self::Float(value) => write!(formatter, "{value}"),
             Self::Nat(value) => write!(formatter, "{value}"),
-            Self::String(value) => write!(formatter, "{value:?}"),
+            Self::String(value) => formatter.write_str(&lean_string_quote(value)),
             Self::Bool(value) => write!(formatter, "{value}"),
             // `List.repr`'s flat layout: `[a, b, c]`.
             Self::List(items) => {
@@ -15554,6 +15578,36 @@ mod tests {
             .expect_err("a forged name cannot escape the selected source root");
         assert_eq!(error.class(), "input");
         assert!(error.to_string().contains("one normalized path segment"));
+    }
+
+    #[test]
+    fn lean_personality_quotes_strings_as_the_pin_does() {
+        // Each expected line is the pinned lean v4.32.0's stdout for the same one-command file,
+        // captured 2026-10-06 (`String.quote`, `Init/Data/Repr.lean:400`).
+        for (source, quoted) in [
+            (r#"#eval "a\nb""#, r#""a\nb""#),
+            (r#"#eval "a\tb""#, r#""a\tb""#),
+            (r#"#eval "a\\b""#, r#""a\\b""#),
+            (r#"#eval "a\"b""#, r#""a\"b""#),
+            ("#eval \"λé\"", "\"λé\""),
+            (r#"#eval "a\x01b""#, r#""a\x01b""#),
+            (r#"#eval "a\rb""#, r#""a\x0db""#),
+            (r#"#eval "a\x7fb""#, r#""a\x7fb""#),
+            (r#"#eval "a\x00b""#, r#""a\x00b""#),
+            ("#eval \"a\u{200b}b\"", "\"a\u{200b}b\""),
+            (r#"#eval "it's""#, r#""it's""#),
+            (r#"#eval ["a\nb", "c\x1fd"]"#, r#"["a\nb", "c\x1fd"]"#),
+        ] {
+            let evaluated = super::execute_source_bytes_with_publisher_and_presentation(
+                vec![source.as_bytes().to_vec()],
+                None,
+                SourcePublication::None,
+                SourcePresentation::Lean,
+                |_, _| Ok::<(), std::io::Error>(()),
+            );
+            assert_eq!(evaluated.exit_code, 0, "{source}: {}", evaluated.stderr);
+            assert_eq!(evaluated.stdout, format!("{quoted}\n"), "{source}");
+        }
     }
 
     #[test]
