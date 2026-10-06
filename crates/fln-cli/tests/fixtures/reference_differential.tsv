@@ -21,7 +21,7 @@ crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	rejec
 crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	accept	match	agree	both FrankenLean doors now accept (measured 2026-10-06 at 5a3ff40e)
-crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean	accept	accept	match	agree	both FrankenLean doors accept and the output matches the pin, as observed at eb465592 (it moved with main's 2026-10-06 source work; the row had not)
 crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 examples/native_closure_data.lean	accept	accept	match	agree	agrees since fln-ffce renamed the `prefix` binder, a keyword at the pin (it was reserved keyword accepted as identifier, franken_lean-z8j.1.6.2)
 examples/native_collection_notation.lean	accept	accept	match	agree	
@@ -107,7 +107,7 @@ examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 45: fa
 examples/native_recursive_data.lean	accept	accept	match	agree	
 examples/native_refinement.lean	reject	accept	n/a	fln-defect	Reference 26: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4; the transport at 48 now uses `cases h`, since `subst` on an HEq whose types differ is refused here as at the pin
 examples/native_scoped_instances.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
-examples/native_scopes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_scopes.lean	accept	accept	match	agree	the drop-in door accepts too and the output matches the pin, as observed at eb465592 (namespaces, sections and `open` reached the drop-in door in 11a87a28; the row had not moved)
 examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_section_records.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_simp_all.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
