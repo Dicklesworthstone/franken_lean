@@ -416,6 +416,167 @@ impl Probe<'_> {
             });
         self.whnf_result(result)
     }
+    /// The next pair of comparands, reduced as the pin's `is_def_eq_core`
+    /// reduces a pair it has not decided: `whnf_core` first, then lazy delta
+    /// (`lazy_delta_reduction`, vendored type_checker.cpp:903-1029), which
+    /// unfolds one definition at a time: the side whose definition is higher,
+    /// or both at equal heights (`compare`, declaration.cpp:24; an abbreviation
+    /// is the highest, [`crate::environment::ReducibilityHint::delta_height`]).
+    /// It stops where the pin would compare arguments first, two applications
+    /// of one regular definition not found incongruent before (:936-946), and
+    /// returns that pair to the worklist, flagged, for congruence to decide it
+    /// with types; it returns as well where the sides meet. Taking each side's WHNF passes such a
+    /// pair unseen: on
+    /// `Char.succ?_eq._proof_1_12`, the pin unfolds `x + 2048` at `UInt32`
+    /// through `HAdd.hAdd` and `Add.add` to `UInt32.add`, whose arguments differ
+    /// only in a proof, while a WHNF reached `UInt32.ofBitVec` and then
+    /// `Nat.add`'s recursion on 2048, one `Nat.succ` per round of this lane.
+    /// Where lazy delta has no step left, each side still takes its comparand
+    /// WHNF, as before: it computes a closed Nat operation, as the pin's
+    /// `reduce_nat` does (:1007-1012), and unfolds a theorem, which the pin's
+    /// `is_delta` would unfold at the lowest height and this checker's delta
+    /// does not.
+    fn lazy_delta_step(
+        &mut self,
+        left: &WireExpr,
+        right: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<(WireExpr, WireExpr, bool)>> {
+        let budget = self.budget.whnf;
+        let core = |probe: &mut Self, term: &WireExpr| {
+            let result = crate::whnf::whnf_core_at_with(
+                term,
+                term.root(),
+                context.reduction(),
+                budget,
+                &mut || probe.poll(),
+            );
+            probe.whnf_result(result)
+        };
+        let (Some(mut l), Some(mut r)) = (core(self, left)?, core(self, right)?) else {
+            return Ok(None);
+        };
+        if l != *left || r != *right {
+            return Ok(Some((l, r, false)));
+        }
+        let nat_operation =
+            |term: &WireExpr| crate::nat_reduce::is_potential_nat_reduction(term, term.root());
+        loop {
+            self.tick()?;
+            if nat_operation(&l) || nat_operation(&r) {
+                break;
+            }
+            let (left_height, left_projection) = Self::delta_height(&l, context);
+            let (right_height, right_projection) = Self::delta_height(&r, context);
+            // With one side alone unfolding, the pin's steps reach no shared
+            // head before that side's own weak head normal form, whose head
+            // does not unfold either: the comparand WHNF below takes them at
+            // once.
+            let (Some(a), Some(b)) = (left_height, right_height) else {
+                break;
+            };
+            let (mut step_left, mut step_right) = (a >= b, b >= a);
+            // With one side headed by a definition and the other by a
+            // projection, the pin reduces the projection side first
+            // (`try_unfold_proj_app`, :911-928), and unfolds the definition
+            // only when that changes nothing.
+            if left_projection != right_projection {
+                let projection = if left_projection { &l } else { &r };
+                let Some(reduced) = self.delta_step(projection, context)? else {
+                    return Ok(None);
+                };
+                if reduced == *projection {
+                    (step_left, step_right) = (right_projection, left_projection);
+                } else if left_projection {
+                    l = reduced;
+                    (step_left, step_right) = (false, false);
+                } else {
+                    r = reduced;
+                    (step_left, step_right) = (false, false);
+                }
+            }
+            let (before_left, before_right) = (step_left, step_right);
+            if step_left {
+                let Some(next) = self.delta_step(&l, context)? else {
+                    return Ok(None);
+                };
+                step_left = next != l;
+                l = next;
+            }
+            if step_right {
+                let Some(next) = self.delta_step(&r, context)? else {
+                    return Ok(None);
+                };
+                step_right = next != r;
+                r = next;
+            }
+            // A step that changes neither side ends lazy delta here, as the pin's
+            // `unfold_definition` failing does (`DefUnknown`).
+            if (before_left || before_right) && !step_left && !step_right {
+                break;
+            }
+            if l == r {
+                return Ok(Some((l, r, false)));
+            }
+            if self.compares_arguments_first(&l, context)
+                && self.same_head_arguments(&l, &r)?.is_some()
+                && !self.incongruent.contains(&l, &r)
+            {
+                return Ok(Some((l, r, true)));
+            }
+        }
+        let Some(l) = self.whnf_comparand(&l, context)? else {
+            return Ok(None);
+        };
+        let Some(r) = self.whnf_comparand(&r, context)? else {
+            return Ok(None);
+        };
+        Ok(Some((l, r, false)))
+    }
+    /// One delta step: the definition at `term`'s head unfolds once (through a
+    /// projection, the one at its structure's head), then `whnf_core`.
+    fn delta_step(
+        &mut self,
+        term: &WireExpr,
+        context: &InferenceContext,
+    ) -> Result<Option<WireExpr>> {
+        let budget = self.budget.whnf;
+        let result = crate::whnf::whnf_delta_step_at_with(
+            term,
+            term.root(),
+            context.reduction(),
+            budget,
+            &mut || self.poll(),
+        );
+        self.whnf_result(result)
+    }
+    /// The height of the definition a delta step on `term` unfolds, `None`
+    /// when its head does not unfold, and whether the head is a projection,
+    /// whose step unfolds its structure's head (as the untyped converter's
+    /// `definition_height_through`).
+    fn delta_height(term: &WireExpr, context: &InferenceContext) -> (Option<u32>, bool) {
+        let mut id = term.root();
+        let mut through_projection = false;
+        loop {
+            match term.node(id) {
+                Some(ExprNode::Apply { function, .. }) => id = *function,
+                Some(ExprNode::Metadata { expression, .. }) => id = *expression,
+                Some(ExprNode::Projection { expression, .. }) => {
+                    through_projection = true;
+                    id = *expression;
+                }
+                Some(ExprNode::Constant { name, .. }) => {
+                    let height = context
+                        .constants()
+                        .find(name)
+                        .and_then(|constant| context.reduction().delta_body(constant))
+                        .map(|body| body.hint().delta_height());
+                    return (height, through_projection);
+                }
+                _ => return (None, through_projection),
+            }
+        }
+    }
     fn whnf_result(&mut self, result: WhnfOutcome) -> Result<Option<WireExpr>> {
         self.check_stop()?;
         match result {
@@ -1253,6 +1414,9 @@ impl Probe<'_> {
         // abandoning it can give those tasks back.
         let mut trail: Vec<(Taken, WireExpr, WireExpr)> = Vec::new();
         let mut attempts = 0_usize;
+        // The pairs `lazy_delta_step` stopped at, for congruence.
+        let mut unfolded: std::collections::HashSet<(WireExpr, WireExpr)> =
+            std::collections::HashSet::new();
         'work: while let Some(task) = work.pop() {
             // A task that does not hold fails the innermost open congruence
             // attempt, whose pair then takes the other rules; outside every
@@ -1457,31 +1621,40 @@ impl Probe<'_> {
             // type_checker.cpp:1117, 1121): untyped, two proofs can only be
             // compared by reducing them, and a transport along an `omega`
             // equation cost `PartialMatch.isLongestMatchAt` its whole budget.
-            if let Some(lt) = self.proof_type(&left, &context)?
+            // A pair lazy delta stopped at is an unfolding of one these rules
+            // have already taken: it has the same type, and the untyped
+            // conversion has been asked of its source. When its congruence
+            // fails, the pin records the failure and unfolds on (:941-950),
+            // and so does this lane, without asking those rules again.
+            let unfolded_here = unfolded.contains(&(left.clone(), right.clone()));
+            if !unfolded_here
+                && let Some(lt) = self.proof_type(&left, &context)?
                 && let Some(rt) = self.proof_type(&right, &context)?
             {
                 work.push(Work::Pair(lt, rt, context));
                 continue;
             }
-            if !skip {
+            if !skip && !unfolded_here {
                 match self.equal(&left, &right, &context)? {
                     Some(true) => continue,
                     Some(false) => fail!(),
                     None => {}
                 }
             }
-            if let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)? {
+            if !unfolded_here
+                && let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)?
+            {
                 work.push(Work::Pair(lt, rt, context));
                 continue;
             }
-            let Some(l) = self.whnf_comparand(&left, &context)? else {
-                fail!()
-            };
-            let Some(r) = self.whnf_comparand(&right, &context)? else {
+            let Some((l, r, stopped)) = self.lazy_delta_step(&left, &right, &context)? else {
                 fail!()
             };
             // A changed head may expose ordinary conversion or proof evidence.
             if l != left || r != right {
+                if stopped {
+                    unfolded.insert((l.clone(), r.clone()));
+                }
                 work.push(Work::Pair(l, r, context));
                 continue;
             }

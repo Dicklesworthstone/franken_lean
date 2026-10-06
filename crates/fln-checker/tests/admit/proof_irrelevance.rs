@@ -1098,3 +1098,75 @@ fn the_typed_lane_answers_a_repeated_pair_without_walking_it_again() {
          of the repeated pair ({walk} each): the typed lane walked it again"
     );
 }
+
+fn hinted(name: &str, declared: Expr, body: Expr, hint: ReducibilityHint) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            decoded(&declared),
+            ConstantSafety::Safe,
+            DefinitionBody::new(decoded(&body), hint, DefinitionSafety::Safe, Vec::new()),
+        ),
+    )
+}
+
+/// The typed lane reduces a pair it has not decided as the pin's lazy delta
+/// does, one definition at a time, and stops where the pin compares arguments
+/// first: two applications of one regular definition (vendored
+/// type_checker.cpp:936). `Ab q` against `Ab p`, `Ab` an abbreviation of the
+/// regular `R`, whose body reaches the type former `U` only through a chain of
+/// `LENGTH` regular definitions: one step on each side gives `R q ≟ R p`, which
+/// congruence and proof irrelevance close. Each side's WHNF instead passes `R`
+/// and walks the whole chain, more than the lane's WHNF budget allows here, as
+/// on `Char.succ?_eq._proof_1_12` the WHNF passed `UInt32.add` and walked
+/// `Nat.add`'s recursion on 2048 (bead `fln-checker-associator-time-y8wc`).
+#[test]
+fn the_typed_lane_unfolds_lazily_to_a_shared_regular_head() {
+    const LENGTH: u32 = 64;
+    let x = || Expr::bvar(0).expect("bound variable");
+    let family = || pi(c("P"), Expr::sort(Level::one()));
+    let mut entries = vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("U", family()),
+        hinted(
+            "D0",
+            family(),
+            lam(c("P"), app(c("U"), [x()])),
+            ReducibilityHint::Regular(1),
+        ),
+    ];
+    for k in 1..=LENGTH {
+        entries.push(hinted(
+            &format!("D{k}"),
+            family(),
+            lam(c("P"), app(c(&format!("D{}", k - 1)), [x()])),
+            ReducibilityHint::Regular(k + 1),
+        ));
+    }
+    entries.push(hinted(
+        "R",
+        family(),
+        lam(c("P"), app(c(&format!("D{LENGTH}")), [x()])),
+        ReducibilityHint::Regular(LENGTH + 2),
+    ));
+    entries.push(hinted(
+        "Ab",
+        family(),
+        lam(c("P"), app(c("R"), [x()])),
+        ReducibilityHint::Abbrev,
+    ));
+    entries.push(entry("w", app(c("Ab"), [c("q")])));
+    let env = environment_of(entries);
+    let candidate = candidate("d", app(c("Ab"), [c("p")]), c("w"));
+    let mut budget = AdmissionBudget::unlimited();
+    budget.inference.whnf.max_steps = u64::from(LENGTH / 2);
+    budget.inference.whnf.max_reductions = u64::from(LENGTH / 2);
+    let verdict = admit(&env, &candidate, budget);
+    assert!(
+        matches!(verdict, Verdict::Admitted(_)),
+        "`R q ≟ R p` closes by congruence before `R` unfolds: {verdict:?}"
+    );
+}
