@@ -1154,14 +1154,10 @@ fn check(
             observed: metadata.num_nested(),
         }));
     }
+    // No bound on the number of universe parameters: the pin keeps them as a
+    // list (`m_lparams`, vendored `inductive.cpp:163`). The expected terms they
+    // enter are bounded by `MAX_INDUCTIVE_EXPECTED_ARENA_UNITS`.
     let levels = declaration.level_parameters();
-    if levels.len() > 8 {
-        return Err(InductiveVerdict::Deferred(
-            InductiveSupportLimit::UniverseParameters {
-                observed: levels.len(),
-            },
-        ));
-    }
     let p = metadata.num_parameters() as usize;
     let q = metadata.num_indices() as usize;
     if p.saturating_add(q) > MAX_NONRECURSIVE_FIELDS {

@@ -534,3 +534,122 @@ fn a_starved_parameter_domain_conversion_is_inconclusive() {
         "{verdict:?}"
     );
 }
+
+/// `KU.{v1 … vn} : (α1 : Sort v1) → … → (αn : Sort vn) → Prop`, one parameter
+/// per universe, with `KU.mk : (α1 …) → KU α1 …` and its K-like recursor
+/// `KU.rec.{u, v1 … vn} : (α1 …) → (motive : KU α1 … → Sort u) →
+/// motive (KU.mk α1 …) → (t : KU α1 …) → motive t`.
+fn universe_parameter_family(count: usize) -> Vec<ConstantEntry> {
+    let u = Level::param(primary_name("u"));
+    let names: Vec<String> = (1..=count).map(|i| format!("v{i}")).collect();
+    let levels: Vec<Level> = names
+        .iter()
+        .map(|name| Level::param(primary_name(name.as_str())))
+        .collect();
+    let level_names: Vec<WireName> = names
+        .iter()
+        .map(|name| checker_name(name.as_str()))
+        .collect();
+    let parameters: Vec<B> = levels
+        .iter()
+        .enumerate()
+        .map(|(index, level)| B::new(&format!("α{index}"), Expr::sort(level.clone())))
+        .collect();
+    let arguments: Vec<Expr> = parameters.iter().map(B::e).collect();
+    let family = call(&["KU"], &levels, &arguments);
+    let major = B::new("t", family.clone());
+    let motive = B::new(
+        "motive",
+        close(std::slice::from_ref(&major), Expr::sort(u.clone()), false),
+    );
+    let minor = B::new(
+        "mk_case",
+        apply(motive.e(), &[call(&["KU", "mk"], &levels, &arguments)]),
+    );
+    let mut prefix = parameters.clone();
+    prefix.extend([motive.clone(), minor.clone()]);
+    let rec_type = close(
+        &prefix,
+        close(
+            std::slice::from_ref(&major),
+            apply(motive.e(), &[major.e()]),
+            false,
+        ),
+        false,
+    );
+    let family_name = checker_name("KU");
+    let mk_name = checker_qualified(&["KU", "mk"]);
+    let safe = ConstantSafety::Safe;
+    let mut rec_levels = vec![checker_name("u")];
+    rec_levels.extend(level_names.iter().cloned());
+    let parameter_count = u32::try_from(count).expect("small family");
+    vec![
+        ConstantEntry::new(
+            family_name.clone(),
+            ConstantDeclaration::inductive(
+                level_names.clone(),
+                decoded(&close(&parameters, Expr::sort(Level::zero()), false)),
+                safe,
+                InductiveDeclaration::new(
+                    parameter_count,
+                    0,
+                    vec![family_name.clone()],
+                    vec![mk_name.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk_name.clone(),
+            ConstantDeclaration::constructor(
+                level_names,
+                decoded(&close(&parameters, family, false)),
+                safe,
+                ConstructorDeclaration::new(family_name.clone(), 0, parameter_count, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["KU", "rec"]),
+            ConstantDeclaration::recursor(
+                rec_levels,
+                decoded(&rec_type),
+                safe,
+                RecursorDeclaration::new(
+                    vec![family_name],
+                    parameter_count,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(
+                        mk_name,
+                        0,
+                        decoded(&close(&prefix, minor.e(), true)),
+                    )],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+/// The pin keeps an inductive's universe parameters as a list with no bound
+/// (`m_lparams`, vendored `inductive.cpp:163`); it refuses only a duplicate
+/// (`check_duplicated_univ_params`, `:779`). The constructor-derived route
+/// deferred any family with more than eight, which in S23 left
+/// `Limits.PreservesColimit₂` (ten) and two siblings without an answer.
+#[test]
+fn a_family_with_more_than_eight_universe_parameters_is_admitted() {
+    for count in [1, 8, 9, 12] {
+        let verdict = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &universe_parameter_family(count),
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            verdict.is_admitted(),
+            "{count} universe parameters: {verdict:?}"
+        );
+    }
+}
