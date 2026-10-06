@@ -604,7 +604,10 @@ impl Context {
                 };
                 expect_atom(keyword, "by_cases", "decidable case split")?;
                 let name = match expect_null_args(binder, "case evidence name")? {
-                    [] => Name::from_components(["h"]),
+                    // The pin's unnamed `by_cases p` binds a hygienic `h✝`: usable by
+                    // `assumption`, never by a source `h` ("Unknown identifier `h`"). A
+                    // generated name, as unnamed `intro` binders get, no identifier spells.
+                    [] => self.fresh_name()?,
                     [Syntax::Ident { val, .. }, colon]
                         if !val.is_anonymous() && val.parent().is_anonymous() =>
                     {

@@ -21,7 +21,7 @@ theorem scopedCase (p q : Prop) [Decidable p] [Decidable q] (saved : p) : p := b
   · exact saved
 
 theorem negation (p : Prop) [Decidable p] (refute : p -> False) : Not p := by
-  by_cases p
+  by_cases h : p
   · exact fun ignored => refute h
   · exact h
 

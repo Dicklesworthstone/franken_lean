@@ -70,20 +70,41 @@ fn case_splits_compute_data_without_skipping_either_source_branch() {
     );
     reject("def invalid : Nat := by by_cases h : True; exact 7; exact (1 : String)");
 }
+/// An unnamed `by_cases p` binds a hygienic hypothesis, as at the pin (lean v4.32.0, each
+/// program run 2026-10-06): `assumption` finds it, a source `h` does not. The refusal is the
+/// pin's first error, verbatim. This test used to accept `f h` and `exact h` there.
 #[test]
 fn default_names_shadow_hygienically_and_dependent_contexts_survive() {
     check(
         r#"
         theorem default_name (p : Prop) [Decidable p] (f : p -> False) : Not p := by
           by_cases p
-          · exact fun unused => f h
-          · exact h
+          · exact fun unused => f unused
+          · assumption
         theorem dependent (p : Prop) [Decidable p] (h : Nat)
             (P : Nat -> Prop) (saved : P h) : P h := by
           by_cases h : p
           · exact saved
           · exact saved
     "#,
+    );
+    let source = "theorem default_name (p : Prop) [Decidable p] (f : p -> False) : Not p := by\n  by_cases p\n  · exact fun unused => f h\n  · exact h\n";
+    reject(source);
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err(source)
+        .to_string();
+    assert!(
+        error.contains("Unknown identifier `h`"),
+        "the pin refuses the default name with `Unknown identifier `h``: {error}"
     );
 }
 #[test]

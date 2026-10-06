@@ -477,7 +477,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_constructor_equalities.lean",
     "examples/native_constructor_equality.lean",
     "examples/native_constructor_tactics.lean",
-    "examples/native_decidable_cases.lean",
     "examples/native_decision_proofs.lean",
     "examples/native_default_simp.lean",
     "examples/native_dependent_indices.lean",
