@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":575,"projection_hash":"a046f3fc5aed46423d891104ff38f6917d01e334f5abd1693c5427b5303b4fe1"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":576,"projection_hash":"310b75b892acedaac3099dcc79f215b3f8f4b7c88673e807cc6d7d1d0b5c7734"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -233,6 +233,7 @@
 {"id":"fln-s8oo"}
 {"id":"fln-s97y"}
 {"id":"fln-selftest-symlink-blocks-bundle-4yhd"}
+{"id":"fln-simp-default-set-a4nb"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
 {"id":"fln-sr2z"}
