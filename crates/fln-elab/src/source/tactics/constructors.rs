@@ -757,7 +757,37 @@ impl Context {
             };
             names.push(name);
         }
-        self.inject_named_proof_goal(proof, goal, name, &names)
+        let work = proof.work.len();
+        let before: HashSet<FVarId> = goal.lctx.decls().iter().map(|l| l.id.clone()).collect();
+        self.inject_named_proof_goal(proof, goal, name, &names)?;
+        // The pin's `evalInjection` ends with `tryAssumption` on the goal it leaves (vendored
+        // src/Lean/Elab/Tactic/Injection.lean): any hypothesis, a new equation or an older
+        // one, that proves it closes it, so a following tactic finds no goal. Only the tactic
+        // does this; `cases` reaches the same injection (`Meta.injection`) without it.
+        let left = (proof.work.len() > work)
+            .then(|| proof.work.pop_if(|w| matches!(w, Work::Goal(_))))
+            .flatten();
+        if let Some(Work::Goal(child)) = left {
+            self.txn.lctx = child.lctx.clone();
+            // The pin's `noConfusion` makes no equation for a proof field, so its
+            // `tryAssumption` cannot use one. This injection still makes them, unnamed; they
+            // are kept out of the search.
+            let mut proof_fields = HashSet::new();
+            for local in child.lctx.decls() {
+                if before.contains(&local.id) {
+                    continue;
+                }
+                let type_ = self.whnf(&local.type_)?;
+                if super::equality::proof_equation(&type_) {
+                    proof_fields.insert(local.id.clone());
+                }
+            }
+            match self.matching_assumption_except(&child, &proof_fields)? {
+                Some(value) => self.close_proof_goal(child, value)?,
+                None => proof.work.push(Work::Goal(child)),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn inject_named_proof_goal(
@@ -817,12 +847,28 @@ impl Context {
             // typed heterogeneous equalities to a checked continuation instead.
             return self.inject_dependent_proof_goal(proof, goal, &equality, names);
         }
-        if equalities.is_empty() || names.len() > equalities.len() {
+        if equalities.is_empty() {
             return Err(error(TacticError::ConstructorEquality));
         }
-        for (i, equality) in equalities.into_iter().enumerate() {
+        // Names go, in order, to the equations the pin makes: never to a proof field's.
+        let named = equalities
+            .iter()
+            .filter(|e| !super::equality::proof_equation(&e.type_))
+            .count();
+        if names.len() > named {
+            return Err(error(TacticError::InjectionUnusedNames {
+                unused: names[named..].to_vec(),
+            }));
+        }
+        let mut next = names.iter();
+        for equality in equalities {
             let id = FVarId(self.fresh_name()?);
-            let name = names.get(i).cloned().unwrap_or_else(|| id.0.clone());
+            let given = if super::equality::proof_equation(&equality.type_) {
+                None
+            } else {
+                next.next().cloned()
+            };
+            let name = given.unwrap_or_else(|| id.0.clone());
             self.txn
                 .lctx
                 .add_let(id.clone(), name, equality.type_, equality.value);

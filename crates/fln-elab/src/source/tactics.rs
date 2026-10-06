@@ -62,6 +62,19 @@ pub enum TacticError {
     UnsupportedEliminator,
     InvalidGeneralization,
     SubstitutionLocal,
+    /// `subst h` on `h : HEq a b` whose two types are not definitionally equal. The pin's
+    /// `subst` (vendored src/Lean/Meta/Tactic/Subst.lean) turns an `HEq` into an `Eq` only
+    /// when they are (`heqToEq`); otherwise it reads `h` as a variable to eliminate and finds
+    /// no equation for it.
+    SubstitutionNoEquation {
+        local: Name,
+    },
+    /// `injection h with …` gave more names than it made equations. The pin's `noConfusion`
+    /// makes none for a proof field, so those take no name (`checkUnusedIds`, vendored
+    /// src/Lean/Elab/Tactic/Injection.lean).
+    InjectionUnusedNames {
+        unused: Vec<Name>,
+    },
     ConstructorEquality,
     NoContradiction,
 }
@@ -126,6 +139,22 @@ impl std::fmt::Display for TacticError {
             Self::SubstitutionLocal => {
                 write!(f, "subst requires an acyclic local-variable equality")
             }
+            // The pin's words.
+            Self::InjectionUnusedNames { unused } => write!(
+                f,
+                "Tactic `injection` failed: too many identifiers provided, unused: [{}]",
+                unused
+                    .iter()
+                    .map(Name::to_display_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            // The pin's words.
+            Self::SubstitutionNoEquation { local } => write!(
+                f,
+                "Tactic `subst` failed: did not find equation for eliminating '{}'",
+                local.to_display_string()
+            ),
             Self::ConstructorEquality => write!(
                 f,
                 "constructor equality has no supported injective fields or contradiction"
@@ -361,6 +390,33 @@ impl Context {
             }
             Err(error) => Err(failure(SourceInferenceError::Unification(Box::new(error)))),
         }
+    }
+
+    /// The pin's `MVarId.assumptionCore`: the most recent hypothesis whose type matches the
+    /// goal, as `assumption` uses it and as `injection` tries it on the goal it leaves.
+    pub(super) fn matching_assumption(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.matching_assumption_except(goal, &std::collections::HashSet::new())
+    }
+
+    /// [`Self::matching_assumption`], never answering with a hypothesis in `hidden`.
+    pub(super) fn matching_assumption_except(
+        &mut self,
+        goal: &ProofGoal,
+        hidden: &std::collections::HashSet<FVarId>,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        for local in goal.lctx.decls().iter().rev() {
+            self.tick()?;
+            if self.is_matrix_hypothesis(local) || hidden.contains(&local.id) {
+                continue;
+            }
+            if self.proof_types_match(&local.type_, &goal.target)? {
+                return Ok(Some(Expr::fvar(local.id.clone())));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn close_proof_goal(
@@ -824,18 +880,9 @@ impl Context {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "assumption", "assumption keyword")?;
-                let mut matched = None;
-                for local in goal.lctx.decls().iter().rev() {
-                    self.tick()?;
-                    if self.is_matrix_hypothesis(local) {
-                        continue;
-                    }
-                    if self.proof_types_match(&local.type_, &goal.target)? {
-                        matched = Some(Expr::fvar(local.id.clone()));
-                        break;
-                    }
-                }
-                let value = matched.ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
+                let value = self
+                    .matching_assumption(&goal)?
+                    .ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
                 self.close_proof_goal(goal, value)?;
             } else {
                 let apply = kind == &parser_kind(&["Tactic", "apply"]);

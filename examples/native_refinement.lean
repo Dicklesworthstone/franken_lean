@@ -45,7 +45,7 @@ theorem functions_ok : functions.first 7 + functions.second 7 = 17 := by rfl
 theorem transported (A B : Type) (a : A) (b : B) (h : HEq a b)
     (P : forall T : Type, T -> Prop) (pa : P A a) : P B b := by
   refine ?_
-  subst h
+  cases h
   exact pa
 
 def copy (n : Nat) : Nat := match n with

@@ -22,6 +22,16 @@ pub(super) fn reflexivity(level: Level, alpha: Expr, value: Expr) -> Expr {
     )
 }
 
+/// An equation between proofs (`Eq.{0}` or `HEq.{0}`), as injection makes for a proof field.
+/// The pin's `noConfusion` makes none, since proofs are irrelevant, so `injection` gives
+/// such an equation no user name and `tryAssumption` never sees one.
+pub(super) fn proof_equation(type_: &Expr) -> bool {
+    equality_target(type_)
+        .map(|(level, ..)| level)
+        .or_else(|| heterogeneous_target(type_).map(|(universe, ..)| universe))
+        .is_some_and(|universe| universe.normalize_fixpoint().is_zero())
+}
+
 /// A bounded shape inspection, not a typing judgment. The supplied proof and
 /// every derived bridge application remain in the final kernel input.
 pub(super) fn heterogeneous_target(expr: &Expr) -> Option<(Level, Expr, Expr, Expr, Expr)> {
@@ -261,6 +271,20 @@ impl Context {
         goal: ProofGoal,
         name: &Name,
     ) -> Result<(), NatDefinitionElabError> {
+        // The `subst` tactic, as the pin's: an `HEq` is substituted only when its two types
+        // are definitionally equal (`heqToEq`). Index unification in `cases` still transports
+        // heterogeneous equations through `substitute_proof_goal_preserving_names`.
+        self.txn.lctx = goal.lctx.clone();
+        if let Some(selected) = goal.lctx.find_by_user_name(name).cloned() {
+            let type_ = self.whnf(&selected.type_)?;
+            if let Some((_, alpha, _, beta, _)) = heterogeneous_target(&type_)
+                && !self.proof_types_match(&alpha, &beta)?
+            {
+                return Err(error(TacticError::SubstitutionNoEquation {
+                    local: name.clone(),
+                }));
+            }
+        }
         self.substitute_proof_goal_preserving_names(proof, goal, name, false)
     }
 

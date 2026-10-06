@@ -139,8 +139,13 @@ fn subst_consumes_homogeneous_heq_without_assuming_proof_irrelevance() {
     }
 }
 
+/// `subst h` on `h : HEq a b` whose types differ is refused, in the pin's words: the pin
+/// substitutes an `HEq` only when its two types are definitionally equal (`heqToEq`, vendored
+/// src/Lean/Meta/Tactic/Subst.lean), and otherwise finds no equation that eliminates `h`.
+/// Each program was run at the pin (lean v4.32.0, 2026-10-06); each is refused with exactly
+/// this first error. This test used to accept all six by transporting the endpoint types.
 #[test]
-fn heterogeneous_substitution_transports_the_endpoint_types_before_values() {
+fn heterogeneous_substitution_is_refused_when_the_types_differ() {
     for source in [
         "def value (A B : Type) (a : A) (b : B) (h : HEq a b) : A := by\n  subst h\n  exact b",
         "theorem typeIdentity (A B : Type) (a : A) (b : B) (h : HEq a b) : A = B := by\n  subst h\n  rfl",
@@ -149,7 +154,18 @@ fn heterogeneous_substitution_transports_the_endpoint_types_before_values() {
         "theorem branchScopes (flag : Bool) (A B : Type) (a : A) (b : B) (h : HEq a b) : A = B := by\n  cases flag with\n  | false =>\n    subst h\n    rfl\n  | true => exact type_eq_of_heq h",
         "theorem introducedTypes (A B : Type) (a : A) (b : B) : HEq a b -> A = B := by\n  intro h\n  subst h\n  rfl",
     ] {
-        check(source);
+        let error = engine()
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source)
+            .to_string();
+        assert!(
+            error.contains("Tactic `subst` failed: did not find equation for eliminating 'h'"),
+            "{source}\nmust be refused as the pin refuses it: {error}"
+        );
     }
 }
 
@@ -181,7 +197,7 @@ fn heterogeneous_substitution_has_no_false_proof_or_scope_escape() {
 #[test]
 fn same_type_heq_can_drive_constructor_injection_and_contradiction() {
     for source in [
-        "theorem injected (x y : Nat) (h : HEq (Nat.succ x) (Nat.succ y)) : x = y := by\n  injection h with predecessor\n  exact predecessor",
+        "theorem injected (x y : Nat) (h : HEq (Nat.succ x) (Nat.succ y)) : y = x := by\n  injection h with predecessor\n  exact eq_of_heq (HEq.symm (heq_of_eq predecessor))",
         "theorem impossible (n : Nat) (h : HEq (Nat.succ n) 0) : 0 = 1 := by contradiction",
         "theorem huge (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by contradiction",
         "theorem combined (x y : Nat) (h : HEq (Nat.succ x) (Nat.succ y)) (hy : y = 0) : x = 0 := by\n  injection h with same\n  subst same\n  exact hy",
@@ -213,23 +229,63 @@ fn heterogeneous_reflexivity_is_checked_not_assumed() {
     }
 }
 
+/// The pin's `noConfusion` makes no equation for a proof field (proofs are irrelevant), so
+/// `injection` names only the other fields' equations, and its closing `tryAssumption` never
+/// sees a proof-field one. Every program was run at the pin (lean v4.32.0, 2026-10-06); each
+/// refusal is its first error, verbatim. These programs used to be accepted by naming the
+/// proof field's equation.
 #[test]
-fn constructor_fallback_retains_dependent_proof_fields_in_data_records() {
-    check(
-        "structure Certificate where\n  carrier : Type\n  value : carrier\n  valid : value = value\ntheorem proofField (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (h : Certificate.mk A a pa = Certificate.mk B b pb) : HEq pa pb := by\n  injection h with types values proofs\n  exact proofs",
-    );
-    check(
-        "structure Certificate where\n  carrier : Type\n  value : carrier\n  valid : value = value\n  serial : Nat\ntheorem serials (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (i j : Nat) (h : Certificate.mk A a pa i = Certificate.mk B b pb j) : i = j := by\n  injection h with types values proofs serials\n  exact serials",
-    );
+fn proof_fields_take_no_injection_name_as_at_the_pin() {
+    let certificate = "structure Certificate where\n  carrier : Type\n  value : carrier\n  valid : value = value\n";
+    let serial = "structure Certificate where\n  carrier : Type\n  value : carrier\n  valid : value = value\n  serial : Nat\n";
+    check(&format!(
+        "{certificate}theorem proofField (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (h : Certificate.mk A a pa = Certificate.mk B b pb) : HEq pa pb := by\n  injection h with types values\n  subst types\n  subst values\n  rfl"
+    ));
+    check(&format!(
+        "{serial}theorem serials (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (i j : Nat) (h : Certificate.mk A a pa i = Certificate.mk B b pb j) : j = i := by\n  injection h with types values serials\n  exact eq_of_heq (HEq.symm (heq_of_eq serials))"
+    ));
+    for (source, unused) in [
+        (
+            format!(
+                "{certificate}theorem proofField (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (h : Certificate.mk A a pa = Certificate.mk B b pb) : HEq pa pb := by\n  injection h with types values proofs\n  exact proofs"
+            ),
+            "[proofs]",
+        ),
+        (
+            format!(
+                "{serial}theorem serials (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b) (i j : Nat) (h : Certificate.mk A a pa i = Certificate.mk B b pb j) : i = j := by\n  injection h with types values proofs serials\n  exact serials"
+            ),
+            "[serials]",
+        ),
+        (
+            "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  injection h with a b\n  exact eq_of_heq (HEq.symm (heq_of_eq a))".to_string(),
+            "[b]",
+        ),
+    ] {
+        let error = engine()
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(&source)
+            .to_string();
+        let wording =
+            format!("Tactic `injection` failed: too many identifiers provided, unused: {unused}");
+        assert!(
+            error.contains(&wording),
+            "{source}\nmust be refused as the pin refuses it, with {wording}: {error}"
+        );
+    }
 }
 
 #[test]
 fn injection_derives_successor_and_product_field_equalities() {
     check(
-        "theorem succInj (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  injection h with hx\n  exact hx",
+        "theorem succInj (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  injection h with hx\n  exact eq_of_heq (HEq.symm (heq_of_eq hx))",
     );
     check(
-        "structure Pair where\n  fst : Nat\n  snd : Nat\ntheorem sndInj (a b c d : Nat) (h : Pair.mk a b = Pair.mk c d) : b = d := by\n  injection h with first second\n  exact second",
+        "structure Pair where\n  fst : Nat\n  snd : Nat\ntheorem sndInj (a b c d : Nat) (h : Pair.mk a b = Pair.mk c d) : d = b := by\n  injection h with first second\n  exact eq_of_heq (HEq.symm (heq_of_eq second))",
     );
     check(
         "theorem reflected (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  injection h with same\n  subst same\n  rfl",
@@ -248,17 +304,19 @@ fn disjoint_constructors_produce_checked_contradictions() {
 #[test]
 fn dependent_fields_produce_heterogeneous_not_forged_homogeneous_equalities() {
     check(
-        "structure Package where\n  carrier : Type\n  value : carrier\ntheorem values (A B : Type) (a : A) (b : B) (h : Package.mk A a = Package.mk B b) : HEq a b := by\n  injection h with types values\n  subst types\n  exact heq_of_eq values",
+        // Accepted at the pin (lean v4.32.0, 2026-10-06). The pin's `values` is `HEq a b`;
+        // this injection's is a transported `Eq`, so the proof avoids naming its type.
+        "structure Package where\n  carrier : Type\n  value : carrier\ntheorem values (A B : Type) (a : A) (b : B) (h : Package.mk A a = Package.mk B b) : HEq b a := by\n  injection h with types values\n  subst types\n  subst values\n  rfl",
     );
     check(
-        "structure Package where\n  carrier : Type\n  value : carrier\ntheorem types (A B : Type) (a : A) (b : B) (h : Package.mk A a = Package.mk B b) : A = B := by\n  injection h with types values\n  exact types",
+        "structure Package where\n  carrier : Type\n  value : carrier\ntheorem types (A B : Type) (a : A) (b : B) (h : Package.mk A a = Package.mk B b) : B = A := by\n  injection h with types values\n  exact eq_of_heq (HEq.symm (heq_of_eq types))",
     );
 }
 
 #[test]
 fn indexed_constructor_equalities_keep_their_dependent_payload_types() {
     check(
-        "inductive Vec (A : Type) : Nat -> Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (a : A) (tail : Vec A n) : Vec A (Nat.succ n)\ntheorem heads (A : Type) (n : Nat) (a b : A) (xs ys : Vec A n) (h : Vec.cons n a xs = Vec.cons n b ys) : a = b := by\n  injection h with lengths heads tails\n  exact heads",
+        "inductive Vec (A : Type) : Nat -> Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (a : A) (tail : Vec A n) : Vec A (Nat.succ n)\ntheorem heads (A : Type) (n : Nat) (a b : A) (xs ys : Vec A n) (h : Vec.cons n a xs = Vec.cons n b ys) : b = a := by\n  injection h with lengths heads tails\n  exact eq_of_heq (HEq.symm (heq_of_eq heads))",
     );
 }
 
@@ -278,7 +336,7 @@ fn huge_literal_contradictions_do_not_expand_a_unary_prefix() {
         "theorem large (h : 340282366920938463463374607431768211456 = 340282366920938463463374607431768211457) : 0 = 1 := by\n  contradiction",
     );
     check(
-        "theorem predecessor (n : Nat) (h : Nat.succ n = 340282366920938463463374607431768211456) : n = 340282366920938463463374607431768211455 := by\n  injection h with previous\n  exact previous",
+        "theorem predecessor (n : Nat) (h : Nat.succ n = 340282366920938463463374607431768211456) : 340282366920938463463374607431768211455 = n := by\n  injection h with previous\n  exact eq_of_heq (HEq.symm (heq_of_eq previous))",
     );
 }
 
@@ -309,14 +367,16 @@ fn proof_irrelevance_never_becomes_constructor_data_injectivity() {
 #[test]
 fn constructor_tactics_preserve_source_obligations_and_branch_isolation() {
     check(
-        "theorem scopedCase (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  cases b with\n  | false =>\n    injection h with child\n    exact child\n  | true =>\n    injection h with other\n    exact other",
+        "theorem scopedCase (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  cases b with\n  | false =>\n    injection h with child\n    exact eq_of_heq (HEq.symm (heq_of_eq child))\n  | true =>\n    injection h with other\n    exact eq_of_heq (HEq.symm (heq_of_eq other))",
     );
     let base = engine();
     for source in [
-        "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  injection h with a b\n  exact a",
-        "structure Pair where\n  fst : Nat\n  snd : Nat\ntheorem bad (a b c d : Nat) (h : Pair.mk a b = Pair.mk c d) : a = c := by\n  injection h with same same\n  exact same",
-        "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  injection h with same\n  exact (fun ignored => same) (1 : String)",
-        "theorem bad (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : x = y := by\n  cases b with\n  | false =>\n    injection h with child\n    exact child\n  | true => exact child",
+        // Each goal is stated the other way round, so the pin's closing `tryAssumption`
+        // does not end the script before the defect each case is about.
+        "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  injection h with a b\n  exact eq_of_heq (HEq.symm (heq_of_eq a))",
+        "structure Pair where\n  fst : Nat\n  snd : Nat\ntheorem bad (a b c d : Nat) (h : Pair.mk a b = Pair.mk c d) : c = a := by\n  injection h with same same\n  exact eq_of_heq (HEq.symm (heq_of_eq same))",
+        "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  injection h with same\n  exact (fun ignored => eq_of_heq (HEq.symm (heq_of_eq same))) (1 : String)",
+        "theorem bad (b : Bool) (x y : Nat) (h : Nat.succ x = Nat.succ y) : y = x := by\n  cases b with\n  | false =>\n    injection h with child\n    exact eq_of_heq (HEq.symm (heq_of_eq child))\n  | true => exact eq_of_heq (HEq.symm (heq_of_eq child))",
     ] {
         assert!(
             base.check_source_files(
@@ -336,7 +396,8 @@ fn injected_proofs_retain_the_actual_equality_and_admitted_recursors() {
     use fln_env::constants::ConstantInfo;
     use std::collections::HashSet;
     let checked = engine().check_source_files(
-        &[b"theorem derived (a b : Nat) (h : Nat.succ a = Nat.succ b) : a = b := by\n  injection h with field\n  exact field"],
+        // `injection` closes the goal with `field` itself (the pin's `tryAssumption`).
+        &[b"theorem derived (a b : Nat) (h : Nat.succ a = Nat.succ b) : a = b := by\n  injection h with field"],
         &KVMap::new(), SourceCheckLimits::new(limits()),
     ).unwrap().into_complete().unwrap();
     let Some(ConstantInfo::Thm(declaration)) = checked
@@ -414,7 +475,7 @@ fn injected_proofs_retain_the_actual_equality_and_admitted_recursors() {
 #[test]
 fn heterogeneous_injection_preserves_the_entire_mixed_field_order() {
     check(
-        "structure Mixed where\n  carrier : Type\n  value : carrier\n  count : Nat\ntheorem counters (A B : Type) (a : A) (b : B) (m n : Nat) (h : Mixed.mk A a m = Mixed.mk B b n) : m = n := by\n  injection h with types values counters\n  exact counters",
+        "structure Mixed where\n  carrier : Type\n  value : carrier\n  count : Nat\ntheorem counters (A B : Type) (a : A) (b : B) (m n : Nat) (h : Mixed.mk A a m = Mixed.mk B b n) : n = m := by\n  injection h with types values counters\n  exact eq_of_heq (HEq.symm (heq_of_eq counters))",
     );
     check(
         "inductive Vec (A : Type) : Nat -> Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\ntheorem tails (A : Type) (n : Nat) (a b : A) (xs ys : Vec A n) (h : Vec.cons n a xs = Vec.cons n b ys) : HEq xs ys := by\n  injection h with _ _ tails\n  exact heq_of_eq tails",

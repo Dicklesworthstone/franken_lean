@@ -176,8 +176,29 @@ fn dependent_substitution_rebuilds_refined_hole_contexts() {
     check(
         "theorem move (n m : Nat) (h : n = m) (P : Nat -> Prop) (p : P n) : P m := by refine ?_; subst h; exact p",
     );
+    // The pin substitutes an `HEq` only when its two types are definitionally equal: the
+    // same-type case is accepted and the two-type case refused, each run at the pin (lean
+    // v4.32.0, 2026-10-06), the refusal with exactly this first error.
     check(
-        "theorem move (A B : Type) (a : A) (b : B) (h : HEq a b) (P : forall T : Type, T -> Prop) (p : P A a) : P B b := by refine ?_; subst h; exact p",
+        "theorem t (x y : Nat) (h : HEq x y) (P : Nat -> Prop) (p : P x) : P y := by refine ?_; subst h; exact p",
+    );
+    let source = "theorem move (A B : Type) (a : A) (b : B) (h : HEq a b) (P : forall T : Type, T -> Prop) (p : P A a) : P B b := by refine ?_; subst h; exact p";
+    reject(source);
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err(source)
+        .to_string();
+    assert!(
+        error.contains("Tactic `subst` failed: did not find equation for eliminating 'h'"),
+        "{source}\nmust be refused as the pin refuses it: {error}"
     );
 }
 

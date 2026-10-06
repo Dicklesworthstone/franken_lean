@@ -19,18 +19,20 @@ theorem endpoints (x y : Nat) (h : HEq x y) : y = x := by
   rfl
 
 def recover (A B : Type) (a : A) (b : B) (h : HEq a b) : A := by
-  subst h
-  exact b
+  cases h
+  exact a
 
 theorem predicate_transport (A B : Type) (a : A) (b : B)
     (h : HEq a b) (P : forall T : Type, T -> Prop) (pa : P A a) : P B b := by
-  subst h
+  cases h
   exact pa
 
 theorem proof_fields (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b)
     (h : Certificate.mk A a pa = Certificate.mk B b pb) : HEq pa pb := by
-  injection h with types values proofs
-  exact proofs
+  injection h with types values
+  subst types
+  subst values
+  rfl
 
 theorem impossible
     (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by
