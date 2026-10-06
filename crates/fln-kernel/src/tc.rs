@@ -4757,10 +4757,10 @@ impl<'a> TypeChecker<'a> {
 
     /// The positive branch of the pin's equal-regular-definition shortcut.
     ///
-    /// Requiring the same constant head makes every recursive query strictly
-    /// smaller (arguments only), so this cannot re-enter on the original pair.
-    /// Structural identity still decides cache hits elsewhere; the packed
-    /// expression hash is never authority here.
+    /// The pin's `is_def_eq_args` walks last-to-first (type_checker.cpp:786).
+    /// A trailing mismatch must avoid forcing expensive earlier arguments.
+    /// Queries are strictly smaller (arguments only); structural identity,
+    /// never the packed expression hash, still decides cache hits elsewhere.
     fn regular_same_head_apps_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
         let (t_head, t_args) = app_spine(t);
         let (s_head, s_args) = app_spine(s);
@@ -4803,7 +4803,7 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(false);
         }
-        for (t_arg, s_arg) in t_args.iter().zip(&s_args) {
+        for (t_arg, s_arg) in t_args.iter().zip(&s_args).rev() {
             if !self.is_def_eq(t_arg, s_arg, depth)? {
                 self.regular_app_def_eq_failure_cache.insert(
                     t.clone(),

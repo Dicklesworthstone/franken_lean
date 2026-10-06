@@ -665,6 +665,144 @@ fn kr312_function_eta() {
     assert!(check_def_eq(&env, &[], &expanded, &f, Budget::DEFAULT).is_accepted());
 }
 
+/// A regular head whose unused first argument is costly to compare. The pin's
+/// `is_def_eq_args` (type_checker.cpp:786) visits the last argument first, so a
+/// mismatch there reaches delta without opening this chain of safe aliases.
+fn regular_argument_order_environment() -> (Environment, Expr) {
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let a_type = constant("A");
+    let mut env = admit(&Environment::new(), &axiom("A", sort1()));
+    env = admit(&env, &axiom("a", a_type.clone()));
+    env = admit(&env, &axiom("b", a_type.clone()));
+    let mut delayed = constant("a");
+    for index in 0..256 {
+        let name = format!("delayed{index}");
+        env = admit(&env, &defn(&name, a_type.clone(), delayed));
+        delayed = constant(&name);
+    }
+    let binary_type = Expr::forall_e(
+        n("unused"),
+        a_type.clone(),
+        Expr::forall_e(
+            n("tag"),
+            a_type.clone(),
+            a_type.clone(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    for (name, body) in [
+        ("ignore", constant("a")),
+        ("keepTag", Expr::bvar(0).expect("packs")),
+    ] {
+        env = admit(
+            &env,
+            &defn(
+                name,
+                binary_type.clone(),
+                Expr::lam(
+                    n("unused"),
+                    a_type.clone(),
+                    Expr::lam(n("tag"), a_type.clone(), body, BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+            ),
+        );
+    }
+    env = admit(
+        &env,
+        &axiom(
+            "P",
+            Expr::forall_e(n("x"), a_type, sort1(), BinderInfo::Default),
+        ),
+    );
+    (env, delayed)
+}
+
+#[test]
+fn kr309_regular_arguments_compare_last_first_before_unfolding() {
+    let (mut env, delayed) = regular_argument_order_environment();
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let ignore = |first, tag| Expr::app(Expr::app(constant("ignore"), first), tag);
+    let budget = Budget::DEFAULT.narrowed(512, 32);
+    let costly = check_def_eq(&env, &[], &delayed, &constant("b"), budget);
+    assert_eq!(
+        exhausted_usage(&costly).reason,
+        ResourceReason::ExecutionSteps,
+        "the unused argument really exceeds this query's unchanged step budget"
+    );
+    let left = ignore(delayed, constant("a"));
+    let right = ignore(constant("b"), constant("b"));
+    for (left, right) in [(&left, &right), (&right, &left)] {
+        let outcome = check_def_eq(&env, &[], left, right, budget);
+        assert!(
+            outcome.is_accepted(),
+            "KR-309: a trailing mismatch must reach equal bodies before forcing the unused argument: {outcome:?}"
+        );
+    }
+
+    // Exercise actual declaration admission, not only the public query API.
+    // Both sides occur as arguments of an opaque type family, so checking the
+    // body's inferred type meets the same regular-head comparison.
+    env = admit(&env, &axiom("witness", Expr::app(constant("P"), left)));
+    let declaration = defn(
+        "convertedWitness",
+        Expr::app(constant("P"), right),
+        constant("witness"),
+    );
+    let outcome = check(&env, &declaration, budget);
+    assert!(
+        outcome.is_accepted(),
+        "KR-309 must complete the declaration's body conversion at the same budget: {outcome:?}"
+    );
+}
+
+#[test]
+fn kr309_failed_regular_congruence_still_checks_bodies_and_resources() {
+    let (mut env, delayed) = regular_argument_order_environment();
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let apply = |name, first, tag| Expr::app(Expr::app(constant(name), first), tag);
+    let budget = Budget::DEFAULT.narrowed(512, 32);
+    let left = apply("keepTag", delayed.clone(), constant("a"));
+    let right = apply("keepTag", constant("b"), constant("b"));
+    for (left, right) in [(&left, &right), (&right, &left)] {
+        let outcome = check_def_eq(&env, &[], left, right, budget);
+        assert_eq!(
+            reject_class(&outcome),
+            Some(RejectClass::NotDefEq),
+            "failed congruence must unfold and compare the unequal bodies: {outcome:?}"
+        );
+    }
+    env = admit(&env, &axiom("tagWitness", Expr::app(constant("P"), left)));
+    let outcome = check(
+        &env,
+        &defn(
+            "falseWitness",
+            Expr::app(constant("P"), right),
+            constant("tagWitness"),
+        ),
+        budget,
+    );
+    assert_eq!(
+        reject_class(&outcome),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "a false declaration must remain rejected after the shortcut declines: {outcome:?}"
+    );
+
+    // When the costly comparison is last, it really is visited. Its exhaustion
+    // cannot be mistaken for a failed shortcut and followed by equal bodies.
+    let left = apply("ignore", constant("a"), delayed);
+    let right = apply("ignore", constant("b"), constant("b"));
+    for (left, right) in [(&left, &right), (&right, &left)] {
+        let outcome = check_def_eq(&env, &[], left, right, budget);
+        assert_eq!(
+            exhausted_usage(&outcome).reason,
+            ResourceReason::ExecutionSteps,
+            "KR-309 must retain typed exhaustion in the argument it actually visits"
+        );
+    }
+}
+
 #[test]
 fn kr306_proof_irrelevance_in_prop() {
     // p : Prop; h1 h2 : p — proofs are definitionally equal.
