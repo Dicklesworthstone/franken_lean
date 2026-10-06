@@ -312,13 +312,25 @@ fn generated_equations_are_not_available_to_user_substitution() {
 }
 
 #[test]
-fn fixed_parameters_and_wrong_child_indices_cannot_be_changed() {
-    reject(&format!(
+fn leading_function_parameters_can_change_in_recursive_matrices() {
+    // Lean v4.32.0 accepts this formerly rejected row (bcvq, comment 3172).
+    // Check its result and a variant that observes the changed function.
+    check(&format!(
         "{SEQ}
       def wrong (f : Nat -> Nat) (xs : Seq Nat) (flag : Bool) : Nat := match xs, flag with
         | .nil, _ => 0
-        | .cons x tail, _ => wrong (fun y => y + 1) tail flag"
+        | .cons x tail, _ => wrong (fun y => y + 1) tail flag
+      theorem original : wrong (fun y => y + 9) (Seq.cons 4 Seq.nil) true = 0 := by rfl
+      def applyChanged (f : Nat -> Nat) (xs : Seq Nat) (flag : Bool) : Nat := match xs, flag with
+        | .nil, _ => f 0
+        | .cons x tail, _ => applyChanged (fun y => y + 1) tail flag
+      theorem base : applyChanged (fun y => y + 9) Seq.nil false = 9 := by rfl
+      theorem changed : applyChanged (fun y => y + 9) (Seq.cons 4 (Seq.cons 5 Seq.nil)) true = 1 := by rfl"
     ));
+}
+
+#[test]
+fn wrong_child_indices_cannot_be_changed() {
     reject(&format!(
         "{VEC}
       def wrong (n : Nat) (xs ys : Vec Nat n) : Vec Nat n := match xs, ys with
