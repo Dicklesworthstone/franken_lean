@@ -2455,8 +2455,10 @@ fn parse_definition_with_grammar(
         });
     }
     let mut cursor = declaration_start + 1;
+    // `(priority := n)`, never an anonymous instance's first explicit binder `(x : T)`.
     let priority_range = if is_instance
         && matches!(tokens.get(cursor).map(|t|&t.kind), Some(TokenKind::Symbol(s)) if s=="(")
+        && matches!(tokens.get(cursor + 2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == ":=")
     {
         let start = cursor;
         if !matches!(tokens.get(start+1).map(|t|&t.kind),Some(TokenKind::Ident(n)) if n==&Name::from_components(["priority"]))

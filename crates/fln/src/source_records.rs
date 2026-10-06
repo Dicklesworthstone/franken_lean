@@ -240,19 +240,32 @@ impl Engine {
                             ),
                         ))
                     })?;
+                // An anonymous instance is registered under the name its elaboration
+                // generated, already qualified by the scope.
+                let declared = match &declaration {
+                    Declaration::Defn(definition) => Some(definition.base.name.clone()),
+                    _ => None,
+                };
                 let result = self
                     .admit_declarations(&[declaration], options, limits)
                     .map_err(EngineExecutionError::from)?;
                 return Ok(match result {
                     Outcome::Complete(mut batch) => {
                         if let Some((name, priority)) = registration {
-                            let name = scope.declaration_name(&name).map_err(|error| {
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::NameScope(error),
-                                    ),
-                                ))
-                            })?;
+                            let name = match (name.is_anonymous(), declared) {
+                                (true, Some(declared)) => declared,
+                                _ => scope.declaration_name(&name).map_err(|error| {
+                                    EngineExecutionError::Frontend(
+                                        DefinitionFrontendError::Elaborate(
+                                            fln_elab::NatDefinitionElabError::Inference(
+                                                fln_elab::source::SourceInferenceError::NameScope(
+                                                    error,
+                                                ),
+                                            ),
+                                        ),
+                                    )
+                                })?,
+                            };
                             batch.engine.environment = fln_elab::instances::register_instance(
                                 batch.engine.environment(),
                                 &name,

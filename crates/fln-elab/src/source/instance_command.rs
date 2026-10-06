@@ -2,7 +2,8 @@
 use super::*;
 pub(super) struct Parts<'a> {
     pub keyword: &'a Syntax,
-    pub id: &'a Syntax,
+    /// `None` for an anonymous instance, whose name the elaborator generates.
+    pub id: Option<&'a Syntax>,
     pub signature: &'a Syntax,
     pub value: &'a Syntax,
     pub priority: u32,
@@ -53,8 +54,10 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
-    let [id] = expect_null_args(&args[3], "explicit instance name")? else {
-        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    let id = match expect_null_args(&args[3], "explicit instance name")? {
+        [] => None,
+        [id] => Some(id),
+        _ => return Err(NatDefinitionElabError::AnonymousDeclarationName),
     };
     Ok(Parts {
         keyword: &args[1],
@@ -76,8 +79,13 @@ pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDe
         return Ok(None);
     }
     let parts = parts(&declaration[1])?;
+    // An anonymous instance is registered under the name its elaboration generates;
+    // the caller takes it from the elaborated declaration.
+    let Some(id) = parts.id else {
+        return Ok(Some((Name::anonymous(), parts.priority)));
+    };
     let id = expect_node(
-        parts.id,
+        id,
         &parser_kind(&["Command", "declId"]),
         2,
         "instance identifier",

@@ -6161,12 +6161,21 @@ impl Engine {
                     ),
                 ))
             })?;
+        let declared = match &declaration {
+            Declaration::Defn(definition) => Some(definition.base.name.clone()),
+            _ => None,
+        };
         let result = self
             .admit_declaration(declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut admitted) => {
                 if let Some((name, priority)) = registration {
+                    // An anonymous instance: the name its elaboration generated.
+                    let name = match (name.is_anonymous(), declared) {
+                        (true, Some(declared)) => declared,
+                        _ => name,
+                    };
                     admitted.engine.environment = fln_elab::instances::register_instance(
                         admitted.engine.environment(),
                         &name,

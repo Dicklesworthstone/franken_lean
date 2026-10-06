@@ -323,8 +323,16 @@ fn named_instance_syntax_is_canonical_and_lossless_and_bounded() {
         assert_eq!(command.syntax(), parsed.syntax());
         assert!(command.query_term_normalized().is_none());
     }
+    // An anonymous instance is named by the pin's generator (`mkInstanceName`).
+    assert!(matches!(
+        engine().check_source_files(
+            &[b"instance : Inhabited Nat := Inhabited.mk 1".as_slice()],
+            &KVMap::new(),
+            limits()
+        ),
+        Ok(fln::Outcome::Complete(_))
+    ));
     for source in [
-        "instance : Inhabited Nat := Inhabited.mk 1",
         "instance (priority := -1) x : Inhabited Nat := Inhabited.mk 1",
         "instance (priority := 4294967296) x : Inhabited Nat := Inhabited.mk 1",
     ] {
@@ -550,4 +558,40 @@ fn dictionary_rewriting_uses_local_precedence_without_guessing_from_occurrences(
         .is_err()
     );
     assert_eq!(before, base.logical_root(&KVMap::new()));
+}
+
+/// Anonymous instances get the pin's generated names (`mkInstanceName`,
+/// `Lean/Elab/DeclNameGen.lean`): type heads in order, `Of…` for each binder the type
+/// does not mention, the current namespace's constants omitted, and `_1`, … while a name
+/// is taken. Every name below is the one the pinned Reference generates for this source;
+/// a wrong one is an unknown identifier in the `example` that uses it.
+#[test]
+fn anonymous_instances_receive_the_pins_generated_names() {
+    let source = "class Shape (α : Type) where
+  area : α → Nat
+structure Sq where
+  s : Nat
+instance : Shape Sq := ⟨fun q => q.s⟩
+instance : Shape (List Sq) := ⟨fun _ => 0⟩
+instance : Inhabited Sq := ⟨⟨1⟩⟩
+instance : Inhabited Sq := ⟨⟨2⟩⟩
+class Foo (α : Type) (n : Nat) where
+  x : Nat
+instance {α : Type} [Inhabited α] : Foo (List α) 3 := ⟨1⟩
+instance (n : Nat) : Foo Sq n := ⟨n⟩
+namespace Sq
+instance : Shape (Option Sq) := ⟨fun _ => 0⟩
+end Sq
+example : Shape Sq := instShapeSq
+example : Shape (List Sq) := instShapeListSq
+example : Inhabited Sq := instInhabitedSq_1
+example : Foo (List Nat) 3 := instFooListOfNatNatOfInhabited
+example : Foo Sq 4 := instFooSq 4
+example : Shape (Option Sq) := Sq.instShapeOption
+";
+    let result = engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+    assert!(
+        matches!(result, Ok(fln::Outcome::Complete(_))),
+        "{result:?}"
+    );
 }

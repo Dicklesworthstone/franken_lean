@@ -23,6 +23,7 @@ mod equations;
 mod inductive;
 mod infer;
 mod instance_command;
+mod instance_name;
 mod instances;
 mod level_syntax;
 mod levels;
@@ -2987,7 +2988,23 @@ fn definition_in_context_named(
         let parts = instance_command::parts(&declaration[1])?;
         instance_parts = [
             parts.keyword.clone(),
-            parts.id.clone(),
+            match parts.id {
+                Some(id) => id.clone(),
+                // Anonymous: a placeholder `declId` whose name is generated below,
+                // once the signature is elaborated (`mkInstanceName`).
+                None => Syntax::node(
+                    parser_kind(&["Command", "declId"]),
+                    vec![
+                        Syntax::Ident {
+                            info: fln_syntax::source::SourceInfo::None,
+                            raw_val: fln_syntax::source::ByteSpan::default(),
+                            val: Name::anonymous(),
+                            preresolved: Vec::new(),
+                        },
+                        Syntax::node(Name::from_components(["null"]), Vec::new()),
+                    ],
+                ),
+            },
             parts.signature.clone(),
             parts.value.clone(),
         ];
@@ -3015,7 +3032,8 @@ fn definition_in_context_named(
     let Syntax::Ident { val: name, .. } = &id[0] else {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     };
-    if name.is_anonymous() {
+    let anonymous_instance = is_instance && name.is_anonymous() && generated_name.is_none();
+    if name.is_anonymous() && !anonymous_instance {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
     if is_protected {
@@ -3023,14 +3041,17 @@ fn definition_in_context_named(
     }
     // Anonymous examples retain their surrounding lookup scope. Their internal
     // numeric identity is never a source namespace or a recursive source name.
-    let name = &match generated_name {
+    // An anonymous instance stays in the current namespace; its name is generated
+    // after its signature.
+    let mut owned_name = match generated_name {
         Some(generated) => generated,
+        None if anonymous_instance => Name::anonymous(),
         None => context.enter_declaration(name)?,
     };
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
-    context.protected_declaration = is_protected.then(|| name.clone());
+    context.protected_declaration = is_protected.then(|| owned_name.clone());
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let signature = expect_node(
@@ -3078,6 +3099,13 @@ fn definition_in_context_named(
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
     }
+    if anonymous_instance {
+        let expected = expected
+            .as_ref()
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        owned_name = context.generated_instance_name(&parameters, expected)?;
+    }
+    let name = &owned_name;
     let theorem_section_parameters = if is_theorem {
         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend(expected.iter().cloned());
@@ -3378,7 +3406,10 @@ pub fn protected_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefini
     let instance = matches!(&declaration[1], Syntax::Node { kind, .. }
         if kind == &parser_kind(&["Command", "instance"]));
     let id = if instance {
-        instance_command::parts(&declaration[1])?.id.clone()
+        instance_command::parts(&declaration[1])?
+            .id
+            .cloned()
+            .ok_or(NatDefinitionElabError::AnonymousDeclarationName)?
     } else {
         let Syntax::Node { args, .. } = &declaration[1] else {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
