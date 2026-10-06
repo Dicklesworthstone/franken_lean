@@ -167,18 +167,26 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.tick()?;
         let target = self.whnf(&goal.target)?;
-        let value = if equality::heterogeneous_target(&target).is_some()
-            || equality_target(&target).is_some()
+        // SolveByElim.lean's default ApplyRulesConfig uses Default
+        // transparency. Keep this separate from rw/simp's reducible closure:
+        // search may unfold an ordinary definition, but not an irreducible one.
+        // The shared conversion query also preserves native arithmetic and
+        // propagates resource stops through the existing choice checkpoints.
+        let value = if let Some((level, alpha, left, beta, right)) =
+            equality::heterogeneous_target(&target)
         {
-            // Preserve search's existing head normalization, while sharing the
-            // automatic-closure operand policy used by rw/simp. Closed literal
-            // arithmetic crosses the exact-intrinsic K1 gate, not a new evaluator
-            // or unrestricted delta conversion. The original goal still closes
-            // through the ordinary proof and declaration checkers.
-            let mut normalized = goal.clone();
-            normalized.target = target.clone();
-            self.automatic_reflexivity_candidate(&normalized, true)?
-                .ok_or_else(|| error(TacticError::NoMatchingAssumption))?
+            if !self.coercion_eq(&alpha, &beta)? || !self.coercion_eq(&left, &right)? {
+                return Err(error(TacticError::NoMatchingAssumption));
+            }
+            [alpha, left].into_iter().fold(
+                Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                Expr::app,
+            )
+        } else if let Some((level, alpha, left, right)) = equality_target(&target) {
+            if !self.coercion_eq(&left, &right)? {
+                return Err(error(TacticError::NoMatchingAssumption));
+            }
+            equality::reflexivity(level, alpha, left)
         } else if matches!(target.node(), ExprNode::Const { name, levels }
             if name == &Name::from_components(["True"]) && levels.is_empty())
         {
