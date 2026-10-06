@@ -1,0 +1,36 @@
+{
+ "bead": "fln-r0yh",
+ "run": "S23",
+ "why": "the combined stdlib + Mathlib frontier after fln-4o0g (Rat and Cat roots), fln-gkhu, fln-52qv and fln-ub7i, with S22's exact parameters; its settled rows are the evidence the frontier beads close from, so it is retained rather than left a scratch file",
+ "command": "fln check-olean --continue --jobs 24 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/LeanSearchClient/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/Qq/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/aesop/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/batteries/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/importGraph/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/plausible/.lake/build/lib/lean /data/corpus/mathlib4-v4.32.0/.lake/packages/proofwidgets/.lake/build/lib/lean",
+ "limits": "ulimit -v 104857600 (KiB: 100 GiB)",
+ "binary": {
+  "sha256": "db62d59baa891617b747ba6035c73f94bf1f5905badc175c8ecd0d9500c621cc",
+  "build_command": "cargo build --locked --release -p fln-cli --bin fln",
+  "source_commit": "612670c8",
+  "profile": "release"
+ },
+ "launched_utc_approx": "2026-10-06T00:22:53Z",
+ "exit": "exit=1 elapsed=14562s",
+ "peak_vmhwm_gib": 89.5,
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "frontier",
+  "authority": true,
+  "trust": "recheck",
+  "modules": 11083,
+  "accepted": 8153,
+  "failed": 1,
+  "inconclusive": 21,
+  "internalFault": 0,
+  "blocked": 2908,
+  "acceptedDeclarations": 635171
+ },
+ "result_sha256": "6b7e6c9bbd529b4646eb2b8009c68d411e332b0eca2d6d3a6f3628f686e7f8ab",
+ "result_file": "S23.json (the run's --json, verbatim)",
+ "not_established": [
+  "the binary is main 612670c8: it predates fln-kiq3 (e287c63a), fln-aemn (1917a8b0), the peer's universe-instantiation fix (f9866039) and the universe-cap change, so this is not current main's frontier",
+  "wall time is this host's under concurrent load, not a throughput figure",
+  "launched_utc_approx is the status file's mtime minus the elapsed seconds"
+ ]
+}
