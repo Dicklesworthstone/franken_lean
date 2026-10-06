@@ -173,12 +173,26 @@ fn zero_field_constructors_cannot_erase_unresolved_header_or_result_obligations(
 fn discarded_type_assertions_are_checked_before_constructor_publication() {
     let e = engine();
     let root = e.logical_root(&KVMap::new());
-    for source in [
-        "inductive Bad : (Type : Nat) where | mk",
-        "inductive Bad where | mk : (Bad : Nat)",
-        "inductive Bad where | package (A : Type) : (Bad : Type)",
-        "inductive Bad where | unit : (Bad : Type) | package (A : Type)",
-        "inductive Bad (A : Type) where | mk (T : Type) : (Bad : Type -> Type) A",
+    // The pin refuses the first two with "Type mismatch" (a sort is not `Nat`, `Bad : Type`
+    // is not `Nat`): rigid mismatches, refused at elaboration here too (fln-azxg). The other
+    // three are the pin's "Invalid universe level in constructor"; here K1 refuses them.
+    let elaboration = ("elaboration", false, 1);
+    let kernel = ("kernel-rejection", true, 1);
+    for (source, stage) in [
+        ("inductive Bad : (Type : Nat) where | mk", elaboration),
+        ("inductive Bad where | mk : (Bad : Nat)", elaboration),
+        (
+            "inductive Bad where | package (A : Type) : (Bad : Type)",
+            kernel,
+        ),
+        (
+            "inductive Bad where | unit : (Bad : Type) | package (A : Type)",
+            kernel,
+        ),
+        (
+            "inductive Bad (A : Type) where | mk (T : Type) : (Bad : Type -> Type) A",
+            kernel,
+        ),
     ] {
         let result = e.check_source_files(
             &[source.as_bytes()],
@@ -188,11 +202,13 @@ fn discarded_type_assertions_are_checked_before_constructor_publication() {
         let Err(error) = result else {
             panic!("invalid type assertion accepted: {source}");
         };
-        assert_eq!(
-            error.disposition(),
-            ("kernel-rejection", true, 1),
-            "{error}"
-        );
+        assert_eq!(error.disposition(), stage, "{source}: {error}");
+        if stage == elaboration {
+            assert!(
+                error.to_string().contains("Type mismatch"),
+                "{source}: {error}"
+            );
+        }
         assert_eq!(e.logical_root(&KVMap::new()), root);
     }
     check("inductive Good where | mk : (Good : Type)\ntheorem good : Good.mk = Good.mk := by rfl");

@@ -118,6 +118,13 @@ pub enum SourceInferenceError {
     DottedIdent(DottedIdentError),
     /// A `·` that no parentheses, tuple or ascription scopes (the pin's `elabCDot`).
     CdotOutsideParentheses,
+    /// A term whose type is rigidly not its expected type, with no coercion between them: the
+    /// pin's `Type mismatch` (`throwTypeMismatchError`). Only rigid mismatches are reported
+    /// here; an undecided one still reaches the kernel (`coercions::rigid_type_mismatch`).
+    TypeMismatch {
+        actual: String,
+        expected: String,
+    },
 }
 
 /// An interpretation as the pin's message names it: a root declaration as `_root_.x`.
@@ -237,6 +244,10 @@ impl std::fmt::Display for SourceInferenceError {
             // The pin's words.
             Self::CdotOutsideParentheses => f.write_str(
                 "invalid occurrence of `·` notation, it must be surrounded by parentheses (e.g. `(· + 1)`)",
+            ),
+            Self::TypeMismatch { actual, expected } => write!(
+                f,
+                "Type mismatch: a term of type `{actual}` is expected to have type `{expected}`"
             ),
         }
     }

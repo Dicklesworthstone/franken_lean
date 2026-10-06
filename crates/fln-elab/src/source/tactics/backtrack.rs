@@ -116,7 +116,10 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
             | SourceInferenceError::Recursion(_)
             | SourceInferenceError::InstanceSynthesisRequired
             | SourceInferenceError::UnresolvedHoles { .. }
-            | SourceInferenceError::UnresolvedUniverses,
+            | SourceInferenceError::UnresolvedUniverses
+            // The pin's `throwTypeMismatchError` is an ordinary elaboration error: `first`
+            // catches it and tries its next alternative.
+            | SourceInferenceError::TypeMismatch { .. },
         ) => true,
         NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason)) => {
             match reason.as_ref() {
@@ -235,6 +238,10 @@ mod tests {
     fn choice_catches_user_failures_but_never_resource_or_scope_faults() {
         assert!(recoverable(&error(TacticError::ExplicitFailure)));
         assert!(recoverable(&error(TacticError::ApplyMismatch)));
+        assert!(recoverable(&failure(SourceInferenceError::TypeMismatch {
+            actual: "String".to_owned(),
+            expected: "Nat".to_owned(),
+        })));
         for failure_kind in [
             UnificationError::Cancelled,
             UnificationError::HeartbeatLimit,

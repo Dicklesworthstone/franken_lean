@@ -82,7 +82,6 @@ fn unused_invalid_assertions_still_cross_kernel_checking() {
     for source in [
         "def bad (P : Prop) : Nat := have h : P := 0; 7",
         "def bad (P : Prop) : Nat := let unused := show P from 0; 7",
-        "def bad : Nat := show Prop from 0",
     ] {
         let env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
         let checked = check_definition_source(source.as_bytes(), &env, budget())
@@ -93,6 +92,16 @@ fn unused_invalid_assertions_still_cross_kernel_checking() {
             checked.outcome
         );
     }
+    // `show Prop from 0` has type `Prop`, a sort, rigidly not `Nat`: refused while
+    // elaborating (fln-azxg). The pin refuses it too, first for `OfNat Prop 0`.
+    let source = "def bad : Nat := show Prop from 0";
+    let env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
+    let refusal = check_definition_source(source.as_bytes(), &env, budget())
+        .expect_err("a sort is not a `Nat`");
+    assert!(
+        format!("{refusal:?}").contains("TypeMismatch"),
+        "{source}\n{refusal:?}"
+    );
 }
 #[test]
 fn have_retains_the_nondependent_let_marker() {

@@ -214,8 +214,11 @@ fn syntax_error_reports_a_real_utf16_source_position() {
 //
 // Document:
 //   line 1 (0-based 0): `def ok : Nat := 1`   — valid
-//   line 2 (0-based 1): `def bad : Nat := "str"` — a `String` body under a `Nat`
-//                        declaration; the kernel rejects it (DefinitionTypeMismatch).
+//   line 2 (0-based 1): `def bad : Type := Type` — a `Type 1` body under a `Type`
+//                        declaration; the kernel rejects it (DefinitionTypeMismatch), as
+//                        the pin rejects it ("Type mismatch"). Two sorts are not a rigid
+//                        mismatch, so this one still reaches K1; `"str"` under `Nat` is
+//                        now refused while elaborating (fln-azxg).
 // The failing command starts at byte 18 (the start of line 2), so the diagnostic
 // must publish at line 1, not the hardcoded file-head line 0.
 #[test]
@@ -224,7 +227,7 @@ fn kernel_rejection_reports_the_command_line_not_the_file_head() {
     let (status, messages, stderr) = run_fln_session(&[
         r#"{"jsonrpc":"2.0","id":"init-1","method":"initialize","params":{}}"#,
         r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/KernelReject.lean","languageId":"lean4","version":1,"text":"def ok : Nat := 1\ndef bad : Nat := \"str\""}}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/KernelReject.lean","languageId":"lean4","version":1,"text":"def ok : Nat := 1\ndef bad : Type := Type"}}}"#,
         r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     ]);

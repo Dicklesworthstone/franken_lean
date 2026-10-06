@@ -38,7 +38,7 @@ fn dependent_updates_substitute_all_replaced_fields_in_telescope_order() {
     );
 }
 #[test]
-fn invalid_dependent_carryover_is_a_kernel_rejection_and_is_atomic() {
+fn invalid_dependent_carryover_is_a_type_mismatch_and_is_atomic() {
     let base = check(&engine(), "structure Package where\n  carrier : Type\n  value : carrier\ndef p : Package := { carrier := Nat, value := 5 }").engine;
     let root = base.logical_root(&KVMap::new());
     let refusal = base
@@ -48,11 +48,14 @@ fn invalid_dependent_carryover_is_a_kernel_rejection_and_is_atomic() {
             SourceCheckLimits::new(limits()),
         )
         .expect_err("stale dependent field must reject");
+    // The pin: "Type mismatch __src.value has type __src.carrier but is expected to have
+    // type String". `p.carrier` reduces to `Nat`, rigidly not `String` (fln-azxg).
     assert_eq!(
         refusal.disposition(),
-        ("kernel-rejection", true, 1),
+        ("elaboration", false, 1),
         "{refusal:?}"
     );
+    assert!(refusal.to_string().contains("Type mismatch"), "{refusal}");
     assert_eq!(base.logical_root(&KVMap::new()), root);
     // `OfNat p.carrier 9` fails at the pin (`p` is not unfolded by instance
     // search); valid source ascribes the carrier.

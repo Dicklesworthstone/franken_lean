@@ -549,12 +549,13 @@ fn checked_source_example_uses_the_public_record_pipeline() {
 fn result_sort_normalization_cannot_discard_invalid_source_annotations() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    // `Type : Nat` reaches K1. `1 : String` is refused while elaborating, as the
-    // pin refuses it (no `OfNat String 1`). Each twin must check.
+    // Both are refused while elaborating, as the pin refuses them: `Type : Nat` is
+    // its "Type mismatch" (a sort is rigidly not `Nat`: fln-azxg), and `1 : String`
+    // has no `OfNat String 1`. Each twin must check.
     for (source, disposition, twin) in [
         (
             "structure Bad : (Type : Nat) where\n  value : Nat",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "structure Bad : (Type : Type 1) where\n  value : Nat",
         ),
         (
@@ -564,7 +565,7 @@ fn result_sort_normalization_cannot_discard_invalid_source_annotations() {
         ),
         (
             "variable (A : Type)\nstructure Bad : (Type : Nat) where\n  value : A",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "variable (A : Type)\nstructure Bad : (Type : Type 1) where\n  value : A",
         ),
         (

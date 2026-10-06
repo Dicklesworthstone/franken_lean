@@ -1,4 +1,8 @@
-//! Inheritance conversions use normal typeclass search and pass both checkers.
+//! A structure value is not a value of its parent: the pinned Lean has no automatic parent
+//! coercion, and refuses each such use at elaboration with "Type mismatch" (bead fln-azxg,
+//! comment 3217, every verdict below taken from the pinned lean v4.32.0). The parent is
+//! reached by its projection (`c.toBase`). A class's parents are a different mechanism: the
+//! parent projection is an instance, which the pin does have.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 use fln_core::name::Name;
@@ -25,27 +29,69 @@ fn checked(base: &Engine, text: &str) -> Engine {
     .engine
 }
 
+/// Refused during elaboration with the pin's "Type mismatch", never only by the kernel: an
+/// ill-typed body must not reach K1 as though elaboration had succeeded.
+fn refused_at_elaboration(base: &Engine, text: &str) {
+    let error = base
+        .check_source_files(
+            &[text.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(text);
+    assert_eq!(error.disposition().0, "elaboration", "{text}: {error}");
+    assert!(
+        error.to_string().contains("Type mismatch"),
+        "{text}: {error}"
+    );
+}
+
+const BASE_CHILD: &str = "structure Base where\n  value : Nat\nstructure Child extends Base where\n  tag : Nat\ndef c : Child := { value := 37, tag := 9 }\ndef getV (b : Base) : Nat := b.value\n";
+
 #[test]
-fn automatic_parent_coercions_accept_child_values_in_parent_functions() {
+fn a_child_value_is_not_a_parent_value_without_its_projection() {
+    // The pin: "Type mismatch c has type Child but is expected to have type Base", and
+    // "Application type mismatch" for the argument.
+    refused_at_elaboration(&engine(), &format!("{BASE_CHILD}def asParent : Base := c"));
+    refused_at_elaboration(&engine(), &format!("{BASE_CHILD}def r : Nat := getV c"));
+    // The pin accepts the projection.
     checked(
         &engine(),
-        "structure Base where\n  value : Nat\nstructure Child extends Base where\n  tag : Nat\ndef get (b : Base) : Nat := b.value\ndef c : Child := { value := 37, tag := 9 }\ndef asParent : Base := c\ndef result : Nat := get c\ntheorem result_ok : result = 37 := by rfl\ntheorem cast_ok : asParent.value = 37 := by rfl",
+        &format!(
+            "{BASE_CHILD}def asParent : Base := c.toBase\ntheorem t : getV c.toBase = 37 := by rfl"
+        ),
     );
 }
 
 #[test]
-fn parameterized_and_transitive_parent_coercions_preserve_actual_fields() {
+fn a_grandchild_value_reaches_its_ancestors_only_by_projection() {
+    let family = "structure Base (A : Type) where\n  value : A\nstructure Middle (A : Type) extends Base A where\n  tag : Nat\nstructure Leaf (A : Type) extends Middle A where\n  last : Nat\ndef getV (b : Base Nat) : Nat := b.value\ndef c : Leaf Nat := { value := 19, tag := 23, last := 29 }\n";
+    refused_at_elaboration(
+        &engine(),
+        &format!("{family}def toMiddle : Middle Nat := c"),
+    );
+    refused_at_elaboration(&engine(), &format!("{family}def r : Nat := getV c"));
     checked(
         &engine(),
-        "structure Base (A : Type) where\n  value : A\nstructure Middle (A : Type) extends Base A where\n  tag : Nat\nstructure Leaf (A : Type) extends Middle A where\n  last : Nat\ndef get (b : Base Nat) : Nat := b.value\ndef c : Leaf Nat := { value := 19, tag := 23, last := 29 }\ntheorem transitive_ok : get c = 19 := by rfl\ndef toMiddle : Middle Nat := c\ntheorem middle_ok : toMiddle.tag = 23 := by rfl",
+        &format!(
+            "{family}theorem t : getV c.toBase = 19 := by rfl\ndef toMiddle : Middle Nat := c.toMiddle\ntheorem m : toMiddle.tag = 23 := by rfl"
+        ),
     );
 }
 
 #[test]
-fn dependent_parent_coercions_keep_target_types_tied_to_the_source_value() {
+fn a_dependent_parent_is_reached_by_its_projection() {
+    let both = "structure Carrier where\n  carrier : Type\nstructure Value (A : Type) where\n  value : A\nstructure Both extends Carrier, Value carrier where\n  tag : Nat\n";
+    // The pin: "Type mismatch b has type Both … but is expected to have type Value b.carrier".
+    refused_at_elaboration(
+        &engine(),
+        &format!("{both}def castV (b : Both) : Value b.carrier := b"),
+    );
     let result = checked(
         &engine(),
-        "structure Carrier where\n  carrier : Type\nstructure Value (A : Type) where\n  value : A\nstructure Both extends Carrier, Value carrier where\n  tag : Nat\ndef b : Both := { carrier := Nat, value := 31, tag := 37 }\ndef cast (b : Both) : Value b.carrier := b\ntheorem dependent_ok : (cast b).value = 31 := by rfl",
+        &format!(
+            "{both}def castV (b : Both) : Value b.carrier := b.toValue\ntheorem t (b : Both) : (castV b).value = b.value := rfl"
+        ),
     );
     assert!(
         InstanceRegistry::read(result.environment())
@@ -89,9 +135,10 @@ fn failed_parent_conversion_does_not_publish_partial_files_or_instances() {
                 .contains(&Name::from_components(["prefix"]))
         );
     }
+    // The pin accepts the projection (and refuses `def valid : Base := c`).
     checked(
         &base,
-        "def valid : Base := c\ntheorem recovery : valid.value = 5 := by rfl",
+        "def valid : Base := c.toBase\ntheorem recovery : valid.value = 5 := by rfl",
     );
 }
 
