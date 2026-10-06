@@ -98,7 +98,7 @@ fn completed_instance_outputs_convert_regular_aliases_without_changing_inputs() 
         concat!(
             "def Id (A : Type) : Type := A\n",
             "def wrapped : Id (Id Nat) := transfer 4\n",
-            "theorem wrapped_ok : wrapped = 5 := by rfl\n",
+            "theorem wrapped_ok : wrapped = (5 : Nat) := by rfl\n",
             "def NatAlias : Type := Nat\n",
             "instance distinct : Transfer NatAlias Bool := { convert := fun x => true }\n",
             "def aliasInput (x : NatAlias) : Bool := Transfer.convert x\n",

@@ -9087,6 +9087,9 @@ struct ExecutableValueTypes {
     float32: Expr,
     uint32: Expr,
     uint64: Expr,
+    /// Set only after admitting an erased type-field representation and
+    /// checking that its private name is absent from the logical environment.
+    boxed: Option<Expr>,
     records: std::collections::HashSet<Expr>,
     closures: std::collections::HashMap<Expr, ValueType>,
 }
@@ -9101,6 +9104,7 @@ impl ExecutableValueTypes {
             float32: Expr::const_(Name::from_components(["Float32"]), Vec::new()),
             uint32: Expr::const_(Name::from_components(["UInt32"]), Vec::new()),
             uint64: Expr::const_(Name::from_components(["UInt64"]), Vec::new()),
+            boxed: None,
             records: std::collections::HashSet::new(),
             closures: std::collections::HashMap::new(),
         }
@@ -9661,7 +9665,9 @@ fn executable_value_type(
     source: &Expr,
     value_types: &ExecutableValueTypes,
 ) -> Option<(ValueType, CallableResultOwnership)> {
-    if source == &value_types.nat {
+    if value_types.boxed.as_ref() == Some(source) {
+        Some((ValueType::Abi, CallableResultOwnership::Erased))
+    } else if source == &value_types.nat {
         Some((ValueType::Nat, CallableResultOwnership::OwnedOrScalar))
     } else if source == &value_types.string {
         Some((ValueType::String, CallableResultOwnership::Owned))

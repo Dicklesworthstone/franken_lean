@@ -128,7 +128,7 @@ fn complete_source_files_register_dictionaries_and_execute_do() {
     );
     execute(
         &format!(
-            "{ID}\ndef mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (x : Nat) => x + 1) 41 : Id Nat)"
+            "{ID}\ndef mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (x : Nat) => x + 1) (41 : Nat) : Id Nat)"
         ),
         "42",
     );

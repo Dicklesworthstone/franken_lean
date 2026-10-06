@@ -192,8 +192,10 @@ impl Preparation<'_> {
             let mut hypotheses = Vec::new();
             for (field, type_) in ctor.fields.iter().enumerate() {
                 self.tick()?;
-                body = self.minor_apply(
+                body = self.constructor_minor_apply(
                     body,
+                    ctor,
+                    field,
                     Expr::proj(shape.projection(ctor), field as u64, major.clone()),
                 )?;
                 if self.recursive_field(type_, &families)?.is_some() {

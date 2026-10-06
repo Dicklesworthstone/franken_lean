@@ -104,17 +104,17 @@ impl Preparation<'_> {
                 arguments[arity..].iter().cloned().fold(field, Expr::app),
             ));
         }
-        // A boxed slot's projection function has a dependent result type, so
-        // it is never compiled as a function. Select the field from the
-        // receiver's closed layout instead; the receiver still occurs once.
+        // A hidden-type field's projection function may have a dependent
+        // result type. Select its checked runtime field interface from the
+        // receiver's closed layout; the receiver still occurs exactly once.
         let Some(receiver_type) = receiver_type.filter(|type_| !type_.has_loose_bvars()) else {
             return Ok(None);
         };
         let Some((shape, field)) = self.projection_slot(&receiver_type, struct_name, *idx)? else {
             return Ok(None);
         };
-        if field != records::boxed_slot_type()
-            || self.value_type(&shape.source)? != Some(ValueType::Constructor)
+        if self.value_type(&shape.source)? != Some(ValueType::Constructor)
+            || self.value_type(&field)?.is_none()
         {
             return Ok(None);
         }
@@ -277,7 +277,7 @@ impl Preparation<'_> {
         Ok(Some(type_))
     }
 
-    fn projection_slot(
+    pub(super) fn projection_slot(
         &mut self,
         receiver_type: &Expr,
         structure: &Name,

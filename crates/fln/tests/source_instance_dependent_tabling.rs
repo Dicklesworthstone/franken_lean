@@ -74,7 +74,7 @@ theorem secondValue : result.second = 7 := by rfl"#,
 }
 
 #[test]
-fn fixed_dependent_outputs_do_not_filter_higher_priority_instances() {
+fn fixed_dependent_prerequisites_preserve_their_outputs_without_changing_root_selection() {
     let base = checked(
         &engine(),
         r#"class D (A : outParam Type) (a : outParam A) where
@@ -85,15 +85,21 @@ class Root where
   value : Nat
 instance root {A : Type} {a : A} [warm : D A a] [fixed : D Nat 7] : Root := Root.mk fixed.value"#,
     );
-    let before = base.logical_root(&KVMap::new());
-    assert!(
-        base.check_source_files(
-            &[b"def rejected : Root := inferInstance"],
-            &KVMap::new(),
-            limits()
-        )
-        .is_err()
+    // The pin preserves known prerequisite outputs, even after an open query
+    // warmed the table. Only an outer synthesis request erases its outputs.
+    checked(
+        &base,
+        "def result : Root := inferInstance\ntheorem fixedSelected : result.value = 7 := by rfl",
     );
+    let before = base.logical_root(&KVMap::new());
+    let error = base
+        .check_source_files(
+            &[b"def rejected : D Nat 7 := inferInstance"],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
     checked(
         &base,

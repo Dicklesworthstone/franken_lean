@@ -116,13 +116,11 @@ fn type_valued_fields_are_erased_and_their_values_boxed() {
 }
 #[test]
 fn unsupported_value_dependent_fields_do_not_become_unchecked_objects() {
-    // A function field over a type field has no layout (fln-lvdh boxes only
-    // a field typed by exactly the type field). The Reference accepts this
-    // program; FrankenLean refuses it rather than build an unchecked object.
-    let engine = base(
-        "structure Shown where\n  carrier : Type\n  value : carrier\n  measure : carrier -> Nat",
-    );
-    let source = "def s : Shown := { carrier := Nat, value := 41, measure := fun n => n + 1 }";
+    // Hidden Type fields have a uniform boxed representation. A type computed
+    // from an ordinary runtime value still has no admitted uniform layout.
+    let engine =
+        base("inductive Dep (b : Bool) : Type where | mk (x : if b then Nat else String) : Dep b");
+    let source = "def s : Dep true := Dep.mk (41 : Nat)";
     let root = engine.logical_root(&KVMap::new());
     assert!(
         engine

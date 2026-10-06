@@ -95,7 +95,7 @@ const MONAD: &str = "class Pure (f : Type -> Type) where\n  pure : {A : Type} ->
 #[test]
 fn monadic_operations_with_late_type_and_instance_arguments_run_on_golem() {
     execute(
-        &format!("{MONAD}#eval (step 9 (M := Id) 41 : Id Nat)"),
+        &format!("{MONAD}#eval (step 9 (M := Id) (41 : Nat) : Id Nat)"),
         "42",
     );
 }
@@ -130,7 +130,7 @@ fn type_errors_and_resource_stops_leave_a_deterministic_clean_retry() {
         base.execute_source_definitions(&[invalid.as_bytes()], &options, limits())
             .is_err()
     );
-    let valid = format!("{MONAD}#eval (step 9 (M := Id) 41 : Id Nat)");
+    let valid = format!("{MONAD}#eval (step 9 (M := Id) (41 : Nat) : Id Nat)");
     let mut bounded = limits();
     bounded.ingress.max_nodes = 1;
     assert!(

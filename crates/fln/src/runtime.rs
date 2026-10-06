@@ -952,6 +952,7 @@ fn result_ownership(result: ValueType) -> CallableResultOwnership {
     match result {
         ValueType::Bool | ValueType::UInt32 => CallableResultOwnership::Scalar,
         ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
+        ValueType::Abi => CallableResultOwnership::Erased,
         _ => CallableResultOwnership::Owned,
     }
 }

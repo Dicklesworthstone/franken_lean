@@ -30,11 +30,11 @@ fn execute(source: &str, expected: &str) {
 #[test]
 fn named_reducible_motives_work_in_direct_and_first_class_recursors() {
     execute(
-        "def Result (n : Nat) : Type := Nat\n#eval @Nat.rec Result 0 (fun (n ih : Nat) => ih + 1) 42",
+        "def Result (n : Nat) : Type := Nat\n#eval @Nat.rec Result (0 : Nat) (fun (n ih : Nat) => ih + 1) 42",
         "42",
     );
     execute(
-        "def Result (n : Nat) : Type := Nat\n#eval let fold : Nat -> Nat := @Nat.rec Result 0 (fun (n ih : Nat) => ih + 1); fold 42",
+        "def Result (n : Nat) : Type := Nat\n#eval let fold : Nat -> Nat := @Nat.rec Result (0 : Nat) (fun (n ih : Nat) => ih + 1); fold 42",
         "42",
     );
 }

@@ -691,9 +691,44 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        self.partial_call_with_remaining(head, args, None)
+    }
+
+    /// A constructor that erased a hidden carrier retains its checked concrete
+    /// remaining telescope at the outer callback boundary. Its saturated inner
+    /// call still uses the erased object layout, so ingress inserts the actual
+    /// ABI conversions. The caller must first prove storage compatibility for
+    /// every remaining field; this never casts an existing closure interface.
+    pub(super) fn partial_call_with_remaining(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+        concrete_remaining: Option<&Expr>,
+    ) -> Result<Option<Expr>, IngressError> {
         let Some(mut type_) = self.callable_type(head)? else {
             return Ok(None);
         };
+        // An unspecialized constructor still has its logical name after its
+        // type fields have been erased. Preserve those verified inert slots
+        // in the saturated inner call: replacing them by let-bound variables
+        // would make constructor preparation mistake them for fresh carrier
+        // arguments. Ordinary Boolean/proof fields have no such exemption.
+        let mut type_fields = Vec::new();
+        if let ExprNode::Const { name, levels } = head.node()
+            && levels.is_empty()
+            && self.specializations.constructor_types.contains_key(name)
+            && let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name)
+            && ctor.num_params == 0
+            && ctor.base.level_params.is_empty()
+            && let Some(shape) = self.record_shape(&Expr::const_(ctor.induct.clone(), vec![]))?
+            && let Some(constructor) = shape.constructors.iter().find(|ctor| &ctor.name == name)
+        {
+            for field in &constructor.type_fields {
+                self.tick()?;
+                reserve(&mut type_fields, self.limits.max_context_depth)?;
+                type_fields.push(*field);
+            }
+        }
         let mut supplied = Vec::new();
         for argument in args {
             self.tick()?;
@@ -715,7 +750,7 @@ impl Preparation<'_> {
             supplied.push((binder_name.clone(), domain, argument.clone()));
             type_ = self.substitution(body, argument)?;
         }
-        let remaining_type = self.normalize_type(&type_)?;
+        let remaining_type = self.normalize_type(concrete_remaining.unwrap_or(&type_))?;
         if !matches!(remaining_type.node(), ExprNode::ForallE { .. }) {
             return Ok(None);
         }
@@ -750,13 +785,20 @@ impl Preparation<'_> {
         let mut value = head.clone();
         for index in (0..total).rev() {
             self.tick()?;
-            value = Expr::app(
-                value,
+            let position = total - 1 - index;
+            let argument = if type_fields.get(position) == Some(&true)
+                && supplied
+                    .get(position)
+                    .is_some_and(|(_, _, value)| value == &proofs::erased_value())
+            {
+                proofs::erased_value()
+            } else {
                 Expr::bvar(
                     u32::try_from(index).map_err(|_| unsupported("partial application index"))?,
                 )
-                .map_err(|_| unsupported("partial application index"))?,
-            );
+                .map_err(|_| unsupported("partial application index"))?
+            };
+            value = Expr::app(value, argument);
         }
         for (index, (name, domain, info)) in remaining.into_iter().enumerate().rev() {
             let offset = depth

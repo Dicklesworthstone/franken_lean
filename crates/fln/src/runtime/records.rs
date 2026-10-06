@@ -6,8 +6,9 @@
 //! refusals unless their checked indices erase to a uniform representation.
 //! Nondependent function fields are owned closures with checked interfaces.
 //! Type-valued fields are runtime-irrelevant, as in the Reference's compiler:
-//! each keeps an inert scalar slot, like a proof. A field whose type is exactly
-//! such a field holds a value of any type and is a boxed polymorphic slot.
+//! each keeps an inert scalar slot, like a proof. Dependent fields use a boxed
+//! leaf through uniform containers and explicitly adapted callback interfaces.
+mod erased;
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
 use fln_core::level::Level;
@@ -32,7 +33,8 @@ pub(super) struct ShapeConstructor {
 }
 
 /// The layout-only field type of a boxed polymorphic slot. It names no
-/// declaration and never reaches a checker; only the record catalog reads it.
+/// declaration and never reaches a checker. Recognition is enabled only after
+/// the immutable environment passes the reserved-name check.
 pub(super) fn boxed_slot_type() -> Expr {
     Expr::const_(name("_fln_runtime_boxed"), vec![])
 }
@@ -181,45 +183,21 @@ impl Preparation<'_> {
             } = type_.node()
             {
                 self.tick()?;
-                // A field typed by exactly an earlier type-valued field holds
-                // a value of whatever type that field names: a boxed slot.
-                let boxed = match binder_type.node() {
-                    ExprNode::BVar { idx } => usize::try_from(*idx)
-                        .ok()
-                        .and_then(|idx| idx.checked_add(1))
-                        .and_then(|distance| type_fields.len().checked_sub(distance))
-                        .and_then(|position| type_fields.get(position).copied())
-                        .unwrap_or(false),
-                    _ => false,
+                let Some(field) = self.erase_field_dependencies(binder_type, &type_fields)? else {
+                    return Ok(None);
                 };
-                let (field, type_field) = if boxed {
-                    if self
-                        .environment
-                        .contains(&super::name("_fln_runtime_boxed"))
-                    {
-                        return Err(unsupported("runtime boxed slot name collision"));
-                    }
-                    (boxed_slot_type(), false)
+                let field = self.normalize_type(&field)?;
+                let (field, type_field) = if self.type_parameter(&field)? {
+                    (proofs::erased_type(), true)
                 } else {
-                    // Any other field's representation may not depend on an
-                    // earlier field. Retain that boundary after substituting
-                    // type params.
-                    if binder_type.has_loose_bvars() {
+                    let (head, _) = self.spine(&field)?;
+                    if !matches!(
+                        head.node(),
+                        ExprNode::Const { .. } | ExprNode::ForallE { .. }
+                    ) {
                         return Ok(None);
                     }
-                    let field = self.normalize_type(binder_type)?;
-                    if self.type_parameter(&field)? {
-                        (proofs::erased_type(), true)
-                    } else {
-                        let (head, _) = self.spine(&field)?;
-                        if !matches!(
-                            head.node(),
-                            ExprNode::Const { .. } | ExprNode::ForallE { .. }
-                        ) {
-                            return Ok(None);
-                        }
-                        (field, false)
-                    }
+                    (field, false)
                 };
                 reserve(&mut fields, self.limits.max_context_depth)?;
                 fields.push(field);
@@ -692,10 +670,43 @@ impl Preparation<'_> {
         let Some(binding) = shape.constructors.iter().find(|c| c.original == *name) else {
             return Ok(None);
         };
+        // Recover concrete field types before erasing the carrier arguments.
+        // An already-erased application is final: never interpret its inert
+        // Boolean type slots as fresh source type arguments on a second visit.
+        let adapt = args[parameters..].iter().enumerate().any(|(index, field)| {
+            binding.type_fields.get(index) == Some(&true) && field != &proofs::erased_value()
+        });
+        let mut actual_type = if adapt {
+            let mut type_ =
+                self.universe_instance(&ctor.base.type_, &ctor.base.level_params, levels)?;
+            for parameter in &args[..parameters] {
+                self.tick()?;
+                let ExprNode::ForallE { body, .. } = type_.node() else {
+                    return Err(unsupported("hidden field constructor parameters"));
+                };
+                type_ = self.substitution(body, parameter)?;
+            }
+            Some(type_)
+        } else {
+            None
+        };
         let mut rewritten = specialized;
         let mut value = Expr::const_(binding.name.clone(), vec![]);
         for (index, field) in args[parameters..].iter().enumerate() {
             self.tick()?;
+            let actual = if let Some(type_) = actual_type.take() {
+                let normal = self.type_head(&type_)?;
+                let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = normal.node()
+                else {
+                    return Err(unsupported("hidden field constructor telescope"));
+                };
+                actual_type = Some(self.substitution(body, field)?);
+                Some(binder_type.clone())
+            } else {
+                None
+            };
             // A type argument has no runtime value; its slot holds the same
             // inert scalar as an erased proof and is never evaluated.
             let field = if binding.type_fields.get(index).copied().unwrap_or(false)
@@ -703,10 +714,46 @@ impl Preparation<'_> {
             {
                 rewritten = true;
                 proofs::erased_value()
+            } else if let (Some(actual), Some(expected)) = (actual, binding.fields.get(index)) {
+                let adapted = self.adapt_erased_field(field, &actual, expected)?;
+                rewritten |= adapted != *field;
+                adapted
             } else {
                 field.clone()
             };
             value = Expr::app(value, field);
+        }
+        // A partial constructor is itself a callback. Once its carrier is
+        // erased, later applications no longer have the concrete telescope
+        // needed to adapt an incoming function or nested object. Share the
+        // unsupplied fields only when that telescope already proves storage
+        // compatibility; an absent adapter is never a closure-signature cast.
+        if let Some(mut type_) = actual_type {
+            let remaining = type_.clone();
+            for expected in binding.fields.iter().skip(args.len() - parameters) {
+                self.tick()?;
+                let normal = self.type_head(&type_)?;
+                let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = normal.node()
+                else {
+                    return Err(unsupported("partial hidden constructor telescope"));
+                };
+                let actual = self.erase_runtime_type(binder_type)?;
+                let actual = self.erase_hidden_types(&actual, &[])?;
+                if !self.shared_erased_storage(&actual, expected)? {
+                    return Err(unsupported(
+                        "partial hidden constructor requires an adapter",
+                    ));
+                }
+                type_ = self.substitution(body, &indexed::pending_parameter())?;
+            }
+            if args.len() - parameters < binding.fields.len() {
+                let remaining = self.erase_runtime_type(&remaining)?;
+                let remaining = self.erase_hidden_types(&remaining, &[])?;
+                let (head, arguments) = self.spine(&value)?;
+                return self.partial_call_with_remaining(&head, &arguments, Some(&remaining));
+            }
         }
         Ok(rewritten.then_some(value))
     }
@@ -762,7 +809,7 @@ impl Preparation<'_> {
         for index in 0..ctor.fields.len() {
             self.tick()?;
             let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
-            body = self.minor_apply(body, field)?;
+            body = self.constructor_minor_apply(body, ctor, index, field)?;
         }
         let body = self.typed_callable_result(body, motive.clone(), result)?;
         Ok(Some(Expr::let_e(
@@ -897,7 +944,7 @@ mod closure_fields_tests {
             .unwrap()
             .check_source_files(
                 &[b"inductive Good where | leaf | node (f : Nat -> Good)\n\
-                    structure Payload where\n  carrier : Type\n  display : carrier -> String\n\
+                    structure Payload where\n  flag : Bool\n  value : if flag then Nat else String\n\
                     inductive Bad where | mk (f : Nat -> Bad) (payload : Payload)\n\
                     inductive ProofChild where | leaf | node (f : Nat -> ProofChild) (h : 0 = 0)"],
                 &KVMap::new(),
@@ -916,9 +963,9 @@ mod closure_fields_tests {
         );
         // Proof payloads now have a valid representation. Keep a positive
         // counterexample alongside the refusal fixture; the latter must fail
-        // after anchoring Bad, when its Payload is discovered. A boxed field
-        // typed by a type field has a layout (fln-lvdh); a function field over
-        // that type does not, so Payload stays refused.
+        // after anchoring Bad, when its Payload is discovered. Hidden-type
+        // callbacks now have a uniform interface, whereas a field type chosen
+        // by an ordinary runtime Boolean still has no supported layout.
         let proof_child = Expr::const_(name("ProofChild"), vec![]);
         assert_eq!(
             prep.value_type(&proof_child).unwrap(),
@@ -1050,15 +1097,49 @@ mod type_field_tests {
     }
 
     #[test]
-    fn other_dependencies_on_a_type_field_remain_refusals() {
-        // Only a field typed by exactly a type field is a boxed slot. A type
-        // field used inside another field's type is refused, never given a
-        // made-up layout, and leaves nothing in the catalog.
+    fn hidden_types_extend_through_data_and_callable_interfaces() {
         let engine = engine();
         let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
         for name_ in ["Listed", "Shown"] {
-            assert_eq!(prep.value_type(&family(name_)).unwrap(), None, "{name_}");
+            assert_eq!(
+                prep.value_type(&family(name_)).unwrap(),
+                Some(ValueType::Constructor),
+                "{name_}"
+            );
         }
+        assert_eq!(
+            fields(&prep, "Listed.mk"),
+            [ValueType::Bool, ValueType::Constructor]
+        );
+        let [ValueType::Bool, ValueType::Abi, ValueType::Closure(id)] = fields(&prep, "Shown.mk")
+        else {
+            panic!("hidden callback layout");
+        };
+        let signature = &prep.interfaces[id.get() as usize];
+        assert_eq!(signature.parameters, [ValueType::Abi]);
+        assert_eq!(signature.result, ValueType::String);
+    }
+
+    #[test]
+    fn a_user_declaration_cannot_claim_the_private_boxed_representation() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = engine()
+            .check_source_files(
+                &[b"def _fln_runtime_boxed : Type := Nat"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        assert_ne!(
+            prep.value_type(&boxed_slot_type()).unwrap(),
+            Some(ValueType::Abi)
+        );
+        assert!(prep.value_type(&family("Package")).is_err());
+        assert!(prep.value_types.boxed.is_none());
         assert!(prep.constructors.is_empty());
     }
 

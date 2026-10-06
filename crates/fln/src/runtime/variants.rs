@@ -72,8 +72,10 @@ impl Preparation<'_> {
                 .map_err(|_| unsupported("variant minor scope"))?;
             for field in 0..ctor.fields.len() {
                 self.tick()?;
-                body = self.minor_apply(
+                body = self.constructor_minor_apply(
                     body,
+                    ctor,
+                    field,
                     Expr::proj(shape.projection(ctor), field as u64, major.clone()),
                 )?;
             }

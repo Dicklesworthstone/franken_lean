@@ -90,17 +90,19 @@ instance incompatible {A : Type} [warm : Pick A] [wrong : Pick Nat] : Root := Ro
     );
     checked(
         &base,
-        "def result : Root := inferInstance\ntheorem fallbackSelected : result.value = 7 := by rfl",
+        // The known child goal keeps Nat despite the cached open Bool answer;
+        // the pin therefore selects this candidate, not the fallback.
+        "def result : Root := inferInstance\ntheorem preferredSelected : result.value = 99 := by rfl\ntheorem openAnswerPreserved : result.stamp = 2 := by rfl",
     );
     let before = base.logical_root(&KVMap::new());
-    assert!(
-        base.check_source_files(
+    let error = base
+        .check_source_files(
             &[b"def wrong : Pick Nat := inferInstance"],
             &KVMap::new(),
-            limits()
+            limits(),
         )
-        .is_err()
-    );
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(before, base.logical_root(&KVMap::new()));
     checked(
         &base,

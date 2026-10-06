@@ -326,7 +326,7 @@ impl Preparation<'_> {
             for (field_index, field_type) in ctor.fields.iter().enumerate() {
                 self.tick()?;
                 let field = Expr::proj(shape.projection(ctor), field_index as u64, major.clone());
-                body = self.minor_apply(body, field.clone())?;
+                body = self.constructor_minor_apply(body, ctor, field_index, field.clone())?;
                 let logical = self.type_head(&logical_fields)?;
                 let ExprNode::ForallE {
                     binder_type: logical_type,

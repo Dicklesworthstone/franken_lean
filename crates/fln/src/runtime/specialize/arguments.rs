@@ -127,13 +127,23 @@ impl Preparation<'_> {
             // Closed static arguments with independent domains need no lift
             // when substituted under the retained runtime binders.
             let proposition = self.proposition_parameter(binder_type)?;
+            let type_argument = !proposition && self.type_parameter(binder_type)?;
+            let runtime_type = if type_argument {
+                Some(if closed(argument) {
+                    argument.clone()
+                } else {
+                    self.erase_hidden_types(argument, &[])?
+                })
+            } else {
+                None
+            };
             let selected = if proposition {
                 Some(erased_proposition())
-            } else if binder_type.has_loose_bvars() || !closed(argument) {
+            } else if binder_type.has_loose_bvars() {
                 None
-            } else if self.type_parameter(binder_type)? {
-                Some(argument.clone())
-            } else if *binder_info == BinderInfo::InstImplicit {
+            } else if let Some(type_) = runtime_type {
+                closed(&type_).then_some(type_)
+            } else if *binder_info == BinderInfo::InstImplicit && closed(argument) {
                 self.instance_factory_value(argument)?
             } else {
                 None
@@ -142,12 +152,12 @@ impl Preparation<'_> {
                 let next_type = self.substitution(body, &selected)?;
                 let next_value = self.substitution(value_body, &selected)?;
                 reserve(&mut static_arguments, self.limits.max_application_args)?;
-                // Keep exact type/dictionary arguments in the key. Only Prop
-                // arguments are layout-independent: use their closed erased
-                // representative, never context-relative indices in a global key.
+                // Hidden-type arguments use their verified closed form, never
+                // context-relative receiver indices in a global key. Ordinary
+                // dictionary factories retain their original cache identity.
                 static_arguments.push((
                     index,
-                    if proposition {
+                    if proposition || type_argument {
                         selected
                     } else {
                         argument.clone()

@@ -146,7 +146,7 @@ impl Preparation<'_> {
                         work.push(Work::Visit(binder_type.clone()));
                     } else {
                         reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(self.erase_data_indices(&normal)?);
+                        values.push(self.erase_hidden_types(&normal, &locals)?);
                     }
                 }
                 Work::Domain(name, original, body, info) => {
@@ -258,7 +258,15 @@ impl Preparation<'_> {
                                 }
                                 reserve(&mut arguments, self.limits.max_application_args)?;
                                 arguments.push(if static_type {
-                                    Frame::Keep(arg.clone())
+                                    // Select hidden carriers while the original
+                                    // receiver telescope is still available.
+                                    // Closed concrete carrier arguments stay
+                                    // intact for constructor callback adapters.
+                                    Frame::Keep(if arg.has_loose_bvars() {
+                                        self.erase_hidden_types(arg, &context)?
+                                    } else {
+                                        arg.clone()
+                                    })
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
                                 });
