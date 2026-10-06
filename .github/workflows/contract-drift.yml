@@ -302,10 +302,26 @@ jobs:
       - name: verify imported tag queries and real module publication
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
         run: |
           # The tag test uses checked-in bytes on every ordinary test run.
           # Regenerate those bytes here and also execute the module target's
           # installed-pin companion case, which fails on absent artifacts.
+          #
+          # real_module_fixtures_e2e and pinned_nat_council decline with a plain
+          # `return` when the pinned lib/lean is absent, and read no
+          # FLN_REQUIRE_REFERENCE, so a missing pin, or a SUITE.lock tag that is not
+          # the v4.32.0 their default path names, would pass them as silent skips.
+          # Name the installed SUITE.lock toolchain's library (both read
+          # FLN_REFERENCE_LIB first) and refuse to run without it.
+          FLN_REFERENCE_LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
+          if [[ ! -f "$FLN_REFERENCE_LIB/Init/Prelude.olean" ]]; then
+            echo "pinned Reference library absent at $FLN_REFERENCE_LIB: these pin-gated targets would skip, not run" >&2
+            exit 2
+          fi
+          export FLN_REFERENCE_LIB
+          export FLN_REQUIRE_REFERENCE=1
           artifact_root="target/e2e/contract-drift-imported-tags-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           python3 -I -S scripts/extract/gen_attribute_state_census.py \
             --tag-oracle-output "$artifact_root/prelude.tsv"
