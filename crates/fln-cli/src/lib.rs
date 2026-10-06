@@ -10964,40 +10964,10 @@ fn lean_evaluation_line(
     Ok(format!("{line}\n"))
 }
 
-fn render_bounded_source_type_atom(type_: &fln::Expr) -> Result<String, &'static str> {
-    match type_.node() {
-        fln::ExprNode::Const { name, levels } if levels.is_empty() => Ok(name.to_display_string()),
-        fln::ExprNode::Sort { level } => match level.to_nat() {
-            Some(0) => Ok("Prop".to_owned()),
-            Some(1) => Ok("Type".to_owned()),
-            Some(level) => Ok(format!("Type {}", level - 1)),
-            None => Err("bounded source check inferred a nonconcrete universe"),
-        },
-        _ => Err("bounded source check inferred an unsupported type shape"),
-    }
-}
-
-fn render_bounded_source_type(type_: &fln::Expr) -> Result<String, &'static str> {
-    let mut domains = Vec::new();
-    let mut current = type_;
-    while let fln::ExprNode::ForallE {
-        binder_type, body, ..
-    } = current.node()
-    {
-        if body.has_loose_bvars() {
-            return Err("bounded source check inferred a dependent function type");
-        }
-        domains.push(render_bounded_source_type_atom(binder_type)?);
-        current = body;
-    }
-    let mut rendered = render_bounded_source_type_atom(current)?;
-    for domain in domains.into_iter().rev() {
-        rendered = format!("{domain} → {rendered}");
-    }
-    Ok(rendered)
-}
-
-fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, MultiplexerOutput> {
+fn render_lean_source_check_line(
+    checked: &fln::SourceCheck,
+    environment: &fln::Environment,
+) -> Result<String, MultiplexerOutput> {
     let Some(term) = checked.parsed.query_term_normalized() else {
         return Err(source_failure(
             "internal-fault",
@@ -11017,19 +10987,46 @@ fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, M
             4,
         ));
     }
-    let type_ = match render_bounded_source_type(&checked.checked_type) {
-        Ok(type_) => type_,
-        Err(error) => {
-            return Err(source_failure(
-                "execution",
-                error,
-                true,
-                SourcePresentation::Lean,
-                1,
-            ));
+    // `#check c` for a constant prints its signature (`delabConstWithSignature`);
+    // any other term prints as `term : type`.
+    let constant = match &checked.declaration {
+        fln::Declaration::Defn(definition) if !term.starts_with('@') => {
+            match definition.value.node() {
+                fln::ExprNode::Const { name, .. } => environment
+                    .find(name)
+                    .map(|info| (name.clone(), info.constant_val().type_.clone())),
+                _ => None,
+            }
         }
+        _ => None,
     };
-    Ok(format!("{term} : {type_}\n"))
+    let mut printer = fln::pretty::Printer::new(environment);
+    let rendered = match &constant {
+        Some((name, type_)) => printer.signature(name, type_),
+        // The pin prints the elaborated term, not its source spelling.
+        None => match &checked.declaration {
+            fln::Declaration::Defn(definition) => {
+                printer.expr(&definition.value, 0).and_then(|value| {
+                    printer
+                        .expr(&checked.checked_type, 0)
+                        .map(|type_| format!("{value} : {type_}"))
+                })
+            }
+            _ => printer
+                .expr(&checked.checked_type, 0)
+                .map(|type_| format!("{term} : {type_}")),
+        },
+    };
+    match rendered {
+        Ok(line) => Ok(format!("{line}\n")),
+        Err(fln::pretty::Unsupported(what)) => Err(source_failure(
+            "capability",
+            &format!("#check cannot print {what} the way the pin does"),
+            false,
+            SourcePresentation::Lean,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        )),
+    }
 }
 
 fn source_uses_mixed_lean_commands(source: &[u8]) -> bool {
@@ -11273,7 +11270,10 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     continue;
                 }
-                let line = match render_lean_source_check_line(check) {
+                let line = match render_lean_source_check_line(
+                    check,
+                    completed.batch.engine.environment(),
+                ) {
                     Ok(line) => line,
                     Err(error) => return error,
                 };

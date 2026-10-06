@@ -200,7 +200,28 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
         ),
         (
             b"#check let x : Nat := 40; x + 2\n".as_slice(),
-            "let x : Nat := 40; x + 2 : Nat\n",
+            "let x := 40;\nx + 2 : Nat\n",
+        ),
+        // Captured from the pinned `lean` on the same queries.
+        (
+            b"#check Nat.succ\n".as_slice(),
+            "Nat.succ (n : Nat) : Nat\n",
+        ),
+        (
+            b"#check @List.map\n".as_slice(),
+            "@List.map : {\u{3b1} : Type u_1} \u{2192} {\u{3b2} : Type u_2} \u{2192} (\u{3b1} \u{2192} \u{3b2}) \u{2192} List \u{3b1} \u{2192} List \u{3b2}\n",
+        ),
+        (
+            b"#check fun n => Nat.succ n\n".as_slice(),
+            "fun n => n.succ : Nat \u{2192} Nat\n",
+        ),
+        (
+            b"#check [1,2,3].length\n".as_slice(),
+            "[1, 2, 3].length : Nat\n",
+        ),
+        (
+            "#check \u{2200} n : Nat, n + 0 = n\n".as_bytes(),
+            "\u{2200} (n : Nat), n + 0 = n : Prop\n",
         ),
     ] {
         let checked = run_lean_stdin(&[Path::new("--stdin")], query);
@@ -313,7 +334,10 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
         b"def add (x : Nat) : Nat := x + 1\n#check add\n",
     );
     assert!(terminal_function_check.status.success());
-    assert_eq!(utf8(&terminal_function_check.stdout), "add : Nat → Nat\n");
+    assert_eq!(
+        utf8(&terminal_function_check.stdout),
+        "add (x : Nat) : Nat\n"
+    );
     assert!(terminal_function_check.stderr.is_empty());
 
     let evaluation_prefix = run_lean_stdin(&[Path::new("--stdin")], b"#eval 1\n#check Nat\n");

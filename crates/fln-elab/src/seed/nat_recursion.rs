@@ -543,8 +543,14 @@ pub(super) fn has_nat_add_seed_dependencies(environment: &Environment) -> bool {
 
 pub(super) fn nat_add_seed_declaration() -> Declaration {
     let mut terms = Terms::new();
-    let left = terms.local("x", nat(), BinderInfo::Default);
-    let right = terms.local("x_1", nat(), BinderInfo::Default);
+    let mut left = terms.local("x", nat(), BinderInfo::Default);
+    let mut right = terms.local("x_1", nat(), BinderInfo::Default);
+    // The pin's `Nat.add` binds both arguments under the hygienic name
+    // `a._@._internal._hyg.0` (they are pattern-matched, never named in source), so
+    // `#check Nat.add` shows no binders: `Nat.add : Nat → Nat → Nat`.
+    let hygienic = Name::num(Name::from_components(["a", "_@", "_internal", "_hyg"]), 0);
+    left.user_name = hygienic.clone();
+    right.user_name = hygienic;
     let motive = terms.add_motive();
     let body = app(
         constant("Nat.brecOn", vec![Level::one()]),

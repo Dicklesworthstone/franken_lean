@@ -31,6 +31,7 @@
 #![feature(alloc_error_hook)]
 
 mod olean_imports;
+pub mod pretty;
 pub mod source_check;
 mod source_execution;
 #[cfg(test)]

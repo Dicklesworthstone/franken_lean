@@ -2834,6 +2834,83 @@ impl Context {
         Ok(())
     }
 
+    /// Assign every universe metavariable still open in `term` a fresh parameter
+    /// `u_1`, `u_2`, … in order of first occurrence (value, then type), returning the
+    /// parameters.
+    fn generalize_level_mvars(
+        &mut self,
+        term: &Typed,
+    ) -> Result<Vec<Name>, NatDefinitionElabError> {
+        self.resolve_instances(true)?;
+        self.resume_postponed_eliminators(true)?;
+        self.flush(true)?;
+        let value = self.instantiate(&term.value)?;
+        let type_ = self.instantiate(&term.type_)?;
+        let mut order: Vec<LMVarId> = Vec::new();
+        let mut exprs = vec![type_, value];
+        while let Some(expr) = exprs.pop() {
+            self.tick()?;
+            if !expr.has_level_mvar() {
+                continue;
+            }
+            let mut levels: Vec<Level> = Vec::new();
+            match expr.node() {
+                ExprNode::Sort { level } => levels.push(level.clone()),
+                // Popped from the end: pushed in reverse so the first is seen first.
+                ExprNode::Const { levels: args, .. } => levels.extend(args.iter().rev().cloned()),
+                ExprNode::App { f, a } => {
+                    exprs.push(a.clone());
+                    exprs.push(f.clone());
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    exprs.push(body.clone());
+                    exprs.push(binder_type.clone());
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    exprs.push(body.clone());
+                    exprs.push(value.clone());
+                    exprs.push(type_.clone());
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    exprs.push(expr.clone());
+                }
+                _ => {}
+            }
+            while let Some(level) = levels.pop() {
+                match level.view() {
+                    fln_core::level::LevelView::MVar(id) => {
+                        if !order.contains(id) {
+                            order.push(id.clone());
+                        }
+                    }
+                    fln_core::level::LevelView::Succ(inner) => levels.push(inner.clone()),
+                    fln_core::level::LevelView::Max(a, b)
+                    | fln_core::level::LevelView::IMax(a, b) => {
+                        levels.push(b.clone());
+                        levels.push(a.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut parameters = Vec::with_capacity(order.len());
+        for (index, id) in order.into_iter().enumerate() {
+            let parameter = Name::str(Name::anonymous(), format!("u_{}", index + 1));
+            self.txn
+                .universes
+                .assign(id, Level::param(parameter.clone()));
+            parameters.push(parameter);
+        }
+        Ok(parameters)
+    }
+
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
         self.resolve_instances(true)?;
         self.resume_postponed_eliminators(true)?;
@@ -3348,11 +3425,19 @@ fn query_in(
         "query keyword",
     )?;
     let term = context.term(&parts[1], None)?;
+    // `#check` generalizes universe metavariables the term leaves open to fresh
+    // parameters `u_1`, `u_2`, … (the pin's `levelMVarToParam`), so `#check @List.map`
+    // has a type; `#eval` needs a closed, concrete term and keeps the refusal.
+    let level_params = if evaluate {
+        Vec::new()
+    } else {
+        context.generalize_level_mvars(&term)?
+    };
     let term = context.finish(term)?;
     Ok(Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),
-            level_params: Vec::new(),
+            level_params,
             type_: term.type_,
         },
         value: term.value,
