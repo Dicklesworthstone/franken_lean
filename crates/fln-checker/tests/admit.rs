@@ -24,6 +24,8 @@ mod identical_unfolding;
 mod indexed;
 #[path = "admit/k_gate_lazy_conversion.rs"]
 mod k_gate_lazy_conversion;
+#[path = "admit/k_gate_proof_irrelevance.rs"]
+mod k_gate_proof_irrelevance;
 #[path = "admit/k_like.rs"]
 mod k_like;
 #[path = "admit/quotient_computation.rs"]

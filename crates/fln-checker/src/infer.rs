@@ -188,6 +188,20 @@ impl InferenceContext {
         }
     }
 
+    /// A context with no locals over `reduction`: exact for closed terms. For
+    /// the KR-317 gate's typed conversion in WHNF, which has a reduction context
+    /// but no local declarations. It declares no universe parameter: the typed
+    /// conversion only infers, and universes are validated in checking mode.
+    pub(crate) fn closed_over(reduction: &WhnfContext) -> InferenceContext {
+        InferenceContext {
+            locals: Arc::new(Vec::new()),
+            local_indexes: Arc::new(BTreeMap::new()),
+            level_parameters: Arc::new(Vec::new()),
+            level_parameter_set: Arc::new(BTreeSet::new()),
+            reduction: Arc::new(reduction.clone()),
+        }
+    }
+
     /// This context for checking a declaration of safety `scope`; see
     /// [`WhnfContext::admitting`].
     pub fn admitting(mut self, scope: DefinitionSafety) -> InferenceContext {

@@ -36,6 +36,20 @@ const K_GATE_CONVERSION_WORK: u64 = 100_000;
 /// the two sides lazily, as the pin's `is_def_eq` does, has not decided.
 const K_GATE_NORMALIZATION_WORK: u64 = 10 * K_GATE_CONVERSION_WORK;
 
+/// The conversion budget of the KR-317 gate: `K_GATE_CONVERSION_WORK` of each
+/// kind of work (see `Reducer::k_constructor_types_convert`).
+fn k_gate_conversion_budget(materialization: TermBudget) -> crate::defeq::DefEqBudget {
+    let work = K_GATE_CONVERSION_WORK;
+    crate::defeq::DefEqBudget::new(
+        crate::defeq::QuickDefEqBudget::new(work, work),
+        work,
+        work,
+        work.saturating_mul(10),
+        work.saturating_mul(100),
+        WhnfBudget::new(work, work, materialization),
+    )
+}
+
 thread_local! {
     /// Whether a KR-317 gate's conversion is running on this thread. That
     /// conversion reduces through WHNF, which may meet another K recursor; the
@@ -450,6 +464,13 @@ pub enum WhnfFault {
     KGateConversion {
         at: usize,
         fault: Box<crate::defeq::DefEqFault>,
+    },
+    /// The KR-317 gate's typed conversion faulted (see
+    /// `Reducer::k_constructor_types_proof_convert`). A fault is never read as
+    /// a gate miss.
+    KGateProofConversion {
+        at: usize,
+        fault: Box<crate::infer::InferenceFault>,
     },
 }
 
@@ -1999,10 +2020,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// there sent WHNF to normalize the proof `hcast` itself, which spent the
     /// whole budget of `blastExtractAndExtend.go._unary.eq_def`.
     ///
-    /// Only `Equal` passes the gate: any other outcome, including a stop within
-    /// `K_GATE_CONVERSION_WORK`, leaves the major as it is, as a structural
-    /// miss does. The work is charged to this reduction, and a cancellation
-    /// observed during it stops this reduction too.
+    /// Only `Equal` passes the gate, or, after a deferral, the typed conversion
+    /// of `k_constructor_types_proof_convert`: any other outcome, including a
+    /// stop within `K_GATE_CONVERSION_WORK`, leaves the major as it is, as a
+    /// structural miss does. The work is charged to this reduction, and a
+    /// cancellation observed during it stops this reduction too.
     fn k_constructor_types_convert(
         &mut self,
         domain: &Arc<WireExpr>,
@@ -2020,15 +2042,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control.step(at, self.cancelled)?;
             return Ok(equal);
         }
-        let work = K_GATE_CONVERSION_WORK;
-        let budget = crate::defeq::DefEqBudget::new(
-            crate::defeq::QuickDefEqBudget::new(work, work),
-            work,
-            work,
-            work.saturating_mul(10),
-            work.saturating_mul(100),
-            WhnfBudget::new(work, work, self.control.budget.materialization),
-        );
+        let budget = k_gate_conversion_budget(self.control.budget.materialization);
         let context = self.context.source;
         let cancelled = &mut *self.cancelled;
         let mut saw_cancellation = false;
@@ -2071,11 +2085,100 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .control
             .reductions
             .saturating_add(progress.whnf_reductions);
+        let deferred = matches!(outcome, crate::defeq::DefEqOutcome::Deferred { .. });
+        let equal =
+            equal || (deferred && self.k_constructor_types_proof_convert(domain, result, at)?);
         if let Some(memo) = memo {
             memo.remember_k_gate(Arc::clone(domain), Arc::clone(result), equal);
         }
         self.control.step(at, self.cancelled)?;
         Ok(equal)
+    }
+
+    /// The KR-317 gate's conversion, typed, for a pair the untyped conversion
+    /// DEFERRED. The pin's gate is its typed `is_def_eq` (vendored
+    /// inductive.h:48), which settles by proof irrelevance (`is_def_eq_core`,
+    /// vendored type_checker.cpp:1117) what an untyped conversion must defer:
+    /// whether two distinct proof terms are interchangeable depends on their
+    /// types. In `SSet.horn₃₁.desc.multicofork._proof_8`
+    /// (Mathlib.AlgebraicTopology.SimplicialSet.HornColimits) the gate of an
+    /// `Eq.rec` cast compares two `Fin` values whose bounds are carried by
+    /// different proofs; with no typed answer the cast stayed stuck, and the
+    /// `decide` above it never reached `true`.
+    ///
+    /// Only closed sides are typed here. This layer carries no local
+    /// declarations, so a side naming a local, a metavariable or a loose bound
+    /// variable is left to the gate's other checks; for closed sides an empty
+    /// local context is exact. Only `equal: true` passes. A stop is a miss, as
+    /// for the untyped conversion; a fault is never one.
+    fn k_constructor_types_proof_convert(
+        &mut self,
+        domain: &Arc<WireExpr>,
+        result: &Arc<WireExpr>,
+        at: usize,
+    ) -> Result<bool, Halt> {
+        let materialization = self.control.budget.materialization;
+        for side in [domain, result] {
+            let facts = self.control.term_halt(
+                WhnfPhase::Iota,
+                inspect_with(side, materialization, &mut *self.cancelled),
+            )?;
+            if facts.external_bound_span != 0
+                || facts.contains_free
+                || facts.contains_expression_meta
+                || facts.contains_universe_meta
+            {
+                return Ok(false);
+            }
+        }
+        let work = K_GATE_CONVERSION_WORK;
+        let budget =
+            crate::infer::InferenceBudget::new(work, work, materialization, materialization)
+                .with_whnf(WhnfBudget::new(work, work, materialization))
+                .with_defeq(k_gate_conversion_budget(materialization));
+        let context = crate::infer::InferenceContext::closed_over(self.context.source);
+        let mode = crate::infer::InferenceMode::Checking {
+            declaration_safety: self.context.source.scope(),
+        };
+        let cancelled = &mut *self.cancelled;
+        let mut saw_cancellation = false;
+        K_GATE_CONVERTING.with(|converting| converting.set(true));
+        let outcome = crate::infer::proof_conversion_with(
+            domain,
+            result,
+            &context,
+            mode,
+            budget,
+            &mut || {
+                let stop = cancelled();
+                saw_cancellation |= stop;
+                stop
+            },
+        );
+        K_GATE_CONVERTING.with(|converting| converting.set(false));
+        if saw_cancellation {
+            return Err(Halt::Stop(Box::new(WhnfStop::Cancelled {
+                at,
+                polls: self.control.polls,
+                completed_steps: self.control.steps,
+                completed_reductions: self.control.reductions,
+            })));
+        }
+        match outcome {
+            crate::infer::ProofConversionOutcome::Complete { equal, polls } => {
+                self.control.steps = self.control.steps.saturating_add(polls);
+                Ok(equal)
+            }
+            crate::infer::ProofConversionOutcome::Halted(outcome) => match *outcome {
+                crate::infer::InferenceOutcome::InternalFault { fault, .. } => {
+                    Err(Halt::Fault(WhnfFault::KGateProofConversion {
+                        at,
+                        fault: Box::new(fault),
+                    }))
+                }
+                _ => Ok(false),
+            },
+        }
     }
 
     /// A sufficient conversion gate for KR-317, tried last: only when the lazy
