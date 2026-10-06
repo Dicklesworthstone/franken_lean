@@ -22,6 +22,44 @@ pub(super) struct PreparedTarget {
 }
 
 impl Context {
+    /// An implicit projection argument can still occupy an instance-implicit
+    /// slot in the class telescope. The pin's `synthPending` fills that slot
+    /// from its own class search; it does not infer it from an arbitrary outer
+    /// candidate. Keep the same nesting bound and speculative-state discipline.
+    fn synthesize_instance_input(
+        &mut self,
+        argument: &Expr,
+        registry: &InstanceRegistry,
+    ) -> Result<(), NatDefinitionElabError> {
+        let ExprNode::MVar { id } = argument.node() else {
+            return Ok(());
+        };
+        if self.synth_pending_depth > MAX_SYNTH_PENDING_DEPTH {
+            return Ok(());
+        }
+        let declaration = self
+            .txn
+            .mvars
+            .get_decl(id)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        if declaration.kind == MetavarKind::SyntheticOpaque && !self.instance_goals.contains(id) {
+            return Ok(());
+        }
+        let mut trial = self.clone();
+        let locals = trial.txn.lctx.clone();
+        let equations = std::mem::take(&mut trial.equations);
+        trial.synth_pending_depth = trial.synth_pending_depth.saturating_add(1);
+        let result = trial.search_instance(id.clone(), registry);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        if result? {
+            trial.txn.lctx = locals;
+            trial.equations = equations;
+            trial.synth_pending_depth = self.synth_pending_depth;
+            *self = trial;
+        }
+        Ok(())
+    }
+
     fn instance_parameter_mode(
         &mut self,
         domain: &Expr,
@@ -176,12 +214,20 @@ impl Context {
             self.tick()?;
             telescope = self.instance_type(&telescope)?;
             let ExprNode::ForallE {
-                binder_type, body, ..
+                binder_type,
+                binder_info,
+                body,
+                ..
             } = telescope.node()
             else {
                 return Err(failure(SourceInferenceError::InvalidInstanceBinder));
             };
             let body = body.clone();
+            let mut argument = self.instantiate(&argument)?;
+            if mode == ParameterMode::Input && *binder_info == BinderInfo::InstImplicit {
+                self.synthesize_instance_input(&argument, registry)?;
+                argument = self.instantiate(&argument)?;
+            }
             let selected = match mode {
                 ParameterMode::Input => {
                     if argument.has_expr_mvar() || argument.has_level_mvar() {
