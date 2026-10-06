@@ -283,10 +283,15 @@ fn quotient_induction_computes_a_dependent_proof() {
         eq_at(Level::one(), quotient_type(), q.clone(), q.clone()),
     );
     let report = txn
-        .unify(&Expr::mvar(proof.clone()), &induction(q), budget())
+        .unify(&Expr::mvar(proof.clone()), &induction(q.clone()), budget())
         .unwrap();
     assert_eq!(report.kernel_checks, 1);
-    assert_eq!(txn.mvars.get_assigned_expr(&proof), Some(&expected));
+    // The hole is assigned the eliminator as written, not its computed proof: the
+    // pin's `isDefEqQuickOther` assigns a metavariable the other side unreduced
+    // (bead fln-eeew; the pin's `isDefEq ?out (Quot.lift …)` leaves `?out :=
+    // Quot.lift (fun x => 9) ⋯ (Quot.mk r 0)`). The computation itself is checked
+    // by the first equation above.
+    assert_eq!(txn.mvars.get_assigned_expr(&proof), Some(&induction(q)));
 }
 
 #[test]
@@ -419,7 +424,11 @@ fn lift_preserves_distinct_source_and_result_universes() {
         .unify(&expr, &Expr::mvar(out.clone()), budget())
         .unwrap();
     assert_eq!(report.kernel_checks, 1);
-    assert_eq!(txn.mvars.get_assigned_expr(&out), Some(&numeral(9)));
+    // Assigned as written, as the pin assigns it (bead fln-eeew): measured with the
+    // pinned `lean`, `isDefEq ?out (Quot.lift (fun _ => 9) h (Quot.mk r 0))` leaves
+    // `?out := Quot.lift (fun x => 9) ⋯ (Quot.mk r 0)`. `k1_proves_computation`
+    // above checks that it computes to 9.
+    assert_eq!(txn.mvars.get_assigned_expr(&out), Some(&expr));
 }
 
 #[test]

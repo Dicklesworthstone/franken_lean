@@ -685,6 +685,19 @@ impl Engine<'_> {
         Ok(true)
     }
 
+    /// `e`, or the function `e` applies, is an unassigned metavariable.
+    fn flexible_head(&mut self, expr: &Expr) -> Result<bool, UnificationError> {
+        let mut head = expr;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.meter.tick()?;
+            head = f;
+        }
+        Ok(matches!(
+            head.node(),
+            ExprNode::MVar { id } if !self.work.mvars.is_assigned(id)
+        ))
+    }
+
     /// An unresolved function application must not fall through to rigid
     /// congruence after both pattern orientations fail. Its eventual function
     /// may discard arguments, so ?f a = ?g b does not require a = b.
@@ -862,6 +875,39 @@ impl Engine<'_> {
         self.meter.tick()?;
         if same_terms(left, right, &mut self.meter)? {
             return Ok(());
+        }
+        // The pin's `isDefEqQuickOther` (vendored Meta/ExprDefEq.lean) assigns a
+        // metavariable-headed side the other side as it stands, before either is
+        // reduced, so it never unfolds a definition in order to assign. Reducing
+        // first assigned `?p := Nat.lt n 5` where the pin assigns `?p := n < 5`; at
+        // `instances` transparency an instance subgoal then carries the unfolded
+        // form, which no stored instance path matches (bead fln-eeew). Only a
+        // constant-headed side is assigned here, the case where reducing first
+        // would unfold a definition. Other shapes keep the reducing path below:
+        // the pin also keeps an in-scope beta redex, but this elaborator does not
+        // yet accept every assignment of one. A refusal here mutates nothing.
+        let left_flex = self.flexible_head(left)?;
+        let right_flex = self.flexible_head(right)?;
+        let constant_headed = |expr: &Expr| {
+            let mut head = expr;
+            while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } = head.node() {
+                head = f;
+            }
+            matches!(head.node(), ExprNode::Const { .. })
+        };
+        let quick = match (left_flex, right_flex) {
+            (true, false) if constant_headed(right) => Some((left, right)),
+            (false, true) if constant_headed(left) => Some((right, left)),
+            _ => None,
+        };
+        if let Some((flex, rigid)) = quick {
+            match self.pattern(flex, rigid, locals, pending) {
+                Ok(true) => return Ok(()),
+                Ok(false)
+                | Err(UnificationError::Deferred(_))
+                | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {}
+                Err(error) => return Err(error),
+            }
         }
         let left = self.whnf(left, locals)?;
         let right = self.whnf(right, locals)?;

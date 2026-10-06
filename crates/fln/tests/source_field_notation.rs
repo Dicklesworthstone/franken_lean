@@ -91,8 +91,8 @@ fn record_projections_aliases_and_method_namespaces_keep_their_priority() {
          structure Outer where\n  point : Point\n\
          theorem nested (p : Outer) : p.point.sum = p.point.x + p.point.y := by rfl\n\
          def Alias := Nat\n\
-         def Alias.double (n : Alias) : Nat := n + n\n\
-         theorem alias (n : Alias) : n.double = n + n := by rfl\n\
+         def Alias.double (n : Alias) : Nat := Nat.add n n\n\
+         theorem alias (n : Alias) : n.double = Nat.add n n := by rfl\n\
          def PointAlias := Point\n\
          def PointAlias.x (p : PointAlias) : Nat := 99\n\
          theorem alias_namespace (p : PointAlias) : p.x = 99 := by rfl\n\
@@ -162,6 +162,25 @@ fn field_notation_reaches_only_the_declaration_itself_and_only_structurally() {
         let error = result.expect_err(source);
         assert_eq!(error.disposition().0, "elaboration", "{source}\n{error}");
     }
+}
+
+/// A `def` alias does not inherit its target's instances: the pin refuses `n + n`
+/// for `n : Alias` with "failed to synthesize HAdd Alias Alias ?m" (v4.32.0, run on
+/// this declaration). This elaborator accepted it until the unifier stopped unfolding
+/// `Alias` to `Nat` in order to assign the operator's type (bead fln-eeew).
+#[test]
+fn addition_on_a_definitional_alias_is_refused_as_the_pin_refuses_it() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = "def Alias := Nat\ndef bad (n : Alias) : Nat := n + n";
+    let result = base.check_source_files(&[source.as_bytes()], &options, limits());
+    assert!(
+        !matches!(result, Ok(Outcome::Complete(_))),
+        "{source}\n{result:?}"
+    );
+    assert_eq!(base.logical_root(&options), root);
+    check("def Alias := Nat\ndef good (n : Alias) : Nat := Nat.add n n");
 }
 
 #[test]

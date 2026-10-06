@@ -539,7 +539,7 @@ impl Query<'_> {
             match head.node() {
                 ExprNode::Lit { literal } => out.push((Key::Lit(literal.clone()), Vec::new())),
                 ExprNode::Const { name, .. } => {
-                    let (folded, unfold) = match self.head(name) {
+                    let (folded, mut unfold) = match self.head(name) {
                         Head::Star => return star(),
                         Head::Folded => (true, false),
                         Head::Unfold => (false, true),
@@ -553,6 +553,14 @@ impl Query<'_> {
                         } else {
                             numeral(&args.iter().rev().cloned().fold(head.clone(), Expr::app))
                         };
+                        // A numeral's heads (`OfNat.ofNat`, `Nat.succ`) are
+                        // semireducible in the pin, so its `reduce` leaves a numeral
+                        // whole and keys it as a literal. Only a recorded `reducible`
+                        // status (`Head::Unfold`, never here) would unfold one; an
+                        // unrecorded status queries the literal alone (bead fln-eeew).
+                        if numeral.is_some() {
+                            unfold = false;
+                        }
                         out.push(match numeral {
                             Some(value) => (Key::Lit(Literal::Nat(value)), Vec::new()),
                             None => (Key::Const(name.clone(), arity), args.clone()),
@@ -1012,6 +1020,50 @@ mod tests {
         // A sort is `other`, which only a star stores.
         let goal = decidable(Expr::sort(Level::zero()));
         assert_eq!(matched(&index, &env, &lctx, &goal), ["decAny"]);
+    }
+
+    /// `OfNat.ofNat Nat 5 inst` in argument position is the literal `5`, as the
+    /// pin's `toNatLit?` keys it, even though `OfNat.ofNat` has no recorded status
+    /// here. Its unfolding (a projection, so a star) is not queried: the pin's
+    /// `OfNat.ofNat` is semireducible, so its `reduce` never unfolds a numeral
+    /// (bead fln-eeew). `decLtZero` (`_ < 0`) is therefore not a match.
+    #[test]
+    fn an_ofnat_numeral_is_its_literal_whatever_its_unrecorded_status() {
+        let (index, env, lctx, x, _) = fixture();
+        let projection = lam(lam(lam(Expr::proj(n("OfNat"), 0, bvar(0)))));
+        let env = env
+            .add_decl(definition("OfNat.ofNat", projection))
+            .unwrap()
+            .add_decl(axiom("instOfNatNat"))
+            .unwrap();
+        let numeral = |value: u64| {
+            app(
+                c("OfNat.ofNat"),
+                &[c("Nat"), lit(value), app(c("instOfNatNat"), &[lit(value)])],
+            )
+        };
+        let goal = |value: u64| {
+            app(
+                c("Decidable"),
+                &[app(
+                    c("LT.lt"),
+                    &[
+                        c("Nat"),
+                        c("instLTNat"),
+                        Expr::fvar(x.clone()),
+                        numeral(value),
+                    ],
+                )],
+            )
+        };
+        assert_eq!(
+            matched(&index, &env, &lctx, &goal(5)),
+            ["decAny", "decLt", "decLtAny"]
+        );
+        assert_eq!(
+            matched(&index, &env, &lctx, &goal(0)),
+            ["decAny", "decLt", "decLtAny", "decLtZero"]
+        );
     }
 
     /// `getUnify`'s matches in the pin's traversal order, unsorted.

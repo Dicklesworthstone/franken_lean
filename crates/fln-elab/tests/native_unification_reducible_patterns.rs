@@ -559,3 +559,61 @@ fn a_late_failure_discards_the_residual_and_both_parent_assignments() {
     );
     unchanged(&txn, &before);
 }
+
+/// A transaction whose environment adds `abbrev two : Nat := 2`.
+fn with_abbreviation() -> (ElabTxn, Expr) {
+    use fln_env::constants::{
+        ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    };
+    let mut txn = transaction();
+    txn.env = txn
+        .env
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name("two"),
+                level_params: Vec::new(),
+                type_: nat(),
+            },
+            value: number(2),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name("two")],
+        }))
+        .unwrap();
+    (txn, Expr::const_(name("two"), Vec::new()))
+}
+
+/// The pin's `isDefEqQuickOther` assigns a metavariable the other side as it
+/// stands (bead fln-eeew): `?m =?= two` gives `?m := two`, in both orientations,
+/// where reducing first gave `?m := 2`. Instance search keys a subgoal by the
+/// assigned form, so `?p := n < 5` and `?p := Nat.lt n 5` find different instances.
+#[test]
+fn a_metavariable_is_assigned_a_constant_headed_side_unreduced() {
+    for reverse in [false, true] {
+        let (mut txn, two) = with_abbreviation();
+        let m = hole(&mut txn, "m", nat(), MetavarKind::Natural);
+        let (left, right) = if reverse {
+            (two.clone(), Expr::mvar(m.clone()))
+        } else {
+            (Expr::mvar(m.clone()), two.clone())
+        };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.expression_assignments, vec![m.clone()]);
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&m),
+            Some(&two),
+            "reverse={reverse}"
+        );
+    }
+}
+
+/// The quick assignment is limited to a constant-headed side: a beta redex still
+/// takes the reducing path, as it did before (the pin would keep an in-scope redex).
+#[test]
+fn a_beta_redex_is_still_reduced_before_it_is_assigned() {
+    let (mut txn, _) = with_abbreviation();
+    let m = hole(&mut txn, "m", nat(), MetavarKind::Natural);
+    let redex = beta(nat(), number(37));
+    txn.unify(&Expr::mvar(m.clone()), &redex, budget()).unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&m), Some(&number(37)));
+}

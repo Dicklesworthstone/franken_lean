@@ -556,3 +556,59 @@ fn two_applicable_candidates_select_the_pins_instance_under_init_core() {
         }
     });
 }
+
+/// The head constant of `e` and its arguments in order.
+fn spine(e: &Expr) -> (String, Vec<Expr>) {
+    let mut args = Vec::new();
+    let mut head = e;
+    while let ExprNode::App { f, a } = head.node() {
+        args.push(a.clone());
+        head = f;
+    }
+    args.reverse();
+    let name = match head.node() {
+        ExprNode::Const { name, .. } => name.to_display_string(),
+        other => format!("{other:?}"),
+    };
+    (name, args)
+}
+
+/// A conjunction of comparisons decides with the pin's instances (bead `fln-eeew`).
+/// `instDecidableAnd`'s `p` and `q` are assigned the comparisons as written, so its
+/// subgoals are `Decidable (n < 5)` and `Decidable (n < 6)`, which the index answers
+/// with `Nat.decLt`. Assigning `p := Nat.lt n 5`, the comparison unfolded at the
+/// `instances` transparency, left a subgoal no stored path matches, and the search
+/// failed. The expected term is the pin's: `prelude`, `import Init.Core`, this
+/// declaration, `#print` under `pp.explicit`:
+/// `@decide (And (@LT.lt Nat instLTNat n 5) (@LT.lt Nat instLTNat n 6))
+///  (@instDecidableAnd (@LT.lt …) (@LT.lt …) (n.decLt 5) (n.decLt 6))`.
+#[test]
+fn a_conjunction_of_comparisons_decides_with_the_pins_instances_under_init_core() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    on_stack(move || {
+        let engine = import_closure(&lib, "Init.Core");
+        let limits =
+            SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+        let source = "def d2 (n : Nat) : Bool := decide (n < 5 ∧ n < 6)";
+        let checked = match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), limits) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("{source} must be admitted: {other:?}"),
+        };
+        let Some(ConstantInfo::Defn(definition)) = checked.engine.environment().find(&n("d2"))
+        else {
+            panic!("d2 is checked");
+        };
+        let ExprNode::Lam { body, .. } = definition.value.node() else {
+            panic!("d2 := {:?}", definition.value);
+        };
+        let (decide, args) = spine(body);
+        assert_eq!(decide, "Decidable.decide");
+        let (and, parts) = spine(&args[1]);
+        assert_eq!(and, "instDecidableAnd");
+        let heads: Vec<String> = parts.iter().map(|part| spine(part).0).collect();
+        assert_eq!(heads, ["LT.lt", "LT.lt", "Nat.decLt", "Nat.decLt"]);
+    });
+}
