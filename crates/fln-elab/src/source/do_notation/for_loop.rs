@@ -191,6 +191,13 @@ impl Context {
             (["ForIn", "forIn"], callback)
         };
         let callback = lambda(name, null(vec![]), callback)?;
+        // The pin's elabForIn/elabForIn' checks the collection without a
+        // callback-derived expected type and selects the iteration dictionary
+        // before elaborating that callback (Lean/Elab/Extra.lean).
+        let collection = Syntax::node(
+            parser_kind(&["Term", "nativeDoForCollection"]),
+            vec![collection],
+        );
         let action = application(
             root(&operation),
             vec![monad_argument(), collection, initial, callback],
@@ -333,7 +340,7 @@ mod tests {
                     root(&["ForIn", "forIn"]),
                     vec![
                         monad_argument(),
-                        named("collection"),
+                        term("nativeDoForCollection", vec![named("collection")]),
                         root(&["PUnit", "unit"]),
                         lambda(
                             named("x"),

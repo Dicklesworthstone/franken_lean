@@ -1071,6 +1071,7 @@ impl Context {
             StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
+            ForCollection(Option<Expr>),
             Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
@@ -1201,6 +1202,14 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "nativeDoForCollection"]) {
+                                    let [collection] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    tasks.push(Task::ForCollection(expected));
+                                    tasks.push(Task::Visit(collection, None, true));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
                                     let (name, suffix, body) = do_notation::join_parts(args)?;
                                     tasks.push(Task::DoJoinValue(name, body, expected.clone()));
@@ -2038,6 +2047,15 @@ impl Context {
                                     explicit,
                                 ));
                             }
+                        }
+                        Task::ForCollection(expected) => {
+                            let collection = values.pop().expect("loop collection visit");
+                            let collection = self.finish_term(collection, expected.as_ref())?;
+                            // Numeric defaults must precede dependent callback
+                            // checking, so the admitted ForIn' dictionary can
+                            // supply the element and membership proof types.
+                            self.resolve_instances_with_defaults()?;
+                            values.push(self.finish_term(collection, expected.as_ref())?);
                         }
                         Task::NamedNext(mut state) => {
                             if let Some(argument) = self.next_named_argument(&mut state)? {
