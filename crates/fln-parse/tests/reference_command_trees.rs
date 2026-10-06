@@ -236,7 +236,9 @@ const CDOTS: &[Accepted] = &[
 /// `«term∃_,_»` over `Lean.explicitBinders` (`Init/NotationExtra.lean`), bare names with a
 /// shared type or bracketed groups; `>`, `≥`, `≤`, `≠`, `!=`, `&&` and `||` are their
 /// `Init/Notation.lean` / `Init/Core.lean` infixes, and an ASCII `>=` / `<=` builds the same
-/// `«term_≥_»` / `«term_≤_»` node as its `unicode(…)` partner, keeping its own atom.
+/// `«term_≥_»` / `«term_≤_»` node as its `unicode(…)` partner, keeping its own atom. A Nat
+/// offset pattern `n + k` is `«term_+_»` in a match alternative, and a trailing `where` block
+/// is `Term.whereDecls` of `letRecDecl`s in `declValSimple`'s last slot.
 /// Captured as above, on 2026-10-06.
 const RELATIONS_AND_EXISTENTIALS: &[Accepted] = &[
     Accepted {
@@ -286,6 +288,22 @@ const RELATIONS_AND_EXISTENTIALS: &[Accepted] = &[
     Accepted {
         source: "theorem h : ∃ _ : Nat, True := ⟨0, trivial⟩",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h []) (Command.declSig [] (Term.typeSpec ":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent (Term.hole "_"))] [":" `Nat])) "," `True))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," `trivial] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def pred2 : Nat → Nat\n  | 0 => 0\n  | n + 1 => n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `pred2 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (num "0")) (Term.matchAlt "|" [[(«term_+_» `n "+" (num "1"))]] "=>" `n)]) (Termination.suffix [] []) [])) []))"#,
+    },
+    Accepted {
+        source: "def f (n : Nat) : Nat := match n with\n  | 0 => 0\n  | k + 2 => k\n  | _ => 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (num "0")) (Term.matchAlt "|" [[(«term_+_» `k "+" (num "2"))]] "=>" `k) (Term.matchAlt "|" [[(Term.hole "_")]] "=>" (num "1"))])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def f (n : Nat) : Nat := g n + 1\nwhere g (m : Nat) : Nat := m * 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term_+_» (Term.app `g [`n]) "+" (num "1")) (Termination.suffix [] []) [(Term.whereDecls "where" [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `g) [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" («term_*_» `m "*" (num "2")))) (Termination.suffix [] []))] [])]) []))"#,
+    },
+    Accepted {
+        source: "def f (n : Nat) : Nat := g n + h n\nwhere\n  g (m : Nat) : Nat := m * 2\n  h (m : Nat) : Nat := g m + 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term_+_» (Term.app `g [`n]) "+" (Term.app `h [`n])) (Termination.suffix [] []) [(Term.whereDecls "where" [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `g) [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" («term_*_» `m "*" (num "2")))) (Termination.suffix [] [])) [] (Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `h) [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" («term_+_» (Term.app `g [`m]) "+" (num "1")))) (Termination.suffix [] []))] [])]) []))"#,
     },
 ];
 

@@ -3092,8 +3092,14 @@ fn definition_in_context_named(
         let parts = expect_node(
             &definition[3],
             &parser_kind(&["Command", "declValEqns"]),
-            3,
+            1,
             "equation value",
+        )?;
+        let parts = expect_node(
+            &parts[0],
+            &parser_kind(&["Term", "matchAltsWhereDecls"]),
+            3,
+            "equation alternatives",
         )?;
         (&parts[0], &parts[1], &parts[2])
     } else {
@@ -3115,7 +3121,18 @@ fn definition_in_context_named(
     for part in termination {
         expect_empty_null(part, "absent termination clause")?;
     }
-    expect_empty_null(where_clause, "absent where clause")?;
+    // `where` declarations scope over the body as `let rec` declarations, the pin's
+    // `expandWhereDecls`; each is its own group here, so a later one may call an
+    // earlier one.
+    let with_where;
+    let body = match expect_null_args(where_clause, "where clause")? {
+        [] => body,
+        [where_decls] if !equations => {
+            with_where = where_body(where_decls, body)?;
+            &with_where
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
     if !is_theorem && !is_instance {
         expect_empty_null(&definition[4], "absent definition clauses")?;
     }
@@ -3353,3 +3370,49 @@ pub use record::{SourceRecord, elaborate_record, is_record};
 
 #[cfg(test)]
 mod conversion_tests;
+
+/// `body` under the `let rec` declarations of a `Term.whereDecls` block, first declaration
+/// outermost.
+fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    let parts = expect_node(
+        where_decls,
+        &parser_kind(&["Term", "whereDecls"]),
+        3,
+        "where declarations",
+    )?;
+    expect_atom(&parts[0], "where", "where keyword")?;
+    expect_empty_null(&parts[2], "where trailing separator")?;
+    let items = expect_null_args(&parts[1], "where declaration list")?;
+    let mut declarations = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if index % 2 == 1 {
+            expect_empty_null(item, "where declaration separator")?;
+        } else {
+            expect_node(
+                item,
+                &parser_kind(&["Term", "letRecDecl"]),
+                4,
+                "where declaration",
+            )?;
+            declarations.push(item.clone());
+        }
+    }
+    let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+    let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+    let mut result = body.clone();
+    for declaration in declarations.into_iter().rev() {
+        result = Syntax::node(
+            parser_kind(&["Term", "letrec"]),
+            vec![
+                null(vec![atom("let"), atom("rec")]),
+                Syntax::node(
+                    parser_kind(&["Term", "letRecDecls"]),
+                    vec![null(vec![declaration])],
+                ),
+                null(Vec::new()),
+                result,
+            ],
+        );
+    }
+    Ok(result)
+}

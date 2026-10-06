@@ -42,6 +42,7 @@ mod records;
 mod term_binders;
 mod term_do;
 mod term_locals;
+mod where_decls;
 
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
@@ -926,7 +927,27 @@ fn bounded_value_syntax(
     body_start: usize,
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let mut value = bounded_term(leaves, view, tokens, body_start..tokens.len(), grammar)?;
+    bounded_value_syntax_to(
+        leaves,
+        view,
+        tokens,
+        let_bindings,
+        body_start..tokens.len(),
+        grammar,
+    )
+}
+
+/// [`bounded_value_syntax`] for a body that ends before the command does (at a
+/// trailing `where` block).
+fn bounded_value_syntax_to(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    let_bindings: Vec<LetBindingTokens>,
+    body: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut value = bounded_term(leaves, view, tokens, body, grammar)?;
     for binding in let_bindings.into_iter().rev() {
         if grammar == DefinitionGrammar::NatOnly
             && (binding.recursive.is_some() || !binding.parameters.is_empty())
@@ -2529,6 +2550,11 @@ fn parse_definition_with_grammar(
         });
     }
     let value_index = assignment_index + 1;
+    // A trailing `where` block of a `:=` definition or theorem (`declValSimple`'s
+    // `whereDecls`). An instance's own `where` is its structure body, never this.
+    let where_index = (!equations && !is_instance && grammar == DefinitionGrammar::Scalar)
+        .then(|| where_decls::start(&tokens, value_index))
+        .flatten();
     let (let_bindings, body_start) = if equations {
         (Vec::new(), assignment_index)
     } else {
@@ -2591,16 +2617,32 @@ fn parse_definition_with_grammar(
             grammar,
         )?
     } else {
-        bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?
+        bounded_value_syntax_to(
+            &leaves,
+            &view,
+            &tokens,
+            let_bindings,
+            body_start..where_index.unwrap_or(tokens.len()),
+            grammar,
+        )?
+    };
+    let where_decls = match where_index {
+        Some(at) => null_node(vec![where_decls::syntax(&leaves, &view, &tokens, at)?]),
+        None => null_node(Vec::new()),
     };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
     let declaration_value = if equations {
+        // `declValEqns := matchAltsWhereDecls` (`Lean/Parser/Command.lean`): the
+        // alternatives, termination hints and `where` block sit in one node.
         Syntax::node(
             parser_kind(&["Command", "declValEqns"]),
-            vec![value, termination, null_node(Vec::new())],
+            vec![Syntax::node(
+                parser_kind(&["Term", "matchAltsWhereDecls"]),
+                vec![value, termination, null_node(Vec::new())],
+            )],
         )
     } else {
         Syntax::node(
@@ -2609,7 +2651,7 @@ fn parse_definition_with_grammar(
                 leaves.leaf(assignment_index)?,
                 value,
                 termination,
-                null_node(Vec::new()),
+                where_decls,
             ],
         )
     };

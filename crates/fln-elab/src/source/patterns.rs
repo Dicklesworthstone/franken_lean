@@ -862,6 +862,7 @@ impl Context {
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let node = self.expand_exists_node(node, pattern)?;
+                    let node = self.expand_offset_pattern(node, pattern)?;
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)

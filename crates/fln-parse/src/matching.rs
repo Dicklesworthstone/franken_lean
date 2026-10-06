@@ -592,6 +592,9 @@ fn pattern(
         Parse(Range<usize>),
         Group(usize, usize),
         Application(usize),
+        /// `p + k` with a numeral `k`: the pin's Nat offset pattern (`«term_+_»`), at the
+        /// `+` and the numeral.
+        Offset(usize, usize),
     }
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
@@ -610,6 +613,23 @@ fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Offset(plus, literal) => {
+                let base = values.pop().expect("planned offset base");
+                values.push(Syntax::node(
+                    Name::str(Name::anonymous(), "term_+_"),
+                    vec![
+                        base,
+                        leaves.leaf(plus)?,
+                        bounded_term_leaf(
+                            leaves,
+                            view,
+                            tokens,
+                            literal,
+                            DefinitionGrammar::Scalar,
+                        )?,
+                    ],
+                ));
+            }
             Task::Group(open, close) => {
                 let inner = values.pop().expect("planned pattern group");
                 values.push(Syntax::node(
@@ -632,6 +652,24 @@ fn pattern(
             Task::Parse(range) => {
                 if range.is_empty() {
                     return Err(refuse(view, tokens, range.start));
+                }
+                // `+` binds looser than application, so a trailing `+ k` outside every
+                // parenthesis splits the pattern: `n + 2`, `(succ n) + 1`.
+                if range.len() >= 3
+                    && is_symbol(tokens, range.end - 2, "+")
+                    && matches!(
+                        tokens[range.end - 1].kind,
+                        TokenKind::Literal(LiteralKind::Nat)
+                    )
+                    && !range.clone().any(|at| {
+                        at < range.end - 2
+                            && (is_symbol(tokens, at, "+")
+                                || pairs.get(&at).is_some_and(|close| *close > range.end - 2))
+                    })
+                {
+                    tasks.push(Task::Offset(range.end - 2, range.end - 1));
+                    tasks.push(Task::Parse(range.start..range.end - 2));
+                    continue;
                 }
                 if is_symbol(tokens, range.start, "(") {
                     let close = pairs[&range.start];

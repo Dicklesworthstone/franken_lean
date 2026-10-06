@@ -680,3 +680,62 @@ impl Context {
         Ok(result)
     }
 }
+
+impl Context {
+    /// A Nat offset pattern, `p + k` with a numeral `k` (the pin's `Nat` literal
+    /// offsets in `Lean.Meta.Match`): in a pattern position it is `Nat.succ` applied
+    /// `k` times to `p`, which is the constructor pattern the pin's match compiler
+    /// reduces it to. A `+` anywhere else, or with a non-numeral right side, is left
+    /// to the ordinary term elaborator.
+    pub(super) fn expand_offset_pattern(
+        &mut self,
+        syntax: Syntax,
+        pattern: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if !pattern || syntax.kind() != Some(&Name::str(Name::anonymous(), "term_+_")) {
+            return Ok(syntax);
+        }
+        let offset = match &syntax {
+            Syntax::Node { args, .. } => match args.as_slice() {
+                [_, _, Syntax::Node { kind, args, .. }]
+                    if kind == &Name::str(Name::anonymous(), "num") =>
+                {
+                    match args.as_slice() {
+                        [Syntax::Atom { val, .. }] => val.parse::<u32>().ok(),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        // A large literal offset would unfold into that many constructor patterns.
+        const MAX_OFFSET: u32 = 4096;
+        let Some(offset) = offset.filter(|offset| *offset <= MAX_OFFSET) else {
+            return Ok(syntax);
+        };
+        let Ok((_, parts)) = node_parts(syntax) else {
+            return Err(invalid());
+        };
+        let Ok([mut result, plus, _]) = <[Syntax; 3]>::try_from(parts) else {
+            return Err(invalid());
+        };
+        expect_atom(&plus, "+", "offset pattern")?;
+        for _ in 0..offset {
+            self.tick()?;
+            result = Syntax::node(
+                parser_kind(&["Term", "app"]),
+                vec![
+                    Syntax::Ident {
+                        info: SourceInfo::None,
+                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        val: Name::from_components(["Nat", "succ"]),
+                        preresolved: Vec::new(),
+                    },
+                    Syntax::node(Name::from_components(["null"]), vec![result]),
+                ],
+            );
+        }
+        Ok(result)
+    }
+}
