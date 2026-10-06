@@ -13,6 +13,7 @@ pub(in crate::source) struct RewriteMatch {
 
 use super::*;
 use fln_core::level::LevelView;
+use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 impl Context {
@@ -218,20 +219,25 @@ impl Context {
     }
 
     /// `name` is one of the seed's Nat intrinsics returning `Nat`, and the
-    /// environment holds exactly the seed's axiom under that name.
+    /// environment holds exactly the seed's checked declaration under that name.
     fn exact_nat_intrinsic(&self, name: &Name) -> bool {
-        let Some(Declaration::Axiom(expected)) =
-            crate::seed::source_intrinsic_seed_declaration(name)
-        else {
+        let Some(expected) = crate::seed::source_intrinsic_seed_declaration(name) else {
             return false;
         };
-        let mut result = &expected.base.type_;
+        let expected = match expected {
+            Declaration::Axiom(value) => ConstantInfo::Axiom(value),
+            Declaration::Defn(value) => ConstantInfo::Defn(value),
+            _ => return false,
+        };
+        let mut result = &expected.constant_val().type_;
         while let ExprNode::ForallE { body, .. } = result.node() {
             result = body;
         }
         matches!(result.node(), ExprNode::Const { name, levels }
             if name == &Name::from_components(["Nat"]) && levels.is_empty())
-            && self.txn.env.find(name) == Some(&fln_env::constants::ConstantInfo::Axiom(expected))
+            && self.txn.env.find(name) == Some(&expected)
+            && (name != &Name::from_components(["Nat", "add"])
+                || crate::seed::has_nat_add_seed_dependencies(&self.txn.env))
     }
 
     pub(in crate::source) fn rewrite_proof_term<'a>(

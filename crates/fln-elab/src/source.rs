@@ -88,6 +88,10 @@ pub enum SourceInferenceError {
     RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
     TypeObligation(Box<Outcome<Verdict>>),
+    /// A completed conversion query refused at elaboration's transparency.
+    /// This is not a kernel rejection of the declaration: ordinary admission
+    /// may unfold definitions that this query must keep opaque.
+    ConversionRefused(Box<Verdict>),
     Tactic(tactics::TacticError),
     UnresolvedHoles {
         count: usize,
@@ -205,6 +209,9 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
                 write!(f, "source type obligation failed: {outcome:?}")
+            }
+            Self::ConversionRefused(verdict) => {
+                write!(f, "source conversion refused: {verdict:?}")
             }
             Self::RecordTerm(error) => write!(f, "{error}"),
             Self::ExpectedType => write!(f, "source annotation requires a type"),
@@ -653,7 +660,7 @@ impl Context {
     }
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        self.whnf_with_transparency(expr, UnificationTransparency::SafeDefinitions, true)
+        self.whnf_with_transparency(expr, UnificationTransparency::Default, true)
     }
 
     fn whnf_with_transparency(
@@ -704,8 +711,8 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        // Source type conversion unfolds safe definitions, including dictionary
-        // projections. Instance candidate matching retains its narrower policy.
+        // Ordinary type conversion preserves irreducibility, including beneath
+        // dictionary projections. Instance matching keeps its narrower policy.
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
         // Assign an unknown expected type before reducing the actual carrier.
@@ -731,21 +738,21 @@ impl Context {
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
         self.check_attempt_equation(actual, expected)?;
-        // Reinstating the witness in the final let would otherwise make K1
-        // accept conversions which are unavailable under an opaque hypothesis.
-        // The kernel fallback preserves arithmetic and proof irrelevance; it
-        // closes live parameters as lambdas, never as their hidden witnesses.
-        if self
-            .opaque_locals
-            .iter()
-            .any(|id| self.txn.lctx.contains(id))
-            && !self.coercion_eq(actual, expected)?
-        {
-            return Err(failure(SourceInferenceError::Unification(Box::new(
-                UnificationError::Deferred(UnificationDeferred::UnsupportedEquation),
-            ))));
+        // Kernel admission unfolds definitions that ordinary elaboration must
+        // leave opaque. Check closed equations at Default as well; otherwise
+        // explicit proof arguments and carrier conversions bypass inference.
+        // The restricted fallback also closes opaque locals as parameters.
+        match self.coercion_conversion(actual, expected)? {
+            coercions::Conversion::Equal => Ok(()),
+            coercions::Conversion::Refuted(verdict) => Err(failure(
+                SourceInferenceError::ConversionRefused(Box::new(verdict)),
+            )),
+            coercions::Conversion::Deferred => {
+                Err(failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Deferred(UnificationDeferred::UnsupportedEquation),
+                ))))
+            }
         }
-        Ok(())
     }
 
     fn constrain(&mut self, actual: &Expr, expected: &Expr) -> Result<(), NatDefinitionElabError> {
@@ -757,8 +764,8 @@ impl Context {
             && !expected.has_level_mvar()
         {
             self.check_scoped_equation(&actual, &expected)?;
-            // Closed constraints are checked by the declaration's ordinary K1
-            // admission. Keeping them there preserves its original verdict.
+            // Final admission still independently checks the declaration under
+            // the kernel's ordinary, unrestricted conversion policy.
             return Ok(());
         }
         if let (Some(left), Some(right)) = (self.known_type(&actual)?, self.known_type(&expected)?)
@@ -1240,12 +1247,11 @@ impl Context {
                         Task::CalcNext(build) => {
                             if let Some(step) = build.steps.get(build.cursor) {
                                 let relation = &step[0];
+                                // The pin elaborates a calc relation with
+                                // `elabType`; its result may inhabit any Sort.
+                                let expected = self.type_expected()?;
                                 tasks.push(Task::CalcRelation(build));
-                                tasks.push(Task::Visit(
-                                    relation,
-                                    Some(Expr::sort(Level::zero())),
-                                    true,
-                                ));
+                                tasks.push(Task::Visit(relation, Some(expected), true));
                             } else {
                                 values.push(self.finish_calculation(build)?);
                             }

@@ -296,6 +296,7 @@ fn global_reducibility_attributes_control_real_instance_conversion() {
 #[test]
 fn global_reducibility_resolves_exact_names_and_survives_the_file() {
     let base = engine();
+    let before = fln_elab::reducibility::ReducibilityTable::read(base.environment()).unwrap();
     let one = b"namespace Visibility\n\
         def hidden : Nat := 4\n\
         def \xc2\xabpart.name\xc2\xbb : Nat := 5\n\
@@ -320,10 +321,10 @@ fn global_reducibility_resolves_exact_names_and_survives_the_file() {
             Ok(Some(fln_elab::reducibility::Reducibility::Irreducible)),
         );
     }
-    assert!(
-        fln_elab::reducibility::ReducibilityTable::read(base.environment())
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        fln_elab::reducibility::ReducibilityTable::read(base.environment()).unwrap(),
+        before,
+        "source attribute updates must preserve every existing base status",
     );
 }
 

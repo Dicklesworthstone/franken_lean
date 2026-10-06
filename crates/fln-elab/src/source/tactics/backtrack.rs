@@ -141,6 +141,15 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
                 Outcome::Complete(Verdict::Rejected { .. })
             )
         }
+        NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict)) => {
+            matches!(
+                verdict.as_ref(),
+                Verdict::Rejected {
+                    class: fln_kernel::verdict::RejectClass::NotDefEq,
+                    ..
+                }
+            )
+        }
         _ => false,
     }
 }

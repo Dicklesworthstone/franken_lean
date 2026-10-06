@@ -10,6 +10,14 @@ mod expand;
 mod function;
 mod monad;
 
+/// A native probe can be blocked before a closed kernel query is possible.
+/// Keep that distinct from a completed query's concrete conversion refusal.
+pub(super) enum Conversion {
+    Equal,
+    Refuted(Verdict),
+    Deferred,
+}
+
 impl Context {
     /// Expected function types expose domain/codomain universe constraints that
     /// a single sort equality can hide behind max/imax. Generate them inside
@@ -41,6 +49,17 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        Ok(matches!(
+            self.coercion_conversion(actual, expected)?,
+            Conversion::Equal
+        ))
+    }
+
+    pub(super) fn coercion_conversion(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<Conversion, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
         // Keep the original carrier when assigning an unknown, including
@@ -57,15 +76,15 @@ impl Context {
             self.whnf(&expected)?
         };
         let mut budget = UnificationBudget::new(self.kernel);
-        budget.transparency = UnificationTransparency::SafeDefinitions;
+        budget.transparency = UnificationTransparency::Default;
         // The pin's `isDefEq` here synthesizes an instance its unification has
         // determined (`change 5 = 5` meets `(2 : Int) + 3 = 5` with `?α := Int`).
         match self.unify_pending(&[(actual.clone(), expected.clone())], budget)? {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(Conversion::Equal),
             Err(error) => {
                 let error = failure(SourceInferenceError::Unification(Box::new(error)));
                 if nonmatch(&error) {
-                    self.coercion_kernel_eq(actual, expected)
+                    self.coercion_kernel_conversion(actual, expected)
                 } else {
                     Err(error)
                 }
@@ -73,21 +92,32 @@ impl Context {
         }
     }
 
-    /// The pattern unifier does not implement full arithmetic, proof
-    /// irrelevance or polymorphic conversion. Before inserting a potentially
-    /// observable conversion, ask the existing kernel equality query on closed
-    /// terms. This grants no declaration authority and retains spent work.
+    /// Complete a closed conversion with the kernel's equality machinery under
+    /// the same Default delta restrictions. Theorem bodies stay opaque too,
+    /// matching Meta/GetUnfoldableConst.lean. This grants no declaration
+    /// authority and retains spent work, including inconclusive outcomes.
     pub(in crate::source) fn coercion_kernel_eq(
+        &mut self,
+        left: Expr,
+        right: Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(matches!(
+            self.coercion_kernel_conversion(left, right)?,
+            Conversion::Equal
+        ))
+    }
+
+    fn coercion_kernel_conversion(
         &mut self,
         mut left: Expr,
         mut right: Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<Conversion, NatDefinitionElabError> {
         if left.has_expr_mvar()
             || left.has_level_mvar()
             || right.has_expr_mvar()
             || right.has_level_mvar()
         {
-            return Ok(false);
+            return Ok(Conversion::Deferred);
         }
         let mut needed = self.elimination_reads(&left)?;
         needed.extend(self.elimination_reads(&right)?);
@@ -108,7 +138,7 @@ impl Context {
                     .as_ref()
                     .is_some_and(|v| v.has_expr_mvar() || v.has_level_mvar())
             {
-                return Ok(false);
+                return Ok(Conversion::Deferred);
             }
             needed.extend(self.elimination_reads(&domain)?);
             if let Some(value) = &value {
@@ -195,12 +225,21 @@ impl Context {
         let kernel = self
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
-        match fln_kernel::check_def_eq(
+        let reducibility = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        match fln_kernel::check_def_eq_with_unfolding(
             &self.txn.env,
             &params.into_iter().collect::<Vec<_>>(),
             &left,
             &right,
             kernel,
+            fln_kernel::DefEqUnfolding {
+                opaque_definitions: reducibility.opaque_definitions(),
+                unfold_theorems: false,
+            },
         ) {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
@@ -215,7 +254,10 @@ impl Context {
                     .checked_add(consumed)
                     .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
                 self.tick()?;
-                Ok(verdict.is_accepted())
+                Ok(match verdict {
+                    Verdict::Accepted { .. } => Conversion::Equal,
+                    rejected @ Verdict::Rejected { .. } => Conversion::Refuted(rejected),
+                })
             }
             outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
                 outcome,

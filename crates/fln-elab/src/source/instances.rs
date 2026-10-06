@@ -173,6 +173,19 @@ impl Context {
     }
 }
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
+    // A completed closed-conversion refusal can start another coercion or
+    // instance trial. Exhaustion, cancellation and faults remain terminal.
+    if let NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict)) =
+        error
+    {
+        return matches!(
+            verdict.as_ref(),
+            Verdict::Rejected {
+                class: fln_kernel::verdict::RejectClass::NotDefEq,
+                ..
+            }
+        );
+    }
     // A refuted rigid mismatch is the plainest non-match: a speculative trial moves on.
     if matches!(
         error,

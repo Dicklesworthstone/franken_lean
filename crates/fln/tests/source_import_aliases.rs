@@ -393,6 +393,10 @@ const OVERLOAD_BY_TYPE: &[(&str, &str)] = &[
         "def foo : Bool := true\nnamespace P\ndef foo : Nat := 2\nend P\nopen P\ndef bar : Prop := foo",
         "foo",
     ),
+    (
+        "def foo : 0 = 0 := rfl\nnamespace P\ndef foo : 1 = 1 := rfl\nend P\nopen P\ndef bar : 0 = 0 := foo",
+        "foo",
+    ),
 ];
 
 /// Whether `expr` mentions the constant `name` anywhere.

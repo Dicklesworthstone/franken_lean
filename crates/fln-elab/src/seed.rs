@@ -32,6 +32,7 @@ mod decidable;
 mod float;
 mod logic;
 mod logic_support;
+mod nat_recursion;
 pub use decidable::false_declaration as false_seed_declaration;
 pub use decidable_eq::equality_decision_seed_declarations;
 pub use decidable_generic::generic_equality_decision_seed_declarations;
@@ -384,10 +385,18 @@ fn nat_binary_to_bool_seed_declaration(operation: &str) -> Declaration {
     })
 }
 
-/// Construct the exact `Nat.add : Nat -> Nat -> Nat` candidate recognized by
-/// the bounded compiler bridge.
+/// The pinned logical model of `Nat.add`, including its course-of-values
+/// recursion. The compiler recognizes this exact checked body for native
+/// arithmetic, while symbolic equations use its admitted logical dependencies.
 pub fn nat_add_seed_declaration() -> Declaration {
-    nat_binary_seed_declaration("add")
+    nat_recursion::nat_add_seed_declaration()
+}
+
+/// Whether the logical dependencies of the source Nat.add model are exact.
+/// The runtime bridge checks this together with Nat.add itself before replacing
+/// its body by arithmetic, so a different admitted helper cannot change meaning.
+pub fn has_nat_add_seed_dependencies(environment: &Environment) -> bool {
+    nat_recursion::has_nat_add_seed_dependencies(environment)
 }
 
 /// Construct the exact `Nat.sub : Nat -> Nat -> Nat` candidate recognized by
@@ -673,7 +682,17 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// frontend. Order is part of the deterministic seed contract: scalar types
 /// precede intrinsic signatures, and collection families precede their checked
 /// operation bodies. This is not a complete Prelude ingestion path.
-pub fn source_seed_declarations() -> [Declaration; 92] {
+pub fn source_seed_declarations() -> [Declaration; 100] {
+    let [
+        punit,
+        pprod,
+        cases_on,
+        below,
+        brec_on_go,
+        brec_on,
+        add_match,
+        add_functional,
+    ] = nat_recursion::nat_add_support_seed_declarations();
     let [false_elim, ne] = logic_support::logical_support_seed_declarations();
     let [
         and,
@@ -714,6 +733,14 @@ pub fn source_seed_declarations() -> [Declaration; 92] {
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
         bool_seed_declaration(),
+        punit,
+        pprod,
+        cases_on,
+        below,
+        brec_on_go,
+        brec_on,
+        add_match,
+        add_functional,
         nat_add_seed_declaration(),
         nat_sub_seed_declaration(),
         nat_mul_seed_declaration(),
@@ -878,41 +905,45 @@ mod tests {
         assert_eq!(declarations[0], nat_inductive_seed_declaration());
         assert_eq!(declarations[1], string_seed_declaration());
         assert_eq!(declarations[2], bool_seed_declaration());
-        assert_eq!(declarations[3], nat_add_seed_declaration());
-        assert_eq!(declarations[4], nat_sub_seed_declaration());
-        assert_eq!(declarations[5], nat_mul_seed_declaration());
-        assert_eq!(declarations[6], nat_div_seed_declaration());
-        assert_eq!(declarations[7], nat_gcd_seed_declaration());
-        assert_eq!(declarations[8], nat_land_seed_declaration());
-        assert_eq!(declarations[9], nat_log2_seed_declaration());
-        assert_eq!(declarations[10], nat_lor_seed_declaration());
-        assert_eq!(declarations[11], nat_mod_seed_declaration());
-        assert_eq!(declarations[12], nat_pow_seed_declaration());
-        assert_eq!(declarations[13], nat_pred_seed_declaration());
-        assert_eq!(declarations[14], nat_shift_left_seed_declaration());
-        assert_eq!(declarations[15], nat_shift_right_seed_declaration());
-        assert_eq!(declarations[16], nat_xor_seed_declaration());
-        assert_eq!(declarations[17], string_append_seed_declaration());
-        assert_eq!(declarations[18], string_length_seed_declaration());
-        assert_eq!(declarations[19], string_utf8_byte_size_seed_declaration());
-        assert_eq!(declarations[20], nat_beq_seed_declaration());
-        assert_eq!(declarations[21], nat_ble_seed_declaration());
-        assert_eq!(declarations[22], nat_dec_le_seed_declaration());
-        assert_eq!(declarations[23], nat_dec_lt_seed_declaration());
-        assert_eq!(declarations[24], string_dec_eq_seed_declaration());
-        assert_eq!(declarations[25], eq_seed_declaration());
-        assert_eq!(declarations[26], rfl_seed_declaration());
-        let [false_elim, ne] = logic_support::logical_support_seed_declarations();
-        assert_eq!(declarations[43], false_elim);
-        assert_eq!(declarations[44], ne);
-        assert_eq!(declarations[45], decidable::decidable_declaration());
-        assert_eq!(declarations[53], out_param_seed_declaration());
-        assert_eq!(declarations[54], semi_out_param_seed_declaration());
-        assert_eq!(declarations[73], quotient_seed_declaration());
-        assert_eq!(declarations[74], quotient_sound_seed_declaration());
-        assert_eq!(declarations[75], propext_seed_declaration());
         assert_eq!(
-            declarations[91],
+            declarations[3..11],
+            nat_recursion::nat_add_support_seed_declarations()
+        );
+        assert_eq!(declarations[11], nat_add_seed_declaration());
+        assert_eq!(declarations[12], nat_sub_seed_declaration());
+        assert_eq!(declarations[13], nat_mul_seed_declaration());
+        assert_eq!(declarations[14], nat_div_seed_declaration());
+        assert_eq!(declarations[15], nat_gcd_seed_declaration());
+        assert_eq!(declarations[16], nat_land_seed_declaration());
+        assert_eq!(declarations[17], nat_log2_seed_declaration());
+        assert_eq!(declarations[18], nat_lor_seed_declaration());
+        assert_eq!(declarations[19], nat_mod_seed_declaration());
+        assert_eq!(declarations[20], nat_pow_seed_declaration());
+        assert_eq!(declarations[21], nat_pred_seed_declaration());
+        assert_eq!(declarations[22], nat_shift_left_seed_declaration());
+        assert_eq!(declarations[23], nat_shift_right_seed_declaration());
+        assert_eq!(declarations[24], nat_xor_seed_declaration());
+        assert_eq!(declarations[25], string_append_seed_declaration());
+        assert_eq!(declarations[26], string_length_seed_declaration());
+        assert_eq!(declarations[27], string_utf8_byte_size_seed_declaration());
+        assert_eq!(declarations[28], nat_beq_seed_declaration());
+        assert_eq!(declarations[29], nat_ble_seed_declaration());
+        assert_eq!(declarations[30], nat_dec_le_seed_declaration());
+        assert_eq!(declarations[31], nat_dec_lt_seed_declaration());
+        assert_eq!(declarations[32], string_dec_eq_seed_declaration());
+        assert_eq!(declarations[33], eq_seed_declaration());
+        assert_eq!(declarations[34], rfl_seed_declaration());
+        let [false_elim, ne] = logic_support::logical_support_seed_declarations();
+        assert_eq!(declarations[51], false_elim);
+        assert_eq!(declarations[52], ne);
+        assert_eq!(declarations[53], decidable::decidable_declaration());
+        assert_eq!(declarations[61], out_param_seed_declaration());
+        assert_eq!(declarations[62], semi_out_param_seed_declaration());
+        assert_eq!(declarations[81], quotient_seed_declaration());
+        assert_eq!(declarations[82], quotient_sound_seed_declaration());
+        assert_eq!(declarations[83], propext_seed_declaration());
+        assert_eq!(
+            declarations[99],
             decidable_option::option_equality_decision_seed_declaration()
         );
         assert!(

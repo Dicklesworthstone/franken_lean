@@ -250,14 +250,16 @@ pub(super) fn probe_says_no(error: &NatDefinitionElabError) -> bool {
         SourceInferenceError::ResourceLimit
         | SourceInferenceError::Scope
         | SourceInferenceError::InstanceRegistry(_)
-        | SourceInferenceError::ObservationComplete => false,
+        | SourceInferenceError::ObservationComplete
+        | SourceInferenceError::ConversionRefused(_) => false,
         SourceInferenceError::TypeObligation(outcome) => complete(outcome),
         SourceInferenceError::Unification(error) => match error.as_ref() {
             UnificationError::Cancelled
             | UnificationError::StepLimit { .. }
             | UnificationError::NodeLimit { .. }
             | UnificationError::AssignmentLimit { .. }
-            | UnificationError::HeartbeatLimit => false,
+            | UnificationError::HeartbeatLimit
+            | UnificationError::Reducibility(_) => false,
             UnificationError::ConversionCheck { outcome }
             | UnificationError::AssignmentCheck { outcome, .. }
             | UnificationError::ConstraintCheck { outcome, .. } => complete(outcome),

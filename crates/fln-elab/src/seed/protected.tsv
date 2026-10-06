@@ -182,8 +182,14 @@ Mul.mul	unprotected
 Mul.rec	unprotected
 Nat	unprotected
 Nat.add	protected
+Nat.add._f	unprotected
+Nat.add.match_1	unprotected
+Nat.below	protected
 Nat.beq	unprotected
 Nat.ble	unprotected
+Nat.brecOn	protected
+Nat.brecOn.go	protected
+Nat.casesOn	unprotected
 Nat.decEq	protected
 Nat.decLe	unprotected
 Nat.decLt	unprotected
@@ -248,6 +254,12 @@ OrOp	unprotected
 OrOp.mk	unprotected
 OrOp.or	unprotected
 OrOp.rec	unprotected
+PProd	unprotected
+PProd.mk	unprotected
+PProd.rec	unprotected
+PUnit	unprotected
+PUnit.rec	unprotected
+PUnit.unit	unprotected
 Pow	unprotected
 Pow.mk	unprotected
 Pow.pow	unprotected

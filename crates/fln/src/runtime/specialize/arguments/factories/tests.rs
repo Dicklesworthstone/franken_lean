@@ -114,6 +114,101 @@ fn function_fields_are_code_not_computations_to_execute_during_specialization() 
 }
 
 #[test]
+fn native_addition_stays_a_function_reference_in_addition_dictionaries() {
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+        2 * 1024 * 1024,
+    )))
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let environment = engine.environment();
+    let add = c("Nat.add");
+    assert!(matches!(
+        environment.find(&name("Nat.add")),
+        Some(ConstantInfo::Defn(_))
+    ));
+    assert_eq!(evaluate(environment, &add), Some(add.clone()));
+    let dictionary = application(
+        Expr::const_(name("Add.mk"), vec![Level::zero()]),
+        [c("Nat"), add.clone()],
+    );
+    assert_eq!(evaluate(environment, &c("instAddNat")), Some(dictionary));
+    let heterogeneous = application(
+        Expr::const_(name("instHAdd"), vec![Level::zero()]),
+        [c("Nat"), c("instAddNat")],
+    );
+    assert_eq!(
+        evaluate(environment, &heterogeneous),
+        Some(application(
+            Expr::const_(name("HAdd.mk"), vec![Level::zero(); 3]),
+            [c("Nat"), c("Nat"), c("Nat"), add.clone()],
+        ))
+    );
+    // Supplying even one runtime argument must not evaluate a primitive in
+    // the dictionary factory, nor let a surrounding term discard its work.
+    for (applied, type_) in [
+        (
+            Expr::app(add.clone(), nat::literal(2)),
+            pi(c("Nat"), c("Nat"), BinderInfo::Default),
+        ),
+        (
+            call("Nat.add", [nat::literal(2), nat::literal(3)]),
+            c("Nat"),
+        ),
+    ] {
+        assert!(evaluate(environment, &applied).is_none());
+        assert!(
+            evaluate(
+                environment,
+                &Expr::let_e(name("unused"), type_, applied, nat::literal(0), false),
+            )
+            .is_none()
+        );
+    }
+
+    // The factory's new preservation rule must use the complete intrinsic
+    // predicate. This metadata fixture changes the helper's behavior while
+    // retaining Nat.add; the separate admission regression checks this same
+    // zero-returning helper through both engines.
+    let mut changed = Environment::new();
+    for (_, info) in environment.constants() {
+        let mut info = info.clone();
+        if let ConstantInfo::Defn(definition) = &mut info
+            && definition.base.name == name("Nat.add._f")
+        {
+            let mut binders = Vec::new();
+            let mut body = &definition.value;
+            while let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                binder_info,
+                body: inner,
+            } = body.node()
+            {
+                binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                body = inner;
+            }
+            assert_eq!(binders.len(), 3);
+            let mut value = nat::literal(0);
+            for (name, type_, info) in binders.into_iter().rev() {
+                value = Expr::lam(name, type_, value, info);
+            }
+            definition.value = value;
+        }
+        changed = changed.add_decl(info).unwrap();
+    }
+    assert_eq!(
+        changed.find(&name("Nat.add")),
+        environment.find(&name("Nat.add"))
+    );
+    assert!(!Preparation::new(&changed, IngressLimits::default()).inert_native_function(&add));
+    assert!(matches!(
+        evaluate(&changed, &add).unwrap().node(),
+        ExprNode::Lam { .. }
+    ));
+}
+
+#[test]
 fn beta_zeta_and_constructor_building_cannot_discard_unproved_inertness() {
     let environment = environment();
     let computed = call("runtimeComputation", [nat::literal(0)]);

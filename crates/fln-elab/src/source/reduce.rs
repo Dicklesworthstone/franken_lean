@@ -97,38 +97,49 @@ impl Context {
                     }
                     ExprNode::Const { name, levels } => match self.txn.env.find(name).cloned() {
                         Some(ConstantInfo::Defn(definition)) => {
-                            if definition.safety != DefinitionSafety::Safe
-                                || !match transparency {
-                                    UnificationTransparency::None => false,
-                                    UnificationTransparency::Abbreviations => {
-                                        definition.hints == ReducibilityHints::Abbrev
-                                    }
-                                    UnificationTransparency::Instances => {
-                                        definition.hints == ReducibilityHints::Abbrev
-                                            || crate::reducibility::table(&self.txn.env)
-                                                .map_err(|error| {
-                                                    failure(SourceInferenceError::Unification(
-                                                        Box::new(UnificationError::Reducibility(
-                                                            error,
-                                                        )),
-                                                    ))
-                                                })?
-                                                .status(name)
-                                                .unfolds_at_instances()
-                                    }
-                                    UnificationTransparency::Default => {
-                                        crate::reducibility::table(&self.txn.env)
-                                            .map_err(|error| {
-                                                failure(SourceInferenceError::Unification(
-                                                    Box::new(UnificationError::Reducibility(error)),
-                                                ))
-                                            })?
-                                            .status(name)
-                                            != crate::reducibility::Reducibility::Irreducible
-                                    }
-                                    UnificationTransparency::SafeDefinitions => true,
+                            if definition.safety != DefinitionSafety::Safe || !match transparency {
+                                UnificationTransparency::None => false,
+                                UnificationTransparency::Abbreviations => {
+                                    crate::reducibility::table(&self.txn.env)
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Reducibility(error),
+                                            )))
+                                        })?
+                                        .get(name)
+                                        .map_or(
+                                            definition.hints == ReducibilityHints::Abbrev,
+                                            |status| {
+                                                status
+                                                    == crate::reducibility::Reducibility::Reducible
+                                            },
+                                        )
                                 }
-                            {
+                                UnificationTransparency::Instances => {
+                                    crate::reducibility::table(&self.txn.env)
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Reducibility(error),
+                                            )))
+                                        })?
+                                        .get(name)
+                                        .map_or(
+                                            definition.hints == ReducibilityHints::Abbrev,
+                                            crate::reducibility::Reducibility::unfolds_at_instances,
+                                        )
+                                }
+                                UnificationTransparency::Default => {
+                                    crate::reducibility::table(&self.txn.env)
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Reducibility(error),
+                                            )))
+                                        })?
+                                        .status(name)
+                                        != crate::reducibility::Reducibility::Irreducible
+                                }
+                                UnificationTransparency::SafeDefinitions => true,
+                            } {
                                 break;
                             }
                             if definition.base.level_params.len() != levels.len() {

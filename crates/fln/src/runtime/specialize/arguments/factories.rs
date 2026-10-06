@@ -46,6 +46,15 @@ impl Preparation<'_> {
                 Task::Value(expression) => {
                     let (head, arguments) = self.spine(&expression)?;
                     if let ExprNode::Const { name, levels } = head.node() {
+                        // A verified primitive is inert as a function value,
+                        // whether its logical declaration is an axiom or a
+                        // definition. Keep its name in dictionary fields so
+                        // executable calls still reach the exact intrinsic
+                        // contract, including the checked helper dependencies.
+                        if arguments.is_empty() && self.inert_native_function(&head) {
+                            values.push(expression);
+                            continue;
+                        }
                         match self.environment.find(name) {
                             Some(ConstantInfo::Axiom(axiom))
                                 if !axiom.is_unsafe
@@ -59,9 +68,7 @@ impl Preparation<'_> {
                                 // Opaque types such as String are inert type
                                 // metadata, not executable axioms. A constant
                                 // producing a runtime value or proof is refused.
-                                if self.type_parameter(&type_)?
-                                    || arguments.is_empty() && self.inert_native_function(&head)
-                                {
+                                if self.type_parameter(&type_)? {
                                     values.push(expression);
                                     continue;
                                 }

@@ -98,6 +98,17 @@ impl Context {
     }
 
     pub(super) fn rewrite_nonmatch(error: &NatDefinitionElabError) -> bool {
+        if let NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict)) =
+            error
+        {
+            return matches!(
+                verdict.as_ref(),
+                Verdict::Rejected {
+                    class: fln_kernel::verdict::RejectClass::NotDefEq,
+                    ..
+                }
+            );
+        }
         let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error
         else {
             return false;
@@ -116,8 +127,8 @@ impl Context {
     }
 
     /// Match both the term and its type. `constrain` contributes universe
-    /// equations, while the explicit equations also check closed mismatches
-    /// (ordinary source elaboration leaves those to final declaration checking).
+    /// equations and concrete closed conversion refusals. Explicit equations
+    /// retain the same obligations through the transactional selection batch.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,

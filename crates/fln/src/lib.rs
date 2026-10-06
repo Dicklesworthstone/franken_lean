@@ -33,6 +33,8 @@
 mod olean_imports;
 pub mod source_check;
 mod source_execution;
+#[cfg(test)]
+mod source_nat_add_binding_tests;
 mod source_records;
 #[cfg(test)]
 mod source_seed_names;
@@ -3598,6 +3600,45 @@ impl EngineBuilder {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
+        }
+        // The pin's generated recursion helpers are reducible, except the
+        // matcher and Nat.add itself, which are implicit_reducible. Their
+        // Abbrev hints alone must not override the effective source status.
+        for (name, status) in [
+            (
+                "Nat.casesOn",
+                fln_elab::reducibility::Reducibility::Reducible,
+            ),
+            ("Nat.below", fln_elab::reducibility::Reducibility::Reducible),
+            (
+                "Nat.brecOn.go",
+                fln_elab::reducibility::Reducibility::Reducible,
+            ),
+            (
+                "Nat.brecOn",
+                fln_elab::reducibility::Reducibility::Reducible,
+            ),
+            (
+                "Nat.add.match_1",
+                fln_elab::reducibility::Reducibility::ImplicitReducible,
+            ),
+            (
+                "Nat.add._f",
+                fln_elab::reducibility::Reducibility::Reducible,
+            ),
+            (
+                "Nat.add",
+                fln_elab::reducibility::Reducibility::ImplicitReducible,
+            ),
+        ] {
+            engine.environment = fln_elab::reducibility::register(
+                &engine.environment,
+                &Name::from_components(name.split('.')),
+                status,
+            )
+            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                detail: "Nat recursion source reducibility registration failed",
+            })?;
         }
         for class in ["Inhabited", "Decidable"] {
             engine.environment = fln_elab::instances::register_class(
@@ -8891,15 +8932,21 @@ pub fn source_scalar_constructor_binding(
 
 fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<IntrinsicBinding> {
     let info = environment.find(name)?;
-    let ConstantInfo::Axiom(actual) = info else {
-        return None;
+    let expected = fln_elab::seed::source_intrinsic_seed_declaration(name)
+        .or_else(|| fln_elab::seed::float_intrinsic_seed_declaration(name))?;
+    let expected = match expected {
+        Declaration::Axiom(value) => ConstantInfo::Axiom(value),
+        Declaration::Defn(value) => ConstantInfo::Defn(value),
+        _ => return None,
     };
-    let Declaration::Axiom(expected) = fln_elab::seed::source_intrinsic_seed_declaration(name)
-        .or_else(|| fln_elab::seed::float_intrinsic_seed_declaration(name))?
-    else {
+    // A definition receives the intrinsic only when its entire checked body,
+    // safety and telescope match the source seed. A familiar name is not enough.
+    if info != &expected {
         return None;
-    };
-    if actual != &expected {
+    }
+    if name == &Name::from_components(["Nat", "add"])
+        && !fln_elab::seed::has_nat_add_seed_dependencies(environment)
+    {
         return None;
     }
     generated_source_intrinsic_binding(name)
@@ -16533,6 +16580,97 @@ mod tests {
             prefix.engine.environment().len()
         );
         assert_eq!(engine.logical_root(&options), before);
+    }
+
+    #[test]
+    fn nat_add_logical_model_passes_both_checkers_for_symbolic_equations() {
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let engine = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let n = Expr::bvar(0).unwrap();
+        let literal = |value| Expr::lit(Literal::Nat(NatLit::from_u64(value)));
+        let add = |left, right| {
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Nat", "add"]), vec![]),
+                    left,
+                ),
+                right,
+            )
+        };
+        let proof = |label, left, right: Expr| {
+            let equality = [nat_type(), left, right.clone()].into_iter().fold(
+                Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                Expr::app,
+            );
+            let reflexivity = [nat_type(), right].into_iter().fold(
+                Expr::const_(Name::from_components(["Eq", "refl"]), vec![Level::one()]),
+                Expr::app,
+            );
+            theorem(
+                label,
+                Expr::forall_e(
+                    Name::from_components(["n"]),
+                    nat_type(),
+                    equality,
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    Name::from_components(["n"]),
+                    nat_type(),
+                    reflexivity,
+                    BinderInfo::Default,
+                ),
+            )
+        };
+        // These proofs bypass elaboration entirely. The logical model must
+        // reach K1 and the independent checker, not just a unifier shortcut.
+        for (label, left, right) in [
+            ("zeroRight", add(n.clone(), literal(0)), n.clone()),
+            (
+                "nestedOffsets",
+                add(add(n.clone(), literal(2)), literal(3)),
+                add(n.clone(), literal(5)),
+            ),
+            (
+                "successorOffset",
+                add(n.clone(), literal(1)),
+                Expr::app(
+                    Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+                    n.clone(),
+                ),
+            ),
+        ] {
+            engine
+                .admit_declaration(proof(label, left, right), &options, limits)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                .into_complete()
+                .expect("both checkers certify symbolic Nat.add computation");
+        }
+        engine
+            .admit_declaration(
+                proof("wrongOffset", add(n.clone(), literal(1)), n),
+                &options,
+                limits,
+            )
+            .expect_err("unequal symbolic offsets must remain rejected");
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(matches!(
+            engine
+                .environment()
+                .find(&Name::from_components(["Nat", "add"])),
+            Some(ConstantInfo::Defn(_))
+        ));
+        assert_eq!(
+            fln_elab::reducibility::table(engine.environment())
+                .unwrap()
+                .status(&Name::from_components(["Nat", "add"])),
+            fln_elab::reducibility::Reducibility::ImplicitReducible,
+        );
     }
 
     #[test]
