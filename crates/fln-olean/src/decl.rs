@@ -1636,14 +1636,14 @@ pub fn chain_extra_const_names(
 /// space, walked, and `ModuleData`-decoded. The private array is then decoded
 /// and proven a superset.
 ///
-/// ONE DELIBERATE DIVERGENCE. The product door also runs the full declaration
-/// decoder over the SERVER part and discards the result. This does not, because
-/// it would be re-decoding the exported array: across all 2,431 chained modules
-/// of the pin, the server part's `constNames` is never different from the
-/// exported part's, and the arrays it points at live in the exported region.
-/// The server region is still walked and `ModuleData`-decoded here, so its
-/// object graph and root contract are checked; only the redundant second pass
-/// over declarations the exported decode already validated is skipped.
+/// ONE DELIBERATE DIVERGENCE. The product door validates the SERVER part's
+/// declarations unless both arrays reuse the exact exported-region objects.
+/// This door always skips that pass: across all 2,431 chained modules of the
+/// pin, the server part's `constNames` is never different from the exported
+/// part's, and the arrays it points at live in the exported region. The server
+/// region is still walked and `ModuleData`-decoded here, so its object graph
+/// and root contract are checked. For a server carrying different declaration
+/// arrays, the product door's additional declaration validation still applies.
 pub fn decode_chain_constants_from_parts(
     exported: &[u8],
     server: &[u8],

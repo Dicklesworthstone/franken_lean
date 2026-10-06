@@ -533,6 +533,52 @@ impl<'a> OleanView<'a> {
             .any(|region| region.base_addr == other.header.base_addr)
     }
 
+    /// Whether both declaration arrays are the same objects in an earlier,
+    /// self-contained view's immutable storage.
+    ///
+    /// A successful declaration decode of `earlier` can then be reused under
+    /// the same declaration budget. This does not validate this view's header,
+    /// region, graph or other `ModuleData` fields; those checks still belong to
+    /// the caller. A false result requires the ordinary declaration decoder.
+    ///
+    /// Matching stored addresses alone is insufficient: the dependency must
+    /// borrow the exact same bytes at the same parsed base. The earlier view
+    /// must have no dependencies, so every pointer its decoder followed stays
+    /// inside that region. `parse_with_dependencies` rejects overlapping
+    /// regions and collisions with local file offsets, so no later region can
+    /// shadow those pointers.
+    pub fn reuses_module_constant_arrays(&self, earlier: &OleanView<'_>) -> RResult<bool> {
+        // Headers are public, so a caller may have changed the current base
+        // since parsing established disjoint address ranges. The earlier base
+        // is bound to its original bytes by the dependency match below.
+        if earlier.has_dependency_regions()
+            || self.header.base_addr != Self::parse(self.bytes)?.header.base_addr
+        {
+            return Ok(false);
+        }
+        let Some(dependency) = self.dependencies.iter().find(|region| {
+            std::ptr::eq(region.bytes, earlier.bytes)
+                && region.base_addr == earlier.header.base_addr
+                && region.payload_offset == earlier.payload_offset
+                && region.payload_len == earlier.payload_len
+        }) else {
+            return Ok(false);
+        };
+        let previous = earlier.module_arrays()?;
+        let current = self.module_arrays()?;
+        for ((previous_offset, previous_len), (current_offset, current_len)) in [
+            (previous.const_names, current.const_names),
+            (previous.constants, current.constants),
+        ] {
+            if previous_len != current_len
+                || dependency.base_addr.checked_add(previous_offset) != Some(current_offset)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Parse one module-system sidecar with the compacted regions it may
     /// reference, in load order.
     ///
@@ -1740,6 +1786,93 @@ mod dependency_address_dispatch_tests {
         )
         .expect("empty module encodes")
         .bytes
+    }
+
+    #[test]
+    fn declaration_array_reuse_requires_both_arrays_and_the_same_backing_region() {
+        let base = format::REGION_ALIGN as u64;
+        let public = empty_module(base);
+        let public_view = OleanView::parse(&public).expect("public view");
+        let public_arrays = public_view.module_arrays().expect("public arrays");
+        let original_server = empty_module(2 * base);
+        let root = {
+            let view = OleanView::parse(&original_server).expect("server view");
+            view.deref(view.root_ptr().expect("root"))
+                .expect("root offset") as usize
+        };
+        let slot = |field| {
+            let index = format::MODULE_DATA_FIELDS
+                .iter()
+                .filter(|field| field.lean_type != "Bool")
+                .position(|candidate| candidate.name == field)
+                .expect("generated field");
+            root + 8 * (index + 1)
+        };
+
+        // Equal empty arrays in another region still require their own decode.
+        let server_view =
+            OleanView::parse_with_dependencies(&original_server, &[&public]).expect("server view");
+        assert!(
+            !server_view
+                .reuses_module_constant_arrays(&public_view)
+                .unwrap()
+        );
+
+        let bindings = [
+            (slot("constNames"), base + public_arrays.const_names.0),
+            (slot("constants"), base + public_arrays.constants.0),
+        ];
+        for binding in &bindings {
+            let mut server = original_server.clone();
+            server[binding.0..binding.0 + 8].copy_from_slice(&binding.1.to_le_bytes());
+            let view = OleanView::parse_with_dependencies(&server, &[&public]).unwrap();
+            assert!(
+                !view.reuses_module_constant_arrays(&public_view).unwrap(),
+                "one shared array does not validate the other"
+            );
+        }
+
+        let mut server = original_server.clone();
+        for (slot, pointer) in bindings {
+            server[slot..slot + 8].copy_from_slice(&pointer.to_le_bytes());
+        }
+        let server_view = OleanView::parse_with_dependencies(&server, &[&public]).unwrap();
+        assert!(
+            server_view
+                .reuses_module_constant_arrays(&public_view)
+                .unwrap()
+        );
+        let copied_public = public.clone();
+        let copied_view = OleanView::parse(&copied_public).unwrap();
+        assert!(
+            !server_view
+                .reuses_module_constant_arrays(&copied_view)
+                .unwrap(),
+            "equal stored addresses in a different allocation are not a reuse proof"
+        );
+
+        // Even unused dependencies make the earlier address space unsuitable
+        // for the self-contained-region proof. Overlap is rejected at parsing.
+        let other = empty_module(3 * base);
+        let earlier_with_dependencies =
+            OleanView::parse_with_dependencies(&public, &[&other]).unwrap();
+        assert!(
+            !server_view
+                .reuses_module_constant_arrays(&earlier_with_dependencies)
+                .unwrap()
+        );
+        assert!(OleanView::parse_with_dependencies(&server, &[&public, &copied_public]).is_err());
+
+        // A minimal server whose root itself refers to the public ModuleData.
+        // Mutating its public header can overlap an earlier object's address
+        // while both declaration arrays still resolve to the earlier region.
+        let mut root_only = original_server[..format::OLEAN_HEADER_SIZE + 8].to_vec();
+        root_only[format::OLEAN_HEADER_SIZE..]
+            .copy_from_slice(&public_view.root_ptr().unwrap().to_le_bytes());
+        let mut view = OleanView::parse_with_dependencies(&root_only, &[&public]).unwrap();
+        assert!(view.reuses_module_constant_arrays(&public_view).unwrap());
+        view.header.base_addr = base;
+        assert!(!view.reuses_module_constant_arrays(&public_view).unwrap());
     }
 
     #[test]

@@ -1238,9 +1238,11 @@ pub fn olean_module_imports(
 /// compacted address spaces, given the shared runtime's full-surface audit in
 /// that same address space (every object, reachable or not, with pointers
 /// allowed to land in the earlier parts), walked through their
-/// dependency-aware object graphs, and declaration-decoded before any result
-/// is returned. This function does not resolve imports or admit any
-/// declaration into an [`Engine`].
+/// dependency-aware object graphs, and their declarations validated before
+/// any result is returned. A server whose declaration arrays reuse the exact
+/// exported-region objects reuses their successful decode under the same
+/// declaration budget; other server arrays are decoded in full. This function
+/// does not resolve imports or admit any declaration into an [`Engine`].
 pub fn decode_olean_module_artifacts(
     artifact: &[u8],
     server_artifact: &[u8],
@@ -1310,12 +1312,24 @@ pub fn decode_olean_module_artifacts(
             part: server_part,
             error,
         })?;
-    DeclDecoder::new(&server_view, limits.declarations)
-        .decode_module_constants()
-        .map_err(|error| OleanDecodeError::CompanionDeclaration {
+    // The pinned server part points its declaration arrays back into the
+    // exported region. Reuse that completed decode only when both arrays name
+    // the same immutable objects under an unambiguous dependency map. Equal
+    // names, counts or stored addresses alone are not a reuse proof.
+    if !server_view
+        .reuses_module_constant_arrays(&public_view)
+        .map_err(|error| OleanDecodeError::CompanionRegion {
             part: server_part,
             error,
-        })?;
+        })?
+    {
+        DeclDecoder::new(&server_view, limits.declarations)
+            .decode_module_constants()
+            .map_err(|error| OleanDecodeError::CompanionDeclaration {
+                part: server_part,
+                error,
+            })?;
+    }
 
     let private_part = OleanCompanionPart::Private;
     let private_view =
@@ -13025,6 +13039,148 @@ mod tests {
             std::fs::read(&path)
                 .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
         })
+    }
+
+    #[test]
+    fn public_olean_decoder_reuses_the_pinned_server_declaration_arrays() {
+        let [exported, server, private] = pinned_prelude_chain();
+        let public_view = super::OleanView::parse(&exported).expect("exported view");
+        let server_view =
+            super::OleanView::parse_with_dependencies(&server, &[&exported]).expect("server view");
+        assert!(
+            server_view
+                .reuses_module_constant_arrays(&public_view)
+                .unwrap(),
+            "the real pinned Prelude must take the guarded reuse path"
+        );
+        let limits = OleanDecodeLimits::new(exported.len() + server.len() + private.len());
+        let exported_constants = super::DeclDecoder::new(&public_view, limits.declarations)
+            .decode_module_constants()
+            .expect("exported declarations");
+        let server_constants = super::DeclDecoder::new(&server_view, limits.declarations)
+            .decode_module_constants()
+            .expect("the omitted server pass");
+        assert_eq!(exported_constants, server_constants);
+        let decoded = super::decode_olean_module_artifacts(&exported, &server, &private, limits)
+            .expect("the pinned chain still decodes");
+        assert!(decoded.companion_parts_loaded);
+        assert_eq!(decoded.constants.len(), 2314);
+        assert!(matches!(
+            decoded.independent,
+            super::IndependentReading::Read(_)
+        ));
+    }
+
+    #[test]
+    fn public_olean_decoder_checks_unshared_server_arrays_and_their_budget() {
+        let base = super::OLEAN_REGION_ALIGN as u64;
+        let axiom = |name: &str, type_| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components([name]),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            })
+        };
+        let encode = |constants: &[ConstantInfo], part| {
+            super::encode_olean_module(
+                super::OleanModuleWriteInput {
+                    is_module: true,
+                    imports: &[],
+                    constants,
+                    extra_const_names: &[],
+                },
+                super::OleanWriteHeader {
+                    version: 2,
+                    flags: 1,
+                    lean_version: super::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                    githash: super::OLEAN_PIN_COMMIT,
+                    base_addr: part * base,
+                },
+                super::OleanWriteBudget::default(),
+            )
+            .expect("module fixture encodes")
+            .bytes
+        };
+        let public_constants = [axiom("Public", Expr::sort(Level::zero()))];
+        let exported = encode(&public_constants, 1);
+        let private = encode(&public_constants, 3);
+        let server = encode(&[axiom("Server", Expr::sort(Level::zero()))], 2);
+        let limits = OleanDecodeLimits::new(exported.len() + server.len() + private.len());
+        let decode = |server: &[u8], limits| {
+            super::decode_olean_module_artifacts(&exported, server, &private, limits)
+        };
+        assert_eq!(
+            decode(&server, limits)
+                .expect("valid unshared server")
+                .constants,
+            public_constants
+        );
+
+        // Bind either one of the server's arrays to the exported array. Both
+        // arrays still have one member, but their names disagree. A names-only
+        // or constants-only shortcut would silently accept one of these cells.
+        let root = |bytes: &[u8], part| {
+            let start = fln_olean::format::OLEAN_HEADER_SIZE;
+            (u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap()) - part * base) as usize
+        };
+        let slot = |field| {
+            let index = fln_olean::format::MODULE_DATA_FIELDS
+                .iter()
+                .filter(|field| field.lean_type != "Bool")
+                .position(|candidate| candidate.name == field)
+                .expect("generated field");
+            8 * (index + 1)
+        };
+        for field in ["constNames", "constants"] {
+            let source = root(&exported, 1) + slot(field);
+            let target = root(&server, 2) + slot(field);
+            let mut altered = server.clone();
+            altered[target..target + 8].copy_from_slice(&exported[source..source + 8]);
+            assert!(matches!(
+                decode(&altered, limits),
+                Err(OleanDecodeError::CompanionDeclaration {
+                    part: super::OleanCompanionPart::Server,
+                    error: OleanDeclarationError::Shape {
+                        what: "constNames[i] != constants[i].name",
+                        ..
+                    },
+                })
+            ));
+        }
+
+        let mut type_ = Expr::sort(Level::zero());
+        for index in 0..32 {
+            type_ = Expr::forall_e(
+                Name::num(Name::anonymous(), index),
+                Expr::sort(Level::zero()),
+                type_,
+                BinderInfo::Default,
+            );
+        }
+        let larger_server = encode(&[axiom("Server", type_)], 2);
+        let mut limits =
+            OleanDecodeLimits::new(exported.len() + larger_server.len() + private.len());
+        assert!(decode(&larger_server, limits).is_ok());
+        limits.declarations.max_objects = 16;
+        let error = decode(&larger_server, limits).expect_err("unshared server exceeds its budget");
+        assert!(matches!(
+            error,
+            OleanDecodeError::CompanionDeclaration {
+                part: super::OleanCompanionPart::Server,
+                error: OleanDeclarationError::Budget { .. },
+            }
+        ));
+        assert!(error.is_resource_exhaustion());
+        limits.declarations.max_objects = 0;
+        assert!(matches!(
+            decode(&server, limits),
+            Err(OleanDecodeError::Declaration(
+                OleanDeclarationError::Budget { .. }
+            ))
+        ));
     }
 
     #[test]
