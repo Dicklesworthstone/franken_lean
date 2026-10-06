@@ -1217,6 +1217,52 @@ impl Probe<'_> {
             if left == right {
                 continue;
             }
+            // KR-301/KR-302: the pin's `quick_is_def_eq` sends matching
+            // lambda/Pi heads directly to `is_def_eq_binding`, before lazy
+            // delta. Open them in this typed worklist as well: an untyped
+            // descent loses the local types needed to identify proof arguments
+            // and can exhaust its budget unfolding their producers. The domain
+            // obligation runs before the bodies are opened, and both remain
+            // ordinary obligations of any enclosing congruence attempt.
+            if let (
+                Some(ExprNode::Lambda {
+                    binder_type: lt,
+                    body: lb,
+                    ..
+                }),
+                Some(ExprNode::Lambda {
+                    binder_type: rt,
+                    body: rb,
+                    ..
+                }),
+            )
+            | (
+                Some(ExprNode::Forall {
+                    binder_type: lt,
+                    body: lb,
+                    ..
+                }),
+                Some(ExprNode::Forall {
+                    binder_type: rt,
+                    body: rb,
+                    ..
+                }),
+            ) = (left.node(left.root()), right.node(right.root()))
+            {
+                let domain = self.piece(&left, *lt)?;
+                let other = self.piece(&right, *rt)?;
+                let (lb, rb) = (*lb, *rb);
+                work.push(Work::Binders(
+                    left,
+                    right,
+                    lb,
+                    rb,
+                    domain.clone(),
+                    context.clone(),
+                ));
+                work.push(Work::Pair(domain, other, context));
+                continue;
+            }
             // Congruence first, with each argument pair decided by this lane.
             // The pin tries congruence before unfolding two applications of one
             // regular definition (`lazy_delta_reduction_step`), comparing the
@@ -1376,37 +1422,6 @@ impl Probe<'_> {
                     let ra = self.piece(&r, *ra)?;
                     work.push(Work::Pair(la, ra, context.clone()));
                     work.push(Work::Pair(lf, rf, context));
-                }
-                (
-                    Some(ExprNode::Lambda {
-                        binder_type: lt,
-                        body: lb,
-                        ..
-                    }),
-                    Some(ExprNode::Lambda {
-                        binder_type: rt,
-                        body: rb,
-                        ..
-                    }),
-                )
-                | (
-                    Some(ExprNode::Forall {
-                        binder_type: lt,
-                        body: lb,
-                        ..
-                    }),
-                    Some(ExprNode::Forall {
-                        binder_type: rt,
-                        body: rb,
-                        ..
-                    }),
-                ) => {
-                    let domain = self.piece(&l, *lt)?;
-                    let other = self.piece(&r, *rt)?;
-                    let lb = *lb;
-                    let rb = *rb;
-                    work.push(Work::Binders(l, r, lb, rb, domain.clone(), context.clone()));
-                    work.push(Work::Pair(domain, other, context));
                 }
                 (
                     Some(ExprNode::Projection {

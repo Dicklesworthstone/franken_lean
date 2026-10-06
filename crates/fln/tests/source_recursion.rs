@@ -190,6 +190,17 @@ theorem ok : count 5 3 (PairIndex.step 2 5 (PairIndex.stop 2 5)) = 8 := by rfl",
 }
 
 #[test]
+fn indexed_recursion_can_change_a_leading_nonuniform_parameter() {
+    // Accepted by Lean v4.32.0; this was a stale refusal (bcvq, comment 3172).
+    check(&format!(
+        "{VEC}
+def bad {{A : Type}} (fixed : Nat) (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => fixed | .cons k x tail => bad 7 k tail
+theorem base : bad 23 0 (Vec.nil : Vec Nat 0) = 23 := by rfl
+theorem changed : bad 23 2 two = 7 := by rfl"
+    ));
+}
+
+#[test]
 fn indexed_recursion_cannot_discard_wrong_indices_or_nondecreasing_calls() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
@@ -197,7 +208,6 @@ fn indexed_recursion_cannot_discard_wrong_indices_or_nondecreasing_calls() {
         "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad n xs",
         "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad n tail",
         "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let unused := bad (Nat.succ k) tail; 1",
-        "def bad {A : Type} (fixed : Nat) (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => fixed | .cons k x tail => bad 7 k tail",
         "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let escaped := bad; escaped k tail",
         "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let unused := bad (let invalid : String := k; k) tail; 1",
         "def bad {A : Type} (n : Nat) (xs : Vec A n) (acc : Nat) : Nat := match xs with | .nil => acc | .cons k x tail => bad k tail (1 : String)",
@@ -304,8 +314,6 @@ fn nondecreasing_and_escaping_calls_are_failure_atomic_even_when_unused() {
         "def loop (n : Nat) : Nat := match n with | .zero => loop n | .succ k => 1",
         "def loop (n : Nat) : Nat := match n with | .zero => 0 | .succ k => let unused := loop n; 0",
         "def loop (n : Nat) : Nat := match n with | .zero => 0 | .succ k => let escaped := loop; escaped k",
-        "def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1",
-        "def loop (fixed n : Nat) : Nat := match n with | .zero => fixed | .succ k => loop 1 k",
     ];
     for text in invalid {
         assert!(
@@ -326,6 +334,36 @@ fn nondecreasing_and_escaping_calls_are_failure_atomic_even_when_unused() {
             SourceCheckLimits::new(limits())
         )
         .is_ok()
+    );
+}
+#[test]
+fn recursive_match_under_application_is_a_known_completeness_gap() {
+    // Lean v4.32.0 accepts this and computes loop 3 = 4 (bcvq, comment 3172).
+    // Native lowering still refuses it; this is not a negative parity witness.
+    let base = engine();
+    let snapshot = base.environment().clone();
+    assert!(
+        base.check_source_files(
+            &[b"def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err()
+    );
+    assert_eq!(base.environment(), &snapshot);
+}
+#[test]
+fn recursion_can_change_a_leading_parameter_before_nat() {
+    // These exact definitions are accepted by Lean v4.32.0 (bcvq, comment 3172).
+    check(
+        "def loop (fixed n : Nat) : Nat := match n with | .zero => fixed | .succ k => loop 1 k
+theorem base : loop 9 0 = 9 := by rfl
+theorem changed : loop 9 3 = 1 := by rfl",
+    );
+    check(
+        "def bad (fixed : Nat) (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => bad 7 k acc
+theorem base : bad 23 0 9 = 9 := by rfl
+theorem changed : bad 23 3 9 = 9 := by rfl",
     );
 }
 #[test]
@@ -401,7 +439,6 @@ fn invalid_changed_arguments_are_not_erased_by_termination_lowering() {
     for text in [
         "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => bad k (bad n acc)",
         "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let unused := bad k (1 : String); 0",
-        "def bad (fixed : Nat) (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => bad 7 k acc",
         "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let escaped := bad; escaped k acc",
     ] {
         assert!(

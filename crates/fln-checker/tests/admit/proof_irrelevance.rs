@@ -553,6 +553,166 @@ fn a_proof_argument_under_one_head_closes_by_congruence() {
     );
 }
 
+/// The outer proof argument makes ordinary conversion defer before the binder
+/// pair. The typed lane must then open that pair, keeping the local's type,
+/// instead of unfolding the two distinct proof-producing chains without types.
+/// The chains are ordinary safe definitions, not a special reduction primitive.
+fn binder_conversion_fixture(lambda: bool) -> (ConstantEnvironment, ConstantEntry) {
+    const LAYERS: usize = 16;
+    let function_type = pi(c("A"), c("P"));
+    let mut entries = vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("leftProof0", function_type.clone()),
+        entry("rightProof0", function_type.clone()),
+        entry("toData", pi(c("P"), c("A"))),
+        entry("toType", pi(c("P"), Expr::sort(Level::one()))),
+    ];
+    for layer in 1..=LAYERS {
+        for side in ["left", "right"] {
+            entries.push(definition(
+                &format!("{side}Proof{layer}"),
+                decoded(&function_type),
+                decoded(&c(&format!("{side}Proof{}", layer - 1))),
+            ));
+        }
+    }
+    let binding = |side: &str| {
+        let proof = app(
+            c(&format!("{side}Proof{LAYERS}")),
+            [Expr::bvar(0).expect("the binder's local")],
+        );
+        if lambda {
+            lam(c("A"), app(c("toData"), [proof]))
+        } else {
+            pi(c("A"), app(c("toType"), [proof]))
+        }
+    };
+    let argument_type = if lambda {
+        pi(c("A"), c("A"))
+    } else {
+        Expr::sort(Level::one())
+    };
+    entries.push(entry(
+        "WithBinder",
+        pi(c("P"), pi(argument_type, Expr::sort(Level::one()))),
+    ));
+    let declared = app(c("WithBinder"), [c("p"), binding("left")]);
+    entries.push(entry("w", app(c("WithBinder"), [c("q"), binding("right")])));
+    (
+        environment_of(entries),
+        candidate("binder_conversion", declared, c("w")),
+    )
+}
+
+#[test]
+fn matching_lambdas_open_before_untyped_body_reduction() {
+    let (env, candidate) = binder_conversion_fixture(true);
+    let mut budget = AdmissionBudget::unlimited();
+    budget.conversion.max_normalizations = 8;
+    let outcome = admit(&env, &candidate, budget);
+    assert!(
+        matches!(outcome, Verdict::Admitted(_)),
+        "matching lambda bodies differ only in proofs of the same proposition: {outcome:?}"
+    );
+}
+
+#[test]
+fn matching_foralls_open_before_untyped_body_reduction() {
+    let (env, candidate) = binder_conversion_fixture(false);
+    let mut budget = AdmissionBudget::unlimited();
+    budget.conversion.max_normalizations = 8;
+    let outcome = admit(&env, &candidate, budget);
+    assert!(
+        matches!(outcome, Verdict::Admitted(_)),
+        "matching dependent forall bodies differ only in proofs: {outcome:?}"
+    );
+}
+
+#[test]
+fn early_binder_conversion_keeps_domain_and_data_obligations() {
+    let env = environment_of(vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("B", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("a", c("A")),
+        entry("b", c("A")),
+        entry(
+            "TypeArg",
+            pi(
+                c("P"),
+                pi(Expr::sort(Level::one()), Expr::sort(Level::one())),
+            ),
+        ),
+        entry(
+            "FunArg",
+            pi(c("P"), pi(pi(c("A"), c("A")), Expr::sort(Level::one()))),
+        ),
+        entry(
+            "domainWitness",
+            app(c("TypeArg"), [c("q"), pi(c("B"), c("A"))]),
+        ),
+        entry(
+            "bodyWitness",
+            app(c("FunArg"), [c("q"), lam(c("A"), c("b"))]),
+        ),
+    ]);
+    for (label, declared, value) in [
+        (
+            "different_domains",
+            app(c("TypeArg"), [c("p"), pi(c("A"), c("A"))]),
+            c("domainWitness"),
+        ),
+        (
+            "different_data",
+            app(c("FunArg"), [c("p"), lam(c("A"), c("a"))]),
+            c("bodyWitness"),
+        ),
+    ] {
+        let outcome = admit(
+            &env,
+            &candidate(label, declared, value),
+            AdmissionBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Verdict::Deferred(AdmissionDeferred::BodyConversion { .. })
+            ),
+            "{label}: a failed binder obligation must not admit the enclosing pair: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn early_binder_conversion_preserves_stops_and_recovery() {
+    let (env, candidate) = binder_conversion_fixture(false);
+    let mut budget = AdmissionBudget::unlimited();
+    budget.conversion.max_normalizations = 0;
+    let starved = admit(&env, &candidate, budget);
+    assert!(
+        matches!(
+            starved,
+            Verdict::Inconclusive(AdmissionStop::BodyConversion { .. })
+        ),
+        "an exhausted root conversion is still inconclusive: {starved:?}"
+    );
+    let cancelled = admit_with(&env, &candidate, AdmissionBudget::unlimited(), || true);
+    assert!(
+        matches!(
+            cancelled,
+            Verdict::Inconclusive(AdmissionStop::Cancelled { .. })
+        ),
+        "cancellation must not become a conversion answer: {cancelled:?}"
+    );
+    let recovered = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(recovered, Verdict::Admitted(_)), "{recovered:?}");
+}
+
 /// Congruence is only sufficient. `T2 (k b) q` against `T2 (k a) p` reaches the
 /// typed lane, since untyped conversion defers the proofs `q ≟ p`. There the
 /// attempt on `k b ≟ k a` fails, `b` and `a` being distinct data, although `k`

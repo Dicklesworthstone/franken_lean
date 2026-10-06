@@ -320,10 +320,17 @@ pub(crate) fn expression_owned_units(node: &ExprNode) -> u64 {
 }
 
 /// One independently decoded expression and all levels embedded in it.
+///
+/// Immutable arenas share their storage on clone. Inference, reduction and memo
+/// results can retain a term without copying its nodes or literal payloads.
+/// Arena builders still own mutable vectors and freeze them only at publication;
+/// no mutable access to the shared storage is exposed. Equality and hashing remain
+/// structural, and the decoder and term-operation budgets are unchanged.
+/// `Arc<Vec<_>>` also moves a builder's existing allocation without copying it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WireExpr {
-    nodes: Vec<ExprNode>,
-    levels: Vec<LevelNode>,
+    nodes: std::sync::Arc<Vec<ExprNode>>,
+    levels: std::sync::Arc<Vec<LevelNode>>,
     root: ExprId,
 }
 
@@ -354,8 +361,8 @@ impl WireExpr {
         root: ExprId,
     ) -> WireExpr {
         WireExpr {
-            nodes,
-            levels,
+            nodes: nodes.into(),
+            levels: levels.into(),
             root,
         }
     }
@@ -1221,11 +1228,7 @@ fn run_expr_dag(
     let mut levels = LevelBuilder::new();
     let (nodes, root) = decode_expr_dag_value(&mut reader, &mut levels)?;
     reader.finish()?;
-    Ok(WireExpr {
-        nodes,
-        levels: levels.nodes,
-        root,
-    })
+    Ok(WireExpr::from_parts(nodes, levels.nodes, root))
 }
 
 fn run_name(
@@ -1269,11 +1272,7 @@ fn run_expr(
     let mut levels = LevelBuilder::new();
     let (nodes, root) = decode_expr_value(&mut reader, &mut levels)?;
     reader.finish()?;
-    Ok(WireExpr {
-        nodes,
-        levels: levels.nodes,
-        root,
-    })
+    Ok(WireExpr::from_parts(nodes, levels.nodes, root))
 }
 
 pub fn decode_name(bytes: &[u8], budget: DecodeBudget) -> DecodeOutcome<WireName> {
