@@ -20,7 +20,7 @@ crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean	accept	reject	n/
 crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
-crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	accept	match	agree	both FrankenLean doors now accept (measured 2026-10-06 at 5a3ff40e)
 crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 examples/native_closure_data.lean	accept	accept	match	agree	agrees since fln-ffce renamed the `prefix` binder, a keyword at the pin (it was reserved keyword accepted as identifier, franken_lean-z8j.1.6.2)
@@ -41,7 +41,7 @@ examples/native_decisions.lean	accept	accept	match	agree
 examples/native_default_simp.lean	reject	check-only	n/a	fln-defect	Reference 26: Invalid simp theorem: Expected a proposition | `simp [-unwrap, (wrap)]` unfolds a parenthesized definition the pin refuses as a simp lemma (franken_lean-jxw); the earlier first error, `universe` used as a name (9), was renamed with fln-ffce
 examples/native_dependent_indices.lean	reject	accept	n/a	fln-defect	Reference 5: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
 examples/native_dependent_vector_pipeline.lean	accept	accept	match	agree	
-examples/native_do.lean	reject	accept	n/a	missing-prelude	Reference 1: `Pure` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
+examples/native_do.lean	reject	reject	n/a	agree	Reference 1: `Pure` has already been declared | agreement by outcome only: FrankenLean still accepts the `Pure` redeclaration and refuses later, at command 6 (native instance search could not resolve all instance arguments) (franken_lean-z8j.1.8)
 examples/native_empty_elimination.lean	reject	accept	n/a	fln-defect	Reference 6: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
 examples/native_equality.lean	accept	accept	match	agree	
 examples/native_equality_transport.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 9: Type mismatch (a named variable at a promoted parameter, in `copy`; was fln-defect, franken_lean-z8j.1.6)
@@ -63,13 +63,13 @@ examples/native_indexed_elimination.lean	reject	reject	n/a	agree	fixed by z8j.1.
 examples/native_indexed_function_children.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Tree.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
 examples/native_indexed_recursion.lean	accept	accept	match	agree	
 examples/native_indexed_vectors.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
-examples/native_induction.lean	reject	check-only	n/a	fln-defect	Reference 43: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_induction.lean	reject	reject	n/a	agree	Reference 43: failed to synthesize instance of type class | FrankenLean: command 10, native instance search could not resolve all instance arguments
 examples/native_induction_specialization.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 6: Type mismatch (a named variable at a promoted parameter; was fln-defect, franken_lean-z8j.1.6)
 examples/native_instance_attributes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_instance_factories.lean	accept	accept	match	agree	
 examples/native_instance_output_search.lean	accept	accept	match	agree	
 examples/native_instances.lean	accept	accept	match	agree	
-examples/native_interleaved_specialization.lean	reject	accept	n/a	missing-prelude	Reference 2: `Pure` has already been declared | the seed has no Prelude `Pure`, so the redeclaration is accepted; landed without a row after the 09-23 freeze (fln-ew20)
+examples/native_interleaved_specialization.lean	reject	reject	n/a	agree	Reference 2: `Pure` has already been declared | agreement by outcome only: FrankenLean still accepts the `Pure` redeclaration and refuses later, at command 7, outside its bounded source grammar (franken_lean-z8j.1.8)
 examples/native_literal_patterns.lean	accept	accept	match	agree	
 examples/native_local_helpers.lean	accept	accept	match	agree	
 examples/native_local_proofs.lean	accept	accept	match	agree	agrees since fln-lvdh: its Type-field record compiles in the drop-in door
@@ -89,19 +89,19 @@ examples/native_nested_lets.lean	accept	accept	match	agree
 examples/native_option_decide.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts. Was a false accept naming the seed's instDecidableEqOption, which the Reference does not have; the seed's instance now carries the pin's name Option.instDecidableEq (fln-ew20)
 examples/native_parameterized_recursion.lean	reject	accept	n/a	missing-prelude	Reference 1: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_pattern_functions.lean	accept	accept	match	agree	
-examples/native_pattern_matching.lean	reject	check-only	n/a	fln-defect	Reference 37: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_pattern_matching.lean	reject	reject	n/a	agree	Reference 37: failed to synthesize instance of type class | FrankenLean: command 13, native instance search could not resolve all instance arguments
 examples/native_pattern_matrices.lean	reject	accept	n/a	fln-defect	Reference 28: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
 examples/native_proof_data.lean	accept	accept	match	agree	
 examples/native_proof_erasure.lean	accept	accept	match	agree	
 examples/native_proof_indices.lean	accept	accept	match	agree	
-examples/native_proposition_conditionals.lean	reject	accept	n/a	fln-defect	Reference 14: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_proposition_conditionals.lean	reject	reject	n/a	agree	Reference 14: failed to synthesize instance of type class | FrankenLean: command 5, native instance search could not resolve all instance arguments
 examples/native_propositional_logic.lean	accept	accept	match	agree	
 examples/native_propositions.lean	accept	accept	match	agree	
 examples/native_quotient_runtime.lean	accept	accept	match	agree	
 examples/native_quotients.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_record_defaults.lean	accept	accept	match	agree	
 examples/native_record_runtime.lean	accept	accept	match	agree	
-examples/native_record_values.lean	reject	check-only	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4)
+examples/native_record_values.lean	reject	reject	n/a	agree	Reference 7: failed to synthesize instance of type class | FrankenLean: command 4, native instance search could not resolve all instance arguments
 examples/native_records.lean	reject	accept	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
 examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 45: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); the earlier first error, `repeat` used as a name (18), was renamed with fln-ffce
 examples/native_recursive_data.lean	accept	accept	match	agree	
