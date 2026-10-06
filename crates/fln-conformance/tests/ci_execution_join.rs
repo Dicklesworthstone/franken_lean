@@ -139,11 +139,11 @@ use std::path::{Path, PathBuf};
 use fln_conformance::execution::{
     CiJob, ELAN_ROOTS, ELAN_TOOLCHAINS_SEGMENT, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES,
     autodiscovery_overrides, check_sh_reaches_workspace, ci_jobs, code_only, e2e_scenario_keys,
-    feature_gated_modules, features_off_by_default, ignored_tests, installs_reference_pin,
-    invokes_check_sh, is_terminal, logical_lines, module_path_prefix, names_scenario_in_code,
-    reach_covers, reaches_the_pinned_reference, record_field, scenario_assignments,
-    shell_code_only, test_function_citation, test_functions, test_reach, unmodelled_feature_cfgs,
-    workspace_member_patterns,
+    feature_gated_modules, features_off_by_default, file_module_declarations, ignored_tests,
+    installs_reference_pin, invokes_check_sh, is_terminal, logical_lines, module_path_prefix,
+    names_scenario_in_code, reach_covers, reaches_the_pinned_reference, record_field,
+    scenario_assignments, shell_code_only, test_function_citation, test_functions, test_reach,
+    unmodelled_feature_cfgs, workspace_member_patterns,
 };
 use fln_conformance::pin::{
     self, PinRig, RIG_EXECUTION_DIR_ENV, RigDisposition, RigExecutionRecord,
@@ -186,11 +186,19 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-7li",
     "fln-lld",
-    "fln-sv7x",
-    "franken_lean-l8bj",
     "fln-d18-product-half-rgsg",
     "franken_lean-z8j.1.3",
     "franken_lean-z8j.1.4",
+    "fln-32rr",
+    "fln-5njk",
+    "fln-frontier-oom-abort-w9dx",
+    "fln-fur.1",
+    "fln-extended-25-modules-council-4974-9m8q",
+    "fln-init-bnh-council-4444-b443",
+    "fln-init-chain-council-3116-kipb",
+    "fln-init-control-council-4698-1yyb",
+    "fln-init-core-council-4442-aiwk",
+    "fln-init-sizeof-council-3290-w4xk",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -258,7 +266,31 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// surface-granularity debt as fln-7li and fln-lld, newly visible rather than newly
 /// created; it shrinks when CI runs those surfaces with the pin or the rows migrate off
 /// them.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 13;
+///
+/// 13 -> 21 on 2026-10-06 (coordinator, session projects-c9). Eighteen terminal rows had joined the
+/// population; eight of them left it by repair. Seven left because contract-drift's
+/// `pin-gated-differentials` job now runs their pin-gated targets with the pin and
+/// FLN_REQUIRE_REFERENCE=1: fln-52qv, fln-vm35, fln-gkhu, fln-export-aliases-ub7i, fln-eq4k, fln-wh2j
+/// and franken_lean-etj.1, measured passing locally at 70e6b559. One more, franken_lean-z8j.1.14,
+/// left when its row stopped citing an `#[ignore]`d test. The same job runs all of fln-olean with
+/// the pin, so the 8 -> 10 entry's decl_decode debt is repaired too: fln-sv7x and franken_lean-l8bj
+/// leave, as that entry said they would once CI installed the pin (decl_decode 97/0 with the pin).
+///
+/// The ten declared here share ONE cause. `crates/fln/src/lib.rs` became pin-reaching at
+/// `79b5e477`, and its only pin coordinate sits in the `#[ignore]`d decoder differential
+/// `every_declaration_under_the_roots_reads_the_same_to_both_decoders`, which IGNORED_PRODUCER_ALLOWANCE
+/// declares. Each of the ten cites that surface:
+/// - fln-32rr, fln-5njk, fln-frontier-oom-abort-w9dx and fln-fur.1 through pin-free `fln::lib` unit
+///   tests;
+/// - the six council rows (…-9m8q, -b443, -kipb, -1yyb, -aiwk, -w4xk) by the file itself. Their
+///   pinned_nat_council evidence already runs with the pin in the imported-tags step.
+///
+/// Measured on an rch worker, which has no pin: all seven cited `fln::lib` tests pass, and none
+/// prints a SKIP. This is the fln-7li and fln-lld surface-granularity debt again: no cited test
+/// needs the pin, and the pin-reaching test in that file is `#[ignore]`d, so CI never runs it. It
+/// shrinks when that differential's locator leaves `lib.rs`, or when these rows migrate off the
+/// surface.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 21;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -961,8 +993,13 @@ struct Derivation {
     /// the three `tests/common/mod.rs` modules all claimed the stem `mod` and two vanished
     /// `(<package>, <stem>)` → path, for every integration target cargo auto-discovers.
     targets: BTreeMap<(String, String), String>,
-    /// `(<package>, <stem>)` → the `#[test]` functions inside that integration target.
+    /// `(<package>, <stem>)` → the `#[test]` functions inside that integration target, a test
+    /// in one of its file modules spelled `<module>::<fn>` as libtest runs it.
     target_tests: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `(<package>, <stem>)` → module name → file, for each file module the target's root
+    /// declares (`#[path = "admit/k_like.rs"] mod k_like;`). It is what the `#[ignore]` join reads
+    /// to find the file a `<module>::<fn>` citation's attribute would sit in.
+    target_modules: BTreeMap<(String, String), BTreeMap<String, String>>,
     /// `<package>` → `(module path prefix, function)` for every lib unit test.
     lib_tests: BTreeMap<String, BTreeSet<(String, String)>>,
     /// member directory → the package name its manifest **declares**. Read, never inferred
@@ -1326,13 +1363,50 @@ fn derive(root: &Path) -> Derivation {
             ));
         }
     }
+    // A target root's FILE modules compile into the same test binary, and libtest names their
+    // tests `<module>::<fn>`. Resolved by rustc's rule for a crate root: relative to the root
+    // file's directory, through `#[path]` when present, else `<name>.rs` or `<name>/mod.rs`.
+    // Before this, the sixteen `#[path]` children of `crates/fln-checker/tests/admit.rs` were
+    // invisible, and seven terminal rows citing `admit::<module>::<fn>` were reported unbound
+    // for naming functions `cargo test --test admit -- --exact` runs. A declaration this cannot
+    // resolve (a `..` path, a missing file) stays unindexed, so it fails loud, never silent.
+    let mut target_modules: BTreeMap<(String, String), BTreeMap<String, String>> = BTreeMap::new();
+    for (key, path) in &targets {
+        let Some((directory, _)) = path.rsplit_once('/') else {
+            continue;
+        };
+        for module in file_module_declarations(&surfaces[path]) {
+            let candidates = match &module.path {
+                Some(relative) if relative.split('/').any(|part| part == "..") => Vec::new(),
+                Some(relative) => vec![format!("{directory}/{relative}")],
+                None => vec![
+                    format!("{directory}/{}.rs", module.name),
+                    format!("{directory}/{}/mod.rs", module.name),
+                ],
+            };
+            if let Some(file) = candidates
+                .into_iter()
+                .find(|candidate| surfaces.contains_key(candidate))
+            {
+                target_modules
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(module.name, file);
+            }
+        }
+    }
     let target_tests: BTreeMap<(String, String), BTreeSet<String>> = targets
         .iter()
         .map(|(key, path)| {
-            (
-                key.clone(),
-                test_functions(&surfaces[path]).into_iter().collect(),
-            )
+            let mut names: BTreeSet<String> = test_functions(&surfaces[path]).into_iter().collect();
+            for (module, file) in target_modules.get(key).into_iter().flatten() {
+                names.extend(
+                    test_functions(&surfaces[file])
+                        .into_iter()
+                        .map(|function| format!("{module}::{function}")),
+                );
+            }
+            (key.clone(), names)
         })
         .collect();
     let mut by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1550,6 +1624,7 @@ fn derive(root: &Path) -> Derivation {
         cfg_gated_modules,
         targets,
         target_tests,
+        target_modules,
         lib_tests,
         packages,
         granularity_preconditions: preconditions,
@@ -1856,13 +1931,24 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 ));
                 continue;
             };
+            // A `<module>::<fn>` citation into a file module carries its `#[ignore]` in THAT
+            // file, never in the target root, so the join must look there.
+            let (surface, function) = path
+                .split_once("::")
+                .and_then(|(module, function)| {
+                    let modules = d
+                        .target_modules
+                        .get(&(package.to_string(), target.to_string()))?;
+                    Some((modules.get(module)?.clone(), function.to_string()))
+                })
+                .unwrap_or_else(|| (target_path.clone(), path.to_string()));
             if !d.target_tests[&(package.to_string(), target.to_string())].contains(path) {
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but {target:?} \
                      declares no `#[test] fn {path}`.",
                     row.bead
                 ));
-            } else if d.ignored.contains(&(target_path.clone(), path.to_string())) {
+            } else if d.ignored.contains(&(surface, function)) {
                 findings.push(format!(
                     "granularity-ignored: terminal row {} cites {artifact:?}, and that function \
                      carries `#[ignore]`. Cargo compiles it; libtest never runs it. The row now \
@@ -4283,6 +4369,90 @@ fn granularity_mutant_a_citation_naming_no_such_function_cannot_leave_the_popula
         .push("test:fln-conformance::kernel_replay::no_such_function".to_string());
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// A real test in `admit/k_like.rs`, spelled as libtest runs it: `k_like::<fn>`.
+fn a_file_module_test(d: &Derivation) -> String {
+    d.target_tests[&("fln-checker".to_string(), "admit".to_string())]
+        .iter()
+        .find(|name| name.starts_with("k_like::"))
+        .unwrap_or_else(|| fixture_panic!("admit/k_like.rs declares no indexed test"))
+        .clone()
+}
+
+fn unbound_for(findings: &[String], citation: &str) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.starts_with("granularity-unbound") && finding.contains(citation))
+}
+
+/// The control for the file-module admission. The real `admit` target's `#[path]` children
+/// are derived, and a citation at the path libtest runs a child's test under binds.
+#[test]
+fn granularity_control_a_citation_into_a_path_submodule_is_bound() {
+    let mut d = derive(&root());
+    let modules = &d.target_modules[&("fln-checker".to_string(), "admit".to_string())];
+    assert_eq!(
+        modules.get("k_like").map(String::as_str),
+        Some("crates/fln-checker/tests/admit/k_like.rs"),
+        "{modules:?}"
+    );
+    let citation = format!("test:fln-checker::admit::{}", a_file_module_test(&d));
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(
+        !unbound_for(&findings, &citation),
+        "{citation} must resolve: {findings:?}"
+    );
+}
+
+/// The admission names functions, never modules: a citation into a real file module naming a
+/// function that module does not declare stays unbound.
+#[test]
+fn granularity_mutant_a_submodule_citation_naming_no_such_function_is_caught() {
+    let mut d = derive(&root());
+    let citation = "test:fln-checker::admit::k_like::no_such_function".to_string();
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(unbound_for(&findings, &citation), "{findings:?}");
+}
+
+/// The `#[ignore]` on a file module's test sits in the module's own file. A join that still
+/// looked in the target root would let an ignored function bind as a running one.
+#[test]
+fn granularity_mutant_a_submodule_citation_naming_an_ignored_function_is_caught() {
+    let mut d = derive(&root());
+    let function = a_file_module_test(&d);
+    let bare = function
+        .strip_prefix("k_like::")
+        .unwrap_or_else(|| fixture_panic!("{function} is not a k_like test"))
+        .to_string();
+    d.ignored
+        .insert(("crates/fln-checker/tests/admit/k_like.rs".to_string(), bare));
+    let citation = format!("test:fln-checker::admit::{function}");
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("granularity-ignored") && f.contains(&citation)),
+        "{findings:?}"
+    );
+}
+
+/// Without the admission the citation is unbound again, so the control above passes because of
+/// the admission and not because the citation was always resolvable.
+#[test]
+fn granularity_mutant_dropping_the_file_module_admission_unbinds_the_citation_again() {
+    let mut d = derive(&root());
+    let citation = format!("test:fln-checker::admit::{}", a_file_module_test(&d));
+    d.target_modules.clear();
+    for names in d.target_tests.values_mut() {
+        names.retain(|name| !name.contains("::"));
+    }
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(unbound_for(&findings, &citation), "{findings:?}");
 }
 
 /// The control for the nested-workspace admission: `fln-epoch-lab` really is derived, so the

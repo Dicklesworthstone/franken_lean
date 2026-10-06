@@ -732,3 +732,150 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
+
+  pin-gated-differentials:
+    name: run the pin-gated differentials terminal coverage rows cite
+    runs-on: ubuntu-24.04
+    # Its own job, not a step of contract-drift above. That job used 340 of its 360
+    # minutes in run 37411709185, and its last lane (the rgha suites) would be the one
+    # cut off. Measured locally at 70e6b559 with the pin and FLN_REQUIRE_REFERENCE=1,
+    # dev profile, 64 cores:
+    # - the four fln targets: 325 s with their build, 6+3+1+2 tests;
+    # - the three fln-cli targets: 34 s, 10+1+3 tests;
+    # - all of fln-olean: 52 s, 562 tests.
+    # All passed.
+    timeout-minutes: 180
+    steps:
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: install pinned elan
+        shell: bash
+        run: |
+          tool_root="$RUNNER_TEMP/elan-bin"
+          archive="$RUNNER_TEMP/elan-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir "$tool_root"
+          python3 -I -S - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import urllib.request
+
+          url = (
+              "https://github.com/leanprover/elan/releases/download/"
+              "v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          expected = "4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c"
+          limit = 32 * 1024 * 1024
+          with urllib.request.urlopen(url, timeout=60) as response:
+              payload = response.read(limit + 1)
+          if len(payload) > limit:
+              raise SystemExit(f"elan archive exceeds {limit} bytes")
+          actual = hashlib.sha256(payload).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"elan archive digest mismatch: {actual} != {expected}")
+          pathlib.Path(sys.argv[1]).write_bytes(payload)
+          print(f"elan archive SHA-256: {actual}")
+          PY
+          tar -xzf "$archive" -C "$tool_root"
+          # Run elan-init in its installer mode. That is what creates $ELAN_HOME/bin with
+          # elan and its lean/lake/leanc/leanchecker proxies. Renaming the binary to `elan`
+          # skipped it, so every later bare `lake` failed with "command not found" and every
+          # weekly run from 2026-07-27 to 2026-09-28 stopped at the witness-tools build
+          # (bead franken_lean-z8j.1.17).
+          export ELAN_HOME="$HOME/.elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          for proxy in elan lean lake leanc leanchecker; do
+            test -x "$ELAN_HOME/bin/$proxy"
+          done
+          printf 'ELAN_HOME=%s\n' "$ELAN_HOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: read the Reference tag from SUITE.lock
+        id: reference
+        shell: bash
+        run: |
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          if (( ${#reference_rows[@]} != 1 )); then
+            echo "SUITE.lock must contain exactly one reference row" >&2
+            exit 2
+          fi
+          pin_tag="$(
+            sed -E 's/.*tag=([^ ]+).*/\1/' <<<"${reference_rows[0]}"
+          )"
+          if [[ ! "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "SUITE.lock Reference tag cannot name an elan toolchain: $pin_tag" >&2
+            exit 2
+          fi
+          printf 'pin_tag=%s\n' "$pin_tag" >> "$GITHUB_OUTPUT"
+          printf 'Reference tag from SUITE.lock: %s\n' "$pin_tag"
+
+      - name: install the SUITE.lock-pinned Reference toolchain
+        id: toolchain
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          elan --version
+          elan toolchain install "leanprover/lean4:$PIN_TAG"
+          toolchain_root="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG"
+          test -x "$toolchain_root/bin/lean"
+          "$toolchain_root/bin/lean" --version
+          # Every bare lean/lake below must resolve to the pin, inside or outside a
+          # directory carrying its own lean-toolchain file.
+          elan default "leanprover/lean4:$PIN_TAG"
+          pin_commit="$(sed -nE 's/^reference .*commit=([0-9a-f]{40}).*/\1/p' SUITE.lock)"
+          test -n "$pin_commit"
+          lean --version | grep -F "$pin_commit"
+          lake --version
+
+      - name: install the pinned Rust toolchain
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        run: |
+          channel="$(python3 -I -S -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+          rustup run "$channel" rustc --version
+          rustup run "$channel" cargo --version
+
+      - name: run the pin-gated differentials with the pin required
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          # These targets compare FrankenLean with the pinned Reference: instance
+          # selection under Init.Core, imported aliases and protected names, frontier
+          # blocking over a pinned council, .olean headers the pin wrote, and the pin's
+          # stdlib rebuilt byte-identical. Without the pin, each pin-gated test prints a
+          # SKIP line and passes. That is how scripts/check.sh and every rch worker run
+          # them. Terminal coverage rows cite these targets: fln-52qv, fln-vm35, fln-gkhu,
+          # fln-export-aliases-ub7i, fln-eq4k, fln-wh2j, franken_lean-etj.1, fln-sv7x and
+          # franken_lean-l8bj (fln-olean decl_decode), and through their fln-olean and
+          # fln-cli citations also fln-fur.1 and fln-frontier-oom-abort-w9dx. So this job
+          # is the only place CI executes that evidence.
+          #
+          # FLN_REQUIRE_REFERENCE turns a typed SKIP into a failure. fln-olean's stdlib
+          # tests read FLN_REFERENCE_LIB instead and decline with a plain return, as
+          # real_module_fixtures_e2e does above. So, as that step does, name the
+          # installed SUITE.lock toolchain's library and refuse to run without it.
+          FLN_REFERENCE_LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
+          if [[ ! -f "$FLN_REFERENCE_LIB/Init/Prelude.olean" ]]; then
+            echo "pinned Reference library absent at $FLN_REFERENCE_LIB: these pin-gated targets would skip, not run" >&2
+            exit 2
+          fi
+          export FLN_REFERENCE_LIB
+          export FLN_REQUIRE_REFERENCE=1
+          rc=0
+          cargo test --locked -p fln \
+            --test source_instance_index --test source_import_aliases \
+            --test source_instance_transparency --test olean_frontier --no-fail-fast || rc=1
+          cargo test --locked -p fln-cli \
+            --test lake_module_build --test check_olean_progress_crash \
+            --test olean_header_pin --no-fail-fast || rc=1
+          cargo test --locked -p fln-olean --no-fail-fast || rc=1
+          exit "$rc"

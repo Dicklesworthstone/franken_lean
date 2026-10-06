@@ -239,6 +239,88 @@ pub fn test_functions(source: &str) -> Vec<String> {
     found
 }
 
+/// A file module declared by an integration target's root: `mod <name>;`, optionally under
+/// `#[path = "<path>"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileModule {
+    pub name: String,
+    /// The `#[path]` attribute's value, relative to the declaring file's directory.
+    pub path: Option<String>,
+}
+
+/// Every **file** module an integration target's root declares at its top level, so a test in
+/// `tests/admit/k_like.rs` can be resolved at the path libtest runs it under, `k_like::<fn>`.
+///
+/// Before this existed, `crates/fln-checker/tests/admit.rs`'s sixteen `#[path = "admit/…"]`
+/// submodules were invisible to the citation check. Every `test:fln-checker::admit::<sub>::<fn>`
+/// citation was reported unbound, although `cargo test -p fln-checker --test admit -- --exact
+/// <sub>::<fn>` runs exactly that function.
+///
+/// The same rules as [`test_functions`] apply, for the same reason: a false *positive* binds a
+/// citation that denotes nothing.
+/// - The declaration must begin at **column zero**. Planted fixture source in a string literal
+///   is usually indented, and an item nested in an inline `mod` is not a root child.
+/// - The item must end in `;`. An inline `mod x { … }` has no file to read.
+/// - A declaration carrying any `#[cfg…]` attribute is **not returned**, because whether it
+///   compiles depends on configuration this scan does not decide. Leaving it out costs a
+///   spurious unbound finding, which is loud. Indexing it would buy a silent pass for a
+///   function the binary may not contain.
+pub fn file_module_declarations(source: &str) -> Vec<FileModule> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let mut item = *line;
+        if item.starts_with(char::is_whitespace) {
+            continue;
+        }
+        loop {
+            let stripped = ["pub(crate) ", "pub "]
+                .iter()
+                .find_map(|modifier| item.strip_prefix(modifier));
+            match stripped {
+                Some(next) => item = next.trim_start(),
+                None => break,
+            }
+        }
+        let Some(rest) = item.strip_prefix("mod ") else {
+            continue;
+        };
+        let Some(name) = rest.trim_end().strip_suffix(';') else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        // The attributes directly above the item, nearest first.
+        let attributes: Vec<&str> = lines[..index]
+            .iter()
+            .rev()
+            .map(|above| above.trim())
+            .take_while(|above| above.starts_with("#["))
+            .collect();
+        if attributes
+            .iter()
+            .any(|attribute| attribute.starts_with("#[cfg"))
+        {
+            continue;
+        }
+        let path = attributes.iter().find_map(|attribute| {
+            let value = attribute
+                .strip_prefix("#[path")?
+                .trim_start()
+                .strip_prefix('=')?;
+            let (_, tail) = value.split_once('"')?;
+            let (path, _) = tail.split_once('"')?;
+            Some(path.to_string())
+        });
+        found.push(FileModule {
+            name: name.to_string(),
+            path,
+        });
+    }
+    found
+}
+
 /// Every reason a member manifest defeats cargo's integration-test **auto-discovery**.
 ///
 /// The target set is derived from the *layout* — one target per top-level `tests/*.rs` — and
@@ -1480,6 +1562,48 @@ fn discussion_only() {\n\
         assert!(!names_scenario_in_code(source, "declaration_membership"));
         // Present, but only in the header comment.
         assert!(!names_scenario_in_code(source, "closure_audit"));
+    }
+
+    #[test]
+    fn file_module_declarations_returns_root_children_and_never_a_gated_or_inline_one() {
+        // The shapes `crates/fln-checker/tests/admit.rs`, `mutual_inductives.rs` and
+        // `lsp_proof_modules.rs` use, plus every shape that must NOT bind a citation.
+        let source = concat!(
+            "#[path = \"admit/k_like.rs\"]\nmod k_like;\n",
+            "#[allow(dead_code)]\n#[path = \"support/mutual.rs\"]\nmod fixtures;\n",
+            "mod common;\n",
+            "pub(crate) mod shared;\n",
+            "#[cfg(feature = \"dev-only\")]\nmod gated;\n",
+            "#[cfg(test)]\n#[path = \"x/cfg_test.rs\"]\nmod cfg_test;\n",
+            "mod inline {\n    mod nested;\n}\n",
+            "const PLANTED: &str = \"\n    mod planted;\n\";\n",
+            "// mod commented;\n",
+            "fn not_a_module() {}\n",
+        );
+        // Equality, not membership, for `feature_gated_modules`' measured reason: a mutant that
+        // stops requiring column zero adds `nested` and `planted`, which no membership check of
+        // the wanted names would notice.
+        assert_eq!(
+            file_module_declarations(source),
+            vec![
+                FileModule {
+                    name: "k_like".to_string(),
+                    path: Some("admit/k_like.rs".to_string()),
+                },
+                FileModule {
+                    name: "fixtures".to_string(),
+                    path: Some("support/mutual.rs".to_string()),
+                },
+                FileModule {
+                    name: "common".to_string(),
+                    path: None,
+                },
+                FileModule {
+                    name: "shared".to_string(),
+                    path: None,
+                },
+            ]
+        );
     }
 
     #[test]
