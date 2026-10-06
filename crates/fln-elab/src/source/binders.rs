@@ -2,6 +2,7 @@
 //! Every written domain remains in the final term. Expected types constrain
 //! inference, but never replace annotations or grant declaration admission.
 use super::*;
+use fln_syntax::source::SourceInfo;
 
 pub(super) struct Binder<'a> {
     names: Vec<Name>,
@@ -503,5 +504,179 @@ impl Context {
         }
         self.txn.lctx = state.saved;
         self.finish_term(body, state.expected.as_ref())
+    }
+}
+
+/// The pin's `∃` notation (`«term∃_,_»`, `Init/NotationExtra.lean`): a macro over
+/// `explicitBinders` whose expansion, `expandExplicitBinders ``Exists`, is one
+/// `Exists fun x : T => …` per bound name, innermost last.
+fn exists_kind() -> Name {
+    Name::str(Name::anonymous(), "term∃_,_")
+}
+
+/// Whether a node is an `∃` the expansion pass must rewrite.
+pub(super) fn is_exists(syntax: &Syntax) -> bool {
+    syntax.kind() == Some(&exists_kind())
+}
+
+/// A node's parts, taken out of it (`Syntax` drops iteratively, so it cannot be
+/// destructured by move). Anything else is handed back unchanged.
+fn node_parts(mut syntax: Syntax) -> Result<(Name, Vec<Syntax>), Syntax> {
+    if let Syntax::Node { kind, args, .. } = &mut syntax {
+        return Ok((kind.clone(), std::mem::take(args)));
+    }
+    Err(syntax)
+}
+
+fn take_null(syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    match node_parts(syntax) {
+        Ok((kind, args)) if kind == Name::from_components(["null"]) => Ok(args),
+        _ => Err(invalid()),
+    }
+}
+
+/// `(colon, domain)` of an optional `: T`, or nothing.
+fn take_domain(syntax: Syntax) -> Result<Option<Syntax>, NatDefinitionElabError> {
+    let mut parts = take_null(syntax)?;
+    match parts.len() {
+        0 => Ok(None),
+        2 => {
+            expect_atom(&parts[0], ":", "existential binder colon")?;
+            Ok(parts.pop())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+impl Context {
+    /// Rewrite one rebuilt `∃ binders, body` node into the pin's expansion. Every
+    /// other node is returned unchanged. Only explicit binders exist in this
+    /// notation, as at the pin: `∃ {x}, p` and `∃ [C], p` are refused, and so is a
+    /// pattern position (`∃` is a term, never a pattern).
+    pub(super) fn expand_exists_node(
+        &mut self,
+        syntax: Syntax,
+        pattern: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if syntax.kind() != Some(&exists_kind()) {
+            return Ok(syntax);
+        }
+        if pattern {
+            return Err(invalid());
+        }
+        let Ok((_, parts)) = node_parts(syntax) else {
+            return Err(invalid());
+        };
+        let Ok([keyword, binders, separator, body]) = <[Syntax; 4]>::try_from(parts) else {
+            return Err(invalid());
+        };
+        expect_atom(&keyword, "∃", "existential keyword")?;
+        expect_atom(&separator, ",", "existential separator")?;
+        let lean = |name: &str| Name::from_components(["Lean", name]);
+        let binder_ident = |syntax: Syntax| -> Result<Syntax, NatDefinitionElabError> {
+            match node_parts(syntax) {
+                Ok((kind, args)) if kind == lean("binderIdent") => {
+                    let Ok([name]) = <[Syntax; 1]>::try_from(args) else {
+                        return Err(invalid());
+                    };
+                    if !simple(&name) {
+                        return Err(invalid());
+                    }
+                    Ok(name)
+                }
+                _ => Err(invalid()),
+            }
+        };
+        let inner = match node_parts(binders) {
+            Ok((kind, args)) if kind == lean("explicitBinders") => {
+                let Ok([inner]) = <[Syntax; 1]>::try_from(args) else {
+                    return Err(invalid());
+                };
+                inner
+            }
+            _ => return Err(invalid()),
+        };
+        let mut bound: Vec<(Syntax, Option<Syntax>)> = Vec::new();
+        match node_parts(inner) {
+            // `unbracketedExplicitBinders`: names with one optional shared type.
+            Ok((kind, args)) if kind == lean("unbracketedExplicitBinders") => {
+                let Ok([names, domain]) = <[Syntax; 2]>::try_from(args) else {
+                    return Err(invalid());
+                };
+                let domain = take_domain(domain)?;
+                for name in take_null(names)? {
+                    self.tick()?;
+                    bound.push((binder_ident(name)?, domain.clone()));
+                }
+            }
+            // One `bracketedExplicitBinders` per `(names : type)` group.
+            Ok((kind, groups)) if kind == Name::from_components(["null"]) => {
+                for group in groups {
+                    self.tick()?;
+                    let Ok((kind, parts)) = node_parts(group) else {
+                        return Err(invalid());
+                    };
+                    if kind != lean("bracketedExplicitBinders") {
+                        return Err(invalid());
+                    }
+                    let Ok([open, names, colon, domain, close]) = <[Syntax; 5]>::try_from(parts)
+                    else {
+                        return Err(invalid());
+                    };
+                    expect_atom(&open, "(", "existential binder opener")?;
+                    expect_atom(&colon, ":", "existential binder colon")?;
+                    expect_atom(&close, ")", "existential binder closer")?;
+                    for name in take_null(names)? {
+                        bound.push((binder_ident(name)?, Some(domain.clone())));
+                    }
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        if bound.is_empty() {
+            return Err(invalid());
+        }
+        let mut result = body;
+        for (name, domain) in bound.into_iter().rev() {
+            self.tick()?;
+            let annotation = match domain {
+                Some(domain) => Syntax::node(
+                    Name::from_components(["null"]),
+                    vec![Syntax::node(
+                        parser_kind(&["Term", "typeSpec"]),
+                        vec![Syntax::atom(SourceInfo::None, ":"), domain],
+                    )],
+                ),
+                None => Syntax::node(Name::from_components(["null"]), Vec::new()),
+            };
+            let lambda = Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![
+                    Syntax::atom(SourceInfo::None, "fun"),
+                    Syntax::node(
+                        parser_kind(&["Term", "basicFun"]),
+                        vec![
+                            Syntax::node(Name::from_components(["null"]), vec![name]),
+                            annotation,
+                            Syntax::atom(SourceInfo::None, "=>"),
+                            result,
+                        ],
+                    ),
+                ],
+            );
+            result = Syntax::node(
+                parser_kind(&["Term", "app"]),
+                vec![
+                    Syntax::Ident {
+                        info: SourceInfo::None,
+                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        val: Name::from_components(["Exists"]),
+                        preresolved: Vec::new(),
+                    },
+                    Syntax::node(Name::from_components(["null"]), vec![lambda]),
+                ],
+            );
+        }
+        Ok(result)
     }
 }

@@ -232,6 +232,63 @@ const CDOTS: &[Accepted] = &[
     },
 ];
 
+/// Relations and existentials (bead `franken_lean-z8j.1.10`): `∃` is
+/// `«term∃_,_»` over `Lean.explicitBinders` (`Init/NotationExtra.lean`), bare names with a
+/// shared type or bracketed groups; `>`, `≥`, `≤`, `≠`, `!=`, `&&` and `||` are their
+/// `Init/Notation.lean` / `Init/Core.lean` infixes, and an ASCII `>=` / `<=` builds the same
+/// `«term_≥_»` / `«term_≤_»` node as its `unicode(…)` partner, keeping its own atom.
+/// Captured as above, on 2026-10-06.
+const RELATIONS_AND_EXISTENTIALS: &[Accepted] = &[
+    Accepted {
+        source: "theorem t : ∃ n : Nat, n = 1 := ⟨1, rfl⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t []) (Command.declSig [] (Term.typeSpec ":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `n)] [":" `Nat])) "," («term_=_» `n "=" (num "1"))))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "1") "," `rfl] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem t2 : ∃ x y : Nat, x = y := ⟨0, 0, rfl⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t2 []) (Command.declSig [] (Term.typeSpec ":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `x) (Lean.binderIdent `y)] [":" `Nat])) "," («term_=_» `x "=" `y)))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," (num "0") "," `rfl] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem t3 : ∃ (n : Nat) (m : Nat), n = m := ⟨0, 0, rfl⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t3 []) (Command.declSig [] (Term.typeSpec ":" («term∃_,_» "∃" (Lean.explicitBinders [(Lean.bracketedExplicitBinders "(" [(Lean.binderIdent `n)] ":" `Nat ")") (Lean.bracketedExplicitBinders "(" [(Lean.binderIdent `m)] ":" `Nat ")")]) "," («term_=_» `n "=" `m)))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," (num "0") "," `rfl] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem g : 3 > 2 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `g []) (Command.declSig [] (Term.typeSpec ":" («term_>_» (num "3") ">" (num "2")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem g2 : 3 ≥ 2 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `g2 []) (Command.declSig [] (Term.typeSpec ":" («term_≥_» (num "3") "≥" (num "2")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem g3 : 3 >= 2 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `g3 []) (Command.declSig [] (Term.typeSpec ":" («term_≥_» (num "3") ">=" (num "2")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem l : 2 ≤ 3 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `l []) (Command.declSig [] (Term.typeSpec ":" («term_≤_» (num "2") "≤" (num "3")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem n : 2 ≠ 3 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `n []) (Command.declSig [] (Term.typeSpec ":" («term_≠_» (num "2") "≠" (num "3")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b : (2 != 3) = true := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_!=_» (num "2") "!=" (num "3")) ")") "=" `true))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem bo : (true && false || true) = true := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `bo []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_||_» («term_&&_» `true "&&" `false) "||" `true) ")") "=" `true))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem le2 : 2 <= 3 := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `le2 []) (Command.declSig [] (Term.typeSpec ":" («term_≤_» (num "2") "<=" (num "3")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h : ∃ _ : Nat, True := ⟨0, trivial⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h []) (Command.declSig [] (Term.typeSpec ":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent (Term.hole "_"))] [":" `Nat])) "," `True))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," `trivial] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+];
+
 /// Malformed `⟨…⟩`, refused at the pin's token. Captured as above (the pin's columns count
 /// code points; `at` is the byte offset in `source`).
 const ANONYMOUS_CONSTRUCTOR_REFUSALS: &[Refused] = &[
@@ -341,6 +398,14 @@ fn anonymous_constructors_produce_the_pins_trees() {
 #[test]
 fn dotted_identifiers_produce_the_pins_trees() {
     for row in DOTTED_IDENTIFIERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn relations_and_existentials_produce_the_pins_trees() {
+    for row in RELATIONS_AND_EXISTENTIALS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

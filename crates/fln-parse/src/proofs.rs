@@ -43,7 +43,7 @@ pub(super) fn parse(
                 depth -= 1;
             }
             TokenKind::Symbol(symbol)
-                if matches!(symbol.as_str(), "forall" | "∀") && depth == 0 =>
+                if matches!(symbol.as_str(), "forall" | "∀" | "∃") && depth == 0 =>
             {
                 forall_commas += 1
             }
@@ -257,8 +257,16 @@ fn local_tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
+        // `decide` is `"decide" optConfig` (`Init/Tactics.lean`); the empty configuration
+        // is a node of its own in the pin's tree.
+        "decide" if range.end == start + 1 => {
+            args.push(Syntax::node(
+                parser_kind(&["Tactic", "optConfig"]),
+                vec![null_node(Vec::new())],
+            ));
+        }
         "assumption" | "solve_by_elim" | "rfl" | "contradiction" | "constructor" | "left"
-        | "right" | "skip" | "fail" | "decide"
+        | "right" | "skip" | "fail"
             if range.end == start + 1 => {}
         _ => return Err(refusal(view, tokens, start)),
     }

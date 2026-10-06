@@ -6,6 +6,10 @@ use super::*;
 pub(super) struct Prefix {
     keyword: usize,
     lambda: bool,
+    /// `∃ binders, body`: forall's binder grammar (the pin's explicitBinders are a
+    /// sublanguage of it), built as the pin's `«term∃_,_»` node. The elaborator's
+    /// expansion pass rewrites it to nested `Exists fun x => ...`, as the pin's macro.
+    exists: bool,
     dependent_arrow: bool,
     binders: Vec<Syntax>,
     annotation: Option<(usize, Syntax)>,
@@ -86,6 +90,7 @@ impl Prefix {
         let mut prefix = Self {
             keyword,
             lambda: symbol(tokens, keyword, "fun") || symbol(tokens, keyword, "λ"),
+            exists: symbol(tokens, keyword, "∃"),
             dependent_arrow,
             binders: Vec::new(),
             annotation: None,
@@ -139,6 +144,10 @@ impl Prefix {
                 return Ok(());
             }
             if name(tokens, *cursor) {
+                // `explicitBinders` is all-bracketed or all-bare, never mixed.
+                if self.exists && self.binders.iter().any(|b| !is_bare(b)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 self.binders.push(binder_name(leaves, tokens, *cursor)?);
                 *cursor += 1;
                 continue;
@@ -154,6 +163,10 @@ impl Prefix {
                 _ => None,
             };
             if let Some((kind, close)) = kind {
+                // `bracketedExplicitBinders` is `(` names `:` type `)` only.
+                if self.exists && (kind != "explicitBinder" || self.binders.iter().any(is_bare)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 let open = *cursor;
                 *cursor += 1;
                 let start = *cursor;
@@ -190,7 +203,7 @@ impl Prefix {
                     *cursor += 1;
                     return Ok(());
                 }
-                if *cursor < end && symbol(tokens, *cursor, close) {
+                if *cursor < end && symbol(tokens, *cursor, close) && !self.exists {
                     let group = Group {
                         open,
                         names,
@@ -209,6 +222,9 @@ impl Prefix {
                 return Err(refuse(view, tokens, *cursor));
             }
             if symbol(tokens, *cursor, ":") {
+                if self.exists && self.binders.iter().any(|b| !is_bare(b)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 self.phase = Phase::SharedType(*cursor);
                 *cursor += 1;
                 return Ok(());
@@ -329,6 +345,19 @@ impl Prefix {
         leaves: &Leaves,
         body: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+        if self.exists {
+            let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
+            let syntax = Syntax::node(
+                Name::str(Name::anonymous(), "term∃_,_"),
+                vec![
+                    leaves.leaf(self.keyword)?,
+                    explicit_binders(self.binders, self.annotation, leaves)?,
+                    separator,
+                    body,
+                ],
+            );
+            return Ok((syntax, self.keyword));
+        }
         let annotation = match self.annotation {
             Some((colon, type_)) => null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
@@ -372,6 +401,82 @@ impl Prefix {
         };
         Ok((syntax, self.keyword))
     }
+}
+
+/// A bare binder: an identifier or `_`, as opposed to a bracketed group.
+fn is_bare(binder: &Syntax) -> bool {
+    matches!(binder, Syntax::Ident { .. }) || binder.kind() == Some(&parser_kind(&["Term", "hole"]))
+}
+
+fn lean_kind(name: &str) -> Name {
+    Name::from_components(["Lean", name])
+}
+
+/// The pin's `explicitBinders` (`Init/NotationExtra.lean`): bare names with an optional
+/// shared type (`unbracketedExplicitBinders`), or one `bracketedExplicitBinders` per
+/// `(names : type)` group. `header` admitted only those two shapes.
+fn explicit_binders(
+    binders: Vec<Syntax>,
+    annotation: Option<(usize, Syntax)>,
+    leaves: &Leaves,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let binder_ident = |name: Syntax| Syntax::node(lean_kind("binderIdent"), vec![name]);
+    let inner = if binders.iter().all(is_bare) {
+        let type_ = match annotation {
+            Some((colon, type_)) => null_node(vec![leaves.leaf(colon)?, type_]),
+            None => null_node(vec![]),
+        };
+        Syntax::node(
+            lean_kind("unbracketedExplicitBinders"),
+            vec![
+                null_node(binders.into_iter().map(binder_ident).collect()),
+                type_,
+            ],
+        )
+    } else {
+        let mut groups = Vec::with_capacity(binders.len());
+        for group in binders {
+            // `[open, names, [colon, type], [], close]`, as `group_syntax` built it.
+            let Syntax::Node { args, .. } = &group else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let [open, names, typed, _default, close] = args.as_slice() else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let (Syntax::Node { args: names, .. }, Syntax::Node { args: typed, .. }) =
+                (names, typed)
+            else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let [colon, type_] = typed.as_slice() else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            groups.push(Syntax::node(
+                lean_kind("bracketedExplicitBinders"),
+                vec![
+                    open.clone(),
+                    null_node(names.iter().cloned().map(binder_ident).collect()),
+                    colon.clone(),
+                    type_.clone(),
+                    close.clone(),
+                ],
+            ));
+        }
+        null_node(groups)
+    };
+    Ok(Syntax::node(lean_kind("explicitBinders"), vec![inner]))
 }
 
 /// Resolve the bracket/term ambiguity once per input range, without repeated
@@ -499,5 +604,62 @@ mod tests {
     fn nat_only_door_does_not_gain_term_binders() {
         assert!(parse_nat_definition(b"def f := fun (x : Nat) => x").is_err());
         assert!(parse_nat_definition(b"def f : (x : Nat) -> Nat := 0").is_err());
+    }
+
+    /// `∃` uses forall's binder grammar and builds the pin's `«term∃_,_»` node, and the
+    /// relation and Boolean operators build the pin's `term_>_`-style nodes. Every byte of
+    /// the source survives.
+    #[test]
+    fn existentials_and_relations_build_the_pins_nodes() {
+        let kinds = |source: &str| {
+            let parsed = parse_source_command(source.as_bytes())
+                .unwrap_or_else(|e| panic!("{source}: {e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![parsed.syntax.clone()];
+            let mut kinds = Vec::new();
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = &syntax {
+                    kinds.push(kind.to_display_string());
+                    pending.extend(args.iter().cloned());
+                }
+            }
+            kinds
+        };
+        let exists = Name::str(Name::anonymous(), "term∃_,_").to_display_string();
+        for source in [
+            "theorem t : ∃ n : Nat, n = 1 := _",
+            "theorem t : ∃ x y : Nat, x = y := _",
+            "theorem t : ∃ (n : Nat) (m : Nat), n = m := _",
+            "theorem t (p : Nat -> Prop) : ∃ n, p n := _",
+        ] {
+            assert_eq!(
+                kinds(source).iter().filter(|k| **k == exists).count(),
+                1,
+                "{source}"
+            );
+        }
+        for (spelling, kind) in [
+            (">", "term_>_"),
+            // The ASCII spelling of `unicode(" ≥ ", " >= ")` is the same syntax.
+            (">=", "term_≥_"),
+            ("<=", "term_≤_"),
+            ("≥", "term_≥_"),
+            ("≤", "term_≤_"),
+            ("≠", "term_≠_"),
+            ("!=", "term_!=_"),
+            ("&&", "term_&&_"),
+            ("||", "term_||_"),
+        ] {
+            let source = format!("def t := a {spelling} b");
+            let expected = Name::str(Name::anonymous(), kind).to_display_string();
+            assert!(kinds(&source).contains(&expected), "{source}");
+        }
+        // The relations are non-associative, as the pin's `infix:50`.
+        assert!(parse_source_command(b"def t := a > b > c").is_err());
+        // `&&` binds tighter than `||`: `a || (b && c)`.
+        let kinds_of_mixed = kinds("def t := a || b && c");
+        let or = kinds_of_mixed.iter().position(|k| k == "term_||_");
+        let and = kinds_of_mixed.iter().position(|k| k == "term_&&_");
+        assert!(or < and, "{kinds_of_mixed:?}");
     }
 }

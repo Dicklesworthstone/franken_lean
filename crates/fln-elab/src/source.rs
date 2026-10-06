@@ -1632,8 +1632,26 @@ impl Context {
                                         }
                                     }
                                     let provided = elements.len().div_ceil(2);
-                                    let function =
-                                        self.anonymous_constructor(expected.as_ref(), provided)?;
+                                    let function = match self
+                                        .anonymous_constructor(expected.as_ref(), provided)
+                                    {
+                                        Err(NatDefinitionElabError::Inference(
+                                            SourceInferenceError::AnonymousCtor(
+                                                anonymous_ctor::AnonymousCtorError::NestedFieldsUnsupported {
+                                                    explicit,
+                                                    ..
+                                                },
+                                            ),
+                                        )) => {
+                                            // The pin's rewrite: the extra arguments become one
+                                            // `⟨…⟩` for the last explicit field.
+                                            let nested =
+                                                anonymous_ctor::nest_fields(elements, explicit);
+                                            values.push(self.term_prepared(&nested, expected)?);
+                                            continue;
+                                        }
+                                        other => other?,
+                                    };
                                     tasks.push(Task::Apply(
                                         function,
                                         Arguments::Separated(elements),
@@ -1688,11 +1706,11 @@ impl Context {
                                 }
                                 if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
                                     let parts = expect_node(syntax, kind, 3, "scalar infix")?;
-                                    expect_atom(
-                                        &parts[1],
-                                        intrinsic.spelling(),
-                                        "scalar operator",
-                                    )?;
+                                    if !intrinsic.spelled_by(&parts[1]) {
+                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                            expected: "scalar operator",
+                                        });
+                                    }
                                     tasks.push(Task::Infix(intrinsic, expected));
                                     tasks.push(Task::Visit(&parts[2], None, true));
                                     tasks.push(Task::Visit(&parts[0], None, true));

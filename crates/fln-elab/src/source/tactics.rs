@@ -619,10 +619,20 @@ impl Context {
                     proposition,
                 });
             } else if kind == &parser_kind(&["Tactic", "decide"]) {
-                let [keyword] = args.as_slice() else {
+                let [keyword, config] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "decide", "decision proof tactic")?;
+                // Only the empty configuration is supported.
+                let config = expect_node(
+                    config,
+                    &parser_kind(&["Tactic", "optConfig"]),
+                    1,
+                    "decide config",
+                )?;
+                if !expect_null_args(&config[0], "decide config items")?.is_empty() {
+                    return Err(error(TacticError::MalformedScript));
+                }
                 self.decide_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "constructor"])
                 || kind == &parser_kind(&["Tactic", "left"])

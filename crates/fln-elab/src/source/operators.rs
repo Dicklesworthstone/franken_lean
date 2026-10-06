@@ -115,17 +115,45 @@ pub(super) fn pin_notation(kind: &Name) -> Option<PinNotation> {
         ),
         ("term-_", PinNotation::Unary("Neg.neg")),
         (
-            "term_<=_",
+            "term_<_",
+            PinNotation::Relation {
+                function: "LT.lt",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_≤_",
             PinNotation::Relation {
                 function: "LE.le",
                 no_prop: false,
             },
         ),
         (
-            "term_<_",
+            "term_>_",
             PinNotation::Relation {
-                function: "LT.lt",
+                function: "GT.gt",
                 no_prop: false,
+            },
+        ),
+        (
+            "term_≥_",
+            PinNotation::Relation {
+                function: "GE.ge",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_≠_",
+            PinNotation::Relation {
+                function: "Ne",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_!=_",
+            PinNotation::Relation {
+                function: "bne",
+                no_prop: true,
             },
         ),
         (
@@ -284,7 +312,10 @@ impl Context {
             return Ok(false);
         }
         let class = function.parent();
-        if class.is_anonymous() {
+        // `Ne`, `bne`, and the `GT.gt`/`GE.ge` definitions (whose namespaces name
+        // no declaration) are ordinary functions; only a class method waits on its
+        // class being registered.
+        if class.is_anonymous() || !self.txn.env.contains(&class) {
             return Ok(true);
         }
         Ok(self.instance_registry()?.is_class(&class))
@@ -1020,7 +1051,10 @@ mod tests {
         );
         for (syntax_kind, function) in [
             ("term_<_", "LT.lt"),
-            ("term_<=_", "LE.le"),
+            ("term_≤_", "LE.le"),
+            ("term_>_", "GT.gt"),
+            ("term_≥_", "GE.ge"),
+            ("term_≠_", "Ne"),
             ("term_=_", "Eq"),
         ] {
             assert_eq!(
@@ -1031,8 +1065,23 @@ mod tests {
                 })
             );
         }
+        assert_eq!(
+            pin_notation(&kind("term_!=_")),
+            Some(PinNotation::Relation {
+                function: "bne",
+                no_prop: true
+            })
+        );
         // Plain `infix` notations in the pin are ordinary applications.
-        for syntax_kind in ["term_<<<_", "term_>>>_", "term_∧_", "term_∨_", "term_↔_"] {
+        for syntax_kind in [
+            "term_<<<_",
+            "term_>>>_",
+            "term_∧_",
+            "term_∨_",
+            "term_↔_",
+            "term_&&_",
+            "term_||_",
+        ] {
             assert_eq!(pin_notation(&kind(syntax_kind)), None, "{syntax_kind}");
         }
     }

@@ -908,6 +908,15 @@ impl BoundedInfixIntrinsic {
             Self::ScalarBeq => "==",
         }
     }
+
+    /// Whether `atom` spells this operator: its own spelling, or the ASCII alternative
+    /// of a `unicode(" ≤ ", " <= ")` notation, which is the same syntax at the pin.
+    fn spelled_by(&self, atom: &Syntax) -> bool {
+        let Syntax::Atom { val, .. } = atom else {
+            return false;
+        };
+        val == self.spelling() || (self.spelling() == "≤" && val == "<=")
+    }
 }
 
 fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {
@@ -919,11 +928,15 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
             ("\\/", "Or"),
             ("↔", "Iff"),
             ("<->", "Iff"),
+            // `infixl " && " => and`: the notation's `and` is the `export Bool (and)`
+            // alias, resolved when the notation was declared.
+            ("&&", "Bool.and"),
+            ("||", "Bool.or"),
         ] {
             if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
                 return Some(BoundedInfixIntrinsic::Fixed {
                     spelling,
-                    intrinsic: Name::from_components([constant]),
+                    intrinsic: Name::from_components(constant.split('.')),
                 });
             }
         }
@@ -949,7 +962,7 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
         ("term_<<<_", "<<<", ["Nat", "shiftLeft"]),
         ("term_>>>_", ">>>", ["Nat", "shiftRight"]),
         ("term_^_", "^", ["Nat", "pow"]),
-        ("term_<=_", "<=", ["Nat", "decLe"]),
+        ("term_≤_", "≤", ["Nat", "decLe"]),
         ("term_<_", "<", ["Nat", "decLt"]),
     ];
     for (syntax_kind, spelling, constant) in rows {
@@ -999,11 +1012,11 @@ fn elaborate_nonlet_term(
                 };
                 if let Some(intrinsic) = bounded_infix_intrinsic(kind, allow_string) {
                     let parts = expect_node(term, kind, 3, "bounded scalar infix expression")?;
-                    expect_atom(
-                        &parts[1],
-                        intrinsic.spelling(),
-                        "bounded scalar infix operator",
-                    )?;
+                    if !intrinsic.spelled_by(&parts[1]) {
+                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                            expected: "bounded scalar infix operator",
+                        });
+                    }
                     tasks.push(Task::ApplyInfix {
                         values_before: values.len(),
                         intrinsic,

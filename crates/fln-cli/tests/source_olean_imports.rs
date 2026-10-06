@@ -289,3 +289,60 @@ fn jobs_takes_one_positive_count() {
         assert!(stderr.contains(message), "{arguments:?}: {stderr}");
     }
 }
+
+/// The pin's relation notations beyond `<`/`<=`/`=`/`==` (`Init/Notation.lean:370-392`,
+/// `Init/Core.lean:775-880`): `>`, `≥`, `>=`, `≤`, `≠` and `!=` are `binrel%` /
+/// `binrel_no_prop%` over `GT.gt`, `GE.ge`, `LE.le`, `Ne` and `bne`; `&&` and `||` are
+/// plain applications of `Bool.and` / `Bool.or`. The fixture is accepted by the pinned
+/// Reference as written. A false relation is still refused.
+#[test]
+fn relation_and_boolean_notations_elaborate_over_the_real_core() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let (code, stdout, stderr) = check_source("core_relations");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("\"theorems\":9"), "{stdout}");
+
+    let scratch = std::env::temp_dir().join(format!("fln-relations-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let wrong = scratch.join("Main.lean");
+    std::fs::write(
+        &wrong,
+        "prelude\nimport Init.Core\ntheorem bad : 2 > 3 := by decide\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json", "--import-posture", "recheck"])
+        .arg(&wrong)
+        .output()
+        .expect("run fln check-source");
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+/// `∃ binders, body` is the pin's macro (`Init/NotationExtra.lean`): one
+/// `Exists fun x : T => …` per bound name. `⟨a, b, c⟩` against a constructor with fewer
+/// explicit fields nests the extra arguments into the last one, as `elabAnonymousCtor`
+/// does. The fixture is accepted by the pinned Reference as written.
+///
+/// On demand (the `Init.NotationExtra` closure is 51 modules, about a minute in release):
+///
+/// ```text
+/// FLN_REQUIRE_REFERENCE=1 cargo test --release -p fln-cli --test source_olean_imports \
+///     -- --ignored --exact existential_notation_and_nested_anonymous_constructors
+/// ```
+#[test]
+#[ignore = "on-demand: council of the 51-module Init.NotationExtra closure"]
+fn existential_notation_and_nested_anonymous_constructors() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let (code, stdout, stderr) = check_source("notation_exists");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("\"commands\":4"), "{stdout}");
+    assert!(stdout.contains("\"theorems\":3"), "{stdout}");
+}

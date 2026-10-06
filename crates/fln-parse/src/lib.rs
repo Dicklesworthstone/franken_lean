@@ -290,6 +290,17 @@ enum BoundedInfix {
     NatPow,
     NatDecLe,
     NatDecLt,
+    /// The pin's other relations (`Init/Notation.lean:370-392`, `Init/Core.lean:775-880`),
+    /// each a `binrel%`/`binrel_no_prop%` macro over its class function.
+    LeUnicode,
+    Gt,
+    Ge,
+    GeUnicode,
+    Ne,
+    Bne,
+    /// `infixl:35 " && " => and` and `infixl:30 " || " => or`: plain applications.
+    BoolAnd,
+    BoolOr,
     ListCons,
 }
 
@@ -319,6 +330,14 @@ impl BoundedInfix {
             Self::NatPow => "^",
             Self::NatDecLe => "<=",
             Self::NatDecLt => "<",
+            Self::LeUnicode => "≤",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::GeUnicode => "≥",
+            Self::Ne => "≠",
+            Self::Bne => "!=",
+            Self::BoolAnd => "&&",
+            Self::BoolOr => "||",
             Self::ListCons => "::",
         }
     }
@@ -337,6 +356,9 @@ impl BoundedInfix {
             Self::NatShiftLeft | Self::NatShiftRight => 75,
             Self::NatPow => 80,
             Self::NatDecLe | Self::NatDecLt => 50,
+            Self::LeUnicode | Self::Gt | Self::Ge | Self::GeUnicode | Self::Ne | Self::Bne => 50,
+            Self::BoolAnd => 35,
+            Self::BoolOr => 30,
             Self::ListCons => 67,
         }
     }
@@ -357,13 +379,29 @@ impl BoundedInfix {
     const fn is_non_associative(self) -> bool {
         matches!(
             self,
-            Self::ScalarBeq | Self::Equality | Self::Iff | Self::IffAscii
+            Self::ScalarBeq
+                | Self::Equality
+                | Self::Iff
+                | Self::IffAscii
+                | Self::LeUnicode
+                | Self::Gt
+                | Self::Ge
+                | Self::GeUnicode
+                | Self::Ne
+                | Self::Bne
         )
     }
 
     fn syntax_kind(self) -> Name {
         if self == Self::Arrow {
             return parser_kind(&["Term", "arrow"]);
+        }
+        // `infix:50 unicode(" ≤ ", " <= ")` (and `≥`): the ASCII spelling is the same
+        // syntax, so the pin builds `«term_≤_»` with a `"<="` atom.
+        match self {
+            Self::NatDecLe => return Name::str(Name::anonymous(), "term_≤_"),
+            Self::Ge => return Name::str(Name::anonymous(), "term_≥_"),
+            _ => {}
         }
         Name::str(Name::anonymous(), format!("term_{}_", self.symbol()))
     }
@@ -556,6 +594,14 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "%" => Some(BoundedInfix::NatMod),
         "<=" => Some(BoundedInfix::NatDecLe),
         "<" => Some(BoundedInfix::NatDecLt),
+        "≤" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::LeUnicode),
+        ">" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Gt),
+        ">=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Ge),
+        "≥" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::GeUnicode),
+        "≠" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Ne),
+        "!=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Bne),
+        "&&" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::BoolAnd),
+        "||" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::BoolOr),
         "<<<" => Some(BoundedInfix::NatShiftLeft),
         ">>>" => Some(BoundedInfix::NatShiftRight),
         "^" => Some(BoundedInfix::NatPow),
@@ -1762,7 +1808,7 @@ fn bounded_term_frames(
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar
-                    && matches!(symbol.as_str(), "forall" | "∀" | "fun" | "λ") =>
+                    && matches!(symbol.as_str(), "forall" | "∀" | "∃" | "fun" | "λ") =>
             {
                 let prefix = term_binders::Prefix::start(
                     leaves,
