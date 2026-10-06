@@ -365,19 +365,24 @@ pub fn closed_vm_value(exit: &VmExit) -> Result<Option<ClosedVmValue>, ClosedVmV
     let VmExit::Returned(returned) = exit else {
         return Err(ClosedVmValueError::NonReturningExit);
     };
-    if returned.value.is_scalar() {
-        return Ok(Some(ClosedVmValue::Scalar(returned.value.unbox())));
+    closed_obj_value(&returned.value)
+}
+
+/// [`closed_vm_value`] for one runtime object, returned or nested in one.
+fn closed_obj_value(value: &fln_rt::obj::Obj) -> Result<Option<ClosedVmValue>, ClosedVmValueError> {
+    if value.is_scalar() {
+        return Ok(Some(ClosedVmValue::Scalar(value.unbox())));
     }
-    if vm_value_kind(&returned.value) == VmValueKind::Mpz {
-        return Ok(nat_decimal(&returned.value).map(ClosedVmValue::NonnegativeMpz));
+    if vm_value_kind(value) == VmValueKind::Mpz {
+        return Ok(nat_decimal(value).map(ClosedVmValue::NonnegativeMpz));
     }
-    if vm_value_kind(&returned.value) != VmValueKind::String {
+    if vm_value_kind(value) != VmValueKind::String {
         return Ok(None);
     }
 
     // `string_view` asserts. This door is embedder-facing: a hostile
     // header must be a typed `ClosedVmValueError`, never a process death.
-    let Some((size, _, _, bytes)) = returned.value.try_string_view() else {
+    let Some((size, _, _, bytes)) = value.try_string_view() else {
         return Err(ClosedVmValueError::InconsistentStringHeader);
     };
     let Some(content_size) = size.checked_sub(1) else {
@@ -395,6 +400,178 @@ pub fn closed_vm_value(exit: &VmExit) -> Result<Option<ClosedVmValue>, ClosedVmV
     let content = std::str::from_utf8(&bytes[..content_size])
         .map_err(|_| ClosedVmValueError::StringPayloadIsNotUtf8)?;
     Ok(Some(ClosedVmValue::String(content.to_owned())))
+}
+
+/// How a closed result is read, decided by its source type: `Nat`, `String`, `Bool`, or a
+/// `List` of one of these, nested to any depth. A list cannot be read without its type, since
+/// `List.nil` and the `Nat` zero are the same boxed scalar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedValueShape {
+    Nat,
+    String,
+    Bool,
+    List(Box<ClosedValueShape>),
+}
+
+/// A closed result read under a [`ClosedValueShape`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedShapedValue {
+    /// Exact decimal digits.
+    Nat(String),
+    String(String),
+    Bool(bool),
+    List(Vec<ClosedShapedValue>),
+}
+
+/// Why a returned value could not be read under its shape. Distinct from
+/// [`ClosedVmValueError`], whose String rules the leaves still apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedShapedValueError {
+    Value(ClosedVmValueError),
+    /// The value is not the shape's runtime representation: for example a `List` cell that is
+    /// neither the boxed `List.nil` nor a two-field `List.cons` constructor, or a `Bool` scalar
+    /// other than 0 or 1.
+    Representation {
+        expected: &'static str,
+    },
+    /// More cells and leaves than the caller allows.
+    TooLarge {
+        limit: usize,
+    },
+}
+
+impl fmt::Display for ClosedShapedValueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value(error) => error.fmt(formatter),
+            Self::Representation { expected } => {
+                write!(formatter, "returned value is not a runtime {expected}")
+            }
+            Self::TooLarge { limit } => {
+                write!(
+                    formatter,
+                    "returned value has more than {limit} cells and leaves"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClosedShapedValueError {}
+
+/// Read a returned value under `shape`, visiting at most `max_nodes` list cells and leaves.
+/// Iterative: neither a long list nor a deeply nested one recurses on the host stack.
+/// `List.nil` is the boxed scalar 0 (the Marrow ABI's form) or a fieldless constructor object
+/// with tag 0 (the form Golem's compiled code builds, measured 2026-10-06), and `List.cons h t`
+/// a constructor object with tag 1 and exactly the two object fields `h` and `t`; anything else
+/// is a typed refusal.
+pub fn closed_vm_shaped_value(
+    exit: &VmExit,
+    shape: &ClosedValueShape,
+    max_nodes: usize,
+) -> Result<ClosedShapedValue, ClosedShapedValueError> {
+    enum Task<'a> {
+        Read(fln_rt::obj::Obj, &'a ClosedValueShape),
+        Collect(usize),
+    }
+    let VmExit::Returned(returned) = exit else {
+        return Err(ClosedShapedValueError::Value(
+            ClosedVmValueError::NonReturningExit,
+        ));
+    };
+    let mut budget = max_nodes;
+    let mut spend = || {
+        budget = budget
+            .checked_sub(1)
+            .ok_or(ClosedShapedValueError::TooLarge { limit: max_nodes })?;
+        Ok::<(), ClosedShapedValueError>(())
+    };
+    let mut tasks = vec![Task::Read(returned.value.clone_ref(), shape)];
+    let mut values: Vec<ClosedShapedValue> = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Read(value, ClosedValueShape::List(element)) => {
+                let mut heads = Vec::new();
+                let mut cell = value;
+                loop {
+                    spend()?;
+                    if cell.is_scalar() {
+                        if cell.unbox() != 0 {
+                            return Err(ClosedShapedValueError::Representation {
+                                expected: "List",
+                            });
+                        }
+                        break;
+                    }
+                    // Golem's compiled code also builds `List.nil` as a fieldless tag-0 object.
+                    if vm_value_kind(&cell) == VmValueKind::Ctor(0) && cell.header().other == 0 {
+                        break;
+                    }
+                    let cons = vm_value_kind(&cell) == VmValueKind::Ctor(1)
+                        && cell.try_ctor_child(2).is_none();
+                    let (Some(head), Some(tail), true) =
+                        (cell.try_ctor_child(0), cell.try_ctor_child(1), cons)
+                    else {
+                        return Err(ClosedShapedValueError::Representation { expected: "List" });
+                    };
+                    heads.push(head);
+                    cell = tail;
+                }
+                tasks.push(Task::Collect(heads.len()));
+                for head in heads.into_iter().rev() {
+                    tasks.push(Task::Read(head, element));
+                }
+            }
+            Task::Read(value, leaf) => {
+                spend()?;
+                let read = closed_obj_value(&value).map_err(ClosedShapedValueError::Value)?;
+                values.push(match (leaf, read) {
+                    (ClosedValueShape::Nat, Some(ClosedVmValue::Scalar(n))) => {
+                        ClosedShapedValue::Nat(n.to_string())
+                    }
+                    (ClosedValueShape::Nat, Some(ClosedVmValue::NonnegativeMpz(digits))) => {
+                        ClosedShapedValue::Nat(digits)
+                    }
+                    (ClosedValueShape::String, Some(ClosedVmValue::String(text))) => {
+                        ClosedShapedValue::String(text)
+                    }
+                    (ClosedValueShape::Bool, Some(ClosedVmValue::Scalar(0))) => {
+                        ClosedShapedValue::Bool(false)
+                    }
+                    (ClosedValueShape::Bool, Some(ClosedVmValue::Scalar(1))) => {
+                        ClosedShapedValue::Bool(true)
+                    }
+                    (ClosedValueShape::Nat, _) => {
+                        return Err(ClosedShapedValueError::Representation { expected: "Nat" });
+                    }
+                    (ClosedValueShape::String, _) => {
+                        return Err(ClosedShapedValueError::Representation { expected: "String" });
+                    }
+                    (ClosedValueShape::Bool, _) => {
+                        return Err(ClosedShapedValueError::Representation { expected: "Bool" });
+                    }
+                    // List shapes are read by the arm above; this one only completes the match.
+                    (ClosedValueShape::List(_), _) => {
+                        return Err(ClosedShapedValueError::Representation { expected: "List" });
+                    }
+                });
+            }
+            Task::Collect(count) => {
+                let start = values
+                    .len()
+                    .checked_sub(count)
+                    .ok_or(ClosedShapedValueError::Representation { expected: "List" })?;
+                let items = values.split_off(start);
+                values.push(ClosedShapedValue::List(items));
+            }
+        }
+    }
+    match (values.pop(), values.is_empty()) {
+        (Some(value), true) => Ok(value),
+        _ => Err(ClosedShapedValueError::Representation {
+            expected: "closed value",
+        }),
+    }
 }
 
 /// Validates and executes one canonical FLBC artifact through Golem.

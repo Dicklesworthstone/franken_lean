@@ -2031,6 +2031,7 @@ fn source_result_kind(type_: &fln::Expr) -> Option<SourceResultKind> {
 #[derive(Debug)]
 enum SourceValueProjectionError {
     Runtime(fln::ClosedVmValueError),
+    Shaped(fln::ClosedShapedValueError),
     InvalidBoolScalar(usize),
     RepresentationMismatch {
         declared: SourceResultKind,
@@ -2042,6 +2043,7 @@ impl std::fmt::Display for SourceValueProjectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => error.fmt(formatter),
+            Self::Shaped(error) => error.fmt(formatter),
             Self::InvalidBoolScalar(value) => write!(
                 formatter,
                 "checked Bool result used invalid runtime scalar {value}; expected 0 or 1"
@@ -2063,12 +2065,63 @@ impl From<fln::ClosedVmValueError> for SourceValueProjectionError {
     }
 }
 
+/// The most list cells and leaves a `List` result is read through.
+const MAX_SOURCE_LIST_NODES: usize = 1 << 20;
+/// The most `List` constructors a result type may nest.
+const MAX_SOURCE_LIST_DEPTH: usize = 64;
+
+/// `List (… (List T))` with `T` a `Nat`, `String` or `Bool`, as a value shape; any other type,
+/// including a bare `T`, is `None`.
+fn source_list_shape(type_: &fln::Expr) -> Option<fln::ClosedValueShape> {
+    let list = fln::Name::from_components(["List"]);
+    let mut depth = 0usize;
+    let mut current = type_;
+    while let fln::ExprNode::App { f, a } = current.node() {
+        let fln::ExprNode::Const { name, levels } = f.node() else {
+            return None;
+        };
+        if name != &list || levels.len() != 1 || depth == MAX_SOURCE_LIST_DEPTH {
+            return None;
+        }
+        depth += 1;
+        current = a;
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut shape = match source_result_kind(current)? {
+        SourceResultKind::Nat => fln::ClosedValueShape::Nat,
+        SourceResultKind::String => fln::ClosedValueShape::String,
+        SourceResultKind::Bool => fln::ClosedValueShape::Bool,
+    };
+    for _ in 0..depth {
+        shape = fln::ClosedValueShape::List(Box::new(shape));
+    }
+    Some(shape)
+}
+
+fn source_shaped_value(value: fln::ClosedShapedValue) -> SourceFinalValue {
+    match value {
+        fln::ClosedShapedValue::Nat(digits) => SourceFinalValue::Nat(digits),
+        fln::ClosedShapedValue::String(text) => SourceFinalValue::String(text),
+        fln::ClosedShapedValue::Bool(value) => SourceFinalValue::Bool(value),
+        fln::ClosedShapedValue::List(items) => {
+            SourceFinalValue::List(items.into_iter().map(source_shaped_value).collect())
+        }
+    }
+}
+
 fn closed_source_cli_value(
     runtime_type: &fln::Expr,
     exit: &fln::VmExit,
 ) -> Result<Option<SourceFinalValue>, SourceValueProjectionError> {
     if let Some(value) = fln::closed_float_value(runtime_type, exit)? {
         return Ok(Some(SourceFinalValue::Float(value)));
+    }
+    if let Some(shape) = source_list_shape(runtime_type) {
+        return fln::closed_vm_shaped_value(exit, &shape, MAX_SOURCE_LIST_NODES)
+            .map(|value| Some(source_shaped_value(value)))
+            .map_err(SourceValueProjectionError::Shaped);
     }
     let Some(declared) = source_result_kind(runtime_type) else {
         return Ok(None);
@@ -10598,6 +10651,8 @@ enum SourceFinalValue {
     Nat(String),
     String(String),
     Bool(bool),
+    /// A `List` of these, nested at most `MAX_SOURCE_LIST_DEPTH` deep.
+    List(Vec<SourceFinalValue>),
 }
 
 #[derive(Debug)]
@@ -10614,6 +10669,7 @@ impl SourceFinalValue {
             Self::Nat(_) => "nat",
             Self::String(_) => "string",
             Self::Bool(_) => "bool",
+            Self::List(_) => "list",
         }
     }
 
@@ -10630,9 +10686,19 @@ impl SourceFinalValue {
             Self::Nat(value) => value.clone(),
             Self::String(value) => json_string(value),
             Self::Bool(value) => value.to_string(),
+            Self::List(items) => format!(
+                "[{}]",
+                items.iter().map(Self::json).collect::<Vec<_>>().join(",")
+            ),
         }
     }
 }
+
+/// The pin's `#eval` prints a `List` through `List.repr`, a fill layout at width 120: flat when
+/// the whole rendering fits in 120 columns (measured at 118 through 122), wrapped otherwise.
+/// Only the flat layout is implemented, so a wider list is refused rather than printed in a
+/// layout the pin would not use.
+const LEAN_EVAL_LIST_WIDTH: usize = 120;
 
 impl std::fmt::Display for SourceFinalValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -10641,6 +10707,17 @@ impl std::fmt::Display for SourceFinalValue {
             Self::Nat(value) => write!(formatter, "{value}"),
             Self::String(value) => write!(formatter, "{value:?}"),
             Self::Bool(value) => write!(formatter, "{value}"),
+            // `List.repr`'s flat layout: `[a, b, c]`.
+            Self::List(items) => {
+                formatter.write_str("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{item}")?;
+                }
+                formatter.write_str("]")
+            }
         }
     }
 }
@@ -10831,11 +10908,36 @@ fn render_source_success(
 fn render_lean_evaluation_results(
     evaluation_results: &[SourceEvaluationResult],
 ) -> MultiplexerOutput {
-    let stdout = evaluation_results
-        .iter()
-        .map(|evaluation| format!("{}\n", evaluation.value))
-        .collect::<String>();
+    let mut stdout = String::new();
+    for evaluation in evaluation_results {
+        match lean_evaluation_line(evaluation.command, &evaluation.value) {
+            Ok(line) => stdout.push_str(&line),
+            Err(refused) => return refused,
+        }
+    }
     MultiplexerOutput::success(stdout)
+}
+
+/// One `#eval` line as the pin's `lean` prints it, newline included, or the typed refusal for
+/// a `List` wider than `LEAN_EVAL_LIST_WIDTH`, whose wrapped layout is not implemented.
+fn lean_evaluation_line(
+    command: usize,
+    value: &SourceFinalValue,
+) -> Result<String, MultiplexerOutput> {
+    let line = value.to_string();
+    if matches!(value, SourceFinalValue::List(_)) && line.chars().count() > LEAN_EVAL_LIST_WIDTH {
+        return Err(source_failure(
+            "capability",
+            &format!(
+                "evaluation command {command} printed a List wider than {LEAN_EVAL_LIST_WIDTH} \
+                 columns; the pin wraps it with List.repr's fill layout, which is not implemented"
+            ),
+            false,
+            SourcePresentation::Lean,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        ));
+    }
+    Ok(format!("{line}\n"))
 }
 
 fn render_bounded_source_type_atom(type_: &fln::Expr) -> Result<String, &'static str> {
@@ -11109,8 +11211,10 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                         );
                     }
                 };
-                stdout.push_str(&value.to_string());
-                stdout.push('\n');
+                match lean_evaluation_line(command_index, &value) {
+                    Ok(line) => stdout.push_str(&line),
+                    Err(refused) => return refused,
+                }
             }
             fln::SourceCommandOutput::Check { check_index, .. }
             | fln::SourceCommandOutput::Example { check_index, .. } => {
@@ -15450,6 +15554,80 @@ mod tests {
             .expect_err("a forged name cannot escape the selected source root");
         assert_eq!(error.class(), "input");
         assert!(error.to_string().contains("one normalized path segment"));
+    }
+
+    #[test]
+    fn lean_personality_prints_lists_as_the_pin_does() {
+        // Each expected line is the pinned lean v4.32.0's stdout for the same one-command file,
+        // captured 2026-10-06.
+        let lean = |source: &str| {
+            super::execute_source_bytes_with_publisher_and_presentation(
+                vec![source.as_bytes().to_vec()],
+                None,
+                SourcePublication::None,
+                SourcePresentation::Lean,
+                |_, _| Ok::<(), std::io::Error>(()),
+            )
+        };
+        let nine = "100000000";
+        let tenth = |last: &str| format!("[{}, {last}]", [nine; 10].join(", "));
+        for (source, stdout) in [
+            (
+                "#eval List.map (fun x => x * 2) [1, 2, 3]".to_owned(),
+                "[2, 4, 6]\n".to_owned(),
+            ),
+            ("#eval ([] : List Nat)".to_owned(), "[]\n".to_owned()),
+            (
+                "#eval [true, false]".to_owned(),
+                "[true, false]\n".to_owned(),
+            ),
+            (
+                "#eval [[1, 2], [], [3]]".to_owned(),
+                "[[1, 2], [], [3]]\n".to_owned(),
+            ),
+            (
+                "#eval [\"a\", \"b\"]".to_owned(),
+                "[\"a\", \"b\"]\n".to_owned(),
+            ),
+            (
+                "#eval [1000000000000000000000, 2]".to_owned(),
+                "[1000000000000000000000, 2]\n".to_owned(),
+            ),
+            (
+                "def xs : List Nat := [4, 5]\n#eval xs".to_owned(),
+                "[4, 5]\n".to_owned(),
+            ),
+            // 118 and 120 columns: the pin prints them flat.
+            (
+                format!("#eval {}", tenth("100000")),
+                format!("{}\n", tenth("100000")),
+            ),
+            (
+                format!("#eval {}", tenth("10000000")),
+                format!("{}\n", tenth("10000000")),
+            ),
+        ] {
+            let evaluated = lean(&source);
+            assert_eq!(evaluated.exit_code, 0, "{source}: {}", evaluated.stderr);
+            assert_eq!(evaluated.stdout, stdout, "{source}");
+        }
+        assert_eq!(tenth("10000000").chars().count(), 120);
+        // 121 columns: the pin wraps the list (`…, 100000000,\n 100000000]`), a layout this
+        // renderer does not produce, so it refuses instead of printing a different one.
+        let wide = lean(&format!("#eval {}", tenth(nine)));
+        assert_eq!(tenth(nine).chars().count(), 121);
+        assert_eq!(
+            wide.exit_code,
+            super::CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            "{}",
+            wide.stderr
+        );
+        assert!(wide.stdout.is_empty(), "{}", wide.stdout);
+        assert!(
+            wide.stderr.contains("wider than 120 columns"),
+            "{}",
+            wide.stderr
+        );
     }
 
     #[test]

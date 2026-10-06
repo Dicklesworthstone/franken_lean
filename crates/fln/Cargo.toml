@@ -16,10 +16,8 @@ fln-hash = { path = "../fln-hash" }
 fln-kernel = { path = "../fln-kernel" }
 fln-olean = { path = "../fln-olean" }
 fln-parse = { path = "../fln-parse" }
+fln-rt = { path = "../fln-rt" }
 fln-server = { path = "../fln-server" }
 fln-syntax = { path = "../fln-syntax" }
 fln-verdict = { path = "../fln-verdict" }
 fln-vm = { path = "../fln-vm" }
-
-[dev-dependencies]
-fln-rt = { path = "../fln-rt" }
