@@ -284,10 +284,18 @@ fn annotation_check_kernel_exhaustion_is_inconclusive_and_atomic() {
         &KVMap::new(),
         SourceCheckLimits::new(limited),
     );
-    let Err(error) = result else {
+    // A kernel nonanswer is an `Ok(Outcome::Inconclusive)` at every source entry
+    // point since 70db74df ("preserve kernel nonanswers across source entry points").
+    let Ok(Outcome::Inconclusive(reason)) = result else {
         panic!("expected bounded annotation-check stop");
     };
-    assert_eq!(error.disposition(), ("inconclusive", false, 3), "{error}");
+    assert!(
+        matches!(
+            reason.cause,
+            fln_core::outcome::InconclusiveCause::ResourceExhausted { .. }
+        ),
+        "a zero-step kernel budget is a resource stop: {reason:?}"
+    );
     assert_eq!(e.logical_root(&KVMap::new()), root);
     check("inductive Flag : Type where | off | on");
 }
