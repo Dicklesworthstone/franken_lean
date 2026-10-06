@@ -116,6 +116,210 @@ fn reject_class(verdict: &Outcome<Verdict>) -> Option<RejectClass> {
 }
 
 #[test]
+fn equality_query_delta_policy_preserves_wrappers_congruence_and_admission() {
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let mut env = admit(&Environment::new(), &axiom("A", sort1()));
+    env = admit(&env, &axiom("a", constant("A")));
+    env = admit(&env, &defn("Hidden", sort1(), constant("A")));
+    env = admit(&env, &defn("Wrapper", sort1(), constant("Hidden")));
+    env = admit(
+        &env,
+        &axiom(
+            "F",
+            Expr::forall_e(n("T"), sort1(), sort1(), BinderInfo::Default),
+        ),
+    );
+    let before = env.clone();
+    let opaque = std::collections::BTreeSet::from([n("Hidden")]);
+    let policy = fln_kernel::DefEqUnfolding {
+        opaque_definitions: &opaque,
+        unfold_theorems: false,
+    };
+    for left in [constant("Hidden"), constant("Wrapper")] {
+        for (left, right) in [(left.clone(), constant("A")), (constant("A"), left)] {
+            for _ in 0..2 {
+                let restricted = fln_kernel::check_def_eq_with_unfolding(
+                    &env,
+                    &[],
+                    &left,
+                    &right,
+                    Budget::DEFAULT,
+                    policy,
+                );
+                assert_eq!(reject_class(&restricted), Some(RejectClass::NotDefEq));
+                assert!(check_def_eq(&env, &[], &left, &right, Budget::DEFAULT).is_accepted());
+            }
+        }
+    }
+    for (left, right) in [
+        (constant("Wrapper"), constant("Hidden")),
+        (
+            Expr::app(constant("F"), constant("Wrapper")),
+            Expr::app(constant("F"), constant("Hidden")),
+        ),
+    ] {
+        let verdict = fln_kernel::check_def_eq_with_unfolding(
+            &env,
+            &[],
+            &left,
+            &right,
+            Budget::DEFAULT,
+            policy,
+        );
+        assert!(verdict.is_accepted(), "{verdict:?}");
+    }
+    assert!(
+        check(
+            &env,
+            &defn("ordinaryAdmission", constant("Hidden"), constant("a")),
+            Budget::DEFAULT,
+        )
+        .is_accepted()
+    );
+    assert_eq!(env, before);
+}
+
+#[test]
+fn equality_query_delta_policy_retains_the_supplied_resource_limit() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &defn("Hidden", sort1(), Expr::const_(n("A"), vec![])));
+    let opaque = std::collections::BTreeSet::from([n("Hidden")]);
+    let tiny = Budget::DEFAULT.narrowed(0, Budget::DEFAULT.depth);
+    let verdict = fln_kernel::check_def_eq_with_unfolding(
+        &env,
+        &[],
+        &Expr::const_(n("Hidden"), vec![]),
+        &Expr::const_(n("A"), vec![]),
+        tiny,
+        fln_kernel::DefEqUnfolding {
+            opaque_definitions: &opaque,
+            unfold_theorems: false,
+        },
+    );
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+    assert_eq!(usage.allowed, tiny.steps);
+    assert!(usage.observed > tiny.steps);
+    assert_eq!(
+        verdict.cache_admission(),
+        CacheAdmission::Refused {
+            authority: Authority::NonAuthoritative,
+        },
+    );
+}
+
+#[test]
+fn typing_query_checks_original_carriers_arguments_and_expected_types() {
+    let constant = |name: &str| Expr::const_(n(name), vec![]);
+    let mut env = admit(&Environment::new(), &axiom("A", sort1()));
+    env = admit(&env, &axiom("a", constant("A")));
+    env = admit(&env, &defn("Hidden", sort1(), constant("A")));
+    env = admit(&env, &defn("Wrapper", sort1(), constant("Hidden")));
+    env = admit(&env, &axiom("hiddenValue", constant("Hidden")));
+    env = admit(
+        &env,
+        &axiom(
+            "consumeHidden",
+            Expr::forall_e(
+                n("x"),
+                constant("Hidden"),
+                constant("A"),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    let before = env.clone();
+    let opaque = std::collections::BTreeSet::from([n("Hidden")]);
+    let policy = fln_kernel::DefEqUnfolding {
+        opaque_definitions: &opaque,
+        unfold_theorems: false,
+    };
+    for (value, expected) in [
+        (constant("a"), constant("Hidden")),
+        (constant("a"), constant("Wrapper")),
+        (constant("hiddenValue"), constant("A")),
+        (
+            Expr::app(constant("consumeHidden"), constant("a")),
+            constant("A"),
+        ),
+    ] {
+        assert!(
+            check(
+                &env,
+                &defn("ordinary", expected.clone(), value.clone()),
+                Budget::DEFAULT,
+            )
+            .is_accepted()
+        );
+        assert!(
+            fln_kernel::check_type_with_unfolding(
+                &env,
+                &[],
+                &value,
+                &expected,
+                Budget::DEFAULT,
+                policy,
+            )
+            .is_rejected()
+        );
+    }
+    for (value, expected) in [
+        (constant("hiddenValue"), constant("Hidden")),
+        (constant("hiddenValue"), constant("Wrapper")),
+        (
+            Expr::app(constant("consumeHidden"), constant("hiddenValue")),
+            constant("A"),
+        ),
+    ] {
+        let verdict = fln_kernel::check_type_with_unfolding(
+            &env,
+            &[],
+            &value,
+            &expected,
+            Budget::DEFAULT,
+            policy,
+        );
+        assert!(verdict.is_accepted(), "{verdict:?}");
+    }
+    let malformed_type = Expr::app(
+        Expr::lam(n("x"), constant("A"), constant("A"), BinderInfo::Default),
+        prop(),
+    );
+    assert!(
+        fln_kernel::check_type_with_unfolding(
+            &env,
+            &[],
+            &constant("a"),
+            &malformed_type,
+            Budget::DEFAULT,
+            policy,
+        )
+        .is_rejected(),
+        "beta reduction must not erase an ill-typed expected type"
+    );
+    let tiny = Budget::DEFAULT.narrowed(0, Budget::DEFAULT.depth);
+    let exhausted = fln_kernel::check_type_with_unfolding(
+        &env,
+        &[],
+        &constant("hiddenValue"),
+        &constant("Hidden"),
+        tiny,
+        policy,
+    );
+    let usage = exhausted_usage(&exhausted);
+    assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+    assert_eq!(usage.allowed, tiny.steps);
+    assert!(usage.observed > usage.allowed);
+    assert_eq!(
+        exhausted.cache_admission(),
+        CacheAdmission::Refused {
+            authority: Authority::NonAuthoritative,
+        }
+    );
+    assert_eq!(env, before);
+}
+
+#[test]
 fn kr104_kr972_a_sort_typed_axiom_is_admitted() {
     let env = Environment::new();
     let verdict = check(&env, &axiom("A", sort1()), Budget::DEFAULT);

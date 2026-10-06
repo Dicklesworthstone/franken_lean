@@ -1937,6 +1937,9 @@ pub(crate) struct TypeChecker<'a> {
     /// domain comparison for an `eagerReduce _ _` argument may reduce open
     /// Nat applications; the previous value is restored after that query.
     eager_reduction: bool,
+    /// Immutable restrictions for a standalone equality query. Admission never
+    /// sets this field, and every query owns all of its policy-sensitive caches.
+    unfolding: Option<crate::DefEqUnfolding<'a>>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -1983,7 +1986,19 @@ impl<'a> TypeChecker<'a> {
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: None,
             eager_reduction: false,
+            unfolding: None,
         }
+    }
+
+    pub(crate) fn new_for_def_eq(
+        env: &'a Environment,
+        lparams: &'a [Name],
+        budget: Budget,
+        unfolding: Option<crate::DefEqUnfolding<'a>>,
+    ) -> Self {
+        let mut checker = Self::new(env, lparams, budget);
+        checker.unfolding = unfolding;
+        checker
     }
 
     /// Adopt an externally-created local (the admission engine's telescopes,
@@ -3217,12 +3232,21 @@ impl<'a> TypeChecker<'a> {
                 // A theorem carries no `DefinitionSafety`, and the pin reports
                 // `is_unsafe() == false` for every theorem, so the KR-973
                 // refusal stays on this arm rather than becoming a shared gate.
-                if !self.may_unfold(defn.safety) {
+                if !self.may_unfold(defn.safety)
+                    || self
+                        .unfolding
+                        .is_some_and(|policy| policy.opaque_definitions.contains(name))
+                {
                     return Ok(None);
                 }
                 (defn.value.clone(), defn.base.level_params.clone())
             }
-            Some(ConstantInfo::Thm(thm)) => (thm.value.clone(), thm.base.level_params.clone()),
+            Some(ConstantInfo::Thm(thm)) => {
+                if self.unfolding.is_some_and(|policy| !policy.unfold_theorems) {
+                    return Ok(None);
+                }
+                (thm.value.clone(), thm.base.level_params.clone())
+            }
             // `is_delta` calls `has_value()` with `allow_opaque` at its DEFAULT
             // false, so an opaque is deliberately not delta. This arm is spelled
             // out rather than swept into a catch-all so the refusal is enforced
@@ -3274,7 +3298,12 @@ impl<'a> TypeChecker<'a> {
             return None;
         };
         match self.env.find(name)? {
-            ConstantInfo::Defn(d) if self.may_unfold(d.safety) => {
+            ConstantInfo::Defn(d)
+                if self.may_unfold(d.safety)
+                    && !self
+                        .unfolding
+                        .is_some_and(|policy| policy.opaque_definitions.contains(name)) =>
+            {
                 Some(match d.hints {
                     ReducibilityHints::Regular(h) => h,
                     // Abbrev unfolds eagerly (treated as tall); Opaque as height 0.
@@ -3285,7 +3314,11 @@ impl<'a> TypeChecker<'a> {
             // Pin `constant_info::get_hints()` has no hints field to read for a
             // theorem and returns `g_opaque`, which is height 0 — the shortest,
             // so lazy delta unfolds the other side first, as at the pin.
-            ConstantInfo::Thm(_) => Some(0),
+            ConstantInfo::Thm(_)
+                if !self.unfolding.is_some_and(|policy| !policy.unfold_theorems) =>
+            {
+                Some(0)
+            }
             _ => None,
         }
     }
