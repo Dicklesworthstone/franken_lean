@@ -6,6 +6,7 @@ use super::*;
 use crate::instances::InstanceRegistry;
 
 mod expand;
+mod function;
 mod monad;
 
 impl Context {
@@ -231,7 +232,10 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        if !self.has_coercion_class("CoeT")? && !self.has_coercion_class("MonadLiftT")? {
+        if !self.has_coercion_class("CoeT")?
+            && !self.has_coercion_class("CoeFun")?
+            && !self.has_coercion_class("MonadLiftT")?
+        {
             return self.constrain_type(actual, expected);
         }
         self.coercion_eq(actual, expected).map(|_| ())
@@ -395,6 +399,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         if !self.has_coercion_class("CoeT")?
             && !self.has_coercion_class("CoeSort")?
+            && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
         {
             self.constrain_expected_type(&term.type_, expected)?;
@@ -426,6 +431,11 @@ impl Context {
         // The pin tries a registered monad lift before ordinary value coercions.
         if let Some(lifted) = self.try_monad_lift(&term, expected)? {
             return Ok(lifted);
+        }
+        // Function-shape coercions precede CoeT, but only a matching function
+        // type commits the speculative output-family assignments.
+        if let Some(function) = self.try_expected_function(&term, expected)? {
+            return Ok(function);
         }
         let mut trial = self.clone();
         let result = (|| {
