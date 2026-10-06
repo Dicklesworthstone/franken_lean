@@ -469,6 +469,57 @@ impl Probe<'_> {
         self.answers.insert(fingerprint, left, right, answer);
         Ok(answer)
     }
+    /// Whether the pin reaches argument-by-argument comparison of two
+    /// applications of `term`'s head before anything unfolds or reduces it:
+    /// - a regular definition, compared by arguments before either side unfolds
+    ///   (`d_t->get_hints().is_regular()`, vendored type_checker.cpp:936);
+    /// - a head that is not delta at all and that `whnf_core` does not reduce:
+    ///   an axiom, an opaque constant, an inductive type, a constructor, the
+    ///   quotient type or its constructor, or a local without a value. Lazy delta
+    ///   returns at once for two such heads (`DefUnknown`, :906-907), so the pin's
+    ///   next step on the pair is `is_def_eq_app` (:1145).
+    ///
+    /// Every other head (an abbreviation or opaque-hint definition, a theorem, a
+    /// recursor, a quotient eliminator, a let-bound local) is unfolded or reduced
+    /// first, and its applications reach congruence late.
+    fn compares_arguments_first(&self, term: &WireExpr, context: &InferenceContext) -> bool {
+        use crate::environment::{ConstantKind, QuotientKind, ReducibilityHint};
+        let mut id = term.root();
+        while let Some(ExprNode::Apply { function, .. }) = term.node(id) {
+            id = *function;
+        }
+        match term.node(id) {
+            Some(ExprNode::Free { name }) => context
+                .locals()
+                .iter()
+                .rev()
+                .find(|local| local.name() == name)
+                .is_none_or(|local| local.value().is_none()),
+            Some(ExprNode::Constant { name, .. }) => {
+                context
+                    .constants()
+                    .find(name)
+                    .is_some_and(|declaration| match declaration.kind() {
+                        ConstantKind::Definition => {
+                            declaration.definition_body().is_some_and(|body| {
+                                matches!(body.hint(), ReducibilityHint::Regular(_))
+                            })
+                        }
+                        ConstantKind::Axiom
+                        | ConstantKind::Opaque
+                        | ConstantKind::Inductive
+                        | ConstantKind::Constructor => true,
+                        ConstantKind::Quotient => matches!(
+                            declaration.quotient_kind(),
+                            Some(QuotientKind::Type | QuotientKind::Constructor)
+                        ),
+                        ConstantKind::Theorem | ConstantKind::Recursor => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// The argument pairs of two applications of one head: the same local, or
     /// the same constant at equal universe levels, applied to equally many
     /// arguments.
@@ -1354,18 +1405,28 @@ impl Probe<'_> {
                 work.push(Work::Pair(domain, other, context));
                 continue;
             }
-            // Congruence first, with each argument pair decided by this lane.
-            // The pin tries congruence before unfolding two applications of one
-            // regular definition (`lazy_delta_reduction_step`), comparing the
-            // arguments with the full conversion. The untyped converter makes
-            // that attempt without types, so it cannot equate proofs: a pair
-            // differing only in a proof argument, such as
-            // `parseFirstByte (b[0]'h₁)` against `parseFirstByte (b[0]'h₂)`,
-            // unfolds on both sides until it defers, and cost
-            // `utf8DecodeChar?_eq_assemble₄` its whole budget. Congruence is
-            // sufficient, so a pair it cannot establish goes on to the rules
-            // below unchanged.
+            // Congruence first, with each argument pair decided by this lane,
+            // only for a head the pin compares by arguments before unfolding or
+            // reducing anything (`compares_arguments_first`): one regular
+            // definition (`lazy_delta_reduction_step`, vendored
+            // type_checker.cpp:936), or a head that is not delta at all, for
+            // which lazy delta returns at once (:906-907) and `is_def_eq_app`
+            // (:1145) comes next. A pair that failed it before is skipped and a
+            // failure is recorded (`failed_before`/`cache_failure`, :941-946;
+            // here `incongruent`). The untyped converter makes that attempt
+            // without types, so it cannot equate proofs: a pair differing only in
+            // a proof argument, such as `parseFirstByte (b[0]'h₁)` against
+            // `parseFirstByte (b[0]'h₂)`, unfolds on both sides until it defers,
+            // and cost `utf8DecodeChar?_eq_assemble₄` its whole budget. Every
+            // other application, such as one of an abbreviation, reaches
+            // congruence late, where the pin does (below). Asked first of every
+            // head, congruence compared arguments the pin never compares: on
+            // `LinearMap.rTensor_tensor`, 89% of this lane's work was spent in
+            // such attempts that failed (bead `fln-checker-associator-time-y8wc`,
+            // comment 3198). Congruence is sufficient, so a pair it cannot
+            // establish goes on to the rules below unchanged.
             if try_congruence
+                && self.compares_arguments_first(&left, &context)
                 && let Some(arguments) = self.same_head_arguments(&left, &right)?
                 && !self.incongruent.contains(&left, &right)
             {
@@ -1422,6 +1483,36 @@ impl Probe<'_> {
             // A changed head may expose ordinary conversion or proof evidence.
             if l != left || r != right {
                 work.push(Work::Pair(l, r, context));
+                continue;
+            }
+            // Late congruence, where the pin's `is_def_eq_core` compares two
+            // applications argument by argument (`is_def_eq_app`, vendored
+            // type_checker.cpp:1145): after proof irrelevance, lazy delta and
+            // full `whnf_core` have not decided the pair (:1117-1142), and before
+            // eta and structure eta (:1148-1152). This is the congruence a stuck
+            // constructor or type-former application needs, such as one that
+            // differs only in a proof argument. A failure is recorded in
+            // `incongruent`, so the retried pair goes on to the rules below.
+            if let Some(arguments) = self.same_head_arguments(&l, &r)?
+                && !self.incongruent.contains(&l, &r)
+            {
+                let mut obligations = Vec::with_capacity(arguments.len());
+                for (left_argument, right_argument) in arguments {
+                    obligations.push(Work::Pair(
+                        self.piece(&l, left_argument)?,
+                        self.piece(&r, right_argument)?,
+                        context.clone(),
+                    ));
+                }
+                work.push(Work::Attempt {
+                    left: l,
+                    right: r,
+                    context,
+                    skip_untyped: skip,
+                    trail: trail.len(),
+                });
+                attempts += 1;
+                work.extend(obligations.into_iter().rev());
                 continue;
             }
             // KR-312 structure eta runs before congruence: after whnf the other
