@@ -7,9 +7,10 @@ mod fixtures;
 mod safety;
 use fixtures::{Fixture, Mutation, fixture, proposition_fixture};
 use fln_checker::admit::{
-    AdmissionBudget, InductiveRejection, InductiveSupportLimit, InductiveVerdict, admit_inductive,
-    admit_inductive_with,
+    AdmissionBudget, InductiveRejection, InductiveStop, InductiveSupportLimit, InductiveVerdict,
+    admit_inductive, admit_inductive_with,
 };
+use fln_checker::defeq::DefEqBudget;
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
     ConstructorDeclaration, EnvironmentBudget, EnvironmentOutcome, InductiveDeclaration,
@@ -18,7 +19,12 @@ use fln_checker::environment::{
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
 };
-use fln_core::{expr::Expr, name::Name};
+use fln_checker::{infer::InferenceBudget, term::TermBudget, whnf::WhnfBudget};
+use fln_core::{
+    expr::{BinderInfo, Expr, ExprNode},
+    level::Level,
+    name::Name,
+};
 use fln_hash::canon::Canonical;
 fn wn(name: &Name) -> WireName {
     match decode_name(&name.to_canonical_bytes(), DecodeBudget::unlimited()) {
@@ -134,6 +140,270 @@ fn mutually_recursive_families_reconstruct_all_motives_and_minors() {
 #[test]
 fn shared_dependent_parameters_and_polymorphic_recursors_are_checked() {
     accepts(&fixture(true, false, false, 2, Mutation::None));
+}
+
+fn map_parameter_domain(type_: &Expr, parameter: usize, map: impl FnOnce(&Expr) -> Expr) -> Expr {
+    let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        binder_info,
+    } = type_.node()
+    else {
+        panic!("fixture parameter missing");
+    };
+    let (domain, body) = if parameter == 0 {
+        (map(binder_type), body.clone())
+    } else {
+        (
+            binder_type.clone(),
+            map_parameter_domain(body, parameter - 1, map),
+        )
+    };
+    Expr::forall_e(binder_name.clone(), domain, body, *binder_info)
+}
+
+/// Keep the second parameter dependent on the first, but make its written
+/// domain a beta redex. The pin opens both domains with the first family's
+/// locals before converting them (`inductive.cpp:234,430`).
+fn convertible_parameter(type_: &Expr) -> Expr {
+    map_parameter_domain(type_, 1, |domain| {
+        let type_of_domain = Expr::sort(
+            Level::succ(Level::succ(Level::param(fixtures::name("u"))).unwrap()).unwrap(),
+        );
+        Expr::app(
+            Expr::lam(
+                fixtures::name("type_alias"),
+                type_of_domain,
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            domain.clone(),
+        )
+    })
+}
+
+fn convertible_mutual_parameters(family: bool, constructor: bool) -> Fixture {
+    let mut f = fixture(true, true, true, 2, Mutation::None);
+    if family {
+        f.types[1].ty = convertible_parameter(&f.types[1].ty);
+    }
+    if constructor {
+        f.ctors[0].ty = convertible_parameter(&f.ctors[0].ty);
+    }
+    f
+}
+
+#[test]
+fn mutually_defined_families_convert_their_shared_dependent_parameter_domains() {
+    accepts(&convertible_mutual_parameters(true, false));
+}
+
+#[test]
+fn mutual_constructors_convert_their_shared_dependent_parameter_domains() {
+    accepts(&convertible_mutual_parameters(false, true));
+    accepts(&convertible_mutual_parameters(true, true));
+}
+
+#[test]
+fn mutual_parameter_conversion_stops_stay_nonanswers_and_allow_recovery() {
+    let unlimited = InferenceBudget::unlimited().defeq;
+    let budget = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget::new(
+            unlimited.quick,
+            0,
+            0,
+            u64::MAX,
+            u64::MAX,
+            WhnfBudget::new(0, 0, TermBudget::unlimited()),
+        ),
+    );
+    for (family, constructor) in [(true, false), (false, true)] {
+        let rs = rows(&convertible_mutual_parameters(family, constructor));
+        let base = empty();
+        let stopped = admit_inductive(&base, &rs, budget, EnvironmentBudget::unlimited());
+        assert!(
+            matches!(
+                stopped,
+                InductiveVerdict::Inconclusive(InductiveStop::ParameterConversion {
+                    parameter: 1,
+                    ..
+                })
+            ),
+            "family={family} constructor={constructor}: {stopped:?}"
+        );
+        assert!(base.find(rs[0].name()).is_none());
+        let mut polls = 0;
+        let complete = admit_inductive_with(
+            &base,
+            &rs,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+            || {
+                polls += 1;
+                false
+            },
+        );
+        assert!(complete.is_admitted(), "{complete:?}");
+        for cut in [1, polls / 2, polls - 1] {
+            let mut observed = 0;
+            let cancelled = admit_inductive_with(
+                &base,
+                &rs,
+                AdmissionBudget::unlimited(),
+                EnvironmentBudget::unlimited(),
+                || {
+                    observed += 1;
+                    observed >= cut
+                },
+            );
+            assert!(
+                matches!(cancelled, InductiveVerdict::Inconclusive(_)),
+                "cut {cut}: {cancelled:?}"
+            );
+        }
+        assert!(verdict(&rs).is_admitted());
+    }
+}
+
+#[test]
+fn unequal_mutual_parameter_domains_and_forged_recursors_are_not_admitted() {
+    let mut f = convertible_mutual_parameters(true, true);
+    f.types[1].ty = map_parameter_domain(&f.types[1].ty, 0, |_| {
+        Expr::sort(Level::succ(Level::succ(Level::param(fixtures::name("u"))).unwrap()).unwrap())
+    });
+    let result = verdict(&rows(&f));
+    assert!(
+        matches!(
+            result,
+            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { ref name })
+                if *name == wn(&f.names[1])
+        ),
+        "{result:?}"
+    );
+
+    let mut f = convertible_mutual_parameters(true, true);
+    f.recs[1].rules[0].rhs = f.recs[0].rules[0].rhs.clone();
+    let result = verdict(&rows(&f));
+    assert!(
+        matches!(
+            result,
+            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+/// Two empty data families with every declared universe used in the family's
+/// result sort and every family occurrence instantiated at the full list.
+/// Their recursor types are written here independently of reconstruction.
+fn many_universe_mutual_fixture(count: usize) -> Fixture {
+    assert!(count > 0);
+    let levels: Vec<_> = (0..count)
+        .map(|i| fixtures::name(&format!("v{i}")))
+        .collect();
+    let actual_levels: Vec<_> = levels.iter().cloned().map(Level::param).collect();
+    let maximum = actual_levels
+        .iter()
+        .cloned()
+        .reduce(|a, b| Level::max(a, b).unwrap())
+        .unwrap();
+    let result_sort = Expr::sort(Level::succ(maximum).unwrap());
+    let motive_level = fixtures::name("motive_universe");
+    let names = vec![
+        fixtures::name("ManyUniverse0"),
+        fixtures::name("ManyUniverse1"),
+    ];
+    let family_terms: Vec<_> = names
+        .iter()
+        .map(|name| Expr::const_(name.clone(), actual_levels.clone()))
+        .collect();
+    let motives: Vec<_> = family_terms
+        .iter()
+        .map(|family| {
+            Expr::forall_e(
+                fixtures::name("major"),
+                family.clone(),
+                Expr::sort(Level::param(motive_level.clone())),
+                BinderInfo::Default,
+            )
+        })
+        .collect();
+    let mut f = Fixture {
+        names: names.clone(),
+        levels,
+        rec_levels: vec![motive_level],
+        parameters: 0,
+        types: Vec::new(),
+        ctors: Vec::new(),
+        recs: Vec::new(),
+        recursive: false,
+        reflexive: false,
+    };
+    f.rec_levels.extend(f.levels.iter().cloned());
+    for family in 0..2 {
+        f.types.push(fixtures::Type {
+            name: names[family].clone(),
+            ty: result_sort.clone(),
+            indices: 0,
+            ctors: Vec::new(),
+        });
+        let mut type_ = Expr::forall_e(
+            fixtures::name("major"),
+            family_terms[family].clone(),
+            Expr::app(
+                Expr::bvar((2 - family) as u32).unwrap(),
+                Expr::bvar(0).unwrap(),
+            ),
+            BinderInfo::Default,
+        );
+        for (index, motive) in motives.iter().enumerate().rev() {
+            type_ = Expr::forall_e(
+                fixtures::name(&format!("motive_{index}")),
+                motive.clone(),
+                type_,
+                BinderInfo::Default,
+            );
+        }
+        f.recs.push(fixtures::Rec {
+            name: fixtures::name(&format!("ManyUniverse{family}.rec")),
+            ty: type_,
+            indices: 0,
+            rules: Vec::new(),
+        });
+    }
+    f
+}
+
+#[test]
+fn mutual_families_support_more_than_eight_universe_parameters() {
+    for count in [1, 8, 9, 16] {
+        accepts(&many_universe_mutual_fixture(count));
+    }
+}
+
+#[test]
+fn wide_mutual_universe_telescopes_still_require_distinct_and_matching_parameters() {
+    let mut duplicated = many_universe_mutual_fixture(9);
+    duplicated.levels[8] = duplicated.levels[0].clone();
+    let result = verdict(&rows(&duplicated));
+    assert!(
+        matches!(result, InductiveVerdict::Rejected(_)),
+        "{result:?}"
+    );
+
+    let mut inconsistent = many_universe_mutual_fixture(9);
+    inconsistent.rec_levels.swap(1, 2);
+    let result = verdict(&rows(&inconsistent));
+    assert!(
+        matches!(
+            result,
+            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+        ),
+        "{result:?}"
+    );
 }
 #[test]
 fn different_dependent_index_telescopes_follow_each_childs_family() {

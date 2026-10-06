@@ -457,13 +457,9 @@ pub(super) fn check(
         return Err(constructor_error(first.name()));
     }
     let levels = header.level_parameters();
-    if levels.len() > 8 {
-        return Err(InductiveVerdict::Deferred(
-            InductiveSupportLimit::UniverseParameters {
-                observed: levels.len(),
-            },
-        ));
-    }
+    // As for the single-family route, the pin checks duplicate universe
+    // parameters, not their count (inductive.cpp:779). The reconstructed terms
+    // remain bounded by MAX_INDUCTIVE_EXPECTED_ARENA_UNITS below.
     if levels.iter().collect::<BTreeSet<_>>().len() != levels.len() {
         return Err(constructor_error(first.name()));
     }
@@ -512,6 +508,7 @@ pub(super) fn check(
     let mut result_sort = None;
     let mut n = 0usize;
     let mut binders = p;
+    let mut locals = Vec::new();
     for name in &block.names {
         audit.tick()?;
         let entry = declarations
@@ -564,14 +561,30 @@ pub(super) fn check(
             if !audit.equal(&sort, expected)? {
                 return Err(constructor_error(name));
             }
-            for (actual, expected) in parameters.iter().zip(&block.parameters) {
-                if !audit.equal(&actual.domain, &expected.domain)? {
+            // The pin compares later families' parameter domains under the
+            // first family's locals (inductive.cpp:234), before staging any
+            // family. Syntactically different aliases can denote one domain.
+            for (parameter, (actual, expected)) in
+                parameters.iter().zip(&block.parameters).enumerate()
+            {
+                if !audit.parameter_domain_converts(
+                    environment,
+                    &locals[..parameter],
+                    levels,
+                    name,
+                    parameter,
+                    &actual.domain,
+                    &expected.domain,
+                )? {
                     return Err(constructor_error(name));
                 }
             }
         } else {
             result_sort = Some(sort);
             block.parameters = parameters;
+            for parameter in &block.parameters {
+                audit.append_local(&mut locals, &parameter.domain)?;
+            }
         }
         let start = n;
         n = n.saturating_add(metadata.constructors().len());
@@ -613,10 +626,6 @@ pub(super) fn check(
     for family in &block.families {
         staged =
             stage_inductive_member(&staged, family.entry, environment_budget, audit.cancelled)?;
-    }
-    let mut locals = Vec::new();
-    for parameter in &block.parameters {
-        audit.append_local(&mut locals, &parameter.domain)?;
     }
     let mut constructor_names = BTreeSet::new();
     let mut total_fields = 0usize;
@@ -663,8 +672,20 @@ pub(super) fn check(
             declared_type_is_a_type(&staged, name, declaration, &audit.budget, audit.cancelled)
                 .map_err(|v| map_member_preamble(name, v))?;
             let (parameters, tail) = audit.peel(declaration.type_(), p)?;
-            for (actual, expected) in parameters.iter().zip(&block.parameters) {
-                if !audit.equal(&actual.domain, &expected.domain)? {
+            // Constructor parameter domains follow the same conversion law,
+            // with already checked families available (inductive.cpp:430).
+            for (parameter, (actual, expected)) in
+                parameters.iter().zip(&block.parameters).enumerate()
+            {
+                if !audit.parameter_domain_converts(
+                    &staged,
+                    &locals[..parameter],
+                    levels,
+                    name,
+                    parameter,
+                    &actual.domain,
+                    &expected.domain,
+                )? {
                     return Err(constructor_error(name));
                 }
             }
