@@ -1,0 +1,115 @@
+name: native ground conversion verification and landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-ground-conversion-landing.yml
+      - .github/patches/fln-ground-conversion.rs
+      - .github/patches/fln-source-rfl-conversion.rs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-ground-conversion-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Verify the candidate and fast-forward only the tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          payload="$GITHUB_WORKSPACE"
+          evidence="$RUNNER_TEMP/ground-conversion-evidence-$GITHUB_RUN_ID"
+          mkdir -p "$evidence"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/ground-conversion-target-$GITHUB_RUN_ID"
+          export CARGO_BUILD_JOBS=4
+          for attempt in 1 2 3; do
+            git -C "$payload" fetch origin main
+            base=$(git -C "$payload" rev-parse origin/main)
+            work="$RUNNER_TEMP/ground-conversion-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+            git -C "$payload" worktree add --detach "$work" "$base"
+            cd "$work"
+            printf '%s\n' "$base" > "$evidence/base-$attempt.txt"
+            rustc --version --verbose | tee "$evidence/rustc-$attempt.log"
+            test ! -e crates/fln/tests/source_rfl_conversion.rs
+            cp "$payload/.github/patches/fln-source-rfl-conversion.rs" crates/fln/tests/source_rfl_conversion.rs
+
+            # A compile failure is not evidence of the bug. Require the exact
+            # new regression to execute and fail before installing the fix.
+            set +e
+            cargo test --locked -p fln --test source_rfl_conversion ground_conversion_finishes_a_batch_without_publishing_a_declaration -- --exact --nocapture > "$evidence/before-$attempt.log" 2>&1
+            before=$?
+            set -e
+            cat "$evidence/before-$attempt.log"
+            test "$before" -ne 0
+            grep -F 'ground_conversion_finishes_a_batch_without_publishing_a_declaration ... FAILED' "$evidence/before-$attempt.log"
+
+            cp "$payload/.github/patches/fln-ground-conversion.rs" crates/fln-elab/src/constraint/unify/ground_conversion.rs
+            python3 -I - <<'PY'
+          from pathlib import Path
+          path = Path('crates/fln-elab/src/constraint/unify.rs')
+          text = path.read_text()
+          replacements = [
+              ('mod flex_flex;\nmod normalize;', 'mod flex_flex;\nmod ground_conversion;\nmod normalize;'),
+              ('        if self.proof_irrelevance(&left, &right, locals, pending)? {',
+               '        if self.ground_conversion(&left, &right, locals)? {\n            return Ok(());\n        }\n        if self.proof_irrelevance(&left, &right, locals, pending)? {'),
+          ]
+          for before, after in replacements:
+              if text.count(before) != 1:
+                  raise SystemExit('unifier integration context changed; refusing blind replacement')
+              text = text.replace(before, after, 1)
+          path.write_text(text)
+          PY
+            files=(crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/ground_conversion.rs crates/fln/tests/source_rfl_conversion.rs)
+            rustfmt --edition 2024 --config skip_children=true "${files[@]}"
+            git diff --check
+            cargo test --locked -p fln --test source_rfl_conversion -- --nocapture 2>&1 | tee "$evidence/regressions-$attempt.log"
+            cargo test --locked -p fln-elab --test native_unification 2>&1 | tee "$evidence/native-unification-$attempt.log"
+            cargo clippy --locked -p fln-elab --lib -- -D warnings 2>&1 | tee "$evidence/clippy-$attempt.log"
+            cargo check --locked --workspace --all-targets 2>&1 | tee "$evidence/workspace-check-$attempt.log"
+            cargo build --locked -p fln-cli --bin fln 2>&1 | tee "$evidence/cli-build-$attempt.log"
+            printf 'theorem t : Nat.add 2 2 = 4 := rfl\n' > "$evidence/valid.lean"
+            printf 'theorem bad : Nat.add 2 2 = 5 := rfl\n' > "$evidence/invalid.lean"
+            "$CARGO_TARGET_DIR/debug/fln" check-source "$evidence/valid.lean" 2>&1 | tee "$evidence/cli-valid-$attempt.log"
+            set +e
+            "$CARGO_TARGET_DIR/debug/fln" check-source "$evidence/invalid.lean" > "$evidence/cli-invalid-$attempt.log" 2>&1
+            invalid=$?
+            set -e
+            cat "$evidence/cli-invalid-$attempt.log"
+            test "$invalid" -eq 1
+            git diff --check
+            git add -- "${files[@]}"
+            git diff --cached --binary > "$evidence/tested-$attempt.patch"
+            git fetch origin main
+            if test "$(git rev-parse origin/main)" != "$base"; then
+              echo 'main advanced; rebuilding the candidate against the new head'
+              continue
+            fi
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix(elab): finish ground conversion in transactional source unification' -m "Implement the fln-b65e computation gap without widening restricted transparency, assigning opaque holes, or bypassing declaration checking. Eight regression tests cover source rfl, scoped lets, negative recovery, transaction atomicity, calibrated kernel stops and cancellation. Native unification tests, package Clippy, workspace all-target compilation, and real check-source positive/negative commands passed. Evidence: Actions run $GITHUB_RUN_ID. Full release and Reference differential gates are not claimed."
+            if git push origin HEAD:main; then
+              git rev-parse HEAD | tee "$evidence/published-commit.txt"
+              exit 0
+            fi
+            echo 'non-forced push lost a race; retrying with full verification'
+          done
+          echo 'main kept advancing; no untested revision was published' >&2
+          exit 1
+
+      - name: Retain exact verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ground-conversion-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ground-conversion-evidence-${{ github.run_id }}
+          if-no-files-found: error
