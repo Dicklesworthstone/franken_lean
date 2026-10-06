@@ -11,7 +11,7 @@
 crates/fln-cli/tests/fixtures/source_ladder/eval_and_check_output.lean	accept	accept	match	agree	
 crates/fln-cli/tests/fixtures/source_ladder/example_by_decide.lean	accept	accept	match	agree	anonymous example checks in a discarded council successor
 crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
-crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean	accept	accept	match	agree	dotted constructors (Term.dotIdent) and the recursive field-notation call l.size now elaborate (franken_lean-z8j.1.10)
 crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/io_main.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/list_literal_length.lean	accept	accept	match	agree	lean resolves List.length field notation and prints 3
