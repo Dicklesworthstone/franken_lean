@@ -62,6 +62,23 @@ impl Context {
     ) -> Result<Conversion, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
+        // Ground equations need no assignments. Use the existing query under
+        // Default's unfolding policy before entering the metavariable solver:
+        // dependent recursor telescopes can otherwise be repeatedly rebuilt
+        // by native conversion's type hints. The query sees original terms,
+        // including native Nat operations, and retains the caller's budget.
+        // A closure still mentioning a local type hole has not run a kernel
+        // query; only that Deferred case proceeds to ordinary unification.
+        if !actual.has_expr_mvar()
+            && !actual.has_level_mvar()
+            && !expected.has_expr_mvar()
+            && !expected.has_level_mvar()
+        {
+            match self.coercion_kernel_conversion(actual.clone(), expected.clone())? {
+                Conversion::Deferred => {}
+                result => return Ok(result),
+            }
+        }
         // Compare the original terms with the ordinary Default reducer. Its
         // quick assignments preserve named carriers, and its native Nat rung
         // runs before delta (the pin's WHNF.lean). Source WHNF here would first

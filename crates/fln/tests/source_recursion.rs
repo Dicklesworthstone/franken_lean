@@ -115,10 +115,45 @@ def indexSum {{A : Type}} (n : Nat) (xs : Vec A n) : Nat := match xs with
   | .cons k x tail => indexSum k tail + n
 theorem ok : indexSum 2 two = 3 := by rfl
 def retain {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
-  | .nil => xs
-  | .cons k x tail => let used := retain k tail; xs
+  | .nil => Vec.nil
+  | .cons k x tail => let used := retain k tail; Vec.cons k x tail
 theorem retained : retain 2 two = two := by rfl"
     ));
+}
+
+#[test]
+fn structural_retry_cannot_retype_the_original_indexed_major() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    // The pin rejects the outer xs : Vec A n in a branch returning Vec A k.succ.
+    // The valid nil branch allows the self-reference to trigger a structural
+    // retry; rebinding xs before checking the original body used to accept it.
+    for nil in ["Vec.nil", "xs"] {
+        let source = format!(
+            "{VEC}\ndef beforeRetain : Nat := 7\ndef retain {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with\n  | .nil => {nil}\n  | .cons k x tail => let used := retain k tail; xs"
+        );
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("ordinary indexed branch typing must survive recursive lowering");
+        assert_eq!(error.disposition(), ("elaboration", false, 1));
+        let fln::SourceCheckError::Command {
+            command, offset, ..
+        } = &error
+        else {
+            panic!("original source command must own its diagnostic: {error:?}");
+        };
+        assert_eq!(*command, 3);
+        assert_eq!(*offset, source.find("def retain").unwrap());
+        assert_eq!(base.logical_root(&options), root);
+        for name in ["Vec", "beforeRetain", "retain"] {
+            assert!(!base.environment().contains(&Name::from_components([name])));
+        }
+    }
 }
 
 #[test]

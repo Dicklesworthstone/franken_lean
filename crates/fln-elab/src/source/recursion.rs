@@ -12,6 +12,7 @@ use super::*;
 mod constrained;
 mod context;
 mod matrix;
+mod obligation;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
 
@@ -184,7 +185,17 @@ impl Context {
                             .expect("prepared structural candidate")
                             .generalized_parameters = generalized.clone();
                         if context.is_empty() {
-                            self.term(syntax, expected.clone())
+                            let obligation =
+                                self.original_recursive_body_obligation(syntax, expected.clone())?;
+                            let mut value = self.term(syntax, expected.clone())?;
+                            value.value = Expr::let_e(
+                                Name::anonymous(),
+                                obligation.type_,
+                                obligation.value,
+                                value.value,
+                                false,
+                            );
+                            Ok(value)
                         } else {
                             let build = self.prepare_contextual_recursion(
                                 syntax,
