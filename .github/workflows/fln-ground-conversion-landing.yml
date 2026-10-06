@@ -13,11 +13,11 @@ permissions:
 
 concurrency:
   group: fln-ground-conversion-landing
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   verify-and-land:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -42,6 +42,7 @@ jobs:
             cd "$work"
             printf '%s\n' "$base" > "$evidence/base-$attempt.txt"
             rustc --version --verbose | tee "$evidence/rustc-$attempt.log"
+            rustup component add rustfmt clippy
             test ! -e crates/fln/tests/source_rfl_conversion.rs
             cp "$payload/.github/patches/fln-source-rfl-conversion.rs" crates/fln/tests/source_rfl_conversion.rs
 
