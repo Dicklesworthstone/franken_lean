@@ -78,9 +78,19 @@ mod tests {
     fn close(local: &LocalDecl, body: Expr, lambda: bool) -> Expr {
         let body = body.abstract_fvar(&local.id, 0).unwrap();
         if lambda {
-            Expr::lam(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::lam(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         } else {
-            Expr::forall_e(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::forall_e(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         }
     }
     fn budget() -> Budget {
@@ -94,7 +104,11 @@ mod tests {
         else {
             panic!("fixture must be kernel accepted");
         };
-        match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
                 result.environment
             }
@@ -116,8 +130,13 @@ mod tests {
             Expr::app(Expr::const_(n("outParam"), vec![output_level]), output_type),
             BinderInfo::Default,
         );
-        let coe = local("coe", close(&x, Expr::app(fv(&b), fv(&x)), false), BinderInfo::Default);
-        let result_level = Level::max(Level::one(), Level::max(u.clone(), v.clone()).unwrap()).unwrap();
+        let coe = local(
+            "coe",
+            close(&x, Expr::app(fv(&b), fv(&x)), false),
+            BinderInfo::Default,
+        );
+        let result_level =
+            Level::max(Level::one(), Level::max(u.clone(), v.clone()).unwrap()).unwrap();
         for declaration in record_declarations(
             &RecordSpec {
                 name: n("CoeFun"),
@@ -128,7 +147,9 @@ mod tests {
                 is_class: true,
             },
             RecordBudget::default(),
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             env = publish(&env, declaration);
         }
         env = register_class(&env, &n("CoeFun")).unwrap();
@@ -144,7 +165,9 @@ mod tests {
                 is_class: true,
             },
             RecordBudget::default(),
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             env = publish(&env, declaration);
         }
         register_class(&env, &n("CoeT")).unwrap()
@@ -152,7 +175,11 @@ mod tests {
     fn accepted(source: &str) -> Expr {
         let checked = crate::check_definition_source(source.as_bytes(), &environment(), budget())
             .unwrap_or_else(|error| panic!("{source}: {error:?}"));
-        assert!(matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}: {:?}", checked.outcome);
+        assert!(
+            matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+            "{source}: {:?}",
+            checked.outcome
+        );
         let Declaration::Defn(declaration) = checked.declaration else {
             panic!("expected a definition");
         };
@@ -168,9 +195,15 @@ mod tests {
             match expr.node() {
                 ExprNode::Const { name: actual, .. } if actual == &n(name) => return true,
                 ExprNode::App { f, a } => work.extend([f, a]),
-                ExprNode::Lam { binder_type, body, .. }
-                | ExprNode::ForallE { binder_type, body, .. } => work.extend([binder_type, body]),
-                ExprNode::LetE { type_, value, body, .. } => work.extend([type_, value, body]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => work.extend([binder_type, body]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => work.extend([type_, value, body]),
                 ExprNode::MData { expr, .. } => work.push(expr),
                 _ => {}
             }
@@ -180,13 +213,17 @@ mod tests {
 
     #[test]
     fn a_bundled_function_can_be_returned_at_an_expected_arrow() {
-        let value = accepted("def asFn (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) : Nat -> Nat := w");
+        let value = accepted(
+            "def asFn (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) : Nat -> Nat := w",
+        );
         assert!(contains(&value, "CoeFun.coe"));
     }
 
     #[test]
     fn a_bundled_function_can_be_passed_to_a_higher_order_function() {
-        let value = accepted("def pass (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) (use : (Nat -> Nat) -> Nat) : Nat := use w");
+        let value = accepted(
+            "def pass (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) (use : (Nat -> Nat) -> Nat) : Nat := use w",
+        );
         assert!(contains(&value, "CoeFun.coe"));
     }
 
@@ -194,13 +231,17 @@ mod tests {
     fn ordinary_functions_and_direct_function_position_remain_valid() {
         let value = accepted("def keep (f : Nat -> Nat) : Nat -> Nat := f");
         assert!(!contains(&value, "CoeFun.coe"));
-        let value = accepted("def call (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) (x : Nat) : Nat := w x");
+        let value = accepted(
+            "def call (W : Type) [inst : CoeFun W (fun _ => Nat -> Nat)] (w : W) (x : Nat) : Nat := w x",
+        );
         assert!(contains(&value, "CoeFun.coe"));
     }
 
     #[test]
     fn a_wrong_function_shape_does_not_block_a_valid_value_coercion() {
-        let value = accepted("def fallback (W : Type) [fn : CoeFun W (fun _ => Nat -> Nat -> Nat)] (w : W) [val : CoeT W w (Nat -> Nat)] : Nat -> Nat := w");
+        let value = accepted(
+            "def fallback (W : Type) [fn : CoeFun W (fun _ => Nat -> Nat -> Nat)] (w : W) [val : CoeT W w (Nat -> Nat)] : Nat -> Nat := w",
+        );
         assert!(contains(&value, "CoeT.coe"));
         assert!(!contains(&value, "CoeFun.coe"));
     }
@@ -214,7 +255,10 @@ mod tests {
             "def bad (W : Type) [inst : CoeFun W (fun _ => Nat)] (w : W) : Nat -> Nat := w",
         ] {
             if let Ok(checked) = crate::check_definition_source(source.as_bytes(), &env, budget()) {
-                assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}");
+                assert!(
+                    !matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                    "{source}"
+                );
             }
         }
     }
@@ -223,11 +267,22 @@ mod tests {
     fn a_failed_function_probe_preserves_semantics_and_charges_work() {
         let mut context = Context::new(&environment(), budget());
         let id = FVarId(n("w"));
-        context.txn.lctx.add_param(id.clone(), n("w"), c("Nat"), BinderInfo::Default);
-        let term = Typed { value: Expr::fvar(id), type_: c("Nat") };
+        context
+            .txn
+            .lctx
+            .add_param(id.clone(), n("w"), c("Nat"), BinderInfo::Default);
+        let term = Typed {
+            value: Expr::fvar(id),
+            type_: c("Nat"),
+        };
         let before = context.txn.clone();
         let next = context.next;
-        assert!(context.try_expected_function(&term, &arrow(c("Nat"), c("Nat"))).unwrap().is_none());
+        assert!(
+            context
+                .try_expected_function(&term, &arrow(c("Nat"), c("Nat")))
+                .unwrap()
+                .is_none()
+        );
         assert!(context.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
         let mut after = context.txn.clone();
         after.budget = before.budget.clone();
@@ -239,12 +294,17 @@ mod tests {
     #[test]
     fn function_coercion_exhaustion_stays_a_resource_error() {
         let mut context = Context::new(&environment(), budget());
-        let term = Typed { value: c("Nat"), type_: Expr::sort(Level::one()) };
+        let term = Typed {
+            value: c("Nat"),
+            type_: Expr::sort(Level::one()),
+        };
         context.txn.budget.max_heartbeats = 1;
         context.txn.budget.heartbeats_consumed = 1;
         assert!(matches!(
             context.try_expected_function(&term, &arrow(c("Nat"), c("Nat"))),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
     }
 }

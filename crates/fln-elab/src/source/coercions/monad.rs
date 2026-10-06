@@ -60,8 +60,13 @@ impl Context {
         }
         let actual = self.whnf(&term.type_)?;
         let target = self.whnf(expected)?;
-        let (ExprNode::App { f: from, a: element }, ExprNode::App { f: to, .. }) =
-            (actual.node(), target.node())
+        let (
+            ExprNode::App {
+                f: from,
+                a: element,
+            },
+            ExprNode::App { f: to, .. },
+        ) = (actual.node(), target.node())
         else {
             return Ok(None);
         };
@@ -70,8 +75,7 @@ impl Context {
         if from.has_expr_mvar() || to.has_expr_mvar() || self.defeq_guarded(from, to)? {
             return Ok(None);
         }
-        let Some(class) = self.lift_application("MonadLiftT", [from.clone(), to.clone()])?
-        else {
+        let Some(class) = self.lift_application("MonadLiftT", [from.clone(), to.clone()])? else {
             return Ok(None);
         };
         let Some(instance) = self.coercion_instance(class.value)? else {
@@ -86,7 +90,8 @@ impl Context {
                 element.clone(),
                 term.value.clone(),
             ],
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         if !self.coercion_eq(&result.type_, expected)? {
@@ -192,7 +197,11 @@ mod tests {
         else {
             panic!("fixture must be kernel accepted");
         };
-        match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
                 result.environment
             }
@@ -286,9 +295,15 @@ mod tests {
             match expr.node() {
                 ExprNode::Const { name, .. } if name == &n("liftM") => return true,
                 ExprNode::App { f, a } => work.extend([f, a]),
-                ExprNode::Lam { binder_type, body, .. }
-                | ExprNode::ForallE { binder_type, body, .. } => work.extend([binder_type, body]),
-                ExprNode::LetE { type_, value, body, .. } => work.extend([type_, value, body]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => work.extend([binder_type, body]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => work.extend([type_, value, body]),
                 ExprNode::MData { expr, .. } => work.push(expr),
                 _ => {}
             }
@@ -297,8 +312,18 @@ mod tests {
     }
     fn context(with_instance: bool) -> (Context, Typed, Expr) {
         let mut context = Context::new(&environment(), budget());
-        let from = parameter(&mut context.txn.lctx, "m", constructor_type(), BinderInfo::Default);
-        let to = parameter(&mut context.txn.lctx, "n", constructor_type(), BinderInfo::Default);
+        let from = parameter(
+            &mut context.txn.lctx,
+            "m",
+            constructor_type(),
+            BinderInfo::Default,
+        );
+        let to = parameter(
+            &mut context.txn.lctx,
+            "n",
+            constructor_type(),
+            BinderInfo::Default,
+        );
         if with_instance {
             parameter(
                 &mut context.txn.lctx,
@@ -308,8 +333,20 @@ mod tests {
             );
         }
         let type_ = Expr::app(fv(&from), c("Nat"));
-        let action = parameter(&mut context.txn.lctx, "x", type_.clone(), BinderInfo::Default);
-        (context, Typed { value: fv(&action), type_ }, Expr::app(fv(&to), c("Nat")))
+        let action = parameter(
+            &mut context.txn.lctx,
+            "x",
+            type_.clone(),
+            BinderInfo::Default,
+        );
+        (
+            context,
+            Typed {
+                value: fv(&action),
+                type_,
+            },
+            Expr::app(fv(&to), c("Nat")),
+        )
     }
 
     #[test]
@@ -342,7 +379,10 @@ mod tests {
             "def bad (m n : Type -> Type) [inst : MonadLiftT m n] (x : m Nat) : n (Nat -> Nat) := x",
         ] {
             if let Ok(checked) = crate::check_definition_source(source.as_bytes(), &env, budget()) {
-                assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}");
+                assert!(
+                    !matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                    "{source}"
+                );
             }
         }
     }
@@ -350,8 +390,16 @@ mod tests {
     #[test]
     fn auto_lift_false_disables_insertion() {
         let (mut context, action, expected) = context(true);
-        context.txn.options.insert(n("autoLift"), DataValue::OfBool(false));
-        assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
+        context
+            .txn
+            .options
+            .insert(n("autoLift"), DataValue::OfBool(false));
+        assert!(
+            context
+                .try_monad_lift(&action, &expected)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -359,7 +407,12 @@ mod tests {
         let (mut context, action, expected) = context(false);
         let before = context.txn.clone();
         let next = context.next;
-        assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
+        assert!(
+            context
+                .try_monad_lift(&action, &expected)
+                .unwrap()
+                .is_none()
+        );
         assert!(context.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
         let mut after = context.txn.clone();
         after.budget = before.budget.clone();
@@ -375,7 +428,9 @@ mod tests {
         context.txn.budget.heartbeats_consumed = 1;
         assert!(matches!(
             context.try_monad_lift(&action, &expected),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
         ));
     }
 }

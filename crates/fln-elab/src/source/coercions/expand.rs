@@ -25,8 +25,18 @@ fn builtin_projection(name: &Name) -> Option<Name> {
     matches!(
         class.leaf_view(),
         LeafView::Str(
-            "Coe" | "CoeTC" | "CoeOut" | "CoeOTC" | "CoeHead" | "CoeHTC"
-                | "CoeTail" | "CoeHTCT" | "CoeDep" | "CoeT" | "CoeFun" | "CoeSort"
+            "Coe"
+                | "CoeTC"
+                | "CoeOut"
+                | "CoeOTC"
+                | "CoeHead"
+                | "CoeHTC"
+                | "CoeTail"
+                | "CoeHTCT"
+                | "CoeDep"
+                | "CoeT"
+                | "CoeFun"
+                | "CoeSort"
         )
     )
     .then_some(class)
@@ -36,6 +46,14 @@ enum Work {
     Visit(Expr),
     Rebuild(Expr),
     Expanded(Expr, Expr),
+}
+
+struct ApplicationSpine {
+    head: Expr,
+    arguments: Vec<Expr>,
+    // Outermost first, so stacking continuations rebuilds the inner prefixes
+    // before the arguments of the outer ones. Each prefix keeps its memo entry.
+    prefixes: Vec<Expr>,
 }
 
 impl Context {
@@ -59,23 +77,50 @@ impl Context {
                     if memo.contains_key(&term.allocation_identity()) {
                         continue;
                     }
-                    if let Some(expanded) = self.expand_coercion_projection(&term)? {
+                    let spine = self.coercion_spine(&term)?;
+                    if let Some(expanded) =
+                        self.expand_coercion_projection(&spine.head, &spine.arguments)?
+                    {
                         work.push(Work::Expanded(term, expanded.clone()));
                         work.push(Work::Visit(expanded));
                         continue;
                     }
+                    if !spine.prefixes.is_empty() {
+                        // Pinned Meta.Transform.visitApp visits the head and
+                        // arguments, not every application prefix. Peeling each
+                        // prefix again would make a long spine quadratic. Keep
+                        // per-prefix rebuilding so shared subapplications still
+                        // reuse the same transformed node.
+                        let mut head = spine.head;
+                        for (prefix, argument) in spine
+                            .prefixes
+                            .into_iter()
+                            .zip(spine.arguments.into_iter().rev())
+                        {
+                            if memo.contains_key(&prefix.allocation_identity()) {
+                                head = prefix;
+                                break;
+                            }
+                            work.push(Work::Rebuild(prefix));
+                            work.push(Work::Visit(argument));
+                        }
+                        work.push(Work::Visit(head));
+                        continue;
+                    }
                     work.push(Work::Rebuild(term.clone()));
                     match term.node() {
-                        ExprNode::App { f, a } => {
-                            work.push(Work::Visit(a.clone()));
-                            work.push(Work::Visit(f.clone()));
+                        ExprNode::Lam {
+                            binder_type, body, ..
                         }
-                        ExprNode::Lam { binder_type, body, .. }
-                        | ExprNode::ForallE { binder_type, body, .. } => {
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
                             work.push(Work::Visit(body.clone()));
                             work.push(Work::Visit(binder_type.clone()));
                         }
-                        ExprNode::LetE { type_, value, body, .. } => {
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
                             work.push(Work::Visit(body.clone()));
                             work.push(Work::Visit(value.clone()));
                             work.push(Work::Visit(type_.clone()));
@@ -101,24 +146,46 @@ impl Context {
                         ExprNode::App { f, a } if changed(f) || changed(a) => {
                             Expr::app(get(f), get(a))
                         }
-                        ExprNode::Lam { binder_name, binder_type, body, binder_info }
-                            if changed(binder_type) || changed(body) =>
-                        {
-                            Expr::lam(binder_name.clone(), get(binder_type), get(body), *binder_info)
-                        }
-                        ExprNode::ForallE { binder_name, binder_type, body, binder_info }
-                            if changed(binder_type) || changed(body) =>
-                        {
-                            Expr::forall_e(binder_name.clone(), get(binder_type), get(body), *binder_info)
-                        }
-                        ExprNode::LetE { decl_name, type_, value, body, non_dep }
-                            if changed(type_) || changed(value) || changed(body) =>
-                        {
-                            Expr::let_e(decl_name.clone(), get(type_), get(value), get(body), *non_dep)
-                        }
-                        ExprNode::Proj { struct_name, idx, expr } if changed(expr) => {
-                            Expr::proj(struct_name.clone(), *idx, get(expr))
-                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } if changed(binder_type) || changed(body) => Expr::lam(
+                            binder_name.clone(),
+                            get(binder_type),
+                            get(body),
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } if changed(binder_type) || changed(body) => Expr::forall_e(
+                            binder_name.clone(),
+                            get(binder_type),
+                            get(body),
+                            *binder_info,
+                        ),
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } if changed(type_) || changed(value) || changed(body) => Expr::let_e(
+                            decl_name.clone(),
+                            get(type_),
+                            get(value),
+                            get(body),
+                            *non_dep,
+                        ),
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } if changed(expr) => Expr::proj(struct_name.clone(), *idx, get(expr)),
                         ExprNode::MData { data, expr } if changed(expr) => {
                             Expr::mdata(data.clone(), get(expr))
                         }
@@ -136,23 +203,29 @@ impl Context {
     fn coercion_spine(
         &mut self,
         expression: &Expr,
-    ) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {
+    ) -> Result<ApplicationSpine, NatDefinitionElabError> {
         let mut head = expression.clone();
-        let mut args = Vec::new();
+        let mut arguments = Vec::new();
+        let mut prefixes = Vec::new();
         while let ExprNode::App { f, a } = head.node() {
             self.tick()?;
-            args.push(a.clone());
+            arguments.push(a.clone());
+            prefixes.push(head.clone());
             head = f.clone();
         }
-        args.reverse();
-        Ok((head, args))
+        arguments.reverse();
+        Ok(ApplicationSpine {
+            head,
+            arguments,
+            prefixes,
+        })
     }
 
     fn expand_coercion_projection(
         &mut self,
-        expression: &Expr,
+        head: &Expr,
+        args: &[Expr],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let (head, args) = self.coercion_spine(expression)?;
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -162,7 +235,19 @@ impl Context {
         let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(name).cloned() else {
             return Ok(None);
         };
-        if definition.safety != DefinitionSafety::Safe
+        // Pinned unfoldProjInst? checks the projection at default transparency
+        // before reducing its dictionary at instances transparency. Ordinary
+        // semireducible class projections are eligible; irreducible ones are not.
+        let irreducible = crate::reducibility::table(&self.txn.env)
+            .map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Reducibility(error),
+                )))
+            })?
+            .status(name)
+            == crate::reducibility::Reducibility::Irreducible;
+        if irreducible
+            || definition.safety != DefinitionSafety::Safe
             || definition.base.level_params.len() != levels.len()
         {
             return Ok(None);
@@ -172,7 +257,8 @@ impl Context {
         };
         let parameters = usize::try_from(family.num_params)
             .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
-        let prefix = parameters.checked_add(1)
+        let prefix = parameters
+            .checked_add(1)
             .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         if args.len() < prefix {
             return Ok(None);
@@ -193,22 +279,25 @@ impl Context {
         {
             return Ok(None);
         }
-        let dictionary = self.reduce_source_head(
-            &args[parameters], UnificationTransparency::Instances, true,
-        )?;
-        let (constructor, mut fields) = self.coercion_spine(&dictionary)?;
-        fields.reverse();
+        let dictionary =
+            self.reduce_source_head(&args[parameters], UnificationTransparency::Instances, true)?;
+        let mut dictionary_spine = self.coercion_spine(&dictionary)?;
+        dictionary_spine.arguments.reverse();
         let Some(mut value) = crate::records::constructor_field(
-            &self.txn.env, &class, 0, &constructor, &fields,
+            &self.txn.env,
+            &class,
+            0,
+            &dictionary_spine.head,
+            &dictionary_spine.arguments,
         ) else {
             // `unfoldDefinition?` leaves a projection of a stuck dictionary
             // alone; do not replace it with a bare `Expr::Proj`.
             return Ok(None);
         };
         // `headBeta`, not WHNF: untagged conversion functions stay folded.
-        for arg in args.into_iter().skip(prefix) {
+        for arg in args.iter().skip(prefix) {
             self.tick()?;
-            value = Expr::app(value, arg);
+            value = Expr::app(value, arg.clone());
         }
         let mut arguments = Vec::new();
         loop {
@@ -260,15 +349,21 @@ mod tests {
         let Outcome::Complete(admitted) = admit(env, declaration, budget()) else {
             panic!("kernel did not complete");
         };
-        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
             panic!("fixture was not accepted");
         };
-        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) =
-            checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None)
-        else {
-            panic!("fixture was not published");
-        };
-        result.environment
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
+                result.environment
+            }
+            Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+            other => panic!("fixture publication failed: {other:?}"),
+        }
     }
     fn local(name: &str, type_: Expr, index: usize) -> LocalDecl {
         LocalDecl {
@@ -285,7 +380,10 @@ mod tests {
         let a = local("A", Expr::sort(Level::one()), 0);
         let b = local("B", Expr::sort(Level::one()), 1);
         let function = Expr::forall_e(
-            n("x"), Expr::fvar(a.id.clone()), Expr::fvar(b.id.clone()), BinderInfo::Default,
+            n("x"),
+            Expr::fvar(a.id.clone()),
+            Expr::fvar(b.id.clone()),
+            BinderInfo::Default,
         );
         let declarations = record_declarations(
             &RecordSpec {
@@ -297,21 +395,30 @@ mod tests {
                 is_class: true,
             },
             RecordBudget::default(),
-        ).unwrap();
+        )
+        .unwrap();
         for declaration in declarations {
             env = publish(&env, declaration);
         }
-        publish(&env, Declaration::Defn(DefinitionVal {
-            base: ConstantVal {
-                name: n("convert"),
-                level_params: Vec::new(),
-                type_: Expr::forall_e(n("x"), c("Nat"), c("Nat"), BinderInfo::Default),
-            },
-            value: Expr::lam(n("x"), c("Nat"), Expr::bvar(0).unwrap(), BinderInfo::Default),
-            hints: ReducibilityHints::Abbrev,
-            safety: DefinitionSafety::Safe,
-            all: vec![n("convert")],
-        }))
+        publish(
+            &env,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: n("convert"),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(n("x"), c("Nat"), c("Nat"), BinderInfo::Default),
+                },
+                value: Expr::lam(
+                    n("x"),
+                    c("Nat"),
+                    Expr::bvar(0).unwrap(),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![n("convert")],
+            }),
+        )
     }
     fn dictionary(function: Expr) -> Expr {
         app(c("Coe.mk"), [c("Nat"), c("Nat"), function])
@@ -323,13 +430,18 @@ mod tests {
     #[test]
     fn builtin_names_are_exact_not_display_string_prefixes() {
         for class in [
-            "Coe", "CoeTC", "CoeOut", "CoeOTC", "CoeHead", "CoeHTC", "CoeTail",
-            "CoeHTCT", "CoeDep", "CoeT", "CoeFun", "CoeSort",
+            "Coe", "CoeTC", "CoeOut", "CoeOTC", "CoeHead", "CoeHTC", "CoeTail", "CoeHTCT",
+            "CoeDep", "CoeT", "CoeFun", "CoeSort",
         ] {
-            assert_eq!(builtin_projection(&Name::str(n(class), "coe")), Some(n(class)));
+            assert_eq!(
+                builtin_projection(&Name::str(n(class), "coe")),
+                Some(n(class))
+            );
         }
         for name in [
-            n("User.Coe.coe"), n("Coe.cast"), n("Coe.coe.extra"),
+            n("User.Coe.coe"),
+            n("Coe.cast"),
+            n("Coe.coe.extra"),
             Name::str(Name::anonymous(), "Coe.coe"),
         ] {
             assert!(builtin_projection(&name).is_none());
@@ -342,18 +454,25 @@ mod tests {
         let mut context = Context::new(&env, budget());
         let variable = Expr::bvar(0).unwrap();
         let original = Expr::lam(
-            n("x"), c("Nat"), coerce(dictionary(c("convert")), variable.clone()),
+            n("x"),
+            c("Nat"),
+            coerce(dictionary(c("convert")), variable.clone()),
             BinderInfo::Default,
         );
         let expected = Expr::lam(
-            n("x"), c("Nat"), Expr::app(c("convert"), variable), BinderInfo::Default,
+            n("x"),
+            c("Nat"),
+            Expr::app(c("convert"), variable),
+            BinderInfo::Default,
         );
         let expanded = context.expand_coercions(&original).unwrap();
         assert_eq!(expanded, expected);
         assert_ne!(expanded, original);
         // Both expressions are checked, not merely compared by a mock reducer.
-        assert!(matches!(fln_kernel::check_def_eq(&env, &[], &original, &expanded, budget()),
-            Outcome::Complete(Verdict::Accepted { .. })));
+        assert!(matches!(
+            fln_kernel::check_def_eq(&env, &[], &original, &expanded, budget()),
+            Outcome::Complete(Verdict::Accepted { .. })
+        ));
     }
 
     #[test]
@@ -362,11 +481,16 @@ mod tests {
         let mut context = Context::new(&env, budget());
         let variable = Expr::bvar(0).unwrap();
         let inner = Expr::lam(
-            n("x"), c("Nat"), coerce(dictionary(c("convert")), variable.clone()),
+            n("x"),
+            c("Nat"),
+            coerce(dictionary(c("convert")), variable.clone()),
             BinderInfo::Default,
         );
         let original = coerce(dictionary(inner), variable.clone());
-        assert_eq!(context.expand_coercions(&original).unwrap(), Expr::app(c("convert"), variable));
+        assert_eq!(
+            context.expand_coercions(&original).unwrap(),
+            Expr::app(c("convert"), variable)
+        );
     }
 
     #[test]
@@ -376,7 +500,10 @@ mod tests {
         let variable = Expr::bvar(0).unwrap();
         let identity = Expr::lam(n("y"), c("Nat"), variable.clone(), BinderInfo::Default);
         let function = Expr::lam(
-            n("x"), c("Nat"), Expr::app(identity, variable.clone()), BinderInfo::Default,
+            n("x"),
+            c("Nat"),
+            Expr::app(identity, variable.clone()),
+            BinderInfo::Default,
         );
         let original = coerce(dictionary(function), variable.clone());
         assert_eq!(context.expand_coercions(&original).unwrap(), variable);
@@ -390,6 +517,86 @@ mod tests {
         assert_eq!(context.expand_coercions(&stuck).unwrap(), stuck);
         let partial = app(c("Coe.coe"), [c("Nat"), c("Nat")]);
         assert_eq!(context.expand_coercions(&partial).unwrap(), partial);
+    }
+
+    #[test]
+    fn irreducible_builtin_projection_is_preserved() {
+        let env = crate::reducibility::register(
+            &environment(),
+            &n("Coe.coe"),
+            crate::reducibility::Reducibility::Irreducible,
+        )
+        .unwrap();
+        let mut context = Context::new(&env, budget());
+        let original = coerce(dictionary(c("convert")), Expr::bvar(0).unwrap());
+        let expanded = context.expand_coercions(&original).unwrap();
+        assert_eq!(
+            expanded.allocation_identity(),
+            original.allocation_identity()
+        );
+    }
+
+    #[test]
+    fn long_application_spine_expands_with_linear_heartbeats() {
+        let env = environment();
+        let mut context = Context::new(&env, budget());
+        let variable = Expr::bvar(0).unwrap();
+        let argument = coerce(dictionary(c("convert")), variable.clone());
+        let expanded_argument = Expr::app(c("convert"), variable);
+        let original = app(c("combine"), std::iter::repeat_n(argument, 2_000));
+        let expected = app(c("combine"), std::iter::repeat_n(expanded_argument, 2_000));
+        // Repeatedly peeling every application prefix takes over two million
+        // steps. One spine traversal and memoized visits need a linear budget.
+        context.txn.budget.max_heartbeats = 20_000;
+        let expanded = context.expand_coercions(&original).unwrap();
+        assert_eq!(expanded, expected);
+
+        let mut context = Context::new(&env, budget());
+        context.txn.budget.max_heartbeats = 20_000;
+        let unchanged = context.expand_coercions(&expanded).unwrap();
+        assert_eq!(
+            unchanged.allocation_identity(),
+            expanded.allocation_identity()
+        );
+    }
+
+    #[test]
+    fn shared_application_prefix_keeps_one_expansion() {
+        let env = environment();
+        let variable = Expr::bvar(0).unwrap();
+        let prefix = Expr::app(
+            c("combine"),
+            coerce(dictionary(c("convert")), variable.clone()),
+        );
+        let extension = Expr::app(prefix.clone(), c("Nat.zero"));
+        let expected_prefix = Expr::app(c("combine"), Expr::app(c("convert"), variable));
+        for prefix_first in [true, false] {
+            let mut context = Context::new(&env, budget());
+            let arguments = if prefix_first {
+                [prefix.clone(), extension.clone()]
+            } else {
+                [extension.clone(), prefix.clone()]
+            };
+            let expanded = context
+                .expand_coercions(&app(c("combine"), arguments))
+                .unwrap();
+            let ExprNode::App { f, a: second } = expanded.node() else {
+                panic!("expected outer application");
+            };
+            let ExprNode::App { a: first, .. } = f.node() else {
+                panic!("expected first argument");
+            };
+            let (prefix, extension) = if prefix_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let ExprNode::App { f: shared, .. } = extension.node() else {
+                panic!("expected extended prefix");
+            };
+            assert_eq!(prefix, &expected_prefix);
+            assert_eq!(prefix.allocation_identity(), shared.allocation_identity());
+        }
     }
 
     #[test]
@@ -412,7 +619,11 @@ mod tests {
         let mut context = Context::new(&env, budget());
         context.txn.budget.max_heartbeats = 1;
         let original = coerce(dictionary(c("convert")), Expr::bvar(0).unwrap());
-        assert!(matches!(context.expand_coercions(&original),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))));
+        assert!(matches!(
+            context.expand_coercions(&original),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
     }
 }
