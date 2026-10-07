@@ -127,6 +127,10 @@ const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 /// every refusal. A standalone image keeps [`OLEAN_REBUILD_SCHEMA`] unchanged.
 const OLEAN_REBUILD_CHAIN_SCHEMA: &str = "fln.olean-rebuild-chain/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
+const IR_INSPECT_SCHEMA: &str = "fln.ir-inspect/1";
+/// How many names `fln ir inspect` lists in one group before it reports how
+/// many it left out.
+const IR_INSPECT_LISTED_NAMES: usize = 64;
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const VERIFY_CAPSULE_SCHEMA: &str = "fln.verify-capsule/2";
 const CAPSULE_DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -195,6 +199,7 @@ const USAGE: &str = concat!(
     "  fln goals [--json] [--max-bytes BYTES] [--offset OFFSET | --line LINE [--col COL]] PATH\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln ilean inspect [--json] [--max-bytes BYTES] PATH\n",
+    "  fln ir inspect [--json] [--declarations] [--max-bytes BYTES] PATH\n",
     "  fln audit --tcb [--json] [--max-bytes BYTES] PATH\n",
     "  fln why-trusts [--json] [--max-bytes BYTES] [--max-nodes N] NAME PATH\n",
     "  fln identity [--json]\n",
@@ -246,6 +251,11 @@ const USAGE: &str = concat!(
     "`ilean inspect` budget-decodes one pinned-format .ilean and canonical-\n",
     "reencodes it, reporting byte identity and bounded aggregate counts. It\n",
     "does not resolve modules, read source, or establish LSP compatibility.\n",
+    "`ir inspect` budget-decodes the compiled declarations stored in one\n",
+    "pinned-format .ir file, or in an .olean that carries its own, and reports\n",
+    "how many there are, which are extern, and which names they call;\n",
+    "--declarations lists them. It executes nothing and does not establish\n",
+    "that FrankenLean can run any of them.\n",
     "`check-olean` checks every declaration in one import-free pinned-format\n",
     ".olean, or a directory containing a closed import set, through K1 and the\n",
     "independent checker, atomically. It reconstructs non-safe mutual definition\n",
@@ -469,6 +479,12 @@ enum MultiplexerCommand {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
+    },
+    IrInspect {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+        declarations: bool,
     },
     Identity {
         json: bool,
@@ -1288,6 +1304,37 @@ fn parse_ilean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
     })
 }
 
+fn parse_ir_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut declarations = false;
+    let filtered: Vec<OsString> = arguments
+        .into_iter()
+        .filter(|argument| {
+            if argument.to_string_lossy() == "--declarations" {
+                declarations = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(filtered, "ir inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "ir inspect accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::IrInspect {
+        path: path.clone(),
+        max_bytes,
+        json,
+        declarations,
+    })
+}
+
 fn parse_path_line_col(s: &str) -> Option<(&str, usize, Option<usize>)> {
     let mut parts = s.rsplitn(3, ':');
     let last = parts.next()?;
@@ -1596,6 +1643,23 @@ fn parse_command(
         }
         return Err(UsageError(format!(
             "unknown ilean subcommand {:?}",
+            subcommand.to_string_lossy()
+        )));
+    }
+    if command == "ir" {
+        let Some(subcommand) = arguments.next() else {
+            return Err(UsageError(
+                "ir requires the `inspect` subcommand".to_owned(),
+            ));
+        };
+        if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if subcommand == "inspect" {
+            return parse_ir_inspect(arguments.collect());
+        }
+        return Err(UsageError(format!(
+            "unknown ir subcommand {:?}",
             subcommand.to_string_lossy()
         )));
     }
@@ -2891,6 +2955,186 @@ fn inspect_ilean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput
     match read_bounded(path, max_bytes, ".ilean artifact") {
         Ok(bytes) => inspect_ilean_bytes(&bytes, max_bytes, json),
         Err(error) => ilean_inspect_failure(IleanInspectFailure::Read(error), json),
+    }
+}
+
+#[derive(Debug)]
+enum IrInspectFailure {
+    Read(BoundedReadFailure),
+    Artifact(fln::IrArtifactError),
+}
+
+impl IrInspectFailure {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Read(error) => error.class(),
+            Self::Artifact(error) if error.is_resource() => "resource",
+            Self::Artifact(_) => "codec",
+        }
+    }
+}
+
+impl fmt::Display for IrInspectFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::Artifact(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn ir_inspect_failure(error: IrInspectFailure, json: bool) -> MultiplexerOutput {
+    let class = error.class();
+    let detail = BoundedText::new(error.to_string());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":false,",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(IR_INSPECT_SCHEMA),
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        format!("fln ir inspect: {class}: {}\n", detail.text())
+    };
+    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
+}
+
+/// The first [`IR_INSPECT_LISTED_NAMES`] of `names` as a JSON array, and how
+/// many were left out.
+fn ir_name_list<'a>(names: impl ExactSizeIterator<Item = &'a fln::Name>) -> (String, usize) {
+    let total = names.len();
+    let shown: Vec<String> = names
+        .take(IR_INSPECT_LISTED_NAMES)
+        .map(|name| json_string(&name.to_display_string()))
+        .collect();
+    (
+        format!("[{}]", shown.join(",")),
+        total.saturating_sub(IR_INSPECT_LISTED_NAMES),
+    )
+}
+
+fn inspect_ir_bytes(
+    bytes: &[u8],
+    max_bytes: usize,
+    json: bool,
+    declarations: bool,
+) -> MultiplexerOutput {
+    use fln::IrDecl;
+    let module = match fln::decode_ir_artifact(bytes, max_bytes) {
+        Ok(module) => module,
+        Err(error) => return ir_inspect_failure(IrInspectFailure::Artifact(error), json),
+    };
+
+    let declared: BTreeSet<&fln::Name> = module.decls.iter().map(IrDecl::name).collect();
+    let externs: Vec<&fln::Name> = module
+        .decls
+        .iter()
+        .filter(|decl| matches!(decl, IrDecl::Extern { .. }))
+        .map(IrDecl::name)
+        .collect();
+    let mut edges = 0usize;
+    let mut targets: BTreeSet<&fln::Name> = BTreeSet::new();
+    for decl in &module.decls {
+        let callees = decl.callees();
+        edges += callees.len();
+        targets.extend(callees);
+    }
+    let outside: Vec<&fln::Name> = targets
+        .iter()
+        .copied()
+        .filter(|target| !declared.contains(target))
+        .collect();
+    let functions = module.decls.len() - externs.len();
+
+    let stdout = if json {
+        let (extern_names, externs_omitted) = ir_name_list(externs.iter().copied());
+        let (outside_names, outside_omitted) = ir_name_list(outside.iter().copied());
+        let (other_tables, tables_omitted) = ir_name_list(module.uninterpreted.iter());
+        let listing = if declarations {
+            let (names, omitted) = ir_name_list(module.decls.iter().map(IrDecl::name));
+            format!(",\"declarationNames\":{names},\"declarationNamesOmitted\":{omitted}")
+        } else {
+            String::new()
+        };
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":false,",
+                "\"bytes\":{},\"declarations\":{},\"functions\":{},\"externs\":{},",
+                "\"directCallEdges\":{},\"distinctCallTargets\":{},",
+                "\"targetsDeclaredElsewhere\":{},",
+                "\"externNames\":{},\"externNamesOmitted\":{},",
+                "\"targetsDeclaredElsewhereNames\":{},\"targetsDeclaredElsewhereOmitted\":{},",
+                "\"tablesNotRead\":{},\"tablesNotReadOmitted\":{}{}}}\n"
+            ),
+            json_string(IR_INSPECT_SCHEMA),
+            bytes.len(),
+            module.decls.len(),
+            functions,
+            externs.len(),
+            edges,
+            targets.len(),
+            outside.len(),
+            extern_names,
+            externs_omitted,
+            outside_names,
+            outside_omitted,
+            other_tables,
+            tables_omitted,
+            listing,
+        )
+    } else {
+        let mut out = format!(
+            concat!(
+                "pinned .ir audit: complete\n",
+                "authority: no\n",
+                "bytes: {}\n",
+                "declarations: {}\n",
+                "functions: {}\n",
+                "externs: {}\n",
+                "direct call edges: {}\n",
+                "distinct call targets: {}\n",
+                "targets declared elsewhere: {}\n",
+            ),
+            bytes.len(),
+            module.decls.len(),
+            functions,
+            externs.len(),
+            edges,
+            targets.len(),
+            outside.len(),
+        );
+        let mut group = |label: &str, names: &mut dyn ExactSizeIterator<Item = &fln::Name>| {
+            let total = names.len();
+            for name in names.take(IR_INSPECT_LISTED_NAMES) {
+                out.push_str(label);
+                out.push_str(BoundedText::new(name.to_display_string()).text());
+                out.push('\n');
+            }
+            if total > IR_INSPECT_LISTED_NAMES {
+                out.push_str(&format!(
+                    "{label}[{} more not listed]\n",
+                    total - IR_INSPECT_LISTED_NAMES
+                ));
+            }
+        };
+        group("extern: ", &mut externs.iter().copied());
+        group("table not read: ", &mut module.uninterpreted.iter());
+        if declarations {
+            group("declaration: ", &mut module.decls.iter().map(IrDecl::name));
+        }
+        out
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn inspect_ir(path: &Path, max_bytes: usize, json: bool, declarations: bool) -> MultiplexerOutput {
+    match read_bounded(path, max_bytes, ".ir artifact") {
+        Ok(bytes) => inspect_ir_bytes(&bytes, max_bytes, json, declarations),
+        Err(error) => ir_inspect_failure(IrInspectFailure::Read(error), json),
     }
 }
 
@@ -13271,6 +13515,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => inspect_ilean(&path, max_bytes, json),
+        Ok(MultiplexerCommand::IrInspect {
+            path,
+            max_bytes,
+            json,
+            declarations,
+        }) => inspect_ir(&path, max_bytes, json, declarations),
         Ok(MultiplexerCommand::ServeLsp) => serve_lsp(),
         Ok(MultiplexerCommand::Goals {
             path,
@@ -14635,16 +14885,17 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, NamedOleanBytes,
-        OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, RECEIPT_SET_SCHEMA,
-        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation, SourcePublication,
-        SourceSidecarPublication, admission_error_disposition, check_olean_bytes,
-        check_olean_module_bytes, derive_lean_installation_paths, diff_olean_bytes,
-        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
-        execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
-        module_name_from_relative, olean_write_error_disposition, parse_source_run,
-        read_bounded_from, render_lean_source_commands, render_lean_source_module_commands, run,
-        run_lean, run_lean_with_input, source_failure, source_import_relative_path,
+        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, IR_INSPECT_SCHEMA,
+        NamedOleanBytes, OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
+        RECEIPT_SET_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation,
+        SourcePublication, SourceSidecarPublication, admission_error_disposition,
+        check_olean_bytes, check_olean_module_bytes, derive_lean_installation_paths,
+        diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
+        execute_source_bytes_with_publisher, execution_error_disposition, inspect_ilean_bytes,
+        inspect_ir_bytes, inspect_olean_bytes, module_name_from_relative,
+        olean_write_error_disposition, parse_source_run, read_bounded_from,
+        render_lean_source_commands, render_lean_source_module_commands, run, run_lean,
+        run_lean_with_input, source_failure, source_import_relative_path,
         verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
@@ -15048,6 +15299,142 @@ mod tests {
                 .stderr
                 .contains("ilean inspect accepts exactly one input path")
         );
+    }
+
+    /// `Lean/Util/Profile.ir` of the pinned toolchain. Every figure asserted
+    /// below was counted from the pin's own printout of that file
+    /// (`fln-olean/fixtures/ir/Lean.Util.Profile.irdump`), not from this reader.
+    const PINNED_IR: &[u8] = include_bytes!("../../fln-olean/fixtures/ir/Lean.Util.Profile.ir");
+
+    #[test]
+    fn ir_inspect_reports_a_real_pinned_ir_file_in_human_and_robot_forms() {
+        let robot = inspect_ir_bytes(PINNED_IR, PINNED_IR.len(), true, false);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        for expected in [
+            format!("\"schema\":\"{IR_INSPECT_SCHEMA}\""),
+            "\"outcome\":\"complete\",\"authority\":false".to_owned(),
+            format!("\"bytes\":{}", PINNED_IR.len()),
+            "\"declarations\":45,\"functions\":43,\"externs\":2".to_owned(),
+            "\"directCallEdges\":56,\"distinctCallTargets\":40".to_owned(),
+            "\"targetsDeclaredElsewhere\":8".to_owned(),
+            "\"externNames\":[\"Lean.profileit\",\"Lean.displayCumulativeProfilingTimes\"]"
+                .to_owned(),
+            "\"externNamesOmitted\":0".to_owned(),
+            "\"tablesNotReadOmitted\":0".to_owned(),
+        ] {
+            assert!(
+                robot.stdout.contains(&expected),
+                "missing {expected} in {}",
+                robot.stdout
+            );
+        }
+        // Without --declarations the listing is absent, not empty.
+        assert!(!robot.stdout.contains("declarationNames"));
+
+        let listed = inspect_ir_bytes(PINNED_IR, PINNED_IR.len(), true, true);
+        assert_eq!(listed.exit_code, 0, "{}", listed.stderr);
+        assert!(
+            listed
+                .stdout
+                .contains("\"declarationNames\":[\"Lean.profileit\",")
+        );
+        assert!(listed.stdout.contains("\"declarationNamesOmitted\":0"));
+
+        let human = inspect_ir_bytes(PINNED_IR, PINNED_IR.len(), false, false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(
+            human
+                .stdout
+                .starts_with("pinned .ir audit: complete\nauthority: no\n")
+        );
+        assert!(
+            human
+                .stdout
+                .contains("declarations: 45\nfunctions: 43\nexterns: 2\n")
+        );
+        assert!(human.stdout.contains("direct call edges: 56\n"));
+        assert!(human.stdout.contains("extern: Lean.profileit\n"));
+        assert!(!human.stdout.contains("declaration: "));
+        let human_listed = inspect_ir_bytes(PINNED_IR, PINNED_IR.len(), false, true);
+        assert_eq!(human_listed.stdout.matches("declaration: ").count(), 45);
+    }
+
+    #[test]
+    fn ir_inspect_preserves_malformed_input_and_budget_stops_as_non_authority() {
+        // An .olean written outside the module system carries its own compiled
+        // declarations in the same entries: 17 here, by the pin's own count.
+        let olean = include_bytes!("../../fln-olean/fixtures/g05_pilot.olean");
+        let carried = inspect_ir_bytes(olean, olean.len(), true, false);
+        assert_eq!(carried.exit_code, 0, "{}", carried.stderr);
+        assert!(
+            carried
+                .stdout
+                .contains("\"declarations\":17,\"functions\":17,\"externs\":0")
+        );
+        assert!(
+            carried
+                .stdout
+                .contains("\"directCallEdges\":13,\"distinctCallTargets\":9")
+        );
+
+        let malformed = inspect_ir_bytes(b"not a compacted region", 1 << 20, true, false);
+        assert_eq!(malformed.exit_code, 1);
+        assert!(malformed.stdout.is_empty());
+        assert!(malformed.stderr.contains("\"authority\":false"));
+        assert!(malformed.stderr.contains("\"class\":\"codec\""));
+
+        // The capture allowance is 64 times the byte allowance: one byte of the
+        // latter cannot hold this file's entries.
+        let exhausted = inspect_ir_bytes(PINNED_IR, 1, true, false);
+        assert_eq!(exhausted.exit_code, 3, "{}", exhausted.stderr);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+        let human = inspect_ir_bytes(PINNED_IR, 1, false, false);
+        assert_eq!(human.exit_code, 3);
+        assert!(human.stderr.starts_with("fln ir inspect: resource: "));
+
+        let path = repository_path("crates/fln-olean/fixtures/ir/Init.Data.Nat.Basic.ir");
+        let wired = run([
+            OsString::from("ir"),
+            OsString::from("inspect"),
+            OsString::from("--json"),
+            OsString::from("--declarations"),
+            path.clone().into_os_string(),
+        ]);
+        assert_eq!(wired.exit_code, 0, "{}", wired.stderr);
+        assert!(
+            wired
+                .stdout
+                .contains("\"declarations\":42,\"functions\":42,\"externs\":0")
+        );
+        assert!(
+            wired
+                .stdout
+                .contains("\"directCallEdges\":51,\"distinctCallTargets\":24")
+        );
+        assert!(wired.stdout.contains("\"targetsDeclaredElsewhere\":5"));
+        assert!(wired.stdout.contains("\"declarationNames\":[\"Nat.blt\","));
+
+        let too_small = run([
+            OsString::from("ir"),
+            OsString::from("inspect"),
+            OsString::from("--max-bytes"),
+            OsString::from("16"),
+            path.into_os_string(),
+        ]);
+        assert_eq!(too_small.exit_code, 3);
+        assert!(too_small.stdout.is_empty());
+
+        let missing = run([OsString::from("ir"), OsString::from("inspect")]);
+        assert_eq!(missing.exit_code, 2);
+        assert!(missing.stderr.contains("ir inspect requires PATH"));
+        let unknown = run([OsString::from("ir"), OsString::from("run")]);
+        assert_eq!(unknown.exit_code, 2);
+        assert!(unknown.stderr.contains("unknown ir subcommand \"run\""));
+        let bare = run([OsString::from("ir")]);
+        assert_eq!(bare.exit_code, 2);
+        assert!(bare.stderr.contains("ir requires the `inspect` subcommand"));
     }
 
     #[test]
@@ -16954,6 +17341,7 @@ mod tests {
         );
         assert!(help.stdout.contains("fln olean diff"));
         assert!(help.stdout.contains("fln ilean inspect"));
+        assert!(help.stdout.contains("fln ir inspect"));
 
         let error = run([OsString::from("olean"), OsString::from("decode")]);
         assert_eq!(error.exit_code, 2);

@@ -637,6 +637,37 @@ fn a_changed_byte_is_a_typed_answer_and_never_a_panic() {
     }
 }
 
+/// An `.olean` written outside the module system carries its own compiled
+/// declarations in the same entries. This one holds what the two `.ir` files do
+/// not: a literal past one machine word, a persistent `inc`, and a string
+/// outside ASCII.
+#[test]
+fn an_olean_that_carries_its_own_ir_decodes_to_what_the_pin_prints() {
+    let bytes: &[u8] = include_bytes!("../fixtures/g05_pilot.olean");
+    let pin = include_str!("../fixtures/ir/g05_pilot.olean.irdump");
+    let (blocks, _) = open(bytes).expect("the fixture opens");
+    let module = decode_ir(&blocks, IrDecodeLimits::default()).expect("the fixture decodes");
+    let ours: Vec<String> = module.decls.iter().map(spell_decl).collect();
+    let theirs: Vec<&str> = pin.lines().collect();
+    assert_eq!(ours.len(), theirs.len(), "declaration count");
+    for (index, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        assert!(
+            ours == theirs,
+            "declaration {index}: {}",
+            first_difference(ours, theirs)
+        );
+    }
+    let text = ours.join("\n");
+    assert!(text.contains("(num 5ce0e9a56015fec5aadfa328ae398115)"));
+    assert!(text.contains("(inc x1 1 1 1)"));
+    assert!(
+        module
+            .decls
+            .iter()
+            .any(|decl| format!("{decl:?}").contains("héllo"))
+    );
+}
+
 // ---- hand-built objects: shapes no real file contains ----
 
 fn block_of(decl: &Obj) -> Vec<OpaqueExtensionBlock> {
@@ -1164,6 +1195,32 @@ fn the_committed_files_and_printouts_are_the_pins_own() {
             "{module_path}: the committed printout is stale"
         );
     }
+    // The `.olean` fixture is this repository's own file, so only its printout is re-derived.
+    let olean =
+        fln_core::checked_workspace_root!().join("crates/fln-olean/fixtures/g05_pilot.olean");
+    let output = Command::new(&lean)
+        .arg("--run")
+        .arg(&script)
+        .arg(&olean)
+        .output()
+        .expect("the pinned lean starts");
+    assert!(
+        output.status.success(),
+        "g05_pilot.olean: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout).expect("the pin prints UTF-8");
+    let declarations: Vec<&str> = printed
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let committed: Vec<&str> = include_str!("../fixtures/ir/g05_pilot.olean.irdump")
+        .lines()
+        .collect();
+    assert!(
+        declarations == committed,
+        "g05_pilot.olean: the committed printout is stale"
+    );
 }
 
 #[test]

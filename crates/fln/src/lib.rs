@@ -138,6 +138,7 @@ pub use fln_olean::ilean::{
     Ilean, IleanBudget, IleanDeclInfo, IleanError, IleanImport, IleanLocation, IleanRefIdent,
     IleanRefInfo, decode_ilean, encode_ilean,
 };
+pub use fln_olean::ir::{IrDecl, IrDecodeError, IrDecodeLimits, IrModule};
 pub use fln_olean::rebuild::RebuildReport as OleanRebuildReport;
 use fln_olean::region::OleanView;
 pub use fln_olean::region::{
@@ -1349,6 +1350,78 @@ pub fn rebuild_olean_module_artifacts(
         loaded.push(bytes);
     }
     Ok(rebuilt)
+}
+
+/// Why a pinned-format `.ir` file could not be read as IR declarations.
+#[derive(Debug)]
+pub enum IrArtifactError {
+    /// The compacted region or its extension entries could not be opened.
+    Container {
+        phase: &'static str,
+        error: OleanRegionError,
+    },
+    /// The container opened and an entry is not a well-formed declaration.
+    Decode(IrDecodeError),
+}
+
+impl IrArtifactError {
+    /// A budget ran out. This says nothing about whether the file is well formed.
+    pub fn is_resource(&self) -> bool {
+        match self {
+            Self::Container {
+                error:
+                    OleanRegionError::BudgetExhausted { .. }
+                    | OleanRegionError::PayloadBudgetExhausted { .. },
+                ..
+            } => true,
+            Self::Container { .. } => false,
+            Self::Decode(error) => error.is_resource(),
+        }
+    }
+}
+
+impl std::fmt::Display for IrArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Container { phase, error } => write!(formatter, "{phase}: {error}"),
+            Self::Decode(error) => write!(formatter, "decode: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for IrArtifactError {}
+
+/// Decode the compiled declarations stored in one `.ir` file of the pinned
+/// Reference epoch: the file a module's compiled code is written to beside its
+/// `.olean`.
+///
+/// `max_bytes` is the caller's allowance for the file. Each declaration is
+/// captured as a standalone region, so a graph two declarations share is
+/// counted once for each; the cumulative capture allowance is therefore 64
+/// times `max_bytes`, and still a bound.
+///
+/// This reads. It executes nothing, admits nothing, and does not establish that
+/// any declaration it returns can be run.
+pub fn decode_ir_artifact(artifact: &[u8], max_bytes: usize) -> Result<IrModule, IrArtifactError> {
+    let capture = max_bytes.saturating_mul(64);
+    let view = OleanView::parse(artifact).map_err(|error| IrArtifactError::Container {
+        phase: "container",
+        error,
+    })?;
+    let blocks = view
+        .extension_payloads(OleanWalkBudget::default(), capture)
+        .map_err(|error| IrArtifactError::Container {
+            phase: "entries",
+            error,
+        })?;
+    fln_olean::ir::decode_ir(
+        &blocks,
+        IrDecodeLimits {
+            max_bytes: capture,
+            ..IrDecodeLimits::default()
+        },
+    )
+    .map_err(IrArtifactError::Decode)
 }
 
 /// Audit and decode one `.olean` produced by the pinned Reference epoch.
