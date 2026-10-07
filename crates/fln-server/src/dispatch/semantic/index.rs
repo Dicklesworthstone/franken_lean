@@ -136,8 +136,8 @@ fn exact_range(text: &str, range: &Range<usize>) -> Result<(), IndexRefusal> {
         return Err(IndexRefusal::InvalidAnnotation);
     }
     for offset in [range.start, range.end] {
-        let position = super::position(text, offset)
-            .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        let position =
+            super::position(text, offset).map_err(|_| IndexRefusal::InvalidAnnotation)?;
         let round_trip = super::super::json::byte_offset(text, position)
             .map_err(|_| IndexRefusal::InvalidAnnotation)?;
         if round_trip != offset {
@@ -173,7 +173,10 @@ impl SemanticIndex {
             // Charge before coordinate scans, result cloning or wire validation.
             // This conservatively covers both source/target round trips and JSON
             // expansion, so a large document times many annotations is bounded.
-            let cost = query.text.len().checked_add(bytes)
+            let cost = query
+                .text
+                .len()
+                .checked_add(bytes)
                 .and_then(|size| size.checked_mul(16))
                 .ok_or(IndexRefusal::ResourceLimit)?;
             add(&mut work, cost, MAX_BUILD_WORK)?;
@@ -200,10 +203,13 @@ impl SemanticIndex {
         }
         entries.sort_by_key(|entry| (entry.annotation.selection.start, entry.order));
         let mut maximum = 0;
-        let max_end = entries.iter().map(|entry| {
-            maximum = maximum.max(entry.annotation.selection.end);
-            maximum
-        }).collect();
+        let max_end = entries
+            .iter()
+            .map(|entry| {
+                maximum = maximum.max(entry.annotation.selection.end);
+                maximum
+            })
+            .collect();
         Ok(Self {
             revision: revision.clone(),
             uri: query.uri.to_owned(),
@@ -234,9 +240,9 @@ impl SemanticIndex {
         if !query.text.is_char_boundary(query.offset) {
             return Err(IndexRefusal::InvalidAnnotation);
         }
-        let mut end = self.entries.partition_point(|entry| {
-            entry.annotation.selection.start <= query.offset
-        });
+        let mut end = self
+            .entries
+            .partition_point(|entry| entry.annotation.selection.start <= query.offset);
         let mut best: Option<&Entry> = None;
         while end > 0 {
             if self.max_end[end - 1] < query.offset {
@@ -250,19 +256,21 @@ impl SemanticIndex {
             }
             let width = annotation.selection.end - annotation.selection.start;
             if best.is_none_or(|previous| {
-                let old_width = previous.annotation.selection.end - previous.annotation.selection.start;
+                let old_width =
+                    previous.annotation.selection.end - previous.annotation.selection.start;
                 width < old_width || (width == old_width && entry.order > previous.order)
             }) {
                 best = Some(entry);
             }
         }
-        let Some(entry) = best else { return Ok(None); };
+        let Some(entry) = best else {
+            return Ok(None);
+        };
         super::validate_target_source(&entry.annotation.answer, documents)
             .map_err(|_| IndexRefusal::ContentModified)?;
         let answer = entry.annotation.answer.clone();
         // Validate against the actual cursor, not just the construction sample.
-        super::result_json(answer.clone(), query)
-            .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        super::result_json(answer.clone(), query).map_err(|_| IndexRefusal::InvalidAnnotation)?;
         Ok(Some(answer))
     }
 }
