@@ -1,0 +1,250 @@
+//! Checked native Repr declarations and replay against the actual pinned library.
+#![forbid(unsafe_code)]
+use fln::source_check::modules::SourceModuleCheckLimits;
+use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
+    OleanDecodeLimits, OleanFrontierJobs, OleanModuleInput, SourceCheckLimits, SourceModuleInput,
+};
+use fln_core::expr::{Expr, ExprNode};
+use fln_env::constants::ConstantInfo;
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+const STACK: usize = 256 * 1024 * 1024;
+const BYTES: usize = 512 * 1024 * 1024;
+const DECLARATIONS: &str = r#"
+structure Packet (A B : Type) where
+  value : A
+  count : Nat
+  proof : True
+  kind : Type
+deriving Repr
+structure Marker : Type where
+deriving Repr
+namespace Wire
+inductive Signal where
+  | red
+  | named (label : String)
+  | numbered (value : Nat)
+deriving Repr
+inductive Message where
+  | wrap (signal : Signal) (code : Nat)
+deriving Repr
+end Wire
+inductive Promote : (loc : Nat) → (state : Nat) → Type where
+  | mk : (loc : Nat) → (state : Nat) → (id : Nat) → Promote loc state
+deriving Repr
+inductive PromoteType : Type → Type 1 where
+  | mk : (A : Type) → PromoteType A
+deriving Repr
+structure Base where
+  n : Nat
+deriving Repr
+structure Child extends Base where
+  flag : Bool
+deriving Repr
+def packet : Packet Nat String :=
+  { value := 7, count := 2, proof := True.intro, kind := Nat }
+"#;
+
+fn name(text: &str) -> Name {
+    Name::from_components(text.split('.'))
+}
+
+fn admission() -> EngineAdmissionLimits {
+    EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK))
+}
+
+fn imported() -> Option<&'static SourceOleanImport> {
+    static IMPORT: OnceLock<Option<SourceOleanImport>> = OnceLock::new();
+    IMPORT
+        .get_or_init(|| {
+            let lib = std::env::var_os("FLN_REFERENCE_LIB")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        PathBuf::from(home)
+                            .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+                    })
+                })
+                .filter(|lib| lib.is_dir());
+            let Some(lib) = lib else {
+                assert!(
+                    std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                    "the pinned Reference is required"
+                );
+                eprintln!("SKIP: pinned Reference lib/lean absent");
+                return None;
+            };
+            let root = name("Init.Data.Repr");
+            let mut pending = vec![root.clone()];
+            let mut artifacts = BTreeMap::new();
+            while let Some(module) = pending.pop() {
+                if artifacts.contains_key(&module) {
+                    continue;
+                }
+                let path = lib
+                    .join(module.to_display_string().replace('.', "/"))
+                    .with_extension("olean");
+                let parts = [
+                    std::fs::read(&path).unwrap(),
+                    std::fs::read(path.with_extension("olean.server")).unwrap(),
+                    std::fs::read(path.with_extension("olean.private")).unwrap(),
+                ];
+                pending.extend(
+                    fln::olean_module_imports(&parts[0], OleanDecodeLimits::new(BYTES)).unwrap(),
+                );
+                artifacts.insert(module, parts);
+            }
+            let modules: Vec<_> = artifacts
+                .iter()
+                .map(|(name, parts)| OleanModuleInput {
+                    name,
+                    artifact: &parts[0],
+                    server_artifact: Some(&parts[1]),
+                    private_artifact: Some(&parts[2]),
+                })
+                .collect();
+            let mut limits = SourceOleanImportLimits::new(OleanCheckLimits::new(
+                BYTES,
+                Budget::for_stack_bytes(STACK),
+            ));
+            limits.jobs = OleanFrontierJobs {
+                threads: NonZeroUsize::new(1).unwrap(),
+                worker_stack_bytes: STACK,
+            };
+            Some(
+                Engine::from_environment(Environment::new())
+                    .import_olean_modules_for_source(&modules, &[root], &KVMap::new(), limits)
+                    .expect("import the actual pinned Repr dependency closure")
+                    .into_complete()
+                    .expect("the actual closure passes both checking engines"),
+            )
+        })
+        .as_ref()
+}
+
+fn checked(engine: &Engine, source: &str) -> Engine {
+    engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(admission()),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("generated declarations pass both checking engines")
+        .engine
+}
+
+fn alpha_type(expr: &Expr) -> Expr {
+    match expr.node() {
+        ExprNode::ForallE {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } => Expr::forall_e(
+            Name::anonymous(),
+            alpha_type(binder_type),
+            alpha_type(body),
+            *binder_info,
+        ),
+        ExprNode::App { f, a } => Expr::app(alpha_type(f), alpha_type(a)),
+        _ => expr.clone(),
+    }
+}
+
+#[test]
+fn repr_helpers_are_checked_and_match_reference_statements_and_module_replay() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let base = &imported.engine;
+            let root = base.logical_root(&KVMap::new());
+            let source = format!(
+                "{DECLARATIONS}\n\
+                 def packetStatement {{A B : Type}} [Repr A] [Repr B] : Repr (Packet A B) := inferInstance\n\
+                 def packetHelperStatement {{A B : Type}} [Repr A] [Repr B] : Packet A B → Nat → Std.Format := instReprPacket.repr\n\
+                 def signalStatement : Repr Wire.Signal := inferInstance\n\
+                 def signalHelperStatement : Wire.Signal → Nat → Std.Format := Wire.instReprSignal.repr\n\
+                 def promotedStatement {{loc state : Nat}} : Repr (Promote loc state) := inferInstance"
+            );
+            let result = checked(base, &source);
+            // These complete statements, including the unused Repr B binder,
+            // were observed with #print on the pinned v4.32.0 Reference.
+            for (generated, expected) in [
+                ("instReprPacket", "packetStatement"),
+                ("instReprPacket.repr", "packetHelperStatement"),
+                ("Wire.instReprSignal", "signalStatement"),
+                ("Wire.instReprSignal.repr", "signalHelperStatement"),
+                ("instReprPromote", "promotedStatement"),
+            ] {
+                let Some(ConstantInfo::Defn(actual)) = result.environment().find(&name(generated))
+                else {
+                    panic!("missing checked generated definition {generated}");
+                };
+                let expected = result.environment().find(&name(expected)).unwrap().constant_val();
+                assert_eq!(actual.base.level_params, expected.level_params, "{generated}");
+                assert_eq!(alpha_type(&actual.base.type_), alpha_type(&expected.type_), "{generated}");
+            }
+            assert_eq!(root, base.logical_root(&KVMap::new()));
+            assert!(!base.environment().contains(&name("instReprPacket")));
+            let again = checked(base, &source);
+            assert_eq!(result.logical_root(&KVMap::new()), again.logical_root(&KVMap::new()));
+
+            for invalid in [
+                "structure Bad where\n  run : Nat → Nat\nderiving Repr",
+                "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
+                "inductive Recursive where\n | node (next : Recursive)\nderiving Repr",
+                "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
+                "structure Partial where\n n : Nat\nderiving Repr, BEq",
+            ] {
+                assert!(
+                    base.check_source_files(
+                        &[invalid.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(admission()),
+                    ).is_err(),
+                    "unsupported or unprintable family must not publish: {invalid}"
+                );
+                assert_eq!(root, base.logical_root(&KVMap::new()));
+            }
+            let library = name("Library");
+            let main = name("Main");
+            let modules = [
+                SourceModuleInput {
+                    name: &library,
+                    source: b"prelude\nimport Init.Data.Repr\nstructure Box (A : Type) where\n value : A\nderiving Repr",
+                },
+                SourceModuleInput {
+                    name: &main,
+                    source: b"prelude\nimport Library\ndef importedPrinter : Repr (Box Nat) := inferInstance",
+                },
+            ];
+            let replayed = imported
+                .check_source_modules(
+                    &modules,
+                    &main,
+                    &KVMap::new(),
+                    SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+                    None,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            for generated in ["instReprBox", "instReprBox.repr", "importedPrinter"] {
+                assert!(replayed.checked.engine.environment().contains(&name(generated)));
+            }
+            checked(base, "structure Retry where\n value : Nat\nderiving Repr");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

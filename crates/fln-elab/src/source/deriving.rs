@@ -4,12 +4,14 @@
 //! hypotheses, then assuming inhabited parameters and retaining only used ones.
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
+mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DerivingError {
     UnsupportedHandler(Name),
     UnsupportedFamily(Name),
     CannotDerive(Name),
+    CannotDeriveRepr(Name),
 }
 
 impl std::fmt::Display for DerivingError {
@@ -34,6 +36,11 @@ impl std::fmt::Display for DerivingError {
                     name.to_display_string()
                 )
             }
+            Self::CannotDeriveRepr(name) => write!(
+                f,
+                "failed to generate Repr instance for {}",
+                name.to_display_string()
+            ),
         }
     }
 }
@@ -133,7 +140,7 @@ pub fn prepare(syntax: &Syntax) -> Result<Option<DerivingRequest>, NatDefinition
 
 #[derive(Debug)]
 pub struct DerivedInstance {
-    /// The default helper precedes its dictionary. Both still require checking.
+    /// The generated helper precedes its dictionary. Both still require checking.
     pub declarations: Vec<Declaration>,
     pub instance: Name,
 }
@@ -476,7 +483,9 @@ pub fn elaborate_handler(
     scope: &SourceScope,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
     let mut context = Context::scoped(environment, kernel, scope);
-    if context.resolve_source_name(handler)?.as_ref() != Some(&named("Inhabited")) {
+    let handler_name = context.resolve_source_name(handler)?;
+    let is_repr = handler_name.as_ref() == Some(&named("Repr"));
+    if !is_repr && handler_name.as_ref() != Some(&named("Inhabited")) {
         return Err(failure(SourceInferenceError::Deriving(
             DerivingError::UnsupportedHandler(handler.clone()),
         )));
@@ -534,6 +543,14 @@ pub fn elaborate_handler(
                 .expect("inserted parameter")
                 .clone(),
         );
+    }
+    if is_repr {
+        return match repr::elaborate(&mut context, family, &parameters, &target, is_record) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveRepr(type_name.clone()),
+            ))),
+            result => result,
+        };
     }
     for add_hypotheses in [false, true] {
         for constructor in &family.ctors {
