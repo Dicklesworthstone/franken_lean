@@ -17,40 +17,45 @@ impl Context {
         if let Some(term) = using {
             return self.simpa_candidate(proof, goal, &rules, term);
         }
-        for local in goal.lctx.decls().iter().rev() {
-            self.tick()?;
-            if self.is_matrix_hypothesis(local) {
-                continue;
-            }
-            let mut trial = self.rewrite_trial();
-            let mut candidate_proof = proof.clone();
-            let term = Typed {
-                value: Expr::fvar(local.id.clone()),
-                type_: local.type_.clone(),
-            };
-            let result = trial.simpa_candidate(&mut candidate_proof, goal.clone(), &rules, term);
-            self.charge_rewrite_trial(&trial);
-            match result {
-                Ok(()) => {
-                    *self = trial;
-                    *proof = candidate_proof;
-                    return Ok(());
-                }
-                Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
-                    TacticError::NoMatchingAssumption,
-                ))) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // `simpa` without evidence can also discharge a goal by simplification
-        // alone, but unlike `simp` it must never leave an unsolved child.
+        // The pin's bare `simpa` simplifies the GOAL and then closes with a
+        // plain `assumption` against the UNSIMPLIFIED hypotheses — measured at
+        // v4.32.0, where its failure is "Tactic `assumption` failed". Evidence
+        // types are never simplified here; that is the `using` form's job, and
+        // trying each hypothesis as implicit `using` evidence accepted goals
+        // the pin rejects (reference_differential.tsv, native_simpa Reference
+        // 16). A goal simp closes outright still succeeds.
         let start = proof.work.len();
-        self.simplify_goal_with_rules(proof, goal, &rules, 0, None)?;
-        if proof.work[start..]
-            .iter()
-            .any(|work| matches!(work, Work::Goal(_)))
-        {
-            return Err(error(TacticError::NoMatchingAssumption));
+        match self.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None) {
+            Ok(()) => {}
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                TacticError::SimplificationNoProgress,
+            ))) => {
+                // The pin's bare `simpa` still closes by assumption when simp
+                // makes no progress — measured at v4.32.0: `simpa only []`
+                // with `h : P` proves `P`. The no-progress path commits
+                // nothing, so the original goal is intact for assumption.
+                let value = self
+                    .matching_assumption(&goal)?
+                    .ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
+                return self.close_proof_goal(goal, value);
+            }
+            Err(other) => return Err(other),
+        }
+        let mut index = start;
+        while index < proof.work.len() {
+            self.tick()?;
+            if let Work::Goal(child) = &proof.work[index] {
+                let child = child.clone();
+                if self.txn.mvars.is_assigned(&child.id) {
+                    index += 1;
+                    continue;
+                }
+                let value = self
+                    .matching_assumption(&child)?
+                    .ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
+                self.close_proof_goal(child, value)?;
+            }
+            index += 1;
         }
         Ok(())
     }

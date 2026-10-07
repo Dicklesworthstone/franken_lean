@@ -221,13 +221,27 @@ impl Context {
                             .ok_or_else(|| failure(SourceInferenceError::Scope))?
                             .id
                             .clone();
-                        for rule in &mut rules {
-                            self.tick()?;
-                            if let SimpRule::Local(id) = rule
-                                && id == &local.id
-                            {
-                                *id = replacement_id.clone();
+                        if saturate {
+                            for rule in &mut rules {
+                                self.tick()?;
+                                if let SimpRule::Local(id) = rule
+                                    && id == &local.id
+                                {
+                                    *id = replacement_id.clone();
+                                }
                             }
+                        } else {
+                            // The pin builds its simp set once, so a located
+                            // hypothesis that was actually rewritten keeps no
+                            // rule for the rest of the tactic — measured at
+                            // v4.32.0: neither its old form nor its rewritten
+                            // form fires afterwards, while an unrewritten
+                            // located hypothesis's rule stays live. Only
+                            // `simp_all`'s saturating revisits remap.
+                            let _ = &replacement_id;
+                            rules.retain(
+                                |rule| !matches!(rule, SimpRule::Local(id) if id == &local.id),
+                            );
                         }
                         proof.work.push(Work::Close(parent, value));
                         goal = next;

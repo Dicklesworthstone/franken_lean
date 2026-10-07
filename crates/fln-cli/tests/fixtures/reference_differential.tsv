@@ -111,8 +111,8 @@ examples/native_scopes.lean	accept	accept	match	agree	the drop-in door accepts t
 examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_section_records.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_simp_all.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
-examples/native_simp_hypotheses.lean	reject	accept	n/a	fln-defect	Reference 11: unsolved goals | tactic goal-management divergence (franken_lean-z8j.1.6.1)
-examples/native_simpa.lean	reject	check-only	n/a	fln-defect	Reference 16: Tactic `assumption` failed | tactic goal-management divergence (franken_lean-z8j.1.6.1)
+examples/native_simp_hypotheses.lean	accept	accept	match	agree	the simp-at unsolved-goals divergence closed with franken_lean-z8j.1.6.1: the simp set is built once, so a located hypothesis that is rewritten keeps no rule for the rest of the tactic (an unrewritten located hypothesis's rule stays live), as measured at v4.32.0; the example's transport theorem now closes its goal explicitly with the rewritten hypothesis
+examples/native_simpa.lean	accept	check-only	n/a	unsupported	the bare-simpa unsolved-goals divergence closed with franken_lean-z8j.1.6.1: bare simpa simplifies the goal and closes with plain assumption against unsimplified hypotheses, as measured at v4.32.0 (including the no-progress case, which still closes by assumption); the remaining check-only split is the @[simp] attribute command outside the drop-in door's bounded grammar, a pre-existing parser gap unrelated to tactics
 examples/native_simplification.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
 examples/native_singleton_inference.lean	accept	accept	match	agree	
 examples/native_staged_callbacks.lean	accept	accept	match	agree	
