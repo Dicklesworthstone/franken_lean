@@ -100,33 +100,81 @@ impl Scopes {
             self.namespaces.insert(namespace.clone());
             self.observe(namespace);
         }
-        let resolved = self.resolve_open(&names).map_err(TransitionError::Scope)?;
-        for namespace in resolved {
-            next.instance_scopes
-                .activate(env, &namespace)
-                .map_err(TransitionError::Registry)?;
-            if !scoped_only && !next.opened.contains(&namespace) {
-                next.opened.push(namespace);
+        // The pin elaborates an open declaration left-to-right in a private
+        // name-resolution state: `open Lean Elab` first makes `Lean.Elab`
+        // available. No prefix of a failed command may escape that state.
+        for name in names {
+            let resolved = self
+                .resolve_open_in(&next, &name)
+                .map_err(TransitionError::Scope)?;
+            for namespace in resolved {
+                next.instance_scopes
+                    .activate(env, &namespace)
+                    .map_err(TransitionError::Registry)?;
+                if !scoped_only {
+                    Self::add_open(&mut next, namespace).map_err(TransitionError::Scope)?;
+                }
             }
         }
         self.current = next;
         Ok(())
     }
 
-    fn resolve_open(&self, names: &[Name]) -> Result<Vec<Name>, String> {
+    /// Namespace lookup is not global-constant lookup. The Reference's
+    /// `resolveNamespace` pools the first enclosing/root namespace with every
+    /// opened namespace's matching child. A plain `open` opens all those
+    /// namespaces; only selective/renaming forms require a unique target.
+    fn resolve_open_in(&self, scope: &SourceScope, name: &Name) -> Result<Vec<Name>, String> {
+        let parts = components(name).map_err(|e| e.to_string())?;
+        if parts.is_empty() || (parts[0] == "_root_" && parts.len() == 1) {
+            return Err("invalid namespace name".into());
+        }
+        let absolute = if parts[0] == "_root_" {
+            Name::from_components(parts[1..].iter().map(String::as_str))
+        } else {
+            name.clone()
+        };
         let mut resolved = Vec::new();
-        for name in names {
-            let name = self
-                .current
-                .resolve(name, |n| self.namespaces.contains(n))
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("unknown namespace `{}`", name.to_display_string()))?;
-            if !resolved.contains(&name) {
-                resolved.push(name);
+        let mut enclosing = scope.namespace.clone();
+        loop {
+            let candidate = if enclosing.is_anonymous() {
+                absolute.clone()
+            } else {
+                enclosing.append_core(name)
+            };
+            if self.namespaces.contains(&candidate) {
+                resolved.push(candidate);
+                break;
             }
+            if enclosing.is_anonymous() {
+                break;
+            }
+            enclosing = enclosing.parent();
+        }
+        for opened in scope.opened.iter().rev() {
+            let candidate = opened.append_core(name);
+            if self.namespaces.contains(&candidate) && !resolved.contains(&candidate) {
+                resolved.push(candidate);
+            }
+        }
+        if resolved.is_empty() {
+            return Err(format!("unknown namespace `{}`", name.to_display_string()));
         }
         Ok(resolved)
     }
+
+    fn add_open(scope: &mut SourceScope, namespace: Name) -> Result<(), String> {
+        if !scope.opened.contains(&namespace) {
+            // One short namespace can expand to many matches. Bound the
+            // resulting state, not only the number of source identifiers.
+            if scope.opened.len() >= 4096 {
+                return Err("scope items limit exceeded".into());
+            }
+            scope.opened.push(namespace);
+        }
+        Ok(())
+    }
+
     /// A file's initial scope. `mode` decides only whether its compiled declarations may
     /// apply recursors the pin's code generator refuses (frontier only, bead
     /// `franken_lean-z8j.1.6.6`).
@@ -273,12 +321,13 @@ impl Scopes {
                 }
             }
             ScopeCommand::Open(names) => {
-                let resolved = self.resolve_open(&names)?;
-                for name in resolved {
-                    if !self.current.opened.contains(&name) {
-                        self.current.opened.push(name);
+                let mut next = self.current.clone();
+                for name in names {
+                    for namespace in self.resolve_open_in(&next, &name)? {
+                        Self::add_open(&mut next, namespace)?;
                     }
                 }
+                self.current = next;
             }
             ScopeCommand::Universe(names) => {
                 let mut seen: BTreeSet<_> = self.current.universes.iter().cloned().collect();
@@ -292,5 +341,120 @@ impl Scopes {
             ScopeCommand::Trivia => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(name: &str) -> Name {
+        Name::from_components(name.split('.'))
+    }
+
+    fn scopes(namespaces: &[&str]) -> Scopes {
+        Scopes {
+            namespaces: namespaces.iter().map(|name| n(name)).collect(),
+            ..Scopes::default()
+        }
+    }
+
+    fn open(scopes: &mut Scopes, names: &[&str]) {
+        scopes
+            .transition(
+                ScopeCommand::Open(names.iter().map(|name| n(name)).collect()),
+                &Environment::new(),
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+    }
+
+    #[test]
+    fn dependent_namespace_names_resolve_left_to_right() {
+        let mut scopes = scopes(&["Library", "Library.Parser", "Library.Parser.Term"]);
+        open(&mut scopes, &["Library", "Parser", "Term"]);
+        assert_eq!(
+            scopes.current.opened,
+            vec![n("Library"), n("Library.Parser"), n("Library.Parser.Term")]
+        );
+        assert_eq!(
+            scopes.current.resolve(&n("value"), |name| name == &n("Library.Parser.Term.value")),
+            Ok(Some(n("Library.Parser.Term.value")))
+        );
+    }
+
+    #[test]
+    fn namespace_open_pools_all_matching_namespaces() {
+        let mut scopes = scopes(&["A", "B", "A.N", "B.N", "N"]);
+        open(&mut scopes, &["A", "B", "N"]);
+        assert_eq!(
+            scopes.current.opened,
+            vec![n("A"), n("B"), n("N"), n("B.N"), n("A.N")]
+        );
+    }
+
+    #[test]
+    fn an_enclosing_namespace_does_not_discard_opened_candidates() {
+        let mut scopes = scopes(&["Outer.N", "N", "A", "A.N"]);
+        scopes.current.namespace = n("Outer");
+        open(&mut scopes, &["A", "N"]);
+        assert_eq!(scopes.current.opened, vec![n("A"), n("Outer.N"), n("A.N")]);
+    }
+
+    #[test]
+    fn failed_late_name_does_not_publish_earlier_opens() {
+        let mut scopes = scopes(&["A", "A.B"]);
+        let before = scopes.current.clone();
+        let result = scopes.transition(
+            ScopeCommand::Open(vec![n("A"), n("B"), n("Missing")]),
+            &Environment::new(),
+        );
+        assert!(result.is_err());
+        assert_eq!(scopes.current, before);
+        assert!(scopes.apply(ScopeCommand::Open(vec![n("A"), n("Missing")])).is_err());
+        assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn scoped_open_does_not_make_names_available_to_later_items() {
+        let mut scopes = scopes(&["A", "A.B"]);
+        let before = scopes.current.clone();
+        assert!(scopes.transition(
+            ScopeCommand::OpenScoped(vec![n("A"), n("B")]),
+            &Environment::new(),
+        ).is_err());
+        assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn root_qualification_and_escaped_components_remain_structural() {
+        let escaped = Name::from_components(["A.B"]);
+        let mut scopes = scopes(&["Root", "Outer.Root"]);
+        scopes.current.namespace = n("Outer");
+        scopes.namespaces.insert(escaped.clone());
+        open(&mut scopes, &["_root_.Root"]);
+        scopes.apply(ScopeCommand::Open(vec![escaped.clone()])).unwrap();
+        assert_eq!(scopes.current.opened, vec![n("Root"), escaped]);
+    }
+
+    #[test]
+    fn ending_a_section_restores_all_open_effects() {
+        let mut scopes = scopes(&["A", "A.B"]);
+        let before = scopes.current.clone();
+        scopes.apply(ScopeCommand::Section(None)).unwrap();
+        open(&mut scopes, &["A", "B"]);
+        scopes.apply(ScopeCommand::End(None)).unwrap();
+        assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn expanded_namespace_state_is_bounded_atomically() {
+        let mut scopes = Scopes::default();
+        scopes.current.opened = (0..4096)
+            .map(|index| Name::str(Name::anonymous(), format!("N{index}")))
+            .collect();
+        scopes.namespaces.insert(n("New"));
+        let before = scopes.current.clone();
+        assert!(scopes.apply(ScopeCommand::Open(vec![n("New")])).is_err());
+        assert_eq!(scopes.current, before);
     }
 }
