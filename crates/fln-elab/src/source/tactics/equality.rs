@@ -181,6 +181,8 @@ impl Context {
     /// witness and its type remain in the parent transport/checking obligation.
     /// In particular this does not authorize deleting an ill-typed cast from
     /// source. K1 and the independent checker still validate the complete term.
+    /// Use this view only to recognize the variable being eliminated; retain
+    /// the opposite endpoint for dependency checks and the generated term.
     fn substitution_endpoint(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
         let rec_name = Name::from_components(["Eq", "rec"]);
         let Some(fln_env::constants::ConstantInfo::Rec(rec)) = self.txn.env.find(&rec_name) else {
@@ -432,10 +434,12 @@ impl Context {
             let Some((level, alpha, left, right)) = equality_target(&type_) else {
                 continue;
             };
-            let left = self.substitution_endpoint(&left)?;
-            let right = self.substitution_endpoint(&right)?;
-            for (candidate, replacement, reverse) in [(&left, &right, true), (&right, &left, false)]
-            {
+            let left_variable = self.substitution_endpoint(&left)?;
+            let right_variable = self.substitution_endpoint(&right)?;
+            for (candidate, replacement, reverse) in [
+                (&left_variable, &right, true),
+                (&right_variable, &left, false),
+            ] {
                 let ExprNode::FVar { id } = candidate.node() else {
                     continue;
                 };

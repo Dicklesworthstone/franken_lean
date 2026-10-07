@@ -1,6 +1,8 @@
 //! Equality tactics must retain ordinary checked proofs and dependent contexts.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckLimits, VmExit,
+};
 fn limits() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
@@ -79,6 +81,72 @@ fn substitution_reintroduces_local_let_values_and_their_dependents() {
     check(
         "def localValue (x y : Nat) (h : x = y) : Nat := let saved := x; by\n  subst h\n  exact saved",
     );
+}
+
+#[test]
+fn substitution_preserves_computed_replacements_in_runtime_let_values() {
+    // The pin reduces the selected endpoint to a variable, but keeps the
+    // opposite endpoint in the reconstructed local. Expanding `x + 20` here
+    // would leak Nat.add's dependent history recursor into a scalar program.
+    for equation in [
+        "(fun value : Nat => value) y = x + 20",
+        "x + 20 = (fun value : Nat => value) y",
+    ] {
+        let source = format!(
+            "def keep (x y : Nat) (h : {equation}) : Nat :=\n  let saved := y\n  by\n    subst h\n    exact saved + 20\n#eval keep 2 22 (Eq.refl 22)"
+        );
+        let result = engine()
+            .execute_source_definitions(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                EngineExecutionLimits::new(limits().kernel),
+            )
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        let VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
+            panic!("checked substitution must return a value")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42")
+        );
+    }
+}
+
+#[test]
+fn substitution_keeps_generated_casts_and_local_aliases_in_scope() {
+    check(
+        "structure Package where\n  carrier : Type\n  value : carrier\ntheorem castAlias (A B : Type) (a : A) (b : B) (h : Package.mk A a = Package.mk B b) : HEq b a :=\n  let saved := a\n  by\n    injection h with types values\n    subst types\n    subst values\n    exact HEq.symm (HEq.refl saved)",
+    );
+}
+
+#[test]
+fn substitution_does_not_normalize_away_syntactic_occurrences() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    // All three are refused by the pin. Although beta reduction can remove
+    // `x`, substitution checks the original replacement and its local aliases.
+    for source in [
+        "theorem forward (x : Nat) (h : x = (fun ignored : Nat => 42) x) : x = 42 := by\n  subst h\n  rfl",
+        "theorem reverse (x : Nat) (h : (fun ignored : Nat => 42) x = x) : x = 42 := by\n  subst h\n  rfl",
+        "theorem aliasCycle (x : Nat) (h : x = 42) : x = 42 :=\n  let saved := x\n  by\n    have same : x = (fun ignored : Nat => 42) saved := h\n    subst same\n    rfl",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        assert!(
+            format!("{error:?}").contains("SubstitutionLocal"),
+            "{error:?}"
+        );
+        assert_eq!(base.logical_root(&options), root);
+    }
+    check("theorem usable (x : Nat) (h : x = 42) : x = 42 := by\n  subst h\n  rfl");
 }
 #[test]
 fn proof_dependent_substitution_does_not_need_symmetry_involution_conversion() {
