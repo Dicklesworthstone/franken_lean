@@ -246,6 +246,9 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(fold) = self.imported_list_recursion(head, args)? {
+            return Ok(Some(fold));
+        }
         let ExprNode::Const {
             name: original,
             levels,

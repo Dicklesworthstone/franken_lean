@@ -51,6 +51,20 @@ struct Comparison<'a> {
     limits: IngressLimits,
 }
 
+pub(super) fn imported_list_recursion_matches(
+    environment: &Environment,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    let mut comparison = Comparison { visited, limits };
+    for declaration in fln_elab::seed::imported_list_recursion_model_declarations() {
+        if !comparison.declaration(environment, declaration)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl Comparison<'_> {
     fn tick(&mut self) -> Result<(), IngressError> {
         charge_catalog_node(self.visited, self.limits)

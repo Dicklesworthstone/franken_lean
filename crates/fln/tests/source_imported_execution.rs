@@ -138,6 +138,17 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         assert_eq!(values(&checked), [vec![11], vec![12], vec![20, 22]]);
         assert!(!checked.modules[1].commands.batch.engine.environment().contains(&name("left")));
 
+        // The imported library's private recursion helpers must remain in
+        // each execution world, including calls reached through a source
+        // dependency's exported definition.
+        let lists = [
+            ("Main", "prelude\nimport Lists\n#eval total (List.map (fun n => n + 1) combined)"),
+            ("Lists", "prelude\nimport Init.Prelude\ndef combined : List Nat := List.append [19] [21]\ndef total (xs : List Nat) : Nat := match xs with | [] => 0 | x :: tail => x + total tail"),
+        ];
+        let list_program = run(&imported, &lists, "Main");
+        assert_eq!(values(&list_program), [vec![], vec![42]]);
+        assert_eq!(imported.engine.logical_root(&options), original);
+
         // Local class registrations are imported in source order, with the
         // actual Prelude's classes, instances and protected-name metadata.
         let registries = [

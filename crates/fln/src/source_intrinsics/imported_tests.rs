@@ -218,11 +218,14 @@ fn admitted_pin_matches_every_primitive_model_dependency() {
                 .into_complete()
                 .unwrap();
             let environment = imported.engine.environment();
-            for operation in ["Nat.pred", "Nat.beq", "Nat.mul", "Nat.sub"] {
-                for declaration in
+            for operation in ["Nat.pred", "Nat.beq", "Nat.mul", "Nat.sub", "List.brecOn"] {
+                let declarations = if operation == "List.brecOn" {
+                    fln_elab::seed::imported_list_recursion_model_declarations()
+                } else {
                     fln_elab::seed::imported_nat_intrinsic_model_declarations(&name(operation))
                         .unwrap()
-                {
+                };
+                for declaration in declarations {
                     let constants = match declaration {
                         Declaration::Defn(value) => vec![ConstantInfo::Defn(value)],
                         Declaration::Inductive(block) => block

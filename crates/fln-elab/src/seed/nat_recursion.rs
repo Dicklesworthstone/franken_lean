@@ -18,9 +18,14 @@ use fln_env::constants::ConstantInfo;
 use std::collections::HashSet;
 
 mod imported;
+mod imported_list;
 
 pub(super) fn imported_nat_intrinsic_model_declarations(name: &Name) -> Option<Vec<Declaration>> {
     imported::declarations(name)
+}
+
+pub(super) fn imported_list_recursion_model_declarations() -> Vec<Declaration> {
+    imported_list::declarations()
 }
 
 fn name(label: &str) -> Name {

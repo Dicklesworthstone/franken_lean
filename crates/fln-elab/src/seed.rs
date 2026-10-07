@@ -413,6 +413,12 @@ pub fn imported_nat_intrinsic_model_declarations(name: &Name) -> Option<Vec<Decl
     nat_recursion::imported_nat_intrinsic_model_declarations(name)
 }
 
+/// Fixed logical candidates for recognizing admitted List course-of-values
+/// recursion. These declarations are not added to the ordinary source seed.
+pub fn imported_list_recursion_model_declarations() -> Vec<Declaration> {
+    nat_recursion::imported_list_recursion_model_declarations()
+}
+
 /// Construct the exact `Nat.sub : Nat -> Nat -> Nat` candidate recognized by
 /// the bounded compiler bridge.
 pub fn nat_sub_seed_declaration() -> Declaration {

@@ -5,6 +5,7 @@
 //! beta reduction introduces strict lets: it never duplicates or drops an
 //! action. Both the original theorem checking and FIR validation remain intact.
 mod arguments;
+mod imported_lists;
 mod scope;
 
 use super::*;
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 pub(super) struct Store {
     // Cached only after the complete immutable decision-family contract checks.
     pub(super) decision_family_checked: bool,
+    list_recursion_checked: bool,
     definitions: BTreeMap<Name, DefinitionVal>,
     instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,
