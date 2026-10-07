@@ -89,13 +89,14 @@ impl Preparation<'_> {
                             }
                         }
                     }
-                    Declaration::Defn(expected) if expected.base.name == name("Not") => {
-                        if !canonical_decision_proof_alias(
-                            self.environment.find(&expected.base.name),
-                            &expected,
-                        ) {
-                            return Err(unsupported("noncanonical decision proof field"));
-                        }
+                    Declaration::Defn(expected)
+                        if expected.base.name == name("Not")
+                            && !canonical_decision_proof_alias(
+                                self.environment.find(&expected.base.name),
+                                &expected,
+                            ) =>
+                    {
+                        return Err(unsupported("noncanonical decision proof field"));
                     }
                     _ => {}
                 }
