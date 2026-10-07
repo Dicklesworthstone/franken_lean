@@ -399,6 +399,13 @@ pub fn has_nat_add_seed_dependencies(environment: &Environment) -> bool {
     nat_recursion::has_nat_add_seed_dependencies(environment)
 }
 
+/// Native logical candidates for the complete `Nat.add` helper closure.
+/// Runtime recognition can compare these candidates with already admitted
+/// declarations without installing a second seed or executing imported code.
+pub fn nat_add_support_seed_declarations() -> [Declaration; 8] {
+    nat_recursion::nat_add_support_seed_declarations()
+}
+
 /// Construct the exact `Nat.sub : Nat -> Nat -> Nat` candidate recognized by
 /// the bounded compiler bridge.
 pub fn nat_sub_seed_declaration() -> Declaration {

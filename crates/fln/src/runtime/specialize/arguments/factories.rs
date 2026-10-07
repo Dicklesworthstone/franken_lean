@@ -51,7 +51,7 @@ impl Preparation<'_> {
                         // definition. Keep its name in dictionary fields so
                         // executable calls still reach the exact intrinsic
                         // contract, including the checked helper dependencies.
-                        if arguments.is_empty() && self.inert_native_function(&head) {
+                        if arguments.is_empty() && self.inert_native_function(&head)? {
                             values.push(expression);
                             continue;
                         }

@@ -380,7 +380,7 @@ impl Preparation<'_> {
                     }
                     Some(ConstantInfo::Induct(_)) => {} // checked type value
                     Some(ConstantInfo::Axiom(_))
-                        if args.is_empty() && self.inert_native_function(&head) => {}
+                        if args.is_empty() && self.inert_native_function(&head)? => {}
                     Some(ConstantInfo::Defn(definition))
                         if args.is_empty()
                             && definition.safety == DefinitionSafety::Safe

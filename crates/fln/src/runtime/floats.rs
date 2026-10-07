@@ -8,27 +8,32 @@ impl Preparation<'_> {
     /// Referencing a verified primitive function executes none of its body.
     /// This permits ordinary checked dictionary constructors to store native
     /// methods while applications of those methods still execute in the VM.
-    pub(super) fn inert_native_function(&self, expression: &Expr) -> bool {
+    pub(super) fn inert_native_function(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<bool, IngressError> {
         let ExprNode::Const {
             name: callee,
             levels,
         } = expression.node()
         else {
-            return false;
+            return Ok(false);
         };
         if !levels.is_empty() {
-            return false;
+            return Ok(false);
         }
-        if source_intrinsic_binding(self.environment, callee).is_some() {
-            return true;
+        if executable_intrinsic_binding(self.environment, callee, &mut self.visited, self.limits)?
+            .is_some()
+        {
+            return Ok(true);
         }
         if callee != &name("Float.ofScientific") && callee != &name("Float32.ofScientific") {
-            return false;
+            return Ok(false);
         }
-        matches!(
+        Ok(matches!(
             (self.environment.find(callee), fln_elab::seed::float_intrinsic_seed_declaration(callee)),
             (Some(ConstantInfo::Axiom(actual)), Some(Declaration::Axiom(expected))) if actual == &expected
-        )
+        ))
     }
 
     fn scientific_nat_literal(&mut self, input: &Expr) -> Result<Option<NatLit>, IngressError> {

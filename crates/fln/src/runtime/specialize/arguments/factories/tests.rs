@@ -201,7 +201,11 @@ fn native_addition_stays_a_function_reference_in_addition_dictionaries() {
         changed.find(&name("Nat.add")),
         environment.find(&name("Nat.add"))
     );
-    assert!(!Preparation::new(&changed, IngressLimits::default()).inert_native_function(&add));
+    assert!(
+        !Preparation::new(&changed, IngressLimits::default())
+            .inert_native_function(&add)
+            .unwrap()
+    );
     assert!(matches!(
         evaluate(&changed, &add).unwrap().node(),
         ExprNode::Lam { .. }

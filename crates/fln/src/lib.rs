@@ -34,6 +34,7 @@ mod olean_imports;
 pub mod pretty;
 pub mod source_check;
 mod source_execution;
+mod source_intrinsics;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
 mod source_records;
@@ -9161,7 +9162,9 @@ fn executable_dependencies(
             scalar_constructors.push(binding);
             continue;
         }
-        if let Some(binding) = source_intrinsic_binding(environment, &name) {
+        if let Some(binding) =
+            executable_intrinsic_binding(environment, &name, &mut visited_nodes, limits)?
+        {
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -9253,6 +9256,22 @@ pub fn source_scalar_constructor_binding(
         universe_arity: 0,
         value,
     })
+}
+
+fn executable_intrinsic_binding(
+    environment: &Environment,
+    name: &Name,
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+) -> Result<Option<IntrinsicBinding>, IngressError> {
+    if name == &Name::from_components(["Nat", "add"]) {
+        return Ok(
+            source_intrinsics::nat_add_matches(environment, visited_nodes, limits)?
+                .then(|| generated_source_intrinsic_binding(name))
+                .flatten(),
+        );
+    }
+    Ok(source_intrinsic_binding(environment, name))
 }
 
 fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<IntrinsicBinding> {
