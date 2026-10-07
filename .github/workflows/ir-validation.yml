@@ -33,7 +33,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rustfmt --edition 2024 crates/fln-olean/src/ir_validate.rs crates/fln-olean/tests/ir_validate.rs crates/fln-olean/tests/ir_validated_graph.rs
+          rustfmt --edition 2024 crates/fln-olean/src/ir_validate.rs crates/fln-olean/src/ir_files.rs crates/fln-olean/src/bin/fln-ir-check.rs crates/fln-olean/tests/ir_validate.rs crates/fln-olean/tests/ir_validated_graph.rs crates/fln-olean/tests/ir_files.rs
           git diff -- crates/fln-olean > "$RUNNER_TEMP/ir-format.patch"
           cat "$RUNNER_TEMP/ir-format.patch"
           git diff --exit-code -- crates/fln-olean
