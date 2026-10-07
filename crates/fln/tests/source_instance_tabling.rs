@@ -163,8 +163,13 @@ fn fixed_output_parameter_prerequisites_replay_their_fresh_output_assignments() 
     );
 }
 
+/// The pin selects `incompatible` (value 99): its prerequisite `Transfer Nat Bool` is
+/// solved by `boolean`, so the known `Bool` output takes part in that subgoal's search,
+/// and the lower-priority `fallback` is never reached. Measured at v4.32.0, 2026-10-07:
+/// `result.value = 99 := by rfl` checks there and `= 7` is refused. FrankenLean agrees
+/// since 10136909; this test expected 7 before that, against the pin.
 #[test]
-fn output_answer_replay_does_not_turn_output_parameters_into_input_filters() {
+fn a_known_output_in_a_prerequisite_selects_its_answer_as_at_the_pin() {
     let base = checked(
         &engine(),
         r#"class Transfer (A : Type) (B : outParam Type) where
@@ -178,6 +183,6 @@ instance incompatible [first : Transfer Nat Nat] [again : Transfer Nat Nat] [bad
     );
     checked(
         &base,
-        "def result : Root := inferInstance\ntheorem priorityPreserved : result.value = 7 := by rfl",
+        "def result : Root := inferInstance\ntheorem selected : result.value = 99 := by rfl",
     );
 }
