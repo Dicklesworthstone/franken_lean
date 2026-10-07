@@ -116,3 +116,20 @@ fn course_of_values_addition_is_not_replaced_by_a_direct_fold() {
         refused_conversion(&model, source);
     }
 }
+
+/// fln-b65e's programs, exactly as filed: term-mode `rfl` computes closed
+/// arithmetic, through class terms and through a definition's value, and still
+/// refuses a false computation. Each was checked at the pinned lean v4.32.0 on
+/// 2026-10-06: the three accept, and `2 + 2 = 5 := rfl` is refused while
+/// elaborating.
+#[test]
+fn term_mode_rfl_computes_closed_arithmetic_and_definition_values_as_at_the_pin() {
+    let base = engine();
+    checked(&base, "theorem direct : Nat.add 2 2 = 4 := rfl");
+    checked(&base, "theorem classTerm : 2 + 2 = 4 := rfl");
+    checked(
+        &base,
+        "def f (n : Nat) : Nat := n + 1\ntheorem unfolded : f 3 = 4 := rfl",
+    );
+    refused_conversion(&base, "theorem wrong : 2 + 2 = 5 := rfl");
+}
