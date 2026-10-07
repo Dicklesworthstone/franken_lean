@@ -327,8 +327,8 @@ fn a_proposition_eliminates_only_into_prop_even_at_a_variable_index() {
     // check, before elimination is reached. With a variable index they reach it:
     // a proof eliminates into a proof, and a data payload cannot be extracted
     // from a proof. Pin: the first is accepted; the second is "Type mismatch when
-    // assigning motive". FrankenLean refuses the second at the kernel instead (the
-    // motive lands in `Sort 1` where `HasData.rec` allows only `Sort 0`).
+    // assigning motive", and so is FrankenLean's refusal: `HasData.rec` has no universe
+    // of its own, so its motive must land in `Prop`, and the goal `A` does not.
     check(
         "inductive Holds : Nat -> Prop where\n  | base : Holds 0\n  | step (n : Nat) (previous : Holds n) : Holds (n + 1)\n\
          theorem duplicate (n : Nat) (h : Holds n) : Holds n := by\n  induction h with\n  | base => exact Holds.base\n  | step n previous ih => exact Holds.step n ih",
@@ -336,7 +336,7 @@ fn a_proposition_eliminates_only_into_prop_even_at_a_variable_index() {
     reject(
         "inductive HasData (A : Type) : Nat -> Prop where\n  | base (a : A) : HasData A 0\n  | step (n : Nat) (previous : HasData A n) : HasData A (n + 1)\n\
          def extract (A : Type) (n : Nat) (h : HasData A n) : A := by\n  induction h with\n  | base a => exact a\n  | step n previous ih => exact ih",
-        Some("TypeMismatch"),
+        Some("InductionMotiveMismatch"),
     );
 }
 

@@ -489,6 +489,19 @@ impl Context {
         Ok(proof)
     }
 
+    /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
+    /// An unknown type or an unresolved level is not judged, so this never refuses
+    /// a goal that might still be a proposition.
+    fn goal_outside_prop(&mut self, target: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let target = self.instantiate(target)?;
+        let Some(sort) = self.known_type(&target)? else {
+            return Ok(false);
+        };
+        let sort = self.whnf(&sort)?;
+        Ok(matches!(sort.node(), ExprNode::Sort { level }
+            if matches!(level.view(), fln_core::level::LevelView::Succ(_))))
+    }
+
     pub(super) fn eliminate_proof_goal_with_indices<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -616,6 +629,14 @@ impl Context {
                 if !self.elimination_reads(parameter)?.is_disjoint(&seen) {
                     return Err(error(TacticError::InductionMotiveMismatch));
                 }
+            }
+            // A recursor with no universe of its own eliminates only into `Prop`: the
+            // pin's `induction` refuses a goal that is certainly not a proposition while
+            // assigning the motive ("Type mismatch when assigning motive").
+            if rec.base.level_params.len() == family.base.level_params.len()
+                && self.goal_outside_prop(&goal.target)?
+            {
+                return Err(error(TacticError::InductionMotiveMismatch));
             }
         }
         let recursive_source = matches!(input, EliminationSyntax::RecursiveMatch(_));
