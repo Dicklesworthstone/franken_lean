@@ -8,6 +8,7 @@
 //! Type-valued fields are runtime-irrelevant, as in the Reference's compiler:
 //! each keeps an inert scalar slot, like a proof. Dependent fields use a boxed
 //! leaf through uniform containers and explicitly adapted callback interfaces.
+mod adapters;
 mod erased;
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
@@ -723,14 +724,14 @@ impl Preparation<'_> {
             };
             value = Expr::app(value, field);
         }
-        // A partial constructor is itself a callback. Once its carrier is
-        // erased, later applications no longer have the concrete telescope
-        // needed to adapt an incoming function or nested object. Share the
-        // unsupplied fields only when that telescope already proves storage
-        // compatibility; an absent adapter is never a closure-signature cast.
+        // A partial constructor is itself a callback. Keep its concrete
+        // remaining interface: an incoming callback or container must cross
+        // the same real adapter as a field supplied in the original call.
         if let Some(mut type_) = actual_type {
             let remaining = type_.clone();
-            for expected in binding.fields.iter().skip(args.len() - parameters) {
+            let first_remaining = args.len() - parameters;
+            let mut needs_adapter = false;
+            for expected in binding.fields.iter().skip(first_remaining) {
                 self.tick()?;
                 let normal = self.type_head(&type_)?;
                 let ExprNode::ForallE {
@@ -742,16 +743,32 @@ impl Preparation<'_> {
                 let actual = self.erase_runtime_type(binder_type)?;
                 let actual = self.erase_hidden_types(&actual, &[])?;
                 if !self.shared_erased_storage(&actual, expected)? {
-                    return Err(unsupported(
-                        "partial hidden constructor requires an adapter",
-                    ));
+                    needs_adapter = true;
                 }
                 type_ = self.substitution(body, &indexed::pending_parameter())?;
             }
-            if args.len() - parameters < binding.fields.len() {
+            if first_remaining < binding.fields.len() {
                 let remaining = self.erase_runtime_type(&remaining)?;
                 let remaining = self.erase_hidden_types(&remaining, &[])?;
                 let (head, arguments) = self.spine(&value)?;
+                if needs_adapter {
+                    let mut runtime_remaining = family;
+                    for domain in binding.fields[first_remaining..].iter().rev() {
+                        self.tick()?;
+                        runtime_remaining = Expr::forall_e(
+                            Name::anonymous(),
+                            domain.clone(),
+                            runtime_remaining,
+                            BinderInfo::Default,
+                        );
+                    }
+                    let value = self
+                        .partial_call_with_remaining(&head, &arguments, Some(&runtime_remaining))?
+                        .ok_or_else(|| unsupported("partial hidden constructor interface"))?;
+                    return self
+                        .adapt_erased_field(&value, &runtime_remaining, &remaining)
+                        .map(Some);
+                }
                 return self.partial_call_with_remaining(&head, &arguments, Some(&remaining));
             }
         }

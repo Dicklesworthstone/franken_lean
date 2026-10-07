@@ -229,27 +229,135 @@ fn an_unused_adapter_initializer_runs_once_and_exhaustion_is_not_success() {
 }
 
 #[test]
-fn nonuniform_nested_callbacks_are_refused_without_retagging() {
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
-    // Sharing this list would leave Nat -> Nat closures in slots requiring
-    // boxed -> Nat. Container-wide callback mapping is not this feature.
-    let source = b"structure Handlers where\n  carrier : Type\n  values : List (carrier -> Nat)\ndef p : Handlers := { carrier := Nat, values := [fun n => n + 1] }";
-    let error = base
-        .execute_source_definitions(
-            &[source],
-            &options,
-            EngineExecutionLimits::new(admission().kernel),
-        )
-        .expect_err("nested callback adapters are required");
-    assert!(format!("{error:?}").contains("Ingress("), "{error:?}");
-    assert_eq!(base.logical_root(&options), root);
-    execute(&base, "#eval 42");
+fn lists_of_hidden_callbacks_are_rebuilt_with_real_adapters() {
+    run(
+        r#"structure Handlers where
+  carrier : Type
+  value : carrier
+  values : List (carrier -> Nat)
+def total (p : Handlers) : Nat :=
+  p.values.foldl (fun (n : Nat) (f : p.carrier -> Nat) => n + f p.value) 0
+def make (offset : Nat) : Handlers :=
+  { carrier := Nat, value := 20, values := [fun n => n + offset, fun n => n] }
+#eval total (make 2)"#,
+        "42",
+    );
 }
 
 #[test]
-fn partial_constructors_preserve_uniform_slots_and_refuse_unsupplied_adapters() {
+fn nested_callback_containers_retain_owned_values_and_captures() {
+    run(
+        r#"structure NestedHandlers where
+  carrier : Type
+  value : carrier
+  values : List (List (carrier -> String))
+def total (p : NestedHandlers) : Nat :=
+  p.values.foldl (fun (n : Nat) (fs : List (p.carrier -> String)) =>
+    fs.foldl (fun (k : Nat) (f : p.carrier -> String) => k + String.length (f p.value)) n) 0
+def make (suffix : String) : NestedHandlers :=
+  { carrier := String, value := "x", values := [[fun s => s ++ suffix], [fun s => suffix ++ s]] }
+#eval total (make "abc")"#,
+        "8",
+    );
+}
+
+#[test]
+fn user_records_and_options_use_their_admitted_constructor_shapes() {
+    run(
+        r#"structure Slot (A : Type) where
+  value : Option A
+structure Packet where
+  carrier : Type
+  value : carrier
+  handler : Slot (carrier -> Nat)
+def read (p : Packet) : Nat := match p.handler.value with
+  | .none => 0
+  | .some f => f p.value
+def p : Packet :=
+  { carrier := Nat, value := 17, handler := Slot.mk (Option.some (fun n => n + 25)) }
+#eval read p"#,
+        "42",
+    );
+}
+
+#[test]
+fn recursive_user_containers_convert_every_child_and_callback() {
+    run(
+        r#"inductive Branch (A : Type) where
+  | leaf (value : A)
+  | node (left : Branch A) (right : Branch A)
+def total {A : Type} (measure : A -> Nat) (tree : Branch A) : Nat := match tree with
+  | .leaf value => measure value
+  | .node left right => total measure left + total measure right
+structure ForestHandlers where
+  carrier : Type
+  value : carrier
+  handlers : Branch (carrier -> Nat)
+def read (p : ForestHandlers) : Nat := total (fun (f : p.carrier -> Nat) => f p.value) p.handlers
+def p : ForestHandlers :=
+  { carrier := Nat, value := 20,
+    handlers := Branch.node (Branch.leaf (fun n => n + 2)) (Branch.leaf (fun n => n)) }
+#eval read p"#,
+        "42",
+    );
+}
+
+#[test]
+fn recursive_container_callbacks_select_children_only_when_called() {
+    run(
+        r#"inductive Route (A : Type) where
+  | leaf (value : A)
+  | node (next : Nat -> Route A)
+def read {A : Type} (measure : A -> Nat) (tree : Route A) : Nat := match tree with
+  | .leaf value => measure value
+  | .node next => read measure (next 20)
+structure RouteHandlers where
+  carrier : Type
+  value : carrier
+  handlers : Route (carrier -> Nat)
+def total (p : RouteHandlers) : Nat := read (fun (f : p.carrier -> Nat) => f p.value) p.handlers
+def p : RouteHandlers :=
+  { carrier := Nat, value := 20, handlers := Route.node (fun offset => Route.leaf (fun n => n + offset + 2)) }
+#eval total p"#,
+        "42",
+    );
+}
+
+#[test]
+fn higher_order_hidden_callbacks_convert_arguments_and_results() {
+    run(
+        r#"structure Runner where
+  carrier : Type
+  value : carrier
+  change : carrier -> carrier
+  run : (carrier -> carrier) -> carrier
+  measure : carrier -> Nat
+def read (p : Runner) : Nat := p.measure (p.run p.change)
+def p : Runner :=
+  { carrier := Nat, value := 40, change := fun n => n + 2,
+    run := fun f => f 40, measure := fun n => n }
+#eval read p"#,
+        "42",
+    );
+    run(
+        r#"structure Runner where
+  carrier : Type
+  value : carrier
+  make : Nat -> List (carrier -> Nat)
+  consume : List (carrier -> Nat) -> Nat
+def read (p : Runner) : Nat := p.consume (p.make 2)
+def p : Runner :=
+  { carrier := Nat, value := 20,
+    make := fun offset => [fun n => n + offset, fun n => n],
+    consume := fun (fs : List (Nat -> Nat)) =>
+      fs.foldl (fun (n : Nat) (f : Nat -> Nat) => n + f 20) 0 }
+#eval read p"#,
+        "42",
+    );
+}
+
+#[test]
+fn partial_constructors_adapt_later_callback_and_container_arguments() {
     run(
         "structure Package where\n  carrier : Type\n  value : carrier\n\
          def make : Nat -> Package := Package.mk Nat\n\
@@ -263,23 +371,104 @@ fn partial_constructors_preserve_uniform_slots_and_refuse_unsupplied_adapters() 
          #eval read (make [\"a\", \"b\"])",
         "2",
     );
+    run(
+        r#"structure Handlers where
+  carrier : Type
+  value : carrier
+  values : List (carrier -> Nat)
+def make : List (Nat -> Nat) -> Handlers := Handlers.mk Nat 40
+def read (p : Handlers) : Nat :=
+  p.values.foldl (fun (n : Nat) (f : p.carrier -> Nat) => n + f p.value) 0
+#eval read (make [fun n => n + 2])"#,
+        "42",
+    );
+    run(
+        &format!(
+            "{SHOWN}def make : (Nat -> Nat) -> Shown := Shown.mk Nat 40\n\
+             def read (p : Shown) : Nat := p.measure p.value\n#eval read (make (fun n => n + 2))"
+        ),
+        "42",
+    );
+}
+
+#[test]
+fn container_adapters_preserve_strict_initializers_and_resource_recovery() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let source = b"structure Handlers where\n  carrier : Type\n  values : List (carrier -> carrier)\ndef make : List (Nat -> Nat) -> Handlers := Handlers.mk Nat\n#eval (make []).values.length";
+    let declarations = r#"def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1
+structure Handlers where
+  carrier : Type
+  values : List (carrier -> Nat)
+def make (cost : Nat) : Handlers :=
+  { carrier := Nat, values := let paid : Nat := spend cost; [fun n => n + 2] }
+"#;
+    let usage = |source: String| {
+        let batch = execute(&base, &source);
+        let VmExit::Returned(value) = &batch.executions.last().unwrap().exit else {
+            panic!("strict initializer did not return")
+        };
+        value.usage.steps
+    };
+    let mapped = |cost| format!("{declarations}#eval (make {cost}).values.length");
+    let direct = |cost| format!("{declarations}#eval let paid : Nat := spend {cost}; 1");
+    assert_eq!(
+        usage(mapped(60)) - usage(mapped(0)),
+        usage(direct(60)) - usage(direct(0))
+    );
+    let mut limits = EngineExecutionLimits::new(admission().kernel);
+    limits.vm.max_steps = 2000;
+    assert!(matches!(
+        base.execute_source_definitions(&[mapped(100000).as_bytes()], &options, limits)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    let retry = || {
+        base.execute_source_definitions(&[mapped(0).as_bytes()], &options, limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let one = retry();
+    let two = retry();
+    assert_eq!(
+        one.executions.last().unwrap().flbc_artifact,
+        two.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn unsupported_container_profiles_do_not_publish_unconverted_closures() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = r#"mutual
+inductive Tree (A : Type) where
+  | leaf (value : A)
+  | node (children : Forest A)
+inductive Forest (A : Type) where
+  | nil
+  | cons (tree : Tree A) (rest : Forest A)
+end
+structure Handlers where
+  carrier : Type
+  values : Tree (carrier -> Nat)
+def p : Handlers := { carrier := Nat, values := Tree.leaf (fun n => n + 2) }
+"#;
     let error = base
         .execute_source_definitions(
-            &[source],
+            &[source.as_bytes()],
             &options,
             EngineExecutionLimits::new(admission().kernel),
         )
-        .expect_err("an unsupplied nested callback still requires an adapter");
+        .expect_err("mutual container adapters require their own recursive group");
     assert!(
-        format!("{error:?}").contains("partial hidden constructor requires an adapter"),
+        format!("{error:?}").contains("hidden container recursive profile"),
         "{error:?}"
     );
     assert_eq!(base.logical_root(&options), root);
-    execute(&base, "#eval 42");
+    run("#eval 42", "42");
 }
 
 #[test]

@@ -272,6 +272,44 @@ impl Preparation<'_> {
                 if !self.equal_runtime_classes(a, e)? {
                     return Ok(false);
                 }
+                if matches!(a, ValueType::Closure(_)) {
+                    // A callable's FIR interface records Constructor for
+                    // every container. Equal interface ids/classes therefore
+                    // do not establish compatible callback slots inside a
+                    // parameter or result container. Check those original
+                    // types through this same structural worklist too.
+                    let mut actual = self.normalize_type(&actual)?;
+                    let mut expected = self.normalize_type(&expected)?;
+                    while let (
+                        ExprNode::ForallE {
+                            binder_type: ad,
+                            body: ab,
+                            ..
+                        },
+                        ExprNode::ForallE {
+                            binder_type: ed,
+                            body: eb,
+                            ..
+                        },
+                    ) = (actual.node(), expected.node())
+                    {
+                        self.tick()?;
+                        if ab.has_loose_bvars() || eb.has_loose_bvars() {
+                            return Ok(false);
+                        }
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push((ad.clone(), ed.clone()));
+                        actual = ab.clone();
+                        expected = eb.clone();
+                    }
+                    if matches!(actual.node(), ExprNode::ForallE { .. })
+                        || matches!(expected.node(), ExprNode::ForallE { .. })
+                    {
+                        return Ok(false);
+                    }
+                    reserve(&mut work, self.limits.max_nodes)?;
+                    work.push((actual, expected));
+                }
                 continue;
             }
             let (Some(a), Some(e)) = (self.record_shape(&actual)?, self.record_shape(&expected)?)
@@ -309,75 +347,10 @@ impl Preparation<'_> {
         let actual = self.erase_runtime_type(actual)?;
         let actual = self.erase_hidden_types(&actual, &[])?;
         let expected = self.normalize_type(expected)?;
-        if self.shared_erased_storage(&actual, &expected)? {
-            return Ok(value.clone());
-        }
-        let (Some(ValueType::Closure(_)), Some(ValueType::Closure(_))) =
-            (self.value_type(&actual)?, self.value_type(&expected)?)
-        else {
-            return Err(unsupported("nonuniform hidden field representation"));
-        };
-        let mut a = actual.clone();
-        let mut e = expected.clone();
-        let mut domains = Vec::new();
-        while let (
-            ExprNode::ForallE {
-                binder_type: ad,
-                body: ab,
-                ..
-            },
-            ExprNode::ForallE {
-                binder_type: ed,
-                body: eb,
-                ..
-            },
-        ) = (a.node(), e.node())
-        {
-            self.tick()?;
-            if ab.has_loose_bvars()
-                || eb.has_loose_bvars()
-                || !self.shared_erased_storage(ad, ed)?
-            {
-                return Err(unsupported("nonuniform hidden callback parameter"));
-            }
-            reserve(&mut domains, self.limits.max_context_depth)?;
-            domains.push(ed.clone());
-            a = ab.clone();
-            e = eb.clone();
-        }
-        if domains.is_empty() || !self.shared_erased_storage(&a, &e)? {
-            return Err(unsupported("nonuniform hidden callback result"));
-        }
-        let arity =
-            u32::try_from(domains.len()).map_err(|_| unsupported("hidden callback arity"))?;
-        let mut body =
-            Expr::bvar(arity).map_err(|_| unsupported("hidden callback capture scope"))?;
-        for index in (0..arity).rev() {
-            self.tick()?;
-            body = Expr::app(
-                body,
-                Expr::bvar(index).map_err(|_| unsupported("hidden callback argument scope"))?,
-            );
-        }
-        for domain in domains.into_iter().rev() {
-            self.tick()?;
-            body = Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
-        }
-        // The source value is evaluated once, before the adapter is returned.
-        // Both checked signatures remain explicit, so ordinary closure ingress
-        // inserts Box/Unbox at the call/result boundaries and validates captures.
-        Ok(Expr::let_e(
-            Name::anonymous(),
-            actual,
-            value.clone(),
-            Expr::let_e(
-                Name::anonymous(),
-                expected,
-                body,
-                Expr::bvar(0).map_err(|_| unsupported("hidden callback result scope"))?,
-                false,
-            ),
-            false,
-        ))
+        let adapter = self.erased_adapter(&actual, &expected)?;
+        Ok(match adapter {
+            None => value.clone(),
+            Some(body) => Expr::let_e(Name::anonymous(), actual, value.clone(), body, false),
+        })
     }
 }
