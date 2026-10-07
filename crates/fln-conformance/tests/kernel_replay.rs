@@ -20800,6 +20800,92 @@ fn selected_real_module_resource_probe() {
     );
 }
 
+/// The two `fln-4hol` admission units stay within their measured step ceilings
+/// at `Budget::DEFAULT` (bead `franken_lean-z8j.1.13`, acceptance criterion 1).
+///
+/// After `e7cdcbbc` (theorem unfolding in the delta gate) both units exhausted
+/// even a 200,000,000-step measurement budget, while the pinned leanchecker
+/// accepts both. The `fln-hvrk` lazy-delta chain plus `68429a1a` returned them
+/// to the parent cell's order of magnitude, measured 2026-10-07 at `247bfe8b`
+/// (release, `Budget::DEFAULT`): `Vector.swap_swap` 17,428 steps and
+/// `ByteArray.utf8DecodeChar?_utf8EncodeChar_append` 525,319.
+///
+/// The ceilings are deliberately bands, not exact pins: roughly ten times the
+/// measured consumption, far below both `Budget::DEFAULT` and the measured
+/// blowup (which sits more than 380x over the looser ceiling), so ordinary
+/// kernel drift passes while a recurrence of the unfolding pathology fails by
+/// margin rather than by budget exhaustion. The whole-stdlib differential
+/// already answers accepted-or-not on demand; this lane adds the consumption
+/// bound for the two named units in one command any kernel change can re-run.
+#[ignore = "cost: two ~26K-declaration closure decodes (about 25 s release, minutes in debug); on-demand regression lane for the fln-4hol units (bead franken_lean-z8j.1.13)"]
+#[test]
+fn fln_4hol_units_accept_within_their_step_ceilings() {
+    let reference_lib =
+        reference_lib().expect("pinned toolchain required for the fln-4hol unit regression");
+    let roots = chosen_set_roots(&reference_lib);
+    for (chosen, selector, ceiling) in [
+        ("Init.Data.Vector.Lemmas", "Vector.swap_swap", 175_000u64),
+        (
+            "Init.Data.String.Decode",
+            "ByteArray.utf8DecodeChar?_utf8EncodeChar_append",
+            4_000_000u64,
+        ),
+    ] {
+        let inventory = closure_inventory(&roots, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+        assert!(
+            inventory.missing_imports.is_empty(),
+            "{chosen}: closure has unresolved imports: {:?}",
+            inventory.missing_imports
+        );
+        let PreparedChosenModule {
+            prep,
+            collision_count,
+        } = prepare_chosen_module(&inventory, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+        assert_eq!(
+            collision_count, 0,
+            "{chosen}: a colliding closure is not the measured fixture"
+        );
+        let matches = prep
+            .items
+            .iter()
+            .filter(|item| {
+                item.member_names
+                    .iter()
+                    .any(|name| name.to_display_string() == selector)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches.len() == 1,
+            "{chosen}: selector `{selector}` matched {} admission units; expected exactly one",
+            matches.len()
+        );
+        let item = matches[0];
+        let verdict =
+            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
+        let outcome = unit_outcome(item, &verdict);
+        assert!(
+            outcome.outcome == "accepted",
+            "{chosen}: `{selector}` produced `{}` ({}); the fln-4hol unit must accept at \
+             Budget::DEFAULT",
+            outcome.outcome,
+            outcome.message
+        );
+        assert!(
+            outcome.steps_used <= ceiling,
+            "{chosen}: `{selector}` consumed {} steps against a {ceiling}-step ceiling; the \
+             fln-4hol unfolding pathology (or a cost regression of its class) is back",
+            outcome.steps_used
+        );
+        assert!(
+            outcome.steps_used > 0,
+            "{chosen}: `{selector}` reported zero steps; an accepted unit cannot be free, so \
+             this measurement is broken"
+        );
+    }
+}
+
 fn validate_leanchecker_authority_contract(script: &str, findings: &str) -> Result<(), String> {
     for required in [
         "ReferenceKernelOracle",
