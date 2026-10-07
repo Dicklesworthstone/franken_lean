@@ -1464,11 +1464,23 @@ impl Drop for Expr {
 
         // A last-reference cascade through `Arc<ExprNode>` would normally recurse
         // through one Rust destructor frame per input node.  Drain unique nodes on
-        // this explicit heap stack instead.  A shared node is only decremented;
+        // an explicit heap stack instead.  A shared node is only decremented;
         // whichever `Expr` later owns its final reference will perform the drain.
-        let mut pending = vec![root];
+        //
+        // The worklist starts EMPTY and the root is consumed through the same
+        // loop head, so the two overwhelmingly common cases allocate nothing at
+        // all: dropping a shared reference (the decrement in `Arc::into_inner`
+        // is the whole story) and dropping a last-reference LEAF (no children
+        // to push, `Vec::new` never allocates until first push). The previous
+        // `vec![root]` paid one heap allocation and free on EVERY `Expr` drop,
+        // measured at 12.4% of kernel replay wall in drop alone plus its share
+        // of the allocator bucket (bead `franken_lean-z8j.1.13`, the slice-C
+        // profile); clones outnumber cascades by orders of magnitude, so the
+        // fast path is the common path.
+        let mut first = Some(root);
+        let mut pending: Vec<Arc<ExprNode>> = Vec::new();
         let mut drained = 0usize;
-        while let Some(node) = pending.pop() {
+        while let Some(node) = first.take().or_else(|| pending.pop()) {
             let Some(node) = Arc::into_inner(node) else {
                 continue;
             };
