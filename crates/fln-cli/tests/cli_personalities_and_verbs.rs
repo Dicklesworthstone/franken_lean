@@ -1046,20 +1046,47 @@ rev = "v4.32.0"
     let manifest_content = std::fs::read_to_string(bare_dir.join("lake-manifest.json")).unwrap();
     assert!(manifest_content.contains("\"name\": \"bare_project\""));
 
-    // 3. lake env (bare)
+    // 3. lake env. The sysroot is where the toolchain is installed. A test
+    // binary is in no toolchain layout, so with LEAN_SYSROOT unset there is
+    // nothing to report: it used to print `LEAN_SYSROOT=/usr/local` and exit 0.
+    let env_unknown = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("env")
+        .env_remove("LEAN_SYSROOT")
+        .output()
+        .expect("run lake env");
+    assert_eq!(env_unknown.status.code(), Some(5), "{env_unknown:?}");
+    assert!(env_unknown.stdout.is_empty());
+    let env_unknown_stderr = String::from_utf8(env_unknown.stderr).expect("utf8 stderr");
+    assert!(env_unknown_stderr.starts_with("lake env: not implemented: "));
+    assert!(!env_unknown_stderr.contains("/usr/local"));
+    // A command is not run in an invented environment either.
+    let env_unknown_run = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["env", "echo", "must_not_run"])
+        .env_remove("LEAN_SYSROOT")
+        .output()
+        .expect("run lake env echo without a sysroot");
+    assert_eq!(env_unknown_run.status.code(), Some(5));
+    assert!(env_unknown_run.stdout.is_empty());
+
+    let sysroot = temp_parent.join("sysroot");
     let env_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .arg("env")
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env");
     assert!(env_output.status.success());
     let env_stdout = String::from_utf8(env_output.stdout).expect("utf8 stdout");
-    assert!(env_stdout.contains("LEAN_SYSROOT="));
-    assert!(env_stdout.contains("LEAN_PATH="));
+    assert!(env_stdout.contains(&format!("LEAN_SYSROOT={}\n", sysroot.display())));
+    assert!(env_stdout.contains(&format!(
+        "LEAN_PATH={}\n",
+        sysroot.join("lib").join("lean").display()
+    )));
     assert!(env_stdout.contains("ELAN_TOOLCHAIN="));
 
     // 4. lake env echo hello
     let env_echo = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "echo", "testing_lake_env_propagation"])
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env echo");
     assert!(env_echo.status.success());
@@ -1069,6 +1096,7 @@ rev = "v4.32.0"
     // 5. lake env with nonexistent command exits 255
     let env_missing = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "nonexistent_command_12345_xyz"])
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env missing");
     assert_eq!(env_missing.status.code(), Some(255));
@@ -1693,4 +1721,158 @@ fn olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude() {
         robot.contains("\"outcome\":\"complete\",\"parts\":3,"),
         "{robot}"
     );
+}
+
+/// Every file under `root` by relative path, without `.git` and
+/// `lean-toolchain`.
+fn scaffold_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name != ".git" {
+                    pending.push(path);
+                }
+            } else if name != "lean-toolchain" {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                out.insert(relative, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// `lake new` writes the pin's `std` tree, refuses the templates it does not
+/// write, and `lake clean` removes the directory the package builds into.
+///
+/// Where the pinned toolchain is installed, the pinned `lake new demo` runs
+/// beside ours and every file is compared. Two things are left out of the
+/// comparison and are differences, not agreements: `lean-toolchain`, because
+/// the pin writes the toolchain name its launcher gave it, and `.git`, because
+/// this implementation spawns git only to fetch dependencies. Typed skip
+/// without the pin; `FLN_REQUIRE_REFERENCE` turns the skip into a failure.
+#[test]
+fn lake_new_writes_the_tree_the_pinned_lake_writes() {
+    let guard = TempDir::new("lake-new-pin");
+    let root = guard.0.clone();
+    let ours_parent = root.join("ours");
+    std::fs::create_dir_all(&ours_parent).unwrap();
+    let lake = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&ours_parent)
+            .args(args)
+            .output()
+            .expect("run lake")
+    };
+
+    let created = lake(&["new", "demo"]);
+    assert!(created.status.success(), "{created:?}");
+    let ours = scaffold_tree(&ours_parent.join("demo"));
+    assert_eq!(
+        ours.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            ".github/workflows/lean_action_ci.yml",
+            ".gitignore",
+            "Demo.lean",
+            "Demo/Basic.lean",
+            "Main.lean",
+            "README.md",
+            "lakefile.toml",
+        ]
+    );
+    // The line the old scaffold got wrong: the pin indents the body of `main`.
+    assert_eq!(
+        String::from_utf8_lossy(&ours["Main.lean"]),
+        "import Demo\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {hello}!\"\n"
+    );
+
+    // A template the pin has and this does not write: said so, and nothing made.
+    // It used to exit 0 and write the default project whatever was asked for.
+    let math = lake(&["new", "mathy", "math"]);
+    assert_eq!(math.status.code(), Some(5), "{math:?}");
+    assert!(
+        String::from_utf8_lossy(&math.stderr)
+            .starts_with("lake new: not implemented: the `math` template")
+    );
+    assert!(!ours_parent.join("mathy").exists());
+    // A template the pin does not have: the pin's own words.
+    let unknown = lake(&["new", "x", "zzz"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&unknown.stderr),
+        "error: unknown package template `zzz`\n"
+    );
+    assert!(!ours_parent.join("x").exists());
+
+    // `lake clean` removes the configured build directory. It used to remove
+    // `.lake/build` whatever the package said, and report success.
+    let cleaned = lake(&["new", "cleanme"]);
+    assert!(cleaned.status.success(), "{cleaned:?}");
+    let package = ours_parent.join("cleanme");
+    std::fs::write(
+        package.join("lakefile.toml"),
+        "name = \"cleanme\"\nbuildDir = \"out\"\n\n[[lean_lib]]\nname = \"Cleanme\"\n",
+    )
+    .unwrap();
+    for built in ["out/lib", ".lake/build/lib"] {
+        std::fs::create_dir_all(package.join(built)).unwrap();
+    }
+    let clean = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&package)
+        .arg("clean")
+        .output()
+        .expect("run lake clean");
+    assert!(clean.status.success(), "{clean:?}");
+    assert!(
+        !package.join("out").exists(),
+        "the configured build directory survived"
+    );
+    assert!(
+        package.join(".lake/build").exists(),
+        "another directory was removed"
+    );
+
+    let pinned = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| {
+            home.join(".elan/toolchains")
+                .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                .join("bin/lake")
+        })
+        .filter(|lake| lake.is_file());
+    let Some(pinned) = pinned else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned lake is absent"
+        );
+        println!("SKIP: no pinned lake; the scaffold was not compared with the pin's");
+        return;
+    };
+    let pin_parent = root.join("pin");
+    std::fs::create_dir_all(&pin_parent).unwrap();
+    let theirs = Command::new(&pinned)
+        .args(["new", "demo"])
+        .current_dir(&pin_parent)
+        .output()
+        .expect("run the pinned lake new");
+    assert!(theirs.status.success(), "{theirs:?}");
+    let theirs = scaffold_tree(&pin_parent.join("demo"));
+    assert_eq!(
+        ours.keys().collect::<Vec<_>>(),
+        theirs.keys().collect::<Vec<_>>(),
+        "the two scaffolds hold different files"
+    );
+    for (path, bytes) in &theirs {
+        assert!(
+            &ours[path] == bytes,
+            "{path} differs from the pin's:\nours: {:?}\npin:  {:?}",
+            String::from_utf8_lossy(&ours[path]),
+            String::from_utf8_lossy(bytes)
+        );
+    }
 }

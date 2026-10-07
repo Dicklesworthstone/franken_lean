@@ -325,3 +325,190 @@ fn default_targets_are_not_synthesized_and_bad_arrays_are_not_filtered() {
         ["a", "b"]
     );
 }
+
+/// Every file of the tree under `root`, by relative path, with its bytes.
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                out.insert(relative, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// The expected bytes are the pin's `std` template (`Lake.initPkg`, vendored
+/// `src/lake/Lake/CLI/Init.lean`), as the pinned `lake new demo` writes them;
+/// fln-cli's `lake_new_writes_the_tree_the_pinned_lake_writes` compares against
+/// the pin itself where it is installed.
+#[test]
+fn the_std_scaffold_is_the_pins_template_byte_for_byte() {
+    let parent = fresh_temp_dir("std-scaffold");
+    let dir = new_package(&parent, "demo", None, LakeConfigFormat::Toml).expect("lake new demo");
+    let expected: std::collections::BTreeMap<String, String> = [
+        (
+            ".github/workflows/lean_action_ci.yml",
+            "name: Lean Action CI\n\non:\n  push:\n  pull_request:\n  workflow_dispatch:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n\n    steps:\n      - uses: actions/checkout@v5\n      - uses: leanprover/lean-action@v1\n",
+        ),
+        (".gitignore", "/.lake\n"),
+        (
+            "Demo.lean",
+            "-- This module serves as the root of the `Demo` library.\n-- Import modules here that should be built as part of the library.\nimport Demo.Basic\n",
+        ),
+        ("Demo/Basic.lean", "def hello := \"world\"\n"),
+        (
+            "Main.lean",
+            "import Demo\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {hello}!\"\n",
+        ),
+        ("README.md", "# demo"),
+        (
+            "lakefile.toml",
+            "name = \"demo\"\nversion = \"0.1.0\"\ndefaultTargets = [\"demo\"]\n\n[[lean_lib]]\nname = \"Demo\"\n\n[[lean_exe]]\nname = \"demo\"\nroot = \"Main\"\n",
+        ),
+        ("lean-toolchain", "leanprover/lean4:v4.32.0\n"),
+    ]
+    .into_iter()
+    .map(|(path, bytes)| (path.to_owned(), bytes.to_owned()))
+    .collect();
+    assert_eq!(tree(&dir), expected);
+
+    // The explicit spelling of the default, in any case, is the same request.
+    let again = new_package(&parent, "demo2", Some("STD.Toml"), LakeConfigFormat::Toml).unwrap();
+    assert_eq!(
+        tree(&again)["Main.lean"],
+        "import Demo2\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {hello}!\"\n"
+    );
+
+    // A second init in the same directory is the pin's refusal and changes nothing.
+    let before = tree(&dir);
+    let err = init_package(&dir, "demo", None, LakeConfigFormat::Toml).unwrap_err();
+    assert!(matches!(err, LakeInitError::AlreadyInitialized));
+    assert_eq!(err.to_string(), "error: package already initialized");
+    assert_eq!(tree(&dir), before);
+}
+
+#[test]
+fn a_template_this_does_not_write_creates_nothing() {
+    let parent = fresh_temp_dir("templates");
+    // The pin has these; only `std` with a TOML configuration is written here.
+    for spec in [
+        "math",
+        "math-lax",
+        "lib",
+        "exe",
+        "std.lean",
+        ".lean",
+        "MATH.toml",
+    ] {
+        let err = new_package(&parent, "pkg", Some(spec), LakeConfigFormat::Toml).unwrap_err();
+        assert!(
+            matches!(err, LakeInitError::TemplateUnavailable { .. }) && err.is_unavailable(),
+            "{spec}: {err}"
+        );
+        assert!(
+            !parent.join("pkg").exists(),
+            "{spec} left a directory behind"
+        );
+    }
+    // The pin does not have these: its own errors, template before language.
+    let unknown = |spec: &str| {
+        let err = new_package(&parent, "pkg", Some(spec), LakeConfigFormat::Toml).unwrap_err();
+        assert!(!err.is_unavailable());
+        assert!(
+            !parent.join("pkg").exists(),
+            "{spec} left a directory behind"
+        );
+        err.to_string()
+    };
+    assert_eq!(unknown("zzz"), "error: unknown package template `zzz`");
+    assert_eq!(
+        unknown("std.zzz"),
+        "error: unknown configuration language `zzz`"
+    );
+    assert_eq!(unknown("zzz.yyy"), "error: unknown package template `zzz`");
+    // Three parts is not a specification at all, and the pin takes its defaults.
+    assert!(new_package(&parent, "three", Some("a.b.c"), LakeConfigFormat::Toml).is_ok());
+    // The caller's language is the default one when the argument names none.
+    let err = new_package(&parent, "pkg", None, LakeConfigFormat::Lean).unwrap_err();
+    assert!(matches!(
+        err,
+        LakeInitError::TemplateUnavailable { ref template, ref language }
+            if template == "std" && language == "lean"
+    ));
+}
+
+#[test]
+fn clean_removes_the_configured_build_directory_and_nothing_else() {
+    let parent = fresh_temp_dir("clean-build-dir");
+    let dir = new_package(&parent, "demo", None, LakeConfigFormat::Toml).unwrap();
+    let set_build_dir = |value: Option<&str>| {
+        let base = "name = \"demo\"\nversion = \"0.1.0\"\n";
+        let line = value.map_or(String::new(), |v| format!("buildDir = \"{v}\"\n"));
+        std::fs::write(
+            dir.join("lakefile.toml"),
+            format!("{base}{line}\n[[lean_lib]]\nname = \"Demo\"\n"),
+        )
+        .unwrap();
+    };
+    let plant = |relative: &str| {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("marker"), b"x").unwrap();
+        path
+    };
+
+    // A configured directory is the one removed; the default one is not touched.
+    set_build_dir(Some("out"));
+    let (custom, default) = (plant("out"), plant(".lake/build"));
+    let report = clean(&dir).expect("clean with buildDir");
+    assert!(report.build_dir_removed);
+    assert!(!custom.exists(), "the configured build directory survived");
+    assert!(
+        default.exists(),
+        "a directory the package does not build into was removed"
+    );
+
+    // With none configured, the default is.
+    set_build_dir(None);
+    assert!(clean(&dir).unwrap().build_dir_removed);
+    assert!(!default.exists());
+    // Nothing there to remove is an answer, not an error.
+    assert!(!clean(&dir).unwrap().build_dir_removed);
+
+    // A build directory that is not inside the package is refused, and nothing goes.
+    let outside = parent.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("precious"), b"x").unwrap();
+    for escape in ["../outside", "..", ".", "", outside.to_str().unwrap()] {
+        set_build_dir(Some(escape));
+        let err = clean(&dir).unwrap_err();
+        assert!(
+            matches!(err, LakeCleanError::BuildDirOutsidePackage(_)),
+            "{escape:?}: {err}"
+        );
+        assert!(
+            outside.join("precious").exists(),
+            "{escape:?} removed outside the package"
+        );
+        assert!(
+            dir.join("Main.lean").exists(),
+            "{escape:?} removed the package"
+        );
+    }
+
+    // A `lakefile.lean` is not evaluated, so its build directory is not known.
+    let lean_only = fresh_temp_dir("clean-lean-config");
+    std::fs::write(lean_only.join("lakefile.lean"), "import Lake\n").unwrap();
+    let kept = lean_only.join(".lake").join("build");
+    std::fs::create_dir_all(&kept).unwrap();
+    let err = clean(&lean_only).unwrap_err();
+    assert!(matches!(err, LakeCleanError::BuildDirUnknown(_)) && err.is_unavailable());
+    assert!(kept.exists());
+}

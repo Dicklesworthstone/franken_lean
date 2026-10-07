@@ -14176,6 +14176,9 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         "clean" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
             match fln_lake::clean(&target_dir) {
+                Err(err) if err.is_unavailable() => {
+                    lake_not_implemented("clean", &err.to_string(), is_json)
+                }
                 Ok(report) => {
                     if is_json {
                         MultiplexerOutput::success(format!(
@@ -14219,6 +14222,9 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 template,
                 fln_lake::LakeConfigFormat::Toml,
             ) {
+                Err(err) if err.is_unavailable() => {
+                    lake_not_implemented("init", &err.to_string(), is_json)
+                }
                 Ok(()) => {
                     if is_json {
                         MultiplexerOutput::success(format!(
@@ -14258,6 +14264,9 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 template,
                 fln_lake::LakeConfigFormat::Toml,
             ) {
+                Err(err) if err.is_unavailable() => {
+                    lake_not_implemented("new", &err.to_string(), is_json)
+                }
                 Ok(created_dir) => {
                     if is_json {
                         MultiplexerOutput::success(format!(
@@ -14342,14 +14351,24 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
         }
         "env" => {
-            let prefix = std::env::var_os("LEAN_SYSROOT")
+            // The sysroot is a fact about where this binary is installed. A
+            // development binary has none, and inventing one would hand every
+            // tool that reads this environment a directory that is not Lean.
+            let Some(prefix) = std::env::var_os("LEAN_SYSROOT")
                 .map(PathBuf::from)
                 .or_else(|| {
                     std::env::current_exe()
                         .ok()
                         .and_then(|exe| derive_lean_installation_paths(&exe).ok().map(|p| p.prefix))
                 })
-                .unwrap_or_else(|| PathBuf::from("/usr/local"));
+            else {
+                return lake_not_implemented(
+                    "env",
+                    "this binary is not in a toolchain layout and LEAN_SYSROOT is not set, so \
+                     there is no sysroot to report",
+                    is_json,
+                );
+            };
 
             if command_args.is_empty() {
                 let mut out = String::new();

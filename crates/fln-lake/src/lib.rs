@@ -340,6 +340,21 @@ pub enum LakeCleanError {
     NoConfigFile(PathBuf),
     /// An I/O error occurred during removal of build outputs.
     Io(String),
+    /// The configuration is a `lakefile.lean`, which is not evaluated, so the
+    /// package's build directory is not known. Nothing was removed.
+    BuildDirUnknown(PathBuf),
+    /// The configured `buildDir` is absolute, empty, or leaves the package.
+    /// Nothing was removed.
+    BuildDirOutsidePackage(PathBuf),
+    /// The configuration could not be read.
+    Config(String),
+}
+
+impl LakeCleanError {
+    /// The request was well formed and this implementation cannot serve it.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::BuildDirUnknown(_))
+    }
 }
 
 impl fmt::Display for LakeCleanError {
@@ -351,6 +366,17 @@ impl fmt::Display for LakeCleanError {
                 p.join("lakefile.lean").display()
             ),
             Self::Io(msg) => write!(f, "error cleaning Lake build outputs: {msg}"),
+            Self::BuildDirUnknown(path) => write!(
+                f,
+                "{} is not evaluated, so the package's build directory is not known; nothing was removed",
+                path.display()
+            ),
+            Self::BuildDirOutsidePackage(path) => write!(
+                f,
+                "error: buildDir {:?} is not a directory inside the package; nothing was removed",
+                path.display().to_string()
+            ),
+            Self::Config(detail) => write!(f, "error: {detail}"),
         }
     }
 }
@@ -360,7 +386,7 @@ impl std::error::Error for LakeCleanError {}
 /// Result of a clean operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LakeCleanReport {
-    /// Whether the `.lake/build` directory was found and removed.
+    /// Whether the package's build directory was found and removed.
     pub build_dir_removed: bool,
     /// The package root cleaned.
     pub dir: PathBuf,
@@ -377,6 +403,22 @@ pub enum LakeInitError {
     AlreadyExists(PathBuf),
     /// An I/O error occurred creating the package files.
     Io(String),
+    /// The template is not one of the pin's.
+    UnknownTemplate(String),
+    /// The configuration language is not one of the pin's.
+    UnknownConfigLanguage(String),
+    /// The pin has this template and language; this implementation writes
+    /// only `std` in TOML. Nothing was created.
+    TemplateUnavailable { template: String, language: String },
+    /// The directory already holds a package configuration.
+    AlreadyInitialized,
+}
+
+impl LakeInitError {
+    /// The request was well formed and this implementation cannot serve it.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::TemplateUnavailable { .. })
+    }
 }
 
 impl fmt::Display for LakeInitError {
@@ -392,6 +434,17 @@ impl fmt::Display for LakeInitError {
                 )
             }
             Self::Io(msg) => write!(f, "error initializing Lake package: {msg}"),
+            Self::UnknownTemplate(template) => {
+                write!(f, "error: unknown package template `{template}`")
+            }
+            Self::UnknownConfigLanguage(language) => {
+                write!(f, "error: unknown configuration language `{language}`")
+            }
+            Self::TemplateUnavailable { template, language } => write!(
+                f,
+                "the `{template}` template with a `{language}` configuration is not written here, only `std` with `toml`; nothing was created"
+            ),
+            Self::AlreadyInitialized => write!(f, "error: package already initialized"),
         }
     }
 }
@@ -801,13 +854,34 @@ impl LakeConfig {
 }
 
 /// Clean build outputs in the package directory `dir`.
+///
+/// What is removed is the package's own build directory: `buildDir` from its
+/// configuration, `.lake/build` when the configuration does not set one. A
+/// `lakefile.lean` cannot be evaluated here, so its build directory is not
+/// known and nothing is removed.
+///
+/// A `buildDir` that is absolute, empty, or leaves the package through `..` is
+/// refused. The pin removes whatever the configuration names; this does not
+/// delete outside the package on a configuration's say-so.
 pub fn clean(dir: &Path) -> Result<LakeCleanReport, LakeCleanError> {
-    let toml_file = dir.join("lakefile.toml");
-    let lean_file = dir.join("lakefile.lean");
-    if !toml_file.exists() && !lean_file.exists() {
-        return Err(LakeCleanError::NoConfigFile(dir.to_path_buf()));
+    let configured = match LakeConfig::discover(dir) {
+        Ok(config) => config.build_dir,
+        Err(LakeDiscoveryError::NotFound(_)) => {
+            return Err(LakeCleanError::NoConfigFile(dir.to_path_buf()));
+        }
+        Err(LakeDiscoveryError::LeanConfigUnsupported(path)) => {
+            return Err(LakeCleanError::BuildDirUnknown(path));
+        }
+        Err(other) => return Err(LakeCleanError::Config(other.to_string())),
+    };
+    let inside = configured.components().next().is_some()
+        && configured
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if !inside {
+        return Err(LakeCleanError::BuildDirOutsidePackage(configured));
     }
-    let build_dir = dir.join(".lake").join("build");
+    let build_dir = dir.join(&configured);
     let mut build_dir_removed = false;
     if build_dir.exists() {
         fs::remove_dir_all(&build_dir).map_err(|e| LakeCleanError::Io(e.to_string()))?;
@@ -863,103 +937,167 @@ fn capitalize_ident(s: &str) -> String {
     }
 }
 
-/// Initialize a Lake package in `dir`.
+/// The pin's package templates (`Lake.InitTemplate.ofString?`) and
+/// configuration languages (`Lake.ConfigLang.ofString?`).
+const INIT_TEMPLATES: [&str; 5] = ["std", "exe", "lib", "math-lax", "math"];
+const INIT_LANGUAGES: [&str; 2] = ["lean", "toml"];
+
+/// Read a `[template][.language]` argument the way the pin's
+/// `parseTemplateLangSpec` does: one or two dot-separated parts, an empty part
+/// meaning its default, any other shape meaning both defaults. A part the pin
+/// does not know is the pin's own error, template first.
+fn init_template_spec(
+    spec: Option<&str>,
+    format: LakeConfigFormat,
+) -> Result<(String, String), LakeInitError> {
+    let parts: Vec<&str> = spec.unwrap_or("").split('.').collect();
+    let (template, language) = match parts.as_slice() {
+        [template, language] => (*template, *language),
+        [template] => (*template, ""),
+        _ => ("", ""),
+    };
+    let template = if template.is_empty() {
+        "std".to_owned()
+    } else {
+        let lower = template.to_lowercase();
+        if !INIT_TEMPLATES.contains(&lower.as_str()) {
+            return Err(LakeInitError::UnknownTemplate(template.to_owned()));
+        }
+        lower
+    };
+    let language = if language.is_empty() {
+        match format {
+            LakeConfigFormat::Toml => "toml".to_owned(),
+            LakeConfigFormat::Lean => "lean".to_owned(),
+        }
+    } else {
+        let lower = language.to_lowercase();
+        if !INIT_LANGUAGES.contains(&lower.as_str()) {
+            return Err(LakeInitError::UnknownConfigLanguage(language.to_owned()));
+        }
+        lower
+    };
+    Ok((template, language))
+}
+
+fn write_new(path: &Path, contents: &str) -> Result<(), LakeInitError> {
+    if path.exists() {
+        return Ok(());
+    }
+    fs::write(path, contents).map_err(|e| LakeInitError::Io(e.to_string()))
+}
+
+/// Initialize a Lake package in `dir` from the pin's `std` template with a
+/// TOML configuration: the files `Lake.initPkg` writes, with the same bytes.
+///
+/// `template` is the pin's `[template][.language]` argument. Only `std` in
+/// TOML is written; another known template or language is refused before
+/// anything is created, and an unknown one is the pin's own error.
+///
+/// Two things the pin does here are not done: no git repository is
+/// initialized (D2: git is spawned only to fetch dependencies), and an
+/// existing `lean-toolchain` is left as it is.
 pub fn init_package(
     dir: &Path,
     name: &str,
-    _template: Option<&str>,
+    template: Option<&str>,
     format: LakeConfigFormat,
 ) -> Result<(), LakeInitError> {
     validate_package_name(name)?;
-    fs::create_dir_all(dir).map_err(|e| LakeInitError::Io(e.to_string()))?;
+    let (template, language) = init_template_spec(template, format)?;
+    if template != "std" || language != "toml" {
+        return Err(LakeInitError::TemplateUnavailable { template, language });
+    }
+    let config_file = dir.join("lakefile.toml");
+    if config_file.exists() {
+        return Err(LakeInitError::AlreadyInitialized);
+    }
+    let io = |e: std::io::Error| LakeInitError::Io(e.to_string());
+    fs::create_dir_all(dir).map_err(io)?;
 
     let lib_name = capitalize_ident(name);
     let exe_name = name.to_ascii_lowercase();
 
-    // Write lean-toolchain
-    let toolchain_file = dir.join("lean-toolchain");
-    if !toolchain_file.exists() {
+    let workflows = dir.join(".github").join("workflows");
+    fs::create_dir_all(&workflows).map_err(io)?;
+    write_new(
+        &workflows.join("lean_action_ci.yml"),
+        "name: Lean Action CI\n\
+         \n\
+         on:\n\
+         \x20 push:\n\
+         \x20 pull_request:\n\
+         \x20 workflow_dispatch:\n\
+         \n\
+         jobs:\n\
+         \x20 build:\n\
+         \x20   runs-on: ubuntu-latest\n\
+         \n\
+         \x20   steps:\n\
+         \x20     - uses: actions/checkout@v5\n\
+         \x20     - uses: leanprover/lean-action@v1\n",
+    )?;
+
+    fs::write(
+        &config_file,
+        format!(
+            "name = \"{name}\"\n\
+             version = \"0.1.0\"\n\
+             defaultTargets = [\"{exe_name}\"]\n\
+             \n\
+             [[lean_lib]]\n\
+             name = \"{lib_name}\"\n\
+             \n\
+             [[lean_exe]]\n\
+             name = \"{exe_name}\"\n\
+             root = \"Main\"\n"
+        ),
+    )
+    .map_err(io)?;
+
+    // The library root and its first module, unless the root is already there.
+    let root_file = dir.join(format!("{lib_name}.lean"));
+    if !root_file.exists() {
+        let lib_dir = dir.join(&lib_name);
+        fs::create_dir_all(&lib_dir).map_err(io)?;
+        write_new(&lib_dir.join("Basic.lean"), "def hello := \"world\"\n")?;
         fs::write(
-            &toolchain_file,
-            format!("leanprover/lean4:{DEFAULT_PIN_TAG}\n"),
+            &root_file,
+            format!(
+                "-- This module serves as the root of the `{lib_name}` library.\n\
+                 -- Import modules here that should be built as part of the library.\n\
+                 import {lib_name}.Basic\n"
+            ),
         )
-        .map_err(|e| LakeInitError::Io(e.to_string()))?;
+        .map_err(io)?;
     }
 
-    // Write .gitignore
-    let gitignore_file = dir.join(".gitignore");
-    if !gitignore_file.exists() {
-        fs::write(&gitignore_file, "/.lake\n").map_err(|e| LakeInitError::Io(e.to_string()))?;
-    }
-
-    // Write config file
-    match format {
-        LakeConfigFormat::Toml => {
-            let toml_file = dir.join("lakefile.toml");
-            if !toml_file.exists() {
-                let toml_content = format!(
-                    "name = \"{name}\"\n\
-                     version = \"0.1.0\"\n\
-                     defaultTargets = [\"{exe_name}\"]\n\
-                     \n\
-                     [[lean_lib]]\n\
-                     name = \"{lib_name}\"\n\
-                     \n\
-                     [[lean_exe]]\n\
-                     name = \"{exe_name}\"\n\
-                     root = \"Main\"\n"
-                );
-                fs::write(&toml_file, toml_content)
-                    .map_err(|e| LakeInitError::Io(e.to_string()))?;
-            }
-        }
-        LakeConfigFormat::Lean => {
-            let lean_config_file = dir.join("lakefile.lean");
-            if !lean_config_file.exists() {
-                let lean_content = format!(
-                    "import Lake\n\
-                     open Lake DSL\n\
-                     \n\
-                     package \"{name}\" where\n\
-                       version := v!\"0.1.0\"\n\
-                     \n\
-                     lean_lib {lib_name} where\n\
-                     \n\
-                     @[default_target]\n\
-                     lean_exe \"{exe_name}\" where\n\
-                       root := `Main\n"
-                );
-                fs::write(&lean_config_file, lean_content)
-                    .map_err(|e| LakeInitError::Io(e.to_string()))?;
-            }
-        }
-    }
-
-    // Write Main.lean
-    let main_file = dir.join("Main.lean");
-    if !main_file.exists() {
-        let main_content = format!(
+    write_new(
+        &dir.join("Main.lean"),
+        &format!(
             "import {lib_name}\n\
              \n\
              def main : IO Unit :=\n\
-               IO.println s!\"Hello, {{hello}}!\"\n"
-        );
-        fs::write(&main_file, main_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
-    }
+             \x20 IO.println s!\"Hello, {{hello}}!\"\n"
+        ),
+    )?;
 
-    // Write <lib_name>.lean
-    let lib_file = dir.join(format!("{lib_name}.lean"));
-    if !lib_file.exists() {
-        let lib_content = "def hello := \"world\"\n";
-        fs::write(&lib_file, lib_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
-    }
+    // The pin's README has no final newline, and a dotted name is written with dashes.
+    write_new(
+        &dir.join("README.md"),
+        &format!("# {}", name.replace('.', "-")),
+    )?;
 
-    // Write README.md
-    let readme_file = dir.join("README.md");
-    if !readme_file.exists() {
-        let readme_content = format!("# {name}\n");
-        fs::write(&readme_file, readme_content).map_err(|e| LakeInitError::Io(e.to_string()))?;
-    }
+    // The pin appends its entry whether or not the file is there.
+    let gitignore = dir.join(".gitignore");
+    let mut ignored = fs::read_to_string(&gitignore).unwrap_or_default();
+    ignored.push_str("/.lake\n");
+    fs::write(&gitignore, ignored).map_err(io)?;
+
+    write_new(
+        &dir.join("lean-toolchain"),
+        &format!("leanprover/lean4:{DEFAULT_PIN_TAG}\n"),
+    )?;
 
     Ok(())
 }
