@@ -1007,11 +1007,44 @@ impl Context {
             return Err(error(TacticError::ApplyMismatch));
         }
         proof.work.push(Work::Close(goal, term.value));
-        // Dependency-producing parameters precede later parameters. Metavariables
-        // already inferred while matching the conclusion are skipped by advance.
-        proof
-            .work
-            .extend(arguments.into_iter().rev().map(Work::Goal));
+        // The pin's apply returns its new goals non-dependent-first
+        // (`ApplyConfig.newGoals := ApplyNewGoals.nonDependentFirst`,
+        // Init/Meta/Defs.lean:1706): a goal is dependent exactly when another
+        // new goal's type mentions its metavariable (`dependsOnOthers`,
+        // Lean/Meta/Tactic/Apply.lean:132), and dependent goals come last with
+        // each class keeping its telescope order. `constructor`, `left`/`right`
+        // and `exists` reach apply with the default config, so they share this
+        // order: after `constructor` on `Witness (fun n => n = 7)` the first
+        // goal is `?n = 7`, not `n : Nat`. Types are instantiated first so
+        // conclusion-matching assignments are visible to the occurs check;
+        // goals whose metavariable was already assigned stay in the list and
+        // are skipped by advance, as before.
+        let mut instantiated = Vec::with_capacity(arguments.len());
+        for subgoal in &arguments {
+            instantiated.push(self.instantiate(&subgoal.target)?);
+        }
+        let mut mentioned = std::collections::HashSet::new();
+        for (index, type_) in instantiated.iter().enumerate() {
+            for id in self.txn.mvars.collect_mvars(type_) {
+                if arguments
+                    .iter()
+                    .enumerate()
+                    .any(|(other, subgoal)| other != index && subgoal.id == id)
+                {
+                    mentioned.insert(id);
+                }
+            }
+        }
+        let (non_dependent, dependent): (Vec<_>, Vec<_>) = arguments
+            .into_iter()
+            .partition(|subgoal| !mentioned.contains(&subgoal.id));
+        proof.work.extend(
+            non_dependent
+                .into_iter()
+                .chain(dependent)
+                .rev()
+                .map(Work::Goal),
+        );
         Ok(())
     }
 }

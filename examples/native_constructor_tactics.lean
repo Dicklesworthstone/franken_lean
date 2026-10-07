@@ -16,21 +16,24 @@ theorem chooseRight (P Q : Prop) (q : Q) : Either P Q := by
 inductive Witness (P : Nat -> Prop) : Prop where
   | intro (n : Nat) (proof : P n)
 
+-- The pin's `constructor` returns non-dependent goals first, so the first
+-- goal here is `?n = 7`; `rfl` proves it and assigns the deferred `n` goal
+-- by unification, which is then discharged without another tactic.
 theorem seven : Witness (fun n => n = 7) := by
   constructor
-  exact 7
   rfl
 
 structure Package where
   carrier : Type
   value : carrier
 
+-- Same ordering: the first goal is `value : ?carrier`, and solving it with an
+-- ascribed numeral infers the deferred `carrier` goal as `Nat` by unification.
 def package : Package := by
   constructor
-  exact Nat
-  exact 7
+  exact (7 : Nat)
 
-theorem package_ok : package.value = 7 := by rfl
+theorem package_ok : package.value = (7 : Nat) := by rfl
 
 inductive At : Nat -> Type where
   | zero : At 0
