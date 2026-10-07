@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":587,"projection_hash":"fb9676f7d01326c24366a9d5a4eac5d21dfa6395158fc24d7a4a74a26195e623"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":604,"projection_hash":"b0278827a274dd185e0431efdfdf2c44bee2c19a4353deb1a85127547bb937b7"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -110,6 +110,7 @@
 {"id":"fln-d7pr"}
 {"id":"fln-db39"}
 {"id":"fln-dcv"}
+{"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
 {"id":"fln-eae"}
@@ -138,16 +139,20 @@
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
 {"id":"fln-freeze-gate-blind-spot-bi3q"}
+{"id":"fln-front-door-residuals-0f6x"}
 {"id":"fln-frontier-oom-abort-w9dx"}
+{"id":"fln-frontier-rows-depend-on-jobs-2g96"}
 {"id":"fln-fur"}
 {"id":"fln-fur.1"}
 {"id":"fln-g1-gate-decision-rysb"}
 {"id":"fln-g1mc"}
 {"id":"fln-g6d1"}
+{"id":"fln-gates-and-governance-decision-cihe"}
 {"id":"fln-giap"}
 {"id":"fln-gjup"}
 {"id":"fln-gkhu"}
 {"id":"fln-glml"}
+{"id":"fln-golem-ordinary-loops-fbj6"}
 {"id":"fln-h1k"}
 {"id":"fln-h1k.1"}
 {"id":"fln-h1k.2"}
@@ -170,6 +175,9 @@
 {"id":"fln-init-control-council-4698-1yyb"}
 {"id":"fln-init-core-council-4442-aiwk"}
 {"id":"fln-init-sizeof-council-3290-w4xk"}
+{"id":"fln-ir-decoder-call-graph-sjzl"}
+{"id":"fln-ir-on-golem-decision-5wfx"}
+{"id":"fln-ir-to-flbc-lowering-7wwf"}
 {"id":"fln-iron-target-profile-contract-ba9"}
 {"id":"fln-it70"}
 {"id":"fln-ivm"}
@@ -182,6 +190,8 @@
 {"id":"fln-k63"}
 {"id":"fln-kernel-bounded-decl-admission-ukzx"}
 {"id":"fln-kernel-loc-disclosure-foreign-counter-c118"}
+{"id":"fln-kernel-reject-side-at-scale-bemc"}
+{"id":"fln-kernel-unfold-differential-tfvw"}
 {"id":"fln-kfdr"}
 {"id":"fln-kfk2"}
 {"id":"fln-kiq3"}
@@ -198,9 +208,11 @@
 {"id":"fln-lst4"}
 {"id":"fln-lvdh"}
 {"id":"fln-lyc8"}
+{"id":"fln-macro-rung-e1rk"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
 {"id":"fln-merkle-decl-digest-80ni"}
+{"id":"fln-mirror-price-cszo"}
 {"id":"fln-msou"}
 {"id":"fln-n1ao"}
 {"id":"fln-narm"}
@@ -221,7 +233,9 @@
 {"id":"fln-parse-before-imports-j8p6"}
 {"id":"fln-parser-structural-identity-tzux"}
 {"id":"fln-path-classification-coverage-unbound-9teu"}
+{"id":"fln-pin-syntax-corpus-7b5b"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
+{"id":"fln-provisional-frontier-vf32"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
 {"id":"fln-pv1"}
@@ -232,7 +246,9 @@
 {"id":"fln-qpkj"}
 {"id":"fln-qw78"}
 {"id":"fln-r0yh"}
+{"id":"fln-r15-decision-vgwl"}
 {"id":"fln-reality-check-1004-y7ba"}
+{"id":"fln-reality-check-1007-kzz9"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-rgha"}
@@ -259,6 +275,7 @@
 {"id":"fln-ubs-timeout-promoted-to-rejection-pekl"}
 {"id":"fln-uc44"}
 {"id":"fln-um4a"}
+{"id":"fln-upstream-suite-scoreboard-n04o"}
 {"id":"fln-uuuz"}
 {"id":"fln-uyuz"}
 {"id":"fln-vm35"}
