@@ -10,7 +10,11 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    fn under(base: &std::path::Path, label: &str) -> Self {
+        let dir = base.join(format!(
             "fln-cli-verbs-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -27,6 +31,13 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Whether `fln doctor` takes `dir` for a franken_lean checkout: an ancestor holding both
+/// `SUITE.lock` and `Cargo.toml`, the rule its checkout-pins check applies.
+fn inside_a_checkout(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|dir| dir.join("SUITE.lock").is_file() && dir.join("Cargo.toml").is_file())
 }
 
 fn doctor_json(cwd: &std::path::Path, elan_home: Option<&std::path::Path>) -> (i32, String) {
@@ -92,7 +103,17 @@ fn doctor_fails_when_run_in_a_checkout_pinned_to_another_reference() {
 
 #[test]
 fn doctor_reports_a_missing_reference_toolchain_without_failing() {
-    let outside = TempDir::new("doctor-outside");
+    // rch rewrites TMPDIR into the synced worktree on its workers, so the system temp
+    // directory can itself sit inside a checkout; `/tmp` is the fallback outside one.
+    let mut outside = TempDir::new("doctor-outside");
+    if inside_a_checkout(&outside.0) {
+        outside = TempDir::under(std::path::Path::new("/tmp"), "doctor-outside");
+    }
+    assert!(
+        !inside_a_checkout(&outside.0),
+        "no directory outside a checkout: {}",
+        outside.0.display()
+    );
     let empty_elan = TempDir::new("doctor-elan");
     let (code, stdout) = doctor_json(&outside.0, Some(&empty_elan.0));
     assert_eq!(
