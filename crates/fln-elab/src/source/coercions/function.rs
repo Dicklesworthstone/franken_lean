@@ -44,6 +44,7 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
+    mod inference;
     use super::*;
     use crate::instances::register_class;
     use crate::records::{RecordBudget, RecordSpec, record_declarations};

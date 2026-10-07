@@ -491,7 +491,13 @@ impl Context {
                 if let Some(lifted) = self.try_monad_lift(&term, expected)? {
                     return Ok(lifted);
                 }
-                // No lift: retain the original postponed typing obligations.
+                // A CoeFun dictionary can likewise determine holes in an
+                // expected Pi type. Its own shape/type probe is transactional;
+                // a failed attempt must retain the original deferred equation.
+                if let Some(function) = self.try_expected_function(&term, expected)? {
+                    return Ok(function);
+                }
+                // No coercion: retain the original postponed typing obligations.
                 // In particular, never select an unknown monad by search and
                 // never refund the failed alternative's work.
                 trial.txn.budget.heartbeats_consumed = self.txn.budget.heartbeats_consumed;
