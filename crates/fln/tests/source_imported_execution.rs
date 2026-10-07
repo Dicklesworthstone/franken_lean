@@ -131,6 +131,11 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         let decisions = [("Main", "prelude\nimport Init.Prelude\ndef decision : Decidable True := Decidable.isTrue True.intro\ndef choose (d : Decidable True) : Nat := match d with | .isTrue h => 42 | .isFalse h => 0\n#eval choose decision")];
         assert_eq!(values(&run(&imported, &decisions, "Main")), [vec![42]]);
 
+        // The real word families are checked records, while the isolated
+        // numeric seed uses opaque native scalars with a different ABI.
+        let words = [("Main", "prelude\nimport Init.Prelude\n#eval UInt32.toNat (UInt32.ofNatLT 42 (by decide))\n#eval BitVec.toNat (UInt32.toBitVec (UInt32.ofNatLT 65 (by decide)))\n#eval BitVec.toNat (UInt64.toBitVec (UInt64.ofNatLT 42 (by decide)))\n#eval UInt32.toNat (Char.val (Char.ofNat 65))\n#eval UInt32.toNat (Char.val (Char.ofNat 55296))")];
+        assert_eq!(values(&run(&imported, &words, "Main")), [vec![42, 65, 42, 65, 0]]);
+
         // Both siblings allocate an evaluation candidate at command zero in
         // their own world. Neither candidate may be replayed into the other or
         // collide when the entry imports both siblings.

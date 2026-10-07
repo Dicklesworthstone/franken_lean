@@ -6,6 +6,7 @@ use fln::{
     EngineExecutionLimits, Environment, Expr, KVMap, Name,
 };
 use fln_core::expr::{BinderInfo, ExprNode, Literal, NatLit};
+use fln_core::level::Level;
 use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
 
 fn limits() -> EngineExecutionLimits {
@@ -217,5 +218,73 @@ fn scientific_literals_require_both_canonical_bit_helpers_in_each_precision() {
             assert_eq!(engine.logical_root(&options), root);
             assert!(!engine.environment().contains(&name("literal")));
         }
+    }
+}
+
+#[test]
+fn checked_same_named_word_records_use_their_actual_fields() {
+    for word in ["UInt32", "UInt64"] {
+        let source = format!(
+            "structure {word} where\n  value : Nat\n\
+             def read (x : {word}) : Nat := x.value\n\
+             #eval read {{ value := 42 }}"
+        );
+        let result = base()
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_or_else(|error| panic!("{word}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let fln::VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
+            panic!("word record must return its field");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42")
+        );
+    }
+}
+
+#[test]
+fn native_word_rows_require_the_matching_opaque_family_contract() {
+    for word in ["UInt32", "UInt64"] {
+        // This alias and these axioms are all admitted by both checkers. Their
+        // familiar names cannot grant a native word ABI to an arbitrary Nat.
+        let mut declarations = vec![definition(word, Expr::sort(Level::one()), constant("Nat"))];
+        for operation in ["ofNat", "toNat"] {
+            declarations.push(
+                fln_elab::seed::float_intrinsic_seed_declaration(&name(&format!(
+                    "{word}.{operation}"
+                )))
+                .unwrap(),
+            );
+        }
+        let options = KVMap::new();
+        let engine = base()
+            .admit_declarations(
+                &declarations,
+                &options,
+                EngineAdmissionLimits::new(limits().kernel),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let root = engine.logical_root(&options);
+        let entry = definition(
+            "roundtrip",
+            constant("Nat"),
+            call(
+                &format!("{word}.toNat"),
+                [call(&format!("{word}.ofNat"), [number(42)])],
+            ),
+        );
+        assert!(matches!(
+            engine.execute_definition(entry, &options, limits()),
+            Err(EngineExecutionError::Ingress(
+                fln_comp::ingress::IngressError::UnknownConstant { .. }
+            ))
+        ));
+        assert_eq!(engine.logical_root(&options), root);
+        assert!(!engine.environment().contains(&name("roundtrip")));
     }
 }

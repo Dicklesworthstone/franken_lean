@@ -9098,8 +9098,8 @@ struct ExecutableValueTypes {
     bool_: Expr,
     float: Expr,
     float32: Expr,
-    uint32: Expr,
-    uint64: Expr,
+    uint32: Option<Expr>,
+    uint64: Option<Expr>,
     /// Set only after admitting an erased type-field representation and
     /// checking that its private name is absent from the logical environment.
     boxed: Option<Expr>,
@@ -9108,19 +9108,36 @@ struct ExecutableValueTypes {
 }
 
 impl ExecutableValueTypes {
-    fn bounded_source() -> Self {
+    fn bounded_source(environment: &Environment) -> Self {
         Self {
             nat: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
             string: Expr::const_(Name::from_components(["String"]), Vec::new()),
             bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
             float: Expr::const_(Name::from_components(["Float"]), Vec::new()),
             float32: Expr::const_(Name::from_components(["Float32"]), Vec::new()),
-            uint32: Expr::const_(Name::from_components(["UInt32"]), Vec::new()),
-            uint64: Expr::const_(Name::from_components(["UInt64"]), Vec::new()),
+            uint32: native_word_type(environment, "UInt32"),
+            uint64: native_word_type(environment, "UInt64"),
             boxed: None,
             records: std::collections::HashSet::new(),
             closures: std::collections::HashMap::new(),
         }
+    }
+}
+
+/// The bounded source seed models words as opaque native scalars. Imported
+/// word structures retain their admitted record layouts until their complete
+/// logical models have a native ABI contract; a familiar name is insufficient.
+fn native_word_type(environment: &Environment, label: &str) -> Option<Expr> {
+    let name = Name::from_components([label]);
+    match environment.find(&name) {
+        Some(ConstantInfo::Axiom(value))
+            if !value.is_unsafe
+                && value.base.level_params.is_empty()
+                && value.base.type_ == Expr::sort(Level::one()) =>
+        {
+            Some(Expr::const_(name, vec![]))
+        }
+        _ => None,
     }
 }
 
@@ -9311,7 +9328,22 @@ fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<In
     {
         return None;
     }
-    generated_source_intrinsic_binding(name)
+    let binding = generated_source_intrinsic_binding(name)?;
+    // Native word operations cannot consume or produce the ordinary record
+    // representation of an imported or user-defined same-named family.
+    for value in binding
+        .arguments
+        .iter()
+        .chain(std::iter::once(&binding.result))
+    {
+        let label = match value {
+            ValueType::UInt32 => "UInt32",
+            ValueType::UInt64 => "UInt64",
+            _ => continue,
+        };
+        native_word_type(environment, label)?;
+    }
+    Some(binding)
 }
 
 fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
@@ -9723,9 +9755,9 @@ fn executable_value_type(
         Some((ValueType::Float, CallableResultOwnership::Owned))
     } else if source == &value_types.float32 {
         Some((ValueType::Float32, CallableResultOwnership::Owned))
-    } else if source == &value_types.uint32 {
+    } else if value_types.uint32.as_ref() == Some(source) {
         Some((ValueType::UInt32, CallableResultOwnership::Scalar))
-    } else if source == &value_types.uint64 {
+    } else if value_types.uint64.as_ref() == Some(source) {
         Some((ValueType::UInt64, CallableResultOwnership::Owned))
     } else if let Some(value) = value_types.closures.get(source) {
         Some((*value, CallableResultOwnership::Owned))

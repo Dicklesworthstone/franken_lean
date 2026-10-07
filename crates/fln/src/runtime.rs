@@ -106,7 +106,7 @@ impl<'a> Preparation<'a> {
             next_local: 0,
             next_nat: 0,
             nat_family_checked: false,
-            value_types: ExecutableValueTypes::bounded_source(),
+            value_types: ExecutableValueTypes::bounded_source(environment),
             interfaces: Vec::new(),
             specializations: specialize::Store::default(),
             data_shapes: std::collections::HashMap::new(),
