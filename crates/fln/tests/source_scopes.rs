@@ -307,14 +307,20 @@ fn open_in_reaches_exactly_its_one_command() {
     assert_eq!(checked_files.commands, 4);
 }
 
-/// Declaration modifiers and nameless instances now parse to the pin's trees
-/// (`crates/fln-parse/tests/reference_command_trees.rs`), but their semantics are not
-/// implemented: each is refused by the elaborator as syntax it does not support, a typed,
-/// non-authoritative refusal, never admitted with the modifier dropped or under an invented
-/// name. The pin accepts every one of these files. `protected` is the exception: it is
-/// elaborated (bead `fln-eq4k`), admitted and tagged, never admitted with the tag dropped.
+/// Declaration modifiers parse to the pin's trees
+/// (`crates/fln-parse/tests/reference_command_trees.rs`), but `private` and
+/// `noncomputable` are not implemented: each is refused by the elaborator as syntax it
+/// does not support, a typed, non-authoritative refusal, never admitted with the modifier
+/// dropped. The pin accepts both files. `protected` is elaborated (bead `fln-eq4k`),
+/// admitted and tagged, never admitted with the tag dropped. A nameless instance is
+/// elaborated too, and the pin accepts it. Its name follows `mkInstanceName`
+/// (`instance_name.rs`) except for one stated deviation. The base name
+/// `instInhabitedNat` is taken by the seed's own instance, so the pin appends the main
+/// module, `instInhabitedNat_<module>` (v4.32.0, measured 2026-10-07). FrankenLean does
+/// not know the module and makes the base unused with a numeric suffix instead. Either
+/// way the instance is new, and the seed's `instInhabitedNat` is never overwritten.
 #[test]
-fn parsed_modifiers_and_nameless_instances_are_refused_until_elaborated() {
+fn parsed_modifiers_are_refused_until_elaborated_and_nameless_instances_are_admitted() {
     let protected = engine()
         .check_source_files(
             &[b"namespace Foo\nprotected def bar : Nat := 1\nend Foo"],
@@ -330,11 +336,40 @@ fn parsed_modifiers_and_nameless_instances_are_refused_until_elaborated() {
             .contains(&Name::from_components(["Foo", "bar"])),
         "`protected` is recorded, not dropped"
     );
-    for source in [
-        "private def a : Nat := 1",
-        "noncomputable def b : Nat := 2",
-        "instance : Inhabited Nat := Inhabited.mk 0",
-    ] {
+    let nameless = engine()
+        .check_source_files(
+            &[b"instance : Inhabited Nat := Inhabited.mk 0"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let seed = engine();
+    let base = Name::from_components(["instInhabitedNat"]);
+    assert_eq!(
+        nameless
+            .engine
+            .environment()
+            .find(&base)
+            .map(|info| info.constant_val().type_.clone()),
+        seed.environment()
+            .find(&base)
+            .map(|info| info.constant_val().type_.clone()),
+        "the seed's own instInhabitedNat is untouched"
+    );
+    let added: Vec<String> = nameless
+        .engine
+        .environment()
+        .constants()
+        .filter(|(name, _)| !seed.environment().contains(name))
+        .map(|(name, _)| name.to_display_string())
+        .collect();
+    assert!(
+        added.len() == 1 && added[0].starts_with("instInhabitedNat_"),
+        "exactly one new instance, named off the taken base: {added:?}"
+    );
+    for source in ["private def a : Nat := 1", "noncomputable def b : Nat := 2"] {
         let error = engine()
             .check_source_files(
                 &[source.as_bytes()],
