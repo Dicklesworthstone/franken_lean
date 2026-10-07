@@ -20362,6 +20362,19 @@ fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
     ]
 }
 
+/// The reject-side mutant root (bead `fln-kernel-reject-side-at-scale-bemc`):
+/// when `FLN_BEMC_ROOT` names a directory, synthetic `Bemc.*` modules written
+/// by `scripts/tribunal/bemc_mutant_generator.lean` become routable through
+/// the same inventory machinery as every provisioned root. Host provisioning,
+/// never a repository input, exactly like `FLN_MATHLIB_CORPUS` above.
+fn chosen_set_roots_with_bemc(reference_lib: &Path) -> Vec<(String, PathBuf)> {
+    let mut roots = chosen_set_roots(reference_lib);
+    if let Ok(root) = std::env::var("FLN_BEMC_ROOT") {
+        roots.push(("Bemc".to_string(), PathBuf::from(root)));
+    }
+    roots
+}
+
 #[test]
 fn chosen_set_routes_every_reference_top_level() {
     let reference_lib = PathBuf::from("/pinned-reference/lib/lean");
@@ -20884,6 +20897,142 @@ fn fln_4hol_units_accept_within_their_step_ceilings() {
              this measurement is broken"
         );
     }
+}
+
+/// The reject-side join (bead `fln-kernel-reject-side-at-scale-bemc`): every
+/// mutant of a synthetic `Bemc.*` module is judged by K1 PER DECLARATION —
+/// each admission unit carries its own prepared environment, so no mutant's
+/// fate can affect the next and no rejection stops the walk — and the verdict
+/// is joined by FRESH NAME against the pin's verdict table written beside the
+/// olean by the generator. The one fatal cell is pin=reject joined with
+/// FrankenLean=accepted: a soundness-side divergence, reported with the full
+/// row before the assertion fires (plan R7 stop-ship). An
+/// inconclusive is never counted as a rejection: it lands in its own cell and
+/// fails the run as unattributed coverage, not as agreement.
+///
+/// Run with:
+///   FLN_BEMC_ROOT=<dir holding Bemc/...> \
+///   FLN_BEMC_MODULE=Bemc.Init.Data.Nat.Basic \
+///   cargo test -p fln-conformance --test kernel_replay \
+///     bemc_synthetic_module_pin_and_kernel_verdicts_join -- --ignored --exact --nocapture
+#[ignore = "cost: decodes the synthetic module's real import closure; on-demand reject-side join lane (bead fln-kernel-reject-side-at-scale-bemc)"]
+#[test]
+fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
+    let chosen = std::env::var("FLN_BEMC_MODULE")
+        .expect("FLN_BEMC_MODULE must name one synthetic Bemc.* module");
+    let bemc_root = std::env::var("FLN_BEMC_ROOT")
+        .expect("FLN_BEMC_ROOT must name the generator's output root");
+    let reference_lib =
+        reference_lib().expect("pinned toolchain required for the reject-side join");
+    let roots = chosen_set_roots_with_bemc(&reference_lib);
+    let inventory = closure_inventory(&roots, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+    assert!(
+        inventory.missing_imports.is_empty(),
+        "{chosen}: closure has unresolved imports: {:?}",
+        inventory.missing_imports
+    );
+    let PreparedChosenModule { prep, .. } = prepare_chosen_module(&inventory, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+
+    let tsv_path = PathBuf::from(&bemc_root)
+        .join(chosen.replace('.', "/"))
+        .with_extension("tsv");
+    let table = std::fs::read_to_string(&tsv_path).unwrap_or_else(|error| {
+        panic!("read the pin verdict table {}: {error}", tsv_path.display())
+    });
+    let mut pin_verdicts: HashMap<String, (String, String)> = HashMap::new();
+    for line in table.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert!(
+            fields.len() == 5,
+            "verdict table row must have five fields, got {}: {line:?}",
+            fields.len()
+        );
+        pin_verdicts.insert(
+            fields[1].to_string(),
+            (fields[3].to_string(), fields[4].to_string()),
+        );
+    }
+    assert!(
+        !pin_verdicts.is_empty(),
+        "an empty verdict table is a broken generator run, not a clean join"
+    );
+
+    let mut agree_reject = 0u64;
+    let mut agree_accept = 0u64;
+    let mut pin_accept_fln_other: Vec<String> = Vec::new();
+    let mut inconclusive_rows: Vec<String> = Vec::new();
+    let mut fatal_rows: Vec<String> = Vec::new();
+    let mut joined = 0u64;
+    for item in &prep.items {
+        let lead = item.lead.to_display_string();
+        if !lead.contains("_bemc_") {
+            continue;
+        }
+        let Some((pin_verdict, pin_class)) = pin_verdicts.get(&lead) else {
+            panic!(
+                "{lead}: judged unit has no row in the pin verdict table; the join is by name and this name is unjoined"
+            );
+        };
+        joined += 1;
+        let verdict =
+            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
+        let outcome = unit_outcome(item, &verdict);
+        let row = format!(
+            "unit={lead} pin={pin_verdict}:{pin_class} fln={}:{}",
+            outcome.outcome, outcome.message
+        );
+        match (pin_verdict.as_str(), outcome.outcome.as_str()) {
+            ("reject", fln) if fln.starts_with("rejected") => agree_reject += 1,
+            ("accept", "accepted") => agree_accept += 1,
+            ("reject", "accepted") => fatal_rows.push(row),
+            (_, fln) if fln.starts_with("inconclusive") => inconclusive_rows.push(row),
+            _ => pin_accept_fln_other.push(row),
+        }
+    }
+    assert!(
+        joined == pin_verdicts.len() as u64,
+        "the synthetic module judged {joined} mutant units against {} table rows; a mutant \
+         the transport dropped or the decode lost is missing coverage, not agreement",
+        pin_verdicts.len()
+    );
+    eprintln!(
+        "bemc-join module={chosen} joined={joined} agree_reject={agree_reject} \
+         agree_accept={agree_accept} pin_accept_fln_other={} inconclusive={} fatal={}",
+        pin_accept_fln_other.len(),
+        inconclusive_rows.len(),
+        fatal_rows.len()
+    );
+    for row in &pin_accept_fln_other {
+        eprintln!("bemc-row false-rejection-or-divergence {row}");
+    }
+    for row in &inconclusive_rows {
+        eprintln!("bemc-row inconclusive {row}");
+    }
+    for row in &fatal_rows {
+        eprintln!("bemc-row FATAL {row}");
+    }
+    assert!(
+        fatal_rows.is_empty(),
+        "pin-rejected mutants ACCEPTED by FrankenLean — a soundness-side divergence, \
+         stop-ship (plan R7): {} row(s), first: {}",
+        fatal_rows.len(),
+        fatal_rows[0]
+    );
+    assert!(
+        inconclusive_rows.is_empty(),
+        "{} mutant unit(s) inconclusive: unattributed coverage, not agreement; first: {}",
+        inconclusive_rows.len(),
+        inconclusive_rows[0]
+    );
+    assert!(
+        pin_accept_fln_other.is_empty(),
+        "{} unit(s) where the engines disagree without a soundness fatal (false rejection \
+         or class drift); first: {}",
+        pin_accept_fln_other.len(),
+        pin_accept_fln_other[0]
+    );
 }
 
 fn validate_leanchecker_authority_contract(script: &str, findings: &str) -> Result<(), String> {
