@@ -364,8 +364,24 @@ impl Context {
             };
         }
         if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
+            if scope.targets.is_some() && scope.allow_return {
+                // The returning-loop owner supplied an Option result
+                // accumulator. Skip administrative joins, not unchecked source.
+                if !terminal {
+                    return Err(invalid());
+                }
+                let return_type = scope
+                    .targets
+                    .and_then(|targets| targets.return_type.as_ref())
+                    .ok_or_else(invalid)?;
+                return self.expand_loop_return_with_signal(
+                    element,
+                    scope.signal,
+                    Some(return_type),
+                );
+            }
             // A branch may return only when there is no enclosing source
-            // continuation. Loop returns are nonlocal and remain unsupported.
+            // continuation, unless its loop owner supplied a return packet.
             if !scope.allow_return || result.is_some() {
                 return Err(invalid());
             }

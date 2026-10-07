@@ -365,3 +365,206 @@ def generic {M : Type -> Type} [Pure M] [Bind M] [Functor M]
 "#,
     );
 }
+
+#[test]
+fn mixed_return_break_continue_paths_share_the_checked_loop_packet() {
+    execute(
+        &base(),
+        r#"
+def choose (mode : Nat) : Logged Nat := do
+  for n in items do
+    try
+      note n
+      if mode == 0 then
+        break
+      else
+        if mode == 1 then
+          continue
+        else
+          return 42
+    finally
+      note 3
+    note 9
+  note 8
+  return 7
+#eval observed (choose 0)
+#eval observed (choose 1)
+#eval observed (choose 2)
+"#,
+        &["138007", "13238007", "13042"],
+    );
+}
+
+#[test]
+fn return_in_a_handler_exits_the_function_after_cleanup() {
+    execute(
+        &base(),
+        r#"
+def handlerReturn : Logged Nat := do
+  for n in items do
+    try
+      note n
+      (raise (4 : Nat) : Logged PUnit)
+    catch e =>
+      note e
+      return (e + 38)
+    finally
+      note 3
+    note 9
+  return 7
+def cleanupFailure : Logged Nat := do
+  for n in items do
+    try
+      note n
+      return 42
+    finally
+      note 3
+      (raise (5 : Nat) : Logged PUnit)
+    note 9
+  return 7
+#eval observed handlerReturn
+#eval observed cleanupFailure
+"#,
+        &["143042", "13105"],
+    );
+}
+
+#[test]
+fn returns_cross_nested_regions_without_entering_either_suffix() {
+    execute(
+        &base(),
+        r#"
+def nestedReturn : Logged Nat := do
+  for n in items do
+    try
+      note n
+      try
+        note 2
+        return 42
+      finally
+        note 3
+      note 8
+    finally
+      note 4
+    note 9
+  return 7
+#eval observed nestedReturn
+"#,
+        &["1234042"],
+    );
+}
+
+#[test]
+fn owned_return_payloads_survive_loop_and_finalizer_closures() {
+    execute(
+        &base(),
+        r#"
+def owned (text : String) : Logged String := do
+  for n in items do
+    try
+      let payload := String.append text "!"
+      note n
+      return payload
+    finally
+      note 3
+    note 9
+  return "unreachable"
+def measure : Logged Nat := loggedMap (fun s => String.length s) (owned "value")
+#eval observed measure
+"#,
+        &["13006"],
+    );
+}
+
+#[test]
+fn generic_nonlocal_returns_need_no_new_instance_or_trust_primitive() {
+    checked(
+        &base(),
+        r#"
+def genericReturn {M : Type -> Type} [Pure M] [Bind M] [Functor M]
+    [MonadExcept Nat M] [MonadFinally M] {R A : Type} [ForIn M R A]
+    (xs : R) (action : A -> M PUnit) (cleanup : M PUnit) (value : A) : M A := do
+  for x in xs do
+    try
+      action x
+      return x
+    catch e =>
+      continue
+    finally
+      cleanup
+  return value
+"#,
+    );
+}
+
+#[test]
+fn incorrect_return_values_inside_inactive_handlers_are_checked() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        "def bad : Logged Nat := do { for n in items do { try { return true } finally { note n } }; return 7 }",
+        "def bad : Logged Nat := do { for n in items do { try { note n } catch e => { return true } }; return 7 }",
+        "def bad : Logged Nat := do { for n in items do { try { return 42 } finally { return 7 } }; return 7 }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    execute(
+        &engine,
+        "def recovered : Logged Nat := do { for n in items do { try { return 42 } finally { note n } }; return 7 }\n#eval observed recovered",
+        &["1042"],
+    );
+}
+
+#[test]
+fn nested_returning_loops_preserve_the_outermost_result_type() {
+    execute(
+        &base(),
+        r#"
+def nestedLoops : Logged Nat := do
+  for n in items do
+    note n
+    for k in items do
+      try
+        note k
+        return 42
+      finally
+        note 3
+      note 8
+    note 9
+  return 7
+#eval observed nestedLoops
+"#,
+        &["113042"],
+    );
+}
+
+#[test]
+fn pattern_handlers_transport_payload_returns_and_local_breaks() {
+    execute(
+        &base(),
+        r#"
+def patternExit (code : Nat) : Logged Nat := do
+  for n in items do
+    try
+      note n
+      (raise code : Logged PUnit)
+    catch
+    | Nat.zero => break
+    | Nat.succ e => return (e + 39)
+    finally
+      note 3
+    note 8
+  return 7
+#eval observed (patternExit 0)
+#eval observed (patternExit 4)
+"#,
+        &["13007", "13042"],
+    );
+}

@@ -74,6 +74,22 @@ impl Context {
             if kind == &parser_kind(&["Term", "doFor"]) {
                 let parts = expect_node(syntax, kind, 4, "return-carrying loop")?;
                 work.push(&parts[3]);
+            } else if kind == &parser_kind(&["Term", "nativeDoTry"]) {
+                let parts = expect_node(syntax, kind, 2, "retained exception region")?;
+                expect_atom(&parts[1], "returning", "retained exception control")?;
+                work.push(&parts[0]);
+            } else if kind == &parser_kind(&["Term", "doTry"]) {
+                let parts = expect_node(syntax, kind, 4, "return-carrying exception region")?;
+                // Only the protected action and handlers share this return.
+                // Cleanup has its own scope and cannot escape into the loop.
+                work.push(&parts[1]);
+                work.push(&parts[2]);
+            } else if kind == &parser_kind(&["Term", "doCatch"]) {
+                let parts = expect_node(syntax, kind, 5, "return-carrying handler")?;
+                work.push(&parts[4]);
+            } else if kind == &parser_kind(&["Term", "doCatchMatch"]) {
+                let parts = expect_node(syntax, kind, 2, "return-carrying pattern handler")?;
+                work.push(&parts[1]);
             } else if kind == &parser_kind(&["Term", "doIf"]) {
                 let parts = expect_node(syntax, kind, 6, "return-carrying branch")?;
                 work.push(&parts[3]);
@@ -165,6 +181,10 @@ impl Context {
         let (header, sequence) = self.split_for_loop(syntax)?;
         let join = self.do_control_name()?;
         let accumulator = self.do_control_name()?;
+        let return_type = match parent {
+            Some(parent) => parent.targets.return_type.clone().ok_or_else(invalid)?,
+            None => term("nativeDoLoopResultType", vec![join.clone()]),
+        };
         let initial = match parent {
             Some(parent) => parent.accumulator.clone(),
             None => app(
@@ -175,15 +195,17 @@ impl Context {
                         atom("("),
                         ident(Name::from_components(["α"])),
                         atom(":="),
-                        term("nativeDoLoopResultType", vec![join.clone()]),
+                        return_type.clone(),
                         atom(")"),
                     ],
                 )],
             ),
         };
         let normal = call(false, vec![step(false, accumulator.clone())]);
+        let mut targets = control::LoopTargets::new(&normal)?;
+        targets.return_type = Some(return_type);
         let scope = LoopScope {
-            targets: control::LoopTargets::new(&normal)?,
+            targets,
             accumulator: accumulator.clone(),
         };
         Ok((
@@ -205,18 +227,48 @@ impl Context {
         &mut self,
         syntax: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        self.expand_loop_return_with_signal(syntax, false, None)
+    }
+
+    pub(super) fn expand_loop_return_with_signal(
+        &mut self,
+        syntax: Syntax,
+        signal: bool,
+        return_type: Option<&Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         self.tick()?;
         let mut parts = node(syntax, "doReturn", 2)?;
-        let values = children(parts.pop().expect("return payload"))?;
+        let mut values = children(parts.pop().expect("return payload"))?;
         expect_atom(&parts[0], "return", "return keyword")?;
         if values.len() != 1 {
             return Err(invalid());
         }
         // Construct the payload at the return site, not in a delayed thunk.
         // Its expected R comes from the checked Option R accumulator.
+        if let Some(return_type) = return_type {
+            // An all-return protected action need not mention the accumulator.
+            // Use the already-checked outer join to choose Option's parameter,
+            // before the handler's signal match needs its inductive head.
+            values.insert(
+                0,
+                term(
+                    "namedArgument",
+                    vec![
+                        atom("("),
+                        ident(Name::from_components(["α"])),
+                        atom(":="),
+                        return_type.clone(),
+                        atom(")"),
+                    ],
+                ),
+            );
+        }
+        let result = step(true, app(root(&["Option", "some"]), values));
+        // The outer done skips the branch/exception suffix; the inner done
+        // stops ForIn with the value. Both tags survive handlers and cleanup.
         Ok(call(
             false,
-            vec![step(true, app(root(&["Option", "some"]), values))],
+            vec![if signal { step(true, result) } else { result }],
         ))
     }
 
@@ -345,6 +397,79 @@ mod tests {
         };
         let inner = expect_node(payload, &parser_kind(&["Term", "app"]), 2, "some").unwrap();
         assert_eq!(inner[0], root(&["Option", "some"]));
+    }
+
+    #[test]
+    fn exception_return_signals_wrap_the_loop_stop_without_delaying_its_payload() {
+        let hint = term("nativeDoLoopResultType", vec![named("checkedJoin")]);
+        let result = context()
+            .expand_loop_return_with_signal(returning("payload"), true, Some(&hint))
+            .unwrap();
+        assert_eq!(count(&result, "payload"), 1);
+        assert_eq!(count(&result, "checkedJoin"), 1);
+        let pure = expect_node(
+            &result,
+            &parser_kind(&["Term", "nativeDoPure"]),
+            1,
+            "signal",
+        )
+        .unwrap();
+        let signal =
+            expect_node(&pure[0], &parser_kind(&["Term", "app"]), 2, "outer done").unwrap();
+        assert_eq!(signal[0], root(&["ForInStep", "done"]));
+        let [loop_stop] = expect_null_args(&signal[1], "loop stop").unwrap() else {
+            panic!("one stop")
+        };
+        let stop = expect_node(loop_stop, &parser_kind(&["Term", "app"]), 2, "inner done").unwrap();
+        assert_eq!(stop[0], root(&["ForInStep", "done"]));
+    }
+
+    #[test]
+    fn return_discovery_crosses_handlers_but_not_cleanup_or_action_values() {
+        let retained = |body, catches, cleanup| {
+            term(
+                "nativeDoTry",
+                vec![
+                    term(
+                        "doTry",
+                        vec![atom("try"), body, null(catches), null(cleanup)],
+                    ),
+                    atom("returning"),
+                ],
+            )
+        };
+        let ordinary = || sequence(vec![term("doExpr", vec![named("action")])]);
+        let handler = term(
+            "doCatch",
+            vec![
+                atom("catch"),
+                named("e"),
+                null(vec![]),
+                atom("=>"),
+                sequence(vec![returning("payload")]),
+            ],
+        );
+        assert!(
+            context()
+                .loop_has_return(&retained(ordinary(), vec![handler], vec![]))
+                .unwrap()
+        );
+        let cleanup = term(
+            "doFinally",
+            vec![atom("finally"), sequence(vec![returning("ownReturn")])],
+        );
+        let independent = sequence(vec![term(
+            "doExpr",
+            vec![term(
+                "do",
+                vec![atom("do"), sequence(vec![returning("ownReturn")])],
+            )],
+        )]);
+        assert!(
+            !context()
+                .loop_has_return(&retained(independent, vec![], vec![cleanup]))
+                .unwrap()
+        );
     }
     #[test]
     fn nested_loops_keep_each_collection_value_and_source_suffix_once() {

@@ -172,6 +172,21 @@ impl Context {
         suffix: Option<Syntax>,
         targets: Option<&control::LoopTargets>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        let scope = SequenceScope {
+            targets,
+            signal: false,
+            require_unit: targets.is_some(),
+            allow_return: targets.is_none() && suffix.is_none(),
+        };
+        self.expand_do_conditional_in_scope(syntax, suffix, scope)
+    }
+
+    pub(super) fn expand_do_conditional_in_scope(
+        &mut self,
+        syntax: Syntax,
+        suffix: Option<Syntax>,
+        scope: SequenceScope<'_>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task<'a> {
             Conditional(Syntax, Option<Syntax>, SequenceScope<'a>),
             Finish(Header, usize, Option<Syntax>, SequenceScope<'a>),
@@ -179,15 +194,9 @@ impl Context {
             Resume(Block<'a>),
             Value(Syntax),
         }
-        if targets.is_some() && suffix.is_none() {
+        if scope.targets.is_some() && suffix.is_none() {
             return Err(invalid());
         }
-        let scope = SequenceScope {
-            targets,
-            signal: false,
-            require_unit: targets.is_some(),
-            allow_return: targets.is_none() && suffix.is_none(),
-        };
         let mut tasks = vec![Task::Conditional(syntax, suffix, scope)];
         let mut values = Vec::new();
         while let Some(task) = tasks.pop() {
@@ -200,7 +209,8 @@ impl Context {
                         targets: scope.targets,
                         signal: scope.targets.is_some(),
                         require_unit: scope.require_unit || suffix.is_some(),
-                        allow_return: scope.allow_return && suffix.is_none(),
+                        allow_return: scope.allow_return
+                            && (scope.targets.is_some() || suffix.is_none()),
                     };
                     tasks.push(Task::Finish(branches.header, values.len(), suffix, scope));
                     for arm in branches.arms.into_iter().rev() {

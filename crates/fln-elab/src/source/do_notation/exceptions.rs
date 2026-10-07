@@ -322,7 +322,7 @@ impl Context {
             // The branch worklist transports all three loop outcomes through
             // the entire handler chain. Its join dispatches only afterwards,
             // keeping the source suffix outside the handler's dynamic extent.
-            return self.expand_do_conditional(syntax, suffix, scope.targets);
+            return self.expand_do_conditional_in_scope(syntax, suffix, scope);
         }
         let mut parts = node(syntax, "nativeDoTry", 2)?;
         let flag = parts.pop().expect("exception control flag");

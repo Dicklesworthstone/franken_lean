@@ -292,6 +292,17 @@ impl Preparation<'_> {
     /// record may contain closures whose arguments/results contain more data;
     /// alternating those types must not alternate recursive Rust calls.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
+        self.tick()?;
+        // These exact keys already passed representation discovery. Repeated
+        // capture sites need not re-erase the same registered telescope. Keep
+        // scalar name recognition below normalization: a familiar name alone
+        // is not a cached record or callback representation.
+        if let Some(value) = self.value_types.closures.get(source) {
+            return Ok(Some(*value));
+        }
+        if self.value_types.records.contains(source) {
+            return Ok(Some(ValueType::Constructor));
+        }
         let source = self.erase_data_indices(source)?;
         if let Some((value, _)) = executable_value_type(&source, &self.value_types) {
             return Ok(Some(value));
@@ -912,6 +923,80 @@ mod closure_fields_tests {
                 ),
             )
         })
+    }
+
+    #[test]
+    fn registered_record_and_callback_lookups_are_exact_and_metered() {
+        let engine = box_engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let record = alternating_type(1);
+        assert_eq!(
+            prep.value_type(&record).unwrap(),
+            Some(ValueType::Constructor)
+        );
+        let ExprNode::App { a: callback, .. } = record.node() else {
+            panic!("Box callback")
+        };
+        let expected = prep.value_type(callback).unwrap();
+        assert!(matches!(expected, Some(ValueType::Closure(_))));
+        let constructors = prep.constructors.clone();
+        let interfaces = prep.interfaces.clone();
+        // Rebuild equal keys, rather than requiring the same allocation.
+        for input in [alternating_type(1), callback.clone()] {
+            let start = prep.visited;
+            prep.limits.max_nodes = start + 1;
+            assert_eq!(
+                prep.value_type(&input).unwrap(),
+                if input == record {
+                    Some(ValueType::Constructor)
+                } else {
+                    expected
+                }
+            );
+            assert_eq!(prep.visited, start + 1);
+            assert!(matches!(
+                prep.value_type(&input),
+                Err(IngressError::ResourceLimit {
+                    resource: IngressResource::Nodes,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(prep.constructors, constructors);
+        assert_eq!(prep.interfaces, interfaces);
+    }
+
+    #[test]
+    fn a_different_callback_telescope_is_not_a_cache_hit_even_after_exhaustion() {
+        let engine = box_engine();
+        let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+        let callback = |result| {
+            Expr::forall_e(
+                Name::anonymous(),
+                Expr::const_(name("Nat"), vec![]),
+                Expr::const_(name(result), vec![]),
+                BinderInfo::Default,
+            )
+        };
+        let registered = callback("Nat");
+        let changed = callback("String");
+        let original = prep.value_type(&registered).unwrap();
+        let interfaces = prep.interfaces.clone();
+        prep.limits.max_nodes = prep.visited + 1;
+        assert!(matches!(
+            prep.value_type(&changed),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+        assert!(!prep.value_types.closures.contains_key(&changed));
+        assert_eq!(prep.interfaces, interfaces);
+        prep.limits = IngressLimits::default();
+        assert_eq!(prep.value_type(&registered).unwrap(), original);
+        let discovered = prep.value_type(&changed).unwrap();
+        assert!(matches!(discovered, Some(ValueType::Closure(_))));
+        assert_ne!(discovered, original);
     }
 
     #[test]
