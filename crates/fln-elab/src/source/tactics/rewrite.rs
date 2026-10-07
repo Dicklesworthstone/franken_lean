@@ -109,33 +109,36 @@ impl Context {
             if !self.proof_types_match_with_budget(&alpha_nf, &beta_nf, budget)? {
                 return Ok(None);
             }
-            let left = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
-            let right = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
-            if !self.proof_types_match_with_budget(&left, &right, budget)?
+            let left_nf = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
+            let right_nf = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
+            if !self.proof_types_match_with_budget(&left_nf, &right_nf, budget)?
                 && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
             {
                 return Ok(None);
             }
             return Ok(Some(app(
                 Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
-                [alpha, left],
+                [alpha, left_nf],
             )));
         }
         let Some((level, alpha, left, right)) = equality_target(&target) else {
             return Ok(None);
         };
-        let left = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
-        let right = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
+        // The arithmetic walk reads class terms by shape, so it gets the sides as
+        // elaborated: abbreviation WHNF leaves `HAdd.hAdd …` as a projection stuck
+        // on an `ImplicitReducible` instance, a shape it cannot read.
+        let left_nf = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
+        let right_nf = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
         let mut budget = UnificationBudget::new(self.kernel);
         budget.zeta_delta = zeta_delta;
-        if !self.proof_types_match_with_budget(&left, &right, budget)?
+        if !self.proof_types_match_with_budget(&left_nf, &right_nf, budget)?
             && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
         {
             return Ok(None);
         }
         Ok(Some(app(
             Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
-            [alpha, left],
+            [alpha, left_nf],
         )))
     }
 
@@ -145,10 +148,17 @@ impl Context {
     /// automatic closure's reducible transparency. Final admission checks both seats.
     ///
     /// Numerals and operators are elaborated as their class terms
-    /// (`OfNat.ofNat Nat 2 (instOfNatNat 2)`, `HAdd.hAdd Nat Nat Nat ...`), so an
-    /// application whose head is not an exact primitive is unfolded with the
-    /// same abbreviation transparency as the operands; it qualifies only if
-    /// that exposes a primitive, a literal, or another reducible application.
+    /// (`OfNat.ofNat Nat 2 (instOfNatNat 2)`, `HAdd.hAdd Nat Nat Nat ...`). Those
+    /// are read by shape, as the pin's `evalNat` and its Nat simprocs read them:
+    /// an `OfNat.ofNat Nat` numeral, a Nat-typed heterogeneous operator, or
+    /// `Nat.succ` contributes its operands, and K1 below decides the equation
+    /// through whatever instance the term carries. Unfolding cannot stand in for
+    /// this. The effective reducibility table makes every native instance
+    /// `ImplicitReducible`, which abbreviation transparency leaves folded, and
+    /// instance transparency would also unfold `Nat.add`, whose status at the pin
+    /// is the same. Any other application is unfolded at abbreviation
+    /// transparency and qualifies only if that exposes one of these, so an
+    /// ordinary definition stays opaque, as at the pin.
     fn rewrite_arithmetic_reflexivity(
         &mut self,
         goal: &ProofGoal,
@@ -191,6 +201,12 @@ impl Context {
                     if levels.is_empty() && self.exact_nat_intrinsic(name) =>
                 {
                     work.extend(arguments);
+                }
+                ExprNode::Const { name, .. }
+                    if nat_arithmetic_operands(name, &arguments).is_some() =>
+                {
+                    let operands = nat_arithmetic_operands(name, &arguments).unwrap_or_default();
+                    work.extend(operands.iter().map(|&index| arguments[index].clone()));
                 }
                 _ => {
                     let reduced = self.whnf_with_transparency(
@@ -592,6 +608,49 @@ impl Context {
 }
 fn app<const N: usize>(head: Expr, args: [Expr; N]) -> Expr {
     args.into_iter().fold(head, Expr::app)
+}
+
+/// The operand positions of a Nat arithmetic class term, read by shape as the
+/// pin's `evalNat` and Nat simprocs read it. `arguments` is innermost-first, as
+/// the walk collects it:
+/// - `OfNat.ofNat Nat n _` gives `n`;
+/// - a heterogeneous operator at `Nat Nat Nat` gives both operands;
+/// - `Nat.succ n` gives `n`.
+///
+/// The instance is not inspected. K1 decides the equation through whichever
+/// instance the term carries, so a nonstandard one makes the check fail.
+fn nat_arithmetic_operands(name: &Name, arguments: &[Expr]) -> Option<&'static [usize]> {
+    let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    const OPERATORS: [[&str; 2]; 11] = [
+        ["HAdd", "hAdd"],
+        ["HSub", "hSub"],
+        ["HMul", "hMul"],
+        ["HDiv", "hDiv"],
+        ["HMod", "hMod"],
+        ["HPow", "hPow"],
+        ["HAnd", "hAnd"],
+        ["HOr", "hOr"],
+        ["HXor", "hXor"],
+        ["HShiftLeft", "hShiftLeft"],
+        ["HShiftRight", "hShiftRight"],
+    ];
+    if name == &Name::from_components(["OfNat", "ofNat"])
+        && arguments.len() == 3
+        && arguments[2] == nat
+    {
+        Some(&[1])
+    } else if OPERATORS
+        .iter()
+        .any(|operator| name == &Name::from_components(*operator))
+        && arguments.len() == 6
+        && arguments[3..].iter().all(|type_| type_ == &nat)
+    {
+        Some(&[0, 1])
+    } else if name == &Name::from_components(["Nat", "succ"]) && arguments.len() == 1 {
+        Some(&[0])
+    } else {
+        None
+    }
 }
 fn children(expr: &Expr) -> [Option<&Expr>; 3] {
     match expr.node() {
