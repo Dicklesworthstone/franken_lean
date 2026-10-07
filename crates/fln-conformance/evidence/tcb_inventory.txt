@@ -12,10 +12,10 @@ schema fln.tcb-inventory/2
 root fln_kernel::check
 crate fln_bignum items=85
 crate fln_core items=164
-crate fln_env items=83
+crate fln_env items=85
 crate fln_hash items=64
-crate fln_kernel items=282
-total items=678 adjacent-items=396
+crate fln_kernel items=291
+total items=689 adjacent-items=398
 budget adjacent-items<=400
 item fln_bignum <fln_bignum::nat::BigNat as core::clone::Clone>::clone
 item fln_bignum <fln_bignum::nat::BigNat as core::cmp::Ord>::cmp
@@ -295,7 +295,9 @@ item fln_env <fln_env::environment::Environment as core::clone::Clone>::clone
 item fln_env <fln_env::environment::Environment>::contains
 item fln_env <fln_env::environment::Environment>::decl_content_digest_and_len
 item fln_env <fln_env::environment::Environment>::find
+item fln_env <fln_env::environment::Environment>::measure_declaration
 item fln_env <fln_env::environment::Environment>::plan_add_decl
+item fln_env <fln_env::environment::Environment>::plan_measured_decl
 item fln_env <fln_env::environment::Environment>::write_decl_content
 item fln_env <fln_env::environment::PreparedDeclarationAdmission>::commit
 item fln_env <fln_env::environment::PreparedDeclarationAdmission>::is_valid_for
@@ -465,6 +467,15 @@ item fln_kernel <fln_kernel::admit::NestedState>::restore_ctor_name
 item fln_kernel <fln_kernel::tc::DependencyScanRefusal>::blocks
 item fln_kernel <fln_kernel::tc::DependencyScanSeen>::admit
 item fln_kernel <fln_kernel::tc::DependencyScanSeen>::new
+item fln_kernel <fln_kernel::tc::DetHashState as core::default::Default>::default
+item fln_kernel <fln_kernel::tc::DetHashState as core::hash::BuildHasher>::build_hasher
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::finish
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::write
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::write_u32
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::write_u64
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::write_u8
+item fln_kernel <fln_kernel::tc::DetHasher as core::hash::Hasher>::write_usize
+item fln_kernel <fln_kernel::tc::DetHasher>::add
 item fln_kernel <fln_kernel::tc::ExprResultCache>::bounded
 item fln_kernel <fln_kernel::tc::ExprResultCache>::get
 item fln_kernel <fln_kernel::tc::ExprResultCache>::insert

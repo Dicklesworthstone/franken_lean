@@ -22,7 +22,7 @@
 //! explicit depth converted to typed exhaustion, and all typing/reduction work
 //! runs through budget-metered [`TypeChecker`] instances.
 
-use std::collections::HashMap;
+use crate::tc::KMap;
 
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
@@ -1706,13 +1706,12 @@ impl<'a> Engine<'a> {
                 inner: u32,
             },
         }
-        let lookup =
-            |done: &HashMap<(usize, u32), Expr>, child: &Expr, inner: u32| -> KResult<Expr> {
-                done.get(&(child.allocation_identity(), inner))
-                    .cloned()
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-            };
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, inner: u32| -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), inner))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             inner,
@@ -2204,12 +2203,12 @@ impl<'a> Engine<'a> {
             Enter(Expr),
             Finish(Expr),
         }
-        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
             done.get(&child.allocation_identity())
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter(e.clone())];
         let mut nodes = 0usize;
         while let Some(op) = stack.pop() {
@@ -2462,12 +2461,12 @@ pub(crate) fn lower_param_expr(
         Enter { e: Expr, bound: u32 },
         Finish { e: Expr, bound: u32 },
     }
-    let lookup = |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+    let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
         done.get(&(child.allocation_identity(), bound))
             .cloned()
             .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     };
-    let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+    let mut done: KMap<(usize, u32), Expr> = KMap::default();
     let mut stack = vec![Op::Enter {
         e: e.clone(),
         bound: bound_inside_arg,

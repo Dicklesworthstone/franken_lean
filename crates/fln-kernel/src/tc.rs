@@ -39,6 +39,93 @@ use fln_env::environment::Environment;
 
 use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
 
+/// Deterministic multiplicative hasher for the kernel's internal maps.
+///
+/// `std`'s default `RandomState` runs SipHash-1-3 under per-process random
+/// seeds. Measured on the release corpus replay (bead
+/// `franken_lean-z8j.1.13`, comment 3322), that hashing was 29% of kernel
+/// wall clock — more than the whnf/defeq/infer decision logic combined — and
+/// the randomization buys nothing HERE: every hot key's entropy source is
+/// the pin-faithful packed structural hash or an allocation address, and the
+/// structural hash is attacker-predictable by construction (the pin computes
+/// it identically), so an adversarial artifact can already choose colliding
+/// KEYS below any seeding of the table's slot function. Collision floods are
+/// therefore handled where they must be handled either way: the §8.2c step
+/// budget turns quadratic probing into a typed `Inconclusive`, never a hang
+/// (FL-INV-07). A fixed hasher also removes per-process seed state from the
+/// kernel, so two runs of one input probe identically.
+///
+/// The mixer is the word-at-a-time rotate/multiply fold rustc's FxHash uses,
+/// chosen for measured cheapness on small integer keys; it is a performance
+/// surface only. Correctness never depends on its distribution: every map
+/// lookup still compares full keys on candidate slots, so a poor mix can
+/// cost steps and wall, never an answer.
+///
+/// Private to `fln_kernel` by design: the independent checker must not share
+/// this code (the dual-engine argument depends on not sharing it), and
+/// nothing outside the kernel can observe it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DetHashState;
+
+pub(crate) struct DetHasher {
+    hash: u64,
+}
+
+const DET_HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+impl DetHasher {
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(DET_HASH_MULTIPLIER);
+    }
+}
+
+impl std::hash::Hasher for DetHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.add(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(tail) ^ rest.len() as u64);
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+impl std::hash::BuildHasher for DetHashState {
+    type Hasher = DetHasher;
+
+    fn build_hasher(&self) -> DetHasher {
+        DetHasher { hash: 0 }
+    }
+}
+
+/// Kernel-internal map on the deterministic hasher. Hit and miss are decided
+/// by key equality, never by the hasher, so this alias changes cost and
+/// nothing else.
+pub(crate) type KMap<K, V> = HashMap<K, V, DetHashState>;
+
 /// Internal control flow: a real rejection or a budget stop. Never observable
 /// outside `check`/`check_defeq`, which convert to [`Verdict`].
 #[derive(Debug)]
@@ -200,16 +287,16 @@ struct LocalDecl {
 /// degraded mode too, while ordinary large terms keep their cache rows
 /// instead of poisoning a permanent refusal key (bead `franken_lean-shgs`).
 struct DependencyScanSeen {
-    structural: HashMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
-    allocations: HashMap<usize, ()>,
+    structural: KMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
+    allocations: KMap<usize, ()>,
     degraded: bool,
 }
 
 impl DependencyScanSeen {
     fn new() -> Self {
         Self {
-            structural: HashMap::new(),
-            allocations: HashMap::new(),
+            structural: KMap::default(),
+            allocations: KMap::default(),
             degraded: false,
         }
     }
@@ -269,8 +356,8 @@ impl DependencyScanSeen {
 /// memo stays bounded.
 #[derive(Default)]
 struct FreeVars {
-    rows: HashMap<usize, (Expr, Rc<[u32]>)>,
-    index: HashMap<FVarId, u32>,
+    rows: KMap<usize, (Expr, Rc<[u32]>)>,
+    index: KMap<FVarId, u32>,
     ids: Vec<FVarId>,
 }
 
@@ -416,7 +503,7 @@ enum DependencyScanRefusal {
 
 impl DependencyScanRefusal {
     /// `true` while this row must still suppress reuse in this context.
-    fn blocks(&self, local_positions: &HashMap<FVarId, usize>) -> bool {
+    fn blocks(&self, local_positions: &KMap<FVarId, usize>) -> bool {
         match self {
             Self::Permanent | Self::CellCap => true,
             Self::MissingFvar(id) => !local_positions.contains_key(id),
@@ -429,7 +516,7 @@ impl DependencyScanRefusal {
 fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
-    seen_ids: &mut HashMap<u32, ()>,
+    seen_ids: &mut KMap<u32, ()>,
     scan: (&mut FreeVars, &mut DependencyScanSeen),
     nodes_left: &mut usize,
 ) -> bool {
@@ -457,13 +544,13 @@ fn collect_fvar_ids(
 fn local_dependencies(
     expressions: &[&Expr],
     locals: &[LocalDecl],
-    local_positions: &HashMap<FVarId, usize>,
+    local_positions: &KMap<FVarId, usize>,
     free_vars: &mut FreeVars,
     nodes_left: &mut usize,
 ) -> Result<Vec<LocalDependency>, DependencyScanRefusal> {
     free_vars.start_scan();
     let mut ids = Vec::new();
-    let mut seen_ids = HashMap::new();
+    let mut seen_ids = KMap::default();
     let mut seen_nodes = DependencyScanSeen::new();
     for expression in expressions {
         let scan = (&mut *free_vars, &mut seen_nodes);
@@ -519,7 +606,7 @@ fn local_dependencies(
 fn dependencies_are_live(
     dependencies: &[LocalDependency],
     locals: &[LocalDecl],
-    local_positions: &HashMap<FVarId, usize>,
+    local_positions: &KMap<FVarId, usize>,
 ) -> bool {
     dependencies.iter().all(|dependency| {
         local_positions
@@ -543,7 +630,7 @@ fn dependencies_are_present(dependencies: &[LocalDependency], locals: &[LocalDec
 /// generation is never reused, so such a row can never be live again: it only
 /// holds dependency cells. Returns the rows and cells removed.
 fn remove_dead_rows<K, E>(
-    buckets: &mut HashMap<K, Vec<E>>,
+    buckets: &mut KMap<K, Vec<E>>,
     locals: &[LocalDecl],
     dependencies: impl Fn(&E) -> &[LocalDependency],
 ) -> (usize, usize) {
@@ -581,12 +668,12 @@ struct ExprResultCacheEntry {
 type ExprResultCrossScopeEntry = (Expr, usize);
 
 struct ExprResultCache {
-    buckets: HashMap<(u64, usize), Vec<ExprResultCacheEntry>>,
-    cross_scope: HashMap<u64, Vec<ExprResultCrossScopeEntry>>,
+    buckets: KMap<(u64, usize), Vec<ExprResultCacheEntry>>,
+    cross_scope: KMap<u64, Vec<ExprResultCrossScopeEntry>>,
     priority_results: Vec<ExprResultCacheEntry>,
-    priority_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
+    priority_scan_refusals: KMap<(u64, usize), DependencyScanRefusal>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
+    dependency_scan_refusals: KMap<(u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -618,12 +705,12 @@ impl ExprResultCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
-            cross_scope: HashMap::new(),
+            buckets: KMap::default(),
+            cross_scope: KMap::default(),
             priority_results: Vec::new(),
-            priority_scan_refusals: HashMap::new(),
+            priority_scan_refusals: KMap::default(),
             cross_scope_entries: 0,
-            dependency_scan_refusals: HashMap::new(),
+            dependency_scan_refusals: KMap::default(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -643,7 +730,7 @@ impl ExprResultCache {
         &self,
         key: &Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) -> Option<Expr> {
         if let Some(value) = self.priority_results.iter().find_map(|entry| {
             (entry.key == *key
@@ -721,7 +808,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.insert_with_collision_policy(key, value, locals, local_positions, false);
     }
@@ -735,7 +822,7 @@ impl ExprResultCache {
         &mut self,
         identity: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         let lookup = identity.clone();
         self.insert_with_collision_policy(
@@ -759,7 +846,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.insert(key.clone(), value.clone(), locals, local_positions);
         if self.get(&key, locals, local_positions).is_none() {
@@ -772,7 +859,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         let mut removed_cells = 0_usize;
         self.priority_results.retain(|entry| {
@@ -864,7 +951,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
         replace_collision: bool,
     ) {
         self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
@@ -1067,10 +1154,10 @@ impl ExprResultCache {
 }
 
 struct PositiveDefEqCache {
-    buckets: HashMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
-    cross_scope: HashMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
+    buckets: KMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
+    cross_scope: KMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, u64, usize), DependencyScanRefusal>,
+    dependency_scan_refusals: KMap<(u64, u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -1100,10 +1187,10 @@ impl PositiveDefEqCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
-            cross_scope: HashMap::new(),
+            buckets: KMap::default(),
+            cross_scope: KMap::default(),
             cross_scope_entries: 0,
-            dependency_scan_refusals: HashMap::new(),
+            dependency_scan_refusals: KMap::default(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -1135,7 +1222,7 @@ impl PositiveDefEqCache {
         left: &Expr,
         right: &Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) -> bool {
         let matches = |bucket: &Vec<PositiveDefEqCacheEntry>| {
             bucket.iter().any(|entry| {
@@ -1227,7 +1314,7 @@ impl PositiveDefEqCache {
         left: Expr,
         right: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
         if (left.has_fvar() || right.has_fvar())
@@ -1426,7 +1513,7 @@ type InstantiateCacheKey = (u64, u32, u64);
 type InstantiateCacheEntry = (Expr, u32, Expr, Expr);
 
 struct InstantiateCache {
-    buckets: HashMap<InstantiateCacheKey, Vec<InstantiateCacheEntry>>,
+    buckets: KMap<InstantiateCacheKey, Vec<InstantiateCacheEntry>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1442,7 +1529,7 @@ impl InstantiateCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries,
             max_bucket_entries,
@@ -1500,7 +1587,7 @@ type InstantiateRevCacheKey = (u64, u32);
 type InstantiateRevCacheEntry = (Expr, u32, Expr);
 
 struct InstantiateRevCache {
-    buckets: HashMap<InstantiateRevCacheKey, Vec<InstantiateRevCacheEntry>>,
+    buckets: KMap<InstantiateRevCacheKey, Vec<InstantiateRevCacheEntry>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1509,7 +1596,7 @@ struct InstantiateRevCache {
 impl InstantiateRevCache {
     fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries: TYPE_CHECKER_CACHE_MAX_ENTRIES,
             max_bucket_entries: TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
@@ -1561,9 +1648,9 @@ struct InstantiateRevContext {
 /// reuse results reached from a different top-level body under that vector.
 /// Full structural equality is the authority after every packed prefilter.
 struct InstantiateRevContextCache {
-    contexts: HashMap<(u64, usize), Vec<InstantiateRevContext>>,
+    contexts: KMap<(u64, usize), Vec<InstantiateRevContext>>,
     context_count: usize,
-    results: HashMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
+    results: KMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
     entries: usize,
     argument_cells: usize,
     max_contexts: usize,
@@ -1583,9 +1670,9 @@ impl InstantiateRevContextCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize, max_argument_cells: usize) -> Self {
         Self {
-            contexts: HashMap::new(),
+            contexts: KMap::default(),
             context_count: 0,
-            results: HashMap::new(),
+            results: KMap::default(),
             entries: 0,
             argument_cells: 0,
             max_contexts: max_entries.min(4_096),
@@ -1681,9 +1768,9 @@ struct LParamContext {
 }
 
 struct InstantiateLParamsCache {
-    contexts: HashMap<(u64, u64, usize, usize), Vec<LParamContext>>,
+    contexts: KMap<(u64, u64, usize, usize), Vec<LParamContext>>,
     context_count: usize,
-    results: HashMap<(u32, u64), Vec<(Expr, Expr)>>,
+    results: KMap<(u32, u64), Vec<(Expr, Expr)>>,
     entries: usize,
     max_contexts: usize,
     max_entries: usize,
@@ -1700,9 +1787,9 @@ impl InstantiateLParamsCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            contexts: HashMap::new(),
+            contexts: KMap::default(),
             context_count: 0,
-            results: HashMap::new(),
+            results: KMap::default(),
             entries: 0,
             max_contexts: max_entries.min(1_024),
             max_entries,
@@ -1810,7 +1897,7 @@ impl InstantiateLParamsCache {
 }
 
 struct RecursorMajorCache {
-    buckets: HashMap<u64, Vec<(Name, Option<Name>)>>,
+    buckets: KMap<u64, Vec<(Name, Option<Name>)>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1819,7 +1906,7 @@ struct RecursorMajorCache {
 impl RecursorMajorCache {
     fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries: 1_024,
             max_bucket_entries: TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
@@ -1877,7 +1964,7 @@ pub(crate) struct TypeChecker<'a> {
     env: &'a Environment,
     lparams: &'a [Name],
     locals: Vec<LocalDecl>,
-    local_positions: HashMap<FVarId, usize>,
+    local_positions: KMap<FVarId, usize>,
     fresh: u64,
     next_local_generation: Option<u64>,
     budget: Budget,
@@ -1907,13 +1994,13 @@ pub(crate) struct TypeChecker<'a> {
     positive_def_eq_cache: PositiveDefEqCache,
     /// Landed lazy-delta outcome memo (bead `fln-4hol` item 2): bounded,
     /// refuse-not-evict, replay-gated by live dependencies; see consts.
-    lazy_delta_outcomes: HashMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
+    lazy_delta_outcomes: KMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
     lazy_delta_outcome_rows: usize,
     lazy_delta_outcome_scan_nodes: u64,
     lazy_delta_replay_hits: u64,
     /// Landed major-coercion outcome memo (bead `fln-4hol` item 2, site 0):
     /// bounded, refuse-not-evict, replay-gated by live dependencies.
-    major_coercion_outcomes: HashMap<(u64, u64), Vec<MajorCoercionEntry>>,
+    major_coercion_outcomes: KMap<(u64, u64), Vec<MajorCoercionEntry>>,
     major_coercion_outcome_rows: usize,
     major_coercion_scan_nodes: u64,
     major_coercion_replay_hits: u64,
@@ -1957,7 +2044,7 @@ impl<'a> TypeChecker<'a> {
             env,
             lparams,
             locals: Vec::new(),
-            local_positions: HashMap::new(),
+            local_positions: KMap::default(),
             fresh: 0,
             next_local_generation: Some(1),
             budget,
@@ -1968,13 +2055,13 @@ impl<'a> TypeChecker<'a> {
             whnf_core_cache: ExprResultCache::rolling(),
             whnf_core_cheap_sensitive_cache: ExprResultCache::rolling(),
             cheap_proj_events: 0,
-            major_coercion_outcomes: HashMap::new(),
+            major_coercion_outcomes: KMap::default(),
             major_coercion_outcome_rows: 0,
             major_coercion_scan_nodes: 0,
             major_coercion_replay_hits: 0,
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
-            lazy_delta_outcomes: HashMap::new(),
+            lazy_delta_outcomes: KMap::default(),
             lazy_delta_outcome_rows: 0,
             lazy_delta_outcome_scan_nodes: 0,
             lazy_delta_replay_hits: 0,
@@ -2115,7 +2202,7 @@ impl<'a> TypeChecker<'a> {
                 lifted: Option<Expr>,
             },
         }
-        let lookup = |done: &HashMap<(usize, u32, usize), Expr>,
+        let lookup = |done: &KMap<(usize, u32, usize), Expr>,
                       child: &Expr,
                       k: u32,
                       subst: &Expr|
@@ -2124,7 +2211,7 @@ impl<'a> TypeChecker<'a> {
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<(usize, u32, usize), Expr> = HashMap::new();
+        let mut done: KMap<(usize, u32, usize), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             k,
@@ -2388,15 +2475,14 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, bound: u32, depth: u32 },
             Finish { e: Expr, bound: u32 },
         }
-        let lookup =
-            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
-                done.get(&(child.allocation_identity(), bound))
-                    .cloned()
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-            };
+        let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), bound))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
         let count =
             u32::try_from(fvars.len()).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             bound,
@@ -2638,12 +2724,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, depth: u32 },
             Finish { e: Expr },
         }
-        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
             done.get(&child.allocation_identity())
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             depth,
@@ -5468,7 +5554,7 @@ impl<'a> TypeChecker<'a> {
         let result = (|| {
             let mut current = e.clone();
             let mut opened_fvars = Vec::new();
-            let mut ordinals = HashMap::new();
+            let mut ordinals = KMap::default();
             let mut binders: Vec<(Name, Expr, BinderInfo, FVarId)> = Vec::new();
             while let ExprNode::Lam {
                 binder_name,
@@ -5633,7 +5719,7 @@ impl<'a> TypeChecker<'a> {
     fn abstract_fvar_set(
         &mut self,
         e: &Expr,
-        ordinals: &HashMap<FVarId, u32>,
+        ordinals: &KMap<FVarId, u32>,
         active: u32,
         bound: u32,
         depth: u32,
@@ -5645,13 +5731,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, bound: u32, depth: u32 },
             Finish { e: Expr, bound: u32 },
         }
-        let lookup =
-            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
-                done.get(&(child.allocation_identity(), bound))
-                    .cloned()
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-            };
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), bound))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             bound,
@@ -5842,12 +5927,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, depth: u32 },
             Finish { e: Expr },
         }
-        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
             done.get(&child.allocation_identity())
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             depth,
@@ -6925,7 +7010,7 @@ fn substitute_level(level: &Level, params: &[Name], levels: &[Level]) -> Level {
     if !level.has_param() {
         return level.clone();
     }
-    let mut done: HashMap<Level, Level> = HashMap::new();
+    let mut done: KMap<Level, Level> = KMap::default();
     let mut stack = vec![(level.clone(), false)];
     while let Some((current, exit)) = stack.pop() {
         if done.contains_key(&current) {
@@ -7373,7 +7458,7 @@ mod tests {
         for _ in 0..400 {
             expr = Expr::app(expr, fvar.clone());
         }
-        let mut ordinals = HashMap::new();
+        let mut ordinals = KMap::default();
         ordinals.insert(id, 0);
         let result = tc
             .abstract_fvar_set(&expr, &ordinals, 1, 0, 0)
@@ -10905,9 +10990,9 @@ mod tests {
         };
 
         let mut ordinary = seed_collision();
-        ordinary.insert(redex.clone(), redex.clone(), &[], &HashMap::new());
+        ordinary.insert(redex.clone(), redex.clone(), &[], &KMap::default());
         assert!(
-            ordinary.get(&redex, &[], &HashMap::new()).is_none()
+            ordinary.get(&redex, &[], &KMap::default()).is_none()
                 && ordinary.entries == 1
                 && ordinary.cross_scope_entries == 1,
             "ordinary collision saturation must remain a bounded cache miss"
@@ -11150,16 +11235,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for key in &keys {
-            cache.insert_reduction_result(key.clone(), value.clone(), &[], &HashMap::new());
+            cache.insert_reduction_result(key.clone(), value.clone(), &[], &KMap::default());
         }
 
         assert!(
             cache.entries == 0
                 && cache.priority_results.len() == TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS
-                && cache.get(&keys[0], &[], &HashMap::new()).is_none()
-                && cache.get(&keys[1], &[], &HashMap::new()) == Some(value.clone())
-                && cache.get(keys.last().expect("one overflow row"), &[], &HashMap::new())
-                    == Some(value)
+                && cache.get(&keys[0], &[], &KMap::default()).is_none()
+                && cache.get(&keys[1], &[], &KMap::default()) == Some(value.clone())
+                && cache.get(
+                    keys.last().expect("one overflow row"),
+                    &[],
+                    &KMap::default()
+                ) == Some(value)
                 && cache.priority_next_replacement == 1,
             "the first overflow must replace exactly the oldest reserved row without widening the bound"
         );
