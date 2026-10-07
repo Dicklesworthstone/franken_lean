@@ -28,6 +28,24 @@ pub(super) fn nat_add_matches(
     Ok(true)
 }
 
+pub(super) fn imported_nat_matches(
+    environment: &Environment,
+    name: &Name,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    let Some(declarations) = fln_elab::seed::imported_nat_intrinsic_model_declarations(name) else {
+        return Ok(false);
+    };
+    let mut comparison = Comparison { visited, limits };
+    for declaration in declarations {
+        if !comparison.declaration(environment, declaration)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 struct Comparison<'a> {
     visited: &'a mut usize,
     limits: IngressLimits,
@@ -260,3 +278,6 @@ impl Comparison<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod imported_tests;

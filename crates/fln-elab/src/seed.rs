@@ -406,6 +406,13 @@ pub fn nat_add_support_seed_declarations() -> [Declaration; 8] {
     nat_recursion::nat_add_support_seed_declarations()
 }
 
+/// Complete pinned logical candidates for imported Nat runtime primitives.
+/// These are compared with already admitted definitions; this accessor neither
+/// changes the source seed nor grants any declaration publication authority.
+pub fn imported_nat_intrinsic_model_declarations(name: &Name) -> Option<Vec<Declaration>> {
+    nat_recursion::imported_nat_intrinsic_model_declarations(name)
+}
+
 /// Construct the exact `Nat.sub : Nat -> Nat -> Nat` candidate recognized by
 /// the bounded compiler bridge.
 pub fn nat_sub_seed_declaration() -> Declaration {

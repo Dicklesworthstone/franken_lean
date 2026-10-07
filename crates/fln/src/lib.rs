@@ -9271,7 +9271,14 @@ fn executable_intrinsic_binding(
                 .flatten(),
         );
     }
-    Ok(source_intrinsic_binding(environment, name))
+    if let Some(binding) = source_intrinsic_binding(environment, name) {
+        return Ok(Some(binding));
+    }
+    Ok(
+        source_intrinsics::imported_nat_matches(environment, name, visited_nodes, limits)?
+            .then(|| generated_source_intrinsic_binding(name))
+            .flatten(),
+    )
 }
 
 fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<IntrinsicBinding> {
