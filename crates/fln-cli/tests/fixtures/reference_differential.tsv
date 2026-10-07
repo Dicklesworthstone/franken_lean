@@ -46,7 +46,7 @@ examples/native_empty_elimination.lean	reject	accept	n/a	fln-defect	Reference 6:
 examples/native_equality.lean	accept	accept	match	agree	
 examples/native_equality_transport.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 9: Type mismatch (a named variable at a promoted parameter, in `copy`; was fln-defect, franken_lean-z8j.1.6)
 examples/native_equations.lean	reject	accept	n/a	missing-prelude	Reference 2: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
-examples/native_expression_elimination.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_expression_elimination.lean	accept	accept	match	agree	the drop-in lean now runs it with the pin's output (observed at af4ad101 by the pinned differential); it was check-only, refused by the drop-in's compiler
 examples/native_float_runtime.lean	accept	accept	match	agree	
 examples/native_floats.lean	accept	accept	match	agree	
 examples/native_function_child_runtime.lean	accept	accept	match	agree	

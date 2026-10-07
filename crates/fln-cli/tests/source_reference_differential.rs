@@ -480,7 +480,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_empty_elimination.lean",
     "examples/native_equality_transport.lean",
     "examples/native_equations.lean",
-    "examples/native_expression_elimination.lean",
     "examples/native_function_children.lean",
     "examples/native_goal_control.lean",
     "examples/native_index_refinement.lean",
