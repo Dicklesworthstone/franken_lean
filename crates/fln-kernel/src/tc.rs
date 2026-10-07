@@ -11533,21 +11533,37 @@ mod tests {
     }
 
     /// Two separate instantiations that rebuild the same structure yield the
-    /// SAME allocation within one checker. Each walk's own memo is per call,
-    /// so this cross-call unification is the interner's and only the
-    /// interner's; a mutant that returns the fresh node instead of the
-    /// retained representative fails here.
+    /// SAME allocation within one checker — and the unifier must provably be
+    /// the interner, which takes dodging the unifier this test's first
+    /// version did not dodge (found by the slice-B1 verifier, z8j.1.13
+    /// comment 3327: `InstantiateCache` verifies sources structurally, so
+    /// identical sources hand back one allocation with the interner gutted,
+    /// and the test's kill claim was false). The sources here are
+    /// structurally DIFFERENT (`#0 #0` against `Sort0 #0`), so the
+    /// instantiate cache cannot join them; and each call substitutes its own
+    /// ALLOCATION of `Sort 0`, so the rebuilt applications also have
+    /// allocation-distinct operands — which additionally future-proofs the
+    /// kill against any parts-keyed construction index (one was built,
+    /// measured perf-neutral at corpus scale, and withdrawn; the record is
+    /// on the bead). A mutant that makes `intern` return the fresh node
+    /// fails exactly here, verified by planting that mutant rather than
+    /// asserting it.
     #[test]
     fn instantiate_results_are_interned_across_calls() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
         let bv = |i: u32| Expr::bvar(i).expect("packs");
-        let subst = Expr::sort(Level::zero());
+        let subst_a = Expr::sort(Level::zero());
+        let subst_b = Expr::sort(Level::zero());
+        assert!(
+            subst_a.allocation_identity() != subst_b.allocation_identity(),
+            "the two substitutes must be allocation-distinct or a construction index unifies for free"
+        );
         let open = Expr::app(bv(0), bv(0));
-        let first = tc.instantiate(&open, 0, &subst, 0).expect("instantiates");
-        let reopened = Expr::app(bv(0), bv(0));
+        let first = tc.instantiate(&open, 0, &subst_a, 0).expect("instantiates");
+        let half_closed = Expr::app(subst_b.clone(), bv(0));
         let second = tc
-            .instantiate(&reopened, 0, &subst, 0)
+            .instantiate(&half_closed, 0, &subst_b, 0)
             .expect("instantiates");
         assert!(
             first == second,
@@ -11555,7 +11571,7 @@ mod tests {
         );
         assert!(
             first.allocation_identity() == second.allocation_identity(),
-            "equal rebuilds across calls must share the interner's retained allocation"
+            "equal rebuilds from DIFFERENT sources and DIFFERENT substitute allocations must              share the interner's retained allocation; only the structural table can join them"
         );
     }
 }
