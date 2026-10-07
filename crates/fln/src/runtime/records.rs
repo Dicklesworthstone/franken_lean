@@ -569,6 +569,16 @@ impl Preparation<'_> {
             result_type = result;
             value = body;
         }
+        if eta_expand
+            && definition.safety == fln_env::constants::DefinitionSafety::Partial
+            && matches!(result_type.node(), ExprNode::ForallE { .. })
+        {
+            // A partial prefix can diverge before it returns a callback.
+            // The flat global ABI must not move that work beneath invented
+            // lambdas. Until partial producers have an explicit stage ABI,
+            // refuse this shape after proof erasure and specialization.
+            return Err(unsupported("partial function-producing stage"));
+        }
         if !eta_expand && matches!(result_type.node(), ExprNode::ForallE { .. }) {
             self.value_type(result_type)?;
         }

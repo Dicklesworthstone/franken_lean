@@ -92,7 +92,9 @@ impl Preparation<'_> {
             Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
                 Some(definition.clone())
             }
-            _ => self.specialized_definition(name),
+            _ => self
+                .specialized_definition(name)
+                .filter(|definition| definition.safety == DefinitionSafety::Safe),
         }
     }
     pub(super) fn universe_instance(
@@ -652,7 +654,7 @@ impl Preparation<'_> {
             return Ok(None);
         };
         self.tick()?;
-        if let Some(definition) = self.definition(name) {
+        if let Some(definition) = self.executable_definition(name)? {
             return self
                 .universe_instance(
                     &definition.base.type_,

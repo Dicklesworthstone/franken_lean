@@ -12,6 +12,7 @@ mod global;
 mod indexed;
 mod mutual;
 mod nat;
+mod partial;
 mod projections;
 mod proofs;
 mod records;

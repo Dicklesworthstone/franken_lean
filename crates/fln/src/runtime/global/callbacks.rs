@@ -52,7 +52,9 @@ impl Preparation<'_> {
                 Some(definition.clone())
             }
             Some(_) => None,
-            None => self.specialized_definition(name),
+            None => self
+                .specialized_definition(name)
+                .filter(|definition| definition.safety == DefinitionSafety::Safe),
         };
         let Some(mut definition) = definition else {
             return Ok(None);

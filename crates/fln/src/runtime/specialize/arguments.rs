@@ -259,7 +259,7 @@ impl Preparation<'_> {
         if self.specializations.definitions.contains_key(original) {
             return Ok(None);
         }
-        let Some(mut definition) = self.definition(original) else {
+        let Some(mut definition) = self.executable_definition(original)? else {
             return Ok(None);
         };
         if definition.base.level_params.len() != levels.len()
@@ -278,7 +278,11 @@ impl Preparation<'_> {
         if prepared.static_arguments.is_empty() && levels.is_empty() {
             return Ok(None);
         }
-        let key = (original.clone(), levels.clone(), prepared.static_arguments);
+        let key = (
+            definition.base.name.clone(),
+            levels.clone(),
+            prepared.static_arguments,
+        );
         let name = if let Some(name) = self.specializations.instances.get(&key) {
             name.clone()
         } else {

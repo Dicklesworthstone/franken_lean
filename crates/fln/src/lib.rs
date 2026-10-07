@@ -9202,10 +9202,7 @@ fn executable_dependencies(
             intrinsics.push(binding);
             continue;
         }
-        let definition = match environment.find(&name) {
-            Some(ConstantInfo::Defn(definition)) => Some(definition.clone()),
-            _ => preparation.specialized_definition(&name),
-        };
+        let definition = preparation.executable_definition(&name)?;
         let Some(definition) = definition else {
             continue;
         };
