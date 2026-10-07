@@ -20899,6 +20899,145 @@ fn fln_4hol_units_accept_within_their_step_ceilings() {
     }
 }
 
+/// One judged mutant row on the FrankenLean side, ready for the verdict join.
+struct BemcJudgedRow {
+    lead: String,
+    outcome: String,
+    message: String,
+}
+
+/// The four-cell join, pure over its inputs so hand-written tables exercise
+/// every cell and the rig's own mutants die in a per-commit unit test
+/// (bead `fln-kernel-reject-side-at-scale-bemc`, the "mutants of the rig"
+/// list). The join is BY NAME, never by position; an unjoined name is an
+/// error, not a skip; inconclusive is its own cell, never agreement and never
+/// a rejection; and the caller must separately require `joined` to equal the
+/// table's size (conservation), because a dropped mutant is missing coverage.
+struct BemcJoinCells {
+    joined: u64,
+    agree_reject: u64,
+    agree_accept: u64,
+    fatal: Vec<String>,
+    inconclusive: Vec<String>,
+    other: Vec<String>,
+}
+
+fn join_bemc_rows(
+    judged: &[BemcJudgedRow],
+    pin_verdicts: &HashMap<String, (String, String)>,
+) -> Result<BemcJoinCells, String> {
+    let mut cells = BemcJoinCells {
+        joined: 0,
+        agree_reject: 0,
+        agree_accept: 0,
+        fatal: Vec::new(),
+        inconclusive: Vec::new(),
+        other: Vec::new(),
+    };
+    for row in judged {
+        let Some((pin_verdict, pin_class)) = pin_verdicts.get(&row.lead) else {
+            return Err(format!(
+                "{}: judged unit has no row in the pin verdict table; the join is by name \
+                 and this name is unjoined",
+                row.lead
+            ));
+        };
+        cells.joined += 1;
+        let rendered = format!(
+            "unit={} pin={pin_verdict}:{pin_class} fln={}:{}",
+            row.lead, row.outcome, row.message
+        );
+        match (pin_verdict.as_str(), row.outcome.as_str()) {
+            ("reject", fln) if fln.starts_with("rejected") => cells.agree_reject += 1,
+            ("accept", "accepted") => cells.agree_accept += 1,
+            ("reject", "accepted") => cells.fatal.push(rendered),
+            (_, fln) if fln.starts_with("inconclusive") => cells.inconclusive.push(rendered),
+            _ => cells.other.push(rendered),
+        }
+    }
+    Ok(cells)
+}
+
+/// The join's own behavior under hand-written tables: every cell reachable,
+/// an unjoined name an error, inconclusive never agreement, and the
+/// classification independent of row order (the join is by name). This is the
+/// per-commit test the rig's four mutants die in.
+#[test]
+fn bemc_join_cells_classify_and_conserve() {
+    let table: HashMap<String, (String, String)> = [
+        ("a".into(), ("reject".into(), "appTypeMismatch".into())),
+        ("b".into(), ("accept".into(), String::new())),
+        ("c".into(), ("reject".into(), "declTypeMismatch".into())),
+        ("d".into(), ("accept".into(), String::new())),
+        ("e".into(), ("reject".into(), "invalidProj".into())),
+    ]
+    .into_iter()
+    .collect();
+    let judged = vec![
+        // deliberately NOT in table order: a position join classifies `e`
+        // with `a`'s pin row and dies here.
+        BemcJudgedRow {
+            lead: "e".into(),
+            outcome: "accepted".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "a".into(),
+            outcome: "rejected:TypeMismatch".into(),
+            message: "application type mismatch".into(),
+        },
+        BemcJudgedRow {
+            lead: "b".into(),
+            outcome: "accepted".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "c".into(),
+            outcome: "inconclusive:Steps".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "d".into(),
+            outcome: "rejected:TypeMismatch".into(),
+            message: "false rejection".into(),
+        },
+    ];
+    let cells = join_bemc_rows(&judged, &table).expect("every name joins");
+    assert_eq!(cells.joined, 5, "five judged rows join five table rows");
+    assert_eq!(cells.agree_reject, 1, "only `a` is reject/reject");
+    assert_eq!(cells.agree_accept, 1, "only `b` is accept/accept");
+    assert_eq!(
+        cells.fatal,
+        vec!["unit=e pin=reject:invalidProj fln=accepted:".to_string()],
+        "exactly the pin-rejected-but-accepted row is fatal"
+    );
+    assert_eq!(
+        cells.inconclusive.len(),
+        1,
+        "the inconclusive row is its own cell: never agreement, never a rejection"
+    );
+    assert!(
+        cells.inconclusive[0].starts_with("unit=c "),
+        "and it is `c`, the pin-rejected inconclusive"
+    );
+    assert_eq!(
+        cells.other.len(),
+        1,
+        "the pin-accepted-but-rejected row is a finding, not agreement"
+    );
+    assert!(cells.other[0].starts_with("unit=d "));
+
+    let missing = vec![BemcJudgedRow {
+        lead: "zz".into(),
+        outcome: "accepted".into(),
+        message: String::new(),
+    }];
+    assert!(
+        join_bemc_rows(&missing, &table).is_err(),
+        "an unjoined name is an error, never a skip"
+    );
+}
+
 /// The reject-side join (bead `fln-kernel-reject-side-at-scale-bemc`): every
 /// mutant of a synthetic `Bemc.*` module is judged by K1 PER DECLARATION —
 /// each admission unit carries its own prepared environment, so no mutant's
@@ -20959,38 +21098,29 @@ fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
         "an empty verdict table is a broken generator run, not a clean join"
     );
 
-    let mut agree_reject = 0u64;
-    let mut agree_accept = 0u64;
-    let mut pin_accept_fln_other: Vec<String> = Vec::new();
-    let mut inconclusive_rows: Vec<String> = Vec::new();
-    let mut fatal_rows: Vec<String> = Vec::new();
-    let mut joined = 0u64;
+    let mut judged: Vec<BemcJudgedRow> = Vec::new();
     for item in &prep.items {
         let lead = item.lead.to_display_string();
         if !lead.contains("_bemc_") {
             continue;
         }
-        let Some((pin_verdict, pin_class)) = pin_verdicts.get(&lead) else {
-            panic!(
-                "{lead}: judged unit has no row in the pin verdict table; the join is by name and this name is unjoined"
-            );
-        };
-        joined += 1;
         let verdict =
             check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
         let outcome = unit_outcome(item, &verdict);
-        let row = format!(
-            "unit={lead} pin={pin_verdict}:{pin_class} fln={}:{}",
-            outcome.outcome, outcome.message
-        );
-        match (pin_verdict.as_str(), outcome.outcome.as_str()) {
-            ("reject", fln) if fln.starts_with("rejected") => agree_reject += 1,
-            ("accept", "accepted") => agree_accept += 1,
-            ("reject", "accepted") => fatal_rows.push(row),
-            (_, fln) if fln.starts_with("inconclusive") => inconclusive_rows.push(row),
-            _ => pin_accept_fln_other.push(row),
-        }
+        judged.push(BemcJudgedRow {
+            lead,
+            outcome: outcome.outcome,
+            message: outcome.message,
+        });
     }
+    let BemcJoinCells {
+        joined,
+        agree_reject,
+        agree_accept,
+        fatal: fatal_rows,
+        inconclusive: inconclusive_rows,
+        other: pin_accept_fln_other,
+    } = join_bemc_rows(&judged, &pin_verdicts).unwrap_or_else(|unjoined| panic!("{unjoined}"));
     assert!(
         joined == pin_verdicts.len() as u64,
         "the synthetic module judged {joined} mutant units against {} table rows; a mutant \
