@@ -9,20 +9,24 @@ fn nat(value: u64) -> Expr {
 }
 
 fn admitted_model(label: &str, change_body: bool) -> Engine {
+    let target = if label == "Nat.pred" {
+        label.to_owned()
+    } else {
+        format!("{label}._f")
+    };
+    admitted_model_changing(label, change_body.then_some(target.as_str()))
+}
+
+fn admitted_model_changing(label: &str, change_target: Option<&str>) -> Engine {
     let mut engine = Engine::from_environment(Environment::new());
     let options = KVMap::new();
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    let target = if label == "Nat.pred" {
-        name(label)
-    } else {
-        name(&format!("{label}._f"))
-    };
+    let target = change_target.map(name);
     let declarations = fln_elab::seed::imported_nat_intrinsic_model_declarations(&name(label))
         .expect("fixed imported model");
     for mut declaration in declarations {
-        if change_body
-            && let Declaration::Defn(definition) = &mut declaration
-            && definition.base.name == target
+        if let Declaration::Defn(definition) = &mut declaration
+            && target.as_ref() == Some(&definition.base.name)
         {
             let mut binders = Vec::new();
             let mut body = &definition.value;
@@ -36,7 +40,7 @@ fn admitted_model(label: &str, change_body: bool) -> Engine {
                 binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
                 body = inner;
             }
-            let mut body = if label == "Nat.beq" {
+            let mut body = if matches!(label, "Nat.beq" | "Nat.ble") {
                 Expr::const_(name("Bool.false"), vec![])
             } else {
                 nat(0)
@@ -66,8 +70,10 @@ fn complete_nat_models_pass_both_checkers_and_execute_native_values() {
     for (label, arguments, expected, result) in [
         ("Nat.pred", vec![43], 42, "Nat"),
         ("Nat.beq", vec![42, 42], 1, "Bool"),
+        ("Nat.ble", vec![41, 42], 1, "Bool"),
         ("Nat.mul", vec![6, 7], 42, "Nat"),
         ("Nat.sub", vec![45, 3], 42, "Nat"),
+        ("Nat.pow", vec![2, 5], 32, "Nat"),
     ] {
         let engine = admitted_model(label, false);
         assert!(
@@ -116,7 +122,9 @@ fn complete_nat_models_pass_both_checkers_and_execute_native_values() {
 
 #[test]
 fn changed_well_typed_bodies_do_not_authorize_imported_nat_intrinsics() {
-    for label in ["Nat.pred", "Nat.beq", "Nat.mul", "Nat.sub"] {
+    for label in [
+        "Nat.pred", "Nat.beq", "Nat.ble", "Nat.mul", "Nat.sub", "Nat.pow",
+    ] {
         let canonical = admitted_model(label, false);
         let changed = admitted_model(label, true);
         if label != "Nat.pred" {
@@ -140,33 +148,69 @@ fn changed_well_typed_bodies_do_not_authorize_imported_nat_intrinsics() {
 }
 
 #[test]
+fn ordering_and_power_require_unchanged_roots_and_arithmetic_dependencies() {
+    for (label, target) in [
+        ("Nat.ble", "Nat.ble"),
+        ("Nat.pow", "Nat.pow"),
+        ("Nat.pow", "Nat.mul._f"),
+    ] {
+        let canonical = admitted_model(label, false);
+        let changed = admitted_model_changing(label, Some(target));
+        assert_ne!(
+            canonical.environment().find(&name(target)),
+            changed.environment().find(&name(target)),
+            "the replacement is independently admitted and changes {target}",
+        );
+        if label != target {
+            assert_eq!(
+                canonical.environment().find(&name(label)),
+                changed.environment().find(&name(label)),
+                "the unchanged power root cannot authorize altered multiplication",
+            );
+        }
+        assert!(
+            !imported_nat_matches(
+                changed.environment(),
+                &name(label),
+                &mut 0,
+                IngressLimits::default(),
+            )
+            .unwrap(),
+            "{label}: changed {target}",
+        );
+    }
+}
+
+#[test]
 fn imported_model_resource_exhaustion_is_not_a_negative_match() {
-    let engine = admitted_model("Nat.beq", false);
-    let name = name("Nat.beq");
-    assert!(matches!(
-        imported_nat_matches(
-            engine.environment(),
-            &name,
-            &mut 0,
-            IngressLimits {
-                max_nodes: 1,
-                ..IngressLimits::default()
-            }
-        ),
-        Err(IngressError::ResourceLimit {
-            resource: IngressResource::Nodes,
-            ..
-        })
-    ));
-    assert!(
-        imported_nat_matches(
-            engine.environment(),
-            &name,
-            &mut 0,
-            IngressLimits::default()
-        )
-        .unwrap()
-    );
+    for label in ["Nat.beq", "Nat.ble", "Nat.pow"] {
+        let engine = admitted_model(label, false);
+        let name = name(label);
+        assert!(matches!(
+            imported_nat_matches(
+                engine.environment(),
+                &name,
+                &mut 0,
+                IngressLimits {
+                    max_nodes: 1,
+                    ..IngressLimits::default()
+                }
+            ),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+        assert!(
+            imported_nat_matches(
+                engine.environment(),
+                &name,
+                &mut 0,
+                IngressLimits::default()
+            )
+            .unwrap()
+        );
+    }
 }
 
 #[test]
@@ -218,7 +262,15 @@ fn admitted_pin_matches_every_primitive_model_dependency() {
                 .into_complete()
                 .unwrap();
             let environment = imported.engine.environment();
-            for operation in ["Nat.pred", "Nat.beq", "Nat.mul", "Nat.sub", "List.brecOn"] {
+            for operation in [
+                "Nat.pred",
+                "Nat.beq",
+                "Nat.ble",
+                "Nat.mul",
+                "Nat.sub",
+                "Nat.pow",
+                "List.brecOn",
+            ] {
                 let declarations = if operation == "List.brecOn" {
                     fln_elab::seed::imported_list_recursion_model_declarations()
                 } else {

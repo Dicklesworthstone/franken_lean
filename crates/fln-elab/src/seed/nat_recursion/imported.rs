@@ -15,16 +15,20 @@ fn regular(declaration: Declaration, height: u32) -> Declaration {
     Declaration::Defn(value)
 }
 
-fn literal_zero() -> Expr {
-    let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+fn of_nat_literal(value: u64) -> Expr {
+    let value = Expr::lit(Literal::Nat(NatLit::from_u64(value)));
     app(
         constant("OfNat.ofNat", vec![Level::zero()]),
         [
             nat(),
-            zero.clone(),
-            Expr::app(constant("instOfNatNat", vec![]), zero),
+            value.clone(),
+            Expr::app(constant("instOfNatNat", vec![]), value),
         ],
     )
+}
+
+fn literal_zero() -> Expr {
+    of_nat_literal(0)
 }
 
 fn unit_declarations() -> [Declaration; 2] {
@@ -446,29 +450,227 @@ fn equality_root() -> Declaration {
     )
 }
 
+fn ordering_match() -> Declaration {
+    let mut terms = Terms::new();
+    let universe = level("u_1");
+    let n = terms.local("n", nat(), BinderInfo::Default);
+    let m = terms.local("m", nat(), BinderInfo::Default);
+    let motive_type = terms.pi(&[n.clone(), m.clone()], Expr::sort(universe.clone()));
+    let motive = terms.local("motive", motive_type, BinderInfo::Default);
+    let left = terms.local("x", nat(), BinderInfo::Default);
+    let right = terms.local("x_1", nat(), BinderInfo::Default);
+    let first_type = terms.pi(std::slice::from_ref(&m), app(fv(&motive), [zero(), fv(&m)]));
+    let first = terms.local("h_1", first_type, BinderInfo::Default);
+    let second_type = terms.pi(
+        std::slice::from_ref(&n),
+        app(fv(&motive), [succ(fv(&n)), zero()]),
+    );
+    let second = terms.local("h_2", second_type, BinderInfo::Default);
+    let third_type = terms.pi(
+        &[n.clone(), m.clone()],
+        app(fv(&motive), [succ(fv(&n)), succ(fv(&m))]),
+    );
+    let third = terms.local("h_3", third_type, BinderInfo::Default);
+    let index = terms.local("x", nat(), BinderInfo::Default);
+    let next_motive = terms.lam(
+        std::slice::from_ref(&index),
+        app(fv(&motive), [succ(fv(&n)), fv(&index)]),
+    );
+    let third_body = app(fv(&third), [fv(&n), fv(&m)]);
+    let next_step = terms.lam(&[m], third_body);
+    let next_body = app(
+        constant("Nat.casesOn", vec![universe.clone()]),
+        [
+            next_motive,
+            fv(&right),
+            Expr::app(fv(&second), fv(&n)),
+            next_step,
+        ],
+    );
+    let next_branch = terms.lam(&[n], next_body);
+    let recursor_motive = terms.lam(
+        std::slice::from_ref(&index),
+        app(fv(&motive), [fv(&index), fv(&right)]),
+    );
+    let body = app(
+        constant("Nat.casesOn", vec![universe]),
+        [
+            recursor_motive,
+            fv(&left),
+            Expr::app(fv(&first), fv(&right)),
+            next_branch,
+        ],
+    );
+    let result = app(fv(&motive), [fv(&left), fv(&right)]);
+    terms.definition(
+        "Nat.ble.match_1",
+        &["u_1"],
+        &[motive, left, right, first, second, third],
+        result,
+        body,
+    )
+}
+
+fn ordering_functional() -> Declaration {
+    let mut terms = Terms::new();
+    let universe = Level::one();
+    let motive = equality_motive(&mut terms);
+    let value = terms.local("x", nat(), BinderInfo::Default);
+    let history = terms.local(
+        "f",
+        below(&universe, motive.clone(), fv(&value)),
+        BinderInfo::Default,
+    );
+    let right = terms.local("x_1", nat(), BinderInfo::Default);
+    let n = terms.local("n", nat(), BinderInfo::Default);
+    let m = terms.local("m", nat(), BinderInfo::Default);
+    let matcher_result = terms.arrow(below(&universe, motive.clone(), fv(&n)), bool_type());
+    let matcher_motive = terms.lam(&[n.clone(), m.clone()], matcher_result);
+    let zero_history = terms.local(
+        "x",
+        below(&universe, motive.clone(), zero()),
+        BinderInfo::Default,
+    );
+    let first = terms.lam(&[m.clone(), zero_history], constant("Bool.true", vec![]));
+    let succ_history = terms.local(
+        "x",
+        below(&universe, motive, succ(fv(&n))),
+        BinderInfo::Default,
+    );
+    let second = terms.lam(
+        &[n.clone(), succ_history.clone()],
+        constant("Bool.false", vec![]),
+    );
+    let third_body = Expr::app(Expr::proj(name("PProd"), 0, fv(&succ_history)), fv(&m));
+    let third = terms.lam(&[n, m, succ_history], third_body);
+    let matched = app(
+        constant("Nat.ble.match_1", vec![universe]),
+        [matcher_motive, fv(&value), fv(&right), first, second, third],
+    );
+    let body = Expr::app(matched, fv(&history));
+    terms.definition(
+        "Nat.ble._f",
+        &[],
+        &[value, history, right],
+        bool_type(),
+        body,
+    )
+}
+
+fn ordering_root() -> Declaration {
+    let mut terms = Terms::new();
+    let left = terms.local("x", nat(), BinderInfo::Default);
+    let right = terms.local("x_1", nat(), BinderInfo::Default);
+    let motive = equality_motive(&mut terms);
+    let body = app(
+        constant("Nat.brecOn", vec![Level::one()]),
+        [
+            motive,
+            fv(&left),
+            constant("Nat.ble._f", vec![]),
+            fv(&right),
+        ],
+    );
+    regular(
+        terms.definition("Nat.ble", &[], &[left, right], bool_type(), body),
+        1,
+    )
+}
+
+fn power_motive(terms: &mut Terms) -> Expr {
+    let value = terms.local("x", nat(), BinderInfo::Default);
+    terms.lam(&[value], nat())
+}
+
+fn power_functional() -> Declaration {
+    let mut terms = Terms::new();
+    let universe = Level::one();
+    let motive = power_motive(&mut terms);
+    let base = terms.local("m", nat(), BinderInfo::Default);
+    let value = terms.local("x", nat(), BinderInfo::Default);
+    let history = terms.local(
+        "f",
+        below(&universe, motive.clone(), fv(&value)),
+        BinderInfo::Default,
+    );
+    let n = terms.local("n", nat(), BinderInfo::Default);
+    let matcher_result = terms.arrow(below(&universe, motive.clone(), fv(&n)), nat());
+    let matcher_motive = terms.lam(std::slice::from_ref(&n), matcher_result);
+    let zero_history = terms.local(
+        "x",
+        below(&universe, motive.clone(), literal_zero()),
+        BinderInfo::Default,
+    );
+    let dummy = terms.local("_", constant("Unit", vec![]), BinderInfo::Default);
+    let first = terms.lam(&[dummy, zero_history], of_nat_literal(1));
+    let succ_history = terms.local(
+        "x",
+        below(&universe, motive, succ(fv(&n))),
+        BinderInfo::Default,
+    );
+    let next_body = app(
+        constant("Nat.mul", vec![]),
+        [Expr::proj(name("PProd"), 0, fv(&succ_history)), fv(&base)],
+    );
+    let next = terms.lam(&[n, succ_history], next_body);
+    let matched = app(
+        constant("Nat.pow.match_1", vec![universe]),
+        [matcher_motive, fv(&value), first, next],
+    );
+    let body = Expr::app(matched, fv(&history));
+    terms.definition("Nat.pow._f", &[], &[base, value, history], nat(), body)
+}
+
+fn power_root() -> Declaration {
+    let mut terms = Terms::new();
+    let base = terms.local("m", nat(), BinderInfo::Default);
+    let exponent = terms.local("x", nat(), BinderInfo::Default);
+    let motive = power_motive(&mut terms);
+    let body = app(
+        constant("Nat.brecOn", vec![Level::one()]),
+        [
+            motive,
+            fv(&exponent),
+            Expr::app(constant("Nat.pow._f", vec![]), fv(&base)),
+        ],
+    );
+    regular(
+        terms.definition("Nat.pow", &[], &[base, exponent], nat(), body),
+        3,
+    )
+}
+
 /// Complete finite closures, ordered for independent dual-checker admission.
 /// No definition is accepted merely because it has one of these names.
 pub(super) fn declarations(wanted: &Name) -> Option<Vec<Declaration>> {
     let pred = wanted == &name("Nat.pred");
     let beq = wanted == &name("Nat.beq");
+    let ble = wanted == &name("Nat.ble");
     let mul = wanted == &name("Nat.mul");
     let sub = wanted == &name("Nat.sub");
-    if !pred && !beq && !mul && !sub {
+    let pow = wanted == &name("Nat.pow");
+    if !pred && !beq && !ble && !mul && !sub && !pow {
         return None;
     }
     let mut declarations = vec![super::super::nat_inductive_seed_declaration()];
-    if mul {
+    if mul || pow {
         declarations.extend(nat_add_support_seed_declarations());
         declarations.push(nat_add_seed_declaration());
         declarations.extend(of_nat_declarations());
         declarations.extend([binary_match(), binary_functional(true), binary_root(true)]);
+        if pow {
+            declarations.extend(unit_declarations());
+            declarations.extend([unary_match(), power_functional(), power_root()]);
+        }
         return Some(declarations);
     }
-    if beq {
+    if beq || ble {
         declarations.push(super::super::bool_seed_declaration());
     }
     declarations.push(punit());
-    declarations.extend(unit_declarations());
+    if !ble {
+        declarations.extend(unit_declarations());
+    }
     if pred || sub {
         declarations.extend(of_nat_declarations());
     }
@@ -476,11 +678,13 @@ pub(super) fn declarations(wanted: &Name) -> Option<Vec<Declaration>> {
     if pred || sub {
         declarations.extend([unary_match(), predecessor()]);
     }
-    if beq || sub {
+    if beq || ble || sub {
         declarations.extend([pprod(), nat_below(), nat_brec_on_go(), nat_brec_on()]);
     }
     if beq {
         declarations.extend([equality_match(), equality_functional(), equality_root()]);
+    } else if ble {
+        declarations.extend([ordering_match(), ordering_functional(), ordering_root()]);
     } else if sub {
         declarations.extend([binary_match(), binary_functional(false), binary_root(false)]);
     }

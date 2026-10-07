@@ -60,7 +60,11 @@ impl Preparation<'_> {
             self.specializations.list_recursion_checked = true;
         }
         let family = Expr::app(constant("List", vec![levels[1].clone()]), args[0].clone());
-        let Some(result_type) = self.indexed_motive(&args[1], &[], &family)? else {
+        // Static element types can carry metadata from a caller. Compare both
+        // motive domains after the same type erasure, while retaining the
+        // original family and operands in the emitted fold.
+        let motive_family = self.erase_runtime_type(&family)?;
+        let Some(result_type) = self.indexed_motive(&args[1], &[], &motive_family)? else {
             return Ok(None);
         };
         if self.value_type(&result_type)?.is_none() {

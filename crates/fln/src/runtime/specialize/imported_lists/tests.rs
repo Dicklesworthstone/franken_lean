@@ -188,6 +188,55 @@ fn complete_list_scaffold_is_dual_admitted_and_preserves_actual_functionals() {
 }
 
 #[test]
+fn list_motive_comparison_preserves_decorated_element_arguments() {
+    let engine = admitted_scaffold(None);
+    let element = Expr::mdata(
+        KVMap::from_entries(vec![(name("borrowed"), DataValue::OfBool(true))]),
+        constant("Nat"),
+    );
+    let family = Expr::app(
+        Expr::const_(name("List"), vec![Level::zero()]),
+        element.clone(),
+    );
+    let motive = Expr::lam(
+        Name::anonymous(),
+        family.clone(),
+        constant("Nat"),
+        BinderInfo::Default,
+    );
+    let head = Expr::const_(name("List.brecOn"), vec![Level::one(), Level::zero()]);
+    let arguments = [element.clone(), motive, list(&[1]), functional(42)];
+    let executed = engine
+        .execute_definition(
+            declaration(
+                "decoratedList",
+                constant("Nat"),
+                application(head.clone(), arguments.clone()),
+            ),
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        closed_vm_value(&executed.exit).unwrap(),
+        Some(ClosedVmValue::Scalar(42))
+    );
+    let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+    let fold = preparation
+        .imported_list_recursion(&head, &arguments)
+        .unwrap()
+        .unwrap();
+    let (_, arguments) = preparation.spine(&fold).unwrap();
+    assert_eq!(arguments[0], element);
+    let ExprNode::Lam { binder_type, .. } = arguments[1].node() else {
+        panic!("emitted fold motive")
+    };
+    assert_eq!(binder_type, &family);
+}
+
+#[test]
 fn list_history_administration_preserves_strict_arguments_and_initializers() {
     let engine = admitted_scaffold(None);
     let work_type = Expr::forall_e(
@@ -513,9 +562,10 @@ fn admitted_list_dependencies_have_uniform_signatures_after_history_reduction() 
                 application(constant("Nat.add"), [Expr::bvar(0).unwrap(), nat(1)]),
                 BinderInfo::Default,
             );
-            let cases = [
+            let mut cases = vec![
                 (
                     "List.append",
+                    result_type.clone(),
                     application(
                         Expr::const_(name("List.append"), vec![Level::zero()]),
                         [natural.clone(), list(&[20]), list(&[22])],
@@ -523,13 +573,37 @@ fn admitted_list_dependencies_have_uniform_signatures_after_history_reduction() 
                 ),
                 (
                     "List.map",
+                    result_type.clone(),
                     application(
                         Expr::const_(name("List.map"), vec![Level::zero(), Level::zero()]),
                         [natural.clone(), natural, callback, list(&[41])],
                     ),
                 ),
             ];
-            for (label, body) in cases {
+            let source = b"def classified (limit : Nat) : List Nat := List.map (fun n => if Nat.beq n limit then 20 else 22) [2, 4]";
+            let checked = imported
+                .engine
+                .check_source_files(
+                    &[source],
+                    &options,
+                    SourceCheckLimits::new(EngineAdmissionLimits::new(
+                        Budget::for_stack_bytes(STACK),
+                    )),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let Some(ConstantInfo::Defn(definition)) =
+                checked.engine.environment().find(&name("classified"))
+            else {
+                panic!("checked conditional map definition")
+            };
+            cases.push((
+                "List.map computed predicate",
+                definition.base.type_.clone(),
+                definition.value.clone(),
+            ));
+            for (label, result_type, body) in cases {
                 let entry = name("diagnosticListResult");
                 let checked = imported
                     .engine
