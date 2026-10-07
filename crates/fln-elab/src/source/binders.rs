@@ -4,12 +4,14 @@
 use super::*;
 use fln_syntax::source::SourceInfo;
 
+#[derive(Clone)]
 pub(super) struct Binder<'a> {
     names: Vec<Name>,
     annotation: Option<&'a Syntax>,
     style: BinderInfo,
 }
 
+#[derive(Clone)]
 pub(super) struct Telescope<'a> {
     binders: Vec<Binder<'a>>,
     cursor: usize,
@@ -20,6 +22,12 @@ pub(super) struct Telescope<'a> {
     expected_body: Option<Expr>,
     lambda: bool,
     pub(super) body: &'a Syntax,
+}
+
+impl Telescope<'_> {
+    pub(super) fn parameters(&self) -> &[LocalDecl] {
+        &self.locals
+    }
 }
 
 fn invalid() -> NatDefinitionElabError {
@@ -448,6 +456,26 @@ impl Context {
         } else {
             Ok(Some(self.type_expected()?))
         }
+    }
+
+    /// A local recursive signature is checked with its own abstract self in
+    /// scope. Once its lambda domains have been checked, the candidate's real
+    /// self binder replaces that temporary one. Saved lambda scopes must not
+    /// restore the discarded identity when the source lambdas are closed.
+    pub(super) fn forget_telescope_local(
+        &mut self,
+        state: &mut Telescope<'_>,
+        removed: &FVarId,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut saved = LocalContext::new();
+        for local in state.saved.decls() {
+            self.tick()?;
+            if &local.id != removed {
+                tactics::eliminate::add_local(&mut saved, local);
+            }
+        }
+        state.saved = saved;
+        Ok(())
     }
 
     pub(super) fn finish_telescope(

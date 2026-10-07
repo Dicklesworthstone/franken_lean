@@ -23,6 +23,8 @@ pub(super) struct Build<'a> {
     pub value_syntax: &'a Syntax,
     pub checkpoint: Option<usize>,
     parameters: Vec<LocalDecl>,
+    header_parameters: usize,
+    lambdas: Vec<binders::Telescope<'a>>,
     saved: LocalContext,
     outer_recursion: Option<recursion::Recursion>,
     marker: Option<FVarId>,
@@ -72,12 +74,13 @@ fn original<'a>(
 impl<'a> Checkpoint<'a> {
     pub fn new(
         context: &mut Context,
-        build: Build<'a>,
+        mut build: Build<'a>,
         tasks: usize,
         values: usize,
     ) -> Result<Self, NatDefinitionElabError> {
+        context.open_local_recursive_lambdas(&mut build)?;
         let mut candidates = vec![None];
-        let body = original(context, build.binding.value)?;
+        let body = original(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
             Ok(columns) => candidates.extend(columns.into_iter().map(Some)),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
@@ -160,6 +163,7 @@ impl Context {
         }
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
+        let header_parameters = parameters.len();
         // Signatures see the enclosing scope. Nonrecursive values do too;
         // recursive values introduce their self binder after this phase.
         Ok(Build {
@@ -169,11 +173,69 @@ impl Context {
             result_type: None,
             checkpoint: None,
             parameters,
+            header_parameters,
+            lambdas: Vec::new(),
             saved,
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
         })
+    }
+
+    /// A recursive local's written lambdas belong to its function telescope,
+    /// just like named header parameters. Check their domains with the local
+    /// self in scope, so an outer declaration with the same name cannot supply
+    /// an annotation that the source's actual recursive name would invalidate.
+    fn open_local_recursive_lambdas<'a>(
+        &mut self,
+        build: &mut Build<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if prepared(self, build.value_syntax)?.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            return Ok(());
+        }
+        let saved = self.txn.lctx.clone();
+        let outer = self.recursion.clone();
+        self.start_local_function_value(build, None)?;
+        let marker = build
+            .marker
+            .clone()
+            .expect("temporary local recursive self");
+        let (body, expected, mut lambdas) = self.open_recursive_lambdas(
+            build.value_syntax,
+            build.result_type.clone(),
+            &mut build.parameters,
+        )?;
+        let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedFunction))?;
+        // A recursive call in a domain precedes the structural match, so no
+        // smaller constructor field can justify it. Do not retain a temporary
+        // self through the domains or turn it into an ordinary captured value.
+        for parameter in &build.parameters[build.header_parameters..] {
+            if self.elimination_reads(&parameter.type_)?.contains(&marker) {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
+        }
+        if self.elimination_reads(&expected)?.contains(&marker) {
+            return Err(failure(SourceInferenceError::Recursion(
+                recursion::RecursionError::NotDecreasing,
+            )));
+        }
+        for lambda in &mut lambdas {
+            self.forget_telescope_local(lambda, &marker)?;
+        }
+        self.txn.lctx = saved;
+        for parameter in &build.parameters[build.header_parameters..] {
+            self.tick()?;
+            tactics::eliminate::add_local(&mut self.txn.lctx, parameter);
+        }
+        self.recursion = outer;
+        build.marker = None;
+        build.outer_recursion = None;
+        build.value_syntax = body;
+        build.result_type = Some(expected);
+        build.lambdas = lambdas;
+        Ok(())
     }
 
     pub(super) fn start_local_function_value(
@@ -191,7 +253,7 @@ impl Context {
             .result_type
             .as_ref()
             .expect("recursive result annotation");
-        let mut body = original(self, build.binding.value)?;
+        let mut body = original(self, build.value_syntax)?;
         while let Some(inner) = parenthesized_inner(body)? {
             self.tick()?;
             body = inner;
@@ -237,7 +299,7 @@ impl Context {
                 type_,
             }
         };
-        if let Syntax::Node { kind, args, .. } = prepared(self, build.binding.value)?
+        if let Syntax::Node { kind, args, .. } = prepared(self, build.value_syntax)?
             && kind == &parser_kind(&["Term", "localRecValue"])
         {
             let index = column.map_or(1, |column| column + 2);
@@ -307,7 +369,8 @@ impl Context {
                 recursion::RecursionError::NotDecreasing,
             )));
         }
-        for local in build.parameters.iter().rev() {
+        value = self.close_recursive_lambdas(&build.lambdas, value)?;
+        for local in build.parameters[..build.header_parameters].iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
             value.value = value
@@ -365,6 +428,8 @@ mod tests {
             value_syntax: &missing,
             checkpoint: None,
             parameters: Vec::new(),
+            header_parameters: 0,
+            lambdas: Vec::new(),
             saved: LocalContext::new(),
             outer_recursion: None,
             marker: None,

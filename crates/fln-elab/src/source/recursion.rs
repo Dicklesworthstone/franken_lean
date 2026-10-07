@@ -11,6 +11,7 @@
 use super::*;
 mod constrained;
 mod context;
+mod lambdas;
 mod matrix;
 mod obligation;
 pub(super) use constrained::ConstrainedBranch;
@@ -160,6 +161,32 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
+        let mut parameters = parameters.to_vec();
+        let result = (|| {
+            let (body, expected, lambdas) =
+                self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+            let body = self.structural_definition_body(name, &parameters, body, expected)?;
+            self.close_recursive_lambdas(&lambdas, body)
+        })();
+        if result.is_err() {
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot;
+            self.txn.budget.heartbeats_consumed = spent;
+        }
+        result
+    }
+
+    /// The body after the source's leading lambdas have introduced their real
+    /// parameters. The original-body obligation and structural call checks are
+    /// identical for header parameters and these written lambda binders.
+    fn structural_definition_body(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let snapshot = self.clone();
         let (selected, context) = self.contextual_recursive_match(parameters, syntax)?;
         let columns = self.recursion_columns(parameters, selected)?;
         let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();

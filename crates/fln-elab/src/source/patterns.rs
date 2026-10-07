@@ -853,11 +853,7 @@ impl Context {
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
                     let binding = self.let_parts(args, false, true)?;
-                    let mut root = binding.value;
-                    while let Some(inner) = parenthesized_inner(root)? {
-                        self.tick()?;
-                        root = inner;
-                    }
+                    let root = self.recursive_lambda_body(binding.value)?;
                     local_roots.insert(std::ptr::from_ref(root));
                 }
                 scan.extend(args);
