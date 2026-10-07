@@ -4,6 +4,7 @@
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod callables;
+mod conditionals;
 mod data_recursion;
 mod decisions;
 mod empty;
@@ -38,6 +39,7 @@ pub(super) struct Preparation<'a> {
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
     equality_family_checked: bool,
+    conditional_contracts: [bool; 2],
     next_branch: usize,
     next_local: u64,
     next_nat: u64,
@@ -103,6 +105,7 @@ impl<'a> Preparation<'a> {
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
             equality_family_checked: false,
+            conditional_contracts: [false; 2],
             next_branch: 0,
             next_local: 0,
             next_nat: 0,

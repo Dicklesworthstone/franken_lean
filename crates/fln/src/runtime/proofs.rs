@@ -207,6 +207,11 @@ impl Preparation<'_> {
                     match expr.node() {
                         ExprNode::App { .. } => {
                             let (head, args) = self.spine(&expr)?;
+                            if let Some(inlined) = self.lazy_conditional(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
                             let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
