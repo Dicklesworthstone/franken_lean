@@ -424,9 +424,14 @@ tree is refused instead of advertising that build directory as an installed
 toolchain. These two queries derive paths; they do not install or register an
 elan toolchain, prove that the reported library tree is populated, or add Lake,
 package, `LEAN_PATH`, or `.olean` discovery.
+An import of `lean FILE` with no local source, such as `import Std`, is read as
+an `.olean` from `LEAN_PATH`, else the pinned toolchain's `lib/lean`, and its
+closure is admitted (or reused from this binary's earlier admission of the same
+bytes) before the entry runs, the same route as `fln run`; only the entry file's
+own `#eval` and `#check` lines are printed.
 The currently implemented binary is not yet the Reference CLI surface: it has
-no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
-implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.
+no general option compatibility, package discovery, implicit Prelude
+processing, general Lean elaboration, or diagnostic-text parity.
 
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned

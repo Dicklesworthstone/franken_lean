@@ -33,6 +33,13 @@
 //! which is never acceptance (FL-INV-07). Each file runs from a temporary copy of its
 //! directory with `LEAN_PATH` unset, so nothing is ever written under `vendor/`.
 //!
+//! FrankenLean admits an explicit import closure itself, and nothing carries over between
+//! runs: its reuse records go to a directory inside the run's copy. Every closure of a
+//! non-`prelude` header contains `Init`, and admitting a closure does at least the work of
+//! admitting any closure inside it. So a header-only `import Init` is run first, and when
+//! even that is not admitted within `FILE_TIMEOUT`, those files are recorded as that measured
+//! timeout rather than each spending `FILE_TIMEOUT` to find it again.
+//!
 //! Run it (pin required, about the pin's own elaboration time over 3,379 files):
 //! `FLN_REQUIRE_REFERENCE=1 cargo test -p fln-cli --release --test upstream_suite_scoreboard \
 //!  -- --ignored --nocapture upstream_suite_scoreboard_measures`
@@ -60,6 +67,12 @@ const ORACLE: &str = "crates/fln-cli/tests/fixtures/upstream_suite/oracle.tsv";
 const LEDGER: &str = "crates/fln-cli/tests/fixtures/upstream_suite/ledger.tsv";
 const HEADER_SCRIPT: &str = "scripts/extract/upstream_suite_headers.lean";
 const WORKERS: usize = 16;
+/// FrankenLean's runs of files with explicit imports share this smaller pool. Each may hold
+/// a cold council of its whole closure (`import Init` alone took 631 s and 5.9 GB at 8
+/// threads, measured 2026-10-07), and sixteen at once would contend for the host's memory.
+const IMPORT_WORKERS: usize = 4;
+/// The header-only program whose admission bounds every non-`prelude` import closure.
+const INIT_STUB: &str = "fln-init-closure.lean";
 /// Generous on purpose: at 60 s the pin's own verdict on its slowest file depended on host
 /// load (one oracle recorded a timeout, the next an acceptance), and a verdict the host can
 /// flip cannot anchor a drift check.
@@ -163,8 +176,11 @@ fn refusal_class(run: &Run) -> String {
     let first = run.stderr.lines().next().unwrap_or_default();
     if first.contains("could not read source import closure")
         || first.contains("cannot resolve import")
+        || first.contains("nor an .olean on the search path")
     {
         "import".to_owned()
+    } else if first.starts_with("lean: capability: ") {
+        "capability".to_owned()
     } else if first.contains("lexical analysis reported") {
         "lexer".to_owned()
     } else if let Some((_, rest)) = first.split_once("outside the bounded source grammar") {
@@ -607,12 +623,14 @@ fn reference_lean(root: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Run `program file` from `directory`, bounded by `FILE_TIMEOUT`.
-fn run(program: &Path, directory: &Path, file: &str) -> Run {
+/// Run `program file` from `directory`, bounded by `FILE_TIMEOUT`. FrankenLean keeps its
+/// import reuse records in `reuse`; the pin ignores the variable.
+fn run(program: &Path, directory: &Path, file: &str, reuse: &Path) -> Run {
     let mut child = Command::new(program)
         .arg(file)
         .current_dir(directory)
         .env_remove("LEAN_PATH")
+        .env("FLN_IMPORT_REUSE_DIR", reuse)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -684,18 +702,19 @@ fn copy_suite(suite: &Path) -> PathBuf {
     copy
 }
 
-/// Run `program` over `files` from the copied suite on `WORKERS` threads.
-fn run_all(program: &Path, copy: &Path, files: &[String]) -> BTreeMap<String, Run> {
+/// Run `program` over `files` from the copied suite on `workers` threads.
+fn run_all(program: &Path, copy: &Path, files: &[String], workers: usize) -> BTreeMap<String, Run> {
     let next = AtomicUsize::new(0);
     let observed = Mutex::new(BTreeMap::new());
+    let reuse = copy.join("fln-import-reuse");
     std::thread::scope(|scope| {
-        for _ in 0..WORKERS {
+        for _ in 0..workers {
             scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(file) = files.get(index) else { break };
                     let (directory, name) = file.split_once('/').expect("dir/file");
-                    let seen = run(program, &copy.join(directory), name);
+                    let seen = run(program, &copy.join(directory), name, &reuse);
                     observed
                         .lock()
                         .expect("observation lock")
@@ -705,6 +724,61 @@ fn run_all(program: &Path, copy: &Path, files: &[String]) -> BTreeMap<String, Ru
         }
     });
     observed.into_inner().expect("observation lock")
+}
+
+/// FrankenLean over the suite: files without explicit imports on `WORKERS`, the rest on
+/// `IMPORT_WORKERS`, after the header-only `import Init` decides whether the non-`prelude`
+/// ones can be admitted at all (see the module documentation).
+fn run_subject(
+    program: &Path,
+    copy: &Path,
+    files: &[String],
+    oracle: &[OracleRow],
+) -> BTreeMap<String, Run> {
+    let headers: BTreeMap<&str, &OracleRow> =
+        oracle.iter().map(|row| (row.file.as_str(), row)).collect();
+    let (imported, plain): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|file| {
+        headers
+            .get(file.as_str())
+            .is_some_and(|row| !row.imports.is_empty())
+    });
+    let mut observed = run_all(program, copy, &plain, WORKERS);
+    std::fs::write(copy.join(INIT_STUB), "import Init\n").expect("write the Init stub");
+    let init = run(program, copy, INIT_STUB, &copy.join("fln-import-reuse"));
+    eprintln!(
+        "upstream_suite_scoreboard: header-only `import Init`: exit {:?} in {} ms",
+        init.exit, init.millis
+    );
+    let (bounded, measured): (Vec<String>, Vec<String>) = imported.into_iter().partition(|file| {
+        init.exit.is_none()
+            && headers
+                .get(file.as_str())
+                .is_some_and(|row| row.kind == "implicit")
+    });
+    observed.extend(run_all(program, copy, &measured, IMPORT_WORKERS));
+    for file in bounded {
+        observed.insert(file, closure_timeout(&init));
+    }
+    observed
+}
+
+/// The row of a file whose closure contains `Init` when the header-only `import Init`
+/// had no verdict within `FILE_TIMEOUT`: that measured timeout, never a run of its own.
+fn closure_timeout(init: &Run) -> Run {
+    assert!(
+        init.exit.is_none(),
+        "only an unadmitted Init bounds a closure"
+    );
+    Run {
+        exit: None,
+        stdout: String::new(),
+        stderr: format!(
+            "not run: the header-only `import Init` was not admitted within {} s ({} ms), and this closure contains it",
+            FILE_TIMEOUT.as_secs(),
+            init.millis
+        ),
+        millis: init.millis,
+    }
 }
 
 /// The checked-in tables, refused as a broken scan unless they name exactly the population.
@@ -788,8 +862,8 @@ fn upstream_suite_scoreboard_measures_the_drop_in_against_the_pin() {
     };
     let frankenlean = PathBuf::from(env!("CARGO_BIN_EXE_lean"));
     let copy = copy_suite(&root.join(SUITE));
-    let pin = run_all(&reference, &copy, &files);
-    let subject = run_all(&frankenlean, &copy, &files);
+    let pin = run_all(&reference, &copy, &files, WORKERS);
+    let subject = run_subject(&frankenlean, &copy, &files, &oracle);
     // The copy is this run's own scratch tree, created above; nothing else is removed.
     let _ = std::fs::remove_dir_all(&copy);
     let report = score(&oracle, &ledger, &pin, &subject);
@@ -827,9 +901,9 @@ fn regenerate_the_upstream_oracle_from_the_pin() {
     assert!(problems.is_empty(), "{problems:?}");
     let reference = reference_lean(&root).expect("the pinned lean");
     let copy = copy_suite(&root.join(SUITE));
-    let first = run_all(&reference, &copy, &files);
+    let first = run_all(&reference, &copy, &files, WORKERS);
     let other_copy = copy_suite(&root.join(SUITE));
-    let second = run_all(&reference, &other_copy, &files);
+    let second = run_all(&reference, &other_copy, &files, WORKERS);
     // The second copy is this run's own scratch tree, created above.
     let _ = std::fs::remove_dir_all(&other_copy);
     let mut headers = BTreeMap::new();
@@ -1045,6 +1119,17 @@ fn pin_drift_and_broken_scans_are_refused() {
 }
 
 #[test]
+fn an_unadmitted_init_bounds_its_closures_as_timeouts_never_acceptance() {
+    let init = ran(None, "", "");
+    let row = closure_timeout(&init);
+    assert!(!row.accepts());
+    assert_eq!(refusal_class(&row), "timeout");
+    assert!(row.stderr.contains("`import Init`"), "{row:?}");
+    let admitted = std::panic::catch_unwind(|| closure_timeout(&ran(Some(0), "", "")));
+    assert!(admitted.is_err(), "an admitted Init bounds nothing");
+}
+
+#[test]
 fn first_refusals_fall_into_the_closed_classes() {
     let refused = |stderr: &str| refusal_class(&ran(Some(1), "", stderr));
     let batch = "lean: execution: definition batch command 0 failed: frontend refused source: ";
@@ -1053,6 +1138,18 @@ fn first_refusals_fall_into_the_closed_classes() {
             "lean: input: could not read source import closure: cannot resolve import `Lean` as Lean.lean below any bounded ancestor of entry a.lean"
         ),
         "import"
+    );
+    assert_eq!(
+        refused(
+            "lean: input: import `Mathlib` is neither a source file (/t/Mathlib.lean) nor an .olean on the search path [/lib/lean]"
+        ),
+        "import"
+    );
+    assert_eq!(
+        refused(
+            "lean: capability: this entry's imports do not reach `Init`, so the pin would print its #eval"
+        ),
+        "capability"
     );
     assert_eq!(
         refused(&format!(

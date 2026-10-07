@@ -519,3 +519,44 @@ fn a_prelude_file_is_an_empty_world_through_the_lean_door() {
         "{refused:?}"
     );
 }
+
+/// A `prelude` file whose imports do not reach `Init` has none of the `Repr` or `ToString`
+/// instances the pin prints an `#eval` through, so there the pin refuses the `#eval` ("could not
+/// synthesize a `Repr` or `ToString` instance for type Nat") and the door must not print it. Its
+/// `#check` lines and silent declarations are unaffected. Pin verdicts measured 2026-10-07.
+#[test]
+fn a_prelude_world_without_init_never_prints_an_eval() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-prelude-eval");
+    let header = "prelude\nimport Init.Prelude\ndef answer : Nat := id 42\n";
+    // Pin: exit 0, silent. Init.Prelude has no `=` notation, hence `Eq`.
+    let silent = workspace.write(
+        "Silent.lean",
+        format!("{header}theorem same : Eq answer answer := rfl\n"),
+    );
+    let ran = lean_door(&workspace, &silent, &lib);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (0, "", ""),
+        "{ran:?}"
+    );
+    // Pin: `Nat : Type`.
+    let check = workspace.write("Check.lean", format!("{header}#check Nat\n"));
+    let ran = lean_door(&workspace, &check, &lib);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str()),
+        (0, "Nat : Type\n"),
+        "{ran:?}"
+    );
+    // Pin: refused. Printing `42` would accept what it refuses.
+    let eval = workspace.write("Eval.lean", format!("{header}#eval answer\n"));
+    let refused = lean_door(&workspace, &eval, &lib);
+    assert_eq!(refused.code, 5, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .starts_with("lean: capability: this prelude file's imports do not reach `Init`"),
+        "{refused:?}"
+    );
+}

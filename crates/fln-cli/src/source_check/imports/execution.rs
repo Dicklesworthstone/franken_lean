@@ -212,7 +212,11 @@ pub(in crate::source_check) fn run(
                 Err(error) => return Some(failure(module_error(error), presentation)),
             };
             Some(match presentation {
-                Presentation::Lean => match lean_output(&completed, &names[0]) {
+                Presentation::Lean => match lean_output(
+                    &completed,
+                    &names[0],
+                    headers[0].prelude && !loaded.reaches(&Name::from_components(["Init"])),
+                ) {
                     Ok(output) => output,
                     Err(error) => failure(error, presentation),
                 },
@@ -292,9 +296,15 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
 /// What the drop-in `lean` prints for a program that ran: the output of the
 /// entry file's own commands. The modules it imports ran too, and what they
 /// print is not the entry's.
+/// `without_init`: the entry is a `prelude` file whose imports never reach `Init`. The pin
+/// prints an `#eval` through a `Repr` or `ToString` instance and refuses it without one, which
+/// such a world may lack (`Init.Prelude` declares neither), while this door's printer needs
+/// none. Printing there would accept what the pin refuses. A non-`prelude` file imports `Init`
+/// implicitly at the pin, so its instances exist whatever this closure holds.
 fn lean_output(
     program: &SourceProgramExecution,
     entry: &Name,
+    without_init: bool,
 ) -> Result<MultiplexerOutput, Failure> {
     validate_exits(program)?;
     let module = program
@@ -302,6 +312,22 @@ fn lean_output(
         .last()
         .filter(|module| &module.module == entry)
         .ok_or_else(|| internal("source program did not retain its entry as the final module"))?;
+    if without_init
+        && module
+            .commands
+            .outputs
+            .iter()
+            .any(|output| matches!(output, fln::SourceCommandOutput::Evaluation { .. }))
+    {
+        return Err(Failure::new(
+            "capability",
+            "this prelude file's imports do not reach `Init`; the pin prints an #eval through \
+             the Repr or ToString instance its world declares and refuses it without one, and \
+             that instance-directed printing is not implemented",
+            false,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        ));
+    }
     Ok(render_lean_source_commands(&module.commands))
 }
 
@@ -597,12 +623,17 @@ mod tests {
                 assert!(render(&program, &entry, 0, None, true).is_ok());
                 // The `lean` presentation prints the entry's own output only: one
                 // `42`, though the dependency evaluated the same term.
-                match lean_output(&program, &entry) {
+                match lean_output(&program, &entry, false) {
                     Ok(presented) => assert_eq!(
                         (presented.exit_code, presented.stdout.as_str()),
                         (0, "42\n")
                     ),
                     Err(error) => panic!("a complete program must present: {}", error.detail),
+                }
+                // A `prelude` entry whose world lacks `Init` never prints an `#eval`.
+                match lean_output(&program, &entry, true) {
+                    Err(error) => assert_eq!((error.class, error.exit), ("capability", 5)),
+                    Ok(_) => panic!("an #eval without Init's instances must not print"),
                 }
                 // The VM terminal seam is public typed data. Plant a completed
                 // panic in a dependency definition that has no output event,
@@ -615,7 +646,7 @@ mod tests {
                     message: "dependency initialization failed".to_owned(),
                     usage: returned.usage,
                 };
-                match lean_output(&program, &entry) {
+                match lean_output(&program, &entry, false) {
                     Err(error) => assert_eq!((error.class, error.exit), ("program-panic", 1)),
                     Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
                 }

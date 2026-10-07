@@ -98,6 +98,12 @@ pub(super) struct Loaded {
     olean_roots: Vec<Name>,
 }
 impl Loaded {
+    /// Whether the `.olean` closure holds `module`. Every module here is reached from the
+    /// entry, so this is the entry's world.
+    pub(super) fn reaches(&self, module: &Name) -> bool {
+        self.oleans.iter().any(|olean| &olean.name == module)
+    }
+
     /// The base engine source is checked against: the council-admitted
     /// `.olean` closure when the source imports one, else `seed()`. `jobs`
     /// closure modules are checked at once, each worker on a stack of the
