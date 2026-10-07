@@ -85,7 +85,8 @@ impl std::fmt::Display for SourceCheckError {
 impl std::error::Error for SourceCheckError {}
 
 impl SourceCheckError {
-    /// Wire classification never turns a frontend resource stop into rejection.
+    /// Wire classification preserves frontend, compiler and codec resource
+    /// stops as nonanswers, including commands executed in imported worlds.
     pub fn disposition(&self) -> (&'static str, bool, u8) {
         match self {
             Self::EmptyInput | Self::Scope { .. } => ("input", false, 1),
@@ -106,6 +107,22 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::CheckerBridge { .. }
         | EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),
+        EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
+            ("resource", false, 3)
+        }
+        EngineExecutionError::Codec(error) if error.is_resource_exhaustion() => {
+            ("resource", false, 3)
+        }
+        EngineExecutionError::Lowering(error) => {
+            if error.is_resource_exhaustion() {
+                ("resource", false, 3)
+            } else if error.is_internal_fault() {
+                ("internal-fault", false, 4)
+            } else {
+                ("execution", true, 1)
+            }
+        }
+        EngineExecutionError::Ingress(_) | EngineExecutionError::Codec(_) => ("execution", true, 1),
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {

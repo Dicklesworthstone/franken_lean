@@ -198,6 +198,29 @@ fn declarations(
 }
 
 impl imported::SourceOleanImport {
+    /// An empty import world for explicit `prelude` programs. No declaration,
+    /// metadata registration or imported module is installed. The private
+    /// contexts retain that empty world independently of the public reports.
+    pub fn empty(options: &KVMap) -> Self {
+        let engine = Engine::from_environment(Environment::new());
+        let root = engine.logical_root(options);
+        let checked = CheckedOleanSet {
+            engine: engine.clone(),
+            base_logical_root: root,
+            result_logical_root: root,
+            modules: Vec::new(),
+        };
+        let contexts =
+            contexts::ImportContexts::capture(&engine, &engine, &checked, BTreeMap::new());
+        Self {
+            contexts,
+            engine,
+            checked,
+            result_logical_root: root,
+            modules: Vec::new(),
+        }
+    }
+
     /// Compile and run an explicit source import graph against this receipt's
     /// private checked contexts. An imported declaration is executable library
     /// input, never an upstream runtime component. No seed is installed.

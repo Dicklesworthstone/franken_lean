@@ -183,7 +183,11 @@ const USAGE: &str = concat!(
     "    modules at once (default: available cores, at most 8); the result does\n",
     "    not depend on N, and --jobs 1 checks them one by one. `lake build`\n",
     "    takes the same --jobs for the imports it admits.\n",
-    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
+    "  fln run [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
+    "    Explicit external imports use the same bounded loader and import posture\n",
+    "    as check-source. Each source module runs in its own import context;\n",
+    "    fln.source-program/1 reports raw results per module. These programs\n",
+    "    currently refuse --emit-*; `prelude` starts without an ambient seed.\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--constants] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
@@ -432,6 +436,8 @@ enum MultiplexerCommand {
         paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        jobs: Option<std::num::NonZeroUsize>,
+        import_posture: fln::source_check::modules::reuse::ImportPosture,
         emit_flbc: Option<PathBuf>,
         emit_sidecar: Option<PathBuf>,
         emit_olean_snapshot: Option<PathBuf>,
@@ -723,6 +729,8 @@ fn parse_path_options(
 }
 
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let (arguments, jobs) = take_jobs_option(arguments)?;
+    let (arguments, import_posture) = source_check::take_import_posture_option(arguments)?;
     let mut filtered = Vec::new();
     let mut emit_flbc = None;
     let mut emit_sidecar = None;
@@ -862,6 +870,8 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         paths,
         max_bytes,
         json,
+        jobs,
+        import_posture,
         emit_flbc,
         emit_sidecar,
         emit_olean_snapshot,
@@ -13180,17 +13190,29 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             paths,
             max_bytes,
             json,
+            jobs,
+            import_posture,
             emit_flbc,
             emit_sidecar,
             emit_olean_snapshot,
-        }) => run_sources(
+        }) => source_check::run_imported(
             &paths,
             max_bytes,
             json,
-            emit_flbc,
-            emit_sidecar,
-            emit_olean_snapshot,
-        ),
+            emit_flbc.is_some() || emit_sidecar.is_some() || emit_olean_snapshot.is_some(),
+            jobs.unwrap_or_else(default_import_jobs),
+            import_posture,
+        )
+        .unwrap_or_else(|| {
+            run_sources(
+                &paths,
+                max_bytes,
+                json,
+                emit_flbc,
+                emit_sidecar,
+                emit_olean_snapshot,
+            )
+        }),
         Ok(MultiplexerCommand::FlbcRun {
             path,
             max_bytes,

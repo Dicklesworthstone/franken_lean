@@ -11,6 +11,7 @@
 //! instead ([`fln::source_check::modules::reuse`]); every output names which.
 use super::*;
 pub(super) mod editor;
+pub(super) mod execution;
 mod metadata;
 mod reuse;
 use fln::source_check::modules::imported::SourceOleanImport;

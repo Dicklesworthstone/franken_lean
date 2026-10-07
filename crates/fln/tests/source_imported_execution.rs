@@ -155,12 +155,18 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         for bad in [
             "prelude\n#check Nat",
             "prelude\nimport Missing\n#eval (42 : Nat)",
-            "prelude\nimport Init.Prelude\ndef prefix : Nat := 42\n#eval prefix\ntheorem falseClaim : (1 : Nat) = 2 := rfl",
+            "prelude\nimport Init.Prelude\ndef stagedResult : Nat := 42\n#eval stagedResult\ntheorem falseClaim : (1 : Nat) = 2 := rfl",
         ] {
             let modules = [SourceModuleInput { name: &entry, source: bad.as_bytes() }];
-            assert!(imported.execute_source_modules(&modules, &entry, &options, limits(), None).is_err(), "{bad}");
+            let error = imported.execute_source_modules(&modules, &entry, &options, limits(), None)
+                .expect_err("invalid module returns no partial execution");
+            if bad.contains("stagedResult") {
+                assert!(matches!(error, fln::source_check::modules::SourceModuleCheckError::Source {
+                    error: fln::SourceCheckError::Command { command: 2, .. }, ..
+                }), "the valid definition and evaluation must precede the failure: {error:?}");
+            }
             assert_eq!(imported.engine.logical_root(&options), original);
-            assert!(!imported.engine.environment().contains(&name("prefix")));
+            assert!(!imported.engine.environment().contains(&name("stagedResult")));
         }
         // A source sibling's declarations do not become ambient merely
         // because another entry branch imports that sibling.
@@ -193,6 +199,112 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         assert_eq!(empty.modules[0].commands.command_count, 0);
         assert!(empty.modules[0].commands.outputs.is_empty());
     }).unwrap().join().unwrap();
+}
+
+#[test]
+fn explicit_prelude_programs_start_in_a_genuinely_empty_import_world() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let options = KVMap::new();
+            let imported = SourceOleanImport::empty(&options);
+            let root = imported.engine.logical_root(&options);
+            assert!(imported.checked.modules.is_empty());
+            assert!(imported.modules.is_empty());
+            assert_eq!(imported.checked.base_logical_root, root);
+            assert_eq!(imported.checked.result_logical_root, root);
+            assert_eq!(imported.result_logical_root, root);
+            let sources = [
+                ("Main", "prelude\nimport Base\n#check token\n"),
+                (
+                    "Base",
+                    "prelude\ninductive Token where\n  | mk\ndef token : Token := Token.mk\n",
+                ),
+            ];
+            let first = run(&imported, &sources, "Main");
+            assert_eq!(
+                first.modules.iter().map(|m| &m.module).collect::<Vec<_>>(),
+                [&name("Base"), &name("Main")]
+            );
+            assert_eq!(first.modules[1].commands.outputs.len(), 1);
+            for module in &first.modules {
+                assert!(
+                    module
+                        .commands
+                        .batch
+                        .engine
+                        .environment()
+                        .find(&name("Nat"))
+                        .is_none()
+                );
+            }
+            let entry = name("Main");
+            for source in ["prelude\n#check Nat", "prelude\nimport Init.Prelude\n"] {
+                let modules = [SourceModuleInput {
+                    name: &entry,
+                    source: source.as_bytes(),
+                }];
+                assert!(
+                    imported
+                        .execute_source_modules(&modules, &entry, &options, limits(), None)
+                        .is_err()
+                );
+            }
+            struct Cancelled;
+            impl fln::CancellationProbe for Cancelled {
+                fn is_cancelled(&self) -> bool {
+                    true
+                }
+            }
+            let modules = [SourceModuleInput {
+                name: &entry,
+                source: b"prelude\n",
+            }];
+            assert!(matches!(
+                imported
+                    .execute_source_modules(&modules, &entry, &options, limits(), Some(&Cancelled))
+                    .unwrap(),
+                fln::Outcome::Inconclusive(_)
+            ));
+            // These are real compiler and bytecode resource stops after
+            // admission, not evidence that the source declaration is invalid.
+            let names = [name("Main"), name("Base")];
+            let modules: Vec<_> = names
+                .iter()
+                .zip(&sources)
+                .map(|(name, (_, source))| SourceModuleInput {
+                    name,
+                    source: source.as_bytes(),
+                })
+                .collect();
+            let mut compiler_limit = limits();
+            compiler_limit.execution.ingress.max_nodes = 1;
+            let mut codec_limit = limits();
+            codec_limit.execution.flbc_codec.max_artifact_bytes = 1;
+            for restricted in [compiler_limit, codec_limit] {
+                let error = imported
+                    .execute_source_modules(&modules, &entry, &options, restricted, None)
+                    .expect_err("the limited compiler cannot complete this program");
+                assert_eq!(error.disposition(), ("resource", false, 3), "{error:?}");
+            }
+            let retry = run(&imported, &sources, "Main");
+            assert_eq!(
+                first.modules[1]
+                    .commands
+                    .batch
+                    .engine
+                    .logical_root(&options),
+                retry.modules[1]
+                    .commands
+                    .batch
+                    .engine
+                    .logical_root(&options)
+            );
+            assert_eq!(imported.engine.logical_root(&options), root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

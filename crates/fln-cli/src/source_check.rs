@@ -1,4 +1,4 @@
-//! User-facing source proof checking. No compiler or VM is entered.
+//! Source proof checking and explicit import resolution for source front doors.
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImport;
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
@@ -21,6 +21,19 @@ pub(super) fn load_build_base(
 }
 
 pub(crate) use imports::{external_inputs, module_records, posture_json, posture_sentence};
+
+/// Explicit import programs use their admitted module worlds. `None` keeps the
+/// existing headerless and ordinary local-source `fln run` contract.
+pub(super) fn run_imported(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    json: bool,
+    emit_artifact: bool,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+) -> Option<MultiplexerOutput> {
+    imports::execution::run(paths, max_bytes, json, emit_artifact, jobs, posture)
+}
 
 /// Remove `--import-posture P` / `--import-posture=P` from an interactive front
 /// door's arguments, which otherwise keep their order. Options end at `--`. The
