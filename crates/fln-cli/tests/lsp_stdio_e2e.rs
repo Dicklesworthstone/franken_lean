@@ -215,10 +215,11 @@ fn syntax_error_reports_a_real_utf16_source_position() {
 // Document:
 //   line 1 (0-based 0): `def ok : Nat := 1`   — valid
 //   line 2 (0-based 1): `def bad : Type := Type` — a `Type 1` body under a `Type`
-//                        declaration; the kernel rejects it (DefinitionTypeMismatch), as
-//                        the pin rejects it ("Type mismatch"). Two sorts are not a rigid
-//                        mismatch, so this one still reaches K1; `"str"` under `Nat` is
-//                        now refused while elaborating (fln-azxg).
+//                        declaration. The pin refuses it while elaborating ("Type
+//                        mismatch"), and so does FrankenLean now, as a refused conversion
+//                        between the two sorts. Before, it reached K1
+//                        (DefinitionTypeMismatch). The position rule is the same for either
+//                        stage: an elaboration failure carries no token position either.
 // The failing command starts at byte 18 (the start of line 2), so the diagnostic
 // must publish at line 1, not the hardcoded file-head line 0.
 #[test]
@@ -242,10 +243,12 @@ fn kernel_rejection_reports_the_command_line_not_the_file_head() {
         })
         .unwrap_or_else(|| panic!("no nonempty publishDiagnostics for {uri}: {messages:#?}"));
 
-    // Sanity: this really is the kernel type-mismatch rejection, not a parse error.
+    // Sanity: this really is the second command's refused conversion, not a parse error.
     assert!(
-        diagnostic.contains("does not match") || diagnostic.contains("DefinitionTypeMismatch"),
-        "expected a kernel type-mismatch rejection, got: {diagnostic}"
+        diagnostic
+            .contains("command 1, byte 18: frontend refused source: elaboration refused source")
+            && diagnostic.contains("not definitionally equal"),
+        "expected the second command's elaboration refusal, got: {diagnostic}"
     );
     assert!(
         diagnostic.contains(r#""start":{"line":1,"character":0}"#),

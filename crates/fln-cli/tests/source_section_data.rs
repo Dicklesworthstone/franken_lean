@@ -81,11 +81,16 @@ fn imported_generalized_records_keep_defaults_and_reject_false_suffixes() {
                 output.stdout.is_empty(),
                 "failed suffix exposed a success receipt"
             );
+            // A false `by rfl` is refused while elaborating, as at the pin ("Tactic `rfl`
+            // failed: The left-hand side … is not definitionally equal …").
             let error = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                error.contains("\"outcome\":\"kernel-rejection\""),
-                "{error}"
-            );
+            for expected in [
+                "\"outcome\":\"elaboration\"",
+                "module `Main`: file 0, command 2, byte 87:",
+                "not definitionally equal",
+            ] {
+                assert!(error.contains(expected), "{error}");
+            }
             assert!(!error.contains("\"outcome\":\"complete\""));
         }
         assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
@@ -98,7 +103,7 @@ fn imported_generalized_records_keep_defaults_and_reject_false_suffixes() {
 }
 
 #[test]
-fn invalid_record_result_ascriptions_are_authoritative_rejections_not_successes() {
+fn invalid_record_result_ascriptions_are_refused_while_elaborating_not_accepted() {
     let dir = std::env::temp_dir().join(format!(
         "fln-record-sort-{}-{}",
         std::process::id(),
@@ -106,9 +111,9 @@ fn invalid_record_result_ascriptions_are_authoritative_rejections_not_successes(
     ));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("Invalid.lean");
-    // The pin: "Type mismatch", `Type : Type 1` is not a `Type`. Two sorts are not a
-    // rigid mismatch, so the ascription reaches K1's authoritative check. (`Type : Nat`
-    // is now refused while elaborating: fln-azxg.)
+    // The pin refuses the ascription while elaborating: "Type mismatch", `Type : Type 1` is
+    // not a `Type`. So does FrankenLean now, as a refused conversion between the two sorts
+    // (its wording, "not definitionally equal", is not yet the pin's).
     let source = "variable (A : Type)\nstructure Bad : (Type : Type) where\n  value : A";
     std::fs::write(&path, source).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
@@ -119,11 +124,9 @@ fn invalid_record_result_ascriptions_are_authoritative_rejections_not_successes(
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        error.contains("\"outcome\":\"kernel-rejection\""),
-        "{error}"
-    );
-    assert!(error.contains("\"authority\":true"), "{error}");
+    for expected in ["\"outcome\":\"elaboration\"", "file 0, command 1, byte 20:"] {
+        assert!(error.contains(expected), "{error}");
+    }
     assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 }
