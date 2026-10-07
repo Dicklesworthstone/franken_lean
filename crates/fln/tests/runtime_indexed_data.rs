@@ -228,28 +228,44 @@ fn existential_type_fields_execute_with_a_boxed_value() {
 }
 
 #[test]
-fn type_indices_are_refused() {
-    use fln::{Outcome, SourceCheckLimits};
+fn type_indices_select_one_uniform_runtime_layout() {
+    use fln::SourceCheckLimits;
     let source = "inductive Dynamic : Type -> Type where | nat (n : Nat) : Dynamic Nat | flag (b : Bool) : Dynamic Bool\n\
          def ignore (x : Dynamic Nat) : Nat := 42\n#eval ignore (Dynamic.nat 7)";
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
+    let definitions = source.split("#eval").next().unwrap();
     // This remains a valid logical declaration, not a parser-error control.
-    base.check_source_files(
-        &[source.split("#eval").next().unwrap().as_bytes()],
-        &options,
-        SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
-    )
-    .unwrap()
-    .into_complete()
-    .unwrap();
-    assert!(
-        !matches!(
-            base.execute_source_definitions(&[source.as_bytes()], &options, limits()),
-            Ok(Outcome::Complete(_))
-        ),
-        "{source}"
+    let checked = base
+        .check_source_files(
+            &[definitions.as_bytes()],
+            &options,
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let prepared = base
+        .execute_source_definitions(&[definitions.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        prepared.engine.logical_root(&options),
+        checked.engine.logical_root(&options)
+    );
+    let executed = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &executed.executions.last().unwrap().exit else {
+        panic!("native return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
     );
     assert_eq!(base.logical_root(&options), root);
 }
