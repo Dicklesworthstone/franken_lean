@@ -1,0 +1,46 @@
+# Focused IR regressions alongside, not instead of, scripts/check.sh.
+name: IR validation regressions
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-olean/**'
+      - 'crates/fln-core/**'
+      - 'crates/fln-hash/**'
+      - 'crates/fln-rt/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-unsafe-region/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ir-validation.yml'
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Use the repository toolchain pin
+        run: rustup show active-toolchain
+      - name: Codec and IR regression tests
+        run: cargo test --locked -p fln-olean
+      - name: Codec and IR Clippy
+        run: cargo clippy --locked -p fln-olean --all-targets -- -D warnings
+      - name: Check changed IR source formatting and retain corrections
+        if: always()
+        shell: bash
+        run: |
+          rustfmt --edition 2024 crates/fln-olean/src/ir_validate.rs crates/fln-olean/tests/ir_validate.rs crates/fln-olean/tests/ir_validated_graph.rs
+          git diff -- crates/fln-olean > "$RUNNER_TEMP/ir-format.patch"
+          cat "$RUNNER_TEMP/ir-format.patch"
+          git diff --exit-code -- crates/fln-olean
+      - name: Preserve formatting patch
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ir-format-${{ github.sha }}
+          path: ${{ runner.temp }}/ir-format.patch
+          if-no-files-found: ignore

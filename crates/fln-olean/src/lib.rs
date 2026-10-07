@@ -42,6 +42,7 @@ pub mod format;
 pub mod ilean;
 pub mod ir;
 mod ir_format;
+pub mod ir_validate;
 pub mod pin;
 pub mod rebuild;
 pub mod region;
