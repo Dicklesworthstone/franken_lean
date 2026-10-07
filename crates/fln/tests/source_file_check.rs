@@ -57,7 +57,8 @@ fn late_failure_exposes_no_successor_and_reports_the_correct_file_offset() {
     assert!(
         matches!(error,SourceCheckError::Command {file:1,command:2,offset,..} if offset==prefix.len())
     );
-    assert_eq!(error.disposition(), ("kernel-rejection", true, 1));
+    // A false `by rfl` is refused while elaborating, as at the pin ("Tactic `rfl` failed").
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&opts), root);
     assert!(
         !base

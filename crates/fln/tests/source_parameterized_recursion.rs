@@ -135,11 +135,9 @@ fn false_generic_proofs_and_late_failures_never_publish_a_prefix() {
                 SourceCheckLimits::new(limits()),
             )
             .unwrap_err();
-        assert_eq!(
-            error.disposition(),
-            ("kernel-rejection", true, 1),
-            "{error:?}"
-        );
+        // A false `rfl` is refused while elaborating, as at the pin ("Tactic `rfl` failed",
+        // measured with `Seq` renamed: the pin's Init already declares `Seq`).
+        assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
         assert_eq!(base.logical_root(&KVMap::new()), root);
         assert!(!base.environment().contains(&Name::from_components(["Seq"])));
     }

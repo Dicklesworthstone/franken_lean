@@ -191,7 +191,8 @@ fn false_proofs_and_invalid_unused_terms_are_still_refused() {
     for (source, refusal, twin) in [
         (
             "theorem false_proof (n : Nat) : 1 = 2 := by cases n with | zero => rfl | succ k => rfl",
-            ("kernel-rejection", true, 1),
+            // A false `rfl` is refused while elaborating, as at the pin ("Tactic `rfl` failed").
+            ("elaboration", false, 1),
             "theorem false_proof (n : Nat) : 1 = 1 := by cases n with | zero => rfl | succ k => rfl",
         ),
         (

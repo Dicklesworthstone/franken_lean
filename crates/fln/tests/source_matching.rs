@@ -139,8 +139,9 @@ fn proposition_valued_matches_build_proofs_for_every_branch() {
 fn all_branches_are_checked_even_when_the_discriminant_is_a_literal() {
     // `(1 : String)` is refused while elaborating, as the pin refuses it (no
     // `OfNat String 1`), and so is `"wrong"` where a `Nat` is expected (the pin's
-    // "Type mismatch", a rigid mismatch: fln-azxg). The false proposition reaches K1.
-    // Each twin must check.
+    // "Type mismatch", a rigid mismatch: fln-azxg). The false proposition's `rfl` is
+    // refused while elaborating too, as at the pin ("Tactic `rfl` failed"). Each twin
+    // must check.
     for (text, refusal, twin) in [
         (
             "def bad : Nat := match true with | true => 1 | false => \"wrong\"",
@@ -154,7 +155,7 @@ fn all_branches_are_checked_even_when_the_discriminant_is_a_literal() {
         ),
         (
             "theorem bad : 1 = 2 := match true with | true => by rfl | false => by rfl",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "theorem bad : 1 = 1 := match true with | true => by rfl | false => by rfl",
         ),
     ] {
@@ -284,10 +285,8 @@ fn failed_matches_cannot_publish_a_successful_prefix_across_files() {
             assert_eq!(result.commands, 3);
             assert_eq!(result.theorems, 1);
         } else {
-            assert_eq!(
-                result.unwrap_err().disposition(),
-                ("kernel-rejection", true, 1)
-            );
+            // A false `by rfl` is refused while elaborating, as at the pin.
+            assert_eq!(result.unwrap_err().disposition(), ("elaboration", false, 1));
         }
         assert_eq!(e.logical_root(&KVMap::new()), root);
         assert!(!e.environment().contains(&Name::from_components(["Branch"])));
