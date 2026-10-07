@@ -17,7 +17,11 @@ permissions:
   contents: read
 jobs:
   regression:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, self-hosted]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -41,6 +45,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ir-format-${{ github.sha }}
+          name: ir-format-${{ matrix.runner }}-${{ github.sha }}
           path: ${{ runner.temp }}/ir-format.patch
           if-no-files-found: ignore
