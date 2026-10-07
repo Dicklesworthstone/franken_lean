@@ -101,7 +101,7 @@ examples/native_quotient_runtime.lean	accept	accept	match	agree
 examples/native_quotients.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_record_defaults.lean	accept	accept	match	agree	
 examples/native_record_runtime.lean	accept	accept	match	agree	
-examples/native_record_values.lean	reject	reject	n/a	agree	Reference 7: failed to synthesize instance of type class | FrankenLean: command 4, native instance search could not resolve all instance arguments
+examples/native_record_values.lean	accept	accept	match	agree	valid Lean since its Package values are compared at the unfolded type (`(23 : Nat)`): a bare numeral at `wrapped.carrier` has no OfNat instance at the pin ("failed to synthesize"), the class of fln-5efd
 examples/native_records.lean	reject	accept	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
 examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 45: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); the earlier first error, `repeat` used as a name (18), was renamed with fln-ffce
 examples/native_recursive_data.lean	accept	accept	match	agree	

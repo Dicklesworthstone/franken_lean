@@ -54,6 +54,15 @@ fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
     fln_cli::run(args)
 }
 
+/// A false `by rfl` is refused while elaborating the command at `at`, as at the
+/// pin ("Tactic `rfl` failed: The left-hand side … is not definitionally equal to
+/// the right-hand side"), and is never left for the kernel to reject.
+fn assert_rfl_refused_at(stderr: &str, at: &str) {
+    assert!(stderr.contains("\"outcome\":\"elaboration\""), "{stderr}");
+    assert!(stderr.contains(at), "{stderr}");
+    assert!(stderr.contains("not definitionally equal"), "{stderr}");
+}
+
 // FrankenLean's refusal texts for the pinned Reference's reasons. The pin
 // (`lean` v4.32.0) says, respectively: "Too many variable names provided at
 // alternative", "Invalid target: Index in target's type is not a variable",
@@ -296,7 +305,7 @@ fn later_files_can_use_prior_theorems_and_failure_emits_no_partial_success() {
     let output = run(args);
     assert_eq!(output.exit_code, 1);
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.contains("\"outcome\":\"kernel-rejection\""));
+    assert_rfl_refused_at(&output.stderr, "file 1, command 1, byte 0:");
     assert!(!output.stderr.contains("\"outcome\":\"complete\""));
 }
 #[test]
@@ -437,7 +446,10 @@ fn installed_binary_resolves_source_instances_across_files_without_execution() {
         output.stdout.is_empty(),
         "late failure must not expose successful prefix"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+    assert_rfl_refused_at(
+        &String::from_utf8_lossy(&output.stderr),
+        "file 1, command 2, byte 0:",
+    );
 }
 
 #[test]
@@ -472,7 +484,7 @@ fn installed_binary_checks_local_dictionaries_and_conditional_instance_rewrites(
     let refused = run(args);
     assert_ne!(refused.exit_code, 0);
     assert!(refused.stdout.is_empty());
-    assert!(refused.stderr.contains("kernel-rejection"));
+    assert_rfl_refused_at(&refused.stderr, "file 1, command 2, byte 0:");
 }
 
 #[test]
@@ -515,7 +527,7 @@ fn later_record_file_failure_emits_no_successful_prefix_or_class_registration() 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("kernel-rejection"), "{error}");
+    assert_rfl_refused_at(&error, "file 1, command 2, byte 48:");
     assert!(!error.contains("\"outcome\":\"complete\""));
 }
 
@@ -595,7 +607,10 @@ fn installed_binary_checks_function_dictionaries_and_refuses_late_false_proofs()
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 3, byte 0:",
+            );
         }
     }
 }
@@ -638,7 +653,10 @@ fn installed_binary_checks_instance_dependent_field_receivers_atomically() {
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 2, byte 0:",
+            );
         }
     }
 }
@@ -736,7 +754,10 @@ fn installed_binary_checks_inductive_constructors_and_recursor_computation_atomi
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 1, byte 0:",
+            );
         }
         assert_eq!(std::fs::read(suffix).unwrap(), before);
         assert_eq!(
@@ -782,7 +803,10 @@ fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_suc
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 3, byte 0:",
+            );
         }
     }
 }
@@ -917,9 +941,21 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
     }
 }
 
+/// `examples/native_induction.lean` in pin syntax. The pin refuses the example's bare
+/// `31` at `packed.carrier` ("failed to synthesize OfNat packed.carrier 31"), and so
+/// does FrankenLean, so its ledger row agrees. Written at the unfolded type, `(31 : Nat)`,
+/// the program is valid at the pin and `fln check-source` accepts it. The drop-in
+/// `lean` still refuses it, because its compiler has no dependent record recursor
+/// result for `unpack` (fln-lvdh).
 #[test]
 fn installed_binary_checks_real_induction_and_dependent_case_proofs() {
-    let path = file(include_str!("../../../examples/native_induction.lean"));
+    let example = include_str!("../../../examples/native_induction.lean");
+    let bare = "theorem unpack_ok : unpack packed = 31 := by rfl";
+    assert_eq!(example.matches(bare).count(), 1);
+    let path = file(&example.replace(
+        bare,
+        "theorem unpack_ok : unpack packed = (31 : Nat) := by rfl",
+    ));
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(path)
@@ -1173,9 +1209,9 @@ fn indexed_proof_failure_emits_no_success_and_does_not_poison_the_next_check() {
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("\"outcome\":\"kernel-rejection\"")
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 1, byte 0:",
             );
         }
     }
@@ -1218,9 +1254,9 @@ fn installed_binary_checks_indexed_matches_without_publishing_failed_prefixes() 
         } else {
             assert!(output.stdout.is_empty());
             assert_eq!(output.status.code(), Some(1));
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("\"outcome\":\"kernel-rejection\"")
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 2, byte 0:",
             );
         }
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
@@ -1455,7 +1491,9 @@ fn installed_heterogeneous_equality_checks_bridges_substitution_and_failure_isol
         );
         if valid {
             let result = String::from_utf8(output.stdout).unwrap();
-            for field in ["\"commands\":10", "\"theorems\":8", "\"executed\":false"] {
+            // Eight theorems, and `Certificate.valid`: the projection of a proof field is a
+            // theorem, as at the pin.
+            for field in ["\"commands\":10", "\"theorems\":9", "\"executed\":false"] {
                 assert!(result.contains(field), "{result}");
             }
             assert!(output.stderr.is_empty());
@@ -2337,8 +2375,16 @@ fn installed_constructor_fallback_preserves_instance_obligations_and_failed_suff
             }
             assert!(result.stderr.is_empty());
         } else {
+            // `left` applies `needs` alone and keeps its failure, as the pin's
+            // `nthConstructor` does ("failed to synthesize Missing"); only
+            // `constructor` moves on to the next constructor.
             assert!(result.stdout.is_empty());
-            assert!(!result.stderr.is_empty());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains("file 1, command 4, byte 0:"), "{stderr}");
+            assert!(
+                stderr.contains("native instance search could not resolve all instance arguments"),
+                "{stderr}"
+            );
         }
         assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
     }
