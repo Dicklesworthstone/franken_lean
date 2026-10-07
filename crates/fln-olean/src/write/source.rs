@@ -8,6 +8,8 @@ use crate::source_extension_format as layout;
 use crate::source_extensions::ClassEntry;
 use std::collections::HashSet;
 
+mod namespaces;
+
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
     pub classes: Vec<ClassEntry>,
@@ -18,18 +20,17 @@ pub struct SourceMetadata {
     pub protected: Vec<Name>,
 }
 
-/// Encode the supported source journals in the pinned physical layout. Empty
-/// metadata takes the original path and produces byte-identical basic modules.
+/// Encode source journals and the namespaces implied by local declarations.
+/// Empty journals with no qualified local declarations retain the original
+/// basic-module bytes. Explicit empty namespaces need a source namespace journal
+/// and are not inferred here; imported declarations are not re-exported.
 pub fn encode_module_with_source_metadata(
     input: ModuleWriteInput<'_>,
     metadata: &SourceMetadata,
     header: OleanWriteHeader<'_>,
     budget: WriteBudget,
 ) -> WResult<EncodedModule> {
-    if metadata.classes.is_empty() && metadata.protected.is_empty() {
-        return encode_module(input, header, budget);
-    }
-    encode_module_metadata(input, Some(metadata), header, budget)
+    namespaces::encode(input, metadata, header, budget)
 }
 
 impl Encoder {
@@ -70,6 +71,11 @@ impl Encoder {
 
     /// The module's extension blocks: one per non-empty supported journal.
     pub(super) fn source_entries(&mut self, metadata: &SourceMetadata) -> WResult<Obj> {
+        let blocks = self.source_blocks(metadata)?;
+        self.array(blocks)
+    }
+
+    fn source_blocks(&mut self, metadata: &SourceMetadata) -> WResult<Vec<Obj>> {
         let mut blocks = Vec::new();
         if !metadata.classes.is_empty() {
             blocks.push(self.class_block(&metadata.classes)?);
@@ -77,7 +83,7 @@ impl Encoder {
         if !metadata.protected.is_empty() {
             blocks.push(self.protected_block(&metadata.protected)?);
         }
-        self.array(blocks)
+        Ok(blocks)
     }
 
     fn class_block(&mut self, classes: &[ClassEntry]) -> WResult<Obj> {
