@@ -296,7 +296,7 @@ pub fn ir_graph_dot(
     for id in ids {
         let rank = remap[id as usize];
         out.push(&format!("  n{rank} [label="))?;
-        out.quote(&graph.name(id).to_string())?;
+        out.quote(&graph.name(id).to_display_string())?;
         let kind = match graph.kind(id) {
             IrNodeKind::Function => "function",
             IrNodeKind::Extern => "extern",
