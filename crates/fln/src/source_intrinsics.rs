@@ -51,6 +51,32 @@ struct Comparison<'a> {
     limits: IngressLimits,
 }
 
+/// Assemble only the existing checked Nat course-of-values models. This is
+/// compiler-local recognition data, not an elaborator API or an admitted seed.
+pub(super) fn imported_nat_recursion_model_declarations() -> Vec<Declaration> {
+    std::iter::once(fln_elab::seed::nat_inductive_seed_declaration())
+        .chain(
+            fln_elab::seed::nat_add_support_seed_declarations()
+                .into_iter()
+                .take(6),
+        )
+        .collect()
+}
+
+pub(super) fn imported_nat_recursion_matches(
+    environment: &Environment,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    let mut comparison = Comparison { visited, limits };
+    for declaration in imported_nat_recursion_model_declarations() {
+        if !comparison.declaration(environment, declaration)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn imported_list_recursion_matches(
     environment: &Environment,
     visited: &mut usize,

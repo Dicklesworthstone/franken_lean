@@ -6,6 +6,7 @@
 //! action. Both the original theorem checking and FIR validation remain intact.
 mod arguments;
 mod imported_lists;
+mod imported_nat;
 mod scope;
 
 use super::*;
@@ -18,6 +19,7 @@ pub(super) struct Store {
     // Cached only after the complete immutable decision-family contract checks.
     pub(super) decision_family_checked: bool,
     list_recursion_checked: bool,
+    nat_recursion_checked: bool,
     definitions: BTreeMap<Name, DefinitionVal>,
     instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,

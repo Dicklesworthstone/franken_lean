@@ -145,10 +145,29 @@ impl Preparation<'_> {
         }
         // Emptiness comes from the admitted zero-constructor family, not from
         // a static approximation of an ordinary, potentially inhabited type.
-        let result_type = self.erase_runtime_type(&type_)?;
-        let result = self
-            .value_type(&result_type)?
-            .ok_or_else(|| unsupported("empty elimination result representation"))?;
+        let mut result_type = self.erase_runtime_type(&type_)?;
+        let mut result = self.value_type(&result_type)?;
+        let mut suffix = &args[arity..];
+        if result.is_none() && !suffix.is_empty() {
+            // An impossible branch can return a function whose domain has no
+            // runtime layout (for example Nat.below 0). No function value is
+            // ever produced: elimination cannot return to evaluate any suffix
+            // operand. Instantiate the admitted result telescope to the final
+            // application type instead of manufacturing the intermediate ABI.
+            for argument in suffix {
+                self.tick()?;
+                let normal = self.type_head(&type_)?;
+                let ExprNode::ForallE { body, .. } = normal.node() else {
+                    return Err(unsupported("empty elimination result telescope"));
+                };
+                type_ = self.substitution(body, argument)?;
+            }
+            result_type = self.erase_runtime_type(&type_)?;
+            result = self.value_type(&result_type)?;
+            suffix = &[];
+        }
+        let result =
+            result.ok_or_else(|| unsupported("empty elimination result representation"))?;
         let name = self.empty_name(major_type, result)?;
         let mut value = Expr::app(
             Expr::const_(name, vec![]),
@@ -156,14 +175,14 @@ impl Preparation<'_> {
         );
         let depth =
             u32::try_from(bindings.len()).map_err(|_| unsupported("empty argument depth"))?;
-        if args.len() > arity {
+        if !suffix.is_empty() {
             // The non-returning call precedes evaluation of suffix arguments,
             // even when its nominal result is a callback.
             let mut applied = Expr::bvar(0).map_err(|_| unsupported("empty result scope"))?;
             let lifted = depth
                 .checked_add(1)
                 .ok_or_else(|| unsupported("empty result depth"))?;
-            for argument in &args[arity..] {
+            for argument in suffix {
                 self.tick()?;
                 applied = Expr::app(applied, self.lift(argument, lifted)?);
             }
