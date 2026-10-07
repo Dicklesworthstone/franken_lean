@@ -103,6 +103,7 @@ impl Context {
             && name != &Name::from_components(["Bind", "bind"])
             && name != &Name::from_components(["MonadExcept", "tryCatch"])
             && name != &Name::from_components(["tryCatchThe"])
+            && name != &Name::from_components(["tryFinally"])
         {
             return Ok(());
         }

@@ -81,3 +81,37 @@ fn exception_planning_is_nonrecursive_and_retains_deep_source() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn finalizers_preserve_original_tokens_and_scope_order() {
+    for (source, regions, finalizers) in [
+        (
+            "def f := do { try { action } finally { cleanup }; suffix }",
+            1,
+            1,
+        ),
+        (
+            "def f := do\r\n  try\r\n    action\r\n  catch e : Error =>\r\n    recover e\r\n  finally\r\n    cleanup -- last\r\n  suffix",
+            1,
+            1,
+        ),
+        (
+            "def f := do { try { try { action } finally { inner } } finally { outer } }",
+            2,
+            2,
+        ),
+    ] {
+        let parsed =
+            parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(count(parsed.syntax(), "doTry"), regions);
+        assert_eq!(count(parsed.syntax(), "doFinally"), finalizers);
+    }
+    for source in [
+        "def f := do { try { action } finally }",
+        "def f := do { try { action } finally { cleanup } catch e => { recover e } }",
+        "def f := do { try { action } finally { cleanup } finally { again } }",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}

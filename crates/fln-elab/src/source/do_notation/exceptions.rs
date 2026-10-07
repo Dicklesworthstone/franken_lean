@@ -48,9 +48,11 @@ impl Context {
         let mut parts = node(syntax, "doTry", 4)?;
         expect_atom(&parts[0], "try", "exception keyword")?;
         let finally = parts.pop().expect("optional finalizer");
-        // Finalizer semantics are not emulated by ordinary sequencing.
-        expect_empty_null(&finally, "exception without finalizer")?;
+        let mut finally = children(finally)?;
         let catches = children(parts.pop().expect("handlers"))?;
+        if finally.len() > 1 || catches.is_empty() && finally.is_empty() {
+            return Err(invalid());
+        }
         let body = parts.pop().expect("protected sequence");
         let mut returning = self.exception_control(&body)?;
         let mut action = self.expand_do_sequence(body, None)?;
@@ -74,6 +76,19 @@ impl Context {
                 }
                 _ => return Err(invalid()),
             };
+        }
+        if let Some(finalizer) = finally.pop() {
+            let mut parts = node(finalizer, "doFinally", 2)?;
+            expect_atom(&parts[0], "finally", "finalizer keyword")?;
+            let body = parts.pop().expect("finalizer sequence");
+            // As in the pin's doTryToCode, cleanup cannot escape its region.
+            // Use tryFinally, not bind: cleanup also runs when the action or
+            // a catch handler fails, and the admitted instance owns precedence.
+            if self.exception_control(&body)? {
+                return Err(invalid());
+            }
+            let cleanup = self.expand_do_sequence(body, None)?;
+            action = apply(&["tryFinally"], vec![action, cleanup]);
         }
         Ok(if returning {
             Syntax::node(
