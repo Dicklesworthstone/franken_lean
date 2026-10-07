@@ -246,6 +246,7 @@ impl Context {
 #[cfg(test)]
 mod tests {
     mod constructors;
+    mod inference;
     mod results;
 
     use super::*;

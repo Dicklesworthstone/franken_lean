@@ -468,20 +468,37 @@ impl Context {
             trial.resolve_instances(false)?;
             let actual = trial.instantiate(&term.type_)?;
             let target = trial.instantiate(expected)?;
-            // Never guess an unknown target by asking for a coercion.
-            // Preserve normal postponement of expression constraints.
+            // Preserve normal postponement instead of repeatedly solving an
+            // open equation. A known monad lift gets its own isolated attempt
+            // below; unrelated holes must not start broader conversion work.
             if actual.has_expr_mvar() || target.has_expr_mvar() {
-                return Ok(true);
+                return Ok(None);
             }
-            trial.coercion_eq(&actual, &target)
+            trial.coercion_eq(&actual, &target).map(Some)
         })();
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         match normal {
-            Ok(true) => {
+            Ok(Some(true)) => {
                 *self = trial;
                 return Ok(term);
             }
-            Ok(false) => {}
+            Ok(None) => {
+                // A known MonadLiftT m n can determine the result element in
+                // n ?A even though direct equality with m A is stuck. The pin's
+                // coerceMonadLift? deliberately handles this case before an
+                // ordinary coercion search (Lean/Meta/Coe.lean). Start from the
+                // original context, not the failed direct-typing equations.
+                if let Some(lifted) = self.try_monad_lift(&term, expected)? {
+                    return Ok(lifted);
+                }
+                // No lift: retain the original postponed typing obligations.
+                // In particular, never select an unknown monad by search and
+                // never refund the failed alternative's work.
+                trial.txn.budget.heartbeats_consumed = self.txn.budget.heartbeats_consumed;
+                *self = trial;
+                return Ok(term);
+            }
+            Ok(Some(false)) => {}
             Err(error) if nonmatch(&error) => {}
             Err(error) => return Err(error),
         }
