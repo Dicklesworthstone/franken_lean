@@ -111,8 +111,12 @@ impl Context {
             }
             let left_nf = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
             let right_nf = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
+            // An `HEq` goal gets the reduced sides, which the arithmetic walk does
+            // not read by shape: the pin's automatic closure leaves closed
+            // arithmetic under `HEq` unsolved (`HEq (2 + 3) 5 := by simp only []`
+            // is "`simp` made no progress", v4.32.0). Only `Eq` goals compute.
             if !self.proof_types_match_with_budget(&left_nf, &right_nf, budget)?
-                && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
+                && !self.rewrite_arithmetic_reflexivity(goal, &left_nf, &right_nf)?
             {
                 return Ok(None);
             }
