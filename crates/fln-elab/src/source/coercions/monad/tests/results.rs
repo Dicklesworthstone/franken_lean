@@ -133,13 +133,27 @@ fn result_environment(lifts: bool) -> Environment {
     let continuation = close(std::slice::from_ref(&x), pure_result, true);
     let body = app(
         c("Monad.bind"),
-        [fv(&m), fv(&monad), fv(&a), fv(&b), fv(&action), continuation],
+        [
+            fv(&m),
+            fv(&monad),
+            fv(&a),
+            fv(&b),
+            fv(&action),
+            continuation,
+        ],
     );
     env = publish(
         &env,
         declaration(
             "Lean.Internal.coeM",
-            &[m.clone(), a.clone(), b.clone(), family.clone(), monad.clone(), action.clone()],
+            &[
+                m.clone(),
+                a.clone(),
+                b.clone(),
+                family.clone(),
+                monad.clone(),
+                action.clone(),
+            ],
             mb,
             body,
         ),
@@ -162,13 +176,29 @@ fn result_environment(lifts: bool) -> Environment {
     );
     let body = app(
         c("Lean.Internal.coeM"),
-        [fv(&target), fv(&a), fv(&b), fv(&family), fv(&target_monad), lifted],
+        [
+            fv(&target),
+            fv(&a),
+            fv(&b),
+            fv(&family),
+            fv(&target_monad),
+            lifted,
+        ],
     );
     publish(
         &env,
         declaration(
             "Lean.Internal.liftCoeM",
-            &[m, target.clone(), a, b.clone(), lift, family, target_monad, action],
+            &[
+                m,
+                target.clone(),
+                a,
+                b.clone(),
+                lift,
+                family,
+                target_monad,
+                action,
+            ],
             Expr::app(fv(&target), fv(&b)),
             body,
         ),
@@ -201,9 +231,15 @@ fn contains_constant(value: &Expr, constant: &str) -> bool {
         match expr.node() {
             ExprNode::Const { name, .. } if name == &n(constant) => return true,
             ExprNode::App { f, a } => work.extend([f, a]),
-            ExprNode::Lam { binder_type, body, .. }
-            | ExprNode::ForallE { binder_type, body, .. } => work.extend([binder_type, body]),
-            ExprNode::LetE { type_, value, body, .. } => work.extend([type_, value, body]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => work.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => work.extend([type_, value, body]),
             ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => work.push(expr),
             _ => {}
         }
@@ -275,9 +311,19 @@ fn result_coercions_work_in_higher_order_arguments() {
 
 fn mapping_context(lifts: bool, dictionary: bool) -> (Context, Typed, Expr) {
     let mut context = Context::new(&result_environment(lifts), budget());
-    let m = parameter(&mut context.txn.lctx, "m", constructor_type(), BinderInfo::Default);
+    let m = parameter(
+        &mut context.txn.lctx,
+        "m",
+        constructor_type(),
+        BinderInfo::Default,
+    );
     let target = if lifts {
-        parameter(&mut context.txn.lctx, "n", constructor_type(), BinderInfo::Default)
+        parameter(
+            &mut context.txn.lctx,
+            "n",
+            constructor_type(),
+            BinderInfo::Default,
+        )
     } else {
         m.clone()
     };
@@ -303,19 +349,38 @@ fn mapping_context(lifts: bool, dictionary: bool) -> (Context, Typed, Expr) {
         parameter(
             &mut context.txn.lctx,
             "convert",
-            close(std::slice::from_ref(&x), app(coe("CoeT"), [fv(&a), fv(&x), fv(&b)]), false),
+            close(
+                std::slice::from_ref(&x),
+                app(coe("CoeT"), [fv(&a), fv(&x), fv(&b)]),
+                false,
+            ),
             BinderInfo::InstImplicit,
         );
     }
     let type_ = Expr::app(fv(&m), fv(&a));
-    let x = parameter(&mut context.txn.lctx, "x", type_.clone(), BinderInfo::Default);
-    (context, Typed { value: fv(&x), type_ }, Expr::app(fv(&target), fv(&b)))
+    let x = parameter(
+        &mut context.txn.lctx,
+        "x",
+        type_.clone(),
+        BinderInfo::Default,
+    );
+    (
+        context,
+        Typed {
+            value: fv(&x),
+            type_,
+        },
+        Expr::app(fv(&target), fv(&b)),
+    )
 }
 
 #[test]
 fn disabling_auto_lift_does_not_disable_same_monad_result_coercions() {
     let (mut context, action, expected) = mapping_context(false, true);
-    context.txn.options.insert(n("autoLift"), DataValue::OfBool(false));
+    context
+        .txn
+        .options
+        .insert(n("autoLift"), DataValue::OfBool(false));
     let result = context.try_monad_lift(&action, &expected).unwrap().unwrap();
     assert!(contains_constant(&result.value, "Monad.bind"));
     assert!(!has_lift(&result.value));
@@ -324,8 +389,16 @@ fn disabling_auto_lift_does_not_disable_same_monad_result_coercions() {
 #[test]
 fn disabling_auto_lift_also_disables_combined_lift_and_map() {
     let (mut context, action, expected) = mapping_context(true, true);
-    context.txn.options.insert(n("autoLift"), DataValue::OfBool(false));
-    assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
+    context
+        .txn
+        .options
+        .insert(n("autoLift"), DataValue::OfBool(false));
+    assert!(
+        context
+            .try_monad_lift(&action, &expected)
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn unchanged_except_work(context: &Context, before: &Context) {
@@ -347,7 +420,12 @@ fn a_failed_result_dictionary_rolls_back_the_entire_attempt() {
     for lifts in [false, true] {
         let (mut context, action, expected) = mapping_context(lifts, false);
         let before = context.clone();
-        assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
+        assert!(
+            context
+                .try_monad_lift(&action, &expected)
+                .unwrap()
+                .is_none()
+        );
         unchanged_except_work(&context, &before);
     }
 }
@@ -362,7 +440,10 @@ fn a_value_specific_dictionary_is_not_a_universal_result_conversion() {
         "def bad (m n : Type -> Type) (A B : Type) [lift : MonadLiftT m n] [monad : Monad m] [convert : (a : A) -> CoeT A a B] (x : m A) : n B := x",
     ] {
         if let Ok(checked) = crate::check_definition_source(source.as_bytes(), &env, budget()) {
-            assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}");
+            assert!(
+                !matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })),
+                "{source}"
+            );
         }
     }
 }
@@ -374,7 +455,9 @@ fn result_mapping_exhaustion_retains_work_and_rolls_back_state() {
     let before = context.clone();
     assert!(matches!(
         context.try_monad_lift(&action, &expected),
-        Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+        Err(NatDefinitionElabError::Inference(
+            SourceInferenceError::ResourceLimit
+        ))
     ));
     unchanged_except_work(&context, &before);
 }
@@ -382,18 +465,36 @@ fn result_mapping_exhaustion_retains_work_and_rolls_back_state() {
 #[test]
 fn failed_mapping_can_be_followed_by_a_successful_mapping() {
     let (mut context, action, expected) = mapping_context(false, false);
-    assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
-    let ExprNode::App { a: source, .. } = action.type_.node() else { panic!("action type") };
-    let ExprNode::App { a: target, .. } = expected.node() else { panic!("target type") };
+    assert!(
+        context
+            .try_monad_lift(&action, &expected)
+            .unwrap()
+            .is_none()
+    );
+    let ExprNode::App { a: source, .. } = action.type_.node() else {
+        panic!("action type")
+    };
+    let ExprNode::App { a: target, .. } = expected.node() else {
+        panic!("target type")
+    };
     let mut locals = LocalContext::new();
     let value = parameter(&mut locals, "a", source.clone(), BinderInfo::Default);
     parameter(
         &mut context.txn.lctx,
         "later",
-        close(std::slice::from_ref(&value), app(coe("CoeT"), [source.clone(), fv(&value), target.clone()]), false),
+        close(
+            std::slice::from_ref(&value),
+            app(coe("CoeT"), [source.clone(), fv(&value), target.clone()]),
+            false,
+        ),
         BinderInfo::InstImplicit,
     );
-    assert!(context.try_monad_lift(&action, &expected).unwrap().is_some());
+    assert!(
+        context
+            .try_monad_lift(&action, &expected)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -413,7 +514,12 @@ fn expansion_respects_an_explicitly_irreducible_helper() {
 fn a_missing_noninstance_argument_is_never_synthesized() {
     let mut context = Context::new(&result_environment(false), budget());
     let before = context.clone();
-    assert!(context.monadic_application("Monad", [None]).unwrap().is_none());
+    assert!(
+        context
+            .monadic_application("Monad", [None])
+            .unwrap()
+            .is_none()
+    );
     unchanged_except_work(&context, &before);
 }
 
@@ -426,7 +532,12 @@ fn an_unknown_destination_constructor_is_not_selected_by_search() {
     let unknown = context.hole(constructor_type()).unwrap();
     let expected = Expr::app(unknown, element.clone());
     let before = context.clone();
-    assert!(context.try_monad_lift(&action, &expected).unwrap().is_none());
+    assert!(
+        context
+            .try_monad_lift(&action, &expected)
+            .unwrap()
+            .is_none()
+    );
     unchanged_except_work(&context, &before);
 }
 
@@ -435,7 +546,12 @@ fn exhaustion_after_synthesis_has_started_is_not_a_failed_coercion() {
     for lifts in [false, true] {
         let (baseline, action, expected) = mapping_context(lifts, true);
         let mut complete = baseline.clone();
-        assert!(complete.try_monad_lift(&action, &expected).unwrap().is_some());
+        assert!(
+            complete
+                .try_monad_lift(&action, &expected)
+                .unwrap()
+                .is_some()
+        );
         let spent = complete.txn.budget.heartbeats_consumed;
         assert!(spent > 4);
         for allowance in [spent / 4, spent / 2, spent - 1] {

@@ -118,16 +118,10 @@ impl Context {
         let Some(actual) = self.known_type(&term.value)? else {
             return Ok(None);
         };
-        let actual = self.whnf_with_transparency(
-            &actual,
-            UnificationTransparency::Abbreviations,
-            true,
-        )?;
-        let target = self.whnf_with_transparency(
-            expected,
-            UnificationTransparency::Abbreviations,
-            true,
-        )?;
+        let actual =
+            self.whnf_with_transparency(&actual, UnificationTransparency::Abbreviations, true)?;
+        let target =
+            self.whnf_with_transparency(expected, UnificationTransparency::Abbreviations, true)?;
         let (
             ExprNode::App {
                 f: from,
@@ -161,7 +155,8 @@ impl Context {
                     Some(monad),
                     Some(term.value.clone()),
                 ],
-            )? else {
+            )?
+            else {
                 return Ok(None);
             };
             return self.finish_monadic_coercion(result, expected);
@@ -189,7 +184,8 @@ impl Context {
                 element.clone(),
                 term.value.clone(),
             ],
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         // A failed direct-result probe must not constrain the fallback's
@@ -217,7 +213,8 @@ impl Context {
                 Some(monad),
                 Some(term.value.clone()),
             ],
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         self.finish_monadic_coercion(result, expected)

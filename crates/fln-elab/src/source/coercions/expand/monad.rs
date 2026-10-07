@@ -42,11 +42,8 @@ impl Context {
         {
             return Ok(None);
         }
-        let mut value = self.instantiate_params(
-            &definition.value,
-            &definition.base.level_params,
-            levels,
-        )?;
+        let mut value =
+            self.instantiate_params(&definition.value, &definition.base.level_params, levels)?;
         let mut arguments: Vec<_> = args.iter().rev().cloned().collect();
         loop {
             self.tick()?;

@@ -88,10 +88,18 @@ fn lifting_recovers_the_monad_after_the_type_hint_has_been_normalized() {
         BinderInfo::InstImplicit,
     );
     let original = Expr::app(c("ReaderLike"), c("Nat"));
-    let x = parameter(&mut context.txn.lctx, "x", original.clone(), BinderInfo::Default);
+    let x = parameter(
+        &mut context.txn.lctx,
+        "x",
+        original.clone(),
+        BinderInfo::Default,
+    );
     let normalized = context.whnf(&original).unwrap();
     assert!(matches!(normalized.node(), ExprNode::ForallE { .. }));
-    let action = Typed { value: fv(&x), type_: normalized };
+    let action = Typed {
+        value: fv(&x),
+        type_: normalized,
+    };
     let expected = Expr::app(fv(&target), c("Nat"));
     let result = context.try_monad_lift(&action, &expected).unwrap().unwrap();
     assert!(has_lift(&result.value));
@@ -103,6 +111,9 @@ fn a_function_backed_monad_does_not_create_an_unregistered_lift() {
     let env = reader_environment();
     let source = "def bad (n : Type -> Type) (x : ReaderLike Nat) : n Nat := x";
     if let Ok(checked) = crate::check_definition_source(source.as_bytes(), &env, budget()) {
-        assert!(!matches!(checked.outcome, Outcome::Complete(Verdict::Accepted { .. })));
+        assert!(!matches!(
+            checked.outcome,
+            Outcome::Complete(Verdict::Accepted { .. })
+        ));
     }
 }
