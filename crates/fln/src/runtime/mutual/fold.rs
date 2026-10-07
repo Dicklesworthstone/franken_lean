@@ -292,7 +292,10 @@ mod tests {
         let text = std::fs::read_to_string(&example)
             .expect("examples/native_mutual_folds.lean is readable");
         let source = text.split("#eval").next().unwrap();
-        let engine = Engine::with_source_seed(limits)
+        // The example folds with `Forest.rec` directly: the `frontier` lane (z8j.1.6.6).
+        let engine = Engine::builder()
+            .mode(fln_core::mode::Mode::Frontier)
+            .build_with_source_seed(limits)
             .unwrap()
             .into_complete()
             .unwrap()

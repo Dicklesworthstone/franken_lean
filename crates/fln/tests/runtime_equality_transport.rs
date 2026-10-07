@@ -73,7 +73,10 @@ fn a_constructor_field_index_can_be_matched() {
     );
 }
 
-const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\ndef total (n : Nat) (xs : Vec Nat n) : Nat := by induction xs with | nil => exact 0 | cons k x tail ih => exact x + ih\n";
+// `total` is structural recursion: an `induction` data fold is a recursor the pin's code
+// generator refuses (bead `franken_lean-z8j.1.6.6`). The pin runs the transport program
+// below to 42.
+const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\ndef total (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => x + total k tail\n";
 #[test]
 fn equality_transport_preserves_the_indexed_object_representation() {
     run(

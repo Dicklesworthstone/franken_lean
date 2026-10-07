@@ -59,9 +59,13 @@ fn field(hasher: &mut DomainHasher, bytes: &[u8]) {
 impl SourceModuleKey {
     /// Every field is length-prefixed or fixed-width, so distinct inputs never share an
     /// encoding. The session base root identifies the external world; the per-module
-    /// base root is checked against the record on every hit.
+    /// base root is checked against the record on every hit. A non-default `mode` is a
+    /// trailing fixed-width field after the counted steps: frontier admits recursor
+    /// code the default refuses (bead `franken_lean-z8j.1.6.6`), so its records must
+    /// never answer a default lookup, while every default key stays what it was.
     pub(super) fn compute(
         checker: CheckerIdentity,
+        mode: fln_core::mode::Mode,
         options: &KVMap,
         session_base: LogicalRoot,
         name: &Name,
@@ -88,6 +92,10 @@ impl SourceModuleKey {
                     hasher.update(&root.0.0);
                 }
             }
+        }
+        if mode != fln_core::mode::Mode::DEFAULT {
+            hasher.update(b"mode\0");
+            hasher.update(&[mode.tag()]);
         }
         SourceModuleKey(hasher.finalize())
     }
@@ -737,8 +745,21 @@ mod tests {
 
     /// One whole invocation: a fresh session, as a new process would have.
     fn build(store: &Memory, checker: CheckerIdentity) -> SourceModuleBuild {
-        let names: Vec<_> = GRAPH.iter().map(|(name, _)| n(name)).collect();
-        let inputs: Vec<_> = GRAPH
+        compile(store, checker, fln_core::mode::Mode::DEFAULT, &GRAPH)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    }
+
+    /// [`build`] of any graph whose entry is `Main`, by an engine in `mode`.
+    fn compile(
+        store: &Memory,
+        checker: CheckerIdentity,
+        mode: fln_core::mode::Mode,
+        graph: &[(&str, &str)],
+    ) -> std::result::Result<Outcome<SourceModuleBuild>, SourceModuleBuildError> {
+        let names: Vec<_> = graph.iter().map(|(name, _)| n(name)).collect();
+        let inputs: Vec<_> = graph
             .iter()
             .zip(&names)
             .map(|((_, source), name)| SourceModuleInput {
@@ -750,22 +771,18 @@ mod tests {
             EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
         ));
         let mut session = SourceModuleSession::new(
-            Engine::builder().build_empty(),
+            Engine::builder().mode(mode).build_empty(),
             KVMap::new(),
             limits,
             SourceModuleCacheLimits::default(),
         );
-        session
-            .compile_with_records(
-                &inputs,
-                &n("Main"),
-                OleanWriteBudget::default(),
-                Some(PersistedModules { checker, store }),
-                None,
-            )
-            .unwrap()
-            .into_complete()
-            .unwrap()
+        session.compile_with_records(
+            &inputs,
+            &n("Main"),
+            OleanWriteBudget::default(),
+            Some(PersistedModules { checker, store }),
+            None,
+        )
     }
 
     fn rows(build: &SourceModuleBuild) -> Vec<(String, ModuleDecision, Option<String>)> {
@@ -801,6 +818,36 @@ mod tests {
 
     fn checker(label: &[u8]) -> CheckerIdentity {
         CheckerIdentity::of_executable(label)
+    }
+
+    /// A record a frontier session wrote never answers a default lookup: frontier admits
+    /// recursor code the default refuses (bead `franken_lean-z8j.1.6.6`), and re-admission
+    /// does not elaborate, so the mode is part of the key. The default session misses,
+    /// elaborates, and refuses as the pin does.
+    #[test]
+    fn a_frontier_record_never_answers_a_default_lookup() {
+        let graph = [(
+            "Main",
+            "prelude\ninductive T where | a | b (x : T)\ndef f (t : T) : T := T.rec (motive := fun _ => T) T.a (fun _ ih => T.b ih) t\n",
+        )];
+        let store = Memory::default();
+        let identity = checker(b"one");
+        let frontier = compile(&store, identity, fln_core::mode::Mode::Frontier, &graph)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(frontier.modules[0].record_write, ModuleRecordWrite::Stored);
+        let again = compile(&store, identity, fln_core::mode::Mode::Frontier, &graph)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(again.modules[0].record, ModuleRecordLookup::Hit);
+        let refusal = compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+            .expect_err("the default session elaborates the module and refuses it");
+        assert!(
+            format!("{refusal:?}").contains("UnsupportedRecursor"),
+            "{refusal:?}"
+        );
     }
 
     #[test]

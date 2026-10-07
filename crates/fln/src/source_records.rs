@@ -108,12 +108,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        self.admit_source_command_in_scope(
-            source,
-            options,
-            limits,
-            &fln_elab::source::scope::SourceScope::default(),
-        )
+        self.admit_source_command_in_scope(source, options, limits, &self.base_source_scope())
     }
 
     pub(crate) fn admit_source_command_in_scope(

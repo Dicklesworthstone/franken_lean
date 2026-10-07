@@ -236,7 +236,7 @@ impl Engine {
             // Global reducibility attributes may change only definitions authored
             // in this file, never declarations supplied by its predecessor.
             let file_base = engine.environment.clone();
-            let mut scopes = scopes::Scopes::new(engine.environment());
+            let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
             let commands = partition_commands(source, file, count)?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
                 return Err(SourceCheckError::Limit {

@@ -1,4 +1,4 @@
-//! Installed source entry points and independent replay of mutual callback folds.
+//! Installed source entry points refuse a directly written mutual callback fold as the pin does.
 #![forbid(unsafe_code)]
 use std::{
     path::Path,
@@ -28,70 +28,35 @@ fn run(source: &Path, artifact: &Path) -> Output {
         .unwrap()
 }
 
-fn replay(artifact: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["flbc", "run", "--json"])
-        .arg(artifact)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("\"returnValue\":42"));
-}
-
+/// `examples/native_mutual_function_children.lean` applies `Tree.rec` directly. The pin refuses it at
+/// line 10 ("code generator does not support recursor `Tree.rec`"), and so do both installed
+/// personalities in their default mode (bead `franken_lean-z8j.1.6.6`). A valid form needs `mutual`
+/// structural recursion, which FrankenLean does not elaborate; executing the fold is the
+/// `frontier` lane, covered by the `fln` runtime tests on this same example. The refusal
+/// publishes no artifact and leaves the source as it was.
 #[test]
-fn escaped_mutual_children_run_in_both_personalities_and_replay() {
+fn direct_mutual_child_folds_are_refused_by_both_personalities_as_the_pin_does() {
     let dir = directory();
     let source = dir.join("Main.lean");
     let artifact = dir.join("main.flbc");
     std::fs::write(&source, EXAMPLE).unwrap();
+    let message = "code generator does not support recursor `Tree.rec` yet";
     let output = run(&source, &artifact);
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("\"finalValue\":42"));
-    replay(&artifact);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{output:?}"
+    );
+    assert!(!artifact.exists());
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&source)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    assert_eq!(output.stdout, b"42\n");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{output:?}"
+    );
     assert_eq!(std::fs::read_to_string(&source).unwrap(), EXAMPLE);
-}
-
-#[test]
-fn imported_callback_failures_preserve_artifacts_and_recover_deterministically() {
-    let dir = directory();
-    let dependency = dir.join("Trees.lean");
-    let source = dir.join("Main.lean");
-    let (defs, eval) = EXAMPLE.split_once("#eval").unwrap();
-    std::fs::write(&dependency, defs).unwrap();
-    std::fs::write(&source, format!("import Trees\n#eval {eval}")).unwrap();
-    let good = dir.join("good.flbc");
-    let output = run(&source, &good);
-    assert!(output.status.success(), "{output:?}");
-    let before = std::fs::read(&good).unwrap();
-    for bad in [
-        "def bad : Tree 0 := Tree.node (fun i => Forest.leaf 0 i)",
-        "def bad : 0 = 1 := by rfl",
-        "mutual\ninductive Bad where | node (f : Worse -> Nat)\ninductive Worse where | node (b : Bad)\nend",
-    ] {
-        std::fs::write(&dependency, format!("{defs}\n{bad}\n")).unwrap();
-        let failed = dir.join("failed.flbc");
-        let output = run(&source, &failed);
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert!(output.stdout.is_empty(), "{output:?}");
-        assert!(!failed.exists());
-        // A failed run must not replace an already published good artifact.
-        let output = run(&source, &good);
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert_eq!(std::fs::read(&good).unwrap(), before);
-    }
-    std::fs::write(&dependency, defs).unwrap();
-    let recovered = dir.join("recovered.flbc");
-    let output = run(&source, &recovered);
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(std::fs::read(&recovered).unwrap(), before);
-    replay(&recovered);
 }

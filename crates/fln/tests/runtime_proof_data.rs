@@ -1,11 +1,16 @@
 //! Proof-bearing objects retain logical field positions without executing evidence.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, VmExit};
+use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Mode, VmExit};
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
 fn run(source: &str, expected: &str) -> u64 {
-    let batch = Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+    run_in(Mode::DEFAULT, source, expected)
+}
+fn run_in(mode: Mode, source: &str, expected: &str) -> u64 {
+    let batch = Engine::builder()
+        .mode(mode)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
         .unwrap()
@@ -65,11 +70,13 @@ fn mutual_sibling_proof_fields_and_recursive_hypotheses_keep_their_slots() {
 }
 #[test]
 fn whole_mutual_folds_erase_proof_fields_without_losing_recursive_results() {
+    // A directly written mutual fold: the `frontier` lane (bead `franken_lean-z8j.1.6.6`).
     let data = "mutual\ninductive Tree where | leaf (n : Nat) (h : n = n) | node (xs : Forest) (h : 0 = 0)\ninductive Forest where | nil | cons (h : 0 = 0) (t : Tree) (xs : Forest)\nend\n";
     let motives = "(fun (t : Tree) => Nat) (fun (xs : Forest) => Nat)";
     let minors = "(fun (n : Nat) (h : n = n) => n) (fun (xs : Forest) (h : 0 = 0) (ih : Nat) => ih) 0 (fun (h : 0 = 0) (t : Tree) (xs : Forest) (ihT : Nat) (ihF : Nat) => ihT + ihF)";
     let value = "Tree.node (Forest.cons (by rfl) (Tree.leaf 40 (by rfl)) (Forest.cons (by rfl) (Tree.leaf 2 (by rfl)) Forest.nil)) (by rfl)";
-    run(
+    run_in(
+        Mode::Frontier,
         &format!(
             "{data}def total (t : Tree) : Nat := @Tree.rec {motives} {minors} t\n#eval total ({value})"
         ),

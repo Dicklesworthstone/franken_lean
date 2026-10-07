@@ -9,8 +9,10 @@ logical admission, not inferred from the runtime layout.
 
 `examples/native_mutual_function_children.lean` maps over a mutually recursive
 Tree/Forest group, returns new objects with owned child closures, and traverses
-those closures after the map returns to compute 42. Both installed source entry
-points, imports, and standalone serialized FLBC replay exercise the same program.
+those closures after the map returns to compute 42. It applies `Tree.rec` directly,
+which the pin's code generator refuses, so the default and `faithful` modes refuse it
+too, at both installed source entry points (bead `franken_lean-z8j.1.6.6`). Only a
+`frontier` engine executes it, as the `fln` runtime tests do.
 
 ## Recursive callbacks
 

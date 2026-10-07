@@ -45,9 +45,44 @@ fn mutual_blocks_execute_through_both_personalities_and_independent_bytecode() {
     check_source_and_replay(include_str!("../../../examples/native_mutual_data.lean"));
 }
 
+/// `examples/native_mutual_folds.lean` applies `Forest.rec` directly. The pin refuses it at
+/// line 12 ("code generator does not support recursor `Forest.rec`"), and so do both installed
+/// personalities in their default mode (bead `franken_lean-z8j.1.6.6`). A valid form needs `mutual`
+/// structural recursion, which FrankenLean does not elaborate; executing the fold is the
+/// `frontier` lane, covered by the `fln` runtime tests on this same example. The refusal
+/// publishes no artifact and leaves the source as it was.
 #[test]
-fn heterogeneous_mutual_folds_replay_without_a_source_environment() {
-    check_source_and_replay(include_str!("../../../examples/native_mutual_folds.lean"));
+fn direct_mutual_folds_are_refused_by_both_personalities_as_the_pin_does() {
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    let artifact = dir.join("main.flbc");
+    std::fs::write(
+        &source,
+        include_str!("../../../examples/native_mutual_folds.lean"),
+    )
+    .unwrap();
+    let message = "code generator does not support recursor `Forest.rec` yet";
+    let output = run(&source, &artifact);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{output:?}"
+    );
+    assert!(!artifact.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        include_str!("../../../examples/native_mutual_folds.lean")
+    );
 }
 
 #[test]
@@ -104,40 +139,6 @@ fn check_source_and_replay(source: &str) {
     assert!(lean.stderr.is_empty());
     assert_eq!(lean.stdout, b"42\n");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
-}
-
-#[test]
-fn imported_mutual_folds_keep_peer_captures_and_replayable_artifacts() {
-    let dir = directory();
-    let dependency = dir.join("Data.lean");
-    let entry = dir.join("Main.lean");
-    let definitions = include_str!("../../../examples/native_mutual_folds.lean")
-        .split("#eval")
-        .next()
-        .unwrap();
-    std::fs::write(&dependency, definitions).unwrap();
-    std::fs::write(
-        &entry,
-        "import Data\n#eval total 2 (Forest.cons (Tree.leaf 40) (@Forest.nil Nat))\n",
-    )
-    .unwrap();
-    let artifact = dir.join("fold.flbc");
-    let output = run(&entry, &artifact);
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty());
-    replay(&artifact);
-    let before = std::fs::read(&artifact).unwrap();
-    std::fs::write(
-        &dependency,
-        format!("{definitions}\ntheorem bad : 0 = 1 := by rfl"),
-    )
-    .unwrap();
-    let rejected = dir.join("rejected.flbc");
-    let output = run(&entry, &rejected);
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(!rejected.exists());
-    assert_eq!(before, std::fs::read(&artifact).unwrap());
 }
 
 #[test]

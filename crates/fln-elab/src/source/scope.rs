@@ -14,6 +14,10 @@ pub struct SourceScope {
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
     pub instance_scopes: crate::instances::scoped::ActiveScopes,
+    /// Set only by an engine in `frontier` mode: a compiled declaration may then apply
+    /// a recursor the pin's code generator refuses (`codegen.rs`, bead
+    /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
+    pub frontier_recursors: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +542,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            frontier_recursors: false,
         };
         let env = [
             "Decidable.decide",
@@ -722,6 +727,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            frontier_recursors: false,
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
             scope.resolve_with_aliases(&n(name), |x| env.contains(x), &aliases, protected)
@@ -789,6 +795,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            frontier_recursors: false,
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];
         let resolve = |name: &str| scope.resolve(&n(name), |x| names.contains(x));

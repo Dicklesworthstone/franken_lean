@@ -1,12 +1,18 @@
 //! Indexed eliminations use admitted recursors and both production checkers.
+//!
+//! `length` and `copy` are data defined by the `induction` tactic, a recursor the pin's
+//! code generator refuses, and so does FrankenLean's default mode (bead
+//! `franken_lean-z8j.1.6.6`). This file checks the elimination, so its engine is `frontier`.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Outcome, SourceCheckLimits};
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Mode, Outcome, SourceCheckLimits};
 
 fn limits() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
 fn engine() -> Engine {
-    Engine::with_source_seed(limits())
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(limits())
         .unwrap()
         .into_complete()
         .unwrap()

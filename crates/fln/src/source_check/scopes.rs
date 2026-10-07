@@ -127,8 +127,12 @@ impl Scopes {
         }
         Ok(resolved)
     }
-    pub fn new(env: &Environment) -> Self {
+    /// A file's initial scope. `mode` decides only whether its compiled declarations may
+    /// apply recursors the pin's code generator refuses (frontier only, bead
+    /// `franken_lean-z8j.1.6.6`).
+    pub fn new(env: &Environment, mode: fln_core::mode::Mode) -> Self {
         let mut scopes = Self::default();
+        scopes.current.frontier_recursors = mode.permits_frontier();
         for (name, _) in env.constants() {
             scopes.observe(name);
         }

@@ -4122,6 +4122,15 @@ impl Engine {
         self.mode
     }
 
+    /// The scope a source command starts in outside any lexical scope: empty, with
+    /// this mode's code generation permission (bead `franken_lean-z8j.1.6.6`).
+    fn base_source_scope(&self) -> fln_elab::source::scope::SourceScope {
+        fln_elab::source::scope::SourceScope {
+            frontier_recursors: self.mode.permits_frontier(),
+            ..fln_elab::source::scope::SourceScope::default()
+        }
+    }
+
     /// The reproducibility profile (Standard or Certified).
     pub fn reproducibility(&self) -> ReproducibilityProfile {
         self.reproducibility
@@ -6135,10 +6144,11 @@ impl Engine {
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_with_budget(
+            fln_elab::elaborate_definition_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
+                &self.base_source_scope(),
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -6318,7 +6328,7 @@ impl Engine {
             options,
             limits,
             command_index,
-            &fln_elab::source::scope::SourceScope::default(),
+            &self.base_source_scope(),
         )
     }
 
@@ -6507,7 +6517,7 @@ impl Engine {
             Command(usize, fln_parse::BytePos, &'s [u8]),
             Scope(usize, fln_parse::command_scope::ScopeCommand),
         }
-        let mut scopes = source_check::scopes::Scopes::new(engine.environment());
+        let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
@@ -7310,10 +7320,11 @@ impl Engine {
             ));
         }
         let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_with_budget(
+            fln_elab::elaborate_definition_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
+                &self.base_source_scope(),
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -10169,8 +10180,11 @@ fn source_run_build_profile() -> (BuildProfileId, &'static str) {
     }
 }
 
-fn current_source_run_coordinates()
--> Result<StandardProductCoordinatesV1, SourceRunSidecarBuildError> {
+/// `mode` is the producing engine's: a frontier run (direct recursor code, bead
+/// `franken_lean-z8j.1.6.6`) binds the frontier tag, which a Sound consumer refuses (D-18).
+fn current_source_run_coordinates(
+    mode: Mode,
+) -> Result<StandardProductCoordinatesV1, SourceRunSidecarBuildError> {
     if !cfg!(all(
         target_arch = "x86_64",
         target_os = "linux",
@@ -10186,7 +10200,7 @@ fn current_source_run_coordinates()
         });
     }
     Ok(StandardProductCoordinatesV1 {
-        mode: Mode::Sound,
+        mode,
         epoch: SOURCE_RUN_EPOCH_ID,
         cgse_policy: SOURCE_RUN_CGSE_POLICY_ID,
         determinism: DeterminismClass::D1Canonicalized,
@@ -10227,9 +10241,9 @@ fn empty_set_material(tag: &str) -> Vec<u8> {
     material_bytes(tag, |writer| writer.u64(0))
 }
 
-fn mode_material() -> Vec<u8> {
+fn mode_material(mode: Mode) -> Vec<u8> {
     material_bytes("fln.source-run.mode/1", |writer| {
-        writer.u8(Mode::Sound.tag());
+        writer.u8(mode.tag());
     })
 }
 
@@ -10308,7 +10322,7 @@ fn source_run_material<'a>(
         ),
         (
             ClosureComponent::Mode,
-            std::borrow::Cow::Owned(mode_material()),
+            std::borrow::Cow::Owned(mode_material(completed.engine.mode())),
         ),
         (
             ClosureComponent::Epoch,
@@ -10354,7 +10368,7 @@ pub fn build_source_run_flbc_sidecar(
         .executions
         .last()
         .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
-    let coordinates = current_source_run_coordinates()?;
+    let coordinates = current_source_run_coordinates(completed.engine.mode())?;
     let material = source_run_material(sources, options, toolchain_image, completed);
     let entries: Vec<_> = material
         .iter()
@@ -10378,7 +10392,8 @@ pub fn verify_source_run_flbc_sidecar(
 ) -> Result<FlbcProductSidecarV1, SourceRunSidecarVerificationError> {
     let sidecar = decode_flbc_product_sidecar(sidecar_bytes)
         .map_err(SourceRunSidecarVerificationError::Codec)?;
-    let expected = current_source_run_coordinates().map_err(|error| match error {
+    // The consumer is Sound: a frontier-bound sidecar is refused here (D-18).
+    let expected = current_source_run_coordinates(Mode::Sound).map_err(|error| match error {
         SourceRunSidecarBuildError::UnsupportedTarget { target } => {
             SourceRunSidecarVerificationError::UnsupportedTarget { target }
         }
@@ -10404,7 +10419,7 @@ pub fn verify_source_run_flbc_sidecar(
             ClosureComponent::Plugins,
             empty_set_material("fln.source-run.plugins/1"),
         ),
-        (ClosureComponent::Mode, mode_material()),
+        (ClosureComponent::Mode, mode_material(Mode::Sound)),
         (ClosureComponent::Epoch, epoch_material()),
         (ClosureComponent::Target, target_material()),
         (ClosureComponent::BuildProfile, build_profile_material()),

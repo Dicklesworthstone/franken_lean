@@ -499,6 +499,7 @@ pub(super) fn run_collecting(
                     .collect();
                 SourceModuleKey::compute(
                     records.persisted.checker,
+                    base.mode(),
                     options,
                     base_logical_root,
                     module.name,

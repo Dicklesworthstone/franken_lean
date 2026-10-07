@@ -588,6 +588,11 @@ impl Context {
         let Some(ConstantInfo::Rec(rec)) = self.txn.env.find(&rec_name).cloned() else {
             return Err(error(TacticError::UnsupportedEliminator));
         };
+        // The pin's `induction` tactic applies the recursor itself; `cases` and `match`
+        // use `casesOn`, which its code generator compiles (`codegen.rs`).
+        if induction && matches!(input, EliminationSyntax::Tactic(_)) {
+            self.note_source_recursor(&rec_name);
+        }
         if family.is_unsafe
             || family.num_nested != 0
             || family.all.is_empty()

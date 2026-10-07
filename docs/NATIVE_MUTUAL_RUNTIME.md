@@ -35,6 +35,15 @@ mutually recursive closure group. The compiler supplies a shared acyclic capture
 environment, including outer values read only by a sibling; no reference-counted
 closure cycle or unchecked global helper is introduced.
 
+**A directly written recursor is the `frontier` lane** (bead `franken_lean-z8j.1.6.6`). The
+pinned Reference refuses to compile a `def`, `instance`, `example` or `#eval` that applies
+`T.rec` to data: "code generator does not support recursor `T.rec` yet, consider using
+'match ... with' and/or structural recursion". The default and `faithful` modes refuse the
+same programs with the same message. FrankenLean lowers `match`, `cases` and structural
+recursion to recursors itself, so this runtime still executes those. Only an engine built
+with `Mode::Frontier` executes a recursor the source names, and its source-run product
+sidecar binds the frontier tag, which a Sound consumer refuses.
+
 Each motive supplies its own checked runtime interface. Peers can return
 different scalar/object types and have different nondependent accumulator
 telescopes. Partial recursive applications remain typed closures. Used induction
@@ -43,7 +52,8 @@ their sibling subtrees. Nested folds are prepared with explicit heap frames.
 Dependency discovery reaches a fixed point over newly prepared peer bodies,
 including intrinsics and ordinary functions absent from the selected member.
 
-`examples/native_mutual_folds.lean` demonstrates type-parameter specialization,
+`examples/native_mutual_folds.lean` (a directly written `Forest.rec`, so `frontier` only;
+see above) demonstrates type-parameter specialization,
 different peer arities, and an offset captured by only the Tree peer. Tests also
 cover three-member groups, heterogeneous String/Nat motives, returned sibling
 objects, nested group dependencies, deterministic replay, resource-stop recovery,

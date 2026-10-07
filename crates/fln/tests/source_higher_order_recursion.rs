@@ -1,9 +1,14 @@
 //! Higher-order recursive constructors are checked independently at admission.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Mode, SourceCheckLimits};
 fn check(source: &str) -> Engine {
+    check_in(Mode::DEFAULT, source)
+}
+fn check_in(mode: Mode, source: &str) -> Engine {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    Engine::with_source_seed(limits)
+    Engine::builder()
+        .mode(mode)
+        .build_with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap()
@@ -48,9 +53,11 @@ fn induction_hypotheses_quantify_the_child_functions_arguments() {
     ));
 }
 #[test]
+/// The pin refuses `fold` ("code generator does not support recursor `Accessible.rec`"),
+/// measured 2026-10-07, and so does the default mode (bead `franken_lean-z8j.1.6.6`). The
+/// elimination itself is checked by a `frontier` engine, which executes such recursors.
 fn accessibility_elimination_returns_dependent_data_without_an_axiom() {
-    check(
-        r#"
+    let source = r#"
         inductive Accessible (A : Type) (R : A -> A -> Prop) : A -> Prop where
           | intro (x : A) (next : forall y : A, R y x -> Accessible A R y) : Accessible A R x
         def fold (A : Type) (R : A -> A -> Prop) (P : A -> Type)
@@ -58,8 +65,24 @@ fn accessibility_elimination_returns_dependent_data_without_an_axiom() {
             (a : A) (h : Accessible A R a) : P a := by
           induction h with
           | intro x next ih => exact step x ih
-    "#,
+    "#;
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let refused = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err("the default refuses the computable fold")
+        .to_string();
+    assert!(
+        refused.contains("code generator does not support recursor `Accessible.rec` yet"),
+        "{refused}"
     );
+    check_in(Mode::Frontier, source);
 }
 #[test]
 fn function_valued_children_with_dependent_arguments_and_indices() {

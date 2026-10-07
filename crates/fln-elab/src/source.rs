@@ -11,6 +11,7 @@ mod application;
 mod binders;
 mod calc;
 mod cdot;
+mod codegen;
 mod coercions;
 mod collections;
 mod do_notation;
@@ -108,6 +109,9 @@ pub enum SourceInferenceError {
     /// The pin's eliminator elaboration (`elabAsElim`) could not finish; the
     /// text is the pin's own message after "failed to elaborate eliminator, ".
     Eliminator(&'static str),
+    /// A compiled declaration applies a recursor the pin's code generator does not
+    /// support (`codegen.rs`, bead `franken_lean-z8j.1.6.6`).
+    UnsupportedRecursor(Name),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     SimpSet(scope::simp::SimpSetError),
@@ -323,6 +327,11 @@ impl std::fmt::Display for SourceInferenceError {
                 "operator elaboration needs a coercion to the tree's maximal type, and expanded coercion insertion is not implemented"
             ),
             Self::Eliminator(reason) => write!(f, "failed to elaborate eliminator, {reason}"),
+            Self::UnsupportedRecursor(name) => write!(
+                f,
+                "code generator does not support recursor `{}` yet, consider using 'match ... with' and/or structural recursion",
+                name.to_display_string()
+            ),
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -489,6 +498,9 @@ struct Context {
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
     postponed_application_errors: Vec<NatDefinitionElabError>,
+    // Recursors the source names directly, which a compiled declaration may not apply
+    // (`codegen.rs`). Rollback restores them with the rest of the context.
+    source_recursors: Vec<Name>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -540,6 +552,7 @@ impl Context {
             recursion: None,
             postponed_eliminators: Vec::new(),
             postponed_application_errors: Vec::new(),
+            source_recursors: Vec::new(),
         }
     }
 
@@ -603,6 +616,11 @@ impl Context {
             .find(name)
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        // Elaboration's own eliminations build their recursor constants directly; one
+        // resolved here is the source's.
+        if matches!(info, fln_env::constants::ConstantInfo::Rec(_)) {
+            self.note_source_recursor(name);
+        }
         let base = info.constant_val();
         let mut levels = Vec::new();
         for _ in &base.level_params {
@@ -3788,6 +3806,10 @@ fn definition_in_context_named(
     {
         return Err(failure(SourceInferenceError::Scope));
     }
+    // The pin compiles every declaration but a theorem (`codegen.rs`).
+    if !is_theorem {
+        context.check_compiled_recursors(&term.value)?;
+    }
     let level_params = context.declaration_levels(&[term.type_.clone(), term.value.clone()])?;
     let base = ConstantVal {
         name: name.clone(),
@@ -3876,6 +3898,10 @@ fn query_in(
         context.generalize_level_mvars(&term)?
     };
     let term = context.finish(term)?;
+    // `#eval` compiles its term (`codegen.rs`); `#check` does not.
+    if evaluate {
+        context.check_compiled_recursors(&term.value)?;
+    }
     Ok(Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),

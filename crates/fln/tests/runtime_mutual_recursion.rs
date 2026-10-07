@@ -1,12 +1,18 @@
 //! Checked mutual recursors execute through native peer-closure groups.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Outcome, VmExit};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Mode, Outcome, VmExit,
+};
 
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
+/// Directly written recursors execute only in the `frontier` mode; the default refuses
+/// them as the pin's code generator does (bead `franken_lean-z8j.1.6.6`).
 fn engine() -> Engine {
-    Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
         .unwrap()

@@ -2253,42 +2253,29 @@ fn installed_literal_patterns_compute_and_preserve_failed_suffix_isolation() {
     }
 }
 
+/// The example folds `Accessible` with its recursor directly. The pin refuses it at line 24
+/// ("code generator does not support recursor `Accessible.rec`"), and so does the installed
+/// check-source in its default mode (bead `franken_lean-z8j.1.6.6`); executing it is the
+/// `frontier` lane. The refusal publishes nothing and leaves the file as it was.
 #[test]
-fn installed_function_children_check_real_recursors_and_preserve_failed_suffixes() {
+fn installed_function_children_refuse_direct_recursor_folds_as_the_pin_does() {
     let prefix = file(include_str!(
         "../../../examples/native_function_children.lean"
     ));
-    let invalid = file(
-        "def bad (t : Branching) : Nat := match t with | .leaf n => n | .node children => bad (children (bad t))",
-    );
     let before = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let result = command.output().unwrap();
-        assert_eq!(
-            result.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
+    for _ in 0..2 {
+        let result = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(result.stdout.is_empty(), "{stderr}");
+        assert!(
+            stderr.contains("code generator does not support recursor `Accessible.rec` yet"),
+            "{stderr}"
         );
-        if valid {
-            let json = String::from_utf8(result.stdout).unwrap();
-            for field in [
-                "\"commands\":20",
-                "\"theorems\":6",
-                "\"authority\":true",
-                "\"executed\":false",
-            ] {
-                assert!(json.contains(field), "{json}");
-            }
-        } else {
-            assert!(result.stdout.is_empty());
-            assert!(!result.stderr.is_empty());
-        }
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
