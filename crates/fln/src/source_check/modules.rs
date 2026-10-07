@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 mod artifacts;
 mod cache;
 mod contexts;
+pub mod execution;
 mod graph;
 pub mod imported;
 pub mod persisted;
