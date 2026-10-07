@@ -485,6 +485,10 @@ struct Context {
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
     postponed_eliminators: Vec<eliminator::PostponedEliminator>,
+    // Resumed argument failures are delayed source diagnostics, just like the
+    // pin's synthetic metavariable errors. Tactic/recursion rollback restores
+    // them; a selected declaration can never discard them or admit its holes.
+    postponed_application_errors: Vec<NatDefinitionElabError>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -535,6 +539,7 @@ impl Context {
             defining: None,
             recursion: None,
             postponed_eliminators: Vec::new(),
+            postponed_application_errors: Vec::new(),
         }
     }
 
@@ -1219,6 +1224,7 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        use application::postponed;
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
         /// `⟨a, b, …⟩` interleaved with their `,` separators, which are skipped.
         #[derive(Clone, Copy)]
@@ -1275,6 +1281,8 @@ impl Context {
             StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
+            CheckArgument(&'a Syntax, Expr),
+            ArgumentComplete(usize),
             ForCollection(Option<Expr>),
             Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
@@ -1334,15 +1342,115 @@ impl Context {
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
         let mut values: Vec<Typed> = Vec::new();
         enum Attempt<'a> {
-            Proof(tactics::backtrack::Checkpoint<'a>),
-            LocalFunction(Box<local_functions::Checkpoint<'a>>),
+            Proof(tactics::backtrack::Checkpoint<'a>, postponed::Queue<'a>),
+            LocalFunction(Box<local_functions::Checkpoint<'a>>, postponed::Queue<'a>),
+            Argument(Box<postponed::Checkpoint<'a>>),
         }
         let mut attempts: Vec<Attempt<'_>> = Vec::new();
+        let mut pending = postponed::Queue::default();
         loop {
+            let mut blocked_application = None;
             let result = (|| {
-                while let Some(task) = tasks.pop() {
+                loop {
+                    let closes_scope = matches!(
+                        tasks.last(),
+                        Some(
+                            Task::BinderBody(..)
+                                | Task::LetBody(..)
+                                | Task::LocalFunctionValue(..)
+                                | Task::MatchBranch(..)
+                                | Task::DoBindJoinBody(..)
+                                | Task::DoBindJoinValue(..)
+                                | Task::ProofTerm(..)
+                                | Task::RefineTerm(..)
+                        )
+                    );
+                    let mut ready = pending.take_ready(self)?;
+                    if ready.is_none()
+                        && (tasks.is_empty() || closes_scope)
+                        && pending.has_current_scope(self)?
+                    {
+                        // A let/lambda closes before the overall term worklist
+                        // is empty. Finish inference while captured locals are
+                        // still available, resuming between individual defaults
+                        // so the callback can constrain other pending numerals.
+                        self.resolve_instances(false)?;
+                        self.flush(false)?;
+                        ready = pending.take_ready(self)?;
+                        if ready.is_none() && self.resolve_next_default_instance()? {
+                            continue;
+                        }
+                    }
+                    if let Some(argument) = ready {
+                        let checkpoint = postponed::Checkpoint::resume(
+                            self,
+                            &pending,
+                            argument,
+                            tasks.len(),
+                            values.len(),
+                        );
+                        let syntax = checkpoint.syntax;
+                        let expected = checkpoint.expected.clone();
+                        let index = attempts.len();
+                        attempts.push(Attempt::Argument(Box::new(checkpoint)));
+                        tasks.push(Task::ArgumentComplete(index));
+                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                    }
+                    let Some(task) = tasks.pop() else {
+                        pending.finish(self)?;
+                        break;
+                    };
                     self.tick()?;
+                    if matches!(
+                        &task,
+                        Task::BinderBody(..)
+                            | Task::LetBody(..)
+                            | Task::LocalFunctionValue(..)
+                            | Task::MatchBranch(..)
+                            | Task::DoBindJoinBody(..)
+                            | Task::DoBindJoinValue(..)
+                            | Task::ProofTerm(..)
+                            | Task::RefineTerm(..)
+                    ) {
+                        // Every still-unresolved argument keeps its original
+                        // scope. A later assignment cannot enter a lambda or
+                        // structural branch after that scope has been closed.
+                        pending.close_scope(self)?;
+                    }
                     match task {
+                        Task::CheckArgument(syntax, expected) => {
+                            if let Some(checkpoint) = postponed::Checkpoint::argument(
+                                self,
+                                &pending,
+                                syntax,
+                                expected.clone(),
+                                tasks.len(),
+                                values.len(),
+                            )? {
+                                let index = attempts.len();
+                                attempts.push(Attempt::Argument(Box::new(checkpoint)));
+                                tasks.push(Task::ArgumentComplete(index));
+                            }
+                            tasks.push(Task::Visit(syntax, Some(expected), true));
+                        }
+                        Task::ArgumentComplete(index) => {
+                            if index + 1 != attempts.len() {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            let Some(Attempt::Argument(checkpoint)) = attempts.last() else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            if checkpoint.tasks != tasks.len()
+                                || checkpoint.values + 1 != values.len()
+                            {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            if let Some(hole) = &checkpoint.hole {
+                                let value = values.pop().expect("resumed argument visit");
+                                self.constrain(hole, &value.value)?;
+                            }
+                            attempts.pop();
+                        }
                         Task::DoAction(arguments, expected) => {
                             let action = values.pop().expect("do action visit");
                             let function = self.do_action(action)?;
@@ -2113,14 +2221,14 @@ impl Context {
                                     values.len(),
                                 );
                                 let branch = checkpoint.begin(self, attempts.len())?;
-                                attempts.push(Attempt::Proof(checkpoint));
+                                attempts.push(Attempt::Proof(checkpoint, pending.clone()));
                                 tasks.push(Task::Proof(branch));
                             }
                             tactics::ProofAction::AttemptComplete(index) => {
                                 if index + 1 != attempts.len() {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
-                                let Some(Attempt::Proof(checkpoint)) = attempts.pop() else {
+                                let Some(Attempt::Proof(checkpoint, _)) = attempts.pop() else {
                                     return Err(failure(SourceInferenceError::Scope));
                                 };
                                 if checkpoint.tasks != tasks.len()
@@ -2131,7 +2239,7 @@ impl Context {
                                 checkpoint.finish(self, &mut proof);
                                 if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
                                     proof = next.begin(self, attempts.len())?;
-                                    attempts.push(Attempt::Proof(next));
+                                    attempts.push(Attempt::Proof(next, pending.clone()));
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
@@ -2276,6 +2384,7 @@ impl Context {
                                 // the checkpoint so a bad `exact rfl` can fall back.
                                 let target = self.instantiate(&goal.target)?;
                                 if self.attempt_depth != 0
+                                    && self.postponed_application_errors.is_empty()
                                     && !target.has_expr_mvar()
                                     && !target.has_level_mvar()
                                 {
@@ -2383,15 +2492,25 @@ impl Context {
                             values.push(self.finish_term(collection, expected.as_ref())?);
                         }
                         Task::NamedNext(mut state) => {
-                            if let Some(argument) = self.next_named_argument(&mut state)? {
+                            let next = self.next_named_argument(&mut state);
+                            if matches!(
+                                &next,
+                                Err(NatDefinitionElabError::Inference(
+                                    SourceInferenceError::ExpectedFunction
+                                        | SourceInferenceError::InvalidNamedArgument(_)
+                                ))
+                            ) {
+                                blocked_application =
+                                    self.application_type_unavailable(state.function_type())?;
+                                if blocked_application.is_some() {
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                }
+                            }
+                            if let Some(argument) = next? {
                                 match argument.value {
                                     application::ApplicationValue::Syntax(syntax) => {
                                         tasks.push(Task::NamedArgument(state, argument.codomain));
-                                        tasks.push(Task::Visit(
-                                            syntax,
-                                            Some(argument.domain),
-                                            true,
-                                        ));
+                                        tasks.push(Task::CheckArgument(syntax, argument.domain));
                                     }
                                     application::ApplicationValue::Elaborated(value) => {
                                         let value =
@@ -2424,7 +2543,18 @@ impl Context {
                                         ImplicitInsertion::ExplicitArgument,
                                     )?
                                 };
-                                let function = self.coerce_function(function)?;
+                                let callee_type = function.type_.clone();
+                                let coerced = self.coerce_function(function);
+                                if matches!(
+                                    &coerced,
+                                    Err(NatDefinitionElabError::Inference(
+                                        SourceInferenceError::ExpectedFunction
+                                    ))
+                                ) {
+                                    blocked_application =
+                                        self.application_type_unavailable(&callee_type)?;
+                                }
+                                let function = coerced?;
                                 let ExprNode::ForallE {
                                     binder_type, body, ..
                                 } = function.type_.node()
@@ -2446,7 +2576,7 @@ impl Context {
                                 tasks.push(Task::Argument(
                                     function, codomain, rest, expected, explicit,
                                 ));
-                                tasks.push(Task::Visit(first, Some(domain), true));
+                                tasks.push(Task::CheckArgument(first, domain));
                             } else {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?
@@ -2582,7 +2712,10 @@ impl Context {
                                     values.len(),
                                 )?;
                                 let (build, column) = checkpoint.begin(attempts.len());
-                                attempts.push(Attempt::LocalFunction(Box::new(checkpoint)));
+                                attempts.push(Attempt::LocalFunction(
+                                    Box::new(checkpoint),
+                                    pending.clone(),
+                                ));
                                 tasks.push(Task::LocalFunctionStart(build, column));
                             } else {
                                 let value = build.binding.value;
@@ -2604,7 +2737,7 @@ impl Context {
                                 if index + 1 != attempts.len() {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
-                                let Some(Attempt::LocalFunction(checkpoint)) = attempts.pop()
+                                let Some(Attempt::LocalFunction(checkpoint, _)) = attempts.pop()
                                 else {
                                     return Err(failure(SourceInferenceError::Scope));
                                 };
@@ -2792,22 +2925,55 @@ impl Context {
                             return Err(problem);
                         };
                         match attempt {
-                            Attempt::LocalFunction(mut checkpoint) => {
+                            Attempt::Argument(checkpoint) => {
+                                tasks.truncate(checkpoint.tasks);
+                                values.truncate(checkpoint.values);
+                                checkpoint.restore(self, &mut pending);
+                                self.tick()?;
+                                if let Some(blocker) = &blocked_application
+                                    && let Some(value) =
+                                        checkpoint.postpone(self, &mut pending, blocker)?
+                                {
+                                    if checkpoint.hole.is_none() {
+                                        values.push(value);
+                                    }
+                                    break;
+                                }
+                                if checkpoint.hole.is_some()
+                                    && !matches!(
+                                        &problem,
+                                        NatDefinitionElabError::Inference(
+                                            SourceInferenceError::Recursion(_)
+                                        )
+                                    )
+                                {
+                                    // Synthetic argument errors belong to the
+                                    // selected term. `first` may still roll back
+                                    // an explicit later failure, but cannot turn
+                                    // a bad postponed `exact` into success.
+                                    self.postponed_application_errors.push(problem.clone());
+                                    break;
+                                }
+                            }
+                            Attempt::LocalFunction(mut checkpoint, queue) => {
                                 tasks.truncate(checkpoint.tasks);
                                 values.truncate(checkpoint.values);
                                 checkpoint.restore(self);
+                                pending = queue;
                                 self.tick()?;
                                 if checkpoint.retry(&problem) {
                                     let (build, column) = checkpoint.begin(attempts.len());
-                                    attempts.push(Attempt::LocalFunction(checkpoint));
+                                    attempts
+                                        .push(Attempt::LocalFunction(checkpoint, pending.clone()));
                                     tasks.push(Task::LocalFunctionStart(build, column));
                                     break;
                                 }
                             }
-                            Attempt::Proof(mut checkpoint) => {
+                            Attempt::Proof(mut checkpoint, queue) => {
                                 tasks.truncate(checkpoint.tasks);
                                 values.truncate(checkpoint.values);
                                 checkpoint.restore(self);
+                                pending = queue;
                                 self.tick()?;
                                 // Motive discovery belongs to the enclosing
                                 // recursion driver, not a tactic alternative.
@@ -2823,7 +2989,7 @@ impl Context {
                                 }
                                 if checkpoint.retry() {
                                     let proof = checkpoint.begin(self, attempts.len())?;
-                                    attempts.push(Attempt::Proof(checkpoint));
+                                    attempts.push(Attempt::Proof(checkpoint, pending.clone()));
                                     tasks.push(Task::Proof(proof));
                                     break;
                                 }
@@ -3128,6 +3294,9 @@ impl Context {
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(error) = self.postponed_application_errors.first() {
+            return Err(error.clone());
+        }
         self.resolve_instances(true)?;
         self.resume_postponed_eliminators(true)?;
         self.flush(true)?;

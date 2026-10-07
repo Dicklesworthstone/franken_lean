@@ -434,6 +434,17 @@ impl Context {
         if matches!(term.type_.node(), ExprNode::ForallE { .. }) {
             return Ok(term);
         }
+        // A later application argument may determine this carrier, including
+        // a bundled value with its own CoeFun dictionary. Do not select that
+        // carrier by coercion search before it is known.
+        let mut head = &term.type_;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        if matches!(head.node(), ExprNode::MVar { .. }) {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        }
         let mut trial = self.clone();
         let result = trial.coerce_shape(&term, true);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;

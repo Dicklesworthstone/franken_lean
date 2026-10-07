@@ -5,6 +5,8 @@
 use super::*;
 use std::collections::{HashSet, VecDeque};
 
+pub(super) mod postponed;
+
 struct Named<'a> {
     name: Name,
     value: ApplicationValue<'a>,
@@ -24,6 +26,12 @@ pub(super) struct NamedApplication<'a> {
     result_expected: Option<Expr>,
     saved: LocalContext,
     eta: Vec<(Name, FVarId, Expr)>,
+}
+
+impl NamedApplication<'_> {
+    pub(super) fn function_type(&self) -> &Expr {
+        &self.function.type_
+    }
 }
 
 pub(super) struct Argument<'a> {

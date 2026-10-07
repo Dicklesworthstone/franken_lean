@@ -372,6 +372,17 @@ impl Context {
         Ok(())
     }
 
+    /// Let the source worklist resume newly available arguments between
+    /// defaults. A resumed callback may determine the carrier of another
+    /// pending numeral, so defaulting all goals before resuming is too early.
+    /// The caller first reaches ordinary synthesis's fixed point.
+    pub(super) fn resolve_next_default_instance(&mut self) -> Result<bool, NatDefinitionElabError> {
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
+        self.resolve_default_instance(&registry)
+    }
+
     /// Defaults are tried only after ordinary synthesis reaches a fixed point.
     /// Higher priorities run across all pending goals before any lower priority.
     /// Commit just one complete result, then rerun ordinary synthesis first.
