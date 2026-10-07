@@ -22,6 +22,7 @@ pub(super) enum Header {
     Proposition(Vec<Syntax>),
     Binding(Box<super::fallback::Header>),
     Match(Box<super::matching::MatchHeader>),
+    Exception(Box<(exceptions::ExceptionRegion, Option<Syntax>)>),
     Pattern {
         operands: Box<(Syntax, Syntax)>,
         monadic: bool,
@@ -37,6 +38,11 @@ impl Context {
         if let Header::Match(header) = header {
             return self.finish_do_match(*header, bodies);
         }
+        if let Header::Exception(region) = header {
+            let (region, cleanup) = *region;
+            bodies.extend(cleanup);
+            return self.finish_exception_region(region, bodies);
+        }
         if bodies.len() != 2 {
             return Err(invalid());
         }
@@ -44,6 +50,7 @@ impl Context {
         let yes = bodies.pop().expect("then branch");
         match header {
             Header::Match(_) => unreachable!("handled match header"),
+            Header::Exception(_) => unreachable!("handled exception header"),
             Header::Binding(header) => self.finish_do_fallback(*header, yes, no),
             Header::Proposition(mut header) => {
                 header.insert(4, yes);
@@ -76,6 +83,9 @@ pub(super) fn split(
     context: &mut Context,
     syntax: Syntax,
 ) -> Result<Branches, NatDefinitionElabError> {
+    if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])) {
+        return context.split_loop_exception(syntax);
+    }
     if fallback::is_binding(&syntax) {
         return fallback::split(syntax);
     }
@@ -212,7 +222,10 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
-                    if is_compound(&element) {
+                    if is_compound(&element)
+                        || (block.scope.targets.is_some()
+                            && element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])))
+                    {
                         // A terminal nested conditional already returns the
                         // same signal as its enclosing branch. Do not append
                         // an administrative bind that just forwards that signal.
@@ -831,5 +844,80 @@ mod tests {
             size < 512 * 150,
             "unexpected continuation multiplication: {size}"
         );
+    }
+
+    fn exception(body: Syntax) -> Syntax {
+        term(
+            "nativeDoTry",
+            vec![
+                term(
+                    "doTry",
+                    vec![
+                        atom("try"),
+                        sequence(body),
+                        null(vec![]),
+                        null(vec![term(
+                            "doFinally",
+                            vec![atom("finally"), sequence(action("cleanup"))],
+                        )]),
+                    ],
+                ),
+                atom("returning"),
+            ],
+        )
+    }
+
+    #[test]
+    fn exception_loop_joins_keep_the_source_suffix_outside_cleanup() {
+        let targets = control::LoopTargets::new(&normal()).unwrap();
+        for stop in [false, true] {
+            let output = context()
+                .expand_do_conditional(exception(jump(stop)), Some(named("suffix")), Some(&targets))
+                .unwrap();
+            let bind = expect_node(
+                &output,
+                &parser_kind(&["Term", "nativeDoBind"]),
+                2,
+                "outer join",
+            )
+            .unwrap();
+            assert_eq!(count(&bind[0], &Name::from_components(["suffix"])), 0);
+            assert_eq!(count(&bind[1], &Name::from_components(["suffix"])), 1);
+            assert_eq!(count(&bind[0], &Name::from_components(["cleanup"])), 1);
+            assert_eq!(count(&bind[1], &Name::from_components(["cleanup"])), 0);
+        }
+    }
+
+    #[test]
+    fn deeply_nested_exception_loop_regions_share_the_branch_worklist() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut input = jump(false);
+                for _ in 0..160 {
+                    input = exception(input);
+                }
+                let targets = control::LoopTargets::new(&normal()).unwrap();
+                let mut stopped = context();
+                stopped.txn.budget.max_heartbeats = 10;
+                assert!(matches!(
+                    stopped.expand_do_conditional(
+                        input.clone(),
+                        Some(named("suffix")),
+                        Some(&targets)
+                    ),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ));
+                let output = context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .unwrap();
+                assert_eq!(count(&output, &Name::from_components(["cleanup"])), 160);
+                assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

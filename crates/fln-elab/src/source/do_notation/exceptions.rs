@@ -318,6 +318,12 @@ impl Context {
         scope: SequenceScope<'_>,
         terminal: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if scope.targets.is_some() {
+            // The branch worklist transports all three loop outcomes through
+            // the entire handler chain. Its join dispatches only afterwards,
+            // keeping the source suffix outside the handler's dynamic extent.
+            return self.expand_do_conditional(syntax, suffix, scope.targets);
+        }
         let mut parts = node(syntax, "nativeDoTry", 2)?;
         let flag = parts.pop().expect("exception control flag");
         let returning = match &flag {
@@ -344,6 +350,26 @@ impl Context {
             scope,
             terminal,
         )
+    }
+
+    pub(super) fn split_loop_exception(
+        &mut self,
+        syntax: Syntax,
+    ) -> Result<conditional::Branches, NatDefinitionElabError> {
+        let mut parts = node(syntax, "nativeDoTry", 2)?;
+        expect_atom(&parts[1], "returning", "retained exception control")?;
+        let (region, mut sequences) = self.split_exception_region(parts.remove(0))?;
+        // A finalizer owns a separate result type and has no access to loop
+        // exits. Only the protected action and handlers return the loop signal.
+        let cleanup = if region.finally {
+            Some(self.expand_do_sequence(sequences.pop().ok_or_else(invalid)?, None)?)
+        } else {
+            None
+        };
+        Ok(conditional::Branches {
+            header: conditional::Header::Exception(Box::new((region, cleanup))),
+            arms: sequences.into_iter().map(Some).collect(),
+        })
     }
 }
 
