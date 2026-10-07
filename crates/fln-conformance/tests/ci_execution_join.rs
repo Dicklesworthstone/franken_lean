@@ -587,6 +587,23 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          re-deriving both where the pin is installed. Nothing per commit re-decodes the pin's \
          other 2,429 files, and no coverage row may cite this function as a CI run",
     ),
+    (
+        "crates/fln-olean/tests/ir_demand.rs",
+        "the_corpus_demand_on_the_toolchain_under_both_readings",
+        "an on-demand measurement, not a gate (beads fln-ir-decoder-call-graph-sjzl item 5 and \
+         fln-mirror-price-cszo): it decodes every `.ir` file of the pinned toolchain and of a \
+         built Mathlib checkout named by FLN_MATHLIB_CORPUS, joins the call graph to the \
+         untracked census partition (FLN_BUILTIN_PARTITION), and prints what the corpus's own \
+         declarations demand of the toolchain under two readings. It needs three inputs no CI \
+         host has, so it never runs per push, and it skips typed without any of them. Its one \
+         recorded run (2026-10-07, about 80 s with CARGO_PROFILE_TEST_OPT_LEVEL=2): 755,838 \
+         nodes, 1,492,181 edges; 2,008 toolchain-API constants reached directly and 383 \
+         externs reached through every body. What holds the graph and both stopping rules per \
+         commit is hand-built: `reach_looks_through_exactly_what_descend_accepts`, \
+         `the_graph_keeps_the_first_declaration_and_names_what_nothing_declares` and \
+         `the_two_readings_stop_at_different_walls`. Nothing per commit re-derives the corpus \
+         figures, and no coverage row may cite this function as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -677,7 +694,13 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// `fln-ir-decoder-call-graph-sjzl`), declared in the commit that adds it: it launches the
 /// pinned `lean` over 2,431 files, which is minutes, and the entry names the two committed
 /// real files that hold the same comparison per commit.
-const IGNORED_PRODUCER_CEILING: usize = 25;
+///
+/// 25 -> 26 for `crates/fln-olean/tests/ir_demand.rs`'s corpus demand measurement (beads
+/// `fln-ir-decoder-call-graph-sjzl` and `fln-mirror-price-cszo`), declared in the commit that
+/// adds it: it needs the pin, a built Mathlib and the untracked census partition, and the
+/// entry says it is a measurement, not a gate, and names the hand-built tests that hold its
+/// rules per commit.
+const IGNORED_PRODUCER_CEILING: usize = 26;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -2094,7 +2117,11 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=12 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=13 rows=13 citations=14 all-rows-declared=true
+    //
+    // `surfaces` rose 12 -> 13 with the declaration of the corpus demand measurement in
+    // crates/fln-olean/tests/ir_demand.rs (2026-10-07). `rows` and `citations` are unmoved:
+    // no terminal row cites that surface.
     //
     // `surfaces` rose 11 -> 12 with the declaration of the whole-pin `.ir` differential in
     // crates/fln-olean/tests/ir.rs (2026-10-07). `rows` and `citations` are unmoved: no

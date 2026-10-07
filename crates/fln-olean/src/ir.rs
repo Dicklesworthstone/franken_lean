@@ -20,6 +20,8 @@ use fln_rt::obj::Obj;
 use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
+pub mod graph;
+
 /// A variable or join-point index (`VarId.idx`, `JoinPointId.idx`).
 pub type IrIndex = u64;
 
