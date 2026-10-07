@@ -813,11 +813,22 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let ExprNode::Lam { body: motive, .. } = args[0].node() else {
+        let ExprNode::Lam {
+            binder_type,
+            body: motive,
+            ..
+        } = args[0].node()
+        else {
             return Ok(None);
         };
+        // A result may depend on the major's erased Type fields while still
+        // having a uniform representation. Resolve those verified projections
+        // in the motive's own local context, just as definition signatures and
+        // constructor minors use the boxed hidden carrier. Dependence on an
+        // ordinary value remains unresolved and is refused by layout discovery.
+        let motive = self.erase_hidden_types(motive, std::slice::from_ref(binder_type))?;
         let result = self
-            .value_type(motive)?
+            .value_type(&motive)?
             .ok_or_else(|| unsupported("dependent record recursor result"))?;
         let major = Expr::bvar(0).map_err(|_| unsupported("record major scope"))?;
         let mut body = args[1]
@@ -828,7 +839,7 @@ impl Preparation<'_> {
             let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
             body = self.constructor_minor_apply(body, ctor, index, field)?;
         }
-        let body = self.typed_callable_result(body, motive.clone(), result)?;
+        let body = self.typed_callable_result(body, motive, result)?;
         Ok(Some(Expr::let_e(
             Name::anonymous(),
             family,

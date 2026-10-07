@@ -71,6 +71,72 @@ fn constructor_minors_keep_hidden_carriers_as_type_metadata() {
 }
 
 #[test]
+fn dependent_record_elimination_returns_the_hidden_carrier() {
+    run(
+        "structure Package where\n  carrier : Type\n  value : carrier\n\
+        def unpack (p : Package) : p.carrier := by cases p with | mk A value => exact value\n\
+        def n : Package := { carrier := Nat, value := 40 }\n\
+        def s : Package := { carrier := String, value := \"ab\" }\n\
+        #eval Nat.add (unpack n) (String.length (unpack s))",
+        "42",
+    );
+}
+
+#[test]
+fn dependent_record_elimination_preserves_callable_and_container_results() {
+    run(
+        "structure Package where\n  carrier : Type\n  value : carrier\n  change : carrier -> carrier\n\
+        def getChange (p : Package) : p.carrier -> p.carrier := by cases p with | mk A value change => exact change\n\
+        def read (p : Package) : p.carrier := getChange p p.value\n\
+        def make (suffix : String) : Package := { carrier := String, value := \"a\", change := fun s => s ++ suffix }\n\
+        #eval String.length (read (make \"bc\") : String)",
+        "3",
+    );
+    run(
+        "structure Package where\n  carrier : Type\n  values : List carrier\n\
+        def unpack (p : Package) : List p.carrier := by cases p with | mk A values => exact values\n\
+        def n : Package := { carrier := Nat, values := [17, 25] }\n\
+        #eval (unpack n : List Nat).foldl Nat.add 0",
+        "42",
+    );
+}
+
+#[test]
+fn dependent_record_elimination_keeps_source_type_checks_and_failure_isolation() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let prefix = "structure Package where\n  carrier : Type\n  value : carrier\n\
+        def unpack (p : Package) : p.carrier := by cases p with | mk A value => exact value\n\
+        def n : Package := { carrier := Nat, value := 42 }\n";
+    let invalid = format!("{prefix}#eval String.length (unpack n)");
+    assert!(
+        base.execute_source_definitions(
+            &[invalid.as_bytes()],
+            &options,
+            EngineExecutionLimits::new(admission().kernel),
+        )
+        .is_err()
+    );
+    assert_eq!(base.logical_root(&options), root);
+    let valid = format!("{prefix}#eval (unpack n : Nat)");
+    let first = execute(&base, &valid);
+    let second = execute(&base, &valid);
+    let VmExit::Returned(value) = &first.executions.last().unwrap().exit else {
+        panic!("clean retry did not return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(
+        first.executions.last().unwrap().flbc_artifact,
+        second.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
 fn hidden_callbacks_box_results_and_preserve_owned_captures() {
     run(
         "structure Pipeline where\n  carrier : Type\n  value : carrier\n  change : carrier -> carrier\n  render : carrier -> String\n\
