@@ -5,6 +5,7 @@ use super::*;
 
 struct Catch {
     keyword: usize,
+    pattern: bool,
     binder: usize,
     colon: Option<usize>,
     arrow: usize,
@@ -22,6 +23,18 @@ pub(super) struct TryPlan {
 }
 
 impl TryPlan {
+    /// Pattern handlers let the match planner own their arm scopes. Named
+    /// handlers and protected/finalizer sequences are owned by the try itself.
+    fn body_owner(&self) -> usize {
+        if self.finally.is_none()
+            && let Some(catch) = self.catches.last()
+            && catch.pattern
+        {
+            catch.keyword
+        } else {
+            self.start
+        }
+    }
     fn close_body(&mut self, end: usize) {
         if let Some((_, finish)) = &mut self.finally {
             *finish = end;
@@ -75,7 +88,7 @@ impl Planner {
         self.active
             .last()
             .and_then(|p| p.catches.last())
-            .is_some_and(|c| at > c.keyword && at < c.arrow)
+            .is_some_and(|c| !c.pattern && at > c.keyword && at < c.arrow)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -86,13 +99,29 @@ impl Planner {
         at: usize,
         depth: usize,
         scopes: &mut DoScopes,
+        matches: &mut Vec<MatchPlan>,
         done: &mut Vec<Plan>,
         end: usize,
     ) -> Result<(), NatDefinitionParseError> {
         let catch = is_symbol(tokens, at, "catch");
         let finally = is_symbol(tokens, at, "finally");
         while self.active.last().is_some_and(|p| {
-            scopes.ended(p.start) && !((catch || finally) && p.accepts(view, tokens, at, depth))
+            scopes.ended(p.body_owner())
+                && !(is_symbol(tokens, at, "|")
+                    && matches
+                        .iter()
+                        .rev()
+                        .find(|m| m.start == p.body_owner())
+                        .is_some_and(|m| {
+                            m.catch
+                                && m.depth == depth
+                                && m.alternatives.first().is_none_or(|first| {
+                                    !later_line(view, tokens, at, first.pipe)
+                                        || column(view, tokens, at)
+                                            >= column(view, tokens, first.pipe)
+                                })
+                        }))
+                && !((catch || finally) && p.accepts(view, tokens, at, depth))
         }) {
             let mut p = self.active.pop().expect("ended exception region");
             scopes.closed(p.start);
@@ -105,10 +134,41 @@ impl Planner {
         let Some(p) = self.active.last_mut() else {
             return Err(refuse(view, tokens, at));
         };
-        if !p.accepts(view, tokens, at, depth) || !scopes.end_exception_body(p.start) {
+        if !p.accepts(view, tokens, at, depth) || !scopes.end_exception_body(p.body_owner()) {
             return Err(refuse(view, tokens, at));
         }
         p.close_body(at);
+        // A new clause ends matches in the previous clause, not a match that
+        // contains this try. Close these before opening a catch-pattern match.
+        while matches
+            .last()
+            .is_some_and(|m| m.start > p.start && m.depth == depth)
+        {
+            scopes.closed(matches.last().expect("completed clause match").start);
+            close(view, tokens, matches, done, at)?;
+        }
+        if catch && is_symbol(tokens, at + 1, "|") {
+            p.catches.push(Catch {
+                keyword: at,
+                pattern: true,
+                binder: at + 1,
+                colon: None,
+                arrow: at,
+                end,
+            });
+            matches.push(MatchPlan {
+                statement: true,
+                function: false,
+                catch: true,
+                baseline: p.baseline,
+                start: at,
+                depth,
+                with: Some(at),
+                alternatives: Vec::new(),
+                end,
+            });
+            return Ok(());
+        }
         let (introducer, body) = if catch {
             let binder = at + 1;
             if binder >= end
@@ -155,6 +215,7 @@ impl Planner {
             }
             p.catches.push(Catch {
                 keyword: at,
+                pattern: false,
                 binder,
                 colon,
                 arrow,
@@ -217,6 +278,16 @@ pub(super) fn build(
     )?;
     let mut catches = Vec::new();
     for c in p.catches {
+        if c.pattern {
+            let (end, handler) = splices
+                .remove(&c.keyword)
+                .ok_or_else(|| refuse(view, tokens, c.keyword))?;
+            if end != c.end || handler.kind() != Some(&parser_kind(&["Term", "doCatchMatch"])) {
+                return Err(refuse(view, tokens, c.keyword));
+            }
+            catches.push(handler);
+            continue;
+        }
         let annotation = if let Some(colon) = c.colon {
             null_node(vec![
                 leaves.leaf(colon)?,

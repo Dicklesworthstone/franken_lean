@@ -48,6 +48,7 @@ impl Plan {
 struct MatchPlan {
     statement: bool,
     function: bool,
+    catch: bool,
     baseline: usize,
     start: usize,
     depth: usize,
@@ -131,6 +132,7 @@ fn plan(
         vec![MatchPlan {
             statement: false,
             function: false,
+            catch: false,
             baseline: 0,
             start: range.start,
             depth: 0,
@@ -165,6 +167,7 @@ fn plan(
             at,
             depth,
             &mut do_scopes,
+            &mut active,
             &mut done,
             range.end,
         )?;
@@ -339,6 +342,7 @@ fn plan(
                 }
             }
             "match" => active.push(MatchPlan {
+                catch: false,
                 statement: statement.is_some(),
                 function: false,
                 baseline: statement.unwrap_or(0),
@@ -349,6 +353,7 @@ fn plan(
                 end: range.end,
             }),
             "fun" | "λ" if is_symbol(tokens, at + 1, "|") => active.push(MatchPlan {
+                catch: false,
                 statement: false,
                 function: true,
                 baseline: {
@@ -590,8 +595,8 @@ fn plan(
     if !delimiters.is_empty() {
         return Err(refuse(view, tokens, range.end));
     }
-    // Descendants start later. Ownership moves into their parent rather than
-    // cloning a growing Syntax tree once per enclosing match.
+    // An inner match always starts later. Build it first and splice it once
+    // into its parent's body, never by recursively invoking the parser.
     done.sort_by_key(|p| std::cmp::Reverse(p.start()));
     Ok(done)
 }
@@ -1191,12 +1196,14 @@ fn build_match(
     let with = plan.with.expect("validated match header");
     let equation_root = equations && plan.start == range.start;
     let mut discriminators = Vec::new();
-    let discriminant_columns = if equation_root || plan.function {
+    let discriminant_columns = if equation_root || plan.function || plan.catch {
         Vec::new()
     } else {
         columns(tokens, plan.start + 1..with)
     };
-    let arity = if equation_root || plan.function {
+    let arity = if plan.catch {
+        1
+    } else if equation_root || plan.function {
         let first = plan.alternatives.first().expect("validated equation row");
         columns(
             tokens,
@@ -1317,7 +1324,12 @@ fn build_match(
         }
         return Ok(Some(alternatives));
     }
-    let syntax = if plan.function {
+    let syntax = if plan.catch {
+        Syntax::node(
+            parser_kind(&["Term", "doCatchMatch"]),
+            vec![leaves.leaf(plan.start)?, alternatives],
+        )
+    } else if plan.function {
         Syntax::node(
             parser_kind(&["Term", "fun"]),
             vec![leaves.leaf(plan.start)?, alternatives],
