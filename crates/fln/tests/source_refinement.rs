@@ -246,11 +246,15 @@ fn irrelevant_ill_typed_arguments_are_actually_refused() {
         ),
         Ok(fln::Outcome::Complete(_))
     ));
+    // The pin refuses this while elaborating: `refine Eq.refl ?_` closes the goal, and
+    // `exact m` is "No goals to be solved" (v4.32.0, 2026-10-06). FrankenLean refuses
+    // it at the same stage since 5a3ff40e, though by a conversion refusal (NotDefEq)
+    // rather than the pin's "No goals"; that difference in reason is not asserted here.
     let source = "def identity (n : Nat) : Nat := n\ntheorem bad (n m : Nat) : identity n = n := by refine Eq.refl ?_; exact m";
     let problem = run(source).unwrap_err();
     assert_eq!(
         problem.disposition(),
-        ("kernel-rejection", true, 1),
+        ("elaboration", false, 1),
         "{problem:?}"
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);

@@ -356,8 +356,8 @@ fn a_reduced_dictionary_does_not_erase_ill_typed_arguments_or_lets() {
             SourceCheckLimits::new(limits),
         )
     };
-    // The pin refuses each `1 : String` while elaborating (no `OfNat String 1`);
-    // the false decision still reaches K1. Each twin must check.
+    // The pin refuses each `1 : String` while elaborating (no `OfNat String 1`),
+    // and the false decision too (see its row). Each twin must check.
     for (source, refusal, twin) in [
         (
             "theorem bad : True := by let witness : Decidable True := (fun ignored => Decidable.isTrue True.intro) (1 : String); decide",
@@ -369,9 +369,13 @@ fn a_reduced_dictionary_does_not_erase_ill_typed_arguments_or_lets() {
             ("elaboration", false, 1),
             "theorem bad : True := by have unused : String := \"one\"; decide",
         ),
+        // The pin refuses this while elaborating, not in the kernel: "Application type
+        // mismatch … `Eq.refl true` has type `true = true` but is expected to have type
+        // `decide False = true`" (v4.32.0, 2026-10-06). Since 5a3ff40e checks closed
+        // source equations at Default transparency, FrankenLean refuses it there too.
         (
             "theorem bad : False := of_decide_eq_true (Eq.refl true)",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "theorem bad : True := of_decide_eq_true (Eq.refl true)",
         ),
     ] {
