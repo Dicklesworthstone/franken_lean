@@ -118,6 +118,9 @@ impl Context {
                 }
                 result => result?,
             };
+            if let Some(expected) = &state.result_expected {
+                self.do_exception_result_hint(&state.function, expected)?;
+            }
             let ExprNode::ForallE {
                 binder_name,
                 binder_type,
