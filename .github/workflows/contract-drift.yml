@@ -879,3 +879,38 @@ jobs:
             --test olean_header_pin --no-fail-fast || rc=1
           cargo test --locked -p fln-olean --no-fail-fast || rc=1
           exit "$rc"
+
+      - name: run the reduced reject-side mutant lane (fln-kernel-reject-side-at-scale-bemc)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          # The bead's acceptance 5: a reduced, fixed-seed reject-side run as a
+          # required step of the scheduled pinned workflow. The generator runs
+          # ONLY under the stock pinned binary (D8); every judged mutant rides
+          # unchecked in a synthetic Bemc.* module; the join judges each unit
+          # per declaration and FAILS on any pin=reject/FrankenLean=accept row
+          # (plan R7 stop-ship), with inconclusive counted as unattributed
+          # coverage and joined-vs-table conservation enforced. Seeds are
+          # fixed, so a red here is a kernel change, never sampling noise.
+          toolchain_bin="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/bin"
+          test -x "$toolchain_bin/lean"
+          bemc_root="$RUNNER_TEMP/bemc-root"
+          mkdir -p "$bemc_root"
+          PATH="$toolchain_bin:$PATH" "$toolchain_bin/lean" --run \
+            scripts/tribunal/bemc_mutant_generator.lean \
+            Init.Data.Nat.Basic 7 4 100 "$bemc_root"
+          PATH="$toolchain_bin:$PATH" "$toolchain_bin/lean" --run \
+            scripts/tribunal/bemc_mutant_generator.lean \
+            Init.Data.List.Basic 7 4 100 "$bemc_root"
+          rc=0
+          FLN_BEMC_ROOT="$bemc_root" FLN_BEMC_MODULE=Bemc.Init.Data.Nat.Basic \
+            cargo test --locked -p fln-conformance --test kernel_replay \
+            bemc_synthetic_module_pin_and_kernel_verdicts_join \
+            -- --ignored --exact --nocapture || rc=1
+          FLN_BEMC_ROOT="$bemc_root" FLN_BEMC_MODULE=Bemc.Init.Data.List.Basic \
+            cargo test --locked -p fln-conformance --test kernel_replay \
+            bemc_synthetic_module_pin_and_kernel_verdicts_join \
+            -- --ignored --exact --nocapture || rc=1
+          exit "$rc"

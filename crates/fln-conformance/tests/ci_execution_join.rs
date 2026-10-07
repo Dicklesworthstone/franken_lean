@@ -369,6 +369,25 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
+        "fln_4hol_units_accept_within_their_step_ceilings",
+        "the whole-stdlib differential catches the accepted-or-not half of the fln-4hol \
+         units on demand (subject_no_answer=0 at 0eb03c7b), and the step CEILINGS this lane \
+         adds are consumption bands, not verdicts: a recurrence of the e7cdcbbc unfolding \
+         pathology also reddens the corpus thread-matrix wall and the frontier runs, which \
+         is where it was found the first time. Bead franken_lean-z8j.1.13 comment 3319 \
+         records the measured values and this placement decision",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "bemc_synthetic_module_pin_and_kernel_verdicts_join",
+        "the join logic itself runs per commit as bemc_join_cells_classify_and_conserve, \
+         where the rig's planted mutants die; the full lane needs a pinned generator run, \
+         and the scheduled contract-drift workflow executes it weekly with fixed seeds, \
+         failing on any pin=reject/FrankenLean=accept row (bead \
+         fln-kernel-reject-side-at-scale-bemc, acceptance 5)",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
         "selected_real_module_resource_probe",
         "not evidence for any claim — an operator-selected diagnostic whose output describes \
          only that invocation. NOTHING compensates per commit by design, and no coverage row \
@@ -591,7 +610,18 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// 18 -> 19 for `crates/fln-cli/tests/source_import_reuse.rs`'s fln-52qv budget lane, declared
 /// in the same commit that adds it: a whole-Init council is too slow per push, and the entry
 /// names the pin-gated Init.Core tests that hold the filter per commit.
-const IGNORED_PRODUCER_CEILING: usize = 19;
+///
+/// 19 -> 21 for two kernel_replay lanes that landed `#[ignore]`d and UNDECLARED, by this
+/// author's own earlier commits (`0ce8af8c`, `1bdbe78f`), which reddened this suite until
+/// repaired here — the miss disclosed rather than smoothed: the fln-4hol step-ceiling lane
+/// (its accepted-or-not half held on demand by the stdlib differential, its consumption
+/// bands also visible in the corpus matrix wall; bead `franken_lean-z8j.1.13` comment 3319)
+/// and the bemc reject-side join (its join logic running per commit as
+/// `bemc_join_cells_classify_and_conserve` where the rig's planted mutants die, the full
+/// lane executed weekly with fixed seeds by the scheduled contract-drift workflow, failing
+/// on any pin=reject/FrankenLean=accept row; bead `fln-kernel-reject-side-at-scale-bemc`,
+/// acceptance 5).
+const IGNORED_PRODUCER_CEILING: usize = 21;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
