@@ -1294,7 +1294,7 @@ impl Context {
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(local_functions::Build<'a>),
             LocalFunctionStart(local_functions::Build<'a>, Option<usize>),
-            LocalFunctionValue(local_functions::Build<'a>),
+            LocalFunctionValue(local_functions::Build<'a>, usize),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool),
             LetBody(LocalContext, FVarId, Name, Typed, bool),
@@ -1350,6 +1350,7 @@ impl Context {
         let mut pending = postponed::Queue::default();
         loop {
             let mut blocked_application = None;
+            let mut containing_argument = None;
             let result = (|| {
                 loop {
                     let closes_scope = matches!(
@@ -1377,8 +1378,29 @@ impl Context {
                         self.resolve_instances(false)?;
                         self.flush(false)?;
                         ready = pending.take_ready(self)?;
-                        if ready.is_none() && self.resolve_next_default_instance()? {
-                            continue;
+                        if ready.is_none() {
+                            let blockers = pending.scope_blockers(self)?;
+                            if !blockers.is_empty() {
+                                for (index, attempt) in attempts.iter().enumerate().rev() {
+                                    self.tick()?;
+                                    if let Attempt::Argument(checkpoint) = attempt
+                                        && let Some(blocker) =
+                                            checkpoint.outer_blocker(self, &blockers)?
+                                    {
+                                        // Rewind the whole containing argument,
+                                        // not an already-closed inner lambda.
+                                        // The blocker belongs to that snapshot.
+                                        blocked_application = Some(blocker);
+                                        containing_argument = Some(index);
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    }
+                                }
+                            }
+                            if self.resolve_next_default_instance()? {
+                                continue;
+                            }
                         }
                     }
                     if let Some(argument) = ready {
@@ -1833,7 +1855,10 @@ impl Context {
                                             ));
                                         } else {
                                             let value = build.binding.value;
-                                            tasks.push(Task::LocalFunctionValue(build));
+                                            tasks.push(Task::LocalFunctionValue(
+                                                build,
+                                                self.postponed_application_errors.len(),
+                                            ));
                                             tasks.push(Task::Visit(value, None, true));
                                         }
                                         continue;
@@ -2719,7 +2744,10 @@ impl Context {
                                 tasks.push(Task::LocalFunctionStart(build, column));
                             } else {
                                 let value = build.binding.value;
-                                tasks.push(Task::LocalFunctionValue(build));
+                                tasks.push(Task::LocalFunctionValue(
+                                    build,
+                                    self.postponed_application_errors.len(),
+                                ));
                                 tasks.push(Task::Visit(value, Some(annotation.value), true));
                             }
                         }
@@ -2727,10 +2755,18 @@ impl Context {
                             self.start_local_function_value(&mut build, column)?;
                             let value = build.value_syntax;
                             let expected = build.result_type.clone();
-                            tasks.push(Task::LocalFunctionValue(build));
+                            tasks.push(Task::LocalFunctionValue(
+                                build,
+                                self.postponed_application_errors.len(),
+                            ));
                             tasks.push(Task::Visit(value, expected, true));
                         }
-                        Task::LocalFunctionValue(build) => {
+                        Task::LocalFunctionValue(build, postponed_start) => {
+                            if build.checkpoint.is_some() {
+                                // Completed local bodies hand selected errors
+                                // to their own structural candidate checkpoint.
+                                self.require_no_postponed_recursion_since(postponed_start)?;
+                            }
                             let value = values.pop().expect("local function value visit");
                             let value = self.close_local_function(&build, value)?;
                             if let Some(index) = build.checkpoint {
@@ -2924,6 +2960,19 @@ impl Context {
                         let Some(attempt) = attempts.pop() else {
                             return Err(problem);
                         };
+                        if let Some(target) = containing_argument {
+                            if attempts.len() > target {
+                                // This is suspension, not a failing tactic.
+                                // The target's complete checkpoint restores all
+                                // nested choices and work, retaining spent fuel.
+                                self.tick()?;
+                                continue;
+                            }
+                            if attempts.len() != target || !matches!(&attempt, Attempt::Argument(_))
+                            {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                        }
                         match attempt {
                             Attempt::Argument(checkpoint) => {
                                 tasks.truncate(checkpoint.tasks);
@@ -2939,11 +2988,16 @@ impl Context {
                                     }
                                     break;
                                 }
+                                if containing_argument.is_some() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
                                 if checkpoint.hole.is_some()
                                     && !matches!(
                                         &problem,
                                         NatDefinitionElabError::Inference(
-                                            SourceInferenceError::Recursion(_)
+                                            SourceInferenceError::Recursion(
+                                                recursion::RecursionError::GeneralizeParameter { .. }
+                                            )
                                         )
                                     )
                                 {
@@ -2951,6 +3005,9 @@ impl Context {
                                     // selected term. `first` may still roll back
                                     // an explicit later failure, but cannot turn
                                     // a bad postponed `exact` into success.
+                                    // Motive generalization is an immediate
+                                    // retry signal; other recursion diagnostics
+                                    // surface at their completed body boundary.
                                     self.postponed_application_errors.push(problem.clone());
                                     break;
                                 }

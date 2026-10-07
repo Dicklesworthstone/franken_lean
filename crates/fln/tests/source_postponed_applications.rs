@@ -75,6 +75,118 @@ fn successive_arguments_resolve_distinct_blockers() {
 }
 
 #[test]
+fn nested_arguments_resume_their_containing_lambda() {
+    for declaration in [
+        "def result : Nat := use (fun f => use (fun g => g 0) f) (fun n => n + 42)",
+        "def result : Nat := use (fun f => use (fun g => use (fun h => h 0) g) f) (fun n => n + 42)",
+        "def captured (offset : Nat) : Nat :=\n  let saved := offset\n  use (fun f => let added := 2; use (fun g => g saved + added) f) (fun n => n)\ndef result : Nat := captured 40",
+    ] {
+        let source = format!("{USE}\n{declaration}");
+        check(
+            &engine(),
+            &format!("{source}\ntheorem computes : result = 42 := by rfl"),
+        );
+        evaluate(&format!("{source}\n#eval result"), "42");
+    }
+}
+
+#[test]
+fn nested_arguments_keep_coercions_and_structural_calls() {
+    let source = format!(
+        "{USE}
+         structure Callable where
+           run : Nat -> Nat
+         instance callable : CoeFun Callable (fun _ => Nat -> Nat) := CoeFun.mk (fun c => c.run)
+         def result : Nat := use (fun f => use (fun g => g 39) f) (Callable.mk (fun n => n + 3))"
+    );
+    check(
+        &engine(),
+        &format!("{source}\ntheorem computes : result = 42 := by rfl"),
+    );
+    evaluate(&format!("{source}\n#eval result"), "42");
+    for (body, expected) in [
+        ("use (fun f => f (count k)) (fun x => x + 1)", "3"),
+        (
+            "use (fun f => use (fun g => g (count k)) f) (fun x => x + 1)",
+            "3",
+        ),
+        (
+            "by first | exact use (fun f => use (fun g => g (count k)) f) (fun x => x + 1) | exact 0",
+            "3",
+        ),
+        (
+            "by first | (exact use (fun f => use (fun g => g (count k)) f) (fun x => x + 1); fail) | exact 7",
+            "7",
+        ),
+    ] {
+        let source = format!(
+            "{USE}\ndef count (n : Nat) : Nat := match n with
+             | 0 => 0
+             | Nat.succ k => {body}"
+        );
+        check(
+            &engine(),
+            &format!("{source}\ntheorem computes : count 3 = {expected} := by rfl"),
+        );
+        evaluate(&format!("{source}\n#eval count 3"), expected);
+    }
+}
+
+#[test]
+fn nested_recursion_preserves_candidate_retry_and_explicit_failure() {
+    for (declaration, expected) in [
+        (
+            "def count (n : Nat) : Nat := match n with\n  | 0 => 4\n  | Nat.succ k => by\n      first\n      | (exact use (fun f => use (fun g => g (count n)) f) (fun x => x + 1); fail)\n      | exact count k + 1\ndef result : Nat := count 3",
+            "7",
+        ),
+        (
+            "def count (acc n : Nat) : Nat := match n with\n  | 0 => acc\n  | Nat.succ k => use (fun f => use (fun g => g (count (acc + 1) k)) f) (fun x => x)\ndef result : Nat := count 39 3",
+            "42",
+        ),
+        (
+            "def result : Nat :=\n  let rec loop (acc n : Nat) : Nat := match n with\n    | 0 => acc\n    | Nat.succ k => use (fun f => use (fun g => g (loop (acc + 1) k)) f) (fun x => x)\n  loop 39 3",
+            "42",
+        ),
+    ] {
+        let source = format!("{USE}\n{declaration}");
+        check(
+            &engine(),
+            &format!("{source}\ntheorem computes : result = {expected} := by rfl"),
+        );
+        evaluate(&format!("{source}\n#eval result"), expected);
+    }
+}
+
+#[test]
+fn nested_suspension_preserves_tactic_choice() {
+    for declaration in [
+        "def result : Nat := use (fun f => by first | exact use (fun g => g 0) f | exact 0) (fun n => n + 42)",
+        "def result : Nat := by first\n\
+         | (exact use (fun f => use (fun g => g 0) f) (42 : Nat); fail)\n\
+         | exact use (fun f => use (fun g => g 40) f) (fun n => n + 2)",
+    ] {
+        let source = format!("{USE}\n{declaration}");
+        check(
+            &engine(),
+            &format!("{source}\ntheorem computes : result = 42 := by rfl"),
+        );
+        evaluate(&format!("{source}\n#eval result"), "42");
+    }
+    for callback in ["fun f => f result", "fun f => use (fun g => g result) f"] {
+        let source = format!(
+            "{USE}\ndef result : Nat := by first
+             | (exact use ({callback}) (fun (n : Nat) => n); fail)
+             | exact 42"
+        );
+        check(
+            &engine(),
+            &format!("{source}\ntheorem computes : result = 42 := by rfl"),
+        );
+        evaluate(&format!("{source}\n#eval result"), "42");
+    }
+}
+
+#[test]
 fn hidden_callback_lists_supply_their_types_after_the_fold_function() {
     let source = "structure Handlers where
       carrier : Type
@@ -161,30 +273,35 @@ fn failed_postponed_arguments_restore_the_tactic_alternative() {
 fn postponed_work_cannot_turn_resource_stops_into_tactic_success() {
     let base = check(&engine(), USE);
     let root = base.logical_root(&KVMap::new());
-    let source = "def result : Nat := by first
-      | exact (let captured := 40; use (fun f => f captured) (fun n => n + 2))
-      | exact 0";
-    let source = format!("{source}\ntheorem computes : result = 42 := by rfl");
     let mut stopped = 0;
-    for steps in [100, 1_000] {
-        let mut low = limits();
-        low.admission.kernel = low.admission.kernel.narrowed(steps, 256);
-        match base.check_source_files(&[source.as_bytes()], &KVMap::new(), low) {
-            Ok(fln::Outcome::Inconclusive(_)) => stopped += 1,
-            Err(error) => {
-                assert!(
-                    matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
-                    "steps={steps}: {error:?}"
-                );
-                stopped += 1;
+    for body in [
+        "let captured := 40; use (fun f => f captured) (fun n => n + 2)",
+        "let captured := 40; use (fun f => use (fun g => g captured) f) (fun n => n + 2)",
+    ] {
+        let source = format!(
+            "def result : Nat := by first | exact ({body}) | exact 0\n\
+             theorem computes : result = 42 := by rfl"
+        );
+        for steps in [100, 1_000] {
+            let mut low = limits();
+            low.admission.kernel = low.admission.kernel.narrowed(steps, 256);
+            match base.check_source_files(&[source.as_bytes()], &KVMap::new(), low) {
+                Ok(fln::Outcome::Inconclusive(_)) => stopped += 1,
+                Err(error) => {
+                    assert!(
+                        matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+                        "steps={steps}: {error:?}"
+                    );
+                    stopped += 1;
+                }
+                Ok(fln::Outcome::Complete(_)) => {}
+                result => panic!("resource stop swallowed: {result:?}"),
             }
-            Ok(fln::Outcome::Complete(_)) => {}
-            result => panic!("resource stop swallowed: {result:?}"),
+            assert_eq!(base.logical_root(&KVMap::new()), root);
         }
-        assert_eq!(base.logical_root(&KVMap::new()), root);
+        check(&base, &source);
     }
     assert!(stopped > 0, "the bounded controls must exhaust work");
-    check(&base, &source);
 }
 
 #[test]
@@ -197,6 +314,12 @@ fn unresolved_and_nonfunction_callees_still_refuse_atomically() {
         "def bad : Nat := use (fun f => f true) (fun (n : Nat) => n)",
         "def bad : Nat := let ignored := use (fun f => f 0) (42 : Nat); 42",
         "def bad : Nat := by first | exact use (fun f => f 0) (42 : Nat) | exact 42",
+        "def bad : Nat := use (fun f => use (fun g => g 0) f) _",
+        "def bad : Nat := by first | exact use (fun f => use (fun g => g 0) f) (42 : Nat) | exact 42",
+        "def bad : Nat := by first | exact use (fun f => use (fun g => g missing) f) (fun (x : Nat) => x) | exact 42",
+        "def bad (n : Nat) : Nat := match n with | 0 => 0 | Nat.succ k => use (fun f => use (fun g => g (bad n)) f) (fun x => x + 1)",
+        "def bad (n : Nat) : Nat := match n with\n  | 0 => 0\n  | Nat.succ k => by\n      first\n      | exact use (fun f => use (fun g => g (bad n)) f) (fun x => x + 1)\n      | exact 0",
+        "def bad : Nat :=\n  let rec loop (n : Nat) : Nat := match n with\n    | 0 => 0\n    | Nat.succ k => by\n        first\n        | exact use (fun f => use (fun g => g (loop n)) f) (fun x => x + 1)\n        | exact 0\n  loop 3",
     ] {
         let error = base
             .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
@@ -205,6 +328,12 @@ fn unresolved_and_nonfunction_callees_still_refuse_atomically() {
             !format!("{error:?}").contains("Frontend(Parse("),
             "{source}\n{error:?}"
         );
+        if source.contains("bad n") || source.contains("loop n") {
+            assert!(
+                format!("{error:?}").contains("NotDecreasing"),
+                "recursive calls must reach their structural check: {source}\n{error:?}"
+            );
+        }
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
     check(&base, "def recovered : Nat := 42");

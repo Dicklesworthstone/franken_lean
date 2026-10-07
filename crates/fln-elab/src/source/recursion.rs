@@ -86,6 +86,30 @@ pub(super) struct Recursion {
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
+    /// A synthetic argument's selected termination failure must reach the
+    /// enclosing candidate driver after tactic alternatives finish. Earlier
+    /// diagnostics belong to an outer body; explicit failure restores the
+    /// existing diagnostic vector along with its argument/proof checkpoint.
+    pub(super) fn require_no_postponed_recursion_since(
+        &mut self,
+        start: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        if start > self.postponed_application_errors.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for index in start..self.postponed_application_errors.len() {
+            self.tick()?;
+            let problem = &self.postponed_application_errors[index];
+            if matches!(
+                problem,
+                NatDefinitionElabError::Inference(SourceInferenceError::Recursion(_))
+            ) {
+                return Err(problem.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Implicit higher-order inference can produce `fun x => P x` for the fixed
     /// parameter `P`. Recognize only that exact eta shape, checking every domain
     /// against P's dependent function telescope. Unlike general conversion this
@@ -156,6 +180,33 @@ impl Context {
             ))) if (&found == name
                 || self.source_scope.declaration_name(&found).as_ref() == Ok(name))
                 && !self.txn.env.contains(name) => {}
+            Ok(body) => {
+                // A resumed callback reports its failure as a delayed source
+                // diagnostic. Let tactic alternatives finish and roll back
+                // first: an explicit `fail` may discard the self reference.
+                // A surviving reference selects the same ordinary recursion
+                // retry before later hole equations can obscure its cause.
+                let mut discovered = false;
+                if !self.txn.env.contains(name) {
+                    for index in snapshot.postponed_application_errors.len()
+                        ..self.postponed_application_errors.len()
+                    {
+                        self.tick()?;
+                        if matches!(
+                            &self.postponed_application_errors[index],
+                            NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(found))
+                                if found == name
+                                    || self.source_scope.declaration_name(found).as_ref() == Ok(name)
+                        ) {
+                            discovered = true;
+                            break;
+                        }
+                    }
+                }
+                if !discovered {
+                    return Ok(body);
+                }
+            }
             result => return result,
         }
         let spent = self.txn.budget.heartbeats_consumed;
@@ -252,6 +303,12 @@ impl Context {
                             );
                             Ok(value)
                         }
+                    })
+                    .and_then(|value| {
+                        self.require_no_postponed_recursion_since(
+                            snapshot.postponed_application_errors.len(),
+                        )?;
+                        Ok(value)
                     });
                 match result {
                     Ok(value) => return Ok(value),

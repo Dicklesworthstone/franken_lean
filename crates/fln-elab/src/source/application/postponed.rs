@@ -15,6 +15,7 @@ pub(in crate::source) struct Argument<'a> {
     pub syntax: &'a Syntax,
     pub expected: Expr,
     waiting: Expr,
+    blocker: MVarId,
     lctx: LocalContext,
     hole: Expr,
 }
@@ -49,6 +50,23 @@ impl<'a> Queue<'a> {
             }
         }
         Ok(None)
+    }
+
+    pub fn scope_blockers(
+        &self,
+        context: &mut Context,
+    ) -> Result<Vec<MVarId>, NatDefinitionElabError> {
+        let mut blockers = Vec::new();
+        for argument in &self.arguments {
+            context.tick()?;
+            if argument.lctx == context.txn.lctx
+                && let Some(blocker) =
+                    context.application_type_unavailable(&Expr::mvar(argument.blocker.clone()))?
+            {
+                blockers.push(blocker);
+            }
+        }
+        Ok(blockers)
     }
 
     pub fn close_scope(&mut self, context: &mut Context) -> Result<(), NatDefinitionElabError> {
@@ -137,6 +155,53 @@ impl<'a> Checkpoint<'a> {
         *queue = self.queue.clone();
     }
 
+    /// Move a suspended nested argument outward only by replaying an entire
+    /// containing argument. Its snapshot must precede the closing lexical
+    /// scope, and its expected type must own the unresolved dependency.
+    /// Current assignments may alias a saved ?A to an inner ?B. Return the
+    /// saved owner ?A, never an inner identity that rollback would discard.
+    pub fn outer_blocker(
+        &self,
+        context: &mut Context,
+        blockers: &[MVarId],
+    ) -> Result<Option<MVarId>, NatDefinitionElabError> {
+        let saved = &self.context.txn.lctx;
+        if saved.len() >= context.txn.lctx.len() {
+            return Ok(None);
+        }
+        for index in 0..saved.len() {
+            context.tick()?;
+            if saved.decls()[index] != context.txn.lctx.decls()[index] {
+                return Ok(None);
+            }
+        }
+        context.tick()?;
+        let expected = self
+            .context
+            .txn
+            .instantiate_expr(&self.expected)
+            .map_err(|error| failure(SourceInferenceError::Universe(error)))?;
+        let mut owners: Vec<_> = self
+            .context
+            .txn
+            .mvars
+            .collect_mvars(&expected)
+            .into_iter()
+            .collect();
+        owners.sort_by(|left, right| left.0.cmp(&right.0));
+        for owner in owners {
+            let current = context.instantiate(&Expr::mvar(owner.clone()))?;
+            let dependencies = context.txn.mvars.collect_mvars(&current);
+            for blocker in blockers {
+                context.tick()?;
+                if dependencies.contains(blocker) {
+                    return Ok(Some(owner));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn postpone(
         &self,
         context: &mut Context,
@@ -158,6 +223,7 @@ impl<'a> Checkpoint<'a> {
             syntax: self.syntax,
             expected: expected.clone(),
             waiting: expected.clone(),
+            blocker: blocker.clone(),
             lctx: context.txn.lctx.clone(),
             hole: hole.clone(),
         });
