@@ -13,9 +13,12 @@
 //! `didOpen`/Full-sync `didChange`/`didSave`/`didClose`. Latest source text is
 //! retained under explicit document/byte limits and monotone client versions so
 //! textless saves can re-check the newest valid snapshot; malformed transitions
-//! invalidate stale retained source and close clears push diagnostics. Cursor-aware
-//! goals, hover/completion/definition semantics, Lean RPC sessions, and persistent
-//! elaboration/import state remain outside this bounded server slice.
+//! invalidate stale retained source and close clears push diagnostics.
+//! `$/lean/plainGoal`, `textDocument/hover`, `textDocument/definition` and
+//! `textDocument/completion` are answered by `dispatch::semantic`, typed read-only
+//! queries over the accepted source snapshot; `$/lean/plainTermGoal` answers null.
+//! Lean RPC sessions (`$/lean/rpc/connect`, `$/lean/rpc/call`) are refused, and
+//! persistent elaboration/import state remains outside this bounded server slice.
 
 #![forbid(unsafe_code)]
 
