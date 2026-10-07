@@ -1,6 +1,6 @@
 //! Native single-family inductive syntax, retaining every original token leaf.
 //! Index telescopes and constructor results are retained; unsupported mutual
-//! blocks and deriving are not dropped or repaired.
+//! blocks and deriving handlers are not dropped or repaired.
 use super::*;
 use std::ops::Range;
 
@@ -60,9 +60,10 @@ pub(super) fn parse(
     }
     let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
+    let end_body = records::deriving_start(&tokens, cursor);
     let mut end_header = cursor;
     let mut nesting = Vec::new();
-    while end_header < tokens.len() {
+    while end_header < end_body {
         if nesting.is_empty()
             && (symbol(&tokens, end_header, "where")
                 || symbol(&tokens, end_header, ":=")
@@ -101,7 +102,7 @@ pub(super) fn parse(
         null_node(vec![])
     };
     let mut begins = Vec::new();
-    for at in end_header..tokens.len() {
+    for at in end_header..end_body {
         if nesting.is_empty() && symbol(&tokens, at, "|") {
             begins.push(at);
         }
@@ -122,10 +123,10 @@ pub(super) fn parse(
             }
         }
     }
-    if !nesting.is_empty() || (end_header < tokens.len() && begins.first() != Some(&end_header)) {
+    if !nesting.is_empty() || (end_header < end_body && begins.first() != Some(&end_header)) {
         return Err(refuse(&view, &tokens, end_header));
     }
-    begins.push(tokens.len());
+    begins.push(end_body);
     let ctors = begins
         .windows(2)
         .map(|w| ctor(&leaves, &view, &tokens, w[0]..w[1]))
@@ -148,10 +149,7 @@ pub(super) fn parse(
             body_keyword,
             null_node(ctors),
             null_node(vec![]),
-            Syntax::node(
-                parser_kind(&["Command", "optDeriving"]),
-                vec![null_node(vec![])],
-            ),
+            records::deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
     Ok(ParsedDefinition {
@@ -185,9 +183,20 @@ mod tests {
         for source in [
             "inductive X where |",
             "inductive X where | c (x : Nat",
-            "inductive X where | c deriving Inhabited",
+            "inductive X where | c deriving",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn deriving_follows_the_complete_constructor_telescope() {
+        let text = "inductive Choice (A : Type) where\r\n | value (a : A)\r\n | empty\r\n deriving Inhabited, Repr\r\n";
+        let parsed = parse_definition(text.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            text.replace("\r\n", "\n").as_bytes()
+        );
     }
 }

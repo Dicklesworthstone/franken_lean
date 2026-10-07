@@ -187,10 +187,19 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        if fln_elab::source::is_inductive(parsed.syntax()) {
+        let deriving =
+            match elaboration_outcome(fln_elab::source::deriving::prepare(parsed.syntax()))? {
+                Outcome::Complete(request) => request,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        let syntax = deriving
+            .as_ref()
+            .map_or_else(|| parsed.syntax(), |request| &request.syntax);
+        if fln_elab::source::is_inductive(syntax) {
             let candidate =
                 match elaboration_outcome(fln_elab::source::scope::elaborate_inductive(
-                    parsed.syntax(),
+                    syntax,
                     self.environment(),
                     limits.kernel,
                     fln_elab::records::RecordBudget::default(),
@@ -200,11 +209,12 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-            return self
+            let result = self
                 .admit_declarations(&[candidate], options, limits)
-                .map_err(EngineExecutionError::from);
+                .map_err(EngineExecutionError::from)?;
+            return self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope);
         }
-        if !fln_elab::source::is_record(parsed.syntax()) {
+        if !fln_elab::source::is_record(syntax) {
             if scope != &fln_elab::source::scope::SourceScope::default() {
                 let declaration =
                     match elaboration_outcome(fln_elab::source::scope::elaborate_definition(
@@ -323,7 +333,7 @@ impl Engine {
             );
         }
         let mut record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
-            parsed.syntax(),
+            syntax,
             self.environment(),
             limits.kernel,
             fln_elab::records::RecordBudget::default(),
@@ -391,7 +401,7 @@ impl Engine {
                     .map_err(EngineExecutionError::from)?;
             }
         }
-        Ok(match result {
+        let result = match result {
             Outcome::Complete(mut batch) => {
                 // Projection hints and reducibility status are different facts.
                 // Non-class data projections are reducible, class fields remain
@@ -485,7 +495,85 @@ impl Engine {
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-        })
+        };
+        self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope)
+    }
+
+    fn finish_source_deriving(
+        &self,
+        result: Outcome<DeclarationBatchAdmission>,
+        request: Option<&fln_elab::source::deriving::DerivingRequest>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let Some(request) = request.filter(|request| !request.handlers.is_empty()) else {
+            return Ok(result);
+        };
+        let mut batch = match result {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let frontend = |reason| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(reason),
+            ))
+        };
+        let type_name = scope
+            .declaration_name(&request.type_name)
+            .map_err(|error| frontend(fln_elab::source::SourceInferenceError::NameScope(error)))?;
+        for handler in &request.handlers {
+            let derived = match elaboration_outcome(fln_elab::source::deriving::elaborate_handler(
+                handler,
+                &type_name,
+                request.is_record,
+                batch.engine.environment(),
+                limits.kernel,
+                scope,
+            ))? {
+                Outcome::Complete(derived) => derived,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            let mut successor = match batch
+                .engine
+                .admit_declarations(&derived.declarations, options, limits)
+                .map_err(EngineExecutionError::from)?
+            {
+                Outcome::Complete(successor) => successor,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            successor.engine.environment = fln_elab::instances::register_instance(
+                successor.engine.environment(),
+                &derived.instance,
+                1000,
+            )
+            .map_err(|error| {
+                frontend(fln_elab::source::SourceInferenceError::InstanceRegistry(
+                    error,
+                ))
+            })?;
+            successor.engine.environment = fln_elab::reducibility::register(
+                successor.engine.environment(),
+                &derived.instance,
+                fln_elab::reducibility::Reducibility::ImplicitReducible,
+            )
+            .map_err(|error| {
+                frontend(fln_elab::source::SourceInferenceError::Unification(
+                    Box::new(fln_elab::constraint::unify::UnificationError::Reducibility(
+                        error,
+                    )),
+                ))
+            })?;
+            // Include every checked helper and dictionary in the ordinary
+            // admission stream. Module export/replay must see the whole command.
+            batch.admissions.extend(successor.admissions);
+            batch.engine = successor.engine;
+            batch.result_logical_root = batch.engine.logical_root(options);
+        }
+        Ok(Outcome::Complete(batch))
     }
 }
 

@@ -14,6 +14,7 @@ mod cdot;
 mod codegen;
 mod coercions;
 mod collections;
+pub mod deriving;
 mod do_notation;
 mod dotted_ident;
 pub use dotted_ident::DottedIdentError;
@@ -59,6 +60,7 @@ pub enum SourceInferenceError {
     Recursion(recursion::RecursionError),
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
+    Deriving(deriving::DerivingError),
     UnknownConstant(Name),
     /// More than one interpretation of an overloaded identifier elaborates against
     /// the expected type (the pin's `elabAppAux`), listed in the order it tries them.
@@ -246,6 +248,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
+            Self::Deriving(error) => write!(f, "{error}"),
             // The pin's two wordings for `lean.unknownIdentifier`, verbatim.
             Self::UnknownConstant(name) => {
                 write!(f, "Unknown identifier `{}`", name.to_display_string())

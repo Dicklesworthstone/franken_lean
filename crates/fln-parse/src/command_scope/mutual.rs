@@ -164,11 +164,8 @@ mod tests {
         let error = parse(source.as_bytes()).unwrap_err();
         assert_eq!(error.primary_offset().unwrap().0, source.find(']').unwrap());
         let source =
-            "mutual\r\ninductive A where | mk\r\ninductive B where | bad deriving Nat\r\nend";
+            "mutual\r\ninductive A where | mk\r\ninductive B where | bad deriving , Nat\r\nend";
         let error = parse(source.as_bytes()).unwrap_err();
-        assert_eq!(
-            error.primary_offset().unwrap().0,
-            source.find("deriving").unwrap()
-        );
+        assert_eq!(error.primary_offset().unwrap().0, source.find(',').unwrap());
     }
 }

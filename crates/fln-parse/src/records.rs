@@ -1,7 +1,7 @@
 //! Bounded record/class declarations using the ordinary token leaves and types.
 //! No source rewriting or fabricated definitions: field scopes survive as syntax.
 //! Parent clauses retain their original type syntax and optional projection names.
-//! Custom constructors and deriving remain explicit refusals.
+//! Deriving clauses retain their handlers; custom constructors remain refused.
 use super::*;
 use std::ops::Range;
 
@@ -13,6 +13,59 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], index: usize) -> NatDefiniti
 }
 fn symbol(tokens: &[LexedToken], index: usize, text: &str) -> bool {
     matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text)
+}
+
+/// The declaration parser consumes a deriving suffix without discarding its
+/// token leaves. Only a top-level keyword ends the constructor/field telescope.
+pub(super) fn deriving_start(tokens: &[LexedToken], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            match symbol.as_str() {
+                "deriving" if depth == 0 => return index,
+                "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
+                ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    tokens.len()
+}
+
+pub(super) fn deriving_suffix(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut suffix = Vec::new();
+    if start < tokens.len() {
+        if !symbol(tokens, start, "deriving") || start + 1 == tokens.len() {
+            return Err(refuse(view, tokens, start));
+        }
+        let mut classes = Vec::new();
+        for index in start + 1..tokens.len() {
+            if (index - start) % 2 == 1 {
+                if !matches!(&tokens[index].kind, TokenKind::Ident(_)) {
+                    return Err(refuse(view, tokens, index));
+                }
+                classes.push(Syntax::node(
+                    parser_kind(&["Command", "derivingClass"]),
+                    vec![null_node(Vec::new()), leaves.leaf(index)?],
+                ));
+            } else {
+                if !symbol(tokens, index, ",") || index + 1 == tokens.len() {
+                    return Err(refuse(view, tokens, index));
+                }
+                classes.push(leaves.leaf(index)?);
+            }
+        }
+        suffix = vec![leaves.leaf(start)?, null_node(classes)];
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Command", "optDeriving"]),
+        vec![null_node(suffix)],
+    ))
 }
 pub(super) fn modifiers() -> Syntax {
     Syntax::node(
@@ -251,13 +304,15 @@ pub(super) fn parse(
     }
     let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
+    let end_body = deriving_start(&tokens, cursor);
+    let body_tokens = &tokens[..end_body];
     let end_result = if symbol(&tokens, cursor, ":") {
-        type_end(&tokens, cursor, "where").min(type_end(&tokens, cursor, "extends"))
+        type_end(body_tokens, cursor, "where").min(type_end(body_tokens, cursor, "extends"))
     } else {
         cursor
     };
     let end_header = if symbol(&tokens, end_result, "extends") {
-        type_end(&tokens, end_result, "where")
+        type_end(body_tokens, end_result, "where")
     } else {
         end_result
     };
@@ -267,13 +322,13 @@ pub(super) fn parse(
         bounded_binder_syntax(&leaves, &view, &tokens, groups, DefinitionGrammar::Scalar)?;
     let result = optional_type(&leaves, &view, &tokens, cursor..end_result)?;
     let inheritance = parents(&leaves, &view, &tokens, end_result, end_header)?;
-    let body = if end_header == tokens.len() {
+    let body = if end_header == end_body {
         null_node(Vec::new())
     } else {
         if !symbol(&tokens, end_header, "where") {
             return Err(refuse(&view, &tokens, end_header));
         }
-        let fields = fields(&leaves, &view, &tokens, end_header + 1)?;
+        let fields = fields(&leaves, &view, body_tokens, end_header + 1)?;
         null_node(vec![
             leaves.leaf(end_header)?,
             null_node(Vec::new()),
@@ -303,10 +358,7 @@ pub(super) fn parse(
             ),
             inheritance,
             body,
-            Syntax::node(
-                parser_kind(&["Command", "optDeriving"]),
-                vec![null_node(Vec::new())],
-            ),
+            deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
     Ok(ParsedDefinition {
@@ -353,7 +405,7 @@ mod tests {
             "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
             "structure A where\n  x : Nat :=",
-            "structure A where\n  x : Nat\nderiving Inhabited",
+            "structure A where\n  x : Nat\nderiving",
             "structure A where\n  x Nat",
             "class A where\n  x : (Nat",
             "structure A where\n  mk ::",
@@ -370,6 +422,29 @@ mod tests {
             "structure Empty : Type where",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
+        }
+    }
+
+    #[test]
+    fn deriving_preserves_handlers_and_original_bytes() {
+        for text in [
+            "structure Point where\r\n  x : Nat\r\n  deriving Inhabited, Repr\r\n",
+            "structure Empty deriving Inhabited",
+            "structure Child extends Parent deriving Inhabited",
+        ] {
+            let parsed = parse_definition(text.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                text.replace("\r\n", "\n").as_bytes()
+            );
+        }
+        for text in [
+            "structure A deriving Inhabited,",
+            "structure A deriving Inhabited Repr",
+            "structure A deriving , Inhabited",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
     }
     #[test]
