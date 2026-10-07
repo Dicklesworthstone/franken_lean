@@ -154,7 +154,7 @@ fn declaration(
 }
 
 /// `instance … where fields` (`Command.whereStructInst`, `"where" structInstFields
-/// optDeriving`): one `structInstField` per field, `name binders := value`, delimited like
+/// optDeriving`): one `structInstField` per field, `name binders [: type] := value`, delimited like
 /// `where` declarations. The elaborator reads it as the structure instance `{ fields }`,
 /// with a field's binders abstracted over its value.
 pub(super) fn struct_instance(
@@ -170,46 +170,7 @@ pub(super) fn struct_instance(
         if index > 0 {
             fields.push(null_node(Vec::new()));
         }
-        // `name binder* := value`, binders bare names only.
-        let mut cursor = name + 1;
-        let mut binders = Vec::new();
-        while cursor < end
-            && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
-            && !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=")
-        {
-            binders.push(leaves.leaf(cursor)?);
-            cursor += 1;
-        }
-        if cursor >= end || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=") {
-            return Err(refuse(view, tokens, cursor.min(end)));
-        }
-        if cursor + 1 >= end {
-            return Err(refuse(view, tokens, end));
-        }
-        let value = bounded_term(
-            leaves,
-            view,
-            tokens,
-            cursor + 1..end,
-            DefinitionGrammar::Scalar,
-        )?;
-        fields.push(Syntax::node(
-            parser_kind(&["Term", "structInstField"]),
-            vec![
-                Syntax::node(
-                    parser_kind(&["Term", "structInstLVal"]),
-                    vec![leaves.leaf(name)?, null_node(Vec::new())],
-                ),
-                null_node(vec![
-                    null_node(binders),
-                    null_node(Vec::new()),
-                    Syntax::node(
-                        parser_kind(&["Term", "structInstFieldDef"]),
-                        vec![leaves.leaf(cursor)?, null_node(Vec::new()), value],
-                    ),
-                ]),
-            ],
-        ));
+        fields.push(struct_field(leaves, view, tokens, name, end)?);
     }
     Ok(Syntax::node(
         parser_kind(&["Command", "whereStructInst"]),
@@ -255,4 +216,159 @@ fn declaration_starts(
         }
     }
     Ok(starts)
+}
+
+/// Reuse the ordinary structure-field telescope grammar. Each annotation and
+/// body is parsed on the term parser's heap frames; this driver only locates
+/// the enclosing header delimiter within this field's indentation boundary.
+fn struct_field(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    name: usize,
+    end: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut cursor = name + 1;
+    let mut prefix = term_binders::Prefix::field(leaves, view, tokens, name, &mut cursor, end)?;
+    while !prefix.body() {
+        let start = cursor;
+        let mut depth = 0usize;
+        while cursor < end {
+            if depth == 0 && prefix.closes_header(tokens, cursor) {
+                break;
+            }
+            if opens(tokens, cursor) {
+                depth += 1;
+            } else if closes(tokens, cursor) {
+                if depth == 0 {
+                    return Err(refuse(view, tokens, cursor));
+                }
+                depth -= 1;
+            }
+            cursor += 1;
+        }
+        if cursor == start || cursor == end {
+            return Err(refuse(view, tokens, cursor));
+        }
+        let domain = bounded_term(
+            leaves,
+            view,
+            tokens,
+            start..cursor,
+            DefinitionGrammar::Scalar,
+        )?;
+        (prefix, cursor) = prefix.finish_header(leaves, view, tokens, cursor, domain, end)?;
+    }
+    if cursor >= end {
+        return Err(refuse(view, tokens, end));
+    }
+    let body = bounded_term(leaves, view, tokens, cursor..end, DefinitionGrammar::Scalar)?;
+    prefix.finish(leaves, body).map(|(field, _)| field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nodes<'a>(syntax: &'a Syntax, kind: &Name, output: &mut Vec<&'a [Syntax]>) {
+        if let Syntax::Node {
+            kind: actual, args, ..
+        } = syntax
+        {
+            if actual == kind {
+                output.push(args);
+            }
+            for arg in args {
+                nodes(arg, kind, output);
+            }
+        }
+    }
+
+    fn children(syntax: &Syntax) -> &[Syntax] {
+        let Syntax::Node { args, .. } = syntax else {
+            panic!("expected a syntax node");
+        };
+        args
+    }
+
+    #[test]
+    fn where_fields_preserve_wildcards_binder_groups_and_result_annotations() {
+        let source = "instance printer : Printer Nat where\r\n  -- parameter comments\r\n  reprPrec _ (prec : Nat) : Std.Format := Std.Format.text \"ok\"\r\n  apply {A : Type} ⦃B : Type⦄ [Inhabited A] [i : Inhabited B] (value : A) := value\r\n";
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace("\r\n", "\n").as_bytes()
+        );
+        let mut fields = Vec::new();
+        nodes(
+            parsed.syntax(),
+            &parser_kind(&["Term", "structInstField"]),
+            &mut fields,
+        );
+        assert_eq!(fields.len(), 2);
+        let first = children(&fields[0][1]);
+        let binders = children(&first[0]);
+        assert!(matches!(&binders[0], Syntax::Node { kind, args, .. }
+            if kind == &parser_kind(&["Term", "hole"]) && args.len() == 1));
+        assert!(matches!(&binders[1], Syntax::Node { kind, .. }
+            if kind == &parser_kind(&["Term", "explicitBinder"])));
+        let annotation = children(&first[1]);
+        assert!(matches!(&annotation[0], Syntax::Node { kind, args, .. }
+            if kind == &parser_kind(&["Term", "typeSpec"]) && args.len() == 2));
+        let second = children(&fields[1][1]);
+        let binders = children(&second[0]);
+        for (binder, expected) in binders.iter().zip([
+            "implicitBinder",
+            "strictImplicitBinder",
+            "instBinder",
+            "instBinder",
+            "explicitBinder",
+        ]) {
+            assert!(matches!(binder, Syntax::Node { kind, .. }
+                if kind == &parser_kind(&["Term", expected])));
+        }
+        assert_eq!(binders.len(), 5);
+        assert!(children(&second[1]).is_empty());
+    }
+
+    #[test]
+    fn where_field_annotations_keep_nested_typed_terms_inside_the_field() {
+        for source in [
+            "instance f : Factory where\n  make (f : (Nat → Nat)) (_ : Nat) : (Nat → Nat) := f",
+            "instance f : Factory where\n  make (x) {A} [i : Inhabited A] := x",
+            "instance f : Factory where\n  make (x : {A : Type} → A → A) := x\n  other _ : Nat := 1",
+            "instance f : Factory where\n  make [C (Nat → Nat)] := fun x => x",
+            "instance f : Factory where\n  make x : (let A := Nat; A) := x",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+        }
+    }
+
+    #[test]
+    fn malformed_where_field_headers_refuse_at_their_own_boundary() {
+        for source in [
+            "instance f : Factory where\n  make (x : Nat] := x",
+            "instance f : Factory where\n  make (x : ) := x",
+            "instance f : Factory where\n  make [C Nat := x",
+            "instance f : Factory where\n  make x : := x",
+            "instance f : Factory where\n  make x : Nat\n  other := 1",
+            "instance f : Factory where\n  make _ : Nat :=\n  other := 1",
+            "instance f : Factory where\n  make (x : Nat) : Nat",
+        ] {
+            assert!(
+                parse_definition(source.as_bytes()).is_err(),
+                "accepted {source}"
+            );
+        }
+        let source = "instance f : Factory where\r\n  make _ : Nat :=\r\n  other := 1";
+        let error = parse_definition(source.as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, NatDefinitionParseError::OutsideSeedGrammar { at, .. }
+            if at == BytePos(source.find("other").unwrap()))
+        );
+    }
 }

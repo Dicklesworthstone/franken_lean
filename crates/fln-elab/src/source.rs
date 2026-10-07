@@ -4059,8 +4059,8 @@ fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefiniti
 }
 
 /// `instance … where fields` (`Command.whereStructInst`) as the structure instance
-/// `{ fields }` it elaborates to; a field's binders (`area q := …`) become a `fun` over
-/// its value, as the pin's `structInstField` expansion does.
+/// `{ fields }` it elaborates to. The ordinary field expansion subsequently lowers
+/// method binders and result annotations, for both `where` and record literals.
 fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
     let parts = expect_node(
         syntax,
@@ -4086,54 +4086,13 @@ fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabErr
             rows.push(atom(","));
             continue;
         }
-        let field = expect_node(
+        expect_node(
             item,
             &parser_kind(&["Term", "structInstField"]),
             2,
             "instance field",
         )?;
-        let payload = expect_null_args(&field[1], "instance field payload")?;
-        let [binders, type_, definition] = payload else {
-            return Err(failure(SourceInferenceError::Scope));
-        };
-        expect_empty_null(type_, "instance field type")?;
-        let binders = expect_null_args(binders, "instance field binders")?;
-        let definition = if binders.is_empty() {
-            definition.clone()
-        } else {
-            let parts = expect_node(
-                definition,
-                &parser_kind(&["Term", "structInstFieldDef"]),
-                3,
-                "instance field definition",
-            )?;
-            let value = Syntax::node(
-                parser_kind(&["Term", "fun"]),
-                vec![
-                    atom("fun"),
-                    Syntax::node(
-                        parser_kind(&["Term", "basicFun"]),
-                        vec![
-                            null(binders.to_vec()),
-                            null(Vec::new()),
-                            atom("=>"),
-                            parts[2].clone(),
-                        ],
-                    ),
-                ],
-            );
-            Syntax::node(
-                parser_kind(&["Term", "structInstFieldDef"]),
-                vec![parts[0].clone(), parts[1].clone(), value],
-            )
-        };
-        rows.push(Syntax::node(
-            parser_kind(&["Term", "structInstField"]),
-            vec![
-                field[0].clone(),
-                null(vec![null(Vec::new()), null(Vec::new()), definition]),
-            ],
-        ));
+        rows.push(item.clone());
     }
     Ok(Syntax::node(
         parser_kind(&["Term", "structInst"]),

@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct Prefix {
     keyword: usize,
     lambda: bool,
+    record_field: bool,
     /// `∃ binders, body`: forall's binder grammar (the pin's explicitBinders are a
     /// sublanguage of it), built as the pin's `«term∃_,_»` node. The elaborator's
     /// expansion pass rewrites it to nested `Exists fun x => ...`, as the pin's macro.
@@ -90,6 +91,7 @@ impl Prefix {
         let mut prefix = Self {
             keyword,
             lambda: symbol(tokens, keyword, "fun") || symbol(tokens, keyword, "λ"),
+            record_field: false,
             exists: symbol(tokens, keyword, "∃"),
             dependent_arrow,
             binders: Vec::new(),
@@ -101,8 +103,35 @@ impl Prefix {
         Ok(prefix)
     }
 
+    /// A structure field uses the same heap phases as a telescope, with `:=`
+    /// ending its header. Its optional type annotates the result of the method.
+    pub(super) fn field(
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        name: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self {
+            keyword: name,
+            lambda: false,
+            record_field: true,
+            exists: false,
+            dependent_arrow: false,
+            binders: Vec::new(),
+            annotation: None,
+            separator: None,
+            phase: Phase::Body,
+        };
+        prefix.header(leaves, view, tokens, cursor, end)?;
+        Ok(prefix)
+    }
+
     fn separator(&self, tokens: &[LexedToken], at: usize) -> bool {
-        if self.dependent_arrow {
+        if self.record_field {
+            symbol(tokens, at, ":=")
+        } else if self.dependent_arrow {
             symbol(tokens, at, "->") || symbol(tokens, at, "→")
         } else if self.lambda {
             symbol(tokens, at, "=>") || symbol(tokens, at, "↦")
@@ -218,7 +247,7 @@ impl Prefix {
                 }
                 return Err(refuse(view, tokens, *cursor));
             }
-            if self.binders.is_empty() {
+            if self.binders.is_empty() && !self.record_field {
                 return Err(refuse(view, tokens, *cursor));
             }
             if symbol(tokens, *cursor, ":") {
@@ -366,7 +395,25 @@ impl Prefix {
             None => null_node(vec![]),
         };
         let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
-        let syntax = if self.dependent_arrow {
+        let syntax = if self.record_field {
+            Syntax::node(
+                parser_kind(&["Term", "structInstField"]),
+                vec![
+                    Syntax::node(
+                        parser_kind(&["Term", "structInstLVal"]),
+                        vec![leaves.leaf(self.keyword)?, null_node(Vec::new())],
+                    ),
+                    null_node(vec![
+                        null_node(self.binders),
+                        annotation,
+                        Syntax::node(
+                            parser_kind(&["Term", "structInstFieldDef"]),
+                            vec![separator, null_node(Vec::new()), body],
+                        ),
+                    ]),
+                ],
+            )
+        } else if self.dependent_arrow {
             Syntax::node(
                 parser_kind(&["Term", "depArrow"]),
                 vec![

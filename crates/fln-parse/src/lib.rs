@@ -1941,15 +1941,16 @@ fn bounded_term_frames(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
             {
-                let frame = record_terms::open(
+                record_terms::open(
+                    leaves,
                     view,
                     tokens,
+                    &mut frames,
                     index,
                     &mut cursor,
                     range.end,
                     updates.contains(&index),
                 )?;
-                frames.push(frame);
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar

@@ -104,7 +104,108 @@ pub(super) enum FieldReceiver<'a> {
     Elaborated(Typed, Name),
 }
 
+/// Field methods are syntax sugar for a checked lambda. A field's result
+/// annotation belongs inside that lambda, where its binders are in scope.
+pub(super) fn is_field_notation(syntax: &Syntax) -> bool {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return false;
+    };
+    if kind != &parser_kind(&["Term", "structInstField"]) {
+        return false;
+    }
+    let Some(Syntax::Node { args: payload, .. }) = args.get(1) else {
+        return false;
+    };
+    payload
+        .iter()
+        .take(2)
+        .any(|syntax| matches!(syntax, Syntax::Node { args, .. } if !args.is_empty()))
+}
+
+fn owned_args(mut syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    match &mut syntax {
+        Syntax::Node { args, .. } => Ok(std::mem::take(args)),
+        _ => Err(failure(SourceInferenceError::Scope)),
+    }
+}
+
 impl Context {
+    /// Part of the ordinary inside-out source expansion. Moving the field body
+    /// preserves heap-bounded traversal even when methods contain other records.
+    pub(super) fn expand_record_field_node(
+        &mut self,
+        mut syntax: Syntax,
+        pattern: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if pattern || !is_field_notation(&syntax) {
+            return Ok(syntax);
+        }
+        self.tick()?;
+        let field = expect_node(
+            &syntax,
+            &parser_kind(&["Term", "structInstField"]),
+            2,
+            "record field",
+        )?;
+        let [binders, annotation, definition] = expect_null_args(&field[1], "field value")? else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_null_args(binders, "field method binders")?;
+        optional_type_syntax(annotation)?;
+        let definition = expect_node(
+            definition,
+            &parser_kind(&["Term", "structInstFieldDef"]),
+            3,
+            "field assignment",
+        )?;
+        expect_atom(&definition[0], ":=", "field assignment token")?;
+        expect_empty_null(&definition[1], "unsupported private field value")?;
+
+        let Syntax::Node { args: field, .. } = &mut syntax else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+        let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+        let payload = std::mem::replace(&mut field[1], null(Vec::new()));
+        let [binders, annotation, mut definition]: [Syntax; 3] = owned_args(payload)?
+            .try_into()
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let binders = owned_args(binders)?;
+        let annotation = owned_args(annotation)?.into_iter().next();
+        let Syntax::Node {
+            args: definition_args,
+            ..
+        } = &mut definition
+        else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut value = std::mem::replace(&mut definition_args[2], null(Vec::new()));
+        if let Some(annotation) = annotation {
+            let [colon, type_]: [Syntax; 2] = owned_args(annotation)?
+                .try_into()
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            value = Syntax::node(
+                parser_kind(&["Term", "typeAscription"]),
+                vec![atom("("), value, colon, null(vec![type_]), atom(")")],
+            );
+        }
+        if !binders.is_empty() {
+            value = Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![
+                    atom("fun"),
+                    Syntax::node(
+                        parser_kind(&["Term", "basicFun"]),
+                        vec![null(binders), null(Vec::new()), atom("=>"), value],
+                    ),
+                ],
+            );
+        }
+        definition_args[2] = value;
+        field[1] = null(vec![null(Vec::new()), null(Vec::new()), definition]);
+        Ok(syntax)
+    }
+
     pub(super) fn field_application_receiver<'a>(
         &mut self,
         syntax: &'a Syntax,

@@ -5,11 +5,15 @@ use super::*;
 pub(super) struct RecordFrame {
     open: usize,
     rows: Vec<Syntax>,
-    field: Option<(usize, Option<usize>)>,
+    field: Option<Field>,
     colon: Option<usize>,
     sources: Vec<Syntax>,
     source_mode: bool,
     with_token: Option<usize>,
+}
+enum Field {
+    Abbreviation(usize),
+    Definition,
 }
 fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
@@ -32,28 +36,42 @@ fn frame(record: RecordFrame) -> BoundedTermFrame {
         operators: Vec::new(),
     }
 }
-fn prefix(
+fn push_field(
+    mut record: RecordFrame,
+    frames: &mut Vec<BoundedTermFrame>,
+    leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     cursor: &mut usize,
     end: usize,
-) -> Result<Option<(usize, Option<usize>)>, NatDefinitionParseError> {
-    if *cursor < end && (symbol(tokens, *cursor, "}") || symbol(tokens, *cursor, ":")) {
-        return Ok(None);
+) -> Result<(), NatDefinitionParseError> {
+    if record.source_mode
+        || (*cursor < end && (symbol(tokens, *cursor, "}") || symbol(tokens, *cursor, ":")))
+    {
+        frames.push(frame(record));
+        return Ok(());
     }
     let name = *cursor;
     if name >= end || !matches!(tokens[name].kind, TokenKind::Ident(_)) {
         return Err(refuse(view, tokens, name));
     }
     *cursor += 1;
-    let assignment = if *cursor < end && symbol(tokens, *cursor, ":=") {
-        let assignment = *cursor;
-        *cursor += 1;
-        Some(assignment)
+    if *cursor < end
+        && (symbol(tokens, *cursor, ",")
+            || symbol(tokens, *cursor, "}")
+            || symbol(tokens, *cursor, ":"))
+    {
+        // A colon after a field abbreviation is the enclosing record's type,
+        // as in `{ value : Box Nat }`.
+        record.field = Some(Field::Abbreviation(name));
+        frames.push(frame(record));
     } else {
-        None
-    };
-    Ok(Some((name, assignment)))
+        let prefix = term_binders::Prefix::field(leaves, view, tokens, name, cursor, end)?;
+        record.field = Some(Field::Definition);
+        frames.push(frame(record));
+        frames.push(term_binders::frame(prefix));
+    }
+    Ok(())
 }
 /// Classify update openers in one pass. A field assignment ends the ambiguous
 /// prefix, and nested parentheses/braces cannot lend their `with` to a parent.
@@ -91,27 +109,27 @@ pub(super) fn update_openers(
     updates
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn open(
+    leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
+    frames: &mut Vec<BoundedTermFrame>,
     open: usize,
     cursor: &mut usize,
     end: usize,
     source_mode: bool,
-) -> Result<BoundedTermFrame, NatDefinitionParseError> {
-    Ok(frame(RecordFrame {
+) -> Result<(), NatDefinitionParseError> {
+    let record = RecordFrame {
         open,
         rows: Vec::new(),
-        field: if source_mode {
-            None
-        } else {
-            prefix(view, tokens, cursor, end)?
-        },
+        field: None,
         colon: None,
         sources: Vec::new(),
         source_mode,
         with_token: None,
-    }))
+    };
+    push_field(record, frames, leaves, view, tokens, cursor, end)
 }
 
 pub(super) fn delimiter(
@@ -141,9 +159,8 @@ pub(super) fn delimiter(
         } else {
             record.source_mode = false;
             record.with_token = Some(at);
-            record.field = prefix(view, tokens, cursor, end)?;
         }
-        frames.push(frame(record));
+        push_field(record, frames, leaves, view, tokens, cursor, end)?;
         return Ok(());
     }
     if symbol(tokens, at, "with") {
@@ -156,36 +173,36 @@ pub(super) fn delimiter(
         }
         let type_ = finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
         annotation = null_node(vec![leaves.leaf(colon)?, type_]);
-    } else if let Some((name, assignment)) = record.field.take() {
-        let payload = if let Some(assignment) = assignment {
-            let value = finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
-            null_node(vec![
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-                Syntax::node(
-                    parser_kind(&["Term", "structInstFieldDef"]),
-                    vec![leaves.leaf(assignment)?, null_node(Vec::new()), value],
-                ),
-            ])
-        } else {
-            if !current.application.is_empty()
-                || !current.operands.is_empty()
-                || !current.operators.is_empty()
-            {
-                return Err(refuse(view, tokens, at));
+    } else if let Some(field) = record.field.take() {
+        let syntax = match field {
+            Field::Definition => {
+                let field =
+                    finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
+                if field.kind() != Some(&parser_kind(&["Term", "structInstField"])) {
+                    return Err(refuse(view, tokens, at));
+                }
+                field
             }
-            null_node(Vec::new())
-        };
-        record.rows.push(Syntax::node(
-            parser_kind(&["Term", "structInstField"]),
-            vec![
+            Field::Abbreviation(name) => {
+                if !current.application.is_empty()
+                    || !current.operands.is_empty()
+                    || !current.operators.is_empty()
+                {
+                    return Err(refuse(view, tokens, at));
+                }
                 Syntax::node(
-                    parser_kind(&["Term", "structInstLVal"]),
-                    vec![leaves.leaf(name)?, null_node(Vec::new())],
-                ),
-                payload,
-            ],
-        ));
+                    parser_kind(&["Term", "structInstField"]),
+                    vec![
+                        Syntax::node(
+                            parser_kind(&["Term", "structInstLVal"]),
+                            vec![leaves.leaf(name)?, null_node(Vec::new())],
+                        ),
+                        null_node(Vec::new()),
+                    ],
+                )
+            }
+        };
+        record.rows.push(syntax);
     } else if !current.application.is_empty()
         || !current.operands.is_empty()
         || !current.operators.is_empty()
@@ -202,8 +219,7 @@ pub(super) fn delimiter(
             return Err(refuse(view, tokens, at));
         }
         record.rows.push(leaves.leaf(at)?);
-        record.field = prefix(view, tokens, cursor, end)?;
-        frames.push(frame(record));
+        push_field(record, frames, leaves, view, tokens, cursor, end)?;
     } else if symbol(tokens, at, ":") {
         record.colon = Some(at);
         frames.push(frame(record));
@@ -252,6 +268,12 @@ mod tests {
             "def x := ({ value := 7 } : Box Nat).value",
             "def x := (make 3).inner.value -- projection\r\n",
             "def x (p : Point) : Nat := p.chaînes",
+            "def x : Printer := { reprPrec _ _ := \"text\" }",
+            "def x : Methods := { f (x y : Nat) : Nat := x + y, identity {A : Type} (x : A) : A := x }",
+            "def x : Selector := { select {A : Type} [d : Chosen A] : A := @Chosen.value A d }",
+            "def x : Factory := { make (x : Nat) : Box := { value := x } }",
+            "def x (value : Nat) := { value : Box Nat }",
+            "def x := { prior with f x _ := x, g (n : Nat) := n + 1 }",
         ] {
             let parsed = parse_definition(text.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), text.as_bytes());
@@ -261,6 +283,25 @@ mod tests {
             );
             assert!(parse_nat_definition(text.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn nested_field_methods_keep_annotations_and_bodies_on_heap_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let text = format!(
+                    "def nested := {}0{}",
+                    "{ make (x : Nat) := ".repeat(6000),
+                    " }".repeat(6000)
+                );
+                let parsed = parse_definition(text.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), text.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
     #[test]
     fn update_sources_roundtrip_without_recursive_lookahead() {
