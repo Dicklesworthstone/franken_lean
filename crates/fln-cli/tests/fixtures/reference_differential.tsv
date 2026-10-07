@@ -94,7 +94,7 @@ examples/native_pattern_matrices.lean	reject	accept	n/a	fln-defect	Reference 28:
 examples/native_proof_data.lean	accept	accept	match	agree	
 examples/native_proof_erasure.lean	accept	accept	match	agree	
 examples/native_proof_indices.lean	accept	accept	match	agree	
-examples/native_proposition_conditionals.lean	reject	reject	n/a	agree	Reference 14: failed to synthesize instance of type class | FrankenLean: command 5, native instance search could not resolve all instance arguments
+examples/native_proposition_conditionals.lean	accept	accept	match	agree	valid Lean since its Carrier value is written at the unfolded type (`(23 : Nat)`): a bare numeral at the plain `def Carrier` has no OfNat instance at the pin ("failed to synthesize"), and the old form is a negative fixture in crates/fln/tests/source_conditionals.rs
 examples/native_propositional_logic.lean	accept	accept	match	agree	
 examples/native_propositions.lean	accept	accept	match	agree	
 examples/native_quotient_runtime.lean	accept	accept	match	agree	
