@@ -163,7 +163,7 @@ pub use fln_verdict::{
     BvDecideInternalFault, BvDecideLimits, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry,
     BvExpr, BvShiftOp, BvUnaryOp, UnsupportedBvOp,
 };
-use fln_vm::interpreter::CommandExecutionContext;
+use fln_vm::interpreter::{CommandExecutionContext, ExecutionCacheContext, InlineCaches};
 pub use fln_vm::interpreter::{
     ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit, nat_decimal,
     value_kind as vm_value_kind,
@@ -7958,7 +7958,12 @@ impl Engine {
             .map_err(EngineExecutionError::Codec)?;
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
-        let exit = match execute_golem_with_options(&executable, options, limits.vm) {
+        let cache_context = ExecutionCacheContext::new(
+            ContentRoot::new(admission.base_logical_root.0.0),
+            source_run_build_profile().0,
+            self.mode,
+        );
+        let exit = match execute_golem_cached(&executable, options, limits.vm, cache_context) {
             Outcome::Complete(exit) => exit,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -7996,6 +8001,40 @@ pub fn execute_golem_with_options(
         limits,
         CommandExecutionContext::from_options(options),
         None,
+    )
+}
+
+/// Dispatch-cache slots for one engine-compiled program run.
+///
+/// The cache is direct-mapped by call site and holds only immutable validation
+/// metadata, so this bounds its memory, not what can execute.
+const ENGINE_INLINE_CACHE_SLOTS: usize = 4096;
+
+/// Execute an engine-compiled program through Golem's inline caches.
+///
+/// [`execute_golem_with_options`] is the uncached semantic path. Without a
+/// cache every intrinsic call scans the whole generated extern census for its
+/// row and parses that row's ownership contract again; the cache resolves each
+/// call site once. The cache lives for this one run and is keyed by the
+/// program, the environment it was admitted in, the build profile and the mode,
+/// so it can only change how fast the VM answers, never what it answers. If
+/// the cache cannot be allocated the run proceeds uncached.
+fn execute_golem_cached(
+    executable: &ValidatedProgram,
+    options: &KVMap,
+    limits: VmExecutionLimits,
+    cache_context: ExecutionCacheContext,
+) -> Outcome<VmExit> {
+    let Ok(mut caches) = InlineCaches::try_new(ENGINE_INLINE_CACHE_SLOTS) else {
+        return execute_golem_with_options(executable, options, limits);
+    };
+    fln_vm::interpreter::execute_cached_with_context(
+        executable,
+        limits,
+        CommandExecutionContext::from_options(options),
+        None,
+        cache_context,
+        &mut caches,
     )
 }
 
@@ -9952,6 +9991,19 @@ impl EngineExecutionLimits {
             flbc_codec: CodecLimits::default(),
             vm: VmExecutionLimits::default(),
             source_modules: SourceModuleLimits::default(),
+        }
+    }
+
+    /// The limits a front door applies to a user's own program.
+    ///
+    /// Identical to [`EngineExecutionLimits::new`] except for the VM, which
+    /// takes [`VmExecutionLimits::user_program`]: no instruction ceiling and a
+    /// frame ceiling sized for real recursion. `new` keeps the small probe
+    /// budget that internal checks and tests rely on.
+    pub fn for_user_program(kernel: Budget) -> Self {
+        Self {
+            vm: VmExecutionLimits::user_program(),
+            ..Self::new(kernel)
         }
     }
 

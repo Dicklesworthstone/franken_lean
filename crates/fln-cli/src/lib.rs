@@ -2334,6 +2334,9 @@ fn execute_flbc_bytes_with_sidecar(
 ) -> MultiplexerOutput {
     let mut limits = fln::FlbcExecutionLimits::default();
     limits.codec.max_artifact_bytes = max_bytes;
+    // A replayed artifact is the same user program `fln run` executed, so it
+    // gets the same VM budget; otherwise a run could emit what replay refuses.
+    limits.vm = fln::VmExecutionLimits::user_program();
     let outcome = match fln::execute_flbc_artifact(bytes, &fln::KVMap::new(), limits) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -10345,42 +10348,50 @@ fn why_trusts(
 
 fn render_why_trusts(report: &WhyTrustsReport, json: bool) -> MultiplexerOutput {
     if json {
-        return MultiplexerOutput::success(format!(
-            concat!(
-                "{{\"schema\":{},\"target\":{},\"module\":{},\"kind\":{},",
-                "\"axioms\":[{}],\"visited\":{},",
-                "\"unresolvedTotal\":{},\"unresolvedSample\":[{}],",
-                "\"truncated\":{}}}\n"
+        return why_trusts_output(
+            report,
+            format!(
+                concat!(
+                    "{{\"schema\":{},\"target\":{},\"module\":{},\"kind\":{},",
+                    "\"axioms\":[{}],\"visited\":{},",
+                    "\"unresolvedTotal\":{},\"unresolvedSample\":[{}],",
+                    "\"truncated\":{}}}\n"
+                ),
+                json_string(WHY_TRUSTS_SCHEMA),
+                json_string(&report.target),
+                json_string(&report.module),
+                json_string(report.kind),
+                report
+                    .axioms
+                    .iter()
+                    .map(|axiom| json_string(axiom))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.visited,
+                report.unresolved_total,
+                report
+                    .unresolved_sample
+                    .iter()
+                    .map(|name| json_string(name))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.truncated,
             ),
-            json_string(WHY_TRUSTS_SCHEMA),
-            json_string(&report.target),
-            json_string(&report.module),
-            json_string(report.kind),
-            report
-                .axioms
-                .iter()
-                .map(|axiom| json_string(axiom))
-                .collect::<Vec<_>>()
-                .join(","),
-            report.visited,
-            report.unresolved_total,
-            report
-                .unresolved_sample
-                .iter()
-                .map(|name| json_string(name))
-                .collect::<Vec<_>>()
-                .join(","),
-            report.truncated,
-        ));
+        );
     }
     let mut stdout = format!(
         concat!("why-trusts: {}\n", "module: {}\n", "kind: {}\n",),
         report.target, report.module, report.kind,
     );
-    if report.axioms.is_empty() {
-        stdout.push_str("axioms: none\n");
+    let axioms_label = if report.truncated {
+        "axioms (partial)"
     } else {
-        stdout.push_str(&format!("axioms: {}\n", report.axioms.join(", ")));
+        "axioms"
+    };
+    if report.axioms.is_empty() {
+        stdout.push_str(&format!("{axioms_label}: none\n"));
+    } else {
+        stdout.push_str(&format!("{axioms_label}: {}\n", report.axioms.join(", ")));
     }
     stdout.push_str(&format!(
         "reachable constants: {}{}\n",
@@ -10398,7 +10409,25 @@ fn render_why_trusts(report: &WhyTrustsReport, json: bool) -> MultiplexerOutput 
     stdout.push_str(
         "scope: decoded types and definition/theorem/opaque bodies; recursor rules, instance selections, and rewrite provenance are not traversed\n",
     );
-    MultiplexerOutput::success(stdout)
+    why_trusts_output(report, stdout)
+}
+
+/// A walk that stopped at `--max-nodes` has not seen the whole closure, so its
+/// axiom list is a lower bound. The report is still printed, but the exit is
+/// the inconclusive one: "axioms: none" from a partial walk is not an answer
+/// (bead `fln-front-door-residuals-0f6x`).
+fn why_trusts_output(report: &WhyTrustsReport, stdout: String) -> MultiplexerOutput {
+    if !report.truncated {
+        return MultiplexerOutput::success(stdout);
+    }
+    MultiplexerOutput {
+        stdout,
+        stderr: format!(
+            "fln why-trusts: inconclusive: the walk stopped at --max-nodes after {} constants; the axiom list is partial\n",
+            report.visited
+        ),
+        exit_code: 3,
+    }
 }
 
 // ---- check-olean run receipts -------------------------------------------
@@ -11563,7 +11592,8 @@ where
         }
     };
     let options = fln::KVMap::new();
-    let limits = fln::EngineExecutionLimits::new(kernel_budget);
+    // A user's program, not a probe: no instruction ceiling, real recursion depth.
+    let limits = fln::EngineExecutionLimits::for_user_program(kernel_budget);
     if matches!(presentation, SourcePresentation::Lean)
         && module_plan.is_none()
         && source_refs.len() == 1
@@ -13284,6 +13314,86 @@ fn run_build_explain(
     lake_build::explain(dir, target, json)
 }
 
+/// The pinned CLI census (`scripts/extract/gen_cli_lake_census.py`), embedded so
+/// the option set below is read from the extraction and never listed by hand.
+const CLI_LAKE_CENSUS: &str = include_str!("../../../contracts/CLI_LAKE_INVENTORY.txt");
+
+/// Every option spelling the pinned `lake` defines (`--wfail`, `-K`, …), with
+/// whether the pin requires it to carry a value.
+fn lake_pinned_options() -> &'static BTreeMap<&'static str, bool> {
+    static OPTIONS: std::sync::OnceLock<BTreeMap<&'static str, bool>> = std::sync::OnceLock::new();
+    OPTIONS.get_or_init(|| {
+        CLI_LAKE_CENSUS
+            .lines()
+            .filter(|line| line.starts_with("surface key=option:lake:"))
+            .filter_map(|line| {
+                let field = |name: &str| line.split(' ').find_map(|field| field.strip_prefix(name));
+                Some((field("spelling=")?, field("argument=")? == "required"))
+            })
+            .collect()
+    })
+}
+
+/// The pinned spelling an argument uses: a long option's name up to any `=`,
+/// or a short option's first flag letter. The flag says whether a value is
+/// already attached (`--dir=x`, `-Kk=v`).
+fn lake_option_spelling(argument: &str) -> (&str, bool) {
+    if let Some(long) = argument.strip_prefix("--") {
+        let name_len = long.find('=').unwrap_or(long.len());
+        return (&argument[..2 + name_len], name_len < long.len());
+    }
+    let end = argument
+        .char_indices()
+        .nth(2)
+        .map_or(argument.len(), |(index, _)| index);
+    (&argument[..end], end < argument.len())
+}
+
+/// The pin's refusal for a `lake` option it does not define, in its words, or
+/// `None` when the pin defines the option (whether or not this build acts on it).
+///
+/// A long option is judged by its name up to any `=`; a short one by its first
+/// flag letter. This used to answer only the CLI census's own probe string and
+/// accept every other unknown option (bead `fln-front-door-residuals-0f6x`).
+fn lake_unknown_option(argument: &str) -> Option<String> {
+    if argument == "-" || !argument.starts_with('-') {
+        return None;
+    }
+    let (name, _) = lake_option_spelling(argument);
+    if lake_pinned_options().contains_key(name) {
+        return None;
+    }
+    let kind = if argument.starts_with("--") {
+        "long"
+    } else {
+        "short"
+    };
+    Some(format!("error: unknown {kind} option '{name}'\n"))
+}
+
+/// Whether the pin makes this option take the next argument as its value.
+fn lake_option_takes_next_argument(argument: &str) -> bool {
+    let (name, attached) = lake_option_spelling(argument);
+    !attached && lake_pinned_options().get(name).copied().unwrap_or(false)
+}
+
+/// A `lake` command the pin has and this build does not: the typed
+/// not-implemented exit, never a message that blames the user's workspace.
+fn lake_not_implemented(command: &str, what: &str, json: bool) -> MultiplexerOutput {
+    let stderr = if json {
+        format!(
+            "{{\"schema\":{},\"command\":{},\"status\":\"not_implemented\",\"description\":{},\"exit_code\":{}}}\n",
+            json_string(CAPABILITY_NOTICE_SCHEMA),
+            json_string(&format!("lake {command}")),
+            json_string(what),
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        )
+    } else {
+        format!("lake {command}: not implemented: {what}\n")
+    };
+    MultiplexerOutput::failure(stderr, CAPABILITY_NOT_IMPLEMENTED_EXIT)
+}
+
 fn lake_operation_failure(
     schema: &str,
     detail: &str,
@@ -13448,15 +13558,11 @@ pub fn run_leanc(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOu
             return MultiplexerOutput::success(leanc_ldflags(&paths.prefix));
         }
     }
-    for arg in &arguments {
-        let s = arg.to_string_lossy();
-        if s.starts_with("--fln-census-unknown") || s.starts_with("--unknown") {
-            return MultiplexerOutput::failure(
-                format!("leanc: unrecognized command-line option '{s}'\n"),
-                1,
-            );
-        }
-    }
+    // Every other argument belongs to the C compiler, as at the pin, whose
+    // `leanc` hands its arguments to its bundled clang: an option the compiler
+    // does not know is the compiler's refusal, in the compiler's words. This
+    // used to answer the CLI census's own probe string itself and forward every
+    // other unknown option (bead `fln-front-door-residuals-0f6x`).
     let cc = std::env::var("LEAN_CC").unwrap_or_else(|_| "cc".to_owned());
     match std::process::Command::new(&cc).args(&arguments).output() {
         Ok(output) => MultiplexerOutput {
@@ -13742,8 +13848,8 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             dir = Some(PathBuf::from(rest));
             continue;
         }
-        if s.starts_with("--fln-census-unknown") || s.starts_with("--unknown") {
-            return MultiplexerOutput::failure(format!("error: unknown option '{s}'\n"), 1);
+        if let Some(refusal) = lake_unknown_option(&s) {
+            return MultiplexerOutput::failure(refusal, 1);
         }
         if s.starts_with('-') {
             if command.as_deref() == Some("build") {
@@ -13753,6 +13859,11 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                     true,
                     is_json,
                 );
+            }
+            // An option the pin defines and this build does not act on. If
+            // the pin gives it a value, that value is not a command.
+            if lake_option_takes_next_argument(&s) {
+                iter.next();
             }
             ignored_options.push(s.into_owned());
             continue;
@@ -13935,6 +14046,12 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                         MultiplexerOutput::success(String::new())
                     }
                 }
+                // Resolving a requirement means fetching it. Nothing here does,
+                // so nothing is written and the answer is "not implemented",
+                // never a manifest that claims a resolution.
+                Err(err @ fln_lake::LakeUpdateError::DependencyResolutionUnavailable { .. }) => {
+                    lake_not_implemented("update", &err.to_string(), is_json)
+                }
                 Err(err) => {
                     if is_json {
                         MultiplexerOutput::failure(
@@ -14077,9 +14194,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 ),
             }
         }
-        "query" | "test" | "lint" | "lean" => MultiplexerOutput::failure(
-            format!("lake {cmd}: requires Lake workspace configuration (plan §13.3)\n"),
-            1,
+        "query" | "test" | "lint" | "lean" => lake_not_implemented(
+            &cmd,
+            "this command needs Lake workspace evaluation (plan §13.3), which this build does not have",
+            is_json,
         ),
         unknown => MultiplexerOutput::failure(format!("error: unknown command '{unknown}'\n"), 1),
     }

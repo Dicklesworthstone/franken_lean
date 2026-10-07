@@ -87,6 +87,36 @@ impl Default for ExecutionLimits {
     }
 }
 
+impl ExecutionLimits {
+    /// Frame ceiling for [`ExecutionLimits::user_program`].
+    ///
+    /// Golem's frames live on the heap, so this is a memory bound, not a host
+    /// stack bound. It is set where the pinned Reference still answers: its
+    /// interpreter evaluates a non-tail recursion one million calls deep.
+    pub const USER_PROGRAM_MAX_STACK_DEPTH: u64 = 4_000_000;
+
+    /// The limits a front door applies to a user's own program (`lean FILE`,
+    /// `fln run`).
+    ///
+    /// [`ExecutionLimits::default`] is a probe budget: one million instructions
+    /// and a thousand frames, sized for internal checks and tests. Applied to a
+    /// user's program it turned a ten-thousand-iteration loop into a typed
+    /// non-answer the Reference never gives (bead
+    /// `fln-golem-ordinary-loops-fbj6`). The Reference puts no instruction
+    /// ceiling on `#eval` or on a compiled program, so this profile has none
+    /// either: a program that does not terminate runs until it is interrupted,
+    /// as it does there. Recursion keeps a ceiling, because a frame is memory;
+    /// reaching it is still a typed [`Inconclusive`], never a host overflow.
+    #[must_use]
+    pub const fn user_program() -> Self {
+        Self {
+            max_steps: u64::MAX,
+            max_stack_depth: Self::USER_PROGRAM_MAX_STACK_DEPTH,
+            max_nat_magnitude_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
 /// The Reference `maxHeartbeats` option for one command, in its public
 /// thousand-heartbeat units.
 ///
@@ -1638,6 +1668,21 @@ where
     }
 }
 
+/// Where the interpreter is, for a diagnostic. It is formatted only when a
+/// message is built: the dispatch loop used to allocate this string for every
+/// instruction it executed (bead `fln-golem-ordinary-loops-fbj6`).
+#[derive(Clone, Copy)]
+struct StepLocation {
+    function: FunctionId,
+    pc: usize,
+}
+
+impl fmt::Display for StepLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "function {} pc {}", self.function.get(), self.pc)
+    }
+}
+
 struct Frame {
     function: FunctionId,
     pc: usize,
@@ -1993,7 +2038,10 @@ fn run(
             function: frame.function,
             pc: frame.pc,
         };
-        let location = format!("function {} pc {}", frame.function.get(), frame.pc);
+        let location = StepLocation {
+            function: frame.function,
+            pc: frame.pc,
+        };
 
         let dynamic_check_system_module =
             if let Instruction::CheckSystemValue { module_name } = &instruction {
@@ -2014,10 +2062,12 @@ fn run(
             )),
             _ => None,
         };
-        let poll_location = check_system_location.as_deref().unwrap_or(&location);
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            let poll_location = check_system_location
+                .clone()
+                .unwrap_or_else(|| location.to_string());
             return Err(Stop::Inconclusive(
-                Inconclusive::cancelled(poll_location).with_progress(poll_location),
+                Inconclusive::cancelled(&poll_location).with_progress(&poll_location),
             ));
         }
         if let Some(check_location) = check_system_location.as_deref()
@@ -2035,7 +2085,7 @@ fn run(
             return Err(execution_steps_exhausted(
                 limits.max_steps,
                 observed_steps,
-                &location,
+                &location.to_string(),
             ));
         }
         steps = observed_steps;
@@ -2064,7 +2114,11 @@ fn run(
                         .saturating_mul(8),
                 );
                 if observed > allowed {
-                    return Err(nat_magnitude_exhausted(allowed, observed, &location));
+                    return Err(nat_magnitude_exhausted(
+                        allowed,
+                        observed,
+                        &location.to_string(),
+                    ));
                 }
                 set_register(
                     current_frame_mut(&mut stack)?,
@@ -2323,7 +2377,7 @@ fn run(
                                         result_ownership,
                                     },
                                     limits.max_stack_depth,
-                                    &location,
+                                    location,
                                 )?;
                                 peak_stack_depth = peak_stack_depth.max(next_depth);
                             }
@@ -2405,7 +2459,7 @@ fn run(
                                     result_ownership,
                                 },
                                 limits.max_stack_depth,
-                                &location,
+                                location,
                             )?;
                             peak_stack_depth = peak_stack_depth.max(next_depth);
                         }
@@ -2444,7 +2498,11 @@ fn run(
                             });
                         }
                         Err(IntrinsicFailure::NatMagnitudeLimit { allowed, observed }) => {
-                            return Err(nat_magnitude_exhausted(allowed, observed, &location));
+                            return Err(nat_magnitude_exhausted(
+                                allowed,
+                                observed,
+                                &location.to_string(),
+                            ));
                         }
                     }
                 }
@@ -2498,7 +2556,7 @@ fn run(
                     values,
                     ReturnTo::Store(dst),
                     limits.max_stack_depth,
-                    &location,
+                    location,
                 )?;
                 peak_stack_depth = peak_stack_depth.max(next_depth);
             }
@@ -2617,7 +2675,7 @@ fn run(
                             args,
                             return_to,
                             limits.max_stack_depth,
-                            &location,
+                            location,
                         )?;
                         peak_stack_depth = peak_stack_depth.max(next_depth);
                     }
@@ -2775,7 +2833,7 @@ fn run(
                                             args,
                                             return_to,
                                             limits.max_stack_depth,
-                                            &location,
+                                            location,
                                         )?;
                                         peak_stack_depth = peak_stack_depth.max(next_depth);
                                     }
@@ -3163,7 +3221,7 @@ fn push_call(
     args: Vec<Obj>,
     return_to: ReturnTo,
     max_stack_depth: u64,
-    location: &str,
+    location: StepLocation,
 ) -> Result<u64, Stop> {
     let next_len = stack.len().checked_add(1).ok_or_else(|| {
         Stop::InternalFault(InternalFault::new(
@@ -3178,7 +3236,11 @@ fn push_call(
         ))
     })?;
     if next_depth > max_stack_depth {
-        return Err(stack_exhausted(max_stack_depth, next_depth, location));
+        return Err(stack_exhausted(
+            max_stack_depth,
+            next_depth,
+            &location.to_string(),
+        ));
     }
     let callee = program.function(function).ok_or_else(|| {
         Stop::InternalFault(InternalFault::new(

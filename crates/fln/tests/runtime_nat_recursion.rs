@@ -217,3 +217,102 @@ fn repeated_compilation_is_deterministic_and_retains_the_original_checked_terms(
         assert_eq!(one.declaration, two.declaration);
     }
 }
+
+/// Bead `fln-golem-ordinary-loops-fbj6`. A loop of ten thousand iterations is an
+/// ordinary program, not a resource attack: the pinned Reference prints
+/// `50005000` for it. The probe budget (`EngineExecutionLimits::new`) must
+/// still stop it with a typed non-answer, and the user-program profile the
+/// front doors use must run it. Each half fails if the other's limits are used.
+#[test]
+fn an_ordinary_loop_runs_under_the_user_program_profile_and_stops_under_the_probe_budget() {
+    let source = "def sumTo (n : Nat) : Nat := match n with | .zero => n | .succ k => sumTo k + n\n#eval sumTo 10000";
+    let kernel = limits().kernel;
+
+    let probe = engine()
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap();
+    assert!(
+        matches!(probe, fln::Outcome::Inconclusive(_)),
+        "the probe budget must stop a 10,000-deep recursion with a typed non-answer"
+    );
+
+    let user = EngineExecutionLimits::for_user_program(kernel);
+    assert_eq!(user.vm.max_steps, u64::MAX);
+    assert!(user.vm.max_stack_depth > limits().vm.max_stack_depth);
+    let completed = engine()
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), user)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(result) = &completed.executions.last().unwrap().exit else {
+        panic!("the user-program profile did not return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("50005000")
+    );
+    assert!(
+        result.usage.steps > limits().vm.max_steps / 10,
+        "the run should be far past anything the probe budget's depth allows: {:?}",
+        result.usage
+    );
+    assert!(result.usage.peak_stack_depth > limits().vm.max_stack_depth);
+}
+
+/// The engine runs its compiled programs through Golem's inline caches. The
+/// uncached path (`execute_flbc_artifact`) is the semantic definition, so the
+/// two must agree on the value AND on the instruction and frame accounting for
+/// the very artifact the engine executed. A cache that changed an answer or
+/// skipped charged work fails here.
+#[test]
+fn the_cached_engine_run_agrees_with_the_uncached_semantic_path() {
+    for (source, expected) in [
+        (
+            "def fact (n : Nat) : Nat := match n with | .zero => 1 | .succ k => fact k * n\n#eval fact 25",
+            "15511210043330985984000000",
+        ),
+        (
+            "def sum (n acc : Nat) : Nat := match n with | .zero => acc | .succ k => sum k (acc + n)\n#eval sum 300 2",
+            "45152",
+        ),
+        (
+            "def walk (n a b : Nat) : Nat := match n with | .zero => a + b | .succ k => walk k (a + 1) (b + 2)\n#eval walk 200 1 2",
+            "603",
+        ),
+    ] {
+        let user = EngineExecutionLimits::for_user_program(limits().kernel);
+        let completed = engine()
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), user)
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        let execution = completed.executions.last().unwrap();
+        let VmExit::Returned(cached) = &execution.exit else {
+            panic!("cached run did not return: {source}")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&cached.value).as_deref(),
+            Some(expected),
+            "{source}"
+        );
+
+        let uncached_limits = fln::FlbcExecutionLimits {
+            vm: user.vm,
+            ..fln::FlbcExecutionLimits::default()
+        };
+        let uncached =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), uncached_limits)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let VmExit::Returned(uncached) = &uncached else {
+            panic!("uncached run did not return: {source}")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&uncached.value).as_deref(),
+            Some(expected),
+            "{source}"
+        );
+        assert_eq!(cached.usage, uncached.usage, "{source}");
+    }
+}

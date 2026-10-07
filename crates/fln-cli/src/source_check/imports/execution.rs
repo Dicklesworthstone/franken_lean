@@ -140,7 +140,7 @@ pub(in crate::source_check) fn run(
             let inputs: Vec<_> = names.iter().zip(sources).map(|(name, source)| {
                 SourceModuleInput { name, source }
             }).collect();
-            let mut limits = SourceProgramLimits::new(fln::EngineExecutionLimits::new(
+            let mut limits = SourceProgramLimits::new(fln::EngineExecutionLimits::for_user_program(
                 fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
             ));
             limits.modules.source.max_bytes = max_bytes;

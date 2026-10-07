@@ -1,0 +1,147 @@
+//! Ordinary loops through the installed front doors (bead `fln-golem-ordinary-loops-fbj6`).
+//!
+//! Measured on 2026-10-07 at `71ec8bff`: `lean` refused every one of these with
+//! `RecursionDepth { limit: 1000 }` or `ExecutionSteps`, because the doors ran user
+//! programs under the interpreter's probe budget. The pinned Reference prints the
+//! values asserted here (recorded that day from `lean` v4.32.0 on the same shapes;
+//! each is also a closed-form fact: a triangular number, a list sum, a tree size).
+//!
+//! What this does not establish: speed, or tail calls. A structural recursion still
+//! costs three frames per call, so a deep enough recursion is still a typed
+//! non-answer; `the_frame_ceiling_is_a_typed_stop_never_a_crash` pins that it is
+//! exit 3 and not a host stack overflow.
+#![forbid(unsafe_code)]
+use std::{
+    path::Path,
+    process::{Command, Output},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn directory() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fln-ordinary-loops-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+fn lean(source: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(source)
+        .output()
+        .unwrap()
+}
+
+fn expect_output(name: &str, program: &str, expected: &str) {
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    std::fs::write(&source, program).unwrap();
+    let output = lean(&source);
+    eprintln!(
+        "{name}: exit={:?} stdout={:?} stderr_bytes={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+        output.stderr.len()
+    );
+    assert!(output.status.success(), "{name}: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected,
+        "{name}"
+    );
+    assert!(output.stderr.is_empty(), "{name}: {output:?}");
+}
+
+const SUM_TO: &str = "def sumTo : Nat → Nat\n  | 0 => 0\n  | n + 1 => (n + 1) + sumTo n\n";
+
+#[test]
+fn a_ten_thousand_iteration_recursion_prints_its_answer() {
+    expect_output(
+        "sumTo 10000",
+        &format!("{SUM_TO}#eval sumTo 10000\n"),
+        "50005000",
+    );
+}
+
+#[test]
+fn a_recursion_past_the_old_frame_and_step_ceilings_prints_its_answer() {
+    // 200,000 calls is about 600,000 frames and 4.4 million instructions,
+    // against the probe budget's 1,000 frames and 1,000,000 instructions.
+    expect_output(
+        "sumTo 200000",
+        &format!("{SUM_TO}#eval sumTo 200000\n"),
+        "20000100000",
+    );
+}
+
+#[test]
+fn building_and_folding_a_long_list_prints_its_answer() {
+    expect_output(
+        "list fold",
+        "def build : Nat → List Nat → List Nat\n  | 0, acc => acc\n  | n + 1, acc => build n (n :: acc)\n#eval (build 20000 []).foldl (· + ·) 0\n",
+        "199990000",
+    );
+}
+
+#[test]
+fn a_tree_of_a_hundred_thousand_nodes_is_past_the_old_step_ceiling() {
+    // Depth 16: 131,071 nodes, more than one million instructions, shallow frames.
+    expect_output(
+        "tree size",
+        "inductive T where\n  | leaf : T\n  | node : T → T → T\ndef mk : Nat → T\n  | 0 => .leaf\n  | n + 1 => .node (mk n) (mk n)\ndef T.size : T → Nat\n  | .leaf => 1\n  | .node l r => l.size + r.size + 1\n#eval (mk 16).size\n",
+        "131071",
+    );
+}
+
+#[test]
+fn an_emitted_artifact_replays_under_the_same_budget_it_ran_under() {
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    let artifact = dir.join("main.flbc");
+    std::fs::write(&source, format!("{SUM_TO}#eval sumTo 10000\n")).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&artifact)
+        .output()
+        .unwrap();
+    eprintln!(
+        "replay: exit={:?} stdout={}",
+        replay.status.code(),
+        String::from_utf8_lossy(&replay.stdout).trim()
+    );
+    assert!(replay.status.success(), "{replay:?}");
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).contains("\"returnValue\":50005000"),
+        "{replay:?}"
+    );
+}
+
+#[test]
+fn the_frame_ceiling_is_a_typed_stop_never_a_crash() {
+    // Far past any frame ceiling: this must end as the documented inconclusive
+    // exit with nothing on stdout, not as a signal or an abort.
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    std::fs::write(&source, format!("{SUM_TO}#eval sumTo 5000000\n")).unwrap();
+    let output = lean(&source);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "ceiling: exit={:?} stderr={}",
+        output.status.code(),
+        stderr.trim().chars().take(160).collect::<String>()
+    );
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(stderr.contains("RecursionDepth"), "{output:?}");
+}

@@ -1013,6 +1013,14 @@ pub enum LakeUpdateError {
     Discovery(LakeDiscoveryError),
     Io(String),
     Parse(String),
+    /// The configuration declares requirements, and resolving one means
+    /// fetching it and recording the commit it resolved to. No fetch exists
+    /// yet (the D2 subprocess protocol, bead `fln-7k0`), so no manifest is
+    /// written: an entry whose `rev` is a copy of the requested revision
+    /// would claim a resolution that never happened.
+    DependencyResolutionUnavailable {
+        requirements: Vec<String>,
+    },
 }
 
 impl fmt::Display for LakeUpdateError {
@@ -1021,6 +1029,13 @@ impl fmt::Display for LakeUpdateError {
             Self::Discovery(e) => write!(f, "error discovering Lake configuration: {e}"),
             Self::Io(msg) => write!(f, "I/O error updating Lake manifest: {msg}"),
             Self::Parse(msg) => write!(f, "error parsing Lake manifest: {msg}"),
+            Self::DependencyResolutionUnavailable { requirements } => write!(
+                f,
+                "dependency resolution is unavailable, so {} requirement(s) cannot be \
+                 resolved ({}); no manifest was written",
+                requirements.len(),
+                requirements.join(", ")
+            ),
         }
     }
 }
@@ -1240,24 +1255,21 @@ impl Manifest {
     }
 }
 
-/// Update dependencies and write `lake-manifest.json`.
+/// Write `lake-manifest.json` for a package with no requirements.
+///
+/// A package that declares requirements is refused with
+/// [`LakeUpdateError::DependencyResolutionUnavailable`] and nothing is written.
+/// Until 2026-10-07 this copied each requested `rev` into the manifest's
+/// resolved `rev`, fetched nothing, and returned `Ok` (bead
+/// `fln-front-door-residuals-0f6x`).
 pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
     let config = LakeConfig::discover(dir).map_err(LakeUpdateError::Discovery)?;
-    let mut manifest = Manifest::new(&config.name);
-    for req in &config.requires {
-        let entry = ManifestPackageEntry {
-            name: req.name.clone(),
-            scope: String::new(),
-            entry_type: "git".to_owned(),
-            url: req.url.clone(),
-            rev: req.rev.clone(),
-            input_rev: req.rev.clone(),
-            subdir: req.subdir.clone(),
-            inherited: false,
-            config_file: "lakefile.toml".to_owned(),
-        };
-        manifest.packages.push(entry);
+    if !config.requires.is_empty() {
+        return Err(LakeUpdateError::DependencyResolutionUnavailable {
+            requirements: config.requires.iter().map(|req| req.name.clone()).collect(),
+        });
     }
+    let manifest = Manifest::new(&config.name);
     manifest
         .save_to_dir(dir)
         .map_err(|e| LakeUpdateError::Io(e.to_string()))?;

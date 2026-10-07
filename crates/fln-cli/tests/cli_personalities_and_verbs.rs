@@ -511,14 +511,30 @@ fn leanc_personality_respects_cli_transcripts() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Usage: leanc"));
 
-    // leanc --fln-census-unknown
-    let output = Command::new(env!("CARGO_BIN_EXE_leanc"))
-        .arg("--fln-census-unknown")
-        .output()
-        .expect("run leanc --fln-census-unknown");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("unrecognized command-line option"));
+    // An option leanc does not define belongs to the C compiler, as at the pin
+    // (whose leanc hands it to clang). So leanc's answer must be the host
+    // compiler's own answer, for the census's probe string and for any other
+    // string alike. This used to assert a message leanc made up for the probe
+    // string only (bead fln-front-door-residuals-0f6x).
+    for unknown in ["--fln-census-unknown", "--some-other-unknown-flag"] {
+        let ours = Command::new(env!("CARGO_BIN_EXE_leanc"))
+            .env_remove("LEAN_CC")
+            .arg(unknown)
+            .output()
+            .expect("run leanc with an unknown option");
+        match Command::new("cc").arg(unknown).output() {
+            Ok(host) => {
+                assert_eq!(ours.status.code(), host.status.code(), "{unknown}");
+                assert_eq!(ours.stderr, host.stderr, "{unknown}");
+                assert!(!ours.status.success(), "{unknown}");
+            }
+            Err(_) => {
+                let stderr = String::from_utf8_lossy(&ours.stderr);
+                assert_eq!(ours.status.code(), Some(1), "{unknown}");
+                assert!(stderr.contains("is unavailable"), "{unknown}: {stderr}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -587,14 +603,155 @@ fn lake_personality_respects_cli_transcripts() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Build targets and output results"));
 
-    // lake --fln-census-unknown help
+    // lake --fln-census-unknown help: the pin's exact words (see the table in
+    // `lake_refuses_every_option_the_pin_does_not_define`).
     let output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--fln-census-unknown", "help"])
         .output()
         .expect("run lake --fln-census-unknown help");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("unknown option"));
+    assert_eq!(
+        stderr,
+        "error: unknown long option '--fln-census-unknown'\n"
+    );
+}
+
+/// Bead `fln-front-door-residuals-0f6x`. `lake` used to give the pin's
+/// unknown-option error only for the literal string the CLI census probes with,
+/// and exit 0 for every other unknown option. The option set now comes from the
+/// extracted census, so any string the pin does not define is refused.
+///
+/// Each row is the pinned `lake` v4.32.0's own first stderr line and exit code
+/// for that argv, recorded on 2026-10-07. The last three rows are the other
+/// direction: options the pin DOES define must not be refused, and a value the
+/// pin attaches to an option must not be read as a command.
+#[test]
+fn lake_refuses_every_option_the_pin_does_not_define() {
+    let rows: [(&[&str], &str); 9] = [
+        (
+            &["--fln-census-unknown", "help"],
+            "error: unknown long option '--fln-census-unknown'",
+        ),
+        (&["--zzz=1", "help"], "error: unknown long option '--zzz'"),
+        (&["--unknown"], "error: unknown long option '--unknown'"),
+        (&["-Zfoo", "help"], "error: unknown short option '-Z'"),
+        (&["help", "--zzz"], "error: unknown long option '--zzz'"),
+        (&["build", "-Z"], "error: unknown short option '-Z'"),
+        (&["-K", "a=b", "zzz"], "error: unknown command 'zzz'"),
+        (
+            &["--log-level", "info", "zzz"],
+            "error: unknown command 'zzz'",
+        ),
+        (
+            &["-q", "-v", "--wfail", "zzz"],
+            "error: unknown command 'zzz'",
+        ),
+    ];
+    for (argv, expected) in rows {
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .args(argv)
+            .output()
+            .expect("run lake");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        eprintln!(
+            "lake {argv:?}: exit={:?} stderr={stderr:?}",
+            output.status.code()
+        );
+        assert_eq!(output.status.code(), Some(1), "{argv:?}");
+        assert_eq!(stderr.lines().next(), Some(expected), "{argv:?}");
+        assert!(output.stdout.is_empty(), "{argv:?}");
+    }
+}
+
+/// A command the pin has and this build does not is the typed not-implemented
+/// exit. It used to exit 1 with "requires Lake workspace configuration", which
+/// reads as the user's mistake.
+#[test]
+fn lake_commands_without_an_implementation_say_so() {
+    for command in ["test", "query", "lint", "lean"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg(command)
+            .output()
+            .expect("run lake");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        eprintln!(
+            "lake {command}: exit={:?} stderr={stderr:?}",
+            output.status.code()
+        );
+        assert_eq!(output.status.code(), Some(5), "{command}");
+        assert!(
+            stderr.starts_with(&format!("lake {command}: not implemented")),
+            "{command}: {stderr}"
+        );
+    }
+}
+
+/// `fln why-trusts` stops at `--max-nodes`. A stopped walk has not seen the
+/// closure, so "axioms: none" from it is not an answer: the exit must be the
+/// inconclusive one. It used to be 0.
+#[test]
+fn a_why_trusts_walk_cut_short_is_inconclusive_not_an_answer() {
+    let temp = TempDir::new("why-trusts-limit");
+    let source = temp.0.join("Main.lean");
+    let snapshot = temp.0.join("main.olean");
+    std::fs::write(
+        &source,
+        "def base : Nat := 6 * 7\ndef answer : Nat := base + 1\n#eval answer\n",
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--emit-olean-snapshot"])
+        .arg(&snapshot)
+        .arg(&source)
+        .output()
+        .expect("run fln run");
+    assert!(run.status.success(), "{run:?}");
+
+    let complete = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["why-trusts", "answer"])
+        .arg(&snapshot)
+        .output()
+        .expect("run fln why-trusts");
+    let complete_stdout = String::from_utf8(complete.stdout).expect("utf8 stdout");
+    eprintln!(
+        "complete: exit={:?} {complete_stdout:?}",
+        complete.status.code()
+    );
+    assert_eq!(complete.status.code(), Some(0), "{complete_stdout}");
+    let complete_axioms = complete_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("axioms: "))
+        .unwrap_or_else(|| panic!("a complete walk states its axioms: {complete_stdout}"));
+    assert!(!complete_stdout.contains("(partial)"), "{complete_stdout}");
+    assert!(!complete_stdout.contains("truncated"), "{complete_stdout}");
+
+    let cut = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["why-trusts", "--max-nodes", "1", "answer"])
+        .arg(&snapshot)
+        .output()
+        .expect("run fln why-trusts --max-nodes 1");
+    let cut_stdout = String::from_utf8(cut.stdout).expect("utf8 stdout");
+    let cut_stderr = String::from_utf8(cut.stderr).expect("utf8 stderr");
+    eprintln!(
+        "cut: exit={:?} {cut_stdout:?} {cut_stderr:?}",
+        cut.status.code()
+    );
+    assert_eq!(cut.status.code(), Some(3), "{cut_stdout}");
+    let cut_axioms = cut_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("axioms (partial): "))
+        .unwrap_or_else(|| panic!("a cut walk labels its axioms partial: {cut_stdout}"));
+    assert!(
+        cut_stdout.contains("truncated by --max-nodes"),
+        "{cut_stdout}"
+    );
+    assert!(cut_stderr.contains("inconclusive"), "{cut_stderr}");
+    // Why the exit code matters: on this very snapshot the complete walk
+    // reaches an axiom and the one-node walk reaches none. Exit 0 with
+    // "axioms: none" was a false answer to a trust question.
+    assert_ne!(complete_axioms, "none", "{complete_stdout}");
+    assert_eq!(cut_axioms, "none", "{cut_stdout}");
 }
 
 #[test]
@@ -835,31 +992,59 @@ rev = "v4.32.0"
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("lakefile.toml"), toml_content).unwrap();
 
-    // 1. lake update
+    // 1. lake update with a requirement: nothing can fetch it, so the answer
+    // is the typed not-implemented exit and NO manifest. This step used to
+    // assert exit 0 and a manifest naming "batteries", which the binary wrote
+    // by copying the requested rev (bead fln-front-door-residuals-0f6x).
     let update_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--dir", pkg_dir.to_str().unwrap(), "update"])
         .output()
         .expect("run lake update");
-    assert!(
-        update_output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&update_output.stderr)
+    let update_stderr = String::from_utf8_lossy(&update_output.stderr);
+    assert_eq!(
+        update_output.status.code(),
+        Some(5),
+        "stderr: {update_stderr}"
     );
-    assert!(pkg_dir.join("lake-manifest.json").exists());
+    assert!(update_output.stdout.is_empty());
+    assert!(
+        update_stderr.contains("lake update: not implemented")
+            && update_stderr.contains("batteries")
+            && update_stderr.contains("no manifest was written"),
+        "{update_stderr}"
+    );
+    assert!(!pkg_dir.join("lake-manifest.json").exists());
 
-    let manifest_content = std::fs::read_to_string(pkg_dir.join("lake-manifest.json")).unwrap();
-    assert!(manifest_content.contains("\"name\": \"my_project\""));
-    assert!(manifest_content.contains("\"batteries\""));
-
-    // 2. lake update --json
+    // 2. lake update --json: the same refusal, typed.
     let update_json = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "update"])
         .output()
         .expect("run lake update --json");
-    assert!(update_json.status.success());
-    let update_json_stdout = String::from_utf8(update_json.stdout).expect("utf8 stdout");
-    assert!(update_json_stdout.contains("\"schema\":\"fln.lake-update/1\""));
-    assert!(update_json_stdout.contains("\"package\":\"my_project\""));
+    assert_eq!(update_json.status.code(), Some(5));
+    let update_json_stderr = String::from_utf8(update_json.stderr).expect("utf8 stderr");
+    assert!(update_json_stderr.contains("\"status\":\"not_implemented\""));
+    assert!(update_json_stderr.contains("\"command\":\"lake update\""));
+    assert!(!pkg_dir.join("lake-manifest.json").exists());
+
+    // 2b. With no requirements there is nothing to resolve: exit 0 and a
+    // manifest with an empty package list.
+    let bare_dir = temp_parent.join("bare_project");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(
+        bare_dir.join("lakefile.toml"),
+        "name = \"bare_project\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let bare_update = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", bare_dir.to_str().unwrap(), "--json", "update"])
+        .output()
+        .expect("run lake update without requirements");
+    assert!(bare_update.status.success(), "{bare_update:?}");
+    let bare_stdout = String::from_utf8(bare_update.stdout).expect("utf8 stdout");
+    assert!(bare_stdout.contains("\"schema\":\"fln.lake-update/1\""));
+    assert!(bare_stdout.contains("\"packages_count\":0"));
+    let manifest_content = std::fs::read_to_string(bare_dir.join("lake-manifest.json")).unwrap();
+    assert!(manifest_content.contains("\"name\": \"bare_project\""));
 
     // 3. lake env (bare)
     let env_output = Command::new(env!("CARGO_BIN_EXE_lake"))

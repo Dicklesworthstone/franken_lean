@@ -201,24 +201,64 @@ rev = "v4.32.0"
 "#;
     std::fs::write(dir.join("lakefile.toml"), toml).unwrap();
 
-    let manifest = fln_lake::update_manifest(&dir).expect("update manifest");
+    // A requirement can only be resolved by fetching it. Nothing fetches, so
+    // `update_manifest` must refuse and write nothing. It used to copy the
+    // requested `rev` ("v4.32.0", a tag) into the resolved `rev` and return Ok
+    // (bead fln-front-door-residuals-0f6x); this test asserted that.
+    match fln_lake::update_manifest(&dir) {
+        Err(fln_lake::LakeUpdateError::DependencyResolutionUnavailable { requirements }) => {
+            assert_eq!(requirements, vec!["mathlib".to_owned()]);
+        }
+        other => panic!("a requirement must be refused, not resolved by copy: {other:?}"),
+    }
+    assert!(
+        !dir.join("lake-manifest.json").exists(),
+        "a refused update must not leave a manifest behind"
+    );
+
+    // With no requirements there is nothing to resolve, and the manifest is real.
+    let bare = fresh_temp_dir("manifest-bare-test");
+    std::fs::write(
+        bare.join("lakefile.toml"),
+        "name = \"math_project\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let manifest = fln_lake::update_manifest(&bare).expect("update with no requirements");
     assert_eq!(manifest.name, "math_project");
     assert_eq!(manifest.version, "1.1.0");
-    assert_eq!(manifest.packages.len(), 1);
-    assert_eq!(manifest.packages[0].name, "mathlib");
-    assert_eq!(
-        manifest.packages[0].url.as_deref(),
-        Some("https://github.com/leanprover-community/mathlib4.git")
-    );
-    assert_eq!(manifest.packages[0].rev.as_deref(), Some("v4.32.0"));
-
-    // Verify written lake-manifest.json
-    let loaded = fln_lake::Manifest::load_from_dir(&dir)
+    assert!(manifest.packages.is_empty());
+    let loaded = fln_lake::Manifest::load_from_dir(&bare)
         .expect("load manifest")
         .expect("manifest exists");
     assert_eq!(loaded.name, "math_project");
+    assert!(loaded.packages.is_empty());
+
+    // Serialization of a resolved entry is still covered, on a manifest built
+    // by hand with a real 40-hex commit, which is what a resolution records.
+    let mut resolved = fln_lake::Manifest::new("math_project");
+    resolved.packages.push(fln_lake::ManifestPackageEntry {
+        name: "mathlib".to_owned(),
+        scope: String::new(),
+        entry_type: "git".to_owned(),
+        url: Some("https://github.com/leanprover-community/mathlib4.git".to_owned()),
+        rev: Some("81a5d257c8e410db227a6665ed08f64fea08e997".to_owned()),
+        input_rev: Some("v4.32.0".to_owned()),
+        subdir: None,
+        inherited: false,
+        config_file: "lakefile.toml".to_owned(),
+    });
+    let round_trip = fresh_temp_dir("manifest-round-trip-test");
+    resolved.save_to_dir(&round_trip).expect("save manifest");
+    let loaded = fln_lake::Manifest::load_from_dir(&round_trip)
+        .expect("load manifest")
+        .expect("manifest exists");
     assert_eq!(loaded.packages.len(), 1);
     assert_eq!(loaded.packages[0].name, "mathlib");
+    assert_eq!(
+        loaded.packages[0].rev.as_deref(),
+        Some("81a5d257c8e410db227a6665ed08f64fea08e997")
+    );
+    assert_eq!(loaded.packages[0].input_rev.as_deref(), Some("v4.32.0"));
 
     // Test parse_json with version 7 integer format for backwards compatibility
     let v7_json = r#"{"version": 7, "packagesDir": ".lake/packages", "packages": [], "name": "legacy_pkg", "lakeDir": ".lake"}"#;
