@@ -11532,7 +11532,55 @@ mod tests {
         );
     }
 
+    /// Two substitutes whose FULL packed words collide must not confuse the
+    /// instantiate cache (bead fln-kernel-reject-side-at-scale-bemc, the
+    /// cache-key adversary made per-commit). Nat literals 54795 and 229944
+    /// share the packed word under this tree's packing (found by birthday
+    /// search against fln-core's own Expr::lit data), and a collision
+    /// propagates upward through identical contexts because application
+    /// packing mixes child words — so the two substitution results share
+    /// every hash-shaped cache key and are separated ONLY by the structural
+    /// verify. The acceptance-3 campaign measured this family unreachable by
+    /// the corpus operators (the P-MEMO plant flipped nothing in 290
+    /// mutants); this test is that plant's standing per-commit killer: drop
+    /// the verify and the second instantiate answers with the first's
+    /// result.
+    #[test]
+    fn colliding_packed_words_do_not_confuse_the_instantiate_cache() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let lit = |v: u64| Expr::lit(Literal::Nat(NatLit::from_u64(v)));
+        let (low, high) = (lit(54_795), lit(229_944));
+        assert!(
+            low.data().0 == high.data().0,
+            "the measured pair must still collide on the full packed word, or this test              stopped testing collisions (re-run the birthday search and update the pair)"
+        );
+        assert!(low != high, "and they must remain structurally distinct");
+        let wrap = |inner: Expr| Expr::app(Expr::sort(Level::zero()), inner);
+        let (sub_low, sub_high) = (wrap(low), wrap(high));
+        assert!(
+            sub_low.data().0 == sub_high.data().0,
+            "a collision must propagate through an identical wrapper, or app packing moved"
+        );
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let open = Expr::app(bv(0), bv(0));
+        let first = tc.instantiate(&open, 0, &sub_low, 0).expect("instantiates");
+        let second = tc
+            .instantiate(&open, 0, &sub_high, 0)
+            .expect("instantiates");
+        assert!(
+            first != second,
+            "two colliding-word substitutes produced one result: a cache answered on the              packed word without its structural verify — the P-MEMO defect, live"
+        );
+        assert!(
+            first == Expr::app(sub_low.clone(), sub_low)
+                && second == Expr::app(sub_high.clone(), sub_high),
+            "each substitution must carry ITS OWN literal through"
+        );
+    }
+
     /// Two separate instantiations that rebuild the same structure yield the
+    /// SAME allocation within one checker    /// Two separate instantiations that rebuild the same structure yield the
     /// SAME allocation within one checker — and the unifier must provably be
     /// the interner, which takes dodging the unifier this test's first
     /// version did not dodge (found by the slice-B1 verifier, z8j.1.13
