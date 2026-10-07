@@ -896,29 +896,7 @@ impl Context {
             type_: motive_type,
         };
         recursor = if family.all.len() == 1 {
-            match self.match_apply(recursor.clone(), motive.clone()) {
-                Err(NatDefinitionElabError::Inference(
-                    SourceInferenceError::ConversionRefused(_),
-                )) => {
-                    // A motive whose sort the recursor refuses (data extracted
-                    // from a Prop) was refused BY THE KERNEL before the closed
-                    // Default-conversion pre-check existed, and the kernel's
-                    // verdict class is the pin-shaped TypeMismatch. Keep that:
-                    // build the application and let ordinary K1 admission
-                    // refuse it, instead of masking the class with the
-                    // pre-check's NotDefEq (fln-ffce comment 3297).
-                    let type_ = self.whnf(&recursor.type_)?;
-                    let ExprNode::ForallE { body, .. } = type_.node() else {
-                        return Err(error(TacticError::UnsupportedEliminator));
-                    };
-                    let body = body.clone();
-                    Typed {
-                        value: Expr::app(recursor.value, motive.value.clone()),
-                        type_: self.substitute(&body, &motive.value)?,
-                    }
-                }
-                other => other?,
-            }
+            self.match_apply(recursor, motive)?
         } else {
             self.specialize_mutual_match(recursor, &family, &rec, motive, &generalized, universe)?
         };
