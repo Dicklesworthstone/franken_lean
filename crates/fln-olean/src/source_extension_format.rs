@@ -13,6 +13,7 @@
 //! src/Lean/Meta/DiscrTree/Types.lean: sha256 c2964c861300247b99afb068c5c77046c8f746b8881e9cfb81e63195ba3d3773
 //! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 //! src/Lean/ReducibilityAttrs.lean: sha256 8d11c2c5d9217eb7034426217b2075526ca4e55f1fdb73d8475d5034f3a6b1a2
+//! src/Lean/Compiler/ExternAttr.lean: sha256 b7fc317ef4457ee6383d2c85a264361b1960d0ce1109c8d2fe5901144d323345
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -90,3 +91,9 @@ pub const REDUCIBILITY_REDUCIBLE: usize = 0;
 pub const REDUCIBILITY_SEMIREDUCIBLE: usize = 1;
 pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;
 pub const REDUCIBILITY_IMPLICIT_REDUCIBLE: usize = 3;
+pub const EXTERN_EXTENSION: &str = "Lean.externAttr";
+pub const LIST_NIL: u8 = 0;
+pub const LIST_CONS: u8 = 1;
+pub const LIST_CONS_HEAD: usize = 0;
+pub const LIST_CONS_TAIL: usize = 1;
+pub const LIST_CONS_POINTERS: usize = 2;

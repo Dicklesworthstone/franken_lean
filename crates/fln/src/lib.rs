@@ -9229,9 +9229,13 @@ fn executable_dependencies(
             scalar_constructors.push(binding);
             continue;
         }
-        if let Some(binding) =
-            executable_intrinsic_binding(environment, &name, &mut visited_nodes, limits)?
-        {
+        if let Some(binding) = executable_intrinsic_binding_cached(
+            environment,
+            &name,
+            &mut visited_nodes,
+            limits,
+            &mut preparation.externs,
+        )? {
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -9322,27 +9326,53 @@ pub fn source_scalar_constructor_binding(
     })
 }
 
+#[cfg(test)]
 fn executable_intrinsic_binding(
     environment: &Environment,
     name: &Name,
     visited_nodes: &mut usize,
     limits: IngressLimits,
 ) -> Result<Option<IntrinsicBinding>, IngressError> {
-    if name == &Name::from_components(["Nat", "add"]) {
-        return Ok(
-            source_intrinsics::nat_add_matches(environment, visited_nodes, limits)?
-                .then(|| generated_source_intrinsic_binding(name))
-                .flatten(),
-        );
-    }
-    if let Some(binding) = source_intrinsic_binding(environment, name) {
-        return Ok(Some(binding));
-    }
-    Ok(
+    executable_intrinsic_binding_cached(environment, name, visited_nodes, limits, &mut None)
+}
+
+fn executable_intrinsic_binding_cached(
+    environment: &Environment,
+    name: &Name,
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+) -> Result<Option<IntrinsicBinding>, IngressError> {
+    let binding = if name == &Name::from_components(["Nat", "add"]) {
+        source_intrinsics::nat_add_matches(environment, visited_nodes, limits)?
+            .then(|| generated_source_intrinsic_binding(name))
+            .flatten()
+    } else if let Some(binding) = source_intrinsic_binding(environment, name) {
+        Some(binding)
+    } else if source_intrinsics::imported_string_internal_matches(
+        environment,
+        name,
+        externs,
+        visited_nodes,
+        limits,
+    )? {
+        // Opaque string models already require their explicit imported extern.
+        return Ok(generated_source_intrinsic_binding(name));
+    } else {
         source_intrinsics::imported_nat_matches(environment, name, visited_nodes, limits)?
             .then(|| generated_source_intrinsic_binding(name))
-            .flatten(),
-    )
+            .flatten()
+    };
+    if binding.is_some() {
+        source_intrinsics::check_selected_extern_attribute(
+            environment,
+            name,
+            externs,
+            visited_nodes,
+            limits,
+        )?;
+    }
+    Ok(binding)
 }
 
 fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<IntrinsicBinding> {
@@ -9403,12 +9433,12 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             Some("Nat.beq"),
         ),
         "Nat.decLe" | "Nat.decLt" => (vec![ValueType::Nat, ValueType::Nat], ValueType::Bool, None),
-        "String.append" => (
+        "String.append" | "String.Internal.append" => (
             vec![ValueType::String, ValueType::String],
             ValueType::String,
             None,
         ),
-        "String.length" | "String.utf8ByteSize" => (
+        "String.length" | "String.utf8ByteSize" | "String.Internal.length" => (
             vec![ValueType::String],
             ValueType::Nat,
             Some("String.length"),

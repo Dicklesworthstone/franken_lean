@@ -124,6 +124,11 @@ pub enum IngressError {
         resource: IngressResource,
         requested: usize,
     },
+    /// A bounded metadata reader exhausted capacity without an individual
+    /// resource count. Preserve its nonanswer without fabricating counters.
+    MetadataResourceExhausted {
+        kind: &'static str,
+    },
     OpenFreeVariable,
     UnresolvedMetavariable,
     LooseBoundVariables {
@@ -443,6 +448,12 @@ impl fmt::Display for IngressError {
                 "core Expr ingress could not reserve {requested} {}",
                 resource.token()
             ),
+            Self::MetadataResourceExhausted { kind } => {
+                write!(
+                    formatter,
+                    "core Expr ingress metadata resource exhausted: {kind}"
+                )
+            }
             Self::OpenFreeVariable => {
                 formatter.write_str("core Expr ingress requires no free variables")
             }
@@ -926,7 +937,9 @@ impl IngressError {
     /// source-shape refusal. Nested FIR validation is classified the same way.
     pub fn is_resource_exhaustion(&self) -> bool {
         match self {
-            Self::ResourceLimit { .. } | Self::AllocationFailure { .. } => true,
+            Self::ResourceLimit { .. }
+            | Self::AllocationFailure { .. }
+            | Self::MetadataResourceExhausted { .. } => true,
             Self::FirValidation(error) => error.is_resource_exhaustion(),
             _ => false,
         }
@@ -5042,9 +5055,17 @@ mod tests {
             resource: fir::ValidationResource::Functions,
             requested: 1,
         });
+        let metadata = IngressError::MetadataResourceExhausted {
+            kind: "extern attribute journal capacity",
+        };
         let shape = IngressError::UnknownConstant { name_hash: 0 };
         assert!(direct.is_resource_exhaustion());
         assert!(nested.is_resource_exhaustion());
+        assert!(metadata.is_resource_exhaustion());
+        assert_eq!(
+            metadata.to_string(),
+            "core Expr ingress metadata resource exhausted: extern attribute journal capacity"
+        );
         assert!(!shape.is_resource_exhaustion());
     }
 

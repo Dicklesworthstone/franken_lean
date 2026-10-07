@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! and protected-declaration journals.
+//! protected-declaration and extern-attribute journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -16,9 +16,11 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION,
-    REDUCIBILITY_EXTENSION, SIMP_EXTENSION,
+    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION, INSTANCE_EXTENSION,
+    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, SIMP_EXTENSION,
 };
+mod externs;
+pub use externs::{ExternAttribute, ExternEntry};
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
 
@@ -107,6 +109,9 @@ pub struct SourceExtensions {
     pub protected: Vec<Name>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Explicit extern bindings. Consumers must validate their declarations and
+    /// selected backend/symbol before granting executable authority.
+    pub externs: Vec<ExternAttribute>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -115,6 +120,7 @@ pub struct SourceExtensions {
 pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_objects: u64,
+    /// Cumulative journal rows plus nested extern list cells.
     pub max_entries: usize,
     pub max_indices: usize,
     /// Cumulative instance `DiscrTree` keys across the batch.
@@ -401,6 +407,7 @@ pub fn decode(
         name(format::ALIAS_EXTENSION),
         name(format::PROTECTED_EXTENSION),
         name(format::REDUCIBILITY_EXTENSION),
+        name(format::EXTERN_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -451,7 +458,10 @@ pub fn decode(
                     out.protected.push(declaration);
                 }
                 6 => out.reducibility.push(reader.reducibility(&obj)?),
-                _ => unreachable!("seven selected extension families"),
+                7 => out
+                    .externs
+                    .push(reader.extern_attribute(&obj, &mut entries_left)?),
+                _ => unreachable!("eight selected extension families"),
             }
         }
     }

@@ -26,6 +26,7 @@ pub mod constraint;
 pub mod dataflow;
 pub mod decision;
 pub mod effects;
+pub mod externs;
 pub mod inductive;
 pub mod info;
 pub mod instances;

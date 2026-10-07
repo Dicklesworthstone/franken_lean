@@ -22,18 +22,34 @@ impl Preparation<'_> {
         if !levels.is_empty() {
             return Ok(false);
         }
-        if executable_intrinsic_binding(self.environment, callee, &mut self.visited, self.limits)?
-            .is_some()
+        if executable_intrinsic_binding_cached(
+            self.environment,
+            callee,
+            &mut self.visited,
+            self.limits,
+            &mut self.externs,
+        )?
+        .is_some()
         {
             return Ok(true);
         }
         if callee != &name("Float.ofScientific") && callee != &name("Float32.ofScientific") {
             return Ok(false);
         }
-        Ok(matches!(
+        let canonical = matches!(
             (self.environment.find(callee), fln_elab::seed::float_intrinsic_seed_declaration(callee)),
             (Some(ConstantInfo::Axiom(actual)), Some(Declaration::Axiom(expected))) if actual == &expected
-        ))
+        );
+        if canonical {
+            source_intrinsics::check_selected_extern_attribute(
+                self.environment,
+                callee,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?;
+        }
+        Ok(canonical)
     }
 
     fn scientific_nat_literal(&mut self, input: &Expr) -> Result<Option<NatLit>, IngressError> {
@@ -100,6 +116,13 @@ impl Preparation<'_> {
             ) && actual == &expected
                 && let ExprNode::Lam { body, .. } = actual.value.node()
             {
+                source_intrinsics::check_selected_extern_attribute(
+                    self.environment,
+                    callee,
+                    &mut self.externs,
+                    &mut self.visited,
+                    self.limits,
+                )?;
                 return self
                     .substitution(body, &Expr::lit(Literal::Nat(number)))
                     .map(Some);
@@ -154,6 +177,13 @@ impl Preparation<'_> {
         {
             return Err(unsupported("noncanonical scientific bit conversion"));
         }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            callee,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
         self.tick()?;
         // Intermediate exact arithmetic is bounded by the same byte ceiling
         // as executable literal payloads. The helper checks before allocation.

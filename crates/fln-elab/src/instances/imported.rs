@@ -536,6 +536,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain explicit imported extern intentions for an admitted declaration.
+    /// This separate journal does not change kept class or instance state.
+    pub fn register_extern(
+        mut self,
+        declaration: &Name,
+        entries: Vec<crate::externs::ExternEntry>,
+    ) -> Result<Self, crate::externs::ExternError> {
+        self.env = crate::externs::register(&self.env, declaration, entries)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {

@@ -8,6 +8,84 @@
 
 use super::*;
 use std::collections::HashSet;
+mod string_internal;
+pub(super) use string_internal::imported_string_internal_matches;
+
+/// A present extern attribute is a separate execution contract. A complete
+/// logical model may justify a native optimization without one, but it must
+/// never override a conflicting explicit runtime implementation.
+fn extern_attribute_matches(
+    environment: &Environment,
+    requested: &Name,
+    required: bool,
+    cache: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    use fln_elab::externs::{ExternEntry, ExternReadError, ExternTable};
+    charge_catalog_node(visited, limits)?;
+    if cache.is_none() {
+        let table = ExternTable::read_metered(environment, |amount| {
+            let observed = visited.saturating_add(amount);
+            if observed > limits.max_nodes {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::Nodes,
+                    limit: limits.max_nodes,
+                    observed,
+                });
+            }
+            *visited = observed;
+            Ok(())
+        })
+        .map_err(|error| match error {
+            ExternReadError::Budget(error) => error,
+            ExternReadError::Registry(fln_elab::externs::ExternError::Limit) => {
+                IngressError::MetadataResourceExhausted {
+                    kind: "native extern attribute journal capacity or allocation",
+                }
+            }
+            ExternReadError::Registry(_) => IngressError::UnsupportedNode {
+                kind: "invalid native extern attribute journal",
+            },
+        })?;
+        *cache = Some(table);
+    }
+    let table = cache
+        .as_ref()
+        .expect("only successful extern tables are cached");
+    let Some(entries) = table.get(requested) else {
+        return Ok(!required);
+    };
+    let label = requested.to_display_string();
+    let row = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|row| row.name == label);
+    if let (Some(row), [ExternEntry::Standard { backend, symbol }]) = (row, entries)
+        && row
+            .attributes
+            .split(';')
+            .any(|attribute| attribute == "extern")
+        && row.entry_class == "standard"
+        && row.entry_scope == "all"
+        && backend == &Name::from_components(["all"])
+        && symbol == row.symbol
+    {
+        return Ok(true);
+    }
+    Err(IngressError::UnsupportedNode {
+        kind: "native extern attribute does not match the supported ABI",
+    })
+}
+
+pub(super) fn check_selected_extern_attribute(
+    environment: &Environment,
+    requested: &Name,
+    cache: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    extern_attribute_matches(environment, requested, false, cache, visited, limits).map(|_| ())
+}
 
 pub(super) fn nat_add_matches(
     environment: &Environment,
@@ -103,6 +181,7 @@ impl Comparison<'_> {
     ) -> Result<bool, IngressError> {
         match expected {
             Declaration::Defn(value) => self.constant(environment, ConstantInfo::Defn(value)),
+            Declaration::Opaque(value) => self.constant(environment, ConstantInfo::Opaque(value)),
             Declaration::Inductive(block) => {
                 for value in block.types {
                     if !self.constant(environment, ConstantInfo::Induct(value))? {
@@ -151,6 +230,9 @@ impl Comparison<'_> {
             (ConstantInfo::Defn(a), ConstantInfo::Defn(b)) => {
                 a.hints == b.hints && a.safety == b.safety && a.all == b.all
             }
+            (ConstantInfo::Opaque(a), ConstantInfo::Opaque(b)) => {
+                a.is_unsafe == b.is_unsafe && a.all == b.all
+            }
             (ConstantInfo::Induct(a), ConstantInfo::Induct(b)) => {
                 a.num_params == b.num_params
                     && a.num_indices == b.num_indices
@@ -185,6 +267,9 @@ impl Comparison<'_> {
         }
         match (actual, expected) {
             (ConstantInfo::Defn(a), ConstantInfo::Defn(b)) => self.expression(&a.value, &b.value),
+            (ConstantInfo::Opaque(a), ConstantInfo::Opaque(b)) => {
+                self.expression(&a.value, &b.value)
+            }
             (ConstantInfo::Rec(a), ConstantInfo::Rec(b)) => {
                 for (a, b) in a.rules.iter().zip(&b.rules) {
                     self.tick()?;

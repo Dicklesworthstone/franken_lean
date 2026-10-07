@@ -29,6 +29,8 @@ pub(super) struct Preparation<'a> {
     environment: &'a Environment,
     limits: IngressLimits,
     visited: usize,
+    // One immutable admitted environment per preparation; cache only successful reads.
+    pub(super) externs: Option<fln_elab::externs::ExternTable>,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
@@ -95,6 +97,7 @@ impl<'a> Preparation<'a> {
             environment,
             limits,
             visited: 0,
+            externs: None,
             lambdas: Vec::new(),
             cases: Vec::new(),
             variant_cases: Vec::new(),
