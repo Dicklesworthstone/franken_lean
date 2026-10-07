@@ -8,6 +8,7 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 mod do_scopes;
+mod exceptions;
 mod fallback;
 mod if_let;
 use do_scopes::DoScopes;
@@ -32,6 +33,7 @@ enum Plan {
     Match(MatchPlan),
     Conditional(ConditionalPlan),
     Fallback(fallback::FallbackPlan),
+    Try(exceptions::TryPlan),
 }
 impl Plan {
     fn start(&self) -> usize {
@@ -39,6 +41,7 @@ impl Plan {
             Self::Match(p) => p.start,
             Self::Conditional(p) => p.start,
             Self::Fallback(p) => p.start,
+            Self::Try(p) => p.start,
         }
     }
 }
@@ -141,6 +144,7 @@ fn plan(
     let mut conditionals: Vec<ConditionalPlan> = Vec::new();
     let mut lets = Vec::new();
     let mut fallbacks = Vec::new();
+    let mut tries = exceptions::Planner::default();
     let mut done = Vec::new();
     let mut do_scopes = DoScopes::default();
     for at in range.clone() {
@@ -155,6 +159,15 @@ fn plan(
             &active,
             failure.is_some(),
         );
+        tries.before(
+            view,
+            tokens,
+            at,
+            depth,
+            &mut do_scopes,
+            &mut done,
+            range.end,
+        )?;
         fallback::advance(
             view,
             tokens,
@@ -254,6 +267,11 @@ fn plan(
         });
         let mut statement_separator = false;
         match symbol.as_str() {
+            "try" => {
+                let baseline = statement.ok_or_else(|| refuse(view, tokens, at))?;
+                tries.open(view, tokens, at, depth, baseline, &mut do_scopes, range.end)?;
+            }
+            ":" if tries.in_header(at) => {}
             "if" => conditionals.push(ConditionalPlan {
                 statement: statement.is_some(),
                 start: at,
@@ -568,6 +586,7 @@ fn plan(
         close(view, tokens, &mut active, &mut done, range.end)?;
     }
     fallback::finish(&mut fallbacks, &mut done, range.end);
+    tries.finish(&mut done, range.end);
     if !delimiters.is_empty() {
         return Err(refuse(view, tokens, range.end));
     }
@@ -1021,6 +1040,7 @@ fn parse_planned(
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
                     || is_symbol(tokens, at, "match")
+                    || is_symbol(tokens, at, "try")
                     || (opens_do && is_symbol(tokens, at, "|"))
                     || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
                         && is_symbol(tokens, at + 1, "|"))
@@ -1344,6 +1364,9 @@ fn parse_compound(
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     for planned in plan(view, tokens, range.clone(), equations)? {
         match planned {
+            Plan::Try(plan) => {
+                exceptions::build(leaves, view, tokens, plan, grammar, &mut splices, &updates)?;
+            }
             Plan::Fallback(plan) => {
                 fallback::build(leaves, view, tokens, plan, grammar, &mut splices, &updates)?;
             }

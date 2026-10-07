@@ -7,6 +7,7 @@
 use super::*;
 mod conditional;
 mod control;
+mod exceptions;
 mod fallback;
 mod for_loop;
 mod if_let;
@@ -266,6 +267,12 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "doTry"])) {
+            if pattern {
+                return Err(invalid());
+            }
+            return self.expand_do_try(syntax);
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "doUnless"])) {
             if pattern {
                 return Err(invalid());
@@ -341,6 +348,9 @@ impl Context {
         scope: SequenceScope<'_>,
         terminal: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])) {
+            return self.prepend_do_try(element, result, scope, terminal);
+        }
         if control::is_jump(&element) {
             // Never erase unchecked source following an unconditional exit.
             if !terminal {

@@ -77,7 +77,7 @@ pub(super) struct Nested {
 }
 
 impl Context {
-    /// The checked Pure/Bind telescope chooses its still-unknown monad and
+    /// The checked Pure/Bind/exception telescope chooses its still-unknown monad and
     /// result parameters from the written expected application before aliases
     /// such as Id erase that application. This is the same typed parameter
     /// choice as nativeDoPure; it also applies to written Pure.pure calls and
@@ -101,6 +101,8 @@ impl Context {
         };
         if name != &Name::from_components(["Pure", "pure"])
             && name != &Name::from_components(["Bind", "bind"])
+            && name != &Name::from_components(["MonadExcept", "tryCatch"])
+            && name != &Name::from_components(["tryCatchThe"])
         {
             return Ok(());
         }

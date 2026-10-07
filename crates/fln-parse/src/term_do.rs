@@ -25,6 +25,9 @@ pub(super) struct Prefix {
 #[derive(Clone, Copy)]
 enum Statement {
     Action,
+    Try {
+        position: BytePos,
+    },
     Conditional {
         position: BytePos,
     },
@@ -253,6 +256,10 @@ impl Prefix {
             self.statement = Statement::Match {
                 position: original_position(view, tokens, at),
             };
+        } else if word(tokens, at, "try") {
+            self.statement = Statement::Try {
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "if") {
             // The compound planner owns the explicit-else conditional. Its
             // branches are reclassified as do elements after that single parse.
@@ -275,7 +282,7 @@ impl Prefix {
         } else {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
-            for unsupported in ["while", "repeat", "try", "have", "let_expr"] {
+            for unsupported in ["while", "repeat", "catch", "finally", "have", "let_expr"] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
                 }
@@ -352,6 +359,17 @@ impl Prefix {
     ) -> Result<Syntax, NatDefinitionParseError> {
         Ok(match self.statement {
             Statement::Action => do_element(value),
+            Statement::Try { position } => {
+                if !matches!(&value, Syntax::Node {kind, args, ..}
+                    if kind == &parser_kind(&["Term", "doTry"]) && args.len() == 4)
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                value
+            }
             Statement::Conditional { position } => conditional::element(value, position)?,
             Statement::Match { position } => {
                 if !matches!(&value, Syntax::Node { kind, args, .. }

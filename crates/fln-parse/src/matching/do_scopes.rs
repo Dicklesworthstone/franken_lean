@@ -184,6 +184,19 @@ impl DoScopes {
         }
     }
 
+    /// A catch/finally delimiter ends the preceding exception body and any
+    /// unbraced statement branches nested inside it. Braces keep their own
+    /// delimiter discipline and cannot be silently crossed.
+    pub(super) fn end_exception_body(&mut self, start: usize) -> bool {
+        while self.sequences.last().is_some_and(|s| s.introducer >= start) {
+            if self.sequences.last().is_some_and(|s| s.braced) {
+                return false;
+            }
+            self.pop();
+        }
+        true
+    }
+
     pub(super) fn ended(&self, start: usize) -> bool {
         self.ended.contains(&start)
     }
