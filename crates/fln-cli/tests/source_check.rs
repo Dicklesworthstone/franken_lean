@@ -941,21 +941,9 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
     }
 }
 
-/// `examples/native_induction.lean` in pin syntax. The pin refuses the example's bare
-/// `31` at `packed.carrier` ("failed to synthesize OfNat packed.carrier 31"), and so
-/// does FrankenLean, so its ledger row agrees. Written at the unfolded type, `(31 : Nat)`,
-/// the program is valid at the pin and `fln check-source` accepts it. The drop-in
-/// `lean` still refuses it, because its compiler has no dependent record recursor
-/// result for `unpack` (fln-lvdh).
 #[test]
 fn installed_binary_checks_real_induction_and_dependent_case_proofs() {
-    let example = include_str!("../../../examples/native_induction.lean");
-    let bare = "theorem unpack_ok : unpack packed = 31 := by rfl";
-    assert_eq!(example.matches(bare).count(), 1);
-    let path = file(&example.replace(
-        bare,
-        "theorem unpack_ok : unpack packed = (31 : Nat) := by rfl",
-    ));
+    let path = file(include_str!("../../../examples/native_induction.lean"));
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(path)

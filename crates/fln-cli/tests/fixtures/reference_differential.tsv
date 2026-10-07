@@ -63,7 +63,7 @@ examples/native_indexed_elimination.lean	reject	reject	n/a	agree	fixed by z8j.1.
 examples/native_indexed_function_children.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Tree.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
 examples/native_indexed_recursion.lean	accept	accept	match	agree	
 examples/native_indexed_vectors.lean	reject	accept	n/a	fln-defect	Reference 5: code generator does not support recursor `Vec.rec` yet, consider using 'match ... with' and/or structural recursion | executes a recursor-compiled def the Reference refuses to compile (franken_lean-z8j.1.6.6)
-examples/native_induction.lean	reject	reject	n/a	agree	Reference 43: failed to synthesize instance of type class | FrankenLean: command 10, native instance search could not resolve all instance arguments
+examples/native_induction.lean	accept	accept	match	agree	valid Lean since its Package value is compared at the unfolded type (`(31 : Nat)`): a bare numeral at `packed.carrier` has no OfNat instance at the pin ("failed to synthesize", the class of fln-5efd); the drop-in runs `unpack`'s dependent record eliminator since 58a3347d (fln-lvdh)
 examples/native_induction_specialization.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 6: Type mismatch (a named variable at a promoted parameter; was fln-defect, franken_lean-z8j.1.6)
 examples/native_instance_attributes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
 examples/native_instance_factories.lean	accept	accept	match	agree	
