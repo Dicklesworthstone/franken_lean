@@ -569,6 +569,24 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          (the superset differential), both pin-gated. Nothing per commit elaborates against \
          the whole Init, and no coverage row may cite this function as a CI run",
     ),
+    (
+        "crates/fln-olean/tests/ir.rs",
+        "every_ir_file_of_the_pinned_toolchain_decodes_to_what_the_pin_prints",
+        "an on-demand whole-pin lane (bead fln-ir-decoder-call-graph-sjzl): it decodes every \
+         `.ir` file under the pinned toolchain's lib/lean, or under FLN_REFERENCE_LIB, and has \
+         the pinned `lean` print each declaration through scripts/tribunal/ir_dump.lean for a \
+         character-for-character comparison. Its recorded runs (2026-10-07): pinned toolchain \
+         394,720/394,720 declarations equal across 2,431 files (250 s at opt-level 2), and the \
+         Mathlib corpus 317,777/317,777 across 8,265. It launches the pin once per 64 files, so \
+         it never runs per push, and nothing dispatches it. Run it with `cargo test -p fln-olean \
+         --test ir -- --ignored`; the recorded runs set CARGO_PROFILE_TEST_OPT_LEVEL=2, and the \
+         unoptimized time was not measured. What holds the comparison per commit is two real \
+         `.ir` files committed beside the pin's printout of them: \
+         `two_real_ir_files_decode_to_exactly_what_the_pin_prints` (87 declarations, 25 of the \
+         28 IR forms the pin stores), with `the_committed_files_and_printouts_are_the_pins_own` \
+         re-deriving both where the pin is installed. Nothing per commit re-decodes the pin's \
+         other 2,429 files, and no coverage row may cite this function as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -654,7 +672,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// (`bef21b47`), which landed undeclared and kept this suite red. Declared from its own
 /// docstring by the coordinator, stating that nothing per commit compensates, so it may not
 /// be cited as per-commit evidence; its author may supply a stronger entry.
-const IGNORED_PRODUCER_CEILING: usize = 24;
+///
+/// 24 -> 25 for `crates/fln-olean/tests/ir.rs`'s whole-pin `.ir` differential (bead
+/// `fln-ir-decoder-call-graph-sjzl`), declared in the commit that adds it: it launches the
+/// pinned `lean` over 2,431 files, which is minutes, and the entry names the two committed
+/// real files that hold the same comparison per commit.
+const IGNORED_PRODUCER_CEILING: usize = 25;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -2071,7 +2094,11 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=11 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=12 rows=13 citations=14 all-rows-declared=true
+    //
+    // `surfaces` rose 11 -> 12 with the declaration of the whole-pin `.ir` differential in
+    // crates/fln-olean/tests/ir.rs (2026-10-07). `rows` and `citations` are unmoved: no
+    // terminal row cites that surface.
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.

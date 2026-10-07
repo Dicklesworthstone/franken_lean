@@ -40,6 +40,8 @@ pub mod decl;
 pub mod extension_write;
 pub mod format;
 pub mod ilean;
+pub mod ir;
+mod ir_format;
 pub mod pin;
 pub mod rebuild;
 pub mod region;
