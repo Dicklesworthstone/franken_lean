@@ -105,11 +105,14 @@ fn proof_constructor_equalities_do_not_expose_existential_data() {
 }
 
 #[test]
-fn contradiction_descends_nested_constructor_equalities() {
+fn contradiction_decides_closed_nested_equations_but_never_injects_open_ones() {
+    // Closed, with a `Decidable` instance: the pin's `decide` refutes it, so it is accepted.
     check(
         "theorem impossible (h : Nat.succ (Nat.succ 0) = Nat.succ 0) : 7 = 9 := by contradiction",
     );
-    check(
+    // Open, same head constructor on both sides: the pin's `contradiction` neither injects
+    // nor decides it, "Tactic `contradiction` failed" (lean v4.32.0, 2026-10-06).
+    refuse(
         "inductive Tree where\n  | leaf (n : Nat)\n  | branch (a b : Tree)\n theorem impossible (t : Tree) (h : Tree.branch t (Tree.leaf 7) = Tree.branch t (Tree.branch t t)) : 1 = 0 := by contradiction",
     );
 }
@@ -133,8 +136,11 @@ fn contradiction_uses_empty_evidence_and_negated_assumptions() {
     );
 }
 #[test]
-fn contradiction_can_use_an_injected_equality_against_a_negation() {
-    check(
+fn contradiction_does_not_inject_to_reach_a_negation() {
+    // `contradiction` never injects an open equation, so `x = y` is never produced for `ne`.
+    // The pin refuses it: "Tactic `contradiction` failed" (lean v4.32.0, 2026-10-06, measured
+    // with the empty type renamed, since the pin's prelude already declares `Void`).
+    refuse(
         "inductive Void : Prop where\n theorem impossible (x y : Nat) (h : Nat.succ x = Nat.succ y) (ne : (x = y) -> Void) : 1 = 0 := by contradiction",
     );
 }
@@ -202,8 +208,11 @@ fn dependent_field_casts_cannot_equate_unrelated_values_or_erase_obligations() {
     }
 }
 #[test]
-fn contradiction_can_reach_a_dependent_payload_after_checked_cast_reduction() {
-    check(
+fn contradiction_does_not_inject_into_a_record_without_decidable_equality() {
+    // The pin compares only the head constructors (`Package.mk` twice) and, for a closed
+    // hypothesis, tries `decide`, which needs a `Decidable` instance that `Package` lacks:
+    // "Tactic `contradiction` failed" (lean v4.32.0, 2026-10-06).
+    refuse(
         "structure Package where\n  carrier : Type\n  value : carrier\n theorem impossible (h : Package.mk Nat 0 = Package.mk Nat 1) : 7 = 9 := by contradiction",
     );
 }

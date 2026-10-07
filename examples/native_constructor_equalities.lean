@@ -25,6 +25,7 @@ theorem disjoint (h : true = false) : 0 = 1 := by
 
 theorem nested (a b : Nat)
     (h : Chain.cons a Chain.nil = Chain.cons b (Chain.cons 7 Chain.nil)) : 0 = 1 := by
+  injection h with value tail
   contradiction
 
 theorem enormous

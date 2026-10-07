@@ -197,7 +197,10 @@ impl Context {
         }
     }
 
-    fn decision_dictionary(&mut self, proposition: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn decision_dictionary(
+        &mut self,
+        proposition: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let domain = Expr::app(constant("Decidable", vec![]), proposition.clone());
         let dictionary = self.instance_hole(domain)?;
         self.resolve_instances(false)?;

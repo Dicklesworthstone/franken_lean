@@ -36,4 +36,5 @@ theorem proof_fields (A B : Type) (a : A) (b : B) (pa : a = a) (pb : b = b)
 
 theorem impossible
     (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by
+  have e := eq_of_heq h
   contradiction

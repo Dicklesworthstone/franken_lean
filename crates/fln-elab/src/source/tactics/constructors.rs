@@ -1015,7 +1015,19 @@ impl Context {
                 type_: local.type_.clone(),
             })
             .collect();
-        let mut pending: std::collections::VecDeque<_> = original.iter().cloned().collect();
+        // The pin's `contradictionCore` (vendored Lean/Meta/Tactic/Contradiction.lean) refutes
+        // an `Eq` or `HEq` hypothesis by its HEAD constructors only; it never injects into
+        // fields. A nested clash it reaches only through `decide` (`Config.useDecide`,
+        // default true): for a hypothesis with no free variables whose `decide` evaluates
+        // to `false`. `HEq` has no `Decidable` instance, so an `HEq` never gets that far.
+        // So field descent is allowed only from a closed `Eq` hypothesis with a
+        // `Decidable` instance, where a nested clash is exactly a `false` decision.
+        let mut pending = std::collections::VecDeque::new();
+        for local in &original {
+            self.tick()?;
+            let descend = self.contradiction_may_descend(&local.type_)?;
+            pending.push_back((local.clone(), descend));
+        }
         let mut negative = Vec::new();
         for local in &original {
             self.tick()?;
@@ -1045,11 +1057,12 @@ impl Context {
         // Pin every pair whose identities are memoized for this request. A
         // dropped temporary allocation can never be reused as an existing key.
         let mut roots = Vec::new();
-        while let Some(evidence) = pending.pop_front() {
+        while let Some((evidence, descend)) = pending.pop_front() {
             self.tick()?;
             if let Some(result) = self.empty_evidence(&evidence, &goal.target)? {
                 return self.close_proof_goal(goal, result);
             }
+            let heterogeneous = super::equality::heterogeneous_target(&evidence.type_).is_some();
             for (function, domain, body) in &negative {
                 self.tick()?;
                 if self.proof_types_match(&evidence.type_, domain)? {
@@ -1072,12 +1085,24 @@ impl Context {
             let alpha = self.whnf(&alpha)?;
             let left = self.whnf(&left)?;
             let right = self.whnf(&right)?;
-            if !seen.insert((left.allocation_identity(), right.allocation_identity())) {
+            // The kind is part of the key: an `HEq` and an `Eq` between the same two
+            // terms are refuted by different rules, so meeting one must not hide the other
+            // (`have e := eq_of_heq h` shares `h`'s very allocations).
+            if !seen.insert((
+                left.allocation_identity(),
+                right.allocation_identity(),
+                heterogeneous,
+                descend,
+            )) {
                 continue;
             }
             roots.push((left.clone(), right.clone()));
-            if let Some(result) =
-                self.unequal_nat_literals(&evidence, &alpha, &left, &right, &goal.target)?
+            // Two distinct nonzero numerals share the head `Nat.succ`, so the pin refutes
+            // them only by `decide`, which an `HEq` never reaches. Zero against a
+            // successor is a head clash and is handled below for either kind.
+            if !heterogeneous
+                && let Some(result) =
+                    self.unequal_nat_literals(&evidence, &alpha, &left, &right, &goal.target)?
             {
                 return self.close_proof_goal(goal, result);
             }
@@ -1096,17 +1121,42 @@ impl Context {
                 {
                     return self.close_proof_goal(goal, result);
                 }
-            } else {
+            } else if descend {
                 for index in 0..left.fields.len() {
                     self.tick()?;
                     if let Some(proof) =
                         self.constructor_field_equality(&evidence, &family, &left, &right, index)?
                     {
-                        pending.push_back(proof);
+                        pending.push_back((proof, true));
                     }
                 }
             }
         }
         Err(error(TacticError::NoContradiction))
+    }
+
+    /// Whether `contradiction` may inject into a same-constructor equation `ty`: only
+    /// where the pin's `decide` branch would decide it. That needs a closed homogeneous
+    /// equation with a `Decidable` instance. The instance query runs on a clone, so a
+    /// missing instance costs its heartbeats and leaves no other state behind; a
+    /// resource stop still propagates.
+    fn contradiction_may_descend(&mut self, ty: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let ty = self.instantiate(ty)?;
+        if ty.has_fvar() || ty.has_expr_mvar() || ty.has_level_mvar() {
+            return Ok(false);
+        }
+        if super::equality::heterogeneous_target(&ty).is_some() || equality_target(&ty).is_none() {
+            return Ok(false);
+        }
+        let mut trial = self.clone();
+        let decided = trial.decision_dictionary(&ty);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match decided {
+            Ok(_) => Ok(true),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
+                Err(failure(SourceInferenceError::ResourceLimit))
+            }
+            Err(_) => Ok(false),
+        }
     }
 }

@@ -23,6 +23,20 @@ fn check(source: &str) {
         .into_complete()
         .unwrap();
 }
+fn refuse(source: &str) {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    assert!(
+        base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err(),
+        "{source}"
+    );
+    assert_eq!(root, base.logical_root(&KVMap::new()));
+}
 #[test]
 fn subst_orients_equalities_and_finds_named_variables() {
     for tactic in ["subst h", "subst x", "subst y"] {
@@ -267,11 +281,19 @@ fn same_type_heq_can_drive_constructor_injection_and_contradiction() {
     for source in [
         "theorem injected (x y : Nat) (h : HEq (Nat.succ x) (Nat.succ y)) : y = x := by\n  injection h with predecessor\n  exact eq_of_heq (HEq.symm (heq_of_eq predecessor))",
         "theorem impossible (n : Nat) (h : HEq (Nat.succ n) 0) : 0 = 1 := by contradiction",
-        "theorem huge (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by contradiction",
         "theorem combined (x y : Nat) (h : HEq (Nat.succ x) (Nat.succ y)) (hy : y = 0) : x = 0 := by\n  injection h with same\n  subst same\n  exact hy",
     ] {
         check(source);
     }
+    // Two distinct nonzero numerals share the head `Nat.succ`, and an `HEq` never reaches
+    // the pin's `decide`: "Tactic `contradiction` failed" (lean v4.32.0, 2026-10-06). The
+    // same equation as an `Eq` is decided and accepted.
+    refuse(
+        "theorem huge (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by contradiction",
+    );
+    check(
+        "theorem huge (h : HEq 340282366920938463463374607431768211456 340282366920938463463374607431768211457) : 0 = 1 := by\n  have e := eq_of_heq h\n  contradiction",
+    );
 }
 
 #[test]
@@ -389,13 +411,17 @@ fn indexed_constructor_equalities_keep_their_dependent_payload_types() {
 }
 
 #[test]
-fn contradiction_descends_through_constructor_fields_without_using_neutral_ones() {
-    check(
+fn contradiction_compares_head_constructors_only_for_open_equations() {
+    // Both are open with the same head constructor on each side, so the pin's
+    // `contradiction` neither injects nor decides them: "Tactic `contradiction` failed"
+    // (lean v4.32.0, 2026-10-06). These are the old forms of the
+    // examples/native_constructor_equalit{y,ies}.lean theorems, which now inject first.
+    for source in [
         "inductive Chain where\n  | nil\n  | cons (value : Nat) (tail : Chain)\ntheorem nested (a b : Nat) (h : Chain.cons a (Chain.cons 7 Chain.nil) = Chain.cons b Chain.nil) : 0 = 1 := by\n  contradiction",
-    );
-    check(
         "theorem nested (n : Nat) (h : Nat.succ (Nat.succ n) = Nat.succ 0) : 0 = 1 := by\n  contradiction",
-    );
+    ] {
+        refuse(source);
+    }
 }
 
 #[test]
