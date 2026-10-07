@@ -238,6 +238,52 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            false,
+        )
+    }
+
+    /// Compile and run ordinary Lean source modules, including the implicit
+    /// `Init` dependency of every module that does not declare `prelude`.
+    /// `Init` must be supplied by this receipt or the source graph; the method
+    /// never installs a seed or obtains authority from the public reports.
+    ///
+    /// The implicit import is a graph edge, not a change to the source bytes.
+    /// Source budgets and diagnostic positions refer to the original input.
+    /// Execution, import isolation and cancellation follow
+    /// [`Self::execute_source_modules`].
+    pub fn execute_lean_source_modules(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            true,
+        )
+    }
+
+    fn execute_source_modules_with_implicit_init(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        implicit_init: bool,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                 "source-program/before-plan",
@@ -249,11 +295,12 @@ impl imported::SourceOleanImport {
             bytes: 0,
             limits: limits.modules,
         };
-        let plan = graph::Plan::new(
+        let plan = graph::Plan::with_implicit_init(
             modules,
             entry,
             self.contexts.complete.imported_modules(),
             &mut meter,
+            implicit_init,
         )?;
         let mut exports = BTreeMap::<usize, replay::Export>::new();
         let mut completed_modules = Vec::new();

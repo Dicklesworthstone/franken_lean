@@ -319,6 +319,186 @@ fn explicit_prelude_programs_start_in_a_genuinely_empty_import_world() {
 }
 
 #[test]
+fn ordinary_execution_imports_init_for_each_module_without_rewriting_source() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let options = KVMap::new();
+            let imported = SourceOleanImport::empty(&options);
+            let original = imported.engine.logical_root(&options);
+            let names = [name("Main"), name("Right"), name("Init"), name("Left")];
+            let sources = [
+                "\u{feff}import Left\r\nimport Right\r\n#check Token\r\n#eval left\r\n#eval right\r\n",
+                "def right : Token := token\n#eval right\n",
+                "prelude\ninductive Token where\n  | off\n  | on\ndef token : Token := Token.on\n",
+                "def left : Token := token\n",
+            ];
+            let modules: Vec<_> = names
+                .iter()
+                .zip(&sources)
+                .map(|(name, source)| SourceModuleInput {
+                    name,
+                    source: source.as_bytes(),
+                })
+                .collect();
+            let mut exact = limits();
+            exact.modules.source.max_bytes = sources.iter().map(|source| source.len()).sum();
+            exact.modules.max_imports = 5;
+            let first = imported
+                .execute_lean_source_modules(&modules, &names[0], &options, exact, None)
+                .expect("all ordinary modules receive their actual Init import")
+                .into_complete()
+                .unwrap();
+            let token_values = |program: &SourceProgramExecution| {
+                program.modules.iter().map(|module| {
+                    module.commands.batch.source_evaluation_indices.iter().map(|&index| {
+                        let fln::VmExit::Returned(returned) = &module.commands.batch.executions[index].exit else {
+                            panic!("the imported Token value must return");
+                        };
+                        assert!(!returned.value.is_scalar());
+                        returned.value.header().tag
+                    }).collect::<Vec<_>>()
+                }).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                first.modules.iter().map(|module| &module.module).collect::<Vec<_>>(),
+                [&names[2], &names[3], &names[1], &names[0]]
+            );
+            assert_eq!(token_values(&first), [vec![], vec![], vec![1], vec![1, 1]]);
+            assert_eq!(first.modules[3].commands.checks.len(), 1);
+            assert!(!first.modules[2].commands.batch.engine.environment().contains(&name("left")));
+            assert!(!first.modules[0].commands.batch.engine.environment().contains(&name("Nat")));
+
+            // The explicit-import API retains its contract: it cannot reach
+            // this Init source unless a source header actually imports it.
+            assert!(matches!(
+                imported.execute_source_modules(&modules, &names[0], &options, exact, None),
+                Err(fln::source_check::modules::SourceModuleCheckError::UnreachableModule(module))
+                    if module == names[2]
+            ));
+            let mut fewer_imports = exact;
+            fewer_imports.modules.max_imports = 4;
+            let mut fewer_bytes = exact;
+            fewer_bytes.modules.source.max_bytes -= 1;
+            for restricted in [fewer_imports, fewer_bytes] {
+                let error = imported
+                    .execute_lean_source_modules(&modules, &names[0], &options, restricted, None)
+                    .expect_err("both implicit imports and original source bytes are charged");
+                assert_eq!(error.disposition(), ("resource", false, 3), "{error:?}");
+            }
+
+            // A non-prelude sibling gets Init, but still cannot see another
+            // sibling's declarations merely because their entry imports both.
+            let mut leaking = modules.clone();
+            leaking[1].source = b"def right : Token := left\n";
+            assert!(matches!(
+                imported.execute_lean_source_modules(&leaking, &names[0], &options, limits(), None),
+                Err(fln::source_check::modules::SourceModuleCheckError::Source { module, .. })
+                    if module == names[1]
+            ));
+            // `prelude` on that same sibling removes its implicit dependency;
+            // Init being present elsewhere must not make Token ambient.
+            let mut explicit_prelude = modules.clone();
+            explicit_prelude[1].source = b"prelude\ndef right : Token := Token.on\n";
+            assert!(matches!(
+                imported.execute_lean_source_modules(&explicit_prelude, &names[0], &options, limits(), None),
+                Err(fln::source_check::modules::SourceModuleCheckError::Source { module, .. })
+                    if module == names[1]
+            ));
+
+            let bad = "\u{feff}import Left\r\nimport Right\r\n#check Token\r\n#check unknownToken\r\n";
+            let mut invalid = modules.clone();
+            invalid[0].source = bad.as_bytes();
+            let error = imported
+                .execute_lean_source_modules(&invalid, &names[0], &options, limits(), None)
+                .unwrap_err();
+            match error {
+                fln::source_check::modules::SourceModuleCheckError::Source {
+                    module,
+                    error: fln::SourceCheckError::Command { command, offset, .. },
+                } => {
+                    assert_eq!(module, names[0]);
+                    assert_eq!(command, 1);
+                    assert_eq!(offset, bad.find("#check unknownToken").unwrap());
+                }
+                other => panic!("the diagnostic must retain the original source position: {other:?}"),
+            }
+            let retry = imported
+                .execute_lean_source_modules(&modules, &names[0], &options, exact, None)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(token_values(&retry), token_values(&first));
+            for (before, after) in first.modules.iter().zip(&retry.modules) {
+                assert_eq!(
+                    before.commands.batch.engine.logical_root(&options),
+                    after.commands.batch.engine.logical_root(&options)
+                );
+                for (before, after) in before.commands.batch.executions.iter().zip(&after.commands.batch.executions) {
+                    assert_eq!(before.flbc_artifact, after.flbc_artifact);
+                }
+            }
+            assert_eq!(imported.engine.logical_root(&options), original);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn ordinary_execution_requires_init_and_preserves_empty_prelude_worlds() {
+    let options = KVMap::new();
+    let imported = SourceOleanImport::empty(&options);
+    let original = imported.engine.logical_root(&options);
+    let entry = name("Main");
+    let modules = [SourceModuleInput {
+        name: &entry,
+        source: b"",
+    }];
+    let error = imported
+        .execute_lean_source_modules(&modules, &entry, &options, limits(), None)
+        .expect_err("even a headerless empty file needs its real Init dependency");
+    assert_eq!(error.disposition(), ("input", false, 1));
+    assert!(matches!(
+        error,
+        fln::source_check::modules::SourceModuleCheckError::MissingModule { importer, module }
+            if importer == entry && module == name("Init")
+    ));
+    struct Cancelled;
+    impl fln::CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    assert!(matches!(
+        imported
+            .execute_lean_source_modules(&modules, &entry, &options, limits(), Some(&Cancelled))
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    let prelude = [SourceModuleInput {
+        name: &entry,
+        source: b"prelude\n",
+    }];
+    let first = imported
+        .execute_lean_source_modules(&prelude, &entry, &options, limits(), None)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(first.modules.len(), 1);
+    assert_eq!(first.modules[0].commands.command_count, 0);
+    assert!(
+        first.modules[0]
+            .commands
+            .batch
+            .engine
+            .environment()
+            .is_empty()
+    );
+    assert_eq!(imported.engine.logical_root(&options), original);
+}
+
+#[test]
 fn execution_preflight_accepts_queries_and_rebases_bad_source_before_import_admission() {
     let entry = name("Main");
     let valid =
