@@ -889,8 +889,10 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
         state: ClaimState::Targeted,
         evidence: "REPAIRED 2026-10-05 (bead franken_lean-z8j.1.19). The PG-5 row justified \
                    its waiver partly by saying CI installs no Reference toolchain. The weekly \
-                   .github/workflows/contract-drift.yml lane installs the pin with elan, as \
-                   AGENTS.md already records. The waiver now rests on cost alone: a weekly \
+                   .github/workflows/contract-drift.yml workflow installs the pin with elan, as \
+                   AGENTS.md already records. Since 74f88388 it does so in two jobs: \
+                   contract-drift, and pin-gated-differentials, which runs the pin-gated \
+                   differentials terminal coverage rows cite. The waiver now rests on cost alone: a weekly \
                    window is not per-commit coverage. The doc comment on the expiry test in \
                    crates/fln-conformance/tests/kernel_replay.rs still repeats the old reason.",
         enforcement: Enforcement::Enforced,
@@ -1213,7 +1215,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
         Citation::OccursExactly {
             path: ".github/workflows/contract-drift.yml",
             needle: "elan toolchain install \"leanprover/lean4:$PIN_TAG\"",
-            count: 1,
+            count: 2,
         },
     ),
 ];
