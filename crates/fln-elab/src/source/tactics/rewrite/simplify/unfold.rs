@@ -47,20 +47,15 @@ impl Context {
 
     /// Selection respects local shadowing. A local proof/parameter with this
     /// name must not accidentally request expansion of a same-named global.
+    /// Only a bare identifier is an unfolding request, as at the pin: `(f)` is a
+    /// term rule (`simp_rule_global`).
     pub(super) fn unfold_simp_term(
         &mut self,
-        mut syntax: &Syntax,
+        syntax: &Syntax,
         reverse: bool,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
-        loop {
-            self.tick()?;
-            if let Some(inner) = parenthesized_inner(syntax)? {
-                syntax = inner;
-            } else {
-                break;
-            }
-        }
+        self.tick()?;
         let Syntax::Ident { val: name, .. } = syntax else {
             return Ok(UnfoldResult::NotDefinition);
         };

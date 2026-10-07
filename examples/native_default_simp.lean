@@ -23,7 +23,7 @@ theorem restored (n : Nat) : wrap n = n := by
   simp [-unwrap, unwrap]
 
 theorem scopedUnfold (n : Nat) : wrap n = n := by
-  simp [-unwrap, (wrap)]
+  simp [-unwrap, wrap]
 
 theorem recovered (n : Nat) : wrap n = n := by
   first | simp [-unwrap] | simp

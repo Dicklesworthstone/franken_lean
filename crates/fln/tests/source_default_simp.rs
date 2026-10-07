@@ -213,7 +213,6 @@ fn per_call_erasures_and_readditions_follow_argument_order_without_changing_defa
         "simp [-unwrap]",
         "simp [unwrap, -unwrap]",
         "simp only [unwrap, -unwrap]",
-        "simp only [(unwrap), -unwrap]",
         "simp [-unwrap, unwrap, -unwrap]",
     ] {
         refused(
@@ -239,6 +238,37 @@ fn per_call_erasures_and_readditions_follow_argument_order_without_changing_defa
         assert_eq!(simp::read(result.engine.environment()).unwrap(), before);
     }
     assert_eq!(simp::read(base.environment()).unwrap(), before);
+}
+
+/// Only a bare identifier names a declaration in a simp argument; a parenthesized one is a
+/// term rule, as at the pin (`resolveSimpIdTheorem?` matches `$id:ident`; bead
+/// `franken_lean-jxw`). Each verdict below is the pinned Reference's, measured on 2026-10-07:
+/// `-unwrap` does not erase the term rule `(unwrap)`, and `(wrap)`, a term whose type is not a
+/// proposition, is refused ("Invalid simp theorem: Expected a proposition") where the bare
+/// `wrap` is unfolded.
+#[test]
+fn a_parenthesized_simp_argument_is_a_term_rule_not_a_declaration() {
+    let base = checked(&engine(), &[WRAP, "attribute [simp] unwrap"]).engine;
+    checked(
+        &base,
+        &["theorem kept (n : Nat) : wrap (wrap n) = n := by simp only [(unwrap), -unwrap]"],
+    );
+    let error = base
+        .check_source_files(
+            &["theorem paren (n : Nat) : wrap n = n := by simp only [(wrap)]".as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("a parenthesized definition is not a proposition")
+        .to_string();
+    assert!(
+        error.contains("Invalid simp theorem: Expected a proposition"),
+        "{error}"
+    );
+    checked(
+        &base,
+        &["theorem bare (n : Nat) : wrap n = n := by simp only [wrap]"],
+    );
 }
 
 #[test]
@@ -272,8 +302,17 @@ fn scoped_erasure_and_explicit_unfolding_use_normal_source_resolution() {
         end A\nopen A\n\
         theorem opened (n : Nat) : «wrap.x» n = n := by simp [-«unwrap.x», «wrap.x»]\n\
         theorem atRoot (n : Nat) : «wrap.x» n = n := by simp [-_root_.A.«unwrap.x», A.«unwrap.x»]\n\
-        theorem higher (T : Type) : «wrap.x» T = T := by simp only [«wrap.x»]\n\
-        theorem grouped (n : Nat) : «wrap.x» n = n := by simp only [((«wrap.x»))]"],
+        theorem higher (T : Type) : «wrap.x» T = T := by simp only [«wrap.x»]"],
+    );
+    // Grouping makes a term, not a declaration: the pin refuses `((«wrap.x»))` as a simp
+    // theorem (measured 2026-10-07; bead `franken_lean-jxw`).
+    refused(
+        &checked(
+            &engine(),
+            &["namespace A\ndef «wrap.x».{u} {T : Sort u} (x : T) : T := x\nend A\nopen A"],
+        )
+        .engine,
+        "theorem grouped (n : Nat) : «wrap.x» n = n := by simp only [((«wrap.x»))]",
     );
     let base = checked(
         &engine(),

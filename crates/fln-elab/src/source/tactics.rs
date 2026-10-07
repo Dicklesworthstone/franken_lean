@@ -28,6 +28,9 @@ pub enum TacticError {
     ExplicitFailure,
     ExpectedGoal,
     ExpectedProposition,
+    /// A non-identifier simp argument whose type does not conclude in a proposition (the
+    /// pin's `checkTypeIsProp`).
+    InvalidSimpTheorem,
     DecisionNotTrue,
     NoGoals,
     UnsolvedGoals {
@@ -84,6 +87,9 @@ impl std::fmt::Display for TacticError {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
             Self::ExpectedProposition => write!(f, "decision requires a proposition"),
+            Self::InvalidSimpTheorem => {
+                write!(f, "Invalid simp theorem: Expected a proposition")
+            }
             Self::DecisionNotTrue => write!(f, "decision did not reduce to a proof of the goal"),
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),

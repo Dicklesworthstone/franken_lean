@@ -55,13 +55,15 @@ fn installed_simp_exclusions_are_per_call_and_failed_files_publish_nothing() {
         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\nend N";
     let use_source = "open N\n\
         theorem restored (n : Nat) : wrap n = n := by simp [-unwrap, unwrap]\n\
-        theorem unfold (n : Nat) : wrap n = n := by simp only [(wrap)]\n\
+        theorem unfold (n : Nat) : wrap n = n := by simp only [wrap]\n\
         theorem retained (n : Nat) : wrap (wrap n) = n := by simp";
     std::fs::write(&library, library_source).unwrap();
     std::fs::write(&use_rules, use_source).unwrap();
     for bad in [
         "theorem excluded (n : Nat) : N.wrap n = n := by simp [-N.unwrap]",
         "theorem unknown (n : Nat) : n = n := by simp [-N.missing]",
+        // A parenthesized definition is a term, not an unfolding request (pin: Invalid simp theorem).
+        "theorem paren (n : Nat) : N.wrap n = n := by simp only [(N.wrap)]",
         "@[simp] theorem falseProof : (0 : Nat) = 1 := by rfl",
     ] {
         std::fs::write(&invalid, bad).unwrap();

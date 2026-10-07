@@ -143,32 +143,60 @@ impl Context {
 
     /// Keep the origin of a bare global selection while assembling this call's
     /// rule set. Applied lemmas have their own expression origin: erasing the
-    /// global does not erase an explicitly instantiated proof. Parentheses do
-    /// not change identity, and local shadowing follows ordinary term lookup.
+    /// global does not erase an explicitly instantiated proof. Only a bare
+    /// identifier selects a global: the pin's `resolveSimpIdTheorem?` matches
+    /// `$id:ident`, so `(f)` is an ordinary term rule (bead `franken_lean-jxw`'s
+    /// `native_default_simp` row). Local shadowing follows ordinary term lookup.
     fn simp_rule_global(
         &mut self,
-        mut syntax: &Syntax,
+        syntax: &Syntax,
     ) -> Result<Option<Name>, NatDefinitionElabError> {
-        loop {
-            self.tick()?;
-            if let Some(inner) = parenthesized_inner(syntax)? {
-                syntax = inner;
-                continue;
+        self.tick()?;
+        let Syntax::Ident { val, .. } = syntax else {
+            return Ok(None);
+        };
+        if self.txn.lctx.find_by_user_name(val).is_some() {
+            return Ok(None);
+        }
+        let resolved = self
+            .resolve_source_name(val)?
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
+        Ok((self.txn.lctx.find_by_user_name(&resolved).is_none()
+            && self.txn.env.contains(&resolved))
+        .then_some(resolved))
+    }
+
+    /// The pin elaborates a non-identifier simp argument as a theorem at once
+    /// (`elabSimpTheorem`) and refuses it unless its type is a proposition under
+    /// its binders (`checkTypeIsProp`: "Invalid simp theorem: Expected a
+    /// proposition"). A pi type is a proposition exactly when its sort is `Prop`,
+    /// so the sort of the term's type decides; a level that does not normalize to
+    /// zero is not a proposition there either. A term this trial cannot elaborate
+    /// keeps the per-use path, which refuses or skips it as before.
+    fn check_simp_term_is_proposition(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut trial = self.rewrite_trial();
+        let sort = (|| -> Result<Option<Expr>, NatDefinitionElabError> {
+            let term = trial.term(syntax, None)?;
+            trial.flush(false)?;
+            let type_ = trial.instantiate(&term.type_)?;
+            let Some(sort) = trial.known_type(&type_)? else {
+                return Ok(None);
+            };
+            let sort = trial.whnf(&sort)?;
+            Ok(Some(trial.instantiate(&sort)?))
+        })();
+        self.charge_rewrite_trial(&trial);
+        let Ok(Some(sort)) = sort else {
+            return Ok(());
+        };
+        match sort.node() {
+            ExprNode::Sort { level } if !level.normalize().is_zero() => {
+                Err(error(TacticError::InvalidSimpTheorem))
             }
-            match syntax {
-                Syntax::Ident { val, .. } => {
-                    if self.txn.lctx.find_by_user_name(val).is_some() {
-                        return Ok(None);
-                    }
-                    let resolved = self.resolve_source_name(val)?.ok_or_else(|| {
-                        failure(SourceInferenceError::UnknownConstant(val.clone()))
-                    })?;
-                    return Ok((self.txn.lctx.find_by_user_name(&resolved).is_none()
-                        && self.txn.env.contains(&resolved))
-                    .then_some(resolved));
-                }
-                _ => return Ok(None),
-            }
+            _ => Ok(()),
         }
     }
 
@@ -370,6 +398,9 @@ impl Context {
                 }
             }
             let origin = self.simp_rule_global(&parts[2])?;
+            if !matches!(parts[2], Syntax::Ident { .. }) {
+                self.check_simp_term_is_proposition(&parts[2])?;
+            }
             if let Some(name) = &origin {
                 // One selected direction per named rule. In particular,
                 // `simp [← lemma]` must not retain the default forward rule.
