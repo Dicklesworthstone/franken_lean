@@ -75,9 +75,14 @@ fn an_implicit_recursor_motive_is_computed_from_the_expected_type() {
     ] {
         accepted(&source);
     }
-    // The motive is right, so a false computation is a kernel rejection.
+    // The motive is right, so a false computation fails only at its `rfl`, which is
+    // refused while elaborating, as at the pin ("Tactic `rfl` failed: The left-hand side
+    // … is not definitionally equal …", v4.32.0, measured 2026-10-07).
     let wrong = refused(&format!("{CHAIN}theorem count : {term} = 2 := by rfl"));
-    assert!(wrong.contains("kernel"), "{wrong}");
+    assert!(
+        wrong.contains("elaboration refused source") && wrong.contains("not definitionally equal"),
+        "{wrong}"
+    );
 }
 
 /// `mkMotive` abstracts the major premise (and the indices) out of the
