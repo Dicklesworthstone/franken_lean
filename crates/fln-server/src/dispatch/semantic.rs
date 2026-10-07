@@ -3,6 +3,7 @@
 use super::*;
 use std::ops::Range;
 mod completion;
+pub mod index;
 pub use completion::CompletionItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

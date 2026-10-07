@@ -19,13 +19,26 @@ pub trait WorkspaceChecker {
         Ok(None)
     }
 
+    /// The revision covers the entire accepted editor world, including import
+    /// invalidations and saves whose client version is unchanged. Cache-aware
+    /// providers may use `semantic::index::SemanticIndex`; existing native query
+    /// implementations keep their behavior through this default adapter.
+    fn query_with_revision(
+        &mut self,
+        query: semantic::Query<'_>,
+        _: &semantic::index::Revision,
+        documents: &[OpenDocumentSource<'_>],
+    ) -> Result<Option<semantic::Answer>, String> {
+        self.query(query, documents)
+    }
+
     fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
     fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
 }
 
-struct Adapter<'a>(&'a mut dyn WorkspaceChecker);
+struct Adapter<'a>(&'a mut dyn WorkspaceChecker, semantic::index::Revision);
 impl CheckSource for Adapter<'_> {
     fn semantic_queries(&self) -> bool {
         self.0.semantic_queries()
@@ -35,7 +48,7 @@ impl CheckSource for Adapter<'_> {
         query: semantic::Query<'_>,
         documents: &[OpenDocumentSource<'_>],
     ) -> Result<Option<semantic::Answer>, String> {
-        self.0.query(query, documents)
+        self.0.query_with_revision(query, &self.1, documents)
     }
 
     fn check(
@@ -44,6 +57,9 @@ impl CheckSource for Adapter<'_> {
         text: &str,
         documents: &[OpenDocumentSource<'_>],
     ) -> Vec<String> {
+        // A same-version save is still a new editor world. Conservatively renew
+        // on every check, including checks of reverse-dependent documents.
+        self.1 = semantic::index::Revision::new();
         self.0.check(uri, text, documents)
     }
     fn tracks_dependencies(&self) -> bool {
@@ -54,6 +70,9 @@ impl CheckSource for Adapter<'_> {
         changed: &[String],
         documents: &[OpenDocumentSource<'_>],
     ) -> Vec<String> {
+        // Close/invalidation and watched-file events may trigger no check at
+        // all. They must still retire answers from the previous dependency world.
+        self.1 = semantic::index::Revision::new();
         self.0.affected(changed, documents)
     }
 }
@@ -66,7 +85,8 @@ pub fn serve_workspace(
     output: &mut dyn Write,
     checker: &mut dyn WorkspaceChecker,
 ) -> io::Result<ServerOutcome> {
-    super::serve_inner(input, output, &mut Adapter(checker))
+    let revision = semantic::index::Revision::new();
+    super::serve_inner(input, output, &mut Adapter(checker, revision))
 }
 
 /// Only bounded URI/version/availability metadata is copied, never source text.
@@ -320,3 +340,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "workspace/semantic_tests.rs"]
+mod semantic_tests;
