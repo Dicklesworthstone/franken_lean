@@ -21,3 +21,6 @@ fln-server = { path = "../fln-server" }
 fln-syntax = { path = "../fln-syntax" }
 fln-verdict = { path = "../fln-verdict" }
 fln-vm = { path = "../fln-vm" }
+
+[dev-dependencies]
+fln-libm = { path = "../fln-libm" }

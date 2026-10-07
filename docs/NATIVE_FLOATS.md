@@ -58,6 +58,16 @@ The source bridge supplies separate `Float`, `Float32`, `UInt32`, and `UInt64`
 representations. Floating-point arithmetic, negation, absolute value,
 classifications, supported comparisons, precision conversions, bit conversions,
 unsigned integer conversions, and `toString` route to their native VM operations.
+The unary math surface — `sqrt`, `ceil`, `floor`, `round`, `sin`, `cos`, `tan`,
+`asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`,
+`exp`, `exp2`, `log`, `log2`, `log10`, `cbrt` — and the binary `pow` and
+`atan2` (argument order `atan2 (y x)`, as in the pin) execute on `fln-libm`,
+the owned deterministic numerics plane (plan §6.8, D21), at each width's own
+precision. Results are therefore bit-identical across hosts by construction and
+are **not** claimed to match the pin's platform-libm bits ULP-for-ULP; a
+domain-edge input (for example `Float.log (-1.0)`) yields the canonical NaN
+value, never a refusal. `Float.frExp` (pair result) and `Float.scaleB` (an
+`Int` exponent) remain unsupported and refuse typed.
 Values can be passed to source functions, reused in locals, selected by branches,
 and captured by closures. Printing uses each value's actual runtime type; the
 numeric bit payload alone does not determine its display.

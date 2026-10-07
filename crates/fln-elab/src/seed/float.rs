@@ -96,13 +96,28 @@ pub fn float_seed_declarations() -> Vec<Declaration> {
                 c(scalar, &[]),
             ));
         }
-        for operation in ["neg", "abs", "sqrt", "ceil", "floor", "round"] {
+        for operation in [
+            "neg", "abs", "sqrt", "ceil", "floor", "round", "sin", "cos", "tan", "asin", "acos",
+            "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "log",
+            "log2", "log10", "cbrt",
+        ] {
             declarations.push(signature(
                 &format!("{scalar}.{operation}"),
                 &[("a", scalar)],
                 c(scalar, &[]),
             ));
         }
+        declarations.push(signature(
+            &format!("{scalar}.pow"),
+            &[("a", scalar), ("b", scalar)],
+            c(scalar, &[]),
+        ));
+        // The pin declares `atan2 (y x : Float)`: y is the first parameter.
+        declarations.push(signature(
+            &format!("{scalar}.atan2"),
+            &[("y", scalar), ("x", scalar)],
+            c(scalar, &[]),
+        ));
         declarations.push(signature(
             &format!("{scalar}.beq"),
             &[("a", scalar), ("b", scalar)],

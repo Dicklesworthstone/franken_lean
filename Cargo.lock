@@ -13,6 +13,7 @@ dependencies = [
  "fln-env",
  "fln-hash",
  "fln-kernel",
+ "fln-libm",
  "fln-olean",
  "fln-parse",
  "fln-rt",
@@ -265,6 +266,7 @@ dependencies = [
  "fln-comp",
  "fln-core",
  "fln-hash",
+ "fln-libm",
  "fln-rt",
 ]
 

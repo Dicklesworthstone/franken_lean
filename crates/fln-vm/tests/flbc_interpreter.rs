@@ -10704,6 +10704,198 @@ fn float_intrinsics_execute_ieee_arithmetic_at_each_native_precision() {
 }
 
 #[test]
+fn float_unary_math_and_pow_atan2_execute_on_the_owned_numerics_plane() {
+    let _guard = lock();
+    // IEEE-exact rows: these goldens are definitional, independent of any
+    // libm, so they anchor the plane absolutely.
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        for (operation, input, expected) in [
+            ("sqrt", 4.0, 2.0_f64),
+            ("sqrt", 2.25, 1.5),
+            ("sqrt", -1.0, f64::NAN),
+            ("ceil", 2.1, 3.0),
+            ("ceil", -2.9, -2.0),
+            ("floor", 2.9, 2.0),
+            ("floor", -2.1, -3.0),
+            // Ties away from zero: the pin's extern symbol is C `round`.
+            ("round", 2.5, 3.0),
+            ("round", -2.5, -3.0),
+            ("round", 2.4, 2.0),
+        ] {
+            let value = run_float(
+                &format!("extern:{family}.{operation}"),
+                vec![float_operand(r(0), binary32, input)],
+                true,
+            );
+            let actual = float_contents(&value, binary32);
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "{family}.{operation}({input})");
+            } else {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{family}.{operation}({input})"
+                );
+            }
+        }
+    }
+    // Transcendental rows return fln-libm's exact bits at the row's own
+    // precision — the owned plane is the semantics owner (§6.8, D21). The
+    // window assertion keeps the wiring check from being purely circular,
+    // and the Float32 comparison fails if a row evaluates at the wrong width.
+    for (operation, input, low, high) in [
+        ("sin", 1.0, 0.841, 0.842),
+        ("cos", 1.0, 0.540, 0.541),
+        ("tan", 1.0, 1.557, 1.558),
+        ("asin", 0.5, 0.523, 0.524),
+        ("acos", 0.5, 1.047, 1.048),
+        ("atan", 1.0, 0.785, 0.786),
+        ("sinh", 1.0, 1.175, 1.176),
+        ("cosh", 1.0, 1.543, 1.544),
+        ("tanh", 1.0, 0.761, 0.762),
+        ("asinh", 1.0, 0.881, 0.882),
+        ("acosh", 2.0, 1.316, 1.317),
+        ("atanh", 0.5, 0.549, 0.550),
+        (
+            "exp",
+            1.0,
+            std::f64::consts::E - 1e-3,
+            std::f64::consts::E + 1e-3,
+        ),
+        ("exp2", 1.5, 2.828, 2.829),
+        ("log", 2.0, 0.693, 0.694),
+        ("log2", 5.0, 2.321, 2.322),
+        ("log10", 5.0, 0.698, 0.699),
+        ("cbrt", 2.0, 1.259, 1.260),
+    ] {
+        let wide = run_float(
+            &format!("extern:Float.{operation}"),
+            vec![float_operand(r(0), false, input)],
+            true,
+        );
+        let wide = float_contents(&wide, false);
+        assert!(
+            low < wide && wide < high,
+            "Float.{operation}({input}) = {wide}"
+        );
+        let owned = match operation {
+            "sin" => fln_libm::sin(input),
+            "cos" => fln_libm::cos(input),
+            "tan" => fln_libm::tan(input),
+            "asin" => fln_libm::asin(input),
+            "acos" => fln_libm::acos(input),
+            "atan" => fln_libm::atan(input),
+            "sinh" => fln_libm::sinh(input),
+            "cosh" => fln_libm::cosh(input),
+            "tanh" => fln_libm::tanh(input),
+            "asinh" => fln_libm::asinh(input),
+            "acosh" => fln_libm::acosh(input),
+            "atanh" => fln_libm::atanh(input),
+            "exp" => fln_libm::exp(input),
+            "exp2" => fln_libm::exp2(input),
+            "log" => fln_libm::log(input),
+            "log2" => fln_libm::log2(input),
+            "log10" => fln_libm::log10(input),
+            "cbrt" => fln_libm::cbrt(input),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            wide.to_bits(),
+            owned.to_bits(),
+            "Float.{operation}({input})"
+        );
+        let narrow = run_float(
+            &format!("extern:Float32.{operation}"),
+            vec![float_operand(r(0), true, input)],
+            true,
+        );
+        let narrow = float_contents(&narrow, true);
+        let owned32 = match operation {
+            "sin" => fln_libm::f32::sin(input as f32),
+            "cos" => fln_libm::f32::cos(input as f32),
+            "tan" => fln_libm::f32::tan(input as f32),
+            "asin" => fln_libm::f32::asin(input as f32),
+            "acos" => fln_libm::f32::acos(input as f32),
+            "atan" => fln_libm::f32::atan(input as f32),
+            "sinh" => fln_libm::f32::sinh(input as f32),
+            "cosh" => fln_libm::f32::cosh(input as f32),
+            "tanh" => fln_libm::f32::tanh(input as f32),
+            "asinh" => fln_libm::f32::asinh(input as f32),
+            "acosh" => fln_libm::f32::acosh(input as f32),
+            "atanh" => fln_libm::f32::atanh(input as f32),
+            "exp" => fln_libm::f32::exp(input as f32),
+            "exp2" => fln_libm::f32::exp2(input as f32),
+            "log" => fln_libm::f32::log(input as f32),
+            "log2" => fln_libm::f32::log2(input as f32),
+            "log10" => fln_libm::f32::log10(input as f32),
+            "cbrt" => fln_libm::f32::cbrt(input as f32),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            narrow.to_bits(),
+            f64::from(owned32).to_bits(),
+            "Float32.{operation}({input})"
+        );
+    }
+    // Domain edges leave the real line: the result is NaN, not a refusal.
+    for (operation, input) in [("log", -1.0), ("acosh", 0.5), ("atanh", 2.0), ("asin", 2.0)] {
+        let value = run_float(
+            &format!("extern:Float.{operation}"),
+            vec![float_operand(r(0), false, input)],
+            true,
+        );
+        assert!(
+            float_contents(&value, false).is_nan(),
+            "Float.{operation}({input})"
+        );
+    }
+    // pow(2, 10) is exact at both widths.
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let value = run_float(
+            &format!("extern:{family}.pow"),
+            vec![
+                float_operand(r(0), binary32, 2.0),
+                float_operand(r(1), binary32, 10.0),
+            ],
+            true,
+        );
+        assert_eq!(
+            float_contents(&value, binary32).to_bits(),
+            1024.0_f64.to_bits()
+        );
+    }
+    // atan2's first argument is y, as in the pin's `atan2 (y x : Float)`:
+    // atan2(1, 0) = +pi/2, while the swapped reading would give 0.
+    let quadrant = run_float(
+        "extern:Float.atan2",
+        vec![
+            float_operand(r(0), false, 1.0),
+            float_operand(r(1), false, 0.0),
+        ],
+        true,
+    );
+    let quadrant = float_contents(&quadrant, false);
+    assert!(
+        (quadrant - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
+        "atan2(y=1, x=0) = {quadrant}"
+    );
+    assert_eq!(quadrant.to_bits(), fln_libm::atan2(1.0, 0.0).to_bits());
+    // frExp and scaleB stay out of this adapter's shape: still a typed refusal.
+    let refusal = float_program(
+        "extern:Float.frExp",
+        vec![float_operand(r(0), false, 1.5)],
+        true,
+    );
+    assert!(matches!(
+        execute(&refusal, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::UnsupportedIntrinsic { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
 fn float_intrinsics_compare_nan_and_signed_zero_without_total_ordering() {
     let _guard = lock();
     for (family, binary32) in [("Float", false), ("Float32", true)] {

@@ -9324,8 +9324,16 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             };
             let floating = matches!(scalar, ValueType::Float | ValueType::Float32);
             match operation {
-                "add" | "sub" | "mul" | "div" if floating => (vec![scalar, scalar], scalar, None),
-                "neg" | "abs" if floating => (vec![scalar], scalar, None),
+                "add" | "sub" | "mul" | "div" | "pow" | "atan2" if floating => {
+                    (vec![scalar, scalar], scalar, None)
+                }
+                "neg" | "abs" | "sqrt" | "ceil" | "floor" | "round" | "sin" | "cos" | "tan"
+                | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+                | "atanh" | "exp" | "exp2" | "log" | "log2" | "log10" | "cbrt"
+                    if floating =>
+                {
+                    (vec![scalar], scalar, None)
+                }
                 "beq" | "decLt" | "decLe" if floating => {
                     (vec![scalar, scalar], ValueType::Bool, None)
                 }
