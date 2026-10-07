@@ -14,8 +14,8 @@ crate fln_bignum items=85
 crate fln_core items=164
 crate fln_env items=85
 crate fln_hash items=64
-crate fln_kernel items=291
-total items=689 adjacent-items=398
+crate fln_kernel items=293
+total items=691 adjacent-items=398
 budget adjacent-items<=400
 item fln_bignum <fln_bignum::nat::BigNat as core::clone::Clone>::clone
 item fln_bignum <fln_bignum::nat::BigNat as core::cmp::Ord>::cmp
@@ -516,6 +516,8 @@ item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::context_key
 item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::get
 item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::insert
 item fln_kernel <fln_kernel::tc::InstantiateRevContextCache>::new
+item fln_kernel <fln_kernel::tc::Interner>::intern
+item fln_kernel <fln_kernel::tc::Interner>::new
 item fln_kernel <fln_kernel::tc::LazyDelta as core::clone::Clone>::clone
 item fln_kernel <fln_kernel::tc::LocalDependency as core::cmp::PartialEq>::eq
 item fln_kernel <fln_kernel::tc::PositiveDefEqCache>::bounded

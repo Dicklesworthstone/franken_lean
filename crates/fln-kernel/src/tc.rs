@@ -49,11 +49,18 @@ use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
 /// the pin-faithful packed structural hash or an allocation address, and the
 /// structural hash is attacker-predictable by construction (the pin computes
 /// it identically), so an adversarial artifact can already choose colliding
-/// KEYS below any seeding of the table's slot function. Collision floods are
-/// therefore handled where they must be handled either way: the §8.2c step
-/// budget turns quadratic probing into a typed `Inconclusive`, never a hang
-/// (FL-INV-07). A fixed hasher also removes per-process seed state from the
-/// kernel, so two runs of one input probe identically.
+/// KEYS below any seeding of the table's slot function. The honest claim is
+/// PARITY WITH THE PIN, not a bound (corrected per the slice-A review,
+/// z8j.1.13 comment 3324): hashbrown's probing is not step-metered, so a
+/// slot-collision flood degrades probes rather than converting to a typed
+/// outcome — the worst case is bounded only by steps times table occupancy,
+/// and a fixed multiply-fold additionally lets low-bit-colliding structural
+/// hashes share a probe start, where the exact-key caps do not apply. The
+/// pin's kernel caches are unseeded `std::unordered_map` over the same
+/// deterministic expression hash, uncapped (vendor `expr_maps.h`), so
+/// nothing here is weaker than the surface being mirrored. A fixed hasher
+/// also removes per-process seed state from the kernel, so two runs of one
+/// input probe identically.
 ///
 /// The mixer is the word-at-a-time rotate/multiply fold rustc's FxHash uses,
 /// chosen for measured cheapness on small integer keys; it is a performance
@@ -125,6 +132,57 @@ impl std::hash::BuildHasher for DetHashState {
 /// by key equality, never by the hasher, so this alias changes cost and
 /// nothing else.
 pub(crate) type KMap<K, V> = HashMap<K, V, DetHashState>;
+
+/// Per-check hash-consing table (plan §7.1b, bead `franken_lean-z8j.1.13`
+/// slice B): one retained allocation per structural identity among the terms
+/// this checker REBUILDS. Decoded terms already arrive maximally shared
+/// (measured: unique allocations equal distinct structures on every probed
+/// module), so the duplication this table removes is exactly the checker's
+/// own — equal results built by separate reductions. Interning after
+/// construction is deliberate: a duplicate's children are already interned,
+/// so dropping the duplicate decrements refcounts without a cascade, and
+/// every later comparison against the retained copy short-circuits on
+/// allocation identity. Bucket candidates verify with full structural
+/// equality (binder names and mdata included, as §7.1b requires), so a
+/// data-word collision costs a compare, never an answer.
+///
+/// The table lives and dies with one `TypeChecker`: nothing it retains
+/// outlives the check, and growth is bounded by the step budget every
+/// constructing operation already charges (§8.2c).
+struct Interner {
+    table: KMap<u64, Vec<Expr>>,
+    hits: u64,
+    misses: u64,
+}
+
+impl Interner {
+    fn new() -> Self {
+        Self {
+            table: KMap::default(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// The retained representative of `e`'s structural identity class.
+    fn intern(&mut self, e: Expr) -> Expr {
+        let bucket = self.table.entry(e.data().0).or_default();
+        for candidate in bucket.iter() {
+            if *candidate == e {
+                self.hits += 1;
+                return candidate.clone();
+            }
+        }
+        self.misses += 1;
+        bucket.push(e.clone());
+        e
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
 
 /// Internal control flow: a real rejection or a budget stop. Never observable
 /// outside `check`/`check_defeq`, which convert to [`Verdict`].
@@ -2011,6 +2069,7 @@ pub(crate) struct TypeChecker<'a> {
     regular_app_def_eq_failure_cache: PositiveDefEqCache,
     /// Free variables for this checker's own dependency scans (`FreeVars`).
     free_vars: FreeVars,
+    interner: Interner,
     instantiate_cache: InstantiateCache,
     instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
@@ -2067,6 +2126,7 @@ impl<'a> TypeChecker<'a> {
             lazy_delta_replay_hits: 0,
             regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
             free_vars: FreeVars::default(),
+            interner: Interner::new(),
             instantiate_cache: InstantiateCache::new(),
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
@@ -2429,6 +2489,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, k, &subst)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     if result != e {
                         self.instantiate_cache
                             .insert(e.clone(), k, subst.clone(), result.clone());
@@ -2687,6 +2748,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     match context {
                         Some(context) => self.instantiate_rev_context_cache.insert(
                             context,
@@ -2892,6 +2954,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     if result != e {
                         self.instantiate_lparams_cache.insert(
                             e.clone(),
@@ -5911,6 +5974,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     done.insert(key, result);
                 }
             }
@@ -11424,5 +11488,74 @@ mod tests {
             Err(Stop::Reject(RejectClass::BlockMismatch, message))
                 if message.contains("cannot contain local variables")
         ));
+    }
+
+    /// Section 7.1b slice B (bead franken_lean-z8j.1.13): the per-check
+    /// interner returns ONE retained allocation per structural identity
+    /// class, keeps distinct structures distinct, and separates alpha-varied
+    /// binders that share a packed data word. Binder names are excluded from
+    /// the hash and included in identity, so the alpha pair exercises the
+    /// bucket-collision path: same bucket, structural verify separates.
+    #[test]
+    fn interner_unifies_equal_structures_and_separates_alpha_variants() {
+        let mut interner = Interner::new();
+        let nat = || Expr::const_(Name::str(Name::anonymous(), "Nat"), vec![]);
+        let one = interner.intern(Expr::app(nat(), nat()));
+        let two = interner.intern(Expr::app(nat(), nat()));
+        assert!(
+            one.allocation_identity() == two.allocation_identity(),
+            "equal structures must share one retained allocation"
+        );
+        let lam = |name: &str| {
+            Expr::lam(
+                Name::str(Name::anonymous(), name),
+                nat(),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            )
+        };
+        let (lam_a, lam_b) = (lam("a"), lam("b"));
+        assert!(
+            lam_a.data().0 == lam_b.data().0,
+            "alpha variants share the packed word, or this test stops testing collisions"
+        );
+        let kept_a = interner.intern(lam_a);
+        let kept_b = interner.intern(lam_b);
+        assert!(
+            kept_a.allocation_identity() != kept_b.allocation_identity(),
+            "binder names are part of structural identity (7.1b: names included)"
+        );
+        let (hits, misses) = interner.stats();
+        assert!(
+            hits == 1 && misses == 3,
+            "one dedupe hit and three retained classes, got {hits}/{misses}"
+        );
+    }
+
+    /// Two separate instantiations that rebuild the same structure yield the
+    /// SAME allocation within one checker. Each walk's own memo is per call,
+    /// so this cross-call unification is the interner's and only the
+    /// interner's; a mutant that returns the fresh node instead of the
+    /// retained representative fails here.
+    #[test]
+    fn instantiate_results_are_interned_across_calls() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let subst = Expr::sort(Level::zero());
+        let open = Expr::app(bv(0), bv(0));
+        let first = tc.instantiate(&open, 0, &subst, 0).expect("instantiates");
+        let reopened = Expr::app(bv(0), bv(0));
+        let second = tc
+            .instantiate(&reopened, 0, &subst, 0)
+            .expect("instantiates");
+        assert!(
+            first == second,
+            "the two rebuilds must be structurally equal before identity is even asked"
+        );
+        assert!(
+            first.allocation_identity() == second.allocation_identity(),
+            "equal rebuilds across calls must share the interner's retained allocation"
+        );
     }
 }
