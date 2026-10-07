@@ -358,6 +358,18 @@ jobs:
           FLN_REQUIRE_REFERENCE=1 cargo test --locked -p fln-cli \
             --test ordinary_lean_probe --no-fail-fast -- --nocapture
 
+      - name: score the pin's own upstream suite through the drop-in (fln-upstream-suite-scoreboard-n04o)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        run: |
+          # Measuring with a ratchet, not gating on a score: one line per upstream
+          # test file and the per-directory, per-stratum and first-refusal summary.
+          # It fails only on a false accept, a regressed identical row, pin drift
+          # or a broken scan. Release, because the pin side elaborates 3,379 files.
+          FLN_REQUIRE_REFERENCE=1 cargo test --locked --release -p fln-cli \
+            --test upstream_suite_scoreboard --no-fail-fast -- --ignored --nocapture \
+            upstream_suite_scoreboard_measures
+
       - name: run the certificate-format independent-checker lane
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash

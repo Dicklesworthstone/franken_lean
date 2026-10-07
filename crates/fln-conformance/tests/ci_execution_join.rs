@@ -346,6 +346,30 @@ const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 /// repair is exactly that migration. See residue item 4 in the module header.
 const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     (
+        "crates/fln-cli/tests/source_olean_imports.rs",
+        "existential_notation_and_nested_anonymous_constructors",
+        "an on-demand council of the 51-module Init.NotationExtra closure (about a minute in \
+         release). Nothing per commit elaborates the pin's `∃` macro or nested `⟨…⟩` against \
+         the real closure, so no coverage row may cite this test for a per-commit claim",
+    ),
+    (
+        "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
+        "upstream_suite_scoreboard_measures_the_drop_in_against_the_pin",
+        "an on-demand pin-gated lane over 3,379 upstream files, run by contract-drift with \
+         FLN_REQUIRE_REFERENCE=1 (bead fln-upstream-suite-scoreboard-n04o); per commit, \
+         the_checked_in_tables_name_exactly_the_upstream_suite holds the population, oracle \
+         and ledger bijection, and the planted false-accept, ratchet, drift and scan tests hold \
+         the scoring law without the pin",
+    ),
+    (
+        "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
+        "regenerate_the_upstream_oracle_from_the_pin",
+        "the oracle's only writer, run by hand for a pin or vendor change behind \
+         FLN_UPSTREAM_ORACLE_WRITE=1 (bead fln-upstream-suite-scoreboard-n04o); the \
+         pin-gated scoreboard's drift check holds the recorded oracle to the live pin, and \
+         the per-commit bijection check holds it to the vendored population",
+    ),
+    (
         "crates/fln-conformance/tests/kernel_replay.rs",
         "pinned_present_olean_kernel_differential",
         "fln-8zsq made its census guard SOURCE-level precisely because this producer is \
@@ -621,7 +645,16 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// lane executed weekly with fixed seeds by the scheduled contract-drift workflow, failing
 /// on any pin=reject/FrankenLean=accept row; bead `fln-kernel-reject-side-at-scale-bemc`,
 /// acceptance 5).
-const IGNORED_PRODUCER_CEILING: usize = 21;
+///
+/// 21 -> 24 for `crates/fln-cli/tests/upstream_suite_scoreboard.rs`'s two lanes (bead
+/// `fln-upstream-suite-scoreboard-n04o`), declared in the commit that adds them: the
+/// scoreboard is too slow per push (3,379 pinned elaborations) and the oracle writer runs
+/// only for a pin change, each entry naming what holds its law per commit; and
+/// `source_olean_imports.rs`'s `existential_notation_and_nested_anonymous_constructors`
+/// (`bef21b47`), which landed undeclared and kept this suite red. Declared from its own
+/// docstring by the coordinator, stating that nothing per commit compensates, so it may not
+/// be cited as per-commit evidence; its author may supply a stronger entry.
+const IGNORED_PRODUCER_CEILING: usize = 24;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -2038,7 +2071,7 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=9 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=11 rows=13 citations=14 all-rows-declared=true
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.

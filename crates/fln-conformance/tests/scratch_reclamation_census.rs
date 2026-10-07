@@ -48,6 +48,12 @@ const MACHINERY: &[&str] = &["crates/fln-core/src/scratch.rs"];
 /// cleanup is deleted stops matching its class instead of staying classified.
 const SELF_CLEANING: &[(&str, &str)] = &[
     ("crates/fln-conformance/src/pin.rs", "remove_dir_all"),
+    // The upstream-suite scoreboard's per-run copies of the vendored suite, reclaimed by the
+    // run that created them (bead fln-upstream-suite-scoreboard-n04o).
+    (
+        "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
+        "remove_dir_all",
+    ),
     (
         "crates/fln-conformance/tests/agents_enforcement_census.rs",
         "remove_dir",
@@ -179,6 +185,7 @@ const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/source_global_stages.rs",
     "crates/fln-cli/tests/source_ground_projections.rs",
     "crates/fln-cli/tests/source_hypothesis_rewriting.rs",
+    "crates/fln-cli/tests/source_imported_execution.rs",
     "crates/fln-cli/tests/source_indexed_function_children.rs",
     "crates/fln-cli/tests/source_indexed_runtime.rs",
     "crates/fln-cli/tests/source_instance_factories.rs",
@@ -196,6 +203,7 @@ const UNROUTED_CLI_PRODUCERS: &[&str] = &[
     "crates/fln-cli/tests/source_nat_runtime.rs",
     "crates/fln-cli/tests/source_nested_lets.rs",
     "crates/fln-cli/tests/source_olean_metadata.rs",
+    "crates/fln-cli/tests/source_ordinary_loops.rs",
     "crates/fln-cli/tests/source_proof_indices.rs",
     "crates/fln-cli/tests/source_proof_runtime.rs",
     "crates/fln-cli/tests/source_quotient_runtime.rs",
