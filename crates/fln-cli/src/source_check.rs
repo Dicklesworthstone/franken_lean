@@ -32,7 +32,31 @@ pub(super) fn run_imported(
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
 ) -> Option<MultiplexerOutput> {
-    imports::execution::run(paths, max_bytes, json, emit_artifact, jobs, posture)
+    imports::execution::run(
+        paths,
+        max_bytes,
+        imports::execution::Presentation::Fln { json },
+        emit_artifact,
+        jobs,
+        posture,
+    )
+}
+
+/// The drop-in `lean` on a file with explicit imports: the same admitted
+/// module world `fln run` uses, presented as `lean` presents a file. Imports
+/// resolve from `LEAN_PATH`, else the pinned toolchain's library, and are
+/// admitted under the interactive doors' default posture. `None` leaves a
+/// headerless file, or one whose imports are local sources, to the existing
+/// local route.
+pub(super) fn run_imported_lean(path: &Path, max_bytes: usize) -> Option<MultiplexerOutput> {
+    imports::execution::run(
+        &[path.to_path_buf()],
+        max_bytes,
+        imports::execution::Presentation::Lean,
+        false,
+        default_import_jobs(),
+        ImportPosture::ReuseVerified,
+    )
 }
 
 /// Remove `--import-posture P` / `--import-posture=P` from an interactive front

@@ -384,8 +384,13 @@ const LEAN_USAGE: &str = concat!(
     "the LSP lifecycle and textDocument/didOpen, running opened documents through\n",
     "the bounded source pipeline and projecting diagnostics. This is the same\n",
     "transport as `fln serve-lsp`.\n",
-    "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
-    ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
+    "An import that is not a local source is loaded as a compiled module from\n",
+    "LEAN_PATH, else from the pinned toolchain under ELAN_HOME or ~/.elan. Its\n",
+    "closure is checked by the kernel before the file runs, or reused from a\n",
+    "verified record of an earlier check; the first check of a large closure\n",
+    "takes minutes. The file's own output is printed and nothing else.\n",
+    "This does not implement the Reference CLI's option set, package\n",
+    "discovery, implicit Prelude processing, general Lean elaboration, or\n",
     "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
     "does not change during the invocation; directory-handle race sealing is not\n",
     "yet implemented.\n",
@@ -13287,7 +13292,22 @@ fn run_sources_with_presentation(
     )
 }
 
+/// Whether local source discovery stopped because an import names no local
+/// source file. The three places that say so all begin their detail this way.
+fn is_unresolved_local_import(error: &BoundedReadFailure) -> bool {
+    matches!(
+        error,
+        BoundedReadFailure::Input { detail, .. } if detail.contains("cannot resolve import `")
+    )
+}
+
 fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
+    // A file that imports compiled modules runs in their admitted world, the
+    // way `fln run` runs it. Only a headerless file, or one whose imports are
+    // all local sources, is left to the local route below.
+    if let Some(output) = source_check::run_imported_lean(&path, max_bytes) {
+        return output;
+    }
     let discovered = match discover_source_closure(path, max_bytes) {
         Ok(discovered) => discovered,
         Err(error) => {
@@ -15988,10 +16008,13 @@ mod tests {
             help.stdout
                 .contains("validated direct local source imports in source order")
         );
+        // Compiled imports are discovered now; package discovery still is not.
         assert!(
             help.stdout
-                .contains("LEAN_PATH/package or\n.olean discovery")
+                .contains("loaded as a compiled module from\nLEAN_PATH")
         );
+        assert!(help.stdout.contains("option set, package\ndiscovery"));
+        assert!(!help.stdout.contains(".olean discovery"));
 
         let pin_version = fln::OLEAN_PIN_TAG
             .strip_prefix('v')

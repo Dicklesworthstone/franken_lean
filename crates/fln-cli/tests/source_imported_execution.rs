@@ -389,3 +389,133 @@ fn imports_limits_original_offsets_and_publication_refusals_are_atomic() {
     }
     ws.run(&main, None, &[]).complete();
 }
+
+/// The drop-in `lean` on one file, with the search path and the record store
+/// both inside the workspace so a run neither reads nor leaves anything else.
+fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(entry)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("records"))
+        .output()
+        .expect("run the installed lean");
+    Run {
+        code: output.status.code().expect("normal process exit"),
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
+/// `lean FILE` used to resolve an import only as a local source file, so a
+/// file that imported a compiled module was refused before it was read, while
+/// `fln run` ran the same file in its admitted world. The door now takes that
+/// route and prints what `lean` prints.
+#[test]
+fn the_lean_door_runs_a_file_that_imports_a_compiled_module() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-import");
+    let entry = workspace.write(
+        "Main.lean",
+        "import Init.Prelude\n\ndef f (n : Nat) : Nat := n + 1\n\n#eval f 41\n#check f\n",
+    );
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!(ours.code, 0, "{ours:?}");
+    assert!(ours.stderr.is_empty(), "{ours:?}");
+    // The entry's own output and nothing else: no module table, no counts.
+    assert_eq!(ours.stdout, "42\nf (n : Nat) : Nat\n");
+
+    // The pinned binary beside that library prints the same bytes.
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    match pinned {
+        Some(pinned) => {
+            let theirs = Command::new(pinned)
+                .arg(&entry)
+                .output()
+                .expect("run the pinned lean");
+            assert!(theirs.status.success(), "{theirs:?}");
+            assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+        }
+        None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+
+    // The same world `fln run` admits: it completes on the same file.
+    workspace.run(&entry, Some(&lib), &[]).complete();
+    // A second run reuses the verified record and says the same thing.
+    let again = lean_door(&workspace, &entry, &lib);
+    assert_eq!(
+        (again.code, again.stdout.as_str()),
+        (0, ours.stdout.as_str()),
+        "{again:?}"
+    );
+}
+
+/// What did not change, and what a missing import now says. No pin is needed:
+/// the search path is an empty directory.
+#[test]
+fn the_lean_door_keeps_its_local_route_and_names_an_import_that_is_nowhere() {
+    let workspace = Workspace::new("lean-door-local");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let missing = workspace.write("Missing.lean", "import No.Such.Module\n\n#eval 1\n");
+    let refused = lean_door(&workspace, &missing, &empty);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .starts_with("lean: input: import `No.Such.Module` is neither a source file"),
+        "{refused:?}"
+    );
+    assert!(refused.stderr.contains("nor an .olean on the search path"));
+
+    // A headerless file never had imports to resolve.
+    let plain = workspace.write(
+        "Plain.lean",
+        "def g (n : Nat) : Nat := n + 2\n\n#eval g 40\n",
+    );
+    let ran = lean_door(&workspace, &plain, &empty);
+    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
+
+    // An import that is a local source file is still loaded as source.
+    workspace.write("Helper.lean", "def h (n : Nat) : Nat := n + 2\n");
+    let local = workspace.write("UsesHelper.lean", "import Helper\n\n#eval h 40\n");
+    let ran = lean_door(&workspace, &local, &empty);
+    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
+}
+
+/// `prelude` means no imports at all, not even the implicit one. The door used
+/// to refuse the keyword itself; it now runs the file in an empty world, where
+/// the file's own declarations exist and nothing else does. The pin accepts the
+/// first file silently and rejects the second (measured 2026-10-07).
+#[test]
+fn a_prelude_file_is_an_empty_world_through_the_lean_door() {
+    let workspace = Workspace::new("lean-door-prelude");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let own = workspace.write(
+        "Own.lean",
+        "prelude\n\ninductive N where\n  | z : N\n  | s : N → N\n\ndef two : N := N.s (N.s N.z)\n",
+    );
+    let ran = lean_door(&workspace, &own, &empty);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (0, "", ""),
+        "{ran:?}"
+    );
+
+    // Nothing is ambient: `Nat` is not there unless the file declares it.
+    let borrowed = workspace.write("Borrowed.lean", "prelude\n\ndef f (n : Nat) : Nat := n\n");
+    let refused = lean_door(&workspace, &borrowed, &empty);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("Unknown identifier `Nat`"),
+        "{refused:?}"
+    );
+}

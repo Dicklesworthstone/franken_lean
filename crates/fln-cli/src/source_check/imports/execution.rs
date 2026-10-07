@@ -1,5 +1,6 @@
-//! `fln run` over explicit source and `.olean` imports. This is the FlN raw
-//! result surface, not Lean's `#eval` printer or an artifact publication path.
+//! `fln run` and the drop-in `lean` over explicit source and `.olean` imports.
+//! `fln run` presents FlN's raw result surface; `lean` presents the entry file's
+//! command output through that door's own printer. Neither publishes an artifact.
 use super::*;
 use fln::source_check::modules::execution::{
     SourceProgramExecution, SourceProgramLimits, preflight_source_program,
@@ -8,7 +9,28 @@ use fln::source_check::modules::execution::{
 const SCHEMA: &str = "fln.source-program/1";
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
-fn failure(error: Failure, json: bool) -> MultiplexerOutput {
+/// How a source program's outcome is presented: FlN's raw result surface, or
+/// the drop-in `lean` door, which prints what the entry file's own commands
+/// print and reports a failure in that door's own form.
+#[derive(Clone, Copy)]
+pub(in crate::source_check) enum Presentation {
+    Fln { json: bool },
+    Lean,
+}
+
+fn failure(error: Failure, presentation: Presentation) -> MultiplexerOutput {
+    let json = match presentation {
+        Presentation::Fln { json } => json,
+        Presentation::Lean => {
+            return source_failure(
+                error.class,
+                &error.detail,
+                error.authority,
+                SourcePresentation::Lean,
+                error.exit,
+            );
+        }
+    };
     let detail = BoundedText::new(error.detail);
     let stderr = if json {
         format!(
@@ -72,7 +94,7 @@ fn append(output: &mut String, text: &str) -> Result<(), Failure> {
 pub(in crate::source_check) fn run(
     paths: &[PathBuf],
     max_bytes: usize,
-    json: bool,
+    presentation: Presentation,
     emit_artifact: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
@@ -95,29 +117,43 @@ pub(in crate::source_check) fn run(
             // A prelude must never fall through to that route's synthetic seed.
             if paths.len() != 1 {
                 return headers.iter().any(|header| header.prelude).then(|| {
-                    failure(Failure::input("a prelude source program requires one entry path"), json)
+                    failure(Failure::input("a prelude source program requires one entry path"), presentation)
                 });
             }
             // The established source-only runner resolves an unambiguous root
             // among bounded ancestors. Preserve that route before the import
             // loader (whose explicit module root is the entry's directory).
             // A transitive `prelude` still requires an empty, isolated world.
-            if !headers[0].prelude
-                && let Ok(discovered) = discover_source_closure(paths[0].clone(), max_bytes)
-                && discovered.sources.iter().all(|source| {
-                    parse_source_header(source).is_ok_and(|header| {
-                        !header.prelude
-                            && fln::partition_source_module(source)
-                                .is_ok_and(|module| module.imports == header.imports)
-                    })
-                })
-            {
-                return None;
+            let local = (!headers[0].prelude)
+                .then(|| discover_source_closure(paths[0].clone(), max_bytes));
+            match &local {
+                Some(Ok(discovered))
+                    if discovered.sources.iter().all(|source| {
+                        parse_source_header(source).is_ok_and(|header| {
+                            !header.prelude
+                                && fln::partition_source_module(source)
+                                    .is_ok_and(|module| module.imports == header.imports)
+                        })
+                    }) =>
+                {
+                    return None;
+                }
+                // For the `lean` door, an import that names no local source is
+                // the one reason to look for a compiled module. Every other
+                // answer the local route gives (a budget stop, an ambiguous
+                // root, a refused symlink) stays the local route's to give.
+                Some(Err(error))
+                    if matches!(presentation, Presentation::Lean)
+                        && !is_unresolved_local_import(error) =>
+                {
+                    return None;
+                }
+                _ => {}
             }
             let total = sources.iter().map(Vec::len).sum();
             let loaded = match load(&paths, sources, total, max_bytes) {
                 Ok(loaded) => loaded,
-                Err(error) => return Some(failure(error, json)),
+                Err(error) => return Some(failure(error, presentation)),
             };
             let Inputs::Modules { names, sources } = &loaded.inputs else {
                 return None;
@@ -135,7 +171,7 @@ pub(in crate::source_check) fn run(
                     "artifact publication (--emit-flbc, --emit-sidecar, --emit-olean-snapshot) is not implemented for explicit import source programs",
                     false,
                     CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                ), json));
+                ), presentation));
             }
             let inputs: Vec<_> = names.iter().zip(sources).map(|(name, source)| {
                 SourceModuleInput { name, source }
@@ -145,7 +181,7 @@ pub(in crate::source_check) fn run(
             ));
             limits.modules.source.max_bytes = max_bytes;
             if let Err(error) = preflight_source_program(&inputs, limits.modules) {
-                return Some(failure(module_error(error), json));
+                return Some(failure(module_error(error), presentation));
             }
             let base = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),
@@ -153,7 +189,7 @@ pub(in crate::source_check) fn run(
                 posture,
             ) {
                 Ok((_, base)) => base,
-                Err(error) => return Some(failure(error, json)),
+                Err(error) => return Some(failure(error, presentation)),
             };
             let empty;
             let receipt = match &base {
@@ -169,25 +205,36 @@ pub(in crate::source_check) fn run(
                 Ok(Outcome::Complete(completed)) => completed,
                 Ok(Outcome::Inconclusive(reason)) => return Some(failure(Failure::new(
                     "inconclusive", &format!("source program did not finish: {reason:?}"), false, 3,
-                ), json)),
+                ), presentation)),
                 Ok(Outcome::InternalFault(fault)) => return Some(failure(Failure::new(
                     "internal-fault", &format!("source program faulted: {fault:?}"), false, 4,
-                ), json)),
-                Err(error) => return Some(failure(module_error(error), json)),
+                ), presentation)),
+                Err(error) => return Some(failure(module_error(error), presentation)),
             };
-            Some(match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json) {
-                Ok(stdout) => MultiplexerOutput::success(stdout),
-                Err(error) => failure(error, json),
+            Some(match presentation {
+                Presentation::Lean => match lean_output(&completed, &names[0]) {
+                    Ok(output) => output,
+                    Err(error) => failure(error, presentation),
+                },
+                Presentation::Fln { json } => {
+                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json) {
+                        Ok(stdout) => MultiplexerOutput::success(stdout),
+                        Err(error) => failure(error, presentation),
+                    }
+                }
             })
         });
     match worker {
         Err(error) => Some(failure(
             Failure::resource(format!("could not start imported source worker: {error}")),
-            json,
+            presentation,
         )),
         Ok(worker) => match worker.join() {
             Ok(result) => result,
-            Err(_) => Some(failure(internal("imported source worker panicked"), json)),
+            Err(_) => Some(failure(
+                internal("imported source worker panicked"),
+                presentation,
+            )),
         },
     }
 }
@@ -240,6 +287,22 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// What the drop-in `lean` prints for a program that ran: the output of the
+/// entry file's own commands. The modules it imports ran too, and what they
+/// print is not the entry's.
+fn lean_output(
+    program: &SourceProgramExecution,
+    entry: &Name,
+) -> Result<MultiplexerOutput, Failure> {
+    validate_exits(program)?;
+    let module = program
+        .modules
+        .last()
+        .filter(|module| &module.module == entry)
+        .ok_or_else(|| internal("source program did not retain its entry as the final module"))?;
+    Ok(render_lean_source_commands(&module.commands))
 }
 
 fn render(
@@ -532,6 +595,15 @@ mod tests {
                 let mut program = SourceProgramExecution { modules };
                 let entry = Name::from_components(["Main"]);
                 assert!(render(&program, &entry, 0, None, true).is_ok());
+                // The `lean` presentation prints the entry's own output only: one
+                // `42`, though the dependency evaluated the same term.
+                match lean_output(&program, &entry) {
+                    Ok(presented) => assert_eq!(
+                        (presented.exit_code, presented.stdout.as_str()),
+                        (0, "42\n")
+                    ),
+                    Err(error) => panic!("a complete program must present: {}", error.detail),
+                }
                 // The VM terminal seam is public typed data. Plant a completed
                 // panic in a dependency definition that has no output event,
                 // keeping every later evaluation successful and unchanged.
@@ -543,6 +615,10 @@ mod tests {
                     message: "dependency initialization failed".to_owned(),
                     usage: returned.usage,
                 };
+                match lean_output(&program, &entry) {
+                    Err(error) => assert_eq!((error.class, error.exit), ("program-panic", 1)),
+                    Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
+                }
                 for json in [false, true] {
                     let error = match render(&program, &entry, 0, None, json) {
                         Err(error) => error,
@@ -555,7 +631,7 @@ mod tests {
                     assert!(
                         error.detail.contains("Dependency") && error.detail.contains("command 0")
                     );
-                    let failed = failure(error, json);
+                    let failed = failure(error, Presentation::Fln { json });
                     assert!(failed.stdout.is_empty());
                 }
             })
