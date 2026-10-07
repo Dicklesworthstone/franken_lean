@@ -5,6 +5,7 @@
 //! right constructor to T. Transporting identity along the supplied equality
 //! then proves T. No no-confusion axiom, guessed equality, or checking shortcut
 //! is introduced. Proof-valued families are deliberately excluded.
+use super::decision::{apps, constant};
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal, RecursorVal};
 use std::collections::HashSet;
@@ -1075,7 +1076,21 @@ impl Context {
                     }
                 }
             }
-            let Some(evidence) = self.homogeneous_equality_evidence(&evidence)? else {
+            let Some(evidence) = ({
+                let narrowed = self.homogeneous_equality_evidence(&evidence)?;
+                if narrowed.is_none() {
+                    // The pin's decide arm (Contradiction.lean:199): a closed
+                    // hypothesis whose synthesized decision computes `false`
+                    // is refuted through `of_decide_eq_false`, whatever its
+                    // shape — `h : 2 < 1` is the measured divergence. Scoped
+                    // to non-equality evidence so every equation keeps the
+                    // existing constructor machinery byte-for-byte.
+                    if let Some(result) = self.decided_false_evidence(&evidence, &goal.target)? {
+                        return self.close_proof_goal(goal, result);
+                    }
+                }
+                narrowed
+            }) else {
                 continue;
             };
             let type_ = evidence.type_.clone();
@@ -1158,5 +1173,71 @@ impl Context {
             }
             Err(_) => Ok(false),
         }
+    }
+
+    /// The pin's `contradiction` decide arm (vendored
+    /// Lean/Meta/Tactic/Contradiction.lean:199): a hypothesis whose CLOSED type
+    /// has a `Decidable` instance computing `false` is refuted through
+    /// `of_decide_eq_false` and `absurd`, whatever the proposition's shape.
+    /// Available only where the pinned constants exist (a real `Init`
+    /// environment); the frozen seed dialect has neither, so the arm never
+    /// fires there and the seed dialect is unchanged. A failed instance query
+    /// or a `true` decision falls through to the ordinary refusal; resource
+    /// exhaustion keeps its typed outcome (FL-INV-07). The eligibility probe
+    /// runs on a clone so a failed query cannot leak instance state, and the
+    /// dictionary in the real proof term is re-synthesized on `self`.
+    fn decided_false_evidence(
+        &mut self,
+        evidence: &Typed,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let refute = Name::from_components(["of_decide_eq_false"]);
+        let absurd = Name::from_components(["absurd"]);
+        if !self.txn.env.contains(&refute) || !self.txn.env.contains(&absurd) {
+            return Ok(None);
+        }
+        let ty = self.instantiate(&evidence.type_)?;
+        if ty.has_fvar() || ty.has_expr_mvar() || ty.has_level_mvar() {
+            return Ok(None);
+        }
+        let mut trial = self.clone();
+        let decided = (|| -> Result<bool, NatDefinitionElabError> {
+            let dictionary = trial.decision_dictionary(&ty)?;
+            let computation = apps(trial.decide_constant(), [ty.clone(), dictionary]);
+            trial.decision_computes_false(computation)
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match decided {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            Err(_) => return Ok(None),
+        }
+        let dictionary = self.decision_dictionary(&ty)?;
+        let sort = self
+            .known_type(target)?
+            .ok_or_else(|| error(TacticError::ExpectedProposition))?;
+        let sort = self.whnf(&sort)?;
+        let ExprNode::Sort { level } = sort.node() else {
+            return Ok(None);
+        };
+        let level = level.clone();
+        // Mirrors `decide_proof_goal`'s construction in the `false` direction:
+        // the kernel justifies `Eq.refl Bool Bool.false` at `decide p = false`
+        // by evaluating the decision, exactly as the `true` case is justified.
+        let reflexive = apps(
+            constant("Eq.refl", vec![Level::one()]),
+            [constant("Bool", vec![]), constant("Bool.false", vec![])],
+        );
+        let negation = apps(
+            Expr::const_(refute, vec![]),
+            [ty.clone(), dictionary, reflexive],
+        );
+        Ok(Some(apps(
+            Expr::const_(absurd, vec![level]),
+            [ty, target.clone(), evidence.value.clone(), negation],
+        )))
     }
 }

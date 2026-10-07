@@ -3,10 +3,10 @@
 //! an unselected source branch or written annotation to disappear.
 use super::*;
 
-fn constant(name: &str, levels: Vec<Level>) -> Expr {
+pub(super) fn constant(name: &str, levels: Vec<Level>) -> Expr {
     Expr::const_(Name::from_components(name.split('.')), levels)
 }
-fn apps(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn apps(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments.into_iter().fold(head, Expr::app)
 }
 
@@ -53,7 +53,7 @@ impl Context {
     /// names the same function `decide`, so the seed spelling is used only where
     /// the pin's constant is absent; it goes when the seed is retired
     /// (franken_lean-z8j.1.8).
-    fn decide_constant(&self) -> Expr {
+    pub(super) fn decide_constant(&self) -> Expr {
         let pinned = Name::from_components(["Decidable", "decide"]);
         if self.txn.env.contains(&pinned) {
             Expr::const_(pinned, vec![])
@@ -138,9 +138,27 @@ impl Context {
     /// Final admission retains the unmodified dictionary and checks both seats.
     fn decision_computes_true(
         &mut self,
-        mut computation: Expr,
+        computation: Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        let mut truth = constant("Bool.true", vec![]);
+        self.decision_computes(computation, "Bool.true")
+    }
+
+    /// The `false` direction of the same evaluation, for the pin's
+    /// `contradiction` decide arm (Lean/Meta/Tactic/Contradiction.lean:199):
+    /// a closed hypothesis whose decision computes `false` is refutable.
+    pub(super) fn decision_computes_false(
+        &mut self,
+        computation: Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.decision_computes(computation, "Bool.false")
+    }
+
+    fn decision_computes(
+        &mut self,
+        mut computation: Expr,
+        constructor: &str,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut truth = constant(constructor, vec![]);
         let mut needed = self.elimination_reads(&computation)?;
         for mut local in self.txn.lctx.decls().to_vec().into_iter().rev() {
             self.tick()?;

@@ -536,6 +536,52 @@ fn decide_evaluates_the_pins_decidable_decide_against_the_real_prelude() {
         .expect("the checking thread completes");
 }
 
+/// The pin's `contradiction` decides a CLOSED NON-EQUATION hypothesis: its
+/// `contradictionCore` decide arm (vendored
+/// Lean/Meta/Tactic/Contradiction.lean:199) refutes any closed hypothesis
+/// whose synthesized decision computes `false`, through `of_decide_eq_false`,
+/// whatever the proposition's shape. Pin-audited 2026-10-07 (v4.32.0, with
+/// `import Init.Core`): `h : 2 < 1` and `h : 5 ≤ 2` are refuted, exit 0; a
+/// hypothesis that decides TRUE is not contradictory, exit 1 with
+/// "Tactic `contradiction` failed". Before the arm landed, FrankenLean
+/// refused both positives with "no supported contradictory evidence".
+#[test]
+fn contradiction_decides_a_closed_non_equation_hypothesis_as_the_pin() {
+    const POSITIVE_LT: &str = "theorem d (h : (2 : Nat) < 1) : False := by contradiction";
+    const POSITIVE_LE: &str = "theorem s (h : (5 : Nat) <= 2) : False := by contradiction";
+    const NEGATIVE: &str = "theorem n (h : (1 : Nat) < 2) : False := by contradiction";
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let engine = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            for positive in [POSITIVE_LT, POSITIVE_LE] {
+                let result =
+                    engine.check_source_files(&[positive.as_bytes()], &KVMap::new(), limits);
+                assert!(
+                    matches!(result, Ok(Outcome::Complete(_))),
+                    "{positive} must be admitted: {result:?}"
+                );
+            }
+            let before = engine.logical_root(&KVMap::new());
+            let negative = engine.check_source_files(&[NEGATIVE.as_bytes()], &KVMap::new(), limits);
+            let rendered = format!("{negative:?}");
+            assert!(
+                negative.is_err() && rendered.contains("NoContradiction"),
+                "{NEGATIVE} must keep the ordinary refusal: {rendered}"
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}
+
 /// Against the pinned `Init.Core`, instance selection for `Decidable (2 + 2 =
 /// 4)` reaches `instDecidableEqNat` within the default budget. Its 39 newer
 /// `Decidable` instances each fail one strict match; each used to cost a
