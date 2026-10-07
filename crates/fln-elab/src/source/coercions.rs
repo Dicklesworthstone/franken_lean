@@ -290,7 +290,21 @@ impl Context {
             // `Id ?A` first exposes its hole and can assign the entire expected
             // `Id Nat` to it, changing later numeral/instance selection. The
             // original equation chooses `?A := Nat` before any delta retry.
-            return self.constrain(actual, expected);
+            //
+            // A result HINT runs before the remaining argument elaborates, so a
+            // concrete refutation here must stay advisory: making it fatal
+            // masked the argument's own diagnostic — `Nat.succ ·` reported a
+            // NotDefEq conversion instead of the pin's "invalid occurrence of
+            // `·` notation" (fln-ffce comment 3297) — and the coercion branch
+            // below already drops a false equality. The equation is still
+            // checked for real where the application completes and at the
+            // declaration's ordinary K1 admission.
+            return match self.constrain(actual, expected) {
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ConversionRefused(_),
+                )) => Ok(()),
+                other => other,
+            };
         }
         self.coercion_eq(actual, expected).map(|_| ())
     }
