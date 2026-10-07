@@ -125,6 +125,12 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         assert_eq!(first.modules[0].commands.checks.len(), 1);
         let artifact = first.modules[0].commands.batch.executions.last().unwrap().flbc_artifact.clone();
 
+        // The actual Prelude's Not definition differs from the seed in binder
+        // names and reducibility hints. Its checked proof field still has the
+        // same erased layout, including decisions consumed by compiled matches.
+        let decisions = [("Main", "prelude\nimport Init.Prelude\ndef decision : Decidable True := Decidable.isTrue True.intro\ndef choose (d : Decidable True) : Nat := match d with | .isTrue h => 42 | .isFalse h => 0\n#eval choose decision")];
+        assert_eq!(values(&run(&imported, &decisions, "Main")), [vec![42]]);
+
         // Both siblings allocate an evaluation candidate at command zero in
         // their own world. Neither candidate may be replayed into the other or
         // collide when the entry imports both siblings.

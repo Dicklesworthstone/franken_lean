@@ -18,6 +18,21 @@ fn required_decision_name(candidate: &Name, carrier: &str, instance: bool) -> bo
         || instance && candidate == &name(&format!("instDecidableEq{carrier}"))
 }
 
+/// `Not` is a static proof-field alias. The pinned Prelude and source seed
+/// have the same `fun p : Prop => p -> False` body, but use different binder
+/// names and unfolding hints. Neither changes this erased representation.
+/// Keep the type, value, universes, safety and mutual group bound to the
+/// canonical declaration; a same-named foreign alias still cannot qualify.
+fn canonical_decision_proof_alias(actual: Option<&ConstantInfo>, expected: &DefinitionVal) -> bool {
+    matches!(actual, Some(ConstantInfo::Defn(actual))
+        if actual.base.name == expected.base.name
+            && actual.base.level_params == expected.base.level_params
+            && crate::olean_imports::expr_eqv(&actual.base.type_, &expected.base.type_)
+            && crate::olean_imports::expr_eqv(&actual.value, &expected.value)
+            && actual.safety == expected.safety
+            && actual.all == expected.all)
+}
+
 impl Preparation<'_> {
     /// Proposition arguments do not affect Decidable's runtime layout: both
     /// constructors retain their tag and one erased proof slot. Choose a closed
@@ -75,9 +90,10 @@ impl Preparation<'_> {
                         }
                     }
                     Declaration::Defn(expected) if expected.base.name == name("Not") => {
-                        if self.environment.find(&expected.base.name)
-                            != Some(&ConstantInfo::Defn(expected))
-                        {
+                        if !canonical_decision_proof_alias(
+                            self.environment.find(&expected.base.name),
+                            &expected,
+                        ) {
                             return Err(unsupported("noncanonical decision proof field"));
                         }
                     }
@@ -115,8 +131,15 @@ impl Preparation<'_> {
                 Declaration::Defn(expected)
                     if required_decision_name(&expected.base.name, carrier, instance) =>
                 {
-                    matches!(self.environment.find(&expected.base.name),
-                        Some(ConstantInfo::Defn(actual)) if actual == &expected)
+                    if expected.base.name == name("Not") {
+                        canonical_decision_proof_alias(
+                            self.environment.find(&expected.base.name),
+                            &expected,
+                        )
+                    } else {
+                        matches!(self.environment.find(&expected.base.name),
+                            Some(ConstantInfo::Defn(actual)) if actual == &expected)
+                    }
                 }
                 Declaration::Inductive(block)
                     if block.types.iter().any(|family| {
@@ -358,6 +381,101 @@ mod tests {
                 assert!(!prep.specializations.decision_family_checked);
             }
             assert!(prep.constructors.is_empty());
+        }
+    }
+
+    #[test]
+    fn proof_alias_accepts_pinned_binder_and_hint_variations_but_not_other_changes() {
+        let seed = environment("Nat", "");
+        let ConstantInfo::Defn(expected) = seed.find(&name("Not")).unwrap() else {
+            panic!("the canonical proof alias is a definition");
+        };
+        let prop = Expr::sort(Level::zero());
+        let mut imported = expected.clone();
+        imported.base.type_ =
+            Expr::forall_e(name("a"), prop.clone(), prop.clone(), BinderInfo::Default);
+        imported.value = Expr::lam(
+            name("a"),
+            prop.clone(),
+            Expr::forall_e(
+                name("a._@._internal._hyg.0"),
+                Expr::bvar(0).unwrap(),
+                constant("False"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        imported.hints = fln_env::constants::ReducibilityHints::Regular(1);
+        assert_ne!(imported, *expected);
+
+        let with_not = |definition: &DefinitionVal| {
+            seed.constants()
+                .fold(Environment::new(), |environment, (n, info)| {
+                    let info = if n == &name("Not") {
+                        ConstantInfo::Defn(definition.clone())
+                    } else {
+                        info.clone()
+                    };
+                    environment.add_decl(info).unwrap()
+                })
+        };
+        let admitted = with_not(&imported);
+        let mut preparation = Preparation::new(&admitted, IngressLimits::default());
+        assert_eq!(
+            preparation
+                .decision_representation(&constant("Decidable"), &[constant("True")])
+                .unwrap(),
+            Some(apply("Decidable", [constant("True")]))
+        );
+        assert_eq!(
+            preparation
+                .equality_decision(
+                    &constant("decide"),
+                    &decide_args(apply("Nat.decEq", [nat::literal(3), nat::literal(4)])),
+                )
+                .unwrap(),
+            Some(apply("Nat.beq", [nat::literal(3), nat::literal(4)]))
+        );
+        assert_eq!(
+            admitted.find(&name("Not")),
+            Some(&ConstantInfo::Defn(imported.clone()))
+        );
+
+        let mut wrong_body = imported.clone();
+        wrong_body.value = Expr::lam(
+            name("a"),
+            prop.clone(),
+            constant("True"),
+            BinderInfo::Default,
+        );
+        let mut wrong_type = imported.clone();
+        wrong_type.base.type_ = Expr::forall_e(
+            name("a"),
+            Expr::sort(Level::one()),
+            prop,
+            BinderInfo::Default,
+        );
+        let mut wrong_levels = imported.clone();
+        wrong_levels.base.level_params.push(name("u"));
+        let mut unsafe_alias = imported.clone();
+        unsafe_alias.safety = fln_env::constants::DefinitionSafety::Unsafe;
+        let mut wrong_group = imported;
+        wrong_group.all.push(name("other"));
+        for altered in [
+            wrong_body,
+            wrong_type,
+            wrong_levels,
+            unsafe_alias,
+            wrong_group,
+        ] {
+            let environment = with_not(&altered);
+            let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            assert!(
+                preparation
+                    .decision_representation(&constant("Decidable"), &[constant("True")])
+                    .is_err()
+            );
+            assert!(!preparation.specializations.decision_family_checked);
         }
     }
 
