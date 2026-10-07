@@ -344,8 +344,17 @@ struct LocalDecl {
 /// so the no-aliasing property this function exists to preserve holds in the
 /// degraded mode too, while ordinary large terms keep their cache rows
 /// instead of poisoning a permanent refusal key (bead `franken_lean-shgs`).
+/// Buckets are `Vec`s under the same `TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES`
+/// cap the old inline `[Option<Expr>; 64]` arrays enforced — the array form
+/// put a 1,024-byte value behind every first-seen packed word (one slot
+/// typically occupied), so map growth memmoved kilobytes per rehash and the
+/// admit scan walked 64 slots regardless of occupancy; measured at 4.4% of
+/// replay wall in the post-slice-C profile (bead `franken_lean-z8j.1.13`,
+/// comment 3336). Capacity, fill order and the degraded transition are
+/// unchanged: a bucket at the cap flips `degraded` exactly where a fully
+/// occupied array did.
 struct DependencyScanSeen {
-    structural: KMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
+    structural: KMap<u64, Vec<Expr>>,
     allocations: KMap<usize, ()>,
     degraded: bool,
 }
@@ -364,24 +373,15 @@ impl DependencyScanSeen {
     /// hash bucket ran out of slots.
     fn admit(&mut self, current: &Expr) -> Option<Expr> {
         if !self.degraded {
-            let bucket = self
-                .structural
-                .entry(current.data().0)
-                .or_insert_with(|| std::array::from_fn(|_| None));
-            if let Some(earlier) = bucket
-                .iter()
-                .flatten()
-                .find(|candidate| *candidate == current)
-            {
+            let bucket = self.structural.entry(current.data().0).or_default();
+            if let Some(earlier) = bucket.iter().find(|candidate| *candidate == current) {
                 return Some(earlier.clone());
             }
-            match bucket.iter_mut().find(|candidate| candidate.is_none()) {
-                Some(vacant) => {
-                    *vacant = Some(current.clone());
-                    return None;
-                }
-                None => self.degraded = true,
+            if bucket.len() < TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
+                bucket.push(current.clone());
+                return None;
             }
+            self.degraded = true;
         }
         let was_present = self
             .allocations
