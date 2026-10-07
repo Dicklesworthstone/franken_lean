@@ -2,6 +2,8 @@
 //! types. Source-local ids are resolved only after every lambda (including
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
+#[cfg(test)]
+mod projected;
 mod recursors;
 mod stages;
 
@@ -9,20 +11,86 @@ use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
 impl Preparation<'_> {
-    /// Recognize a literal callable after strict local initializers without
-    /// evaluating, substituting, or discarding any of those initializers.
-    /// This selects annotation only; it does not make the operand inert.
+    /// Recognize a literal callback after strict lets or administrative record
+    /// projections. Only select its annotation here: the original operand and
+    /// all initializers still enter the ordinary strict preparation path.
     pub(super) fn has_literal_callable_tail(&mut self, value: &Expr) -> Result<bool, IngressError> {
-        let mut value = value;
+        let mut value = value.clone();
         loop {
             self.tick()?;
-            match value.node() {
-                ExprNode::LetE { body, .. } => value = body,
-                ExprNode::MData { expr, .. } => value = expr,
+            value = match value.node() {
+                ExprNode::LetE { body, .. } => body.clone(),
+                ExprNode::MData { expr, .. } => expr.clone(),
                 ExprNode::Lam { .. } => return Ok(true),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+                        return Ok(false);
+                    };
+                    field
+                }
+                ExprNode::App { .. } => {
+                    let (head, args) = self.spine(&value)?;
+                    let Some(field) = self.callback_projection_body(&head, &args)? else {
+                        return Ok(false);
+                    };
+                    field
+                }
                 _ => return Ok(false),
-            }
+            };
         }
+    }
+
+    /// Expose only an admitted projection's administrative body for the
+    /// annotation probe. Unlike `projection_call`, do not erase or prepare its
+    /// selected field here: proof erasure itself calls this probe, and entering
+    /// it again would recursively traverse nested callback bodies. The returned
+    /// projection is inspected only; the caller keeps the original expression.
+    fn callback_projection_body(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(name).cloned() else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        let mut body = &definition.value;
+        let mut arity = 0usize;
+        while let ExprNode::Lam { body: next, .. } = body.node() {
+            self.tick()?;
+            arity += 1;
+            body = next;
+        }
+        // Applying a selected callback is execution, not projection discovery.
+        // Only the exact administrative projection telescope is inspected.
+        if arity == 0
+            || args.len() != arity
+            || !matches!(body.node(), ExprNode::Proj { expr, .. }
+                if matches!(expr.node(), ExprNode::BVar { idx: 0 }))
+        {
+            return Ok(None);
+        }
+        let mut value =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for arg in args {
+            self.tick()?;
+            let ExprNode::Lam { body, .. } = value.node() else {
+                return Ok(None);
+            };
+            value = self.substitution(body, arg)?;
+        }
+        Ok(Some(value))
     }
 
     /// Adapt underapplication before separating an eliminator's returned
