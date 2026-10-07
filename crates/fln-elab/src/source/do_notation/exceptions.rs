@@ -2,6 +2,12 @@
 //! admitted implementation decides which action runs. No host exception or
 //! privileged execution path is introduced by this syntax expansion.
 use super::*;
+mod exits;
+
+pub(super) struct ExceptionRegion {
+    handlers: Vec<(Syntax, Vec<Syntax>)>,
+    finally: bool,
+}
 
 fn apply(name: &[&str], mut arguments: Vec<Syntax>) -> Syntax {
     // Use the ordinary named-argument path so the expected action parameters
@@ -183,6 +189,46 @@ impl Context {
         &mut self,
         syntax: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if self.exception_control(&syntax)? {
+            // The outside continuation determines the return-packet type.
+            // Keep this region until its enclosing sequence owns that scope.
+            return Ok(Syntax::node(
+                parser_kind(&["Term", "nativeDoTry"]),
+                vec![syntax, atom("returning")],
+            ));
+        }
+        let action = self.expand_do_try_action(syntax, None)?;
+        Ok(Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action]))
+    }
+
+    fn expand_do_try_action(
+        &mut self,
+        syntax: Syntax,
+        join: Option<&Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let (region, sequences) = self.split_exception_region(syntax)?;
+        let last = sequences.len() - 1;
+        let mut bodies = Vec::new();
+        for (index, sequence) in sequences.into_iter().enumerate() {
+            self.tick()?;
+            bodies.push(self.expand_exception_sequence(
+                sequence,
+                if region.finally && index == last {
+                    None
+                } else {
+                    join
+                },
+            )?);
+        }
+        self.finish_exception_region(region, bodies)
+    }
+
+    /// Expose sequence bodies to the caller's heap worklist. A terminal try can
+    /// nest arbitrarily without recursively entering another sequence driver.
+    pub(super) fn split_exception_region(
+        &mut self,
+        syntax: Syntax,
+    ) -> Result<(ExceptionRegion, Vec<Syntax>), NatDefinitionElabError> {
         let mut parts = node(syntax, "doTry", 4)?;
         expect_atom(&parts[0], "try", "exception keyword")?;
         let finally = parts.pop().expect("optional finalizer");
@@ -192,9 +238,10 @@ impl Context {
             return Err(invalid());
         }
         let body = parts.pop().expect("protected sequence");
-        let mut returning = self.exception_control(&body)?;
-        let mut action = self.expand_do_sequence(body, None)?;
+        let mut sequences = vec![body];
+        let mut handlers = Vec::new();
         for handler in catches {
+            self.tick()?;
             let handler = if handler.kind() == Some(&parser_kind(&["Term", "doCatchMatch"])) {
                 self.expand_catch_pattern(handler)?
             } else {
@@ -206,20 +253,12 @@ impl Context {
                 return Err(invalid());
             }
             let body = parts.pop().expect("handler sequence");
-            returning |= self.exception_control(&body)?;
-            let body = self.expand_do_sequence(body, None)?;
             let annotation = children(parts.remove(2))?;
             let name = parts.remove(1);
-            let handler = lambda(name, null(vec![]), body)?;
-            action = match annotation.as_slice() {
-                [] => apply(&["MonadExcept", "tryCatch"], vec![action, handler]),
-                [colon, type_] => {
-                    expect_atom(colon, ":", "handler type")?;
-                    apply(&["tryCatchThe"], vec![type_.clone(), action, handler])
-                }
-                _ => return Err(invalid()),
-            };
+            handlers.push((name, annotation));
+            sequences.push(body);
         }
+        let has_finally = !finally.is_empty();
         if let Some(finalizer) = finally.pop() {
             let mut parts = node(finalizer, "doFinally", 2)?;
             expect_atom(&parts[0], "finally", "finalizer keyword")?;
@@ -230,19 +269,46 @@ impl Context {
             if self.exception_control(&body)? {
                 return Err(invalid());
             }
-            let cleanup = self.expand_do_sequence(body, None)?;
-            action = apply(&["tryFinally"], vec![action, cleanup]);
+            sequences.push(body);
         }
-        Ok(if returning {
-            Syntax::node(
-                parser_kind(&["Term", "nativeDoTry"]),
-                vec![action, atom("returning")],
-            )
-        } else {
-            // Normal completion must remain a doExpr: the enclosing nested-do
-            // worklist attaches its value continuation to that category.
-            Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action])
-        })
+        Ok((
+            ExceptionRegion {
+                handlers,
+                finally: has_finally,
+            },
+            sequences,
+        ))
+    }
+
+    pub(super) fn finish_exception_region(
+        &mut self,
+        region: ExceptionRegion,
+        bodies: Vec<Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if bodies.len() != region.handlers.len() + 1 + usize::from(region.finally) {
+            return Err(invalid());
+        }
+        let mut bodies = bodies.into_iter();
+        let mut action = bodies.next().ok_or_else(invalid)?;
+        for (name, annotation) in region.handlers {
+            self.tick()?;
+            let handler = lambda(name, null(vec![]), bodies.next().ok_or_else(invalid)?)?;
+            action = match annotation.as_slice() {
+                [] => apply(&["MonadExcept", "tryCatch"], vec![action, handler]),
+                [colon, type_] => {
+                    expect_atom(colon, ":", "handler type")?;
+                    apply(&["tryCatchThe"], vec![type_.clone(), action, handler])
+                }
+                _ => return Err(invalid()),
+            };
+        }
+        if region.finally {
+            action = apply(
+                &["tryFinally"],
+                vec![action, bodies.next().ok_or_else(invalid)?],
+            );
+        }
+        Ok(action)
     }
 
     pub(super) fn prepend_do_try(
@@ -259,10 +325,18 @@ impl Context {
             Syntax::Atom { val, .. } if val == "action" => false,
             _ => return Err(invalid()),
         };
-        // Until tagged exits are threaded through the combinator, refuse a
-        // nonlocal exit rather than treating return/break as ordinary fallthrough.
-        if returning && (!terminal || suffix.is_some() || !scope.allow_return) {
-            return Err(invalid());
+        if returning {
+            if !scope.allow_return || scope.targets.is_some() {
+                return Err(invalid());
+            }
+            let region = parts.pop().expect("retained exception region");
+            if let Some(suffix) = suffix {
+                return self.expand_returning_try(region, suffix);
+            }
+            if !terminal {
+                return Err(invalid());
+            }
+            parts.push(self.expand_do_try_action(region, None)?);
         }
         self.prepend_do_element(
             Syntax::node(parser_kind(&["Term", "doExpr"]), parts),

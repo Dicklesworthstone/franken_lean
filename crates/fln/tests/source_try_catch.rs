@@ -154,7 +154,6 @@ fn bad_handlers_do_not_publish_and_valid_retry_recovers() {
     for s in [
         "def bad : Trial Nat := do { try { return 1 } catch e => { return true } }",
         "def bad : Trial Nat := do { try { return 1 }; return 2 }",
-        "def bad : Trial Nat := do { try { raise (1 : Nat) } catch e => { return e }; return 2 }",
         "def bad : Trial Nat := do { try { return 1 } catch e : Bool => { return 2 } }",
     ] {
         assert!(
@@ -168,6 +167,13 @@ fn bad_handlers_do_not_publish_and_valid_retry_recovers() {
     checked(
         &engine,
         "def good : Trial Nat := do { try { return 1 } catch e => { return e } }",
+    );
+    // A handler return crosses the completed exception region, rather than
+    // becoming ordinary fallthrough to the following return.
+    execute(
+        &engine,
+        "def recovered : Trial Nat := do { try { raise (1 : Nat) } catch e => { return e }; return 2 }\n#eval result recovered",
+        &["1"],
     );
 }
 

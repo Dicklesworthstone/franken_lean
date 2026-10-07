@@ -88,7 +88,8 @@ impl Context {
             let Syntax::Node { kind, args, .. } = syntax else {
                 continue;
             };
-            if nested::sequence(syntax).is_some() {
+            if nested::sequence(syntax).is_some() || kind == &parser_kind(&["Term", "nativeDoTry"])
+            {
                 return Ok(true);
             }
             if kind == &parser_kind(&["Term", "doReturn"]) && branch {
@@ -157,9 +158,22 @@ impl Context {
         &mut self,
         sequence: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        self.expand_returning_sequence_at(sequence, None)
+    }
+
+    /// An exception region has a normal-completion packet, not a source
+    /// statement after its last return. Keep that distinction on the worklist:
+    /// returns bypass this continuation, while ordinary actions must finish at
+    /// Unit before it is produced.
+    pub(super) fn expand_returning_sequence_at(
+        &mut self,
+        sequence: Syntax,
+        normal: Option<Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task {
             Block(Block),
             Resume(Block),
+            FinishException(exceptions::ExceptionRegion, usize),
             Conditional(
                 Syntax,
                 Option<Syntax>,
@@ -173,7 +187,13 @@ impl Context {
             Finish(conditional::Header, usize, Option<(Syntax, Syntax)>, bool),
             Value(Syntax),
         }
-        let mut work = vec![Task::Block(Block::new(sequence, None, false, None)?)];
+        let require_unit = normal.is_some();
+        let mut work = vec![Task::Block(Block::new(
+            sequence,
+            normal,
+            require_unit,
+            None,
+        )?)];
         let mut values = Vec::new();
         while let Some(task) = work.pop() {
             self.tick()?;
@@ -187,6 +207,27 @@ impl Context {
                     let terminal = block.terminal;
                     block.terminal = false;
                     let element = sequence_element(statement)?;
+                    if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
+                        && block.result.is_none()
+                        && block.loop_scope.is_none()
+                    {
+                        // A value-bearing nested completion needs a separate
+                        // normal payload as well as the return packet. Never
+                        // discard that continuation or invoke it inside try.
+                        if !terminal || block.completion.is_some() {
+                            return Err(invalid());
+                        }
+                        let mut parts = node(element, "nativeDoTry", 2)?;
+                        expect_atom(&parts[1], "returning", "retained exception control")?;
+                        let (region, sequences) = self.split_exception_region(parts.remove(0))?;
+                        work.push(Task::Resume(block));
+                        work.push(Task::FinishException(region, values.len()));
+                        for sequence in sequences.into_iter().rev() {
+                            self.tick()?;
+                            work.push(Task::Block(Block::new(sequence, None, false, None)?));
+                        }
+                        continue;
+                    }
                     if nested::sequence(&element).is_some() {
                         let scope = SequenceScope {
                             targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
@@ -303,6 +344,10 @@ impl Context {
                         },
                         _ => body,
                     });
+                }
+                Task::FinishException(region, start) => {
+                    let bodies = values.split_off(start);
+                    values.push(self.finish_exception_region(region, bodies)?);
                 }
                 Task::FinishLoop(build) => {
                     let body = values.pop().ok_or_else(invalid)?;

@@ -99,7 +99,7 @@ impl Context {
     }
 
     /// The existing named-argument path checks this type like any written
-    /// Option.none parameter. Its source is the enclosing join's ORIGINAL
+    /// Option constructor parameter. Its source is the enclosing join's ORIGINAL
     /// result, before Id/State alias reduction; no monad injectivity is assumed.
     pub(super) fn do_loop_result_argument(
         &mut self,
@@ -121,7 +121,8 @@ impl Context {
             || !matches!(join.leaf_view(), fln_core::name::LeafView::Num(_))
             || name != &Name::from_components(["α"])
             || !matches!(function.value.node(), ExprNode::Const { name, .. }
-                if name == &Name::from_components(["Option", "none"]))
+                if name == &Name::from_components(["Option", "none"])
+                    || name == &Name::from_components(["Option", "some"]))
         {
             return Err(invalid());
         }
