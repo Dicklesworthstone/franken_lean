@@ -141,6 +141,10 @@ impl Preparation<'_> {
             constant("List.rec", levels.clone()),
             [args[0].clone(), motive, first, step, args[2].clone()],
         );
+        // History reduction can expose projections below fresh binders.
+        // Select their ground layouts while the fold still contains that
+        // telescope, before callable extraction removes its source context.
+        let fold = self.lower_projections(&fold)?;
         Ok(Some(application(fold, args[4..].iter().cloned())))
     }
 
@@ -465,3 +469,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod catalog_tests;

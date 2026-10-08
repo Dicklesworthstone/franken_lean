@@ -564,6 +564,28 @@ fn admitted_list_dependencies_have_uniform_signatures_after_history_reduction() 
             );
             let mut cases = vec![
                 (
+                    "List.length Nat",
+                    natural.clone(),
+                    application(
+                        Expr::const_(name("List.length"), vec![Level::zero()]),
+                        [natural.clone(), list(&[20, 22, 0])],
+                    ),
+                ),
+                (
+                    "List.length Char",
+                    natural.clone(),
+                    application(
+                        Expr::const_(name("List.length"), vec![Level::zero()]),
+                        [
+                            constant("Char"),
+                            Expr::app(
+                                Expr::const_(name("List.nil"), vec![Level::zero()]),
+                                constant("Char"),
+                            ),
+                        ],
+                    ),
+                ),
+                (
                     "List.append",
                     result_type.clone(),
                     application(
@@ -657,6 +679,28 @@ fn admitted_list_dependencies_have_uniform_signatures_after_history_reduction() 
                     assert!(
                         signature.is_some(),
                         "{label}: {generated:?} <- {original:?}"
+                    );
+                }
+                let expected = match label {
+                    "List.length Nat" => Some(3),
+                    "List.length Char" => Some(0),
+                    _ => None,
+                };
+                if let Some(expected) = expected {
+                    let executed = imported
+                        .engine
+                        .execute_definition(
+                            declaration("executedListLength", result_type, body),
+                            &options,
+                            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                        )
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                        .into_complete()
+                        .unwrap();
+                    assert_eq!(
+                        closed_vm_value(&executed.exit).unwrap(),
+                        Some(ClosedVmValue::Scalar(expected)),
+                        "{label} uses the admitted logical body in the native VM"
                     );
                 }
             }
