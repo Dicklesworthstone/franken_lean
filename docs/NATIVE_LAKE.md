@@ -199,6 +199,29 @@ replaced with metadata guessed from its directory name. Supported declarative
 `lakefile.toml` configuration remains available. Malformed default-target array
 elements are rejected, not silently filtered out.
 
+`lake clean` removes the `buildDir` that `lakefile.toml` names, `.lake/build`
+when it names none, and nothing else. A `buildDir` that is absolute, empty, or
+leaves the package through `..` is refused with exit 1 and nothing is removed;
+the pin removes whatever the configuration names, and this does not delete
+outside the package on a configuration's say-so. A package configured only by
+`lakefile.lean` gets exit 5, because its build directory is not known without
+evaluating it; again nothing is removed.
+
+`lake new NAME [TEMPLATE]` and `lake init [NAME] [TEMPLATE]` write the pin's
+`std` template with a TOML configuration. When the pinned toolchain is
+installed, `lake_new_writes_the_tree_the_pinned_lake_writes` in
+`crates/fln-cli/tests/cli_personalities_and_verbs.rs` compares the tree with the
+one the pinned `lake new` writes, byte for byte, apart from `lean-toolchain` and
+`.git`. Another template or configuration language the pin knows (`exe`, `lib`,
+`math-lax`, `math`; `.lean`) is refused with exit 5 before anything is created.
+An unknown one gets the pin's own error and exit 1. Two things the pin does are
+not done: no git repository is initialized, because git is spawned only to fetch
+dependencies, and an existing `lean-toolchain` is left as it is.
+
+`lake env` reports the sysroot from `LEAN_SYSROOT`, or from the toolchain layout
+around the running binary. A binary outside a toolchain layout with
+`LEAN_SYSROOT` unset gets exit 5 instead of an invented sysroot.
+
 Installed-command tests in `crates/fln-cli/tests/lake_module_build.rs` inspect
 every emitted artifact, import it into a separate downstream build, and check
 proofs against the resulting artifact closure. Negative cases cover invalid
