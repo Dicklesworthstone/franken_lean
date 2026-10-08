@@ -102,6 +102,11 @@ fn admitted_prelude_arithmetic_and_recursive_consumers_run_without_a_seed() {
             ("def total (xs : List Nat) : Nat := match xs with | [] => 0 | x :: tail => x + total tail\ndef powered (base : Nat) : List Nat := List.map (Nat.pow base) [1, 2, 3]\n#eval total (powered 3)", 39),
             ("def total (xs : List Nat) : Nat := match xs with | [] => 0 | x :: tail => x + total tail\n#eval total (List.map (fun (b : Bool) => if b then 20 else 22) [true, false])", 42),
             ("def applyTotal (fs : List (Nat -> Nat)) (n : Nat) : Nat := match fs with | [] => 0 | f :: rest => f n + applyTotal rest n\n#eval applyTotal (List.map (fun k => fun n => k + n) [19, 21]) 1", 42),
+            // The pin's `Char` holds a `UInt32`, which here is an admitted structure, not the
+            // seed's native word, so `List Char` is a value type only through that layout.
+            ("def count (xs : List Char) : Nat := match xs with | [] => 0 | _ :: tail => count tail + 1\n#eval count []", 0),
+            ("def count (xs : List Char) : Nat := match xs with | [] => 0 | _ :: tail => count tail + 1\n#eval count [Char.ofNat 97, Char.ofNat 98]", 2),
+            ("#eval (Char.ofNat 97).val.toBitVec.toFin.val", 97),
         ].into_iter().map(|(source, value)| (source, ClosedVmValue::Scalar(value))).chain([
             ("#eval Nat.pred 18446744073709551617", ClosedVmValue::NonnegativeMpz("18446744073709551616".to_owned())),
             ("#eval Nat.mul 4294967296 4294967296", ClosedVmValue::NonnegativeMpz("18446744073709551616".to_owned())),
