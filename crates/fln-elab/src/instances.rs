@@ -397,6 +397,9 @@ fn validate_instance(env: &Environment, name: &Name) -> Result<Name, InstanceReg
         ConstantInfo::Thm(_) => true,
         ConstantInfo::Opaque(value) => !value.is_unsafe,
         ConstantInfo::Axiom(value) => !value.is_unsafe,
+        // `class abbrev C := A` registers the constructor `C.mk` itself as the instance; at
+        // the pin, `Std.Internal.Do.Assertion.mk` is one, so `import Std` carries it.
+        ConstantInfo::Ctor(value) => !value.is_unsafe,
         _ => false,
     };
     if !safe {

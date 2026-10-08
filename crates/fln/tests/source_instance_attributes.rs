@@ -91,6 +91,28 @@ fn attributed_generic_instances_synthesize_their_prerequisites() {
     );
 }
 
+/// `class abbrev C := A` registers the constructor `C.mk` itself as the instance (the pin's
+/// `Std.Internal.Do.Assertion.mk`, which `import Std` carries), so a constructor is as valid an
+/// instance as a definition. The pin accepts this source.
+#[test]
+fn a_class_constructor_can_be_the_registered_instance() {
+    let checked = checked(
+        &engine(),
+        "\
+        class Marker\n\
+        attribute [instance] Marker.mk\n\
+        def needs [Marker] : Nat := 0\n\
+        def used : Nat := needs",
+    );
+    assert!(
+        InstanceRegistry::read(checked.environment())
+            .unwrap()
+            .candidates(&n("Marker"))
+            .iter()
+            .any(|entry| entry.declaration == n("Marker.mk"))
+    );
+}
+
 #[test]
 fn late_unknown_or_nonclass_names_publish_no_attribute_prefix() {
     let base = checked(
