@@ -37,7 +37,7 @@ fn omitted_defaults_use_actual_preceding_values_and_updates_preserve_copies() {
 fn dependent_types_proofs_and_method_parameters_are_closed_in_order() {
     check(
         &engine(),
-        "structure Package where\n  carrier : Type := Nat\n  value : carrier\n  copy : carrier := value\n  proof : value = value := rfl\n  ident (x : carrier) : carrier := x\ndef p : Package := { value := 9 }\ndef q : Package := { carrier := String, value := \"hi\" }\ntheorem p_ok : p.copy = 9 := by rfl\ntheorem q_ok : q.ident q.copy = \"hi\" := by rfl",
+        "structure Package where\n  carrier : Type := Nat\n  value : carrier\n  copy : carrier := value\n  proof : value = value := rfl\n  ident (x : carrier) : carrier := x\ndef p : Package := { value := 9 }\ndef q : Package := { carrier := String, value := \"hi\" }\ntheorem p_ok : p.copy = (9 : Nat) := by rfl\ntheorem q_ok : q.ident q.copy = \"hi\" := by rfl",
     );
 }
 #[test]

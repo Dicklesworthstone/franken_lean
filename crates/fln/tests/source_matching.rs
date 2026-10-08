@@ -125,7 +125,7 @@ fn inferred_result_types_and_function_valued_branches_are_supported() {
 #[test]
 fn dependent_record_match_refines_the_expected_type() {
     check(
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef extract (p : Package) : p.carrier := match p with | Package.mk A x => x\ndef packaged : Package := { carrier := Nat, value := 21 }\ntheorem extracted : extract packaged = 21 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef extract (p : Package) : p.carrier := match p with | Package.mk A x => x\ndef packaged : Package := { carrier := Nat, value := 21 }\ntheorem extracted : extract packaged = (21 : Nat) := by rfl",
     );
 }
 #[test]

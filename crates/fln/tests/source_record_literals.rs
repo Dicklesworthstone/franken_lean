@@ -400,7 +400,7 @@ fn proof_fields_use_the_ordinary_tactic_and_kernel_path() {
 fn named_field_access_carries_receiver_and_dependent_field_types() {
     check(
         &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef packed : Package := { carrier := Nat, value := 23 }\ndef read (p : Package) : p.carrier := p.value\ntheorem value_ok : packed.value = 23 := by rfl\ntheorem read_ok : read packed = 23 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef packed : Package := { carrier := Nat, value := 23 }\ndef read (p : Package) : p.carrier := p.value\ntheorem value_ok : packed.value = (23 : Nat) := by rfl\ntheorem read_ok : read packed = (23 : Nat) := by rfl",
     );
 }
 #[test]
