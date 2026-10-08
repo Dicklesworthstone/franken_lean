@@ -1,0 +1,101 @@
+name: IR graph archive activation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-hash/src/ir_graph.rs'
+      - 'crates/fln-olean/src/ir_archive.rs'
+      - 'scripts/register_ir_graph_codec.py'
+      - '.github/workflows/ir-archive-landing.yml'
+permissions:
+  contents: write
+concurrency:
+  group: ir-archive-activation
+  cancel-in-progress: false
+jobs:
+  activate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Register the codec without rewriting historical evidence
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git rev-parse HEAD
+          rustup show active-toolchain
+          mkdir -p "$RUNNER_TEMP/ir-archive-evidence"
+          python3 -I scripts/register_ir_graph_codec.py | tee "$RUNNER_TEMP/ir-archive-evidence/registration.log"
+          if tail -n 1 "$RUNNER_TEMP/ir-archive-evidence/registration.log" | grep -qx registered; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Format only the codec and registration edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true \
+            crates/fln-hash/src/ir_graph.rs crates/fln-hash/src/canon.rs \
+            crates/fln-hash/src/domain.rs crates/fln-hash/src/lib.rs \
+            crates/fln-hash/tests/domain_enforcement.rs \
+            crates/fln-olean/src/ir_archive.rs crates/fln-olean/src/lib.rs
+      - name: Run both complete package suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-hash -p fln-olean 2>&1 | tee "$RUNNER_TEMP/ir-archive-evidence/tests.log"
+      - name: Clippy both packages without warning exemptions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln-hash -p fln-olean --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/ir-archive-evidence/clippy.log"
+      - name: Compile workspace consumers of the registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/ir-archive-evidence/workspace-check.log"
+      - name: Publish only the tested registration and formatted source
+        if: steps.registry.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import subprocess
+          allowed = {
+              'crates/fln-hash/src/canon.rs', 'crates/fln-hash/src/domain.rs',
+              'crates/fln-hash/src/lib.rs', 'crates/fln-hash/src/ir_graph.rs',
+              'crates/fln-hash/tests/domain_enforcement.rs',
+              'crates/fln-hash/fixtures/ir_domain_vectors.txt',
+              'crates/fln-olean/src/lib.rs', 'crates/fln-olean/src/ir_archive.rs',
+          }
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
+          if not changed or (changed | untracked) - allowed:
+              raise SystemExit(f'unexpected publication set: {changed | untracked}')
+          subprocess.run(['git', 'add', '--', *sorted(allowed)], check=True)
+          PY
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m 'feat(olean): activate the tested canonical IR graph codec and census adapter' \
+            -m 'Both hash/codec package suites, package Clippy, and workspace compilation completed in this workflow. New hash domains are frozen separately; historical vectors and host attestations are unchanged. Snapshot decoding confers no execution or kernel authority.'
+          git rev-parse HEAD | tee "$RUNNER_TEMP/ir-archive-evidence/tested-commit.txt"
+          # No force/rebase: a concurrent advance must be reconciled and re-tested.
+          git push origin HEAD:main
+      - name: Retain logs and the exact working-tree correction
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ir-archive-evidence"
+          git diff HEAD -- > "$RUNNER_TEMP/ir-archive-evidence/working-tree.patch"
+          git rev-parse HEAD > "$RUNNER_TEMP/ir-archive-evidence/checkout.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ir-archive-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ir-archive-evidence
+          if-no-files-found: error
