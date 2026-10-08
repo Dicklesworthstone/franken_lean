@@ -6,6 +6,14 @@
 //! Crucible. Even then the result is only a candidate: this crate exposes no
 //! environment-publication path. A SAT result is an independently re-decoded
 //! counterexample.
+//!
+//! What the checked proof stream does not do yet is prove the theorem. The
+//! candidate's statement and its proof term are the caller's `source_proposition`
+//! and `reflected_proof`, and Crucible checks that term as given. The step that
+//! would derive the proof term from the replayed certificate (that the CNF is
+//! the proposition's bitblasting, and that an unsatisfiable CNF proves it) is not
+//! built. So nothing unsound can be admitted through here, but the SAT
+//! certificate is not what makes the theorem true.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +35,8 @@ use crate::{
     solve_with_cancel,
 };
 
-/// The registered orchestration policy for the complete `bv_decide` path.
+/// The registered orchestration policy for the `bv_decide` path (see the module
+/// doc for the reflection step it does not yet perform).
 ///
 /// This is an in-memory algorithm identity, not a new durable schema.
 pub const BV_DECIDE_POLICY_ID: &str = "fln.verdict.bv-decide/1";

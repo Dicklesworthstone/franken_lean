@@ -1172,7 +1172,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
         "README-DROP-IN-TODAY",
         Citation::OccursExactly {
             path: "README.md",
-            needle: "accepts 3 of the 27 probe programs the pinned Reference accepts",
+            needle: "accepts 15 of the 29 probe programs the pinned Reference accepts",
             count: 1,
         },
     ),
