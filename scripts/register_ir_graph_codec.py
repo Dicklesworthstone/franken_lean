@@ -7,7 +7,6 @@ and codec package tests and Clippy before publishing the resulting tree.
 """
 from pathlib import Path
 import subprocess
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,6 +23,7 @@ def main() -> None:
     canon = (ROOT / canon_path).read_text()
     if "pub const SCHEMA_IR_CALL_GRAPH:" in canon:
         required = {
+            canon_path: ["hash_rows, 15,"],
             domain_path: ["IrCallGraph", "IrPartition", "HISTORICAL_DOMAIN_VECTORS"],
             "crates/fln-hash/src/lib.rs": ["pub mod ir_graph;"],
             "crates/fln-olean/src/lib.rs": ["pub mod ir_archive;"],
@@ -53,6 +53,9 @@ def main() -> None:
     change(canon_path, '            (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),\n',
         '            (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),\n'
         '            (SCHEMA_IR_CALL_GRAPH, "fln.canon.ir-call-graph"),\n')
+    # The new constant is joined above and contributes exactly one Hash-owned
+    # schema. Keep the guard's exact inventory assertion, rather than omitting it.
+    change(canon_path, '            hash_rows, 14,\n', '            hash_rows, 15,\n')
     change(domain_path, '    /// Tribunal fixture and corpus identity (test apparatus only).\n    Fixture,',
         '    /// Canonical static IR graph analysis data, never kernel authority.\n    IrCallGraph,\n'
         '    /// Exact bytes of an input census partition used to classify an IR graph.\n    IrPartition,\n'

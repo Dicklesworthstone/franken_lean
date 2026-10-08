@@ -260,7 +260,7 @@ fn command_reports_usage_and_does_not_publish_on_output_exhaustion() {
 fn missing_input_directory_and_corrupt_container_have_distinct_outcomes() {
     let dir = Scratch::new();
     assert_eq!(command(&[], &[dir.0.join("absent.ir")]).status.code(), Some(5));
-    assert_eq!(command(&[], &[dir.0.clone()]).status.code(), Some(5));
+    assert_eq!(command(&[], std::slice::from_ref(&dir.0)).status.code(), Some(5));
     let bad = dir.write("bad.ir", b"not an IR container");
     let output = command(&["--dot"], &[bad]);
     assert_eq!(output.status.code(), Some(1));

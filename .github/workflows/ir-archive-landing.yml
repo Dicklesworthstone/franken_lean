@@ -14,7 +14,6 @@ permissions:
   contents: write
 concurrency:
   group: ir-archive-activation
-  # Superseded candidates cannot block the complete codec+command candidate.
   cancel-in-progress: true
 jobs:
   activate:
@@ -38,15 +37,22 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I scripts/register_ir_graph_cli.py | tee "$RUNNER_TEMP/ir-archive-evidence/command-install.log"
-      - name: Format only the codec and command edits
+      - name: Format the codec, commands and their existing IR dependencies
         shell: bash
         run: |
           set -euo pipefail
+          # The prior IR run produced a real formatting failure. Format these
+          # existing IR files too; do not suppress or skip the formatting gate.
           rustfmt --edition 2024 --config skip_children=true \
             crates/fln-hash/src/ir_graph.rs crates/fln-hash/src/canon.rs \
             crates/fln-hash/src/domain.rs crates/fln-hash/src/lib.rs \
             crates/fln-hash/tests/domain_enforcement.rs \
             crates/fln-olean/src/ir_archive.rs crates/fln-olean/src/lib.rs \
+            crates/fln-olean/src/ir_validate.rs crates/fln-olean/src/ir_types.rs \
+            crates/fln-olean/src/ir_files.rs crates/fln-olean/src/ir_files/type_tests.rs \
+            crates/fln-olean/tests/ir_validate.rs crates/fln-olean/tests/ir_validated_graph.rs \
+            crates/fln-olean/tests/ir_files.rs crates/fln-olean/tests/ir_types.rs \
+            crates/fln-olean/tests/ir_type_cli.rs \
             crates/fln-olean/src/bin/fln-ir-check.rs \
             crates/fln-olean/src/bin/fln-ir-graph.rs \
             crates/fln-olean/src/bin/ir_support/mod.rs \
@@ -72,7 +78,14 @@ jobs:
           set -euo pipefail
           python3 -I - <<'PY'
           import subprocess
-          allowed = {
+          legacy_format_only = {
+              'crates/fln-olean/src/ir_validate.rs', 'crates/fln-olean/src/ir_types.rs',
+              'crates/fln-olean/src/ir_files.rs', 'crates/fln-olean/src/ir_files/type_tests.rs',
+              'crates/fln-olean/tests/ir_validate.rs', 'crates/fln-olean/tests/ir_validated_graph.rs',
+              'crates/fln-olean/tests/ir_files.rs', 'crates/fln-olean/tests/ir_types.rs',
+              'crates/fln-olean/tests/ir_type_cli.rs',
+          }
+          allowed = legacy_format_only | {
               'crates/fln-hash/src/canon.rs', 'crates/fln-hash/src/domain.rs',
               'crates/fln-hash/src/lib.rs', 'crates/fln-hash/src/ir_graph.rs',
               'crates/fln-hash/tests/domain_enforcement.rs',
@@ -87,6 +100,18 @@ jobs:
           untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
           if (changed | untracked) - allowed:
               raise SystemExit(f'unexpected publication set: {changed | untracked}')
+          # Enforce that inherited files are exactly rustfmt outputs of HEAD;
+          # none of their assertions or implementation can be changed here.
+          from pathlib import Path
+          import tempfile
+          for path in sorted(changed & legacy_format_only):
+              original = subprocess.check_output(['git', 'show', 'HEAD:' + path])
+              with tempfile.TemporaryDirectory() as directory:
+                  candidate = Path(directory) / Path(path).name
+                  candidate.write_bytes(original)
+                  subprocess.run(['rustfmt', '--edition', '2024', '--config-path', 'rustfmt.toml', '--config', 'skip_children=true', str(candidate)], check=True)
+                  if candidate.read_bytes() != Path(path).read_bytes():
+                      raise SystemExit(f'non-formatting change in inherited IR file: {path}')
           if changed or untracked:
               subprocess.run(['git', 'add', '--', *sorted(changed | untracked)], check=True)
           PY
@@ -96,7 +121,7 @@ jobs:
           fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -m 'feat(olean): activate tested reusable IR graph archives and file-only queries' \
-            -m 'Both hash/codec package suites, package Clippy, and workspace compilation completed in this workflow. New hash domains are frozen separately; historical vectors and host attestations are unchanged. Archives and query results remain analysis data, not execution or kernel authority.'
+            -m 'Both hash/codec package suites, package Clippy, and workspace compilation completed in this workflow. New hash domains are frozen separately; historical vectors and host attestations are unchanged. Existing IR changes are checked against exact rustfmt outputs. Archives and query results remain analysis data, not execution or kernel authority.'
           git rev-parse HEAD | tee "$RUNNER_TEMP/ir-archive-evidence/tested-commit.txt"
           # No force/rebase: a concurrent advance must be reconciled and re-tested.
           git push origin HEAD:main
