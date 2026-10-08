@@ -77,6 +77,23 @@ fn control(s: &str) -> bool {
             | "omit"
     )
 }
+/// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
+fn doc_comment(token: &LexedToken) -> bool {
+    matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--" || symbol == "/-!")
+}
+
+/// Whether `token` can follow a declaration's doc comment: the declaration keywords and the
+/// rest of `declModifiers` (attributes, then the modifiers), whose first slot the doc fills.
+fn carries_doc_comment(token: &LexedToken) -> bool {
+    matches!(&token.kind, TokenKind::Symbol(symbol)
+    if modifiers::is_modifier(symbol)
+        || matches!(
+            symbol.as_str(),
+            "def" | "theorem" | "abbrev" | "opaque" | "axiom" | "example" | "instance"
+                | "structure" | "class" | "inductive" | "@["
+        ))
+}
+
 fn declaration(s: &str) -> bool {
     matches!(
         s,
@@ -102,6 +119,11 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let Some(first) = tokens.first() else {
         return Ok(Some(ScopeCommand::Trivia));
     };
+    // A module doc, or a declaration's doc comment that `partition` split off after checking
+    // what follows it, changes no environment and prints nothing.
+    if tokens.len() == 1 && doc_comment(first) {
+        return Ok(Some(ScopeCommand::Trivia));
+    }
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
@@ -197,6 +219,8 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     let mut current_open = false;
     let mut open_in = false;
     let mut mutual_until = 0;
+    // The token after a doc comment begins its declaration wherever it sits on the line.
+    let mut after_doc = false;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
             continue;
@@ -217,9 +241,30 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 continue;
             }
             let command_line = (index == 0
+                || std::mem::take(&mut after_doc)
                 || source_view.line_of(token.extent.start())
                     > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
+            // A doc comment is its own command: a module doc (`moduleDoc`) always, and a
+            // declaration's (`declModifiers`' first slot) only before what can carry it, as
+            // at the pin, which refuses `/-- d -/ #eval e` at the `#eval`.
+            if depth == 0 && command_line && !open_in && doc_comment(token) {
+                if symbol == "/--" && !tokens.get(index + 1).is_some_and(carries_doc_comment) {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: tokens.get(index + 1).map_or(BytePos(source.len()), |next| {
+                            view.to_original(next.extent.start())
+                        }),
+                        expected: NatDefinitionExpectation::DefinitionKeyword,
+                    });
+                }
+                starts.push(view.to_original(token.extent.start()).0);
+                current_open = false;
+                declaration_column = None;
+                attribute_prefix = false;
+                prefix_column = None;
+                after_doc = symbol == "/--";
+                continue;
+            }
             let scope_start = control(symbol) && command_line;
             // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
             // …) precede the declaration keyword in one command (`declModifiers`).
@@ -470,6 +515,43 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(command)
             );
+        }
+    }
+
+    /// Doc comments are commands of their own: a module doc wherever a command may start, a
+    /// declaration's only before what can carry it, the way the pin refuses `/-- d -/ #eval e`.
+    #[test]
+    fn doc_comments_are_their_own_commands_and_must_be_carried() {
+        let source = "/-! A module doc with `code`; it's prose. -/\n/-- The answer. -/\ndef answer : Nat := 42\n/-- Inline. -/ private def other : Nat := 1\n#eval answer\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        let texts: Vec<_> = commands
+            .iter()
+            .map(|(_, command)| std::str::from_utf8(command).unwrap().trim_end())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "/-! A module doc with `code`; it's prose. -/",
+                "/-- The answer. -/",
+                "def answer : Nat := 42",
+                "/-- Inline. -/",
+                "private def other : Nat := 1",
+                "#eval answer",
+            ]
+        );
+        for doc in [texts[0], texts[1], texts[3]] {
+            assert_eq!(
+                parse(doc.as_bytes()).unwrap(),
+                Some(ScopeCommand::Trivia),
+                "{doc}"
+            );
+        }
+        for bad in [
+            "/-- d -/\n#eval 1\n",
+            "def x : Nat := 1\n/-- dangling -/\n",
+            "/-- d -/\n/-- e -/\ndef x : Nat := 1\n",
+        ] {
+            assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 }

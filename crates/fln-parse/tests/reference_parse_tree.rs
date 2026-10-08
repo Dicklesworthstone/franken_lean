@@ -971,8 +971,8 @@ fn parse_doc_definition(source: &str) -> Result<Syntax, String> {
         })
         .collect::<Vec<_>>()
         .join("|");
-    let expected =
-        "symbol:/--|ident:frozen|ident:doc|symbol:-/|symbol:def|ident:x|symbol::=|literal:Nat";
+    // The whole doc comment is one token, as `commentBody` reads it raw at the pin.
+    let expected = "symbol:/--|symbol:def|ident:x|symbol::=|literal:Nat";
     if signature != expected {
         return Err(format!(
             "doc command token sequence diverged: expected {expected:?}, got {signature:?}"
@@ -985,9 +985,15 @@ fn parse_doc_definition(source: &str) -> Result<Syntax, String> {
             .leaf(index)
             .map_err(|error| format!("doc command leaf {index} missing: {error:?}"))
     };
+    // The body atom starts after the opener's trailing whitespace, where `commentBody` starts.
+    let body_start = fln_syntax::trivia::scan_trivia(
+        &text,
+        fln_syntax::source::BytePos(tokens[0].extent.start().0 + 3),
+    )
+    .map_err(|error| format!("doc comment opener trivia refused: {error:?}"))?;
     let body = text
         .as_str()
-        .get(tokens[1].extent.start().0..tokens[3].extent.end().0)
+        .get(body_start.0..tokens[0].extent.end().0)
         .ok_or_else(|| "doc comment body span was not a UTF-8 boundary".to_string())?;
 
     let doc_comment = Syntax::node(
@@ -1008,25 +1014,25 @@ fn parse_doc_definition(source: &str) -> Result<Syntax, String> {
     );
     let decl_id = Syntax::node(
         parser_kind(&["Command", "declId"]),
-        vec![leaf(5)?, null_node(Vec::new())],
+        vec![leaf(2)?, null_node(Vec::new())],
     );
     let opt_decl_sig = Syntax::node(
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let numeral = Syntax::node(name("num"), vec![leaf(7)?]);
+    let numeral = Syntax::node(name("num"), vec![leaf(4)?]);
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
     let decl_value = Syntax::node(
         parser_kind(&["Command", "declValSimple"]),
-        vec![leaf(6)?, numeral, termination, null_node(Vec::new())],
+        vec![leaf(3)?, numeral, termination, null_node(Vec::new())],
     );
     let definition = Syntax::node(
         parser_kind(&["Command", "definition"]),
         vec![
-            leaf(4)?,
+            leaf(1)?,
             decl_id,
             opt_decl_sig,
             decl_value,

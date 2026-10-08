@@ -35,8 +35,8 @@
 //! line comment.
 
 use crate::source::{BytePos, ByteSpan, SourceText};
-use crate::token::{LexedToken, TokenError, TokenTable, lex_token};
-use crate::trivia::scan_trivia;
+use crate::token::{LexedToken, TokenError, TokenKind, TokenTable, lex_token};
+use crate::trivia::{opens_doc_comment, scan_doc_comment, scan_trivia};
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 
@@ -200,6 +200,21 @@ fn lex_from_bounded(
                 if stop.0 >= end {
                     break;
                 }
+                // A doc comment's body is `commentBody`, which no token table can express:
+                // the whole comment is one token, named by its opener, and its extent
+                // covers everything the scan read, as every unbounded construct's does.
+                if opens_doc_comment(text, stop) {
+                    let (event, next) = doc_comment_event(text, stop);
+                    events.push(event);
+                    if over(&events) {
+                        return (events, true);
+                    }
+                    if next.0 <= stop.0 {
+                        break;
+                    }
+                    at = next;
+                    continue;
+                }
                 match lex_token(text, table, stop) {
                     Ok(token) => {
                         let next = token.extent.end();
@@ -257,6 +272,31 @@ fn lex_from_bounded(
         }
     }
     (events, false)
+}
+
+/// The event for the doc comment opening at `stop`, and where the driver resumes. Out of line
+/// so its temporaries never enlarge the driver's frame: parsers run it on small host stacks.
+#[inline(never)]
+fn doc_comment_event(text: &SourceText, stop: BytePos) -> (Event, BytePos) {
+    match scan_doc_comment(text, stop) {
+        Ok(next) => (
+            Event::Token(LexedToken {
+                kind: TokenKind::Symbol(text.as_str()[stop.0..stop.0 + 3].to_owned()),
+                extent: span(stop, next),
+            }),
+            next,
+        ),
+        Err(error) => {
+            let resume = crate::recover::resume_after_trivia_error(text, error);
+            (
+                Event::Refused {
+                    error: RunError::Trivia(error),
+                    skipped: span(stop, resume),
+                },
+                resume,
+            )
+        }
+    }
 }
 
 /// Skip one scalar past a token refusal, so the driver always advances.
@@ -318,9 +358,9 @@ pub fn relex_incremental(
     //
     // So the restart backs up by the lexer's actual lookahead bound:
     //   * `max_token_len`, covering every trie walk;
-    //   * `LITERAL_LOOKAHEAD`, covering the fixed two-character probes — the `..` after a
-    //     numeral, the `''` that is not a char literal, `--` and `/-`, the backtick's
-    //     following character;
+    //   * `LITERAL_LOOKAHEAD`, covering the fixed probes — the `..` after a numeral, the
+    //     `''` that is not a char literal, `--` and `/-`, the backtick's following
+    //     character, and the three-byte doc comment opener `/--` or `/-!`;
     //   * a backward walk over `#`* and an `r`, the one *unbounded* probe in the lexer
     //     (`isRawStrLitStart` reads arbitrarily many `#`s before deciding), so an `r###x`
     //     whose `x` becomes a quote is re-lexed from the `r`.
@@ -334,7 +374,7 @@ pub fn relex_incremental(
         .position(|event| event.extent().end().0 >= edited.start().0)
         .unwrap_or(old.events.len());
 
-    const LITERAL_LOOKAHEAD: usize = 2;
+    const LITERAL_LOOKAHEAD: usize = 3;
     let lookback = table.max_token_len().max(LITERAL_LOOKAHEAD);
     let mut safe_before = edited.start().0.saturating_sub(lookback);
     safe_before = extend_back_over_raw_string_opener(new_text, safe_before);
@@ -717,6 +757,48 @@ mod tests {
                 );
                 assert!(!message.is_empty(), "{raw:?}: empty diagnostic message");
             }
+        }
+    }
+
+    /// A doc comment is one token named by its opener, however much prose its body holds,
+    /// and an incremental re-lex agrees with a full one when an edit opens, closes or enters
+    /// one.
+    #[test]
+    fn a_doc_comment_is_one_token_and_relexes_like_a_full_run() {
+        let text = text_of("/-- it's `x` -/\ndef f := 1\n/-! a /- b -/ c -/");
+        let run = lex_run(&text, &table());
+        assert!(run.accepted(), "{run:?}");
+        let tokens: Vec<_> = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Token(token) => Some(token),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens[0].kind, TokenKind::Symbol("/--".to_owned()));
+        assert_eq!(tokens[0].extent, span(BytePos(0), BytePos(15)));
+        assert_eq!(tokens.len(), 6, "{tokens:?}");
+        assert_eq!(tokens[5].kind, TokenKind::Symbol("/-!".to_owned()));
+        assert!(!lex_run(&text_of("def /-- open"), &table()).accepted());
+        for (old, at, len, insert) in [
+            ("/- c -/ def", 2, 0, "-"),
+            ("/-- c -/ def", 2, 1, ""),
+            ("/-- c -/ def", 6, 2, ""),
+            ("/-- c def", 6, 0, "-/"),
+            ("def /-- a -/ f", 9, 0, " /- x -/"),
+        ] {
+            let new = [&old[..at], insert, &old[at + len..]].concat();
+            let new_text = text_of(&new);
+            let before = lex_run(&text_of(old), &table());
+            let edited = ByteSpan::new(BytePos(at), BytePos(at + len)).expect("forward span");
+            let (incremental, _) =
+                relex_incremental(&before, edited, insert.len(), &new_text, &table());
+            assert_eq!(
+                incremental,
+                lex_run(&new_text, &table()),
+                "{old:?} -> {new:?}"
+            );
         }
     }
 }

@@ -16128,6 +16128,29 @@ mod tests {
         assert!(exhausted.stderr.contains("0-byte input limit"));
     }
 
+    /// Doc comments are the pin's syntax: a module doc and a declaration's doc change nothing,
+    /// and one that nothing can carry is refused. Verdicts measured at the pin on 2026-10-07.
+    #[test]
+    fn the_lean_door_reads_doc_comments_as_the_pin_does() {
+        let lean = |source: &str| {
+            let mut input = std::io::Cursor::new(source.as_bytes().to_vec());
+            run_lean_with_input([OsString::from("--stdin")], &mut input)
+        };
+        // Pin: `43`.
+        let documented = lean(
+            "/-! A module doc with `code`; it's prose.\nSecond line. -/\n/-- The answer. -/\ndef answer : Nat := 42\n/-- Inline. -/ def other : Nat := 1\n#eval answer + other\n",
+        );
+        assert_eq!(documented.exit_code, 0, "{}", documented.stderr);
+        assert_eq!(documented.stdout, "43\n");
+        // Pin: "unexpected token '#eval'; expected ..." and "unexpected end of input; expected ...".
+        for source in ["/-- d -/\n#eval 1\n", "def x : Nat := 1\n/-- dangling -/\n"] {
+            let refused = lean(source);
+            assert_eq!(refused.exit_code, 1, "{source:?}: {refused:?}");
+            assert!(refused.stdout.is_empty(), "{source:?}");
+            assert!(refused.stderr.starts_with("lean: "), "{source:?}");
+        }
+    }
+
     #[test]
     fn lean_source_import_names_map_only_to_normalized_lean_paths() {
         let name = fln::Name::from_components(["Project", "Foundation", "Nat"]);
