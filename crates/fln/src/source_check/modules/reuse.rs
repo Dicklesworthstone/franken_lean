@@ -8,7 +8,7 @@
 //! declarations, about 84 CPU-minutes per invocation, so an interactive door with an
 //! implicit `import Init` gives no verdict at all.
 //!
-//! `reuse-verified` is a cache over a PRIOR council admission of the identical closure:
+//! `reuse-verified` is a cache over PRIOR council admissions of identical inputs:
 //!
 //! * **Keyed** by [`ImportClosureKey`], one `Domain::CacheKey` digest over every byte of
 //!   every imported part (exported, server and private), the ordered import roots, the
@@ -22,6 +22,13 @@
 //!   A logical root covers declarations, extension deltas and options (plan §7.1), so a
 //!   rebuilt environment that differs from the admitted one in any constant refuses the
 //!   record, and the caller re-admits through the council.
+//! * **Composable.** On an exact-closure miss, module records bind each artifact's
+//!   complete bytes and ordered dependency keys. Their councils ran against only the
+//!   module's declared import closure. Every use re-proves that context's base and
+//!   result roots, all decoded declaration content (including subsuming repeats), and
+//!   complete checker-row coverage. Reused and newly checked modules are assembled in
+//!   the original deterministic order before the shared metadata activation runs once.
+//!   Legacy whole-closure records never manufacture these narrower-context records.
 //! * **Reported.** [`ImportPostureReport`] names the posture, whether the council ran,
 //!   the key, and what happened to the record; every front door prints it.
 //!
@@ -383,6 +390,173 @@ fn seal(body: &[u8]) -> Digest {
     hasher.finalize()
 }
 
+/// A separate key space for one module and its declared import closure. Dependency
+/// keys are in the artifact's import order and already bind their own dependencies,
+/// so each raw artifact is hashed once rather than once per importing module.
+fn module_reuse_key(
+    module: &OleanModuleInput<'_>,
+    dependencies: &[ImportClosureKey],
+    options: &KVMap,
+    checker: CheckerIdentity,
+) -> ImportClosureKey {
+    let mut hasher = DomainHasher::new(Domain::CacheKey);
+    hasher.update(b"fln.import-module-reuse-key/1\0");
+    hasher.update(&checker.0.0);
+    let mut field = |bytes: &[u8]| {
+        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(&options.to_canonical_bytes());
+    field(&module.name.to_canonical_bytes());
+    field(module.artifact);
+    for part in [module.server_artifact, module.private_artifact] {
+        match part {
+            Some(bytes) => {
+                field(&[1]);
+                field(bytes);
+            }
+            None => field(&[0]),
+        }
+    }
+    field(
+        &u64::try_from(dependencies.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for dependency in dependencies {
+        field(&dependency.0.0);
+    }
+    ImportClosureKey(hasher.finalize())
+}
+
+/// Module records deliberately cannot be parsed as whole-closure records. Their
+/// base/result roots describe the module's OWN import closure, not its position in
+/// a larger request. The inner declaration root covers every decoded constant,
+/// including a subsuming repeat whose body is not retained in the environment.
+const MODULE_RECORD_PREFIX: &[u8] = b"fln.import-module-reuse-record/1\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleReuseRecord(ImportReuseRecord);
+
+impl ModuleReuseRecord {
+    fn from_checked(
+        name: &Name,
+        checked: &CheckedOlean,
+        key: ImportClosureKey,
+        checker: CheckerIdentity,
+        content_root: LogicalRoot,
+    ) -> std::result::Result<Self, ImportReuseRefusal> {
+        let module = RecordedModule::from_checked(
+            name,
+            &checked.decoded,
+            &checked.declarations,
+            checked.base_logical_root,
+            checked.result_logical_root,
+        )?;
+        Ok(Self(ImportReuseRecord {
+            key: key.0,
+            checker: checker.0,
+            base_root: checked.base_logical_root.0,
+            declaration_root: content_root.0,
+            result_root: checked.result_logical_root.0,
+            modules: vec![module],
+        }))
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = MODULE_RECORD_PREFIX.to_vec();
+        bytes.extend(self.0.to_bytes());
+        bytes
+    }
+
+    fn parse(bytes: &[u8]) -> std::result::Result<Self, ImportReuseRefusal> {
+        let body = bytes
+            .strip_prefix(MODULE_RECORD_PREFIX)
+            .ok_or(ImportReuseRefusal::Malformed("module record schema"))?;
+        let record = ImportReuseRecord::parse(body)?;
+        let [module] = record.modules.as_slice() else {
+            return Err(ImportReuseRefusal::ModuleInventory);
+        };
+        if module.base_root != record.base_root || module.result_root != record.result_root {
+            return Err(ImportReuseRefusal::Malformed("module context roots"));
+        }
+        Ok(Self(record))
+    }
+}
+
+impl RecordedModule {
+    fn from_checked(
+        name: &Name,
+        decoded: &DecodedOlean,
+        declarations: &[OleanCheckedDeclaration],
+        base: LogicalRoot,
+        result: LogicalRoot,
+    ) -> std::result::Result<Self, ImportReuseRefusal> {
+        let mut index = BTreeMap::new();
+        for (at, constant) in decoded.constants.iter().enumerate() {
+            if index.insert(constant.name(), at).is_some() {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "a module declares one name twice",
+                ));
+            }
+        }
+        let mut rows = Vec::with_capacity(declarations.len());
+        let mut seen = BTreeSet::new();
+        for row in declarations {
+            if schema_code(row.checker.schema).is_none() {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "a checker row carries an unknown schema",
+                ));
+            }
+            let Some(&at) = index.get(&row.name) else {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "a checker row names no declaration of its module",
+                ));
+            };
+            if !seen.insert(at) {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "two checker rows name one declaration",
+                ));
+            }
+            rows.push((at, row.checker));
+        }
+        if rows.len() != decoded.constants.len() {
+            return Err(ImportReuseRefusal::Unrecordable(
+                "checker rows do not cover every declaration",
+            ));
+        }
+        Ok(Self {
+            name: name.to_canonical_bytes(),
+            base_root: base.0,
+            result_root: result.0,
+            rows,
+        })
+    }
+}
+
+fn module_content_root(
+    decoded: &DecodedOlean,
+    options: &KVMap,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<LogicalRoot> {
+    let mut pairs = Vec::with_capacity(decoded.constants.len());
+    for info in &decoded.constants {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module-content"));
+        }
+        pairs.push((
+            info.name().to_canonical_bytes(),
+            Environment::decl_content_digest(info),
+        ));
+    }
+    pairs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Outcome::Complete(fln_hash::root::declaration_root(
+        pairs.len(),
+        pairs.iter().map(|(name, digest)| (name.as_slice(), digest)),
+        Some(options),
+    ))
+}
+
 impl ImportReuseRecord {
     /// The record of a council admission that has just completed under `key`.
     ///
@@ -402,45 +576,13 @@ impl ImportReuseRecord {
         }
         let mut modules = Vec::with_capacity(checked.modules.len());
         for module in &checked.modules {
-            let mut index: BTreeMap<&Name, usize> = BTreeMap::new();
-            for (at, constant) in module.decoded.constants.iter().enumerate() {
-                if index.insert(constant.name(), at).is_some() {
-                    return Err(ImportReuseRefusal::Unrecordable(
-                        "a module declares one name twice",
-                    ));
-                }
-            }
-            let mut rows = Vec::with_capacity(module.declarations.len());
-            let mut seen = BTreeSet::new();
-            for row in &module.declarations {
-                if schema_code(row.checker.schema).is_none() {
-                    return Err(ImportReuseRefusal::Unrecordable(
-                        "a checker row carries an unknown schema",
-                    ));
-                }
-                let Some(&at) = index.get(&row.name) else {
-                    return Err(ImportReuseRefusal::Unrecordable(
-                        "a checker row names no declaration of its module",
-                    ));
-                };
-                if !seen.insert(at) {
-                    return Err(ImportReuseRefusal::Unrecordable(
-                        "two checker rows name one declaration",
-                    ));
-                }
-                rows.push((at, row.checker));
-            }
-            if rows.len() != module.decoded.constants.len() {
-                return Err(ImportReuseRefusal::Unrecordable(
-                    "checker rows do not cover every declaration",
-                ));
-            }
-            modules.push(RecordedModule {
-                name: module.name.to_canonical_bytes(),
-                base_root: module.base_logical_root.0,
-                result_root: module.result_logical_root.0,
-                rows,
-            });
+            modules.push(RecordedModule::from_checked(
+                &module.name,
+                &module.decoded,
+                &module.declarations,
+                module.base_logical_root,
+                module.result_logical_root,
+            )?);
         }
         Ok(ImportReuseRecord {
             key: key.0,
@@ -628,6 +770,8 @@ pub enum ImportAdmission {
     Council,
     /// A record of an earlier council admission was rebuilt and re-proved.
     Reused,
+    /// Some modules were re-proved from records and the council checked the rest.
+    Composed,
 }
 
 impl ImportAdmission {
@@ -635,6 +779,7 @@ impl ImportAdmission {
         match self {
             ImportAdmission::Council => "council",
             ImportAdmission::Reused => "reused",
+            ImportAdmission::Composed => "composed",
         }
     }
 }
@@ -700,6 +845,10 @@ pub struct ImportPostureReport {
     pub key: Option<ImportClosureKey>,
     pub record: RecordLookup,
     pub record_write: RecordWrite,
+    /// Modules whose earlier council admission was re-proved in this run.
+    pub reused_modules: usize,
+    /// Modules handed to K1 and the independent checker in this run.
+    pub council_modules: usize,
 }
 
 /// What `reuse-verified` needs: who is checking, and where records live.
@@ -725,6 +874,13 @@ pub enum ImportReuse {
 }
 
 type ImportResult<T> = std::result::Result<T, SourceOleanImportError>;
+
+struct ComposedModules {
+    checked: CheckedOleanSet,
+    records: Vec<(ImportClosureKey, ModuleReuseRecord)>,
+    unrecordable: Option<ImportReuseRefusal>,
+    reused: usize,
+}
 
 impl Engine {
     /// [`Engine::import_olean_modules_for_source_with_cancel`] under an explicit posture.
@@ -763,6 +919,8 @@ impl Engine {
                     key: None,
                     record: RecordLookup::NotConsulted,
                     record_write: RecordWrite::NotAttempted,
+                    reused_modules: 0,
+                    council_modules: modules.len(),
                 });
             }
             ImportPostureRequest::ReuseUnavailable(reason) => {
@@ -772,6 +930,8 @@ impl Engine {
                     key: None,
                     record: RecordLookup::Unavailable(reason),
                     record_write: RecordWrite::NotAttempted,
+                    reused_modules: 0,
+                    council_modules: modules.len(),
                 });
             }
             ImportPostureRequest::ReuseVerified(reuse) => reuse,
@@ -807,6 +967,8 @@ impl Engine {
                                 key: Some(key),
                                 record: RecordLookup::Hit,
                                 record_write: RecordWrite::NotAttempted,
+                                reused_modules: modules.len(),
+                                council_modules: 0,
                             },
                         )));
                     }
@@ -818,32 +980,622 @@ impl Engine {
                 },
             },
         };
-        let admitted = self.import_olean_modules_for_source_with_cancel(
-            modules,
-            roots,
-            options,
-            limits,
-            cancellation,
-        )?;
-        Ok(admitted.map_complete(|import| {
-            let record_write =
-                match ImportReuseRecord::from_admission(key, reuse.checker, options, &import) {
-                    Err(refusal) => RecordWrite::Unrecordable(refusal),
-                    Ok(made) => match reuse.store.save(key, &made.to_bytes()) {
-                        Ok(()) => RecordWrite::Stored,
-                        Err(error) => RecordWrite::Failed(error),
-                    },
-                };
-            (
-                import,
-                ImportPostureReport {
-                    posture: ImportPosture::ReuseVerified,
-                    admission: ImportAdmission::Council,
-                    key: Some(key),
-                    record,
-                    record_write,
+        let composed = match self
+            .compose_recorded_modules(modules, options, limits, &reuse, cancellation)
+            .map_err(|error| SourceOleanImportError::Check(Box::new(error)))?
+        {
+            Outcome::Complete(composed) => composed,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let (admitted, module_records, unrecordable, reused_modules) = match composed {
+            Some(composed) => (
+                self.activate_source_metadata(
+                    composed.checked,
+                    modules,
+                    roots,
+                    options,
+                    limits,
+                    cancellation,
+                )?,
+                composed.records,
+                composed.unrecordable,
+                composed.reused,
+            ),
+            None => (
+                self.import_olean_modules_for_source_with_cancel(
+                    modules,
+                    roots,
+                    options,
+                    limits,
+                    cancellation,
+                )?,
+                Vec::new(),
+                None,
+                0,
+            ),
+        };
+        let import = match admitted {
+            Outcome::Complete(import) => import,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/record",
+            )));
+        }
+        // No module memo escapes an unsuccessful import or incomplete metadata
+        // activation. Storage is optional; failures do not change its logical result.
+        let mut record_write =
+            match ImportReuseRecord::from_admission(key, reuse.checker, options, &import) {
+                Err(refusal) => RecordWrite::Unrecordable(refusal),
+                Ok(made) => match reuse.store.save(key, &made.to_bytes()) {
+                    Ok(()) => RecordWrite::Stored,
+                    Err(error) => RecordWrite::Failed(error),
                 },
-            )
+            };
+        for (module_key, made) in module_records {
+            if let Err(error) = reuse.store.save(module_key, &made.to_bytes()) {
+                record_write = RecordWrite::Failed(error);
+            }
+        }
+        if let Some(refusal) = unrecordable
+            && !matches!(record_write, RecordWrite::Failed(_))
+        {
+            record_write = RecordWrite::Unrecordable(refusal);
+        }
+        let council_modules = modules.len().saturating_sub(reused_modules);
+        let admission = match (reused_modules, council_modules) {
+            (0, _) => ImportAdmission::Council,
+            (_, 0) => ImportAdmission::Reused,
+            _ => ImportAdmission::Composed,
+        };
+        Ok(Outcome::Complete((
+            import,
+            ImportPostureReport {
+                posture: ImportPosture::ReuseVerified,
+                admission,
+                key: Some(key),
+                record,
+                record_write,
+                reused_modules,
+                council_modules,
+            },
+        )))
+    }
+
+    /// Populate/reuse module records only from checks against the declared import
+    /// closure. A legacy whole-closure record cannot supply that authority: its
+    /// council may have seen unrelated earlier modules in the request.
+    fn compose_recorded_modules(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        reuse: &ReuseVerified<'_>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Option<ComposedModules>>, OleanCheckError> {
+        if self.environment != Environment::new() || !self.imported_modules.is_empty() {
+            return Ok(Outcome::Complete(None));
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/modules",
+            )));
+        }
+        let ordered =
+            self.decode_olean_module_set(modules, limits.check, CheckerReading::Skip, limits.jobs)?;
+        let count = ordered.len();
+        let inputs: BTreeMap<_, _> = modules.iter().map(|module| (module.name, module)).collect();
+        let positions: BTreeMap<_, _> = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| (name.clone(), index))
+            .collect();
+        let mut dependencies = Vec::with_capacity(count);
+        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> = Vec::with_capacity(count);
+        let mut keys = Vec::with_capacity(count);
+        for (index, (name, decoded)) in ordered.iter().enumerate() {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/module-key",
+                )));
+            }
+            let mut imports = BTreeSet::new();
+            let mut closure = BTreeSet::new();
+            let mut dependency_keys = Vec::new();
+            for import in &decoded.module.imports {
+                let Some(&dependency) = positions.get(&import.module).filter(|i| **i < index)
+                else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "a module reuse dependency is not before its importer",
+                    });
+                };
+                imports.insert(dependency);
+                closure.extend(closures[dependency].iter().copied());
+                dependency_keys.push(keys[dependency]);
+            }
+            closure.insert(index);
+            let Some(input) = inputs.get(name) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "a decoded reuse module has no artifact input",
+                });
+            };
+            keys.push(module_reuse_key(
+                input,
+                &dependency_keys,
+                options,
+                reuse.checker,
+            ));
+            dependencies.push(imports);
+            closures.push(std::sync::Arc::new(closure));
+        }
+        let mut engines = FrontierEngines::new(
+            (0..count)
+                .map(|index| frontier_base_of(&dependencies, &closures, |i| i, index))
+                .collect(),
+        );
+        let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
+        let mut scheduled = Vec::with_capacity(count);
+        let mut records = Vec::new();
+        let mut unrecordable = None;
+        let mut reused = 0;
+        let mut ambient = self.environment.clone();
+        let names: Vec<Name> = ordered.iter().map(|(name, _)| name.clone()).collect();
+        for (index, (name, artifact)) in ordered.into_iter().enumerate() {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/module",
+                )));
+            }
+            let base = engines.release(index, &closures, true)?;
+            let closure = closures[index]
+                .iter()
+                .filter(|member| **member != index)
+                .filter_map(|member| accepted[*member].clone())
+                .collect();
+            let job = FrontierJob {
+                index,
+                position: index,
+                name: name.clone(),
+                artifact,
+                base,
+                closure,
+                retain: true,
+            };
+            let context = self.frontier_closure_engine(&job)?;
+            let mut decoded = job.artifact;
+            let content_root = match module_content_root(&decoded, options, cancellation) {
+                Outcome::Complete(root) => root,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            let key = keys[index];
+            let record = reuse
+                .store
+                .load(key)
+                .ok()
+                .flatten()
+                .and_then(|bytes| ModuleReuseRecord::parse(&bytes).ok());
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/module-lookup",
+                )));
+            }
+            let hit = match record {
+                Some(record) => match context.rebuild_recorded_module(
+                    &name,
+                    &decoded,
+                    key,
+                    reuse.checker,
+                    &record,
+                    content_root,
+                    options,
+                    cancellation,
+                ) {
+                    Outcome::Complete(Ok(checked)) => Some(checked),
+                    Outcome::Complete(Err(_)) => None,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                },
+                None => None,
+            };
+            let from_record = hit.is_some();
+            let checked = match hit {
+                Some(checked) => {
+                    reused += 1;
+                    checked
+                }
+                None => {
+                    // The independent seat reads the original bytes itself only for
+                    // misses. A primary decode is never passed off as its reading.
+                    let input = inputs[&name];
+                    let mut parts = vec![input.artifact];
+                    parts.extend(input.server_artifact);
+                    parts.extend(input.private_artifact);
+                    decoded.independent = independent_reading(&parts, limits.check.decode);
+                    match context.check_composed_module(decoded, options, limits) {
+                        Ok(Outcome::Complete(checked)) => checked,
+                        Ok(Outcome::Inconclusive(reason)) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Ok(Outcome::InternalFault(fault)) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                        Err(OleanCheckError::MissingConstants { names, .. })
+                            if !names.is_empty()
+                                && names.iter().all(|name| {
+                                    ambient.contains(name) && !context.environment.contains(name)
+                                }) =>
+                        {
+                            // Preserve the serial door's established behavior for a
+                            // declaration relying on an undeclared sibling module.
+                            // None of this abandoned attempt's records is published.
+                            return Ok(Outcome::Complete(None));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            if !from_record {
+                match ModuleReuseRecord::from_checked(
+                    &name,
+                    &checked,
+                    key,
+                    reuse.checker,
+                    content_root,
+                ) {
+                    Ok(record) => records.push((key, record)),
+                    Err(refusal) => unrecordable = Some(refusal),
+                }
+            }
+            let mut admitted = Vec::new();
+            let mut closure_digests = Vec::with_capacity(checked.decoded.constants.len());
+            for info in &checked.decoded.constants {
+                let Some(entry) = checked.engine.environment.entry(info.name()) else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "a checked module reuse constant has no environment entry",
+                    });
+                };
+                closure_digests.push(Some(entry.digest()));
+                if !context.environment.contains(info.name()) {
+                    ambient = merge_frontier_entry(ambient, &entry)?;
+                    admitted.push(entry);
+                }
+            }
+            let checker_entries = if from_record {
+                BTreeMap::new()
+            } else {
+                frontier_checker_entries(&checked.engine, &admitted, limits.check)
+            };
+            let mut engine = checked.engine;
+            let mut imported = (*engine.imported_modules).clone();
+            imported.insert(name.clone());
+            engine.imported_modules = std::sync::Arc::new(imported);
+            let module = std::sync::Arc::new(FrontierAccepted {
+                index,
+                position: index,
+                name,
+                admitted,
+            });
+            accepted[index] = Some(std::sync::Arc::clone(&module));
+            engines.keep(index, Some(engine));
+            scheduled.push(ScheduledOleanModule {
+                module,
+                decoded: checked.decoded,
+                declarations: checked.declarations,
+                closure_digests,
+                checker_entries,
+            });
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/assemble",
+            )));
+        }
+        let checked = if reused == 0 {
+            self.reassemble_olean_module_set(names, scheduled, true, options, limits.check)?
+        } else {
+            match self.reassemble_reused_modules(scheduled, options, limits, cancellation)? {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        };
+        Ok(Outcome::Complete(Some(ComposedModules {
+            checked,
+            records,
+            unrecordable,
+            reused,
+        })))
+    }
+
+    /// A cold module uses the same configured worker stack as the scheduled council
+    /// door. The caller's admission budget was calibrated for that stack; silently
+    /// running it on the calling thread would change its resource contract.
+    fn check_composed_module(
+        &self,
+        decoded: DecodedOlean,
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+    ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
+        let check = || self.check_decoded_olean(decoded, options, limits.check);
+        if limits.jobs.threads.get() == 1 {
+            return check();
+        }
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("fln-import-reuse-council".to_owned())
+                .stack_size(limits.jobs.worker_stack_bytes)
+                .spawn_scoped(scope, check)
+                .map_err(|_| OleanCheckError::InternalInvariant {
+                    detail: "could not start a module reuse council worker",
+                })?;
+            worker.join().map_err(frontier_unwound)?
+        })
+    }
+
+    /// The module form of the D6 carve-out, confined to this same file. It starts
+    /// from a re-proved import context and requires both that context's root and
+    /// the complete decoded content before publishing any declaration.
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_recorded_module(
+        &self,
+        name: &Name,
+        decoded: &DecodedOlean,
+        key: ImportClosureKey,
+        checker: CheckerIdentity,
+        record: &ModuleReuseRecord,
+        content_root: LogicalRoot,
+        options: &KVMap,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<std::result::Result<CheckedOlean, ImportReuseRefusal>> {
+        let refuse = |reason| Outcome::Complete(Err(reason));
+        let record = &record.0;
+        if record.checker != checker.0 {
+            return refuse(ImportReuseRefusal::CheckerIdentity);
+        }
+        if record.key != key.0 {
+            return refuse(ImportReuseRefusal::Key);
+        }
+        let [module] = record.modules.as_slice() else {
+            return refuse(ImportReuseRefusal::ModuleInventory);
+        };
+        if module.name != name.to_canonical_bytes() {
+            return refuse(ImportReuseRefusal::ModuleInventory);
+        }
+        let base = self.logical_root(options);
+        if base.0 != record.base_root || module.base_root != record.base_root {
+            return refuse(ImportReuseRefusal::Root {
+                at: "module-base",
+                module: Some(name.clone()),
+            });
+        }
+        if content_root.0 != record.declaration_root {
+            return refuse(ImportReuseRefusal::Root {
+                at: "module-content",
+                module: Some(name.clone()),
+            });
+        }
+        let mut covered = vec![false; decoded.constants.len()];
+        let mut declarations = Vec::with_capacity(module.rows.len());
+        for &(at, checker) in &module.rows {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module-rows"));
+            }
+            match covered.get_mut(at) {
+                Some(slot) if !*slot => *slot = true,
+                _ => return refuse(ImportReuseRefusal::Rows),
+            }
+            declarations.push(OleanCheckedDeclaration {
+                name: decoded.constants[at].name().clone(),
+                checker,
+            });
+        }
+        if covered.iter().any(|covered| !covered) {
+            return refuse(ImportReuseRefusal::Rows);
+        }
+        let mut environment = self.environment.clone();
+        let mut admitted_any = false;
+        for info in &decoded.constants {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/module-declaration",
+                ));
+            }
+            if environment.contains(info.name()) {
+                // Both the effective context root and this copy's complete content
+                // are bound above. The council keeps the already-present copy.
+                continue;
+            }
+            let measured = match Environment::measure_declaration(
+                info.clone(),
+                DeclarationBudget::UNBOUNDED,
+                cancellation,
+            ) {
+                Outcome::Complete(measured) => measured,
+                Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            };
+            let plan = match environment.plan_measured_decl(measured, CollisionBudget::UNBOUNDED) {
+                Outcome::Complete(DeclarationPlan::Prepared(plan)) => plan,
+                Outcome::Complete(DeclarationPlan::DuplicateName { .. }) => {
+                    return Outcome::InternalFault(InternalFault::new(
+                        "import reuse",
+                        "an absent module constant was planned as a duplicate",
+                    ));
+                }
+                Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            };
+            environment = match plan.commit(&environment, cancellation) {
+                Outcome::Complete(DeclarationCommitted::Published(published)) => {
+                    published.environment
+                }
+                Outcome::Complete(DeclarationCommitted::DuplicateName { .. }) => {
+                    return Outcome::InternalFault(InternalFault::new(
+                        "import reuse",
+                        "an absent module constant was published as a duplicate",
+                    ));
+                }
+                Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            };
+            admitted_any = true;
+        }
+        let root = environment.logical_root(options);
+        if root.0 != record.result_root || module.result_root != record.result_root {
+            return refuse(ImportReuseRefusal::Root {
+                at: "module-result",
+                module: Some(name.clone()),
+            });
+        }
+        let mut engine = self.clone();
+        engine.environment = environment;
+        engine.checker_environment = None;
+        if admitted_any {
+            engine.options = options.clone();
+        }
+        Outcome::Complete(Ok(CheckedOlean {
+            engine,
+            decoded: decoded.clone(),
+            base_logical_root: base,
+            result_logical_root: root,
+            declarations,
+        }))
+    }
+
+    /// Reassemble own-context admissions in the requested set's canonical order.
+    /// As on an exact record hit, the independent projection is absent; a later
+    /// council projects the dependencies it actually reaches. Metadata is activated
+    /// only by the caller, after the complete declaration world has been assembled.
+    fn reassemble_reused_modules(
+        &self,
+        scheduled: Vec<ScheduledOleanModule>,
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        let base = self.logical_root(options);
+        let mut environment = self.environment.clone();
+        let mut deltas = Vec::with_capacity(scheduled.len());
+        let mut pending = Vec::with_capacity(scheduled.len());
+        for scheduled in scheduled {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/assemble-module",
+                )));
+            }
+            let ScheduledOleanModule {
+                module,
+                decoded,
+                declarations,
+                closure_digests,
+                ..
+            } = scheduled;
+            if closure_digests.len() != decoded.constants.len() {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "a reused module's context digests do not cover its declarations",
+                });
+            }
+            let own: BTreeSet<&Name> = module
+                .admitted
+                .iter()
+                .map(|entry| entry.declaration().name())
+                .collect();
+            let repeats = decoded
+                .constants
+                .iter()
+                .zip(&closure_digests)
+                .any(|(info, copy)| {
+                    environment.entry(info.name()).is_some_and(|present| {
+                        own.contains(info.name())
+                            || copy.is_none_or(|copy| copy != present.digest())
+                    })
+                });
+            let declarations = if repeats {
+                serial_olean_rows(&environment, &decoded, declarations, limits.check)?
+            } else {
+                declarations
+            };
+            let mut delta = Vec::new();
+            for entry in &module.admitted {
+                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                        "import-reuse/assemble-declaration",
+                    )));
+                }
+                if !environment.contains(entry.declaration().name()) {
+                    delta.push((
+                        entry.declaration().name().to_canonical_bytes(),
+                        entry.digest(),
+                    ));
+                }
+                environment = merge_frontier_entry(environment, entry)?;
+            }
+            deltas.push(delta);
+            pending.push((module.name.clone(), decoded, declarations));
+        }
+        let roots = module_roots(base, &deltas, options, limits.jobs);
+        let mut previous = base;
+        let mut checked_modules = Vec::with_capacity(pending.len());
+        for ((name, decoded, declarations), root) in pending.into_iter().zip(roots) {
+            checked_modules.push(CheckedOleanModule {
+                name,
+                decoded,
+                declarations,
+                base_logical_root: previous,
+                result_logical_root: root,
+            });
+            previous = root;
+        }
+        if environment.logical_root(options) != previous {
+            return Ok(Outcome::InternalFault(InternalFault::new(
+                "import reuse",
+                "composed module roots differ from the assembled environment",
+            )));
+        }
+        let imported = checked_modules
+            .iter()
+            .map(|module| module.name.clone())
+            .collect();
+        let dependencies = checked_modules
+            .iter()
+            .map(|module| {
+                (
+                    module.name.clone(),
+                    module
+                        .decoded
+                        .module
+                        .imports
+                        .iter()
+                        .map(|import| import.module.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        let admitted_any = deltas.iter().any(|delta| !delta.is_empty());
+        let engine = Engine {
+            environment: environment.clone(),
+            checker_environment: None,
+            imported_modules: std::sync::Arc::new(imported),
+            imported_environment: Some(environment),
+            imported_module_dependencies: std::sync::Arc::new(dependencies),
+            epoch: self.epoch.clone(),
+            mode: self.mode,
+            reproducibility: self.reproducibility,
+            options: if admitted_any {
+                options.clone()
+            } else {
+                self.options.clone()
+            },
+        };
+        Ok(Outcome::Complete(CheckedOleanSet {
+            engine,
+            base_logical_root: base,
+            result_logical_root: previous,
+            modules: checked_modules,
         }))
     }
 
@@ -1279,6 +2031,9 @@ impl Engine {
 }
 
 #[cfg(test)]
+mod composed_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::imported::tests::{closure, inputs, limits, n, on_import_stack, pinned_lib};
     use super::*;
@@ -1286,7 +2041,7 @@ mod tests {
 
     /// Records held in memory under the same byte contract as any other store.
     #[derive(Default)]
-    struct Memory(Mutex<BTreeMap<ImportClosureKey, Vec<u8>>>);
+    pub(super) struct Memory(pub(super) Mutex<BTreeMap<ImportClosureKey, Vec<u8>>>);
     impl ImportReuseStore for Memory {
         fn load(&self, key: ImportClosureKey) -> std::result::Result<Option<Vec<u8>>, String> {
             Ok(self.0.lock().expect("store lock").get(&key).cloned())
@@ -1300,11 +2055,11 @@ mod tests {
         }
     }
 
-    fn identity(name: &str) -> CheckerIdentity {
+    pub(super) fn identity(name: &str) -> CheckerIdentity {
         CheckerIdentity::of_executable(name.as_bytes())
     }
 
-    fn import_with(
+    pub(super) fn import_with(
         modules: &[OleanModuleInput<'_>],
         roots: &[Name],
         posture: ImportPostureRequest<'_>,
@@ -1323,7 +2078,7 @@ mod tests {
             .expect("the pinned closure imports completely")
     }
 
-    fn reuse<'a>(
+    pub(super) fn reuse<'a>(
         checker: CheckerIdentity,
         store: &'a dyn ImportReuseStore,
     ) -> ImportPostureRequest<'a> {

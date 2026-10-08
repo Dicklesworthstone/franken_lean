@@ -85,6 +85,17 @@ fn without_imports(text: &str) -> String {
     format!("{}{}", &text[..start], &text[end..])
 }
 
+fn prelude_records(scratch: &Scratch, closure_key: &str) -> Vec<String> {
+    let records = scratch.files("records");
+    let closure = format!("{closure_key}.record");
+    assert_eq!(records.len(), 2, "one closure record and one module record");
+    assert!(records.contains(&closure));
+    let module = records.iter().find(|name| **name != closure).unwrap();
+    let bytes = std::fs::read(scratch.0.join("records").join(module)).unwrap();
+    assert!(bytes.starts_with(b"fln.import-module-reuse-record/1\n"));
+    records
+}
+
 struct Run {
     output: Output,
     seconds: f64,
@@ -144,7 +155,7 @@ fn check_source_reuses_its_recorded_prelude_closure_and_says_so() {
     let first_out = first.stdout();
     assert!(
         first_out.contains(
-            "\"oleanImports\":{\"trust\":\"reuse-verified\",\"admission\":\"council\",\"closureKey\":\""
+            "\"oleanImports\":{\"trust\":\"reuse-verified\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":1,\"closureKey\":\""
         ),
         "{first_out}"
     );
@@ -155,17 +166,18 @@ fn check_source_reuses_its_recorded_prelude_closure_and_says_so() {
         "{first_out}"
     );
     let key = member(&first_out, "closureKey").unwrap().to_owned();
-    assert_eq!(scratch.files("records"), [format!("{key}.record")]);
+    let records = prelude_records(&scratch, &key);
 
     let second = check_source(fln, &entry, &store, &[]);
     let second_out = second.stdout();
     assert!(
         second_out.contains(&format!(
-            "\"oleanImports\":{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"closureKey\":\"{key}\",\"record\":\"hit\",\"modules\":1,\"declarations\":2314}}"
+            "\"oleanImports\":{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"reusedModules\":1,\"councilModules\":0,\"closureKey\":\"{key}\",\"record\":\"hit\",\"modules\":1,\"declarations\":2314}}"
         )),
         "{second_out}"
     );
     assert_eq!(without_imports(&first_out), without_imports(&second_out));
+    assert_eq!(scratch.files("records"), records);
     assert!(second_out.contains("\"theorems\":2"), "{second_out}");
     eprintln!(
         "check-source Init.Prelude: council {:.2} s, reuse-verified {:.2} s",
@@ -178,12 +190,12 @@ fn check_source_reuses_its_recorded_prelude_closure_and_says_so() {
     let recheck_out = recheck.stdout();
     assert!(
         recheck_out.contains(
-            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":1,"
+            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":1,\"modules\":1,"
         ),
         "{recheck_out}"
     );
     assert_eq!(without_imports(&first_out), without_imports(&recheck_out));
-    assert_eq!(scratch.files("records"), [format!("{key}.record")]);
+    assert_eq!(scratch.files("records"), records);
 }
 
 /// The planted negatives at `check-source`, on a private copy of the real Prelude:
@@ -282,8 +294,16 @@ fn a_changed_olean_byte_or_another_checker_forces_readmission() {
         Some("refused:checker-identity"),
         "{planted}"
     );
-    assert_eq!(member(&planted, "admission"), Some("council"), "{planted}");
+    // The exact record is foreign, but the second binary already admitted its
+    // own Prelude module above. That independently bound memo recovers the
+    // closure without another council and repairs the foreign closure record.
+    assert_eq!(member(&planted, "admission"), Some("reused"), "{planted}");
+    assert!(
+        planted.contains("\"reusedModules\":1,\"councilModules\":0"),
+        "{planted}"
+    );
     assert_eq!(member(&planted, "recordWrite"), Some("stored"), "{planted}");
+    assert_eq!(without_imports(&elsewhere), without_imports(&planted));
     assert_eq!(member(&run(&other).stdout(), "record"), Some("hit"));
 }
 
@@ -319,7 +339,7 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     let first = build();
     let first_out = first.stdout();
     assert!(
-        first_out.contains("\"import_posture\":\"reuse-verified\",\"imports\":[{\"trust\":\"reuse-verified\",\"admission\":\"council\",\"closureKey\":\""),
+        first_out.contains("\"import_posture\":\"reuse-verified\",\"imports\":[{\"trust\":\"reuse-verified\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":1,\"closureKey\":\""),
         "{first_out}"
     );
     assert_eq!(
@@ -335,7 +355,7 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     let second_out = second.stdout();
     assert!(
         second_out.contains(&format!(
-            "\"imports\":[{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"closureKey\":\"{key}\",\"record\":\"hit\"}}]"
+            "\"imports\":[{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"reusedModules\":1,\"councilModules\":0,\"closureKey\":\"{key}\",\"record\":\"hit\"}}]"
         )),
         "{second_out}"
     );
