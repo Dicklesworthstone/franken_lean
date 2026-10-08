@@ -245,6 +245,43 @@ fn checked_same_named_word_records_use_their_actual_fields() {
 }
 
 #[test]
+fn enclosing_records_discover_checked_word_layouts_before_compiling_their_consumers() {
+    for word in ["UInt32", "UInt64"] {
+        let source = format!(
+            "structure {word} where\n  value : Nat\n\
+             structure Cell where\n  word : {word}\n\
+             structure Envelope where\n  cell : Cell\n\
+             def read (x : Envelope) : Nat := x.cell.word.value\n\
+             #eval read {{ cell := {{ word := {{ value := 42 }} }} }}"
+        );
+        let engine = base();
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let execute = || {
+            engine
+                .execute_source_definitions(&[source.as_bytes()], &options, limits())
+                .unwrap_or_else(|error| panic!("nested {word}: {error:?}"))
+                .into_complete()
+                .unwrap()
+        };
+        let first = execute();
+        let result = first.executions.last().unwrap();
+        let fln::VmExit::Returned(value) = &result.exit else {
+            panic!("nested word record must return its field")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            result.flbc_artifact,
+            execute().executions.last().unwrap().flbc_artifact
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+}
+
+#[test]
 fn native_word_rows_require_the_matching_opaque_family_contract() {
     for word in ["UInt32", "UInt64"] {
         // This alias and these axioms are all admitted by both checkers. Their

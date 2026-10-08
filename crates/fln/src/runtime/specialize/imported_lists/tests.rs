@@ -665,3 +665,64 @@ fn admitted_list_dependencies_have_uniform_signatures_after_history_reduction() 
         .join()
         .unwrap();
 }
+
+#[test]
+fn decoded_list_length_has_a_ground_character_signature() {
+    let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from) else {
+        assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none());
+        eprintln!("SKIP: pinned Reference lib/lean is absent");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let path = library.join("Init/Prelude.olean");
+            let parts = [
+                std::fs::read(&path).unwrap(),
+                std::fs::read(path.with_extension("olean.server")).unwrap(),
+                std::fs::read(path.with_extension("olean.private")).unwrap(),
+            ];
+            let decoded = decode_olean_module_artifacts(
+                &parts[0],
+                &parts[1],
+                &parts[2],
+                OleanDecodeLimits::new(256 * 1024 * 1024),
+            )
+            .unwrap();
+            // This codec/representation probe grants no admission authority.
+            // Admission and VM execution of nested word records have separate
+            // coverage in runtime_float_authority.
+            let environment = decoded
+                .constants
+                .into_iter()
+                .fold(Environment::new(), |env, info| env.add_decl(info).unwrap());
+            let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            let replacement = preparation
+                .specialize_call(
+                    &Expr::const_(name("List.length"), vec![Level::zero()]),
+                    &[
+                        constant("Char"),
+                        Expr::app(
+                            Expr::const_(name("List.nil"), vec![Level::zero()]),
+                            constant("Char"),
+                        ),
+                    ],
+                )
+                .unwrap()
+                .unwrap();
+            let (head, _) = preparation.spine(&replacement).unwrap();
+            let ExprNode::Const { name, .. } = head.node() else {
+                panic!("a specialization has a private callable identity")
+            };
+            let definition = preparation.specialized_definition(name).unwrap();
+            let signature = preparation
+                .signature(&definition, true)
+                .unwrap()
+                .expect("the character list discovers its nested checked UInt32 layout");
+            assert_eq!(signature.parameters, [ValueType::Constructor]);
+            assert_eq!(signature.result, ValueType::Nat);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

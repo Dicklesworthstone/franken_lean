@@ -450,7 +450,10 @@ impl Preparation<'_> {
                         .flat_map(|ctor| &ctor.fields)
                     {
                         self.tick()?;
-                        if scalar_type(field).is_none()
+                        // A familiar scalar name is not a representation.
+                        // Imported UInt32/UInt64 are checked records; discover
+                        // their fields before completing an enclosing record.
+                        if executable_value_type(field, &self.value_types).is_none()
                             && field != &boxed_slot_type()
                             && !shapes.iter().any(|shape| &shape.source == field)
                         {
