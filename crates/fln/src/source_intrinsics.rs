@@ -8,6 +8,7 @@
 
 use super::*;
 use std::collections::HashSet;
+pub(super) mod st;
 mod string_internal;
 pub(super) use string_internal::imported_string_internal_matches;
 

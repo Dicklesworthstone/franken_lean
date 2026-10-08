@@ -18,6 +18,7 @@ mod projections;
 mod proofs;
 mod records;
 mod specialize;
+mod st;
 mod transport;
 mod variants;
 
@@ -49,6 +50,7 @@ pub(super) struct Preparation<'a> {
     value_types: ExecutableValueTypes,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
     specializations: specialize::Store,
+    st: st::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -116,6 +118,7 @@ impl<'a> Preparation<'a> {
             value_types: ExecutableValueTypes::bounded_source(environment),
             interfaces: Vec::new(),
             specializations: specialize::Store::default(),
+            st: st::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
@@ -378,6 +381,10 @@ impl<'a> Preparation<'a> {
                         let (head, args) = self.spine(&expr)?;
                         if let Some(decision) = self.nat_equality_decision(&head, &args)? {
                             tasks.push(Task::Visit(decision));
+                            continue;
+                        }
+                        if let Some(action) = self.st_call(&head, &args)? {
+                            tasks.push(Task::Visit(action));
                             continue;
                         }
                         if let Some(projected) = self.projection_call(&head, &args)? {
@@ -957,7 +964,7 @@ fn scalar_type(expr: &Expr) -> Option<ValueType> {
 }
 fn result_ownership(result: ValueType) -> CallableResultOwnership {
     match result {
-        ValueType::Bool | ValueType::UInt32 => CallableResultOwnership::Scalar,
+        ValueType::Unit | ValueType::Bool | ValueType::UInt32 => CallableResultOwnership::Scalar,
         ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         ValueType::Abi => CallableResultOwnership::Erased,
         _ => CallableResultOwnership::Owned,

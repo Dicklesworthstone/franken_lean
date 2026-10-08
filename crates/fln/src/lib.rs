@@ -9215,6 +9215,9 @@ struct ExecutableValueTypes {
     /// Set only after admitting an erased type-field representation and
     /// checking that its private name is absent from the logical environment.
     boxed: Option<Expr>,
+    /// Private runtime carriers registered only after checking their complete
+    /// admitted source contracts and ruling out logical-name collisions.
+    native: std::collections::HashMap<Expr, (ValueType, CallableResultOwnership)>,
     records: std::collections::HashSet<Expr>,
     closures: std::collections::HashMap<Expr, ValueType>,
 }
@@ -9230,6 +9233,7 @@ impl ExecutableValueTypes {
             uint32: native_word_type(environment, "UInt32"),
             uint64: native_word_type(environment, "UInt64"),
             boxed: None,
+            native: std::collections::HashMap::new(),
             records: std::collections::HashSet::new(),
             closures: std::collections::HashMap::new(),
         }
@@ -9302,13 +9306,17 @@ fn executable_dependencies(
             scalar_constructors.push(binding);
             continue;
         }
-        if let Some(binding) = executable_intrinsic_binding_cached(
-            environment,
-            &name,
-            &mut visited_nodes,
-            limits,
-            &mut preparation.externs,
-        )? {
+        let intrinsic = match preparation.st_intrinsic_binding(&name) {
+            Some(binding) => Some(binding),
+            None => executable_intrinsic_binding_cached(
+                environment,
+                &name,
+                &mut visited_nodes,
+                limits,
+                &mut preparation.externs,
+            )?,
+        };
+        if let Some(binding) = intrinsic {
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -9882,7 +9890,9 @@ fn executable_value_type(
     source: &Expr,
     value_types: &ExecutableValueTypes,
 ) -> Option<(ValueType, CallableResultOwnership)> {
-    if value_types.boxed.as_ref() == Some(source) {
+    if let Some(value) = value_types.native.get(source) {
+        Some(*value)
+    } else if value_types.boxed.as_ref() == Some(source) {
         Some((ValueType::Abi, CallableResultOwnership::Erased))
     } else if source == &value_types.nat {
         Some((ValueType::Nat, CallableResultOwnership::OwnedOrScalar))

@@ -71,6 +71,12 @@ impl Preparation<'_> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
+        // Only exact primitive adapters create native cells. A same-named or
+        // differently instantiated source Ref never receives an object-field
+        // layout that could be confused with the VM's reference handle.
+        if self.st_ref_record_forbidden(name)? {
+            return Ok(None);
+        }
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
             return Ok(None);
         };

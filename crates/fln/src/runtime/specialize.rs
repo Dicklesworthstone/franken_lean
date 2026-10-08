@@ -25,7 +25,7 @@ pub(super) struct Store {
     types: HashMap<Expr, Expr>,
     constructor_types: HashMap<Name, Expr>,
 }
-fn closed(expr: &Expr) -> bool {
+pub(super) fn closed(expr: &Expr) -> bool {
     !expr.has_loose_bvars()
         && !expr.has_fvar()
         && !expr.has_expr_mvar()
@@ -152,6 +152,11 @@ impl Preparation<'_> {
                     head = receiver;
                 }
                 ExprNode::Const { name, levels } => {
+                    if let Some(carrier) = self.st_type_head(&head, &args)? {
+                        head = carrier;
+                        args.clear();
+                        continue;
+                    }
                     if let Some(definition) = self.definition(name)
                         && definition.base.level_params.len() == levels.len()
                     {
@@ -413,6 +418,12 @@ impl Preparation<'_> {
         index: u64,
         value: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
+        // Native ST handles have no ordinary record fields. In particular a
+        // source constructor/projection cannot relabel a raw opaque carrier as
+        // a cell whose contents received the checked Nat representation.
+        if self.st_ref_record_forbidden(family)? {
+            return Ok(None);
+        }
         if !self.static_value(value)? {
             return self.single_field_projection(family, index, value);
         }
@@ -656,6 +667,11 @@ impl Preparation<'_> {
             return Ok(None);
         };
         self.tick()?;
+        if levels.is_empty()
+            && let Some(type_) = self.st_intrinsic_type(name)
+        {
+            return Ok(Some(type_));
+        }
         if let Some(definition) = self.executable_definition(name)? {
             return self
                 .universe_instance(
