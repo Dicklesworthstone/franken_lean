@@ -4458,6 +4458,24 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        self.check_olean_modules_with_cancel(modules, options, limits, None)
+    }
+
+    /// The serial council retains completed modules only in local successors.
+    /// Cancellation at a module boundary or before the final return discards
+    /// those successors; the caller receives no partially admitted import set.
+    fn check_olean_modules_with_cancel(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "olean-modules/before-decode",
+            )));
+        }
         let ordered = self.decode_olean_module_set(
             modules,
             limits,
@@ -4482,6 +4500,11 @@ impl Engine {
                 requested: ordered.len(),
             })?;
         for (name, artifact) in ordered {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "olean-modules/before-module",
+                )));
+            }
             let checked = match engine.check_decoded_olean(artifact, options, limits)? {
                 Outcome::Complete(checked) => checked,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -4515,6 +4538,11 @@ impl Engine {
         engine.imported_module_dependencies = std::sync::Arc::new(dependencies);
         engine.imported_environment = bound_base.then(|| engine.environment.clone());
         let result_logical_root = engine.logical_root(options);
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "olean-modules/before-publication",
+            )));
+        }
         Ok(Outcome::Complete(CheckedOleanSet {
             engine,
             base_logical_root,
@@ -4962,9 +4990,11 @@ impl Engine {
     /// One thread, or a base engine whose environment is not empty, takes the serial
     /// door itself: over a nonempty base the serial projection also holds the base
     /// constants each review covered, which the per-module projections do not
-    /// reproduce. `cancellation` is sampled whenever a module is decided; a running
-    /// council is not interrupted, and a set whose answer is already fixed is
-    /// returned rather than discarded.
+    /// reproduce. `cancellation` is sampled at module boundaries; a running
+    /// council is not interrupted. The serial fallback also samples before
+    /// decoding and before publishing the completed set, returning no partial
+    /// successor on cancellation. Parallel work whose answer is already fixed
+    /// retains its existing completed-answer precedence.
     pub fn check_olean_modules_scheduled(
         &self,
         modules: &[OleanModuleInput<'_>],
@@ -4974,7 +5004,7 @@ impl Engine {
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
         if jobs.threads.get() == 1 || !self.environment.is_empty() {
-            return self.check_olean_modules(modules, options, limits);
+            return self.check_olean_modules_with_cancel(modules, options, limits, cancellation);
         }
         let ordered = self.decode_olean_module_set(modules, limits, CheckerReading::Read, jobs)?;
         let bound_base = (self.environment == Environment::new()
@@ -11142,6 +11172,8 @@ pub(crate) fn assert_checked_sets_identical(
 
 #[cfg(test)]
 mod tests {
+    mod olean_cancellation;
+
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround,
         ClosedVmValue, ClosedVmValueError, ConstantInfo, ConstantVal, ConstructorVal, Declaration,
