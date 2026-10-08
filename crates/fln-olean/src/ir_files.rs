@@ -9,6 +9,7 @@
 
 use crate::ir::graph::IrNodeKind;
 use crate::ir::{IrDecodeError, IrDecodeLimits, IrModule, decode_ir};
+use crate::ir_types::{IrTypeValidationError, IrTypeValidationSummary, check_after_structure};
 use crate::ir_validate::{
     IrValidatedGraphError, IrValidationLimits, ValidatedIrCallGraph, build_validated_ir_call_graph,
 };
@@ -53,6 +54,7 @@ pub enum IrFileError {
     MissingIrBlock(PathBuf),
     Decode { path: PathBuf, source: IrDecodeError },
     Validation(IrValidatedGraphError),
+    Representation(IrTypeValidationError),
 }
 
 impl IrFileError {
@@ -69,6 +71,7 @@ impl IrFileError {
             ),
             Self::Decode { source, .. } => source.is_resource(),
             Self::Validation(source) => source.is_resource(),
+            Self::Representation(source) => source.is_resource(),
             _ => false,
         }
     }
@@ -87,6 +90,9 @@ pub struct CheckedIrFiles {
     pub checked: ValidatedIrCallGraph,
     pub input_bytes: u64,
     pub captured_payload_bytes: usize,
+    /// Present only when the expression representation pass actually ran.
+    /// Its work count includes the structural pass, not a fresh allowance.
+    pub representation: Option<IrTypeValidationSummary>,
 }
 
 fn limit(resource: &'static str) -> IrFileError {
@@ -135,15 +141,35 @@ fn read_file(path: &Path, cap: u64) -> Result<Vec<u8>, IrFileError> {
     Ok(out)
 }
 
-/// Validate every declaration in exactly the supplied file closure. Imports
-/// are not fetched implicitly and missing callee signatures are never inferred
-/// from call sites. Supply additional reviewed extern signatures explicitly.
-/// All files decode and all declarations validate before a graph is returned.
-/// Duplicate paths and declarations are refused; inputs are never modified.
+/// Validate the structure of exactly the supplied file closure. This retains
+/// the original structural-only API; use [`check_ir_files_with_types`] for the
+/// additional expression representation rules used by the command by default.
+/// Imports are not fetched and missing signatures are not invented.
 pub fn check_ir_files(
     paths: &[PathBuf],
     census_externs: &BTreeMap<Name, usize>,
     limits: IrFileLimits,
+) -> Result<CheckedIrFiles, IrFileError> {
+    check_files(paths, census_externs, limits, false)
+}
+
+/// Decode, structurally validate, then check expression representations before
+/// returning any graph. Both passes share `validation.max_work`; a type-rule
+/// refusal or resource stop returns no partial result. This does not check
+/// ownership, constructor layouts or full application ABI signatures.
+pub fn check_ir_files_with_types(
+    paths: &[PathBuf],
+    census_externs: &BTreeMap<Name, usize>,
+    limits: IrFileLimits,
+) -> Result<CheckedIrFiles, IrFileError> {
+    check_files(paths, census_externs, limits, true)
+}
+
+fn check_files(
+    paths: &[PathBuf],
+    census_externs: &BTreeMap<Name, usize>,
+    limits: IrFileLimits,
+    check_types: bool,
 ) -> Result<CheckedIrFiles, IrFileError> {
     if paths.is_empty() {
         return Err(IrFileError::EmptyInput);
@@ -213,10 +239,17 @@ pub fn check_ir_files(
         .collect();
     let checked = build_validated_ir_call_graph(&inputs, census_externs, limits.validation)
         .map_err(IrFileError::Validation)?;
+    let representation = if check_types {
+        Some(check_after_structure(&modules, *checked.summary(), limits.validation)
+            .map_err(IrFileError::Representation)?)
+    } else {
+        None
+    };
     Ok(CheckedIrFiles {
         checked,
         input_bytes,
         captured_payload_bytes: payload_bytes,
+        representation,
     })
 }
 
@@ -315,3 +348,6 @@ pub fn ir_graph_dot(
     out.push("}\n")?;
     Ok(out.text)
 }
+
+#[cfg(test)]
+mod type_tests;

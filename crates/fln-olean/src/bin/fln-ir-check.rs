@@ -1,7 +1,9 @@
 //! Native, read-only validation of a supplied IR file closure.
 #![forbid(unsafe_code)]
 
-use fln_olean::ir_files::{IrFileLimits, check_ir_files, ir_graph_dot};
+use fln_olean::ir_files::{
+    IrFileLimits, check_ir_files, check_ir_files_with_types, ir_graph_dot,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -9,26 +11,28 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const HELP: &str = "Usage: fln-ir-check [OPTIONS] [--] FILE.ir...\n\n\
-Validate all supplied IR declarations, then optionally emit a static DOT graph.\n\
+Check structure and expression representations, then optionally emit a DOT graph.\n\
 Include the complete declaration closure: missing callees are errors, not stubs.\n\
 No Reference implementation, initializer, or external tool is executed.\n\n\
   --dot                    Write the validated static graph to stdout\n\
+  --structural-only        Skip expression representation checks (diagnostic mode)\n\
   --max-files N            Maximum number of supplied files\n\
   --max-file-bytes N       Maximum actual bytes read from any file\n\
   --max-total-bytes N      Maximum actual bytes read across all files\n\
   --max-payload-bytes N    Maximum expanded captured payload bytes in total\n\
   --max-output-bytes N     Maximum DOT output bytes (default 67108864)\n\
-  --max-work N             Structural validation work allowance\n\
+  --max-work N             Shared structural and representation work allowance\n\
   --help                   Show this help\n\n\
-Exit codes: 0 structurally valid, 1 malformed/unclosed IR, 2 usage,\n\
+Exit codes: 0 requested checks passed, 1 malformed/unclosed IR, 2 usage,\n\
 5 unavailable input, unsupported container capability, resource limit, or I/O.\n\
 DOT records direct fap/pap calls only and reports the unresolved ap count.\n\
-Structural validity does not establish typing, ownership, or execution safety.\n";
+Checks do not establish full ABI typing, ownership, or execution safety.\n";
 
 type Result<T> = std::result::Result<T, (u8, String)>;
 
 fn number(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<u64> {
-    args.next().and_then(|arg| arg.to_str().and_then(|s| s.parse().ok()))
+    args.next()
+        .and_then(|arg| arg.to_str().and_then(|s| s.parse().ok()))
         .ok_or_else(|| (2, format!("{flag} requires a nonnegative integer")))
 }
 
@@ -38,7 +42,8 @@ fn host_size(value: u64, flag: &str) -> Result<usize> {
 
 fn write_stdout(text: &str) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush())
+    stdout.write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
         .map_err(|error| (5, format!("stdout: {error}")))
 }
 
@@ -46,6 +51,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mut limits = IrFileLimits::default();
     let mut dot = false;
+    let mut structural_only = false;
     let mut max_output = 64 * 1024 * 1024;
     let mut paths = Vec::new();
     let mut positional = false;
@@ -58,6 +64,7 @@ fn run() -> Result<()> {
             Some("--") => positional = true,
             Some("--help" | "-h") => return write_stdout(HELP),
             Some("--dot") => dot = true,
+            Some("--structural-only") => structural_only = true,
             Some("--max-files") => {
                 limits.max_files = host_size(number(&mut args, "--max-files")?, "--max-files")?;
             }
@@ -89,15 +96,25 @@ fn run() -> Result<()> {
     if paths.is_empty() {
         return Err((2, "at least one IR file is required; use --help for usage".into()));
     }
-    let result = check_ir_files(&paths, &BTreeMap::new(), limits)
-        .map_err(|error| (if error.is_inconclusive() { 5 } else { 1 }, error.to_string()))?;
+    let result = if structural_only {
+        check_ir_files(&paths, &BTreeMap::new(), limits)
+    } else {
+        check_ir_files_with_types(&paths, &BTreeMap::new(), limits)
+    }.map_err(|error| (if error.is_inconclusive() { 5 } else { 1 }, error.to_string()))?;
     let summary = result.checked.summary();
-    let message = format!(
+    let mut message = format!(
         "IR structurally valid: {} files, {} declarations, {} externs, {} direct edges, {} unresolved closure calls; {} input bytes, {} captured payload bytes\n",
         summary.modules, summary.declarations, summary.extern_declarations,
         result.checked.graph().edge_count(), summary.dynamic_calls,
         result.input_bytes, result.captured_payload_bytes,
     );
+    match result.representation {
+        Some(types) => message.push_str(&format!(
+            "IR expression representations checked: {} expressions, {} type nodes; {} cumulative validation work\n",
+            types.expressions, types.type_nodes, types.work,
+        )),
+        None => message.push_str("IR expression representations: NOT CHECKED (structural-only)\n"),
+    }
     if dot {
         // Construct the complete bounded report before publishing a single byte.
         let output = ir_graph_dot(&result.checked, max_output)
