@@ -9,6 +9,8 @@ use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
 
 #[cfg(test)]
+mod expected_tests;
+#[cfg(test)]
 mod lookup_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,12 +233,13 @@ impl Context {
     pub(super) fn qualified_record_field(
         &mut self,
         name: &Name,
+        expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let Some((receiver, path)) = self.qualified_field_receiver(name)? else {
             return Ok(None);
         };
         let field = self.resolve_field_path(receiver, &path, false)?;
-        Ok(Some(self.field_value(field)?))
+        Ok(Some(self.field_value(field, expected)?))
     }
 
     /// Splitting is reserved for identifiers that did not resolve as a whole.
@@ -323,7 +326,7 @@ impl Context {
             self.tick()?;
             let field =
                 self.resolve_field(receiver, &Name::from_components([part.as_str()]), false)?;
-            receiver = self.field_value(field)?;
+            receiver = self.field_value(field, None)?;
         }
         self.resolve_field(
             receiver,
@@ -487,7 +490,11 @@ impl Context {
         }
     }
 
-    fn field_value(&mut self, field: FieldResolution) -> Result<Typed, NatDefinitionElabError> {
+    fn field_value(
+        &mut self,
+        field: FieldResolution,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let FieldResolution::Method {
             function,
             receiver,
@@ -499,8 +506,13 @@ impl Context {
             };
             return Ok(value);
         };
+        // A bare qualified method still applies its receiver. Preserve the
+        // whole term's expectation here, just as the explicit projection and
+        // application paths do, so its implicit result constructor is chosen
+        // before instance synthesis. Intermediate path receivers have no such
+        // expectation: it belongs only to the final field or method.
         let mut state =
-            self.start_field_application(function, receiver, &base, &[], None, false)?;
+            self.start_field_application(function, receiver, &base, &[], expected.cloned(), false)?;
         while let Some(argument) = self.next_named_argument(&mut state)? {
             let application::ApplicationValue::Elaborated(value) = argument.value else {
                 return Err(failure(SourceInferenceError::Scope));

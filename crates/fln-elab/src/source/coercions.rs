@@ -9,6 +9,7 @@ use fln_env::constants::ConstantInfo;
 mod expand;
 mod function;
 mod monad;
+mod result_hint;
 
 /// A native probe can be blocked before a closed kernel query is possible.
 /// Keep that distinct from a completed query's concrete conversion refusal.
@@ -299,14 +300,16 @@ impl Context {
             // below already drops a false equality. The equation is still
             // checked for real where the application completes and at the
             // declaration's ordinary K1 admission.
-            return match self.constrain(actual, expected) {
+            match self.constrain(actual, expected) {
                 Err(NatDefinitionElabError::Inference(
                     SourceInferenceError::ConversionRefused(_),
                 )) => Ok(()),
                 other => other,
-            };
+            }?;
+        } else if self.coercion_eq(actual, expected)? {
+            return Ok(());
         }
-        self.coercion_eq(actual, expected).map(|_| ())
+        self.first_order_result_hint(actual, expected)
     }
 
     fn coercion_level(&mut self, type_: &Expr) -> Result<Option<Level>, NatDefinitionElabError> {

@@ -764,7 +764,7 @@ impl Context {
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
-                if let Some(term) = self.qualified_record_field(name)? {
+                if let Some(term) = self.qualified_record_field(name, expected)? {
                     return Ok(term);
                 }
                 if name == &Name::from_components(["true"]) {
