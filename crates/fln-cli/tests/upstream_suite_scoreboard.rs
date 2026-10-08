@@ -458,8 +458,15 @@ fn score(
             // What the pin said is the evidence a reader needs to tell a pin change from a
             // host condition, so its first stderr line and last stdout line travel with it.
             let said = |text: &str, last: bool| {
-                let line = if last { text.lines().last() } else { text.lines().next() };
-                line.unwrap_or_default().chars().take(300).collect::<String>()
+                let line = if last {
+                    text.lines().last()
+                } else {
+                    text.lines().next()
+                };
+                line.unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
             };
             report.problems.push(format!(
                 "{}: the pinned Reference no longer reproduces its oracle row (exit {} digest \
