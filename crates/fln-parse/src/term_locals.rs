@@ -357,10 +357,7 @@ impl Prefix {
                     leaves.leaf(at)?,
                     leaves.leaf(p.colon.expect("suffices colon"))?,
                 ]),
-                None => Syntax::node(
-                    Name::from_components(["hygieneInfo"]),
-                    vec![hygiene_ident()],
-                ),
+                None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let intro = p.proof_intro.expect("suffices proof introducer");
             let proof = p.value.expect("suffices continuation");
@@ -390,10 +387,7 @@ impl Prefix {
             let separator = separator(leaves, p.separator)?;
             let name = match p.name {
                 Some(at) => leaves.leaf(at)?,
-                None => Syntax::node(
-                    Name::from_components(["hygieneInfo"]),
-                    vec![hygiene_ident()],
-                ),
+                None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let annotation = match (p.colon, p.annotation) {
                 (Some(colon), Some(type_)) => null_node(vec![Syntax::node(

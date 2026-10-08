@@ -1249,25 +1249,85 @@ fn finish_bounded_frame(
         .0)
 }
 
-fn hygiene_ident() -> Syntax {
-    Syntax::Ident {
-        info: SourceInfo::None,
-        raw_val: ByteSpan::empty_at(BytePos(0)),
-        val: Name::anonymous(),
-        preresolved: Vec::new(),
+/// A `hygieneInfo` node: the anonymous identifier `hygieneInfoFn` builds (vendored
+/// `src/Lean/Parser/Basic.lean:1322`), zero-width at `pos`, owning `trailing`. The `hygieneInfo`
+/// helpers are out of line: the term parser's frames run on small host stacks.
+#[inline(never)]
+fn hygiene_info(pos: BytePos, trailing: ByteSpan) -> Syntax {
+    Syntax::node(
+        Name::str(Name::anonymous(), "hygieneInfo"),
+        vec![Syntax::Ident {
+            info: SourceInfo::Original {
+                leading: ByteSpan::empty_at(pos),
+                pos,
+                trailing,
+                end_pos: pos,
+            },
+            raw_val: ByteSpan::empty_at(pos),
+            val: Name::anonymous(),
+            preresolved: Vec::new(),
+        }],
+    )
+}
+
+/// `hygieneInfo` right after the token `previous`, as `hygieneInfoFn` places it when the token
+/// is the last item on the parser's stack: at the token's end, taking the token's trailing
+/// whitespace, which the token gives up. A token without original positions leaves the
+/// identifier position-free.
+#[inline(never)]
+pub(crate) fn hygiene_info_after(previous: &mut Syntax) -> Syntax {
+    if let Syntax::Atom {
+        info: SourceInfo::Original {
+            trailing, end_pos, ..
+        },
+        ..
+    } = previous
+    {
+        let stolen = std::mem::replace(trailing, ByteSpan::empty_at(*end_pos));
+        return hygiene_info(*end_pos, stolen);
+    }
+    Syntax::node(
+        Name::str(Name::anonymous(), "hygieneInfo"),
+        vec![Syntax::Ident {
+            info: SourceInfo::None,
+            raw_val: ByteSpan::empty_at(BytePos(0)),
+            val: Name::anonymous(),
+            preresolved: Vec::new(),
+        }],
+    )
+}
+
+/// `hygieneInfo` where the previous stack item has no tail token (`have`'s empty `letConfig`,
+/// `suffices`'s alternative): `hygieneInfoFn` falls back to the current position, after the
+/// keyword's trailing whitespace, with empty trivia.
+#[inline(never)]
+pub(crate) fn hygiene_info_following(keyword: &Syntax) -> Syntax {
+    match keyword {
+        Syntax::Atom {
+            info: SourceInfo::Original { trailing, .. },
+            ..
+        } => hygiene_info(trailing.end(), ByteSpan::empty_at(trailing.end())),
+        _ => hygiene_info_after(&mut Syntax::Missing),
     }
 }
 
-fn hygienic_lparen(lparen: Syntax) -> Syntax {
+/// The pin's `Term.cdot`: the `·` (or `.`) atom and the `hygieneInfo` after it.
+#[inline(never)]
+fn cdot(leaves: &Leaves, index: usize) -> Result<Syntax, NatDefinitionParseError> {
+    let mut dot = leaves.leaf(index)?;
+    let hygiene = hygiene_info_after(&mut dot);
+    Ok(Syntax::node(
+        parser_kind(&["Term", "cdot"]),
+        vec![dot, hygiene],
+    ))
+}
+
+#[inline(never)]
+fn hygienic_lparen(mut lparen: Syntax) -> Syntax {
+    let hygiene = hygiene_info_after(&mut lparen);
     Syntax::node(
         parser_kind(&["Term", "hygienicLParen"]),
-        vec![
-            lparen,
-            Syntax::node(
-                Name::str(Name::anonymous(), "hygieneInfo"),
-                vec![hygiene_ident()],
-            ),
-        ],
+        vec![lparen, hygiene],
     )
 }
 
@@ -1558,19 +1618,7 @@ fn dot_term(
         // `·`, or `.` spelling it (`unicodeSymbol "·" "."`): the pin's `Term.cdot`, a
         // placeholder that the nearest enclosing parentheses, tuple or ascription turn
         // into a function (`expandCDot?`). The atom keeps the source spelling.
-        frame.application.push((
-            Syntax::node(
-                parser_kind(&["Term", "cdot"]),
-                vec![
-                    leaves.leaf(index)?,
-                    Syntax::node(
-                        Name::str(Name::anonymous(), "hygieneInfo"),
-                        vec![hygiene_ident()],
-                    ),
-                ],
-            ),
-            index,
-        ));
+        frame.application.push((cdot(leaves, index)?, index));
         return Ok(false);
     }
     if !touches_identifier {
