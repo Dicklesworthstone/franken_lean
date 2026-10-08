@@ -1,0 +1,342 @@
+name: Native array updates - implement and verify
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-array-updates-landing.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-array-updates-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-07-13 --profile minimal --component rustfmt --component clippy
+      - name: Prepare exact implementation and regression patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apply-array-updates.py" <<'PY'
+          from pathlib import Path
+
+          source = Path("crates/fln-vm/src/interpreter.rs")
+          text = source.read_text(encoding="utf-8")
+          replacements = [
+              ("mod floats;\nmod tail_calls;", "mod arrays;\nmod floats;\nmod tail_calls;"),
+              ("    TaskBind,\n    Unsupported,", "    TaskBind,\n    ArrayExtra(arrays::Intrinsic),\n    Unsupported,"),
+              (
+                  "            _ => floats::Intrinsic::for_row(row).map_or(Self::Unsupported, Self::Float),",
+                  "            _ => arrays::Intrinsic::for_row(row)\n                .map(Self::ArrayExtra)\n                .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))\n                .unwrap_or(Self::Unsupported),",
+              ),
+              (
+                  "        IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),",
+                  "        IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),\n        IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),",
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(new) == 1:
+                  continue
+              if text.count(old) != 1:
+                  raise SystemExit(f"ambiguous or missing interpreter anchor: {old!r}")
+              text = text.replace(old, new, 1)
+          source.write_text(text, encoding="utf-8")
+
+          arrays = Path("crates/fln-vm/src/interpreter/arrays.rs")
+          arrays_text = r'''//! Native array updates over Marrow handles. Like the existing Array.push
+          //! adapter, updates copy the object slots instead of mutating a shared array.
+          //! The checked index must be established before allocating or retaining any
+          //! output slots; proof-erased bounds violations are typed VM refusals.
+          use super::{
+              IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity,
+              nat_as_usize, uint64_argument,
+          };
+
+          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+          pub(super) enum Intrinsic {
+              Pop,
+              Set,
+              Uset,
+              Swap,
+              SwapIfInBounds,
+          }
+
+          impl Intrinsic {
+              pub(super) fn for_row(row: &str) -> Option<Self> {
+                  Some(match row {
+                      "extern:Array.pop" => Self::Pop,
+                      "extern:Array.set" => Self::Set,
+                      "extern:Array.uset" => Self::Uset,
+                      "extern:Array.swap" => Self::Swap,
+                      "extern:Array.swapIfInBounds" => Self::SwapIfInBounds,
+                      _ => return None,
+                  })
+              }
+
+              pub(super) fn invoke(
+                  self,
+                  row: &str,
+                  args: &[Obj],
+              ) -> Result<IntrinsicResult, IntrinsicFailure> {
+                  expect_arity(row, args, if self == Self::Pop { 1 } else { 3 })?;
+                  let operation = match self {
+                      Self::Pop => "Array.pop",
+                      Self::Set => "Array.set",
+                      Self::Uset => "Array.uset",
+                      Self::Swap => "Array.swap",
+                      Self::SwapIfInBounds => "Array.swapIfInBounds",
+                  };
+                  let array = &args[0];
+                  let (size, _) = array_value(array, operation, 0)?;
+                  if self == Self::Pop {
+                      return Ok(IntrinsicResult::raw_object(if size == 0 {
+                          array.clone_ref()
+                      } else {
+                          Obj::mk_array((0..size - 1).map(|index| array.array_child(index)).collect())
+                      }));
+                  }
+                  // USize is a full-width boxed scalar in FLBC, not a tagged Nat.
+                  // Nat indices retain their arbitrary precision: an mpz is never
+                  // truncated to its low word and accidentally treated as in bounds.
+                  let first = if self == Self::Uset {
+                      uint64_argument(&args[1], operation, 1)? as usize
+                  } else {
+                      nat_as_usize(&args[1], operation, 1)?.unwrap_or(usize::MAX)
+                  };
+                  match self {
+                      Self::Set | Self::Uset => {
+                          check_index(first, size)?;
+                          let updated = (0..size)
+                              .map(|index| {
+                                  if index == first {
+                                      args[2].clone_ref()
+                                  } else {
+                                      array.array_child(index)
+                                  }
+                              })
+                              .collect();
+                          Ok(IntrinsicResult::raw_object(Obj::mk_array(updated)))
+                      }
+                      Self::Swap | Self::SwapIfInBounds => {
+                          let second = nat_as_usize(&args[2], operation, 2)?.unwrap_or(usize::MAX);
+                          if self == Self::SwapIfInBounds && (first >= size || second >= size) {
+                              return Ok(IntrinsicResult::raw_object(array.clone_ref()));
+                          }
+                          check_index(first, size)?;
+                          check_index(second, size)?;
+                          if first == second {
+                              return Ok(IntrinsicResult::raw_object(array.clone_ref()));
+                          }
+                          let updated = (0..size)
+                              .map(|index| {
+                                  array.array_child(if index == first {
+                                      second
+                                  } else if index == second {
+                                      first
+                                  } else {
+                                      index
+                                  })
+                              })
+                              .collect();
+                          Ok(IntrinsicResult::raw_object(Obj::mk_array(updated)))
+                      }
+                      Self::Pop => unreachable!("pop returned before index processing"),
+                  }
+              }
+          }
+
+          fn check_index(index: usize, size: usize) -> Result<(), VmRefusal> {
+              if index < size {
+                  Ok(())
+              } else {
+                  Err(VmRefusal::ArrayIndexOutOfBounds { index, size })
+              }
+          }
+          '''
+          if arrays.exists():
+              raise SystemExit("array adapter already exists; review before reapplying")
+          arrays.write_text(arrays_text, encoding="utf-8")
+
+          tests = Path("crates/fln-vm/tests/flbc_interpreter.rs")
+          test_text = tests.read_text(encoding="utf-8")
+          if "fn array_updates_program(" in test_text:
+              raise SystemExit("array regressions already exist; review before reapplying")
+          tests.write_text(test_text + r'''
+          // Array updates deliberately retain an alias to the input across each owned
+          // extern call. The result tuple makes a shared-input mutation observable.
+          fn array_updates_program(row: &str, first: Instruction, second: Instruction) -> ValidatedProgram {
+              let mut code = vec![
+                  Instruction::String { dst: r(0), value: "alpha".into() },
+                  Instruction::String { dst: r(1), value: "beta".into() },
+                  Instruction::String { dst: r(2), value: "gamma".into() },
+                  Instruction::Array { dst: r(3), items: vec![r(0), r(1), r(2)] },
+                  Instruction::Copy { dst: r(4), src: r(3) },
+                  first,
+                  second,
+              ];
+              let arguments = match row {
+                  "extern:Array.pop" => vec![r(3)],
+                  "extern:Array.set" | "extern:Array.uset" => vec![r(3), r(5), r(2)],
+                  _ => vec![r(3), r(5), r(6)],
+              };
+              code.push(intrinsic(r(7), row, arguments));
+              code.push(Instruction::Ctor { dst: r(8), tag: 0, fields: vec![r(4), r(7)], scalar_bytes: Vec::new() });
+              code.push(Instruction::Return { src: r(8) });
+              validated(vec![function(0, 0, 9, code)])
+          }
+
+          fn array_update_strings(array: &Obj) -> Vec<String> {
+              let (size, _) = array.array_view();
+              (0..size).map(|index| {
+                  let child = array.array_child(index);
+                  let (size, _, _, bytes) = child.try_string_view().expect("string array cell");
+                  String::from_utf8(bytes[..size - 1].to_vec()).expect("UTF-8 cell")
+              }).collect()
+          }
+
+          #[test]
+          fn array_updates_preserve_shared_inputs_and_owned_heap_results() {
+              let _guard = lock();
+              for (row, expected) in [
+                  ("extern:Array.pop", vec!["alpha", "beta"]),
+                  ("extern:Array.set", vec!["gamma", "beta", "gamma"]),
+                  ("extern:Array.uset", vec!["gamma", "beta", "gamma"]),
+                  ("extern:Array.swap", vec!["gamma", "beta", "alpha"]),
+                  ("extern:Array.swapIfInBounds", vec!["gamma", "beta", "alpha"]),
+              ] {
+                  let first = if row == "extern:Array.uset" {
+                      boxed_scalar(r(5), 0u64.to_ne_bytes().to_vec())
+                  } else {
+                      Instruction::Nat { dst: r(5), value: 0 }
+                  };
+                  let program = array_updates_program(row, first, Instruction::Nat { dst: r(6), value: 2 });
+                  let completed = returned(execute(&program, ExecutionLimits::default(), None));
+                  let original = completed.value.ctor_child(0);
+                  let updated = completed.value.ctor_child(1);
+                  assert_eq!(array_update_strings(&original), ["alpha", "beta", "gamma"], "{row}");
+                  assert_eq!(array_update_strings(&updated), expected, "{row}");
+                  let survivor = updated.array_child(0);
+                  drop(completed);
+                  drop(original);
+                  drop(updated);
+                  assert!(survivor.try_string_view().is_some(), "{row}: dangling returned cell");
+                  assert_eq!(survivor.header().rc, 1, "{row}: leaked heap reference");
+              }
+          }
+
+          #[test]
+          fn array_updates_refuse_erased_bad_bounds_without_truncating_nats() {
+              let _guard = lock();
+              for row in ["extern:Array.set", "extern:Array.swap", "extern:Array.uset"] {
+                  for huge in [false, true] {
+                      let first = if row == "extern:Array.uset" {
+                          boxed_scalar(r(5), (if huge { u64::MAX } else { 3u64 }).to_ne_bytes().to_vec())
+                      } else if huge {
+                          Instruction::NatBig { dst: r(5), limbs_le: vec![0, 1] }
+                      } else {
+                          Instruction::Nat { dst: r(5), value: 3 }
+                      };
+                      let program = array_updates_program(row, first, Instruction::Nat { dst: r(6), value: 0 });
+                      match execute(&program, ExecutionLimits::default(), None) {
+                          Outcome::Complete(VmExit::Refused { refusal: VmRefusal::ArrayIndexOutOfBounds { size: 3, .. }, .. }) => {}
+                          other => panic!("{row} must refuse invalid bounds: {other:?}"),
+                      }
+                  }
+              }
+          }
+
+          #[test]
+          fn array_updates_total_swap_and_empty_pop_preserve_values() {
+              let _guard = lock();
+              for (first, second) in [(0, 0), (3, 0), (0, 3)] {
+                  let program = array_updates_program("extern:Array.swapIfInBounds",
+                      Instruction::Nat { dst: r(5), value: first },
+                      Instruction::Nat { dst: r(6), value: second });
+                  let completed = returned(execute(&program, ExecutionLimits::default(), None));
+                  assert_eq!(array_update_strings(&completed.value.ctor_child(1)), ["alpha", "beta", "gamma"]);
+              }
+              let program = array_updates_program("extern:Array.swapIfInBounds",
+                  Instruction::NatBig { dst: r(5), limbs_le: vec![0, 1] },
+                  Instruction::Nat { dst: r(6), value: 0 });
+              let completed = returned(execute(&program, ExecutionLimits::default(), None));
+              assert_eq!(array_update_strings(&completed.value.ctor_child(1)), ["alpha", "beta", "gamma"]);
+              let empty = validated(vec![function(0, 0, 2, vec![
+                  Instruction::Array { dst: r(0), items: Vec::new() },
+                  intrinsic(r(1), "extern:Array.pop", vec![r(0)]),
+                  Instruction::Return { src: r(1) },
+              ])]);
+              assert_eq!(returned(execute(&empty, ExecutionLimits::default(), None)).value.array_view().0, 0);
+          }
+
+          #[test]
+          fn array_updates_swap_covers_every_index_pair() {
+              let _guard = lock();
+              for first in 0..3 {
+                  for second in 0..3 {
+                      let program = array_updates_program("extern:Array.swap",
+                          Instruction::Nat { dst: r(5), value: first },
+                          Instruction::Nat { dst: r(6), value: second });
+                      let first_run = returned(execute(&program, ExecutionLimits::default(), None));
+                      let mut expected = vec!["alpha", "beta", "gamma"];
+                      expected.swap(first as usize, second as usize);
+                      let actual = array_update_strings(&first_run.value.ctor_child(1));
+                      assert_eq!(actual, expected);
+                  }
+              }
+          }
+          ''', encoding="utf-8")
+          PY
+      - name: Test and commit array updates directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/array-updates-target"
+          git config user.name 'OpenAI coding assistant'
+          git config user.email 'noreply@openai.com'
+          for attempt in 1 2 3; do
+            git -C "$root" fetch origin main
+            work="$RUNNER_TEMP/array-updates-$attempt"
+            git -C "$root" worktree add --detach "$work" origin/main
+            cd "$work"
+            python3 -I "$RUNNER_TEMP/apply-array-updates.py"
+            rustfmt --edition 2024 crates/fln-vm/src/interpreter/arrays.rs crates/fln-vm/src/interpreter.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git diff --check
+            cargo test --locked -p fln-vm --test flbc_interpreter array_updates_ -- --nocapture
+            cargo test --locked -p fln-vm --lib
+            cargo test --locked -p fln-vm --test flbc_interpreter
+            cargo clippy --locked -p fln-vm --lib --no-deps -- -D warnings
+            python3 -I - <<'PY'
+          import subprocess
+          allowed = {
+              "crates/fln-vm/src/interpreter.rs",
+              "crates/fln-vm/src/interpreter/arrays.rs",
+              "crates/fln-vm/tests/flbc_interpreter.rs",
+          }
+          changed = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          unexpected = [line for line in changed if line[3:] not in allowed]
+          if unexpected:
+              raise SystemExit(f"unexpected worktree changes: {unexpected}")
+          PY
+            git add -- crates/fln-vm/src/interpreter.rs crates/fln-vm/src/interpreter/arrays.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git commit -m "feat(vm): execute array set, uset, pop and swap intrinsics" -m "Preserve aliases and row ownership through native Marrow objects. Refuse erased invalid bounds without truncating Nat indices, use boxed USize inputs, and preserve total swapIfInBounds/empty pop semantics. Add FLBC execution regressions for shared heap cells, reference release, invalid bounds and every swap pair. Verified with pinned Rust: VM library and complete FLBC interpreter suites, plus library Clippy."
+            if git push origin HEAD:main; then
+              git rev-parse HEAD
+              exit 0
+            fi
+            echo "main advanced; replaying and retesting on its new tip"
+            cd "$root"
+          done
+          echo "Could not publish after three non-force fast-forward attempts" >&2
+          exit 1
