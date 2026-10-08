@@ -5,10 +5,11 @@
 //! arrays and records share the module's object and byte budgets.
 use super::*;
 use crate::source_extension_format as layout;
-use crate::source_extensions::ClassEntry;
+use crate::source_extensions::{ClassEntry, ReducibilityEntry};
 use std::collections::HashSet;
 
 mod namespaces;
+mod reducibility;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -18,6 +19,9 @@ pub struct SourceMetadata {
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
     /// reading this module answers `isProtected` correctly.
     pub protected: Vec<Name>,
+    /// This module's final status for each owned declaration. The writer sorts
+    /// these by Name.quickLt for the pin's per-module binary search.
+    pub reducibility: Vec<ReducibilityEntry>,
 }
 
 /// Encode source journals and the namespaces implied by local declarations.
@@ -82,6 +86,9 @@ impl Encoder {
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.protected_block(&metadata.protected)?);
+        }
+        if !metadata.reducibility.is_empty() {
+            blocks.push(self.reducibility_block(&metadata.reducibility)?);
         }
         Ok(blocks)
     }
@@ -168,6 +175,7 @@ mod tests {
                 out_level_params: vec![2],
             }],
             protected: Vec::new(),
+            ..SourceMetadata::default()
         }
     }
     /// Protected names round-trip, alone and beside classes, in `Name.quickLt`
@@ -186,6 +194,7 @@ mod tests {
             let metadata = SourceMetadata {
                 classes: classes.clone(),
                 protected: names.clone(),
+                ..SourceMetadata::default()
             };
             let encoded = encode_module_with_source_metadata(
                 input(),
@@ -209,6 +218,7 @@ mod tests {
             let metadata = SourceMetadata {
                 classes: Vec::new(),
                 protected: bad,
+                ..SourceMetadata::default()
             };
             assert!(matches!(
                 encode_module_with_source_metadata(

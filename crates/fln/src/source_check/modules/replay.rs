@@ -41,6 +41,7 @@ impl Export {
         if let Some(suffix) = self.extensions.iter().find(|suffix| {
             !fln_elab::instances::export::supports(&suffix.descriptor)
                 && !fln_elab::protected_names::supports(&suffix.descriptor)
+                && !fln_elab::reducibility::export::supports(&suffix.descriptor)
         }) {
             return Err(extension_error(
                 module,

@@ -18,6 +18,8 @@ use fln_env::extensions::{
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+pub mod export;
+
 const MAGIC: &[u8] = b"FLNREDUC\x01";
 const MAX_ROWS: usize = 1 << 20;
 const MAX_ENTRY_BYTES: usize = 65_536;

@@ -83,7 +83,10 @@ pub(super) fn encode(
     let mut encoder = Encoder::new(budget, header.version)?;
     let namespaces = encoder.declaration_namespaces(input.constants)?;
     if namespaces.is_empty() {
-        return if metadata.classes.is_empty() && metadata.protected.is_empty() {
+        return if metadata.classes.is_empty()
+            && metadata.protected.is_empty()
+            && metadata.reducibility.is_empty()
+        {
             encode_module(input, header, budget)
         } else {
             encode_module_metadata(input, Some(metadata), header, budget)
@@ -100,10 +103,17 @@ pub(super) fn encode(
     blocks.push(encoder.namespace_block(&namespaces)?);
     let entries = encoder.array(blocks)?;
     let root = encoder.module_root_with_entries(input, Some(entries))?;
-    let finished = finish_region(encoder, root, header_bytes, header.version, header.base_addr)?;
-    let expr_nodes = u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
-        what: "expression node count overflows",
-    })?;
+    let finished = finish_region(
+        encoder,
+        root,
+        header_bytes,
+        header.version,
+        header.base_addr,
+    )?;
+    let expr_nodes =
+        u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
+            what: "expression node count overflows",
+        })?;
     let imports = u64::try_from(input.imports.len()).map_err(|_| WriteError::Contract {
         what: "import count overflows",
     })?;
@@ -197,7 +207,10 @@ mod tests {
         let encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
         let mut expected = vec![name("Lib"), name("Lib.Inner"), name("Lib.Other")];
         expected.sort_by(Name::quick_cmp);
-        assert_eq!(encoder.declaration_namespaces(&constants).unwrap(), expected);
+        assert_eq!(
+            encoder.declaration_namespaces(&constants).unwrap(),
+            expected
+        );
         let mut reversed = constants;
         reversed.reverse();
         assert_eq!(encoder.declaration_namespaces(&reversed).unwrap(), expected);
@@ -228,7 +241,9 @@ mod tests {
         assert_eq!(entries.try_array_view().unwrap().0, namespaces.len());
         for (index, expected) in namespaces.iter().enumerate() {
             assert_eq!(
-                conversion.project_name(&entries.array_child(index)).unwrap(),
+                conversion
+                    .project_name(&entries.array_child(index))
+                    .unwrap(),
                 *expected
             );
         }
@@ -244,6 +259,7 @@ mod tests {
                 out_level_params: vec![],
             }],
             protected: vec![name("Lib.protected")],
+            ..SourceMetadata::default()
         };
         for version in [2, 3] {
             let encoded = encode_module_with_source_metadata(

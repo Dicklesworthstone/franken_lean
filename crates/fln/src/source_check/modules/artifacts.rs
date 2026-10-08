@@ -193,6 +193,39 @@ impl PendingArtifact {
                     out_level_params: class.parameters.out_level_params,
                 });
         }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let exported = fln_elab::reducibility::export::statuses(base, checked, remaining).map_err(
+            |error| match error {
+                fln_elab::reducibility::ReducibilityError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::reducibility::export::journal_name(),
+                    reason: "invalid reducibility metadata export",
+                },
+            },
+        )?;
+        let (statuses, work) = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+            module: name.clone(),
+            extension: fln_elab::reducibility::export::journal_name(),
+            reason: "imported-declaration reducibility overrides require a reducibilityExtra serializer",
+        })?;
+        meter.work(work)?;
+        for row in statuses {
+            use fln_elab::reducibility::Reducibility;
+            use fln_olean::source_extensions::{ReducibilityEntry, ReducibilityStatus};
+            metadata.reducibility.push(ReducibilityEntry {
+                declaration: row.declaration,
+                status: match row.status {
+                    Reducibility::Reducible => ReducibilityStatus::Reducible,
+                    Reducibility::Semireducible => ReducibilityStatus::Semireducible,
+                    Reducibility::Irreducible => ReducibilityStatus::Irreducible,
+                    Reducibility::ImplicitReducible => ReducibilityStatus::ImplicitReducible,
+                },
+            });
+        }
         // The module's own `protected` tags: those the checked environment
         // records beyond its import base. The pin tags a declaration only in the
         // module that declares it, and writes them into that module's olean.
