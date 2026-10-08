@@ -5,15 +5,18 @@
 //! arrays and records share the module's object and byte budgets.
 use super::*;
 use crate::source_extension_format as layout;
-use crate::source_extensions::{ClassEntry, ReducibilityEntry};
+use crate::source_extensions::{ClassEntry, InstanceEntry, InstanceKey, ReducibilityEntry};
 use std::collections::HashSet;
 
+mod instances;
 mod namespaces;
 mod reducibility;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
     pub classes: Vec<ClassEntry>,
+    /// Chronological global/scoped entries, retaining repeated priority updates.
+    pub instances: Vec<InstanceEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
     /// entries, one `Name` each. They are written sorted by `Name.quickLt`, the
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
@@ -83,6 +86,9 @@ impl Encoder {
         let mut blocks = Vec::new();
         if !metadata.classes.is_empty() {
             blocks.push(self.class_block(&metadata.classes)?);
+        }
+        if !metadata.instances.is_empty() {
+            blocks.push(self.instance_block(&metadata.instances)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.protected_block(&metadata.protected)?);

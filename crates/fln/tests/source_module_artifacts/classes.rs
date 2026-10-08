@@ -5,6 +5,9 @@ use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportL
 use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
 use fln_olean::source_extensions::{self, ClassEntry, DecodeLimits};
 
+#[path = "instances.rs"]
+mod instances;
+
 const CLASS: &str = "prelude\nclass Mapper (A : Type) where\n  apply : A -> A";
 
 fn compiled(files: &[(&str, &str)]) -> SourceModuleBuild {
@@ -237,19 +240,32 @@ fn warm_class_artifacts_remain_byte_identical_and_writer_failures_preserve_cache
 }
 
 #[test]
-fn unsupported_instance_rows_cannot_escape_in_an_incomplete_artifact() {
+fn polymorphic_instances_survive_compilation_and_dual_checked_import() {
     let initial = Engine::builder().build_empty();
     let root = initial.logical_root(&KVMap::new());
     let source =
         format!("{CLASS}\ninstance mapperId (A : Type) : Mapper A := Mapper.mk (fun x => x)");
-    assert!(matches!(
-        build(&initial, &[("Main", &source)], OleanWriteBudget::default()),
-        Err(SourceModuleBuildError::Check(
-            SourceModuleCheckError::Extension { .. }
-        ))
-    ));
+    let built = build(&initial, &[("Main", &source)], OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
     assert_eq!(initial.logical_root(&KVMap::new()), root);
-    imported(&compiled(&[("Main", CLASS)]));
+    let rows = metadata(&built.artifacts[0].bytes).instances;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declaration, name("mapperId"));
+    assert_eq!(
+        rows[0].keys,
+        [
+            source_extensions::InstanceKey::Const(name("Mapper"), 1),
+            source_extensions::InstanceKey::Star
+        ]
+    );
+    let receipt = imported(&built);
+    assert_eq!(receipt.modules[0].instances, 1);
+    receipt.engine.check_source_files(
+        &[b"def useMapper (A : Type) (x : A) : A := Mapper.apply x\ndef mapperIdentity (A : Type) (P : A -> Prop) (x : A) (h : P x) : P (Mapper.apply x) := h"],
+        &KVMap::new(), limits().source,
+    ).unwrap().into_complete().unwrap();
 }
 
 #[test]

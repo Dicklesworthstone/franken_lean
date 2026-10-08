@@ -158,30 +158,29 @@ impl PendingArtifact {
             }
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
-        let exported =
-            fln_elab::instances::export::classes(base, checked, remaining).map_err(|error| {
-                match error {
-                    fln_elab::instances::InstanceRegistryError::Limit => {
-                        SourceModuleCheckError::Limit {
-                            resource: "module work",
-                            limit: meter.limits.max_work,
-                        }
+        let exported = fln_elab::instances::export::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::instances::InstanceRegistryError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
                     }
-                    _ => SourceModuleCheckError::Extension {
-                        module: name.clone(),
-                        extension: fln_elab::instances::export::journal_name(),
-                        reason: "invalid class metadata export",
-                    },
                 }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::instances::export::journal_name(),
+                    reason: "invalid class or instance metadata export",
+                },
             })?;
-        let (classes, work) = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+        let (registrations, work) = exported.ok_or_else(|| SourceModuleCheckError::Extension {
             module: name.clone(),
             extension: fln_elab::instances::export::journal_name(),
-            reason: "instance indexing has no pinned artifact serializer yet",
+            reason: "instance registration ownership, scope, or exact indexing is unsupported",
         })?;
         meter.work(work)?;
+        meter.bytes(registrations.bytes_examined)?;
         let mut metadata = SourceMetadata::default();
-        for class in classes {
+        for class in registrations.classes {
             meter.bytes(
                 4 * (class.parameters.out_params.len() + class.parameters.out_level_params.len()),
             )?;
@@ -192,6 +191,39 @@ impl PendingArtifact {
                     out_params: class.parameters.out_params,
                     out_level_params: class.parameters.out_level_params,
                 });
+        }
+        for instance in registrations.instances {
+            use fln_elab::instances::discr_tree::Key;
+            use fln_olean::source_extensions::{InstanceEntry, InstanceKey};
+            meter.work(1)?;
+            meter.bytes(instance.synth_order.len().saturating_mul(4))?;
+            meter.bytes(
+                instance
+                    .keys
+                    .len()
+                    .saturating_mul(std::mem::size_of::<InstanceKey>()),
+            )?;
+            let keys = instance
+                .keys
+                .into_iter()
+                .map(|key| match key {
+                    Key::Star => InstanceKey::Star,
+                    Key::Other => InstanceKey::Other,
+                    Key::Lit(value) => InstanceKey::Lit(value),
+                    Key::FVar(id, arity) => InstanceKey::FVar(id.0, arity),
+                    Key::Const(name, arity) => InstanceKey::Const(name, arity),
+                    Key::Arrow => InstanceKey::Arrow,
+                    Key::Proj(name, index, arity) => InstanceKey::Proj(name, index, arity),
+                })
+                .collect();
+            metadata.instances.push(InstanceEntry {
+                declaration: instance.declaration,
+                value: instance.value,
+                priority: instance.priority,
+                synth_order: instance.synth_order,
+                scope: None,
+                keys,
+            });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let exported = fln_elab::reducibility::export::statuses(base, checked, remaining).map_err(
@@ -213,9 +245,12 @@ impl PendingArtifact {
             reason: "imported-declaration reducibility overrides require a reducibilityExtra serializer",
         })?;
         meter.work(work)?;
+        let mut explicit_statuses = std::collections::BTreeSet::new();
         for row in statuses {
             use fln_elab::reducibility::Reducibility;
             use fln_olean::source_extensions::{ReducibilityEntry, ReducibilityStatus};
+            meter.work(1)?;
+            explicit_statuses.insert(row.declaration.clone());
             metadata.reducibility.push(ReducibilityEntry {
                 declaration: row.declaration,
                 status: match row.status {
@@ -225,6 +260,20 @@ impl PendingArtifact {
                     Reducibility::ImplicitReducible => ReducibilityStatus::ImplicitReducible,
                 },
             });
+        }
+        // Native instances have this default in ReducibilityTable::effective.
+        // Once imported, their status must come from reducibilityCore instead;
+        // an explicit owned status always wins, including later overrides.
+        for instance in &metadata.instances {
+            meter.work(1)?;
+            if explicit_statuses.insert(instance.declaration.clone()) {
+                metadata
+                    .reducibility
+                    .push(fln_olean::source_extensions::ReducibilityEntry {
+                        declaration: instance.declaration.clone(),
+                        status: fln_olean::source_extensions::ReducibilityStatus::ImplicitReducible,
+                    });
+            }
         }
         // The module's own `protected` tags: those the checked environment
         // records beyond its import base. The pin tags a declaration only in the

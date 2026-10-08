@@ -3,6 +3,38 @@ use super::*;
 use fln_core::level::LevelView;
 use std::collections::HashSet;
 
+mod data;
+mod index;
+#[cfg(test)]
+mod tests;
+pub use data::{InstanceRegistration, Registrations, registrations};
+
+/// Exact pinned indexing metadata for the supported native type fragment.
+/// Absence is an explicit unsupported result, never a guessed wildcard path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedIndex {
+    pub keys: Vec<discr_tree::Key>,
+    pub synth_order: Vec<u32>,
+}
+
+/// Derive indexing without reading the registry again or changing any state.
+/// Native source search and artifact export use this same bounded computation.
+pub fn derive_index(
+    env: &Environment,
+    registry: &InstanceRegistry,
+    declaration: &Name,
+    work_left: &mut usize,
+) -> Result<Option<DerivedIndex>, InstanceRegistryError> {
+    index::derive(
+        env,
+        &registry.classes,
+        &registry.imported.classes,
+        None,
+        declaration,
+        work_left,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassRegistration {
     pub name: Name,
@@ -24,47 +56,8 @@ pub fn classes(
     result: &Environment,
     max_work: usize,
 ) -> Result<Option<(Vec<ClassRegistration>, usize)>, InstanceRegistryError> {
-    let registry = InstanceRegistry::read(result)?;
-    let Some(current) = result.extension(&extension_name()) else {
-        if base.extension(&extension_name()).is_some() {
-            return Err(InstanceRegistryError::Malformed);
-        }
-        return Ok(Some((Vec::new(), 0)));
-    };
-    let prior = base.extension(&extension_name());
-    let start = prior.map_or(0, |prior| prior.len());
-    if current.descriptor != descriptor() {
-        return Err(InstanceRegistryError::Malformed);
-    }
-    if let Some(prior) = prior
-        && (prior.descriptor != current.descriptor
-            || prior.len() > current.len()
-            || !prior.entries().zip(current.entries()).all(|(a, b)| a == b))
-    {
-        return Err(InstanceRegistryError::Malformed);
-    }
-    let mut rows = Vec::new();
-    let mut remaining = max_work;
-    for entry in current.entries().skip(start) {
-        tick(&mut remaining)?;
-        let mut bytes: &[u8] = &entry.payload;
-        if take(&mut bytes, MAGIC.len())? != MAGIC {
-            return Err(InstanceRegistryError::Malformed);
-        }
-        if take(&mut bytes, 1)?[0] != 0 {
-            return Ok(None);
-        }
-        let name = read_name(&mut bytes)?;
-        if !bytes.is_empty() {
-            return Err(InstanceRegistryError::Malformed);
-        }
-        let parameters = match registry.imported_class_parameters(&name) {
-            Some(parameters) => parameters.clone(),
-            None => parameters_with_budget(result, &name, &mut remaining)?,
-        };
-        rows.push(ClassRegistration { name, parameters });
-    }
-    Ok(Some((rows, max_work - remaining)))
+    Ok(registrations(base, result, max_work)?
+        .and_then(|(rows, work)| rows.instances.is_empty().then_some((rows.classes, work))))
 }
 
 /// The pinned Class.checkOutParam / computeOutLevelParams rules operate on the
@@ -110,7 +103,7 @@ fn parameters_with_budget(
                 let mut output = annotated;
                 for &previous in &out {
                     tick(work_left)?;
-                    if binder_type.has_loose_bvar(index - previous - 1) {
+                    if contains_loose(binder_type, index - previous - 1, work_left)? {
                         if !annotated && *binder_info != BinderInfo::InstImplicit {
                             return Err(InstanceRegistryError::InvalidClass(class.clone()));
                         }
@@ -172,17 +165,56 @@ fn parameters_with_budget(
     }
     // computeOutLevelParams excludes the result sort, even if the class has
     // no term parameters. Do not substitute the source solver's cache policy.
-    let out_level_params = info
-        .constant_val()
-        .level_params
-        .iter()
-        .enumerate()
-        .filter_map(|(i, name)| (!inputs.contains(name)).then_some(i as u32))
-        .collect();
+    let mut out_level_params = Vec::new();
+    for (index, name) in info.constant_val().level_params.iter().enumerate() {
+        tick(work_left)?;
+        if !inputs.contains(name) {
+            out_level_params.push(u32::try_from(index).map_err(|_| InstanceRegistryError::Limit)?);
+        }
+    }
     Ok(imported::ClassParameters {
         out_params: out,
         out_level_params,
     })
+}
+
+fn contains_loose(
+    expr: &Expr,
+    index: u32,
+    left: &mut usize,
+) -> Result<bool, InstanceRegistryError> {
+    let mut todo = vec![(expr, index)];
+    let mut seen = HashSet::new();
+    while let Some((expr, index)) = todo.pop() {
+        tick(left)?;
+        if expr.loose_bvar_range() <= index || !seen.insert((expr.allocation_identity(), index)) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::BVar { idx } if *idx == index => return Ok(true),
+            ExprNode::App { f, a } => todo.extend([(f, index), (a, index)]),
+            ExprNode::ForallE {
+                binder_type, body, ..
+            }
+            | ExprNode::Lam {
+                binder_type, body, ..
+            } => {
+                todo.extend([(binder_type, index), (body, index.saturating_add(1))]);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                todo.extend([
+                    (type_, index),
+                    (value, index),
+                    (body, index.saturating_add(1)),
+                ]);
+            }
+            ExprNode::Proj { expr, .. } | ExprNode::MData { expr, .. } => todo.push((expr, index)),
+            _ => {}
+        }
+    }
+    Ok(false)
 }
 
 fn tick(left: &mut usize) -> Result<(), InstanceRegistryError> {

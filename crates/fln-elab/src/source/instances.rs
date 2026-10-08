@@ -10,6 +10,9 @@ mod parameters;
 mod reconcile;
 mod table;
 
+#[cfg(test)]
+mod index_tests;
+
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
 /// The pin's `maxSynthPendingDepth` default (vendored Meta/Basic.lean). As in
@@ -170,6 +173,31 @@ impl Context {
         self.registry_cache
             .read(&self.txn.env)
             .map_err(registry_error)
+    }
+
+    /// Source and imported instances share one ordered index. Computing native
+    /// paths spends this command's heartbeats, including unsuccessful work;
+    /// exhaustion cannot silently switch back to a different candidate order.
+    fn instance_search_index<'r>(
+        &mut self,
+        registry: &'r InstanceRegistry,
+    ) -> Result<&'r crate::instances::discr_tree::InstanceIndex, NatDefinitionElabError> {
+        self.tick()?;
+        let budget = &mut self.txn.budget;
+        let ceiling = if budget.max_heartbeats == 0 {
+            u64::MAX
+        } else {
+            budget.max_heartbeats
+        };
+        let available = ceiling.saturating_sub(budget.heartbeats_consumed);
+        let initial = usize::try_from(available).unwrap_or(usize::MAX);
+        let mut remaining = initial;
+        let result = registry.instance_index(&self.txn.env, &mut remaining);
+        budget.heartbeats_consumed = budget
+            .heartbeats_consumed
+            .checked_add((initial - remaining) as u64)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        result.map_err(registry_error)
     }
 }
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
@@ -535,8 +563,7 @@ impl Context {
                 .instantiate_expr(&prepared.target)
                 .unwrap_or_else(|_| prepared.target.clone());
             candidates.extend(
-                registry
-                    .instance_index()
+                self.instance_search_index(registry)?
                     .narrow(
                         &self.txn.env,
                         &self.txn.lctx,
@@ -623,11 +650,19 @@ impl Context {
                 .checked_add(1)
                 .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         }
-        if let Candidate::Global(name) = candidate
-            && let Some(parameters) = registry.imported_instance_parameters(name)
-        {
+        let synth_order = if let Candidate::Global(name) = candidate {
+            if let Some(parameters) = registry.imported_instance_parameters(name) {
+                Some(parameters.synth_order.as_slice())
+            } else {
+                self.instance_search_index(registry)?
+                    .native_synth_order(name)
+            }
+        } else {
+            None
+        };
+        if let Some(synth_order) = synth_order {
             let mut ordered = Vec::with_capacity(subgoals.len());
-            for index in &parameters.synth_order {
+            for index in synth_order {
                 self.tick()?;
                 let slot = positions
                     .iter()

@@ -168,6 +168,80 @@ pub(super) fn journal_digest(env: &Environment) -> Option<[u8; 32]> {
         .map(|extension| extension.content_digest().0)
 }
 
+/// Read only the authoritative imported class policies for native artifact
+/// export. Instance rows need no revalidation here: they are not exported or
+/// changed, and the caller has already admitted its import base. Row traversal,
+/// payload bytes and declaration telescope visits are charged before use.
+pub(super) fn export_classes(
+    env: &Environment,
+    work_left: &mut usize,
+) -> Result<(BTreeMap<Name, ClassParameters>, usize), InstanceRegistryError> {
+    let Some(extension) = env.extension(&name()) else {
+        return Ok((BTreeMap::new(), 0));
+    };
+    if extension.descriptor != descriptor() {
+        return Err(InstanceRegistryError::Malformed);
+    }
+    if extension.len() > MAX_ROWS {
+        return Err(InstanceRegistryError::Limit);
+    }
+    let mut result = BTreeMap::new();
+    let mut bytes_read = 0usize;
+    let charge = |left: &mut usize, amount: usize| -> Result<(), InstanceRegistryError> {
+        *left = left
+            .checked_sub(amount)
+            .ok_or(InstanceRegistryError::Limit)?;
+        Ok(())
+    };
+    for entry in extension.entries() {
+        charge(work_left, 1)?;
+        charge(work_left, entry.payload.len())?;
+        bytes_read += entry.payload.len();
+        if entry.payload.len() > MAX_ENTRY_BYTES {
+            return Err(InstanceRegistryError::Limit);
+        }
+        let mut bytes = entry
+            .payload
+            .strip_prefix(MAGIC)
+            .ok_or(InstanceRegistryError::Malformed)?;
+        match take(&mut bytes, 1)?[0] {
+            1 => continue,
+            0 => {}
+            _ => return Err(InstanceRegistryError::Malformed),
+        }
+        let class = read_name(&mut bytes)?;
+        let parameters = ClassParameters {
+            out_params: indices(&mut bytes)?,
+            out_level_params: indices(&mut bytes)?,
+        };
+        if !bytes.is_empty() {
+            return Err(InstanceRegistryError::Malformed);
+        }
+        validate_class(env, &class)?;
+        let info = env
+            .find(&class)
+            .ok_or(InstanceRegistryError::Malformed)?
+            .constant_val();
+        let mut type_ = &info.type_;
+        let mut binders = 0;
+        loop {
+            charge(work_left, 1)?;
+            match type_.node() {
+                ExprNode::ForallE { body, .. } => {
+                    binders += 1;
+                    type_ = body;
+                }
+                ExprNode::MData { expr, .. } => type_ = expr,
+                _ => break,
+            }
+        }
+        validate_indices(&parameters.out_params, binders)?;
+        validate_indices(&parameters.out_level_params, info.level_params.len())?;
+        result.insert(class, parameters);
+    }
+    Ok((result, bytes_read))
+}
+
 pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError> {
     let Some(extension) = env.extension(&name()) else {
         return Ok(Metadata::default());

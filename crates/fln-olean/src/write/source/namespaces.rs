@@ -84,6 +84,7 @@ pub(super) fn encode(
     let namespaces = encoder.declaration_namespaces(input.constants)?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
+            && metadata.instances.is_empty()
             && metadata.protected.is_empty()
             && metadata.reducibility.is_empty()
         {

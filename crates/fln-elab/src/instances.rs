@@ -335,11 +335,15 @@ impl InstanceRegistry {
     pub fn candidates(&self, class: &Name) -> &[InstanceEntry] {
         self.instances.get(class).map_or(&[], Vec::as_slice)
     }
-    /// The pin's discrimination tree over the imported instances' stored paths
-    /// ([`discr_tree`], bead `fln-52qv`). A registry is not changed once read,
-    /// so the index built on first use stays its index.
-    pub(crate) fn instance_index(&self) -> &discr_tree::InstanceIndex {
-        self.index.get(self)
+    /// The pin's discrimination tree over imported paths and supported native
+    /// models. Derivation reads the admitted environment, spends caller work,
+    /// and publishes the cache only after the complete active view succeeds.
+    pub(crate) fn instance_index(
+        &self,
+        env: &Environment,
+        work_left: &mut usize,
+    ) -> Result<&discr_tree::InstanceIndex, InstanceRegistryError> {
+        self.index.get(self, env, work_left)
     }
     pub fn imported_class_parameters(&self, class: &Name) -> Option<&imported::ClassParameters> {
         self.imported.classes.get(class)
