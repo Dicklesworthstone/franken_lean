@@ -346,6 +346,26 @@ const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 /// repair is exactly that migration. See residue item 4 in the module header.
 const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     (
+        "crates/fln-syntax/tests/pin_syntax_corpus.rs",
+        "pin_syntax_corpus_against_the_pin",
+        "an on-demand pin-gated lane (bead fln-pin-syntax-corpus-7b5b): the pinned frontend dumps \
+         1,077 Init and Std files on first use (about 6 minutes; 6 s from its cache), checks every \
+         dump against the checked-in manifest and asserts the lossless round trip over all 72,092 \
+         commands; with FLN_PIN_SYNTAX_WRITE=1 it is the manifest's only writer. Per commit, \
+         every_vendored_init_and_std_source_has_its_manifest_row holds the population, the \
+         source digests and the producer, and fln-syntax's pin_syntax unit tests hold the round \
+         trip and its refusals on planted dumps",
+    ),
+    (
+        "crates/fln-parse/tests/pin_syntax_frontier.rs",
+        "pin_syntax_frontier_a_measures_the_production_parser",
+        "a measurement lane over the pin syntax corpus cache (bead fln-pin-syntax-corpus-7b5b \\
+         item 4, the metric franken_lean-z8j.1.10 asks for): FrankenLean's production parser on \\
+         all 72,092 commands against the pin's trees, typed SKIP without the cache. It fails \\
+         only on a broken scan, so it gates nothing yet; per commit, \\
+         the_comparison_names_shape_and_position_differences holds its classification",
+    ),
+    (
         "crates/fln-cli/tests/source_olean_imports.rs",
         "existential_notation_and_nested_anonymous_constructors",
         "an on-demand council of the 51-module Init.NotationExtra closure (about a minute in \
@@ -700,7 +720,13 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// adds it: it needs the pin, a built Mathlib and the untracked census partition, and the
 /// entry says it is a measurement, not a gate, and names the hand-built tests that hold its
 /// rules per commit.
-const IGNORED_PRODUCER_CEILING: usize = 26;
+///
+/// 26 -> 27 for `crates/fln-syntax/tests/pin_syntax_corpus.rs`'s pinned lane (bead
+/// `fln-pin-syntax-corpus-7b5b`), declared in the commit that adds it: the pinned frontend over
+/// 1,077 files is minutes on first use, and the entry names what holds the corpus per commit.
+/// 27 -> 28 for `crates/fln-parse/tests/pin_syntax_frontier.rs`'s frontier A, in the same change:
+/// a measurement over that corpus's cache, which no CI host holds.
+const IGNORED_PRODUCER_CEILING: usize = 28;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -2117,7 +2143,12 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=13 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=15 rows=13 citations=14 all-rows-declared=true
+    //
+    // `surfaces` rose 13 -> 15 with the declarations of the pin syntax corpus's pinned lane in
+    // crates/fln-syntax/tests/pin_syntax_corpus.rs and its frontier A in
+    // crates/fln-parse/tests/pin_syntax_frontier.rs (2026-10-08). `rows` and `citations` are
+    // unmoved: no terminal row cites either surface.
     //
     // `surfaces` rose 12 -> 13 with the declaration of the corpus demand measurement in
     // crates/fln-olean/tests/ir_demand.rs (2026-10-07). `rows` and `citations` are unmoved:
