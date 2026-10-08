@@ -47,6 +47,22 @@ const SPEND: &str =
     "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
+fn ordinary_higher_order_arguments_do_not_repeat_callback_annotation() {
+    execute(
+        "def use (f : (Nat -> Nat) -> Nat) : Nat := f (fun n => n)\n#eval use (fun g => g 42)",
+        "42",
+    );
+    execute(
+        "def use (f : (Nat -> Nat) -> Nat) : Nat := f (fun n => n)\n#eval let callback : (Nat -> Nat) -> Nat := fun g => g 42; use callback",
+        "42",
+    );
+    execute(
+        "#eval let callback : (Nat -> Nat) -> Nat := fun g => g 21; let forward : ((Nat -> Nat) -> Nat) -> Nat := fun f => f (fun n => n); callback (fun n => n) + forward callback",
+        "42",
+    );
+}
+
+#[test]
 fn known_staged_callbacks_execute_through_the_ordinary_higher_order_consumer() {
     execute(
         &format!(
@@ -114,6 +130,11 @@ fn selected_staged_callback_consumer_cannot_bypass_foreign_extern_metadata() {
         APPLY,
         "applyBoth",
         "#eval applyBoth (fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y) 20 21",
+    );
+    assert_foreign_extern_is_not_inlined(
+        APPLY,
+        "applyBoth",
+        "#eval let callback : Nat -> Nat -> Nat := fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y; let alias : Nat -> Nat -> Nat := callback; applyBoth alias 20 21",
     );
 }
 

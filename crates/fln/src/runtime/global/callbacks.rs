@@ -3,13 +3,326 @@
 //! Every other supplied operand keeps one strict binding in source order.
 use super::*;
 
-fn literal_lambda(expr: &Expr) -> Option<&Expr> {
-    matches!(expr.node(), ExprNode::Lam { .. }).then_some(expr)
-}
-
 impl Preparation<'_> {
+    /// Typed identity lets can hide a literal consumer or callback after
+    /// dictionary projection. Expose only lambda construction, its aliases,
+    /// and checked administrative field selection. A computed initializer still
+    /// takes the ordinary strict path. Retain each checked annotation at the
+    /// real lambda's return stages before removing its administrative binding.
+    pub(in crate::runtime) fn inert_callable(
+        &mut self,
+        input: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut value = input.clone();
+        let mut bindings = Vec::new();
+        loop {
+            self.tick()?;
+            match value.node() {
+                ExprNode::MData { expr, .. } => value = expr.clone(),
+                ExprNode::LetE {
+                    type_,
+                    value: initializer,
+                    body,
+                    ..
+                } => {
+                    self.producer_depth(bindings.len().saturating_add(1))?;
+                    reserve(&mut bindings, self.limits.max_context_depth)?;
+                    bindings.push((type_.clone(), body.clone()));
+                    value = initializer.clone();
+                }
+                ExprNode::Lam { .. } => {
+                    let Some((type_, body)) = bindings.pop() else {
+                        return Ok(Some(value));
+                    };
+                    let literal = self.annotate_callable_tail(&value, &type_)?;
+                    value = self.substitution(&body, &literal)?;
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let Some(projected) = self.executable_projection(struct_name, *idx, expr)?
+                    else {
+                        return Ok(None);
+                    };
+                    value = projected;
+                }
+                ExprNode::App { .. } => {
+                    let (head, arguments) = self.spine(&value)?;
+                    let selected = match self.projection_call(&head, &arguments)? {
+                        Some(projected) => Some(projected),
+                        None => self.static_callable_instance(&head, &arguments)?,
+                    };
+                    let Some(projected) = selected else {
+                        return Ok(None);
+                    };
+                    value = projected;
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// A global method applied only to its checked static arguments is still
+    /// lambda construction. Expose the existing specialization's literal body
+    /// before an administrative alias registers a flat wrapper around it. Any
+    /// runtime operand or computed initializer keeps the ordinary strict path.
+    fn static_callable_instance(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        if !matches!(self.environment.find(name),
+            Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe)
+        {
+            return Ok(None);
+        }
+        let Some(specialized) = self.specialize_call(head, arguments)? else {
+            return Ok(None);
+        };
+        let (selected, runtime_arguments) = self.spine(&specialized)?;
+        if !runtime_arguments.is_empty() {
+            return Ok(None);
+        }
+        let ExprNode::Const {
+            name: selected,
+            levels,
+        } = selected.node()
+        else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        let Some(definition) = self.specialized_definition(selected) else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || !matches!(definition.value.node(), ExprNode::Lam { .. })
+        {
+            return Ok(None);
+        }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        let definition = self.normalize_definition_signature(&definition)?;
+        self.annotate_callable_tail(&definition.value, &definition.base.type_)
+            .map(Some)
+    }
+
+    /// Keep a known higher-order consumer visible until its actual callback
+    /// operands are available. Strict producer prefixes remain outside the
+    /// substituted literal, in their original order and evaluated once.
+    /// This runs before either initializer or body registers local closures.
+    pub(in crate::runtime) fn expose_callable_binding(
+        &mut self,
+        type_: &Expr,
+        initializer: &Expr,
+        body: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut result = body;
+        while let ExprNode::MData { expr, .. } = result.node() {
+            self.tick()?;
+            result = expr;
+        }
+        if matches!(result.node(), ExprNode::BVar { idx: 0 }) {
+            // This binding is the checked type anchor of a returned closure.
+            return Ok(None);
+        }
+        let mut value = initializer.clone();
+        let mut prefix = Vec::new();
+        loop {
+            self.tick()?;
+            if let Some(literal) = self.inert_callable(&value)? {
+                value = literal;
+                break;
+            }
+            match value.node() {
+                ExprNode::MData { expr, .. } => value = expr.clone(),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value: init,
+                    body,
+                    non_dep,
+                } => {
+                    self.producer_depth(prefix.len().saturating_add(1))?;
+                    reserve(&mut prefix, self.limits.max_context_depth)?;
+                    prefix.push((decl_name.clone(), type_.clone(), init.clone(), *non_dep));
+                    value = body.clone();
+                }
+                ExprNode::App { .. } => {
+                    let (head, args) = self.spine(&value)?;
+                    let reduced = match self.projection_call(&head, &args)? {
+                        Some(projected) => Some(projected),
+                        None => match self.static_apply(&head, &args)? {
+                            Some(applied) => Some(applied),
+                            None => self.static_callable_instance(&head, &args)?,
+                        },
+                    };
+                    let Some(reduced) = reduced else {
+                        return Ok(None);
+                    };
+                    if reduced == value {
+                        return Ok(None);
+                    }
+                    value = reduced;
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let Some(projected) = self.executable_projection(struct_name, *idx, expr)?
+                    else {
+                        return Ok(None);
+                    };
+                    value = projected;
+                }
+                ExprNode::Lam { .. } => break,
+                _ => {
+                    return Ok(None);
+                }
+            }
+        }
+        let depth = self.producer_depth(prefix.len())?;
+        let shifted_type = self.lift(type_, depth)?;
+        let mut selected = self.staged_callback(&value, &shifted_type)?;
+        if !selected {
+            let mut consumer = false;
+            let mut remaining = self.normalize_type(&shifted_type)?;
+            let mut lambda = value.clone();
+            while let (
+                ExprNode::Lam { body: next, .. },
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                },
+            ) = (lambda.node(), remaining.node())
+            {
+                self.tick()?;
+                // Ordinary first-order local functions retain shared closure
+                // bindings. Only generic templates and actual callable
+                // consumers need this call-site exposure.
+                if self.type_parameter(binder_type)? {
+                    selected = true;
+                    break;
+                }
+                consumer |= !binder_type.has_loose_bvars()
+                    && matches!(self.value_type(binder_type)?, Some(ValueType::Closure(_)));
+                lambda = next.clone();
+                remaining = self.type_head(body)?;
+            }
+            // A flat callback used as a value needs this outer checked type.
+            // Inlining it into an ordinary global call recreates annotate_call's
+            // input; inlining it into a local call loses its signature entirely.
+            // Expose a consumer only when every runtime occurrence is called.
+            selected |= consumer && self.only_callee_uses(body)?;
+        }
+        if !selected {
+            return Ok(None);
+        }
+        let literal = self.annotate_callable_tail(&value, &shifted_type)?;
+        let literal = self.retain_staged_callable_type(literal, &shifted_type)?;
+        // Lifting a lambda keeps the bound function slot at zero while
+        // shifting every outer capture beneath the retained strict prefix.
+        let scoped_body = self.lift(
+            &Expr::lam(
+                Name::anonymous(),
+                type_.clone(),
+                body.clone(),
+                BinderInfo::Default,
+            ),
+            depth,
+        )?;
+        let ExprNode::Lam { body, .. } = scoped_body.node() else {
+            return Err(unsupported("known callback binding scope"));
+        };
+        let mut result = self.substitution(body, &literal)?;
+        for (name, type_, value, non_dep) in prefix.into_iter().rev() {
+            self.tick()?;
+            result = Expr::let_e(name, type_, value, result, non_dep);
+        }
+        Ok(Some(result))
+    }
+
+    /// A staged literal may remain a value after substitution, for example as
+    /// an argument to a local consumer. Its returned stages are annotated by
+    /// `annotate_callable_tail`, but the outer stage needs its checked type as
+    /// well. Keep an identity let which ordinary local registration consumes;
+    /// known applications can still inspect the literal via `inert_callable`.
+    pub(in crate::runtime) fn retain_staged_callable_type(
+        &mut self,
+        value: Expr,
+        type_: &Expr,
+    ) -> Result<Expr, IngressError> {
+        if !self.staged_callback(&value, type_)? {
+            return Ok(value);
+        }
+        let type_ = self.normalize_type(type_)?;
+        let Some(result @ ValueType::Closure(_)) = self.value_type(&type_)? else {
+            return Ok(value);
+        };
+        self.typed_callable_result(value, type_, result)
+    }
+
+    fn only_callee_uses(&mut self, body: &Expr) -> Result<bool, IngressError> {
+        let mut pending = vec![(body.clone(), 0usize, false)];
+        let mut used = false;
+        while let Some((expr, depth, callee)) = pending.pop() {
+            self.tick()?;
+            match expr.node() {
+                ExprNode::BVar { idx } if usize::try_from(*idx).ok() == Some(depth) => {
+                    if !callee {
+                        return Ok(false);
+                    }
+                    used = true;
+                }
+                ExprNode::App { f, a } => {
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((a.clone(), depth, false));
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((f.clone(), depth, true));
+                }
+                ExprNode::Lam { body, .. } => {
+                    let nested = depth.saturating_add(1);
+                    self.producer_depth(nested)?;
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((body.clone(), nested, false));
+                }
+                ExprNode::LetE { value, body, .. } => {
+                    let nested = depth.saturating_add(1);
+                    self.producer_depth(nested)?;
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((body.clone(), nested, callee));
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((value.clone(), depth, false));
+                }
+                ExprNode::MData { expr, .. } => {
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((expr.clone(), depth, callee));
+                }
+                ExprNode::Proj { expr, .. } => {
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push((expr.clone(), depth, false));
+                }
+                // Binder domains and let annotations are checked source types,
+                // not runtime value occurrences. Their erasure is unchanged.
+                _ => {}
+            }
+        }
+        Ok(used)
+    }
+
     fn staged_callback(&mut self, input: &Expr, type_: &Expr) -> Result<bool, IngressError> {
-        let Some(mut value) = literal_lambda(input) else {
+        let Some(mut value) = self.inert_callable(input)? else {
             return Ok(false);
         };
         let mut type_ = self.normalize_type(type_)?;
@@ -17,7 +330,7 @@ impl Preparation<'_> {
         loop {
             self.tick()?;
             if let ExprNode::MData { expr, .. } = value.node() {
-                value = expr;
+                value = expr.clone();
                 continue;
             }
             let (ExprNode::Lam { body, .. }, ExprNode::ForallE { body: result, .. }) =
@@ -27,7 +340,7 @@ impl Preparation<'_> {
             };
             depth = depth.saturating_add(1);
             self.producer_depth(depth)?;
-            value = body;
+            value = body.clone();
             type_ = result.clone();
         }
     }
@@ -76,7 +389,7 @@ impl Preparation<'_> {
         let mut literal = false;
         for argument in args {
             self.tick()?;
-            if literal_lambda(argument).is_some() {
+            if self.inert_callable(argument)?.is_some() {
                 literal = true;
                 break;
             }
@@ -176,12 +489,13 @@ impl Preparation<'_> {
             }
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
-            if let Some(lambda) = literal_lambda(&argument) {
+            if let Some(lambda) = self.inert_callable(&argument)? {
+                let lambda = self.retain_staged_callable_type(lambda, domain)?;
                 // Captures already name runtime values, not initializer code.
                 // The charged capture-avoiding substitution adjusts both the
                 // removed parameter and all retained strict argument slots.
-                value = self.substitution(body, lambda)?;
-                type_ = self.substitution(result, lambda)?;
+                value = self.substitution(body, &lambda)?;
+                type_ = self.substitution(result, &lambda)?;
             } else {
                 self.producer_depth(bindings.len().saturating_add(1))?;
                 reserve(&mut bindings, self.limits.max_context_depth)?;

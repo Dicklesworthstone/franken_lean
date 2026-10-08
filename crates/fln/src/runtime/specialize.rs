@@ -566,6 +566,11 @@ impl Preparation<'_> {
         if args.is_empty() {
             return Ok(None);
         }
+        if matches!(head.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+            && let Some(literal) = self.inert_callable(head)?
+        {
+            return Ok(Some(application(literal, args.iter().cloned())));
+        }
         // A let in function position must finish its strict initializer before
         // evaluating any application argument. Reassociate without substituting
         // the initializer, preserving sharing and exposing literal lambda tails.
@@ -628,9 +633,13 @@ impl Preparation<'_> {
                 consumed += 1;
                 continue;
             }
-            if matches!(argument.node(), ExprNode::Lam { .. })
-                || self.type_parameter(binder_type)? && closed(argument)
-            {
+            if let Some(literal) = self.inert_callable(argument)? {
+                let literal = self.retain_staged_callable_type(literal, binder_type)?;
+                head = self.substitution(body, &literal)?;
+                consumed += 1;
+                continue;
+            }
+            if self.type_parameter(binder_type)? && closed(argument) {
                 head = self.substitution(body, argument)?;
                 consumed += 1;
                 continue;

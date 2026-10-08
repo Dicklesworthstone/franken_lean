@@ -27,6 +27,8 @@ const EXTERNS: [(&str, &str); 5] = [
 
 #[path = "runtime_st_authority/payloads.rs"]
 mod payloads;
+#[path = "runtime_st_authority/public_api.rs"]
+mod public_api;
 
 fn name(spelling: &str) -> Name {
     Name::from_components(spelling.split('.'))
@@ -700,6 +702,7 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
             drop(imported);
 
             payloads::check_payloads(&engine);
+            public_api::check_public_api(&engine);
 
             for (target, symbol) in EXTERNS {
                 let missing = Engine::from_environment(rebuild_environment(

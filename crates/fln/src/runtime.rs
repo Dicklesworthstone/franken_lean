@@ -623,6 +623,12 @@ impl<'a> Preparation<'a> {
                             body,
                             non_dep: nondep,
                         } => {
+                            if let Some(exposed) =
+                                self.expose_callable_binding(type_, value, body)?
+                            {
+                                tasks.push(Task::Visit(exposed));
+                                continue;
+                            }
                             tasks.push(Task::Let {
                                 name: name.clone(),
                                 type_: self.normalize_type(type_)?,
