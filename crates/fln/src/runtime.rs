@@ -292,7 +292,16 @@ impl<'a> Preparation<'a> {
             safety: fln_env::constants::DefinitionSafety::Safe,
             all: Vec::new(),
         };
-        let Some(mut signature) = self.signature(&definition, false)? else {
+        // Task::Let registers this value after visiting its entire initializer;
+        // every lambda domain and the surrounding let type are normalized.
+        // Derive the interface directly when those exact prepared telescopes
+        // agree. Re-erasing each nested continuation body here would repeat
+        // work whose transformed copy local registration never consumes.
+        let signature = match self.prepared_signature(&definition, false)? {
+            Some(signature) => Some(signature),
+            None => self.signature(&definition, false)?,
+        };
+        let Some(mut signature) = signature else {
             return Ok(value.clone());
         };
         if signature.parameters.is_empty() {

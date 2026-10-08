@@ -52,26 +52,33 @@ impl Operation {
     }
 
     fn argument_types(self) -> Vec<Expr> {
-        let nat = Expr::const_(name("Nat"), vec![]);
         match self {
-            Self::New => vec![nat],
+            Self::New => vec![payload_type()],
             Self::Get => vec![ref_type()],
-            Self::Set | Self::Swap => vec![ref_type(), nat],
+            Self::Set | Self::Swap => vec![ref_type(), payload_type()],
+        }
+    }
+
+    fn capture_types(self, payload: &Expr) -> Vec<Expr> {
+        match self {
+            Self::New => vec![payload.clone()],
+            Self::Get => vec![ref_type()],
+            Self::Set | Self::Swap => vec![ref_type(), payload.clone()],
         }
     }
 
     fn argument_values(self) -> Vec<ValueType> {
         match self {
-            Self::New => vec![ValueType::Nat],
+            Self::New => vec![ValueType::Abi],
             Self::Get => vec![ValueType::Ref],
-            Self::Set | Self::Swap => vec![ValueType::Ref, ValueType::Nat],
+            Self::Set | Self::Swap => vec![ValueType::Ref, ValueType::Abi],
         }
     }
 
     fn raw_result(self) -> (Expr, ValueType) {
         match self {
             Self::New => (ref_type(), ValueType::Ref),
-            Self::Get | Self::Swap => (Expr::const_(name("Nat"), vec![]), ValueType::Nat),
+            Self::Get | Self::Swap => (payload_type(), ValueType::Abi),
             Self::Set => (unit_type(), ValueType::Unit),
         }
     }
@@ -134,7 +141,11 @@ fn world_type() -> Expr {
 }
 
 fn ref_type() -> Expr {
-    Expr::const_(name("_fln_runtime_st_ref_nat"), vec![])
+    Expr::const_(name("_fln_runtime_st_ref"), vec![])
+}
+
+fn payload_type() -> Expr {
+    Expr::const_(name("_fln_runtime_st_payload"), vec![])
 }
 
 fn unit_type() -> Expr {
@@ -231,8 +242,10 @@ impl Preparation<'_> {
     }
 
     /// Called before delta reduction hides Void's opaque carrier projection.
-    /// `arguments` is the type reducer's reversed application spine. Open or
-    /// non-Nat cells remain unsupported; no runtime value enters a type key.
+    /// `arguments` is the type reducer's reversed application spine. A closed
+    /// handle has no ordinary record fields, independently of its payload.
+    /// Primitive selection separately proves the payload's complete runtime
+    /// representation; doing that here would recursively reenter type_head.
     pub(super) fn st_type_head(
         &mut self,
         head: &Expr,
@@ -248,13 +261,18 @@ impl Preparation<'_> {
         if !levels.is_empty() {
             return Ok(None);
         }
-        if head_name == &name("Void") && arguments.len() == 1 && specialize::closed(&arguments[0]) {
+        // The exact Void family makes sigma a phantom type index. Preserve
+        // its uniform world representation even while a checked polymorphic
+        // dictionary still binds sigma: unfolding it first would expose the
+        // opaque NonemptyType field and incorrectly select a generic ABI slot.
+        // This grants no primitive implementation for an open action; those
+        // calls retain their separate ground-argument and extern checks.
+        if head_name == &name("Void") && arguments.len() == 1 {
             return self.st_world();
         }
         if head_name == &name("ST.Ref")
             && arguments.len() == 2
             && arguments.iter().all(specialize::closed)
-            && arguments[0] == Expr::const_(name("Nat"), vec![])
         {
             return self.st_ref();
         }
@@ -435,19 +453,35 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let domains = operation.argument_types();
-        let arity = domains.len();
+        let arity = operation.argument_values().len();
         let saturated = arity + 2;
         if !(args.len() == saturated || args.len() == saturated + 1)
             || !specialize::closed(&args[0])
             || !specialize::closed(&args[1])
-            || self.type_head(&args[1])? != Expr::const_(name("Nat"), vec![])
         {
             return Ok(None);
         }
         if self.st_world()?.is_none() || self.st_ref()?.is_none() {
             return Ok(None);
         }
+        let payload = self.erase_runtime_type(&args[1])?;
+        if !specialize::closed(&payload)
+            || !matches!(
+                self.value_type(&payload)?,
+                Some(ValueType::Nat | ValueType::String | ValueType::Constructor)
+            )
+        {
+            return Ok(None);
+        }
+        // One canonical generated row serves every proved payload layout.
+        // Ingress inserts explicit Box/Unbox operations between this ABI word
+        // and the concrete argument/Out field; no layout or callable is cast.
+        self.st_carrier(
+            payload_type(),
+            ValueType::Abi,
+            CallableResultOwnership::Erased,
+        )?;
+        let domains = operation.capture_types(&payload);
         if operation == Operation::Set {
             self.st_carrier(
                 unit_type(),

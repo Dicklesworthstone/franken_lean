@@ -558,6 +558,21 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let definition = self.normalize_definition_signature(definition)?;
+        self.prepared_signature(&definition, eta_expand)
+    }
+
+    /// Derive metadata from an already prepared lambda and its runtime type.
+    /// The representation and exact binder-spine checks are identical to the
+    /// ordinary signature path. This does not revisit the executable body:
+    /// local closure registration consumes only the resulting interface.
+    pub(super) fn prepared_signature(
+        &mut self,
+        definition: &DefinitionVal,
+        eta_expand: bool,
+    ) -> Result<Option<ExecutableSignature>, IngressError> {
+        if !definition.base.level_params.is_empty() {
+            return Ok(None);
+        }
         let mut type_ = &definition.base.type_;
         loop {
             self.tick()?;
@@ -603,7 +618,7 @@ impl Preparation<'_> {
             self.value_type(result_type)?;
         }
         executable_signature(
-            &definition,
+            definition,
             &self.value_types,
             &mut self.visited,
             self.limits,

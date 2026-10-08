@@ -9676,19 +9676,20 @@ fn executable_lambda(
     let Declaration::Defn(definition) = declaration else {
         return Ok(None);
     };
-    let Some(mut signature) = preparation.signature(definition, false)? else {
-        return Ok(None);
-    };
-    if signature.parameters.is_empty() {
-        return Ok(None);
-    }
     // Catalog eta can give a Const/App alias a first-order signature. Only a
     // real lambda spine is a publishable local closure; executing `copy` as a
-    // zero-argument program is an arity error.
+    // zero-argument program is an arity error. Exclude that shape before
+    // preparing a signature whose normalized body would be discarded.
     if !matches!(
         definition.value.node(),
         fln_core::expr::ExprNode::Lam { .. }
     ) {
+        return Ok(None);
+    }
+    let Some(mut signature) = preparation.signature(definition, false)? else {
+        return Ok(None);
+    };
+    if signature.parameters.is_empty() {
         return Ok(None);
     }
     preparation.refine_local_result(&mut signature, prepared)?;

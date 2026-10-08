@@ -36,8 +36,9 @@ pub(crate) fn st_world_contract_matches(
     matches(environment, model::world(), visited, limits)
 }
 
-/// The initial reference representation stores a checked ground Nat value.
-/// Other cell element types remain the runtime adapter's explicit refusal.
+/// The exact polymorphic reference representation. Keep the admitted Nat core
+/// contract as well; payloads and their nested fields may use native Nats.
+/// Runtime preparation separately proves each closed payload representation.
 pub(crate) fn st_ref_contract_matches(
     environment: &Environment,
     visited: &mut usize,

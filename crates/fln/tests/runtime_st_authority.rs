@@ -25,6 +25,9 @@ const EXTERNS: [(&str, &str); 5] = [
     ("ST.Prim.Ref.swap", "lean_st_ref_swap"),
 ];
 
+#[path = "runtime_st_authority/payloads.rs"]
+mod payloads;
+
 fn name(spelling: &str) -> Name {
     Name::from_components(spelling.split('.'))
 }
@@ -695,6 +698,8 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
             assert_eq!(imported.engine.logical_root(&options), root);
             let engine = imported.engine.clone();
             drop(imported);
+
+            payloads::check_payloads(&engine);
 
             for (target, symbol) in EXTERNS {
                 let missing = Engine::from_environment(rebuild_environment(

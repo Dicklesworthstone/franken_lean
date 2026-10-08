@@ -323,6 +323,88 @@ fn exact_runners_do_not_inline_over_explicit_extern_metadata() {
 }
 
 #[test]
+fn open_state_index_keeps_the_exact_world_carrier_before_specialization() {
+    let with_bool = |mut env: Environment| {
+        let Declaration::Inductive(block) = fln_elab::seed::bool_seed_declaration() else {
+            unreachable!("fixed Boolean family")
+        };
+        for info in block
+            .types
+            .into_iter()
+            .map(ConstantInfo::Induct)
+            .chain(block.ctors.into_iter().map(ConstantInfo::Ctor))
+            .chain(block.recursors.into_iter().map(ConstantInfo::Rec))
+        {
+            env = env.add_decl(info).unwrap();
+        }
+        env
+    };
+    let constant = |label| Expr::const_(name(label), vec![]);
+    let open = Expr::app(constant("Void"), Expr::bvar(0).unwrap());
+    let closed = Expr::app(constant("Void"), constant("Unit"));
+    let environment = with_bool(bare(|_| {}));
+    let mut preparation = runtime::Preparation::new(&environment, IngressLimits::default());
+    let world = preparation.normalize_type(&closed).unwrap();
+    assert_eq!(world, constant("_fln_runtime_st_world"));
+    assert_eq!(preparation.normalize_type(&open).unwrap(), world);
+    // A later type substitution cannot change the selected callback domain.
+    let callback = Expr::forall_e(
+        name("sigma"),
+        Expr::sort(Level::one()),
+        Expr::forall_e(name("state"), open, constant("Nat"), BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let expected = Expr::forall_e(
+        name("sigma"),
+        Expr::sort(Level::one()),
+        Expr::forall_e(
+            name("state"),
+            world.clone(),
+            constant("Nat"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    assert_eq!(preparation.normalize_type(&callback).unwrap(), expected);
+
+    let changed = with_bool(bare(|info| {
+        if let ConstantInfo::Defn(definition) = info
+            && definition.base.name == name("Void")
+        {
+            definition.value = Expr::lam(
+                name("sigma"),
+                Expr::sort(Level::one()),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            );
+        }
+    }));
+    let open = Expr::app(constant("Void"), Expr::bvar(0).unwrap());
+    assert_ne!(
+        runtime::Preparation::new(&changed, IngressLimits::default())
+            .normalize_type(&open)
+            .unwrap(),
+        world
+    );
+    let collision = environment
+        .add_decl(ConstantInfo::Axiom(fln_env::constants::AxiomVal {
+            base: ConstantVal {
+                name: name("_fln_runtime_st_world"),
+                level_params: vec![],
+                type_: Expr::sort(Level::one()),
+            },
+            is_unsafe: false,
+        }))
+        .unwrap();
+    assert!(matches!(
+        runtime::Preparation::new(&collision, IngressLimits::default()).normalize_type(&open),
+        Err(IngressError::UnsupportedNode {
+            kind: "ST runtime carrier name collision"
+        })
+    ));
+}
+
+#[test]
 fn exact_st_models_match_actual_pinned_artifacts() {
     let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from) else {
         assert!(
