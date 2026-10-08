@@ -110,6 +110,15 @@ impl Preparation<'_> {
         if !matches!(remaining.node(), ExprNode::ForallE { .. }) {
             return Ok(None);
         }
+        // This staged producer's constant disappears when its body is copied.
+        // Preserve the selected extern policy before bypassing catalog discovery.
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
         definition.base.type_ = self.universe_instance(
             &definition.base.type_,
             &definition.base.level_params,

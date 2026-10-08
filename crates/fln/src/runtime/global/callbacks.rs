@@ -120,6 +120,15 @@ impl Preparation<'_> {
         if !selected {
             return Ok(None);
         }
+        // Inlining removes this constant before executable catalog discovery.
+        // Its selected extern policy must still be checked before using the body.
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
         let definition = self.normalize_definition_signature(&definition)?;
         self.inline_callback_arguments(definition, args)
     }
