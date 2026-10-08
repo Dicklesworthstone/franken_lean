@@ -9436,8 +9436,14 @@ fn executable_intrinsic_binding_cached(
         externs,
         visited_nodes,
         limits,
+    )? || source_intrinsics::imported_string_length_matches(
+        environment,
+        name,
+        externs,
+        visited_nodes,
+        limits,
     )? {
-        // Opaque string models already require their explicit imported extern.
+        // Imported string models already require their explicit extern contracts.
         return Ok(generated_source_intrinsic_binding(name));
     } else {
         source_intrinsics::imported_nat_matches(environment, name, visited_nodes, limits)?

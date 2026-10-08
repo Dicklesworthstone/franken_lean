@@ -135,7 +135,12 @@ fn opaque(label: &str) -> OpaqueVal {
     }
 }
 
-fn record_contract(label: &str, constructor: &str, fields: u32, type_: Expr) -> [ConstantInfo; 2] {
+pub(super) fn record_contract(
+    label: &str,
+    constructor: &str,
+    fields: u32,
+    type_: Expr,
+) -> [ConstantInfo; 2] {
     [
         ConstantInfo::Induct(InductiveVal {
             base: base(label, vec![], Expr::sort(Level::one())),
@@ -159,7 +164,7 @@ fn record_contract(label: &str, constructor: &str, fields: u32, type_: Expr) -> 
     ]
 }
 
-fn scalar_records() -> Vec<ConstantInfo> {
+pub(super) fn scalar_records() -> Vec<ConstantInfo> {
     let string = record_contract(
         "String",
         "String.ofByteArray",

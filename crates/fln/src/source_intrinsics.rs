@@ -10,7 +10,9 @@ use super::*;
 use std::collections::HashSet;
 pub(super) mod st;
 mod string_internal;
+mod string_length;
 pub(super) use string_internal::imported_string_internal_matches;
+pub(super) use string_length::imported_string_length_matches;
 
 /// A present extern attribute is a separate execution contract. A complete
 /// logical model may justify a native optimization without one, but it must
