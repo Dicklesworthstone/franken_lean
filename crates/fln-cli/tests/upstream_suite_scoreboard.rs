@@ -455,12 +455,21 @@ fn score(
             continue;
         };
         if live_pin.exit != row.exit {
+            // What the pin said is the evidence a reader needs to tell a pin change from a
+            // host condition, so its first stderr line and last stdout line travel with it.
+            let said = |text: &str, last: bool| {
+                let line = if last { text.lines().last() } else { text.lines().next() };
+                line.unwrap_or_default().chars().take(300).collect::<String>()
+            };
             report.problems.push(format!(
                 "{}: the pinned Reference no longer reproduces its oracle row (exit {} digest \
-                 {:016x}); re-record the oracle only for a pin change",
+                 {:016x}); re-record the oracle only for a pin change. Pin stderr: {:?}; last \
+                 stdout line: {:?}",
                 row.file,
                 exit_field(live_pin.exit),
-                digest(&live_pin.stdout)
+                digest(&live_pin.stdout),
+                said(&live_pin.stderr, false),
+                said(&live_pin.stdout, true)
             ));
         } else if !row.volatile && digest(&live_pin.stdout) != row.digest {
             report.host_dependent.push(row.file.clone());
