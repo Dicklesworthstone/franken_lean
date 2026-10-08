@@ -10989,7 +10989,7 @@ impl fmt::Display for EngineExecutionError {
             Self::UnexpectedPublication { detail } => {
                 write!(formatter, "unexpected publication result: {detail}")
             }
-            Self::Ingress(error) => write!(formatter, "compiler ingress refused term: {error:?}"),
+            Self::Ingress(error) => write!(formatter, "compiler ingress refused term: {error}"),
             Self::Lowering(error) => write!(formatter, "FIR lowering refused term: {error}"),
             Self::Codec(error) => write!(formatter, "FLBC codec refused artifact: {error:?}"),
         }

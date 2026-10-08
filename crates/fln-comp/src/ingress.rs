@@ -145,7 +145,10 @@ pub enum IngressError {
     UnsupportedNode {
         kind: &'static str,
     },
+    /// A constant no runtime catalog binds. The name is carried so a refusal says which
+    /// constant it is; `name_hash` is its observable `Name.hash`.
     UnknownConstant {
+        name: Name,
         name_hash: u64,
     },
     CheckSystemUniverseArity {
@@ -291,7 +294,10 @@ pub enum IngressError {
         first: usize,
         second: usize,
     },
+    /// No catalog binds this structure's field. `structure` is carried so a refusal says
+    /// which; `name_hash` is its observable `Name.hash`.
     UnknownProjection {
+        structure: Name,
         name_hash: u64,
         field: u64,
     },
@@ -484,9 +490,10 @@ impl fmt::Display for IngressError {
                     "core Expr node {kind} is outside the executable subset"
                 )
             }
-            Self::UnknownConstant { name_hash } => write!(
+            Self::UnknownConstant { name, name_hash } => write!(
                 formatter,
-                "core Expr constant with observable name hash {name_hash} is not in the runtime catalogs"
+                "core Expr constant `{}` (observable name hash {name_hash}) is not in the runtime catalogs",
+                name.to_display_string()
             ),
             Self::CheckSystemUniverseArity {
                 name_hash,
@@ -703,9 +710,14 @@ impl fmt::Display for IngressError {
                 formatter,
                 "constructor catalog bindings {first} and {second} duplicate projection structure name hash {name_hash}"
             ),
-            Self::UnknownProjection { name_hash, field } => write!(
+            Self::UnknownProjection {
+                structure,
+                name_hash,
+                field,
+            } => write!(
                 formatter,
-                "structure projection with observable name hash {name_hash} and field {field} is absent"
+                "structure projection `{}` field {field} (observable name hash {name_hash}) is absent",
+                structure.to_display_string()
             ),
             Self::ProjectionOperandType {
                 name_hash,
@@ -2811,7 +2823,10 @@ fn resolve_call<'a>(
             arguments,
         });
     }
-    Err(IngressError::UnknownConstant { name_hash })
+    Err(IngressError::UnknownConstant {
+        name: name.clone(),
+        name_hash,
+    })
 }
 
 fn malformed(phase: &'static str, expected: usize, observed: usize) -> IngressError {
@@ -3983,12 +3998,14 @@ fn lower_body<'a>(
                         idx,
                         expr,
                     } => {
-                        let projection = catalog.resolve_projection(struct_name, *idx).ok_or(
-                            IngressError::UnknownProjection {
-                                name_hash: struct_name.hash(),
-                                field: *idx,
-                            },
-                        )?;
+                        let projection =
+                            catalog
+                                .resolve_projection(struct_name, *idx)
+                                .ok_or_else(|| IngressError::UnknownProjection {
+                                    structure: struct_name.clone(),
+                                    name_hash: struct_name.hash(),
+                                    field: *idx,
+                                })?;
                         work.projection_calls = work.projection_calls.saturating_add(1);
                         try_push(
                             &mut tasks,
@@ -5058,7 +5075,10 @@ mod tests {
         let metadata = IngressError::MetadataResourceExhausted {
             kind: "extern attribute journal capacity",
         };
-        let shape = IngressError::UnknownConstant { name_hash: 0 };
+        let shape = IngressError::UnknownConstant {
+            name: Name::anonymous(),
+            name_hash: 0,
+        };
         assert!(direct.is_resource_exhaustion());
         assert!(nested.is_resource_exhaustion());
         assert!(metadata.is_resource_exhaustion());
@@ -5463,7 +5483,10 @@ mod tests {
                 &Expr::const_(Name::anonymous(), Vec::new()),
                 IngressLimits::default()
             ),
-            Err(IngressError::UnknownConstant { name_hash: 1723 })
+            Err(IngressError::UnknownConstant {
+                name: Name::anonymous(),
+                name_hash: 1723,
+            })
         );
         assert_eq!(
             lower_closed_expr(&Expr::app(nat(0), nat(1)), IngressLimits::default()),
@@ -5702,6 +5725,7 @@ mod tests {
         assert_eq!(
             lower_closed_expr(&projection, IngressLimits::default()),
             Err(IngressError::UnknownProjection {
+                structure: Name::anonymous(),
                 name_hash: Name::anonymous().hash(),
                 field: 0,
             })
@@ -5950,8 +5974,18 @@ mod tests {
         let source = Expr::const_(name.clone(), Vec::new());
         assert!(matches!(
             lower_closed_expr(&source, IngressLimits::default()),
-            Err(IngressError::UnknownConstant { name_hash }) if name_hash == name.hash()
+            Err(IngressError::UnknownConstant { name: unknown, name_hash })
+                if name_hash == name.hash() && unknown == name
         ));
+        // The refusal names the constant, so a reader can tell which one is missing.
+        let refused = lower_closed_expr(&source, IngressLimits::default())
+            .expect_err("Bool.true is in no catalog here");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("core Expr constant `Bool.true` ("),
+            "{refused}"
+        );
 
         let binding = scalar_bool_constructor(&["Bool", "true"], true);
         let applied = Expr::app(source.clone(), nat(0));
@@ -6368,9 +6402,25 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownProjection {
+                structure: unknown_name.clone(),
                 name_hash: unknown_name.hash(),
                 field: 0,
             })
+        );
+        assert_eq!(
+            lower_closed_expr_with_catalogs(
+                &Expr::proj(unknown_name.clone(), 0, nat(0)),
+                &[],
+                std::slice::from_ref(&pair),
+                &[],
+                IngressLimits::default(),
+            )
+            .map_err(|error| error.to_string()),
+            Err(
+                "structure projection `User.Missing` field 0 (observable name hash ".to_owned()
+                    + &unknown_name.hash().to_string()
+                    + ") is absent"
+            )
         );
         assert_eq!(
             lower_closed_expr_with_catalogs(
@@ -6381,6 +6431,7 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownProjection {
+                structure: Name::from_components(["User", "Pair"]),
                 name_hash: projection_name_hash,
                 field: 2,
             })
@@ -8440,6 +8491,7 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownConstant {
+                name: unknown_name.clone(),
                 name_hash: unknown_name.hash(),
             })
         );
