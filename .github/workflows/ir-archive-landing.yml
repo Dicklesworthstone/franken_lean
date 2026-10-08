@@ -7,12 +7,15 @@ on:
       - 'crates/fln-hash/src/ir_graph.rs'
       - 'crates/fln-olean/src/ir_archive.rs'
       - 'scripts/register_ir_graph_codec.py'
+      - 'scripts/register_ir_graph_cli.py'
+      - '.github/patches/ir-graph-cli/**'
       - '.github/workflows/ir-archive-landing.yml'
 permissions:
   contents: write
 concurrency:
   group: ir-archive-activation
-  cancel-in-progress: false
+  # Superseded candidates cannot block the complete codec+command candidate.
+  cancel-in-progress: true
 jobs:
   activate:
     runs-on: ubuntu-24.04
@@ -22,7 +25,6 @@ jobs:
         with:
           fetch-depth: 0
       - name: Register the codec without rewriting historical evidence
-        id: registry
         shell: bash
         run: |
           set -euo pipefail
@@ -31,12 +33,12 @@ jobs:
           rustup show active-toolchain
           mkdir -p "$RUNNER_TEMP/ir-archive-evidence"
           python3 -I scripts/register_ir_graph_codec.py | tee "$RUNNER_TEMP/ir-archive-evidence/registration.log"
-          if tail -n 1 "$RUNNER_TEMP/ir-archive-evidence/registration.log" | grep -qx registered; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Format only the codec and registration edits
+      - name: Install the exact command sources and executable tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/register_ir_graph_cli.py | tee "$RUNNER_TEMP/ir-archive-evidence/command-install.log"
+      - name: Format only the codec and command edits
         shell: bash
         run: |
           set -euo pipefail
@@ -44,8 +46,12 @@ jobs:
             crates/fln-hash/src/ir_graph.rs crates/fln-hash/src/canon.rs \
             crates/fln-hash/src/domain.rs crates/fln-hash/src/lib.rs \
             crates/fln-hash/tests/domain_enforcement.rs \
-            crates/fln-olean/src/ir_archive.rs crates/fln-olean/src/lib.rs
-      - name: Run both complete package suites
+            crates/fln-olean/src/ir_archive.rs crates/fln-olean/src/lib.rs \
+            crates/fln-olean/src/bin/fln-ir-check.rs \
+            crates/fln-olean/src/bin/fln-ir-graph.rs \
+            crates/fln-olean/src/bin/ir_support/mod.rs \
+            crates/fln-olean/tests/ir_archive_cli.rs
+      - name: Run both complete package suites including real command tests
         shell: bash
         run: |
           set -euo pipefail
@@ -60,8 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/ir-archive-evidence/workspace-check.log"
-      - name: Publish only the tested registration and formatted source
-        if: steps.registry.outputs.changed == 'true'
+      - name: Publish only the tested registration and command sources
         shell: bash
         run: |
           set -euo pipefail
@@ -73,16 +78,25 @@ jobs:
               'crates/fln-hash/tests/domain_enforcement.rs',
               'crates/fln-hash/fixtures/ir_domain_vectors.txt',
               'crates/fln-olean/src/lib.rs', 'crates/fln-olean/src/ir_archive.rs',
+              'crates/fln-olean/src/bin/fln-ir-check.rs',
+              'crates/fln-olean/src/bin/fln-ir-graph.rs',
+              'crates/fln-olean/src/bin/ir_support/mod.rs',
+              'crates/fln-olean/tests/ir_archive_cli.rs',
           }
           changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
           untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
-          if not changed or (changed | untracked) - allowed:
+          if (changed | untracked) - allowed:
               raise SystemExit(f'unexpected publication set: {changed | untracked}')
-          subprocess.run(['git', 'add', '--', *sorted(allowed)], check=True)
+          if changed or untracked:
+              subprocess.run(['git', 'add', '--', *sorted(changed | untracked)], check=True)
           PY
+          if git diff --cached --quiet; then
+            echo 'No uncommitted registration or command changes; tests verified existing source.'
+            exit 0
+          fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'feat(olean): activate the tested canonical IR graph codec and census adapter' \
-            -m 'Both hash/codec package suites, package Clippy, and workspace compilation completed in this workflow. New hash domains are frozen separately; historical vectors and host attestations are unchanged. Snapshot decoding confers no execution or kernel authority.'
+            commit -m 'feat(olean): activate tested reusable IR graph archives and file-only queries' \
+            -m 'Both hash/codec package suites, package Clippy, and workspace compilation completed in this workflow. New hash domains are frozen separately; historical vectors and host attestations are unchanged. Archives and query results remain analysis data, not execution or kernel authority.'
           git rev-parse HEAD | tee "$RUNNER_TEMP/ir-archive-evidence/tested-commit.txt"
           # No force/rebase: a concurrent advance must be reconciled and re-tested.
           git push origin HEAD:main
