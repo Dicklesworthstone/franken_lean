@@ -55,8 +55,8 @@ fn abstract_monads_use_local_dictionary_parameters() {
 def map {M : Type -> Type} [Pure M] [Bind M] {A B : Type} (f : A -> B) (action : M A) : M B := do
   let x ← action
   return (f x)
-def seq {M : Type -> Type} [Bind M] {A B : Type} (x : M A) (y : M B) : M B := do
-  x
+def seq {M : Type -> Type} [Pure M] [Bind M] {A B : Type} (x : M A) (y : M B) : M B := do
+  let ignored ← x
   y
 "#,
     );
@@ -143,6 +143,39 @@ theorem succeeded : success = Maybe.some 42 := by rfl
 }
 
 #[test]
+fn discarded_polymorphic_actions_receive_the_unit_result_type() {
+    let base = checked(
+        &engine(),
+        r#"
+inductive Maybe (A : Type) where
+  | none
+  | some (value : A)
+def maybeBind {A B : Type} (action : Maybe A) (next : A -> Maybe B) : Maybe B :=
+  match action with
+  | .none => Maybe.none
+  | .some value => next value
+instance maybePure : Pure Maybe := { pure := fun value => Maybe.some value }
+instance maybeBinder : Bind Maybe := { bind := fun action next => maybeBind action next }
+"#,
+    );
+    // The only difference is the ignored action's explicit element type.
+    // Ordinary statement sequencing must supply that same unit constraint.
+    checked(
+        &base,
+        "def annotated : Maybe Nat := do\n  (Maybe.none : Maybe PUnit)\n  return 42",
+    );
+    checked(
+        &base,
+        r#"
+def discarded : Maybe Nat := do
+  Maybe.none
+  return 42
+theorem discardedValue : discarded = Maybe.none := by rfl
+"#,
+    );
+}
+
+#[test]
 fn invalid_actions_missing_dictionaries_and_scope_escapes_preserve_the_engine() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
@@ -155,6 +188,8 @@ fn invalid_actions_missing_dictionaries_and_scope_escapes_preserve_the_engine() 
         "def bad : Id Nat := do let n ← (do let hidden := 7; return hidden); return hidden",
         "def bad (P : Prop) : Id Nat := do let unused : P := 0; return 7",
         "def bad : Id Nat := do return 7; return 8",
+        "def bad : Id Nat := do (7 : Id Nat); return 8",
+        "def bad : Id Nat := do _; return 8",
     ] {
         assert!(
             base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())

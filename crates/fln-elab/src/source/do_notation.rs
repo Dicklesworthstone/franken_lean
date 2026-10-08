@@ -398,12 +398,11 @@ impl Context {
             let action = parts.pop().expect("action");
             return Ok(if let Some(body) = result {
                 let name = self.do_control_name()?;
-                let annotation = if scope.require_unit {
-                    unit_annotation()
-                } else {
-                    null(vec![])
-                };
-                call(true, vec![action, lambda(name, annotation, body)?])
+                // The pin requires a unit result for every bare nonterminal
+                // statement, including an otherwise polymorphic throw. This
+                // typed continuation constrains only the discarded result;
+                // named binds and terminal actions retain their inferred types.
+                call(true, vec![action, lambda(name, unit_annotation(), body)?])
             } else {
                 action
             });

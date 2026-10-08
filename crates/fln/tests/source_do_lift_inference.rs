@@ -44,9 +44,25 @@ def lifted {M N : Type -> Type} [Pure N] [Bind N] [MonadLiftT M N] {A : Type} (a
   let x ← action
   return x
 def discard {M N : Type -> Type} [Pure N] [Bind N] [MonadLiftT M N] (action : M Nat) : N Nat := do
-  action
+  let ignored ← action
   return 7
 "#,
+    );
+}
+
+#[test]
+fn discarded_actions_require_unit_even_when_an_implicit_lift_exists() {
+    let base = checked(&seed(), CLASSES);
+    let root = base.logical_root(&KVMap::new());
+    let invalid = "def bad {M N : Type -> Type} [Pure N] [Bind N] [MonadLiftT M N] (action : M Nat) : N Nat := do\n  action\n  return 7";
+    assert!(
+        base.check_source_files(&[invalid.as_bytes()], &KVMap::new(), limits())
+            .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    checked(
+        &base,
+        "def discarded {M N : Type -> Type} [Pure N] [Bind N] [MonadLiftT M N] (action : M PUnit) : N Nat := do\n  action\n  return 7",
     );
 }
 

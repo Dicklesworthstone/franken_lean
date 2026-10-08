@@ -1,7 +1,7 @@
-//! Public ST source syntax over the already admitted artifact closure.
+//! Public ST/EST source syntax over the already admitted artifact closure.
 use super::*;
 
-pub(super) const PROGRAMS: [(&str, &str); 2] = [
+pub(super) const PROGRAMS: [(&str, &str); 3] = [
     (
         "qualified reference operations",
         r#"
@@ -30,6 +30,29 @@ import Init.System.ST
   let previous ← alias.swap 22
   let current ← reference.get
   return Nat.add previous current)
+"#,
+    ),
+    (
+        "lifted state and caught exceptions",
+        r#"
+prelude
+import Init.System.ST
+
+def stateResult (result : Except Nat Nat) : Nat :=
+  match result with
+  | .ok value => value
+  | .error code => Nat.add 1000 code
+
+#eval stateResult (runEST (fun sigma => do
+  let reference ← ST.mkRef (σ := sigma) (0 : Nat)
+  try
+    reference.set 37
+    throw (5 : Nat)
+    reference.set 99
+    return 0
+  catch code =>
+    let current ← reference.get
+    return Nat.add current code))
 "#,
     ),
 ];
