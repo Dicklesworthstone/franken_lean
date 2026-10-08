@@ -88,6 +88,9 @@ pub enum NatDefinitionExpectation {
     NaturalValue,
     ScalarValue,
     EndOfCommand,
+    /// A declaration's doc comment that links into the reference manual (`lean-manual://`):
+    /// the pin validates those links (`validateDocComment`) and this grammar does not.
+    DocCommentWithoutManualLinks,
 }
 
 /// Why the bounded source command parser refused.

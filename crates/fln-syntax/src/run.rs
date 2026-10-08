@@ -204,8 +204,7 @@ fn lex_from_bounded(
                 // the whole comment is one token, named by its opener, and its extent
                 // covers everything the scan read, as every unbounded construct's does.
                 if opens_doc_comment(text, stop) {
-                    let (event, next) = doc_comment_event(text, stop);
-                    events.push(event);
+                    let next = push_doc_comment(text, stop, &mut events);
                     if over(&events) {
                         return (events, true);
                     }
@@ -274,27 +273,26 @@ fn lex_from_bounded(
     (events, false)
 }
 
-/// The event for the doc comment opening at `stop`, and where the driver resumes. Out of line
-/// so its temporaries never enlarge the driver's frame: parsers run it on small host stacks.
+/// Push the event for the doc comment opening at `stop`, returning where the driver resumes.
+/// Out of line, and the event is built here rather than returned, so nothing of it occupies the
+/// driver's frame: parsers run the driver on small host stacks.
 #[inline(never)]
-fn doc_comment_event(text: &SourceText, stop: BytePos) -> (Event, BytePos) {
+fn push_doc_comment(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -> BytePos {
     match scan_doc_comment(text, stop) {
-        Ok(next) => (
-            Event::Token(LexedToken {
+        Ok(next) => {
+            events.push(Event::Token(LexedToken {
                 kind: TokenKind::Symbol(text.as_str()[stop.0..stop.0 + 3].to_owned()),
                 extent: span(stop, next),
-            }),
-            next,
-        ),
+            }));
+            next
+        }
         Err(error) => {
             let resume = crate::recover::resume_after_trivia_error(text, error);
-            (
-                Event::Refused {
-                    error: RunError::Trivia(error),
-                    skipped: span(stop, resume),
-                },
-                resume,
-            )
+            events.push(Event::Refused {
+                error: RunError::Trivia(error),
+                skipped: span(stop, resume),
+            });
+            resume
         }
     }
 }

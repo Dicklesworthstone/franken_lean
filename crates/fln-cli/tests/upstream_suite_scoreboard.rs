@@ -27,7 +27,10 @@
 //! as host-dependent, not failed: some files print the host itself (`elab/async_systems_info`
 //! prints `constrainedMemory`, the launching cgroup's limit), which no same-host volatility
 //! measurement can catch. "Identical output" is therefore judged against the live pin's
-//! stdout from the same run, never against the recorded digest.
+//! stdout from the same run, never against the recorded digest. A live pin exit code the oracle
+//! does not record is re-run once, alone; when the retry reproduces the oracle it is reported as
+//! a host-dependent exit (`elab/async_systems_info` loses a race with the host's renicing daemon),
+//! and when it does not, it is verdict drift and fails.
 //!
 //! It never fails on a low score. A file with no verdict within `FILE_TIMEOUT` is `timeout`,
 //! which is never acceptance (FL-INV-07). Each file runs from a temporary copy of its
@@ -406,6 +409,30 @@ struct Report {
     per_stratum: BTreeMap<String, (usize, usize)>,
     /// First-refusal classes over pin-accepted files FrankenLean does not accept.
     histogram: BTreeMap<String, usize>,
+}
+
+/// Re-run, once and alone, every file whose live pin exit code is not the oracle's, keeping the
+/// second result. Returns the files whose retry reproduced the oracle: their verdict depends on
+/// the host under load, not on the pin. `elab/async_systems_info` sets its own and its parent's
+/// scheduling priority to 3 and asserts it took, which fails whenever a host daemon (here
+/// `ananicy-cpp`, which renices `lean` to 15) got there first. A drift the retry repeats stays in
+/// `pin` and fails `score` as before.
+fn retry_drifted(
+    oracle: &[OracleRow],
+    pin: &mut BTreeMap<String, Run>,
+    mut rerun: impl FnMut(&str) -> Run,
+) -> Vec<String> {
+    let mut reproduced = Vec::new();
+    for row in oracle {
+        if pin.get(&row.file).is_some_and(|live| live.exit != row.exit) {
+            let again = rerun(&row.file);
+            if again.exit == row.exit {
+                reproduced.push(row.file.clone());
+            }
+            pin.insert(row.file.clone(), again);
+        }
+    }
+    reproduced
 }
 
 /// Score one run against the oracle and the ledger. `pin` is the live pin result per file
@@ -862,7 +889,20 @@ fn upstream_suite_scoreboard_measures_the_drop_in_against_the_pin() {
     };
     let frankenlean = PathBuf::from(env!("CARGO_BIN_EXE_lean"));
     let copy = copy_suite(&root.join(SUITE));
-    let pin = run_all(&reference, &copy, &files, WORKERS);
+    let mut pin = run_all(&reference, &copy, &files, WORKERS);
+    let reuse = copy.join("fln-import-reuse");
+    let host_dependent_exits = retry_drifted(&oracle, &mut pin, |file| {
+        let (directory, name) = file.split_once('/').expect("dir/file");
+        run(&reference, &copy.join(directory), name, &reuse)
+    });
+    eprintln!(
+        "upstream_suite_scoreboard: pin exits that drifted under load and reproduced the oracle alone: {}",
+        if host_dependent_exits.is_empty() {
+            "none".to_owned()
+        } else {
+            host_dependent_exits.join(" ")
+        }
+    );
     let subject = run_subject(&frankenlean, &copy, &files, &oracle);
     // The copy is this run's own scratch tree, created above; nothing else is removed.
     let _ = std::fs::remove_dir_all(&copy);
@@ -1076,6 +1116,42 @@ fn a_planted_regression_of_an_identical_row_fails_the_ratchet() {
     let subject = BTreeMap::from([("elab/ok.lean".to_owned(), ran(Some(0), "other\n", ""))]);
     let report = score(std::slice::from_ref(&volatile), &ledger, &pin, &subject);
     assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+#[test]
+fn a_drifted_pin_exit_is_retried_once_and_only_a_reproduced_one_is_forgiven() {
+    let rows = vec![
+        oracle_row("elab/flaky.lean", 0, ""),
+        oracle_row("elab/moved.lean", 0, ""),
+        oracle_row("elab/steady.lean", 0, ""),
+    ];
+    let mut pin = BTreeMap::from([
+        ("elab/flaky.lean".to_owned(), ran(Some(1), "", "")),
+        ("elab/moved.lean".to_owned(), ran(Some(1), "", "")),
+        ("elab/steady.lean".to_owned(), ran(Some(0), "", "")),
+    ]);
+    let mut reruns = Vec::new();
+    let reproduced = retry_drifted(&rows, &mut pin, |file| {
+        reruns.push(file.to_owned());
+        ran(Some(if file == "elab/flaky.lean" { 0 } else { 1 }), "", "")
+    });
+    assert_eq!(
+        reruns,
+        ["elab/flaky.lean", "elab/moved.lean"],
+        "only drifted files rerun"
+    );
+    assert_eq!(reproduced, ["elab/flaky.lean"]);
+    let ledger: Vec<_> = rows
+        .iter()
+        .map(|row| ledger_row(&row.file, Some(1), "n/a"))
+        .collect();
+    let subject: BTreeMap<_, _> = rows
+        .iter()
+        .map(|row| (row.file.clone(), ran(Some(1), "", "")))
+        .collect();
+    let report = score(&rows, &ledger, &pin, &subject);
+    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+    assert!(report.problems[0].starts_with("elab/moved.lean: the pinned Reference no longer"));
 }
 
 #[test]

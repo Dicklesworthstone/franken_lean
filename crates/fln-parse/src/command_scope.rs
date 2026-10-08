@@ -82,6 +82,59 @@ fn doc_comment(token: &LexedToken) -> bool {
     matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--" || symbol == "/-!")
 }
 
+/// A declaration's doc comment the pin would validate: it attaches the docstring through
+/// `addMarkdownDocString`, whose `validateDocComment` checks every `lean-manual://` link and
+/// reports a malformed one as an error. That validation is not implemented, so such a doc
+/// comment is refused rather than accepted. A module doc (`/-!`) is stored unvalidated. Out of
+/// line so its temporaries stay out of `partition`'s frame (parsers run on small host stacks).
+#[inline(never)]
+fn unvalidated_manual_link(
+    view: &SourceView,
+    token: &LexedToken,
+) -> Option<NatDefinitionParseError> {
+    let TokenKind::Symbol(symbol) = &token.kind else {
+        return None;
+    };
+    let text = view
+        .normalized()
+        .as_str()
+        .get(token.extent.start().0..token.extent.end().0)?;
+    (symbol == "/--" && text.contains("lean-manual://")).then(|| {
+        NatDefinitionParseError::OutsideSeedGrammar {
+            at: view.to_original(token.extent.start()),
+            expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
+        }
+    })
+}
+
+/// The doc comment at `tokens[index]` as a command of its own: a declaration's must not need
+/// manual-link validation and must be followed by what can carry it, as at the pin, which
+/// refuses `/-- d -/ #eval e` at the `#eval` and a doc at end of input. Out of line, with the
+/// refusals built here, so they occupy nothing of `partition`'s frame.
+#[inline(never)]
+fn doc_comment_is_carried(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    index: usize,
+    source_len: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let token = &tokens[index];
+    if let Some(refusal) = unvalidated_manual_link(view, token) {
+        return Err(refusal);
+    }
+    if matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--")
+        && !tokens.get(index + 1).is_some_and(carries_doc_comment)
+    {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: tokens.get(index + 1).map_or(BytePos(source_len), |next| {
+                view.to_original(next.extent.start())
+            }),
+            expected: NatDefinitionExpectation::DefinitionKeyword,
+        });
+    }
+    Ok(())
+}
+
 /// Whether `token` can follow a declaration's doc comment: the declaration keywords and the
 /// rest of `declModifiers` (attributes, then the modifiers), whose first slot the doc fills.
 fn carries_doc_comment(token: &LexedToken) -> bool {
@@ -122,6 +175,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     // A module doc, or a declaration's doc comment that `partition` split off after checking
     // what follows it, changes no environment and prints nothing.
     if tokens.len() == 1 && doc_comment(first) {
+        if let Some(refusal) = unvalidated_manual_link(&view, first) {
+            return Err(refusal);
+        }
         return Ok(Some(ScopeCommand::Trivia));
     }
     let TokenKind::Symbol(keyword) = &first.kind else {
@@ -249,14 +305,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // declaration's (`declModifiers`' first slot) only before what can carry it, as
             // at the pin, which refuses `/-- d -/ #eval e` at the `#eval`.
             if depth == 0 && command_line && !open_in && doc_comment(token) {
-                if symbol == "/--" && !tokens.get(index + 1).is_some_and(carries_doc_comment) {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: tokens.get(index + 1).map_or(BytePos(source.len()), |next| {
-                            view.to_original(next.extent.start())
-                        }),
-                        expected: NatDefinitionExpectation::DefinitionKeyword,
-                    });
-                }
+                doc_comment_is_carried(&view, &tokens, index, source.len())?;
                 starts.push(view.to_original(token.extent.start()).0);
                 current_open = false;
                 declaration_column = None;
@@ -553,5 +602,18 @@ mod tests {
         ] {
             assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
+        // The pin validates a declaration doc's manual links ("Unknown documentation type `f`")
+        // and stores a module doc's unvalidated; both verdicts measured 2026-10-07.
+        let linked = "/-- see [](lean-manual://f) -/\ndef x := 44\n";
+        assert!(matches!(
+            partition(linked.as_bytes()),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(0),
+                expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
+            })
+        ));
+        assert!(parse(b"/-- see [](lean-manual://f) -/").is_err());
+        let module = partition(b"/-! see [](lean-manual://f) -/\ndef x := 44\n").unwrap();
+        assert_eq!(parse(module[0].1).unwrap(), Some(ScopeCommand::Trivia));
     }
 }
