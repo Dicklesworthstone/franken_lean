@@ -337,8 +337,6 @@ class Pure (f : Type u -> Type v) where
   pure : {A : Type u} -> A -> f A
 class Bind (m : Type u -> Type v) where
   bind : {A B : Type u} -> m A -> (A -> m B) -> m B
-inductive PUnit : Type where
-  | unit
 inductive ForInStep (A : Type u) where
   | done (value : A)
   | yield (value : A)

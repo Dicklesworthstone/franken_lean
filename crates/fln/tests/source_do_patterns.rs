@@ -32,6 +32,7 @@ class Bind (m : Type -> Type) where
 def Id (A : Type) : Type := A
 instance idPure : Pure Id := { pure := fun a => a }
 instance idBind : Bind Id := { bind := fun a k => k a }
+instance idOfNat {A : Type} {n : Nat} [inst : OfNat A n] : OfNat (Id A) n := inst
 structure Pair where
   first : Nat
   second : Nat
@@ -283,7 +284,8 @@ def choose (choice : Choice) : Id Nat := do
   return (x + y)
 theorem earlyPattern : choose (Choice.pair (Pair.mk 4 2)) = 42 := by rfl
 theorem laterPattern : choose Choice.empty = 42 := by rfl
-#eval choose (Choice.pair (Pair.mk 4 2)) + choose Choice.empty
+def runNat (x : Id Nat) : Nat := x
+#eval runNat (choose (Choice.pair (Pair.mk 4 2))) + runNat (choose Choice.empty)
 "#;
     let run = engine()
         .execute_source_definitions(

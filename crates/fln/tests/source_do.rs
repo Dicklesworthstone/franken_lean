@@ -30,6 +30,7 @@ class Bind (m : Type -> Type) where
 def Id (A : Type) : Type := A
 instance idPure : Pure Id := { pure := fun a => a }
 instance idBind : Bind Id := { bind := fun a k => k a }
+instance idOfNat {A : Type} {n : Nat} [inst : OfNat A n] : OfNat (Id A) n := inst
 "#,
     )
 }
@@ -227,7 +228,8 @@ def nested (flag : Bool) : Id Nat :=
 theorem readerBranch : selected true 40 = 42 := by rfl
 theorem otherReaderBranch : selected false 40 = 7 := by rfl
 theorem nestedBranch : nested true = 42 := by rfl
-#eval selected true 40 + nested true
+def runNat (x : Id Nat) : Nat := x
+#eval selected true 40 + runNat (nested true)
 "#;
     let base = engine();
     let root = base.logical_root(&KVMap::new());
