@@ -1,0 +1,492 @@
+name: Native runtime universe values - verify and land
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-runtime-universe-landing.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-runtime-universe-landing
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Install repository-pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Materialize reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/bare-universe.patch" <<'PATCH'
+          diff --git a/crates/fln/src/runtime.rs b/crates/fln/src/runtime.rs
+          --- a/crates/fln/src/runtime.rs
+          +++ b/crates/fln/src/runtime.rs
+          @@ -650,9 +650,19 @@
+                                       });
+                                       tasks.push(Task::Visit(expr.clone()));
+                                   }
+          -                        ExprNode::Const { name, .. } => {
+          +                        ExprNode::Const { name, levels } => {
+                                       if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
+                                           tasks.push(Task::Visit(constructor));
+          +                                continue;
+          +                            }
+          +                            // Ground universes are static arguments even when no
+          +                            // term argument is supplied. Use the ordinary checked
+          +                            // specialization cache before deriving a callable or
+          +                            // collecting this value's executable dependencies.
+          +                            if !levels.is_empty()
+          +                                && let Some(specialized) = self.specialize_call(&expr, &[])?
+          +                            {
+          +                                tasks.push(Task::Visit(specialized));
+                                           continue;
+                                       }
+                                       if let Some(producer) = self.global_producer(&expr, &[])? {
+          diff --git a/crates/fln/src/runtime/specialize/arguments/tests.rs b/crates/fln/src/runtime/specialize/arguments/tests.rs
+          --- a/crates/fln/src/runtime/specialize/arguments/tests.rs
+          +++ b/crates/fln/src/runtime/specialize/arguments/tests.rs
+          @@ -3,6 +3,197 @@
+           use super::*;
+           use fln_env::constants::{ConstantVal, ReducibilityHints};
+           
+          +// These worlds exercise post-admission compiler mechanics, not admission itself.
+          +// The integration tests admit the corresponding declarations through both seats.
+          +fn bare_universe_definition(label: &str, value: Expr) -> DefinitionVal {
+          +    let declaration_name = name(label);
+          +    DefinitionVal {
+          +        base: ConstantVal {
+          +            name: declaration_name.clone(),
+          +            level_params: vec![name("u")],
+          +            type_: ty("Nat"),
+          +        },
+          +        value,
+          +        hints: ReducibilityHints::Abbrev,
+          +        safety: DefinitionSafety::Safe,
+          +        all: vec![declaration_name],
+          +    }
+          +}
+          +
+          +#[test]
+          +fn bare_universe_values_receive_private_ground_definitions() {
+          +    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition.clone()))
+          +        .unwrap();
+          +    let input = Expr::const_(definition.base.name.clone(), vec![Level::one()]);
+          +    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+          +    let prepared = preparation.expression(&input).unwrap();
+          +    let ExprNode::Const { name, levels } = prepared.node() else {
+          +        panic!("a nullary value must remain a constant, not execute during preparation");
+          +    };
+          +    assert_ne!(name, &definition.base.name);
+          +    assert!(levels.is_empty());
+          +    let specialized = preparation.specialized_definition(name).unwrap();
+          +    assert!(specialized.base.level_params.is_empty());
+          +    assert_eq!(specialized.base.type_, definition.base.type_);
+          +    assert_eq!(specialized.value, definition.value);
+          +    assert!(!environment.contains(name));
+          +    assert_eq!(
+          +        environment.find(&definition.base.name),
+          +        Some(&ConstantInfo::Defn(definition.clone()))
+          +    );
+          +}
+          +
+          +#[test]
+          +fn bare_universe_cache_keys_distinguish_universes_and_reuse_repeated_values() {
+          +    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition))
+          +        .unwrap();
+          +    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+          +    let zero = Expr::const_(name("bareAnswer"), vec![Level::zero()]);
+          +    let one = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+          +    let first = preparation.expression(&zero).unwrap();
+          +    let second = preparation.expression(&one).unwrap();
+          +    assert_ne!(first, second);
+          +    assert_eq!(preparation.expression(&zero).unwrap(), first);
+          +    assert_eq!(preparation.expression(&one).unwrap(), second);
+          +    assert_eq!(preparation.specializations.definitions.len(), 2);
+          +}
+          +
+          +#[test]
+          +fn bare_universe_alias_dependencies_reach_the_executable_catalog() {
+          +    let inner = bare_universe_definition("bareInner", nat::literal(42));
+          +    let outer = bare_universe_definition(
+          +        "bareOuter",
+          +        Expr::const_(inner.base.name.clone(), vec![Level::param(name("u"))]),
+          +    );
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(inner))
+          +        .unwrap()
+          +        .add_decl(ConstantInfo::Defn(outer))
+          +        .unwrap();
+          +    let limits = IngressLimits::default();
+          +    let mut preparation = Preparation::new(&environment, limits);
+          +    let prepared = preparation
+          +        .expression(&Expr::const_(name("bareOuter"), vec![Level::one()]))
+          +        .unwrap();
+          +    let catalog =
+          +        executable_dependencies(&environment, &prepared, limits, &mut preparation).unwrap();
+          +    assert_eq!(catalog.functions.len(), 2);
+          +    assert_eq!(preparation.specializations.definitions.len(), 2);
+          +    for function in &catalog.functions {
+          +        assert_eq!(function.universe_arity, 0);
+          +        assert!(function.parameters.is_empty());
+          +        assert!(!environment.contains(&function.name));
+          +    }
+          +    assert!(
+          +        catalog
+          +            .functions
+          +            .iter()
+          +            .any(|function| function.body == nat::literal(42))
+          +    );
+          +    let mut referenced = std::collections::BTreeSet::new();
+          +    let mut visited = 0;
+          +    for function in &catalog.functions {
+          +        collect_executable_constants(&function.body, &mut referenced, &mut visited, limits)
+          +            .unwrap();
+          +    }
+          +    assert_eq!(referenced.len(), 1);
+          +    assert!(
+          +        referenced
+          +            .iter()
+          +            .all(|name| catalog.functions.iter().any(|f| &f.name == name))
+          +    );
+          +}
+          +
+          +#[test]
+          +fn bare_universe_path_leaves_monomorphic_constants_unchanged() {
+          +    let mut definition = bare_universe_definition("monoAnswer", nat::literal(42));
+          +    definition.base.level_params.clear();
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition))
+          +        .unwrap();
+          +    let input = ty("monoAnswer");
+          +    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+          +    assert_eq!(preparation.expression(&input).unwrap(), input);
+          +    assert!(preparation.specializations.definitions.is_empty());
+          +}
+          +
+          +#[test]
+          +fn bare_universe_specialization_never_guesses_open_or_mismatched_levels() {
+          +    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition))
+          +        .unwrap();
+          +    for levels in [
+          +        vec![],
+          +        vec![Level::zero(), Level::one()],
+          +        vec![Level::param(name("unresolved"))],
+          +    ] {
+          +        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+          +        let input = Expr::const_(name("bareAnswer"), levels);
+          +        assert!(preparation.specialize_call(&input, &[]).unwrap().is_none());
+          +        assert!(preparation.specializations.definitions.is_empty());
+          +    }
+          +}
+          +
+          +#[test]
+          +fn bare_universe_specialization_refuses_reserved_name_collisions() {
+          +    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+          +    let mut collision = bare_universe_definition("collision", nat::literal(0));
+          +    collision.base.name = Name::num(name("_fln_runtime_specialization"), 0);
+          +    collision.base.level_params.clear();
+          +    collision.all = vec![collision.base.name.clone()];
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition))
+          +        .unwrap()
+          +        .add_decl(ConstantInfo::Defn(collision.clone()))
+          +        .unwrap();
+          +    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+          +    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+          +    assert!(matches!(
+          +        preparation.expression(&input),
+          +        Err(IngressError::UnsupportedNode {
+          +            kind: "runtime specialization name collision"
+          +        })
+          +    ));
+          +    assert!(preparation.specializations.definitions.is_empty());
+          +    assert_eq!(
+          +        environment.find(&collision.base.name),
+          +        Some(&ConstantInfo::Defn(collision.clone()))
+          +    );
+          +}
+          +
+          +#[test]
+          +fn bare_universe_specialization_obeys_table_limits_and_allows_a_clean_retry() {
+          +    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+          +    let environment = Environment::new()
+          +        .add_decl(ConstantInfo::Defn(definition))
+          +        .unwrap();
+          +    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+          +    let mut limits = IngressLimits::default();
+          +    limits.fir.max_functions = 0;
+          +    let mut preparation = Preparation::new(&environment, limits);
+          +    assert!(matches!(
+          +        preparation.expression(&input),
+          +        Err(IngressError::ResourceLimit {
+          +            resource: IngressResource::ProgramTables,
+          +            limit: 0,
+          +            observed: 1,
+          +        })
+          +    ));
+          +    assert!(preparation.specializations.definitions.is_empty());
+          +    let first = Preparation::new(&environment, IngressLimits::default())
+          +        .expression(&input)
+          +        .unwrap();
+          +    let retry = Preparation::new(&environment, IngressLimits::default())
+          +        .expression(&input)
+          +        .unwrap();
+          +    assert_eq!(first, retry);
+          +}
+          +
+           fn b(index: u32) -> Expr {
+               Expr::bvar(index).unwrap()
+           }
+          diff --git a/crates/fln/tests/runtime_interleaved_specialization.rs b/crates/fln/tests/runtime_interleaved_specialization.rs
+          --- a/crates/fln/tests/runtime_interleaved_specialization.rs
+          +++ b/crates/fln/tests/runtime_interleaved_specialization.rs
+          @@ -28,6 +28,162 @@
+               );
+           }
+           
+          +// Build these telescopes directly so parser support for explicit universe
+          +// syntax cannot hide a failure in the post-admission runtime path.
+          +fn bare_universe_name(label: &str) -> fln::Name {
+          +    fln::Name::from_components([label])
+          +}
+          +
+          +fn bare_universe_const(label: &str, levels: Vec<fln::Level>) -> fln::Expr {
+          +    fln::Expr::const_(bare_universe_name(label), levels)
+          +}
+          +
+          +fn admit_bare_universe_definition(
+          +    engine: Engine,
+          +    label: &str,
+          +    level_params: Vec<fln::Name>,
+          +    type_: fln::Expr,
+          +    value: fln::Expr,
+          +) -> Engine {
+          +    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+          +    let name = bare_universe_name(label);
+          +    engine
+          +        .admit_declaration(
+          +            fln::Declaration::Defn(DefinitionVal {
+          +                base: ConstantVal {
+          +                    name: name.clone(),
+          +                    level_params,
+          +                    type_,
+          +                },
+          +                value,
+          +                safety: DefinitionSafety::Safe,
+          +                hints: ReducibilityHints::Abbrev,
+          +                all: vec![name],
+          +            }),
+          +            &KVMap::new(),
+          +            limits().admission(),
+          +        )
+          +        .unwrap()
+          +        .into_complete()
+          +        .unwrap()
+          +        .engine
+          +}
+          +
+          +fn bare_universe_base() -> Engine {
+          +    engine()
+          +        .execute_source_definitions(
+          +            &[b"def bareLiteralAnswer : Nat := 42"],
+          +            &KVMap::new(),
+          +            limits(),
+          +        )
+          +        .unwrap()
+          +        .into_complete()
+          +        .unwrap()
+          +        .engine
+          +}
+          +
+          +#[test]
+          +fn bare_universe_aliases_execute_after_dual_admission_without_logical_changes() {
+          +    let mut base = admit_bare_universe_definition(
+          +        bare_universe_base(),
+          +        "bareLeaf",
+          +        vec![bare_universe_name("u")],
+          +        bare_universe_const("Nat", vec![]),
+          +        bare_universe_const("bareLiteralAnswer", vec![]),
+          +    );
+          +    base = admit_bare_universe_definition(
+          +        base,
+          +        "bareAlias",
+          +        vec![bare_universe_name("u")],
+          +        bare_universe_const("Nat", vec![]),
+          +        bare_universe_const("bareLeaf", vec![fln::Level::param(bare_universe_name("u"))]),
+          +    );
+          +    base = admit_bare_universe_definition(
+          +        base,
+          +        "bareEntry",
+          +        vec![],
+          +        bare_universe_const("Nat", vec![]),
+          +        bare_universe_const("bareAlias", vec![fln::Level::one()]),
+          +    );
+          +    let options = KVMap::new();
+          +    let root = base.logical_root(&options);
+          +    let run = || {
+          +        base.execute_source_definitions(&[b"#eval bareEntry"], &options, limits())
+          +            .unwrap()
+          +            .into_complete()
+          +            .unwrap()
+          +    };
+          +    let first = run();
+          +    assert_eq!(first.executions.len(), 1);
+          +    let VmExit::Returned(value) = &first.executions[0].exit else {
+          +        panic!("bare universe alias did not return");
+          +    };
+          +    assert_eq!(
+          +        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+          +        Some("42")
+          +    );
+          +    let second = run();
+          +    assert_eq!(
+          +        first.executions[0].flbc_artifact,
+          +        second.executions[0].flbc_artifact
+          +    );
+          +    assert_eq!(base.logical_root(&options), root);
+          +}
+          +
+          +#[test]
+          +fn bare_universe_callbacks_keep_their_checked_runtime_interface() {
+          +    use fln::{BinderInfo, Expr};
+          +    let nat = bare_universe_const("Nat", vec![]);
+          +    let callback_type = Expr::forall_e(
+          +        bare_universe_name("x"),
+          +        nat.clone(),
+          +        nat.clone(),
+          +        BinderInfo::Default,
+          +    );
+          +    let callback_value = Expr::lam(
+          +        bare_universe_name("x"),
+          +        nat.clone(),
+          +        Expr::bvar(0).unwrap(),
+          +        BinderInfo::Default,
+          +    );
+          +    let base = admit_bare_universe_definition(
+          +        bare_universe_base(),
+          +        "bareCopy",
+          +        vec![bare_universe_name("u")],
+          +        callback_type.clone(),
+          +        callback_value,
+          +    );
+          +    // The instanced constant is a value, not an App node. It must be
+          +    // specialized before partial application builds its callable closure.
+          +    let value = Expr::let_e(
+          +        bare_universe_name("saved"),
+          +        callback_type,
+          +        bare_universe_const("bareCopy", vec![fln::Level::one()]),
+          +        Expr::app(
+          +            Expr::bvar(0).unwrap(),
+          +            bare_universe_const("bareLiteralAnswer", vec![]),
+          +        ),
+          +        false,
+          +    );
+          +    let base = admit_bare_universe_definition(base, "bareCallbackEntry", vec![], nat, value);
+          +    let options = KVMap::new();
+          +    let root = base.logical_root(&options);
+          +    let run = base
+          +        .execute_source_definitions(&[b"#eval bareCallbackEntry"], &options, limits())
+          +        .unwrap()
+          +        .into_complete()
+          +        .unwrap();
+          +    assert_eq!(run.executions.len(), 1);
+          +    let VmExit::Returned(value) = &run.executions[0].exit else {
+          +        panic!("bare universe callback did not return");
+          +    };
+          +    assert_eq!(
+          +        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+          +        Some("42")
+          +    );
+          +    assert_eq!(base.logical_root(&options), root);
+          +}
+          +
+           const KEEP: &str = "def keep (ignored : Nat) {A : Type} (x : A) : A := x\n";
+           
+           #[test]
+          PATCH
+      - name: Reproduce, verify, and commit implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/fln-runtime-universe-target"
+          git config user.name 'OpenAI coding assistant'
+          git config user.email 'noreply@openai.com'
+          for attempt in 1 2 3; do
+            git -C "$root" fetch origin main
+            work="$RUNNER_TEMP/fln-runtime-universe-$attempt"
+            git -C "$root" worktree add --detach "$work" origin/main
+            cd "$work"
+            git rev-parse HEAD
+            git apply --check "$RUNNER_TEMP/bare-universe.patch"
+            git apply --exclude=crates/fln/src/runtime.rs "$RUNNER_TEMP/bare-universe.patch"
+            set +e
+            cargo test --locked -p fln --lib bare_universe_values_receive_private_ground_definitions -- --nocapture > "$RUNNER_TEMP/bare-universe-before-$attempt.log" 2>&1
+            before=$?
+            set -e
+            cat "$RUNNER_TEMP/bare-universe-before-$attempt.log"
+            test "$before" -ne 0
+            grep -F 'bare_universe_values_receive_private_ground_definitions ... FAILED' "$RUNNER_TEMP/bare-universe-before-$attempt.log"
+            git apply --include=crates/fln/src/runtime.rs "$RUNNER_TEMP/bare-universe.patch"
+            rustfmt --edition 2024 crates/fln/src/runtime.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_interleaved_specialization.rs
+            git diff --check
+            cargo test --locked -p fln --lib bare_universe_ -- --nocapture | tee "$RUNNER_TEMP/bare-universe-after-$attempt.log"
+            grep -F '7 passed; 0 failed' "$RUNNER_TEMP/bare-universe-after-$attempt.log"
+            cargo test --locked -p fln --test runtime_interleaved_specialization -- --nocapture
+            cargo test --locked -p fln --lib runtime:: -- --test-threads=2
+            cargo clippy --locked -p fln --lib --no-deps -- -D warnings
+            cargo check --locked -p fln-cli --all-targets
+            python3 -I - <<'CHECK'
+          import subprocess
+          allowed = {
+              "crates/fln/src/runtime.rs",
+              "crates/fln/src/runtime/specialize/arguments/tests.rs",
+              "crates/fln/tests/runtime_interleaved_specialization.rs",
+          }
+          changes = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          if {line[3:] for line in changes} != allowed:
+              raise SystemExit(f"unexpected changed paths: {changes}")
+          CHECK
+            git add -- crates/fln/src/runtime.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_interleaved_specialization.rs
+            git commit -m "fix(runtime): specialize bare universe-instantiated values and callbacks" -m "Route nullary universe instances through the existing private specialization cache before callable preparation and dependency discovery. Preserve monomorphic fast paths, checked source declarations, universe checks, reserved-name refusals and resource limits. Add seven compiler regressions plus two dual-admitted execution regressions for alias chains and callbacks. The new value regression fails before the implementation; focused tests, runtime library tests, library Clippy, and CLI all-target checks pass with the repository-pinned Rust."
+            if git push origin HEAD:main; then
+              echo "LANDED_IMPLEMENTATION_SHA=$(git rev-parse HEAD)"
+              exit 0
+            fi
+            echo "main advanced; replaying and retesting against its new tip"
+            cd "$root"
+          done
+          echo "No implementation published after three non-force attempts" >&2
+          exit 1
+      - name: Preserve validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bare-universe-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/bare-universe-*.log
+          if-no-files-found: ignore
