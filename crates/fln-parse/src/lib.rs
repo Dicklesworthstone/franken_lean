@@ -88,6 +88,8 @@ pub enum NatDefinitionExpectation {
     NaturalValue,
     ScalarValue,
     EndOfCommand,
+    /// An attribute, or an attribute's argument, this grammar does not read (inside `@[…]`).
+    Attribute,
     /// A declaration's doc comment that links into the reference manual (`lean-manual://`):
     /// the pin validates those links (`validateDocComment`) and this grammar does not.
     DocCommentWithoutManualLinks,
@@ -2356,7 +2358,9 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
             }
             // `@[…]`, `private`, `protected`, `noncomputable`, … lead a declaration
             // (`declModifiers`), whose own parser decides which attributes it reads.
-            TokenKind::Symbol(symbol) if symbol == "@[" => source_declaration(source),
+            TokenKind::Symbol(symbol) if symbol == "@[" || symbol == "/--" => {
+                source_declaration(source)
+            }
             _ if command_scope::modifiers::leads(token) => source_declaration(source),
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
                 Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -2517,39 +2521,113 @@ fn bounded_binder_syntax(
     Ok(parameters)
 }
 
-/// The attributes and modifiers before a declaration keyword: where the attributes end, and
-/// where the declaration keyword must be. Out of line so its temporaries stay out of the declaration
-/// parser's frame (small host stacks; see `deep_quantifier_bodies_use_heap_frames`).
+/// The doc comment, attributes and modifiers before a declaration keyword: where the doc
+/// comment ends (0 or 1), where the attributes end, and where the declaration keyword must be.
+/// Out of line so its temporaries stay out of the declaration parser's frame (small host stacks;
+/// see `deep_quantifier_bodies_use_heap_frames`).
 #[inline(never)]
 fn declaration_prefix(
     view: &SourceView,
     tokens: &[LexedToken],
     grammar: DefinitionGrammar,
-) -> Result<(usize, usize), NatDefinitionParseError> {
+) -> Result<(usize, usize, usize), NatDefinitionParseError> {
     if grammar != DefinitionGrammar::Scalar {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
-    let attributes_end = command_scope::attributes::inline_end(view, tokens)?;
+    let doc_end = usize::from(leading_doc_comment(tokens));
+    let attributes_end = command_scope::attributes::inline_end(view, tokens, doc_end)?;
     Ok((
+        doc_end,
         attributes_end,
         command_scope::modifiers::scan(tokens, attributes_end).end(),
     ))
 }
 
-/// The declaration's `declModifiers` node: the attributes before `attributes_end` and the
-/// modifier slots from there to `declaration_start`. Out of line for the same reason as
+/// Whether the command opens with a declaration's doc comment (`declModifiers`' first slot).
+fn leading_doc_comment(tokens: &[LexedToken]) -> bool {
+    matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "/--")
+}
+
+/// The doc comment at token `index` as the pin's `docComment` node, `"/--" >> ppSpace >>
+/// commentBody` (vendored `src/Lean/Parser/Command.lean`): two atoms where the lexer has one
+/// token. The `/--` atom keeps the token's leading trivia and owns the whitespace after it; the
+/// body runs from the next character through `-/` and keeps the token's trailing trivia. A body
+/// that opens with a comment is refused: the pin's whitespace would read it as one.
+#[inline(never)]
+fn doc_comment_syntax(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    index: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let refuse = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, index),
+        expected: NatDefinitionExpectation::DefinitionKeyword,
+    };
+    let SourceInfo::Original {
+        leading,
+        pos,
+        trailing,
+        end_pos,
+    } = leaves.leaf(index)?.info()
+    else {
+        return Err(refuse());
+    };
+    let text = view.normalized().as_str();
+    let opener_end = pos.0 + 3;
+    let body_start = opener_end
+        + text
+            .get(opener_end..end_pos.0)
+            .ok_or_else(refuse)?
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+    let body = text.get(body_start..end_pos.0).ok_or_else(refuse)?;
+    if body.starts_with("--") || (body.starts_with("/-") && body != "-/") {
+        return Err(refuse());
+    }
+    let opener = Syntax::Atom {
+        info: SourceInfo::Original {
+            leading,
+            pos,
+            trailing: ByteSpan::new(BytePos(opener_end), BytePos(body_start)).ok_or_else(refuse)?,
+            end_pos: BytePos(opener_end),
+        },
+        val: "/--".into(),
+    };
+    let body = Syntax::Atom {
+        info: SourceInfo::Original {
+            leading: ByteSpan::empty_at(BytePos(body_start)),
+            pos: BytePos(body_start),
+            trailing,
+            end_pos,
+        },
+        val: body.into(),
+    };
+    Ok(null_node(vec![Syntax::node(
+        parser_kind(&["Command", "docComment"]),
+        vec![opener, body],
+    )]))
+}
+
+/// The declaration's `declModifiers` node: the doc comment before `doc_end`, the attributes
+/// before `attributes_end` and the modifier slots from there to `declaration_start`. Out of line for the same reason as
 /// [`declaration_prefix`].
 #[inline(never)]
 fn declaration_modifiers(
     view: &SourceView,
     leaves: &Leaves,
     tokens: &[LexedToken],
+    doc_end: usize,
     attributes_end: usize,
     declaration_start: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut parts = vec![null_node(Vec::new()); 7];
-    if attributes_end != 0 {
-        parts[1] = command_scope::attributes::inline_syntax(leaves, tokens, attributes_end)?;
+    if doc_end != 0 {
+        parts[0] = doc_comment_syntax(view, leaves, tokens, 0)?;
+    }
+    if attributes_end != doc_end {
+        parts[1] = command_scope::attributes::inline_syntax(view, leaves, tokens, doc_end)?;
     }
     if declaration_start != attributes_end {
         command_scope::modifiers::scan(tokens, attributes_end).fill(
@@ -2594,19 +2672,21 @@ fn parse_definition_with_grammar(
         .collect::<Vec<_>>();
     let tokens = split_field_indices(view.normalized(), tokens);
 
+    // A declaration's doc comment leads its command (`declModifiers`' first slot).
+    let keyword = usize::from(grammar == DefinitionGrammar::Scalar && leading_doc_comment(&tokens));
     if grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.first().map(|token| &token.kind),
+        && matches!(tokens.get(keyword).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == "inductive")
     {
-        return inductive::parse(view, tokens);
+        return inductive::parse(view, tokens, keyword);
     }
     if grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
+        && matches!(tokens.get(keyword).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
     {
-        return records::parse(view, tokens);
+        return records::parse(view, tokens, keyword);
     }
 
-    let (attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
+    let (doc_end, attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
     if !matches!(
         tokens.get(declaration_start).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance"))
@@ -2621,7 +2701,7 @@ fn parse_definition_with_grammar(
     let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
     let is_example =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "example");
-    if attributes_end != 0 && is_instance {
+    if attributes_end != doc_end && is_instance {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
             expected: NatDefinitionExpectation::DefinitionKeyword,
@@ -2748,8 +2828,14 @@ fn parse_definition_with_grammar(
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(declaration_start)?;
 
-    let modifiers =
-        declaration_modifiers(&view, &leaves, &tokens, attributes_end, declaration_start)?;
+    let modifiers = declaration_modifiers(
+        &view,
+        &leaves,
+        &tokens,
+        doc_end,
+        attributes_end,
+        declaration_start,
+    )?;
     let declaration_id = if !named {
         None
     } else {

@@ -3524,6 +3524,7 @@ fn definition_in_context_named(
     let mut is_protected = false;
     for (index, modifier) in modifiers.iter().enumerate() {
         match index {
+            0 => doc_comment_slot(modifier)?,
             1 => {}
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
@@ -3929,6 +3930,28 @@ pub fn instance_registration(
 /// `declModifiers`' `protected` slot: docComment, attributes, visibility, then
 /// `protected` (vendored `src/Lean/Parser/Command.lean`, `declModifiers`).
 const PROTECTED_SLOT: usize = 3;
+
+/// `declModifiers`' doc comment slot: empty, or the pin's `docComment` node. A docstring adds
+/// no declaration and no meaning the kernel sees; the reference-manual links the pin validates
+/// were checked when the command was partitioned.
+pub(crate) fn doc_comment_slot(slot: &Syntax) -> Result<(), NatDefinitionElabError> {
+    match expect_null_args(slot, "doc comment")? {
+        [] => Ok(()),
+        [doc] => {
+            let parts = expect_node(
+                doc,
+                &parser_kind(&["Command", "docComment"]),
+                2,
+                "doc comment",
+            )?;
+            expect_atom(&parts[0], "/--", "doc comment opener")?;
+            Ok(())
+        }
+        _ => Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one doc comment",
+        }),
+    }
+}
 
 /// Whether a `protected` slot is set: empty, or exactly one
 /// `Lean.Parser.Command.protected` node holding the keyword.

@@ -34,6 +34,7 @@
 //! *previous* event was, as when typing a `-` before an existing `-` turns two tokens into a
 //! line comment.
 
+use crate::literal::LiteralKind;
 use crate::source::{BytePos, ByteSpan, SourceText};
 use crate::token::{LexedToken, TokenError, TokenKind, TokenTable, lex_token};
 use crate::trivia::{opens_doc_comment, scan_doc_comment, scan_trivia};
@@ -214,6 +215,15 @@ fn lex_from_bounded(
                     at = next;
                     continue;
                 }
+                // `h.1.isEmpty`: digits right after a projection's `.` are a field index, read
+                // as digits alone, never the numeral `1.isEmpty` would begin.
+                if let Some(next) = push_field_index(text, stop, &mut events) {
+                    if over(&events) {
+                        return (events, true);
+                    }
+                    at = next;
+                    continue;
+                }
                 match lex_token(text, table, stop) {
                     Ok(token) => {
                         let next = token.extent.end();
@@ -295,6 +305,57 @@ fn push_doc_comment(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -
             resume
         }
     }
+}
+
+/// A field index, as the pin's `proj` reads one: `"." >> checkNoWsBefore >> (fieldIdx <|>
+/// rawIdent)` (vendored `src/Lean/Parser/Term.lean`), where `fieldIdxFn` takes a nonzero digit
+/// and then digits, and nothing else. So in `h.1.isEmpty` the `1` is a field index and the
+/// `.isEmpty` the next projection, where the generic numeral would read `1.` and refuse the
+/// identifier after its decimal point. The `.` must touch both the term before it (an
+/// identifier, a numeral or a closing bracket) and the digits. Pushes the index and returns
+/// its end; `None` leaves `stop` to the ordinary lexer. Out of line, so it adds nothing to the
+/// driver's frame.
+#[inline(never)]
+fn push_field_index(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -> Option<BytePos> {
+    let bytes = text.as_bytes();
+    if !bytes
+        .get(stop.0)
+        .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+    {
+        return None;
+    }
+    let mut tokens = events
+        .iter()
+        .rev()
+        .filter(|event| !matches!(event, Event::Trivia(span) if span.len_bytes() == 0));
+    let Some(Event::Token(dot)) = tokens.next() else {
+        return None;
+    };
+    if !matches!(&dot.kind, TokenKind::Symbol(symbol) if symbol == ".") || dot.extent.end() != stop
+    {
+        return None;
+    }
+    let Some(Event::Token(before)) = tokens.next() else {
+        return None;
+    };
+    let projectable = match &before.kind {
+        TokenKind::Ident(_) | TokenKind::Literal(LiteralKind::Nat) => true,
+        TokenKind::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]" | "}" | "⟩" | "⦄"),
+        TokenKind::Literal(_) => false,
+    };
+    if !projectable || before.extent.end() != dot.extent.start() {
+        return None;
+    }
+    let mut end = stop.0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    let next = BytePos(end);
+    events.push(Event::Token(LexedToken {
+        kind: TokenKind::Literal(LiteralKind::Nat),
+        extent: span(stop, next),
+    }));
+    Some(next)
 }
 
 /// Skip one scalar past a token refusal, so the driver always advances.
@@ -798,5 +859,39 @@ mod tests {
                 "{old:?} -> {new:?}"
             );
         }
+    }
+
+    /// Digits right after a projection's touching `.` are a field index, so `h.1.isEmpty`
+    /// lexes; a `.` with space before it, a leading zero, or a decimal numeral are unchanged.
+    #[test]
+    fn a_digit_after_a_touching_projection_dot_is_a_field_index() {
+        let table = TokenTable::from_tokens([".", "(", ")", ":="]);
+        let tokens = |raw: &str| {
+            let run = lex_run(&text_of(raw), &table);
+            let accepted = run.accepted();
+            let shapes: Vec<String> = run
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Token(token) => {
+                        Some(raw[token.extent.start().0..token.extent.end().0].to_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (accepted, shapes.join(" "))
+        };
+        assert_eq!(
+            tokens("h.1.isEmpty_eq"),
+            (true, "h . 1 . isEmpty_eq".to_owned())
+        );
+        assert_eq!(tokens("(p).2.impl"), (true, "( p ) . 2 . impl".to_owned()));
+        assert_eq!(tokens("m.12.e"), (true, "m . 12 . e".to_owned()));
+        assert_eq!(tokens("x := 0.5"), (true, "x := 0.5".to_owned()));
+        assert!(
+            !tokens("h .1.isEmpty").0,
+            "a `.` after space is no projection"
+        );
+        assert!(!tokens("h.0.isEmpty").0, "fieldIdx takes no leading zero");
     }
 }

@@ -73,6 +73,24 @@ pub(super) fn modifiers() -> Syntax {
         (0..7).map(|_| null_node(Vec::new())).collect(),
     )
 }
+
+/// The declaration's `declModifiers`: its doc comment when the keyword at `keyword` follows one
+/// (`keyword` is 1), every other slot empty.
+pub(super) fn modifiers_after_doc(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    keyword: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut parts: Vec<Syntax> = (0..7).map(|_| null_node(Vec::new())).collect();
+    if keyword != 0 {
+        parts[0] = crate::doc_comment_syntax(view, leaves, tokens, 0)?;
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Command", "declModifiers"]),
+        parts,
+    ))
+}
 pub(super) fn optional_type(
     leaves: &Leaves,
     view: &SourceView,
@@ -165,6 +183,7 @@ fn fields(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
+    keyword: usize,
     start: usize,
 ) -> Result<Vec<Syntax>, NatDefinitionParseError> {
     if start == tokens.len() {
@@ -179,8 +198,8 @@ fn fields(
             .0
     };
     let base = column(start);
-    if source.line_of(tokens[start].extent.start()) > source.line_of(tokens[0].extent.start())
-        && base <= column(0)
+    if source.line_of(tokens[start].extent.start()) > source.line_of(tokens[keyword].extent.start())
+        && base <= column(keyword)
     {
         return Err(refuse(view, tokens, start));
     }
@@ -294,15 +313,20 @@ fn parents(
     )]))
 }
 
+/// `structure`/`class` at token `keyword` (1 after a doc comment, else 0).
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
+    keyword: usize,
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
-    let is_class = symbol(&tokens, 0, "class");
-    if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-        return Err(refuse(&view, &tokens, 1));
+    let is_class = symbol(&tokens, keyword, "class");
+    if !matches!(
+        tokens.get(keyword + 1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(&view, &tokens, keyword + 1));
     }
-    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, keyword + 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let end_body = deriving_start(&tokens, cursor);
     let body_tokens = &tokens[..end_body];
@@ -328,7 +352,7 @@ pub(super) fn parse(
         if !symbol(&tokens, end_header, "where") {
             return Err(refuse(&view, &tokens, end_header));
         }
-        let fields = fields(&leaves, &view, body_tokens, end_header + 1)?;
+        let fields = fields(&leaves, &view, body_tokens, keyword, end_header + 1)?;
         null_node(vec![
             leaves.leaf(end_header)?,
             null_node(Vec::new()),
@@ -343,12 +367,12 @@ pub(super) fn parse(
         vec![
             Syntax::node(
                 parser_kind(&["Command", if is_class { "classTk" } else { "structureTk" }]),
-                vec![leaves.leaf(0)?],
+                vec![leaves.leaf(keyword)?],
             ),
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
                 vec![
-                    leaves.leaf(1)?,
+                    leaves.leaf(keyword + 1)?,
                     levels::declaration_syntax(&leaves, universe_suffix)?,
                 ],
             ),
@@ -361,11 +385,12 @@ pub(super) fn parse(
             deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
+    let modifiers = modifiers_after_doc(&view, &leaves, &tokens, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(
             parser_kind(&["Command", "declaration"]),
-            vec![modifiers(), structure],
+            vec![modifiers, structure],
         ),
         epilogue,
     })

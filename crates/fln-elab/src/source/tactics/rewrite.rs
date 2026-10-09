@@ -30,7 +30,7 @@ impl Context {
             if close { "rw" } else { "rewrite" },
             "rewrite keyword",
         )?;
-        expect_empty_null(config, "default rewrite configuration")?;
+        expect_default_config(config, "default rewrite configuration")?;
         let parts = expect_node(
             sequence,
             &parser_kind(&["Tactic", "rwRuleSeq"]),

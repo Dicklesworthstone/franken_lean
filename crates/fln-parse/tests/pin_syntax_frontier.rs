@@ -199,7 +199,28 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
             .into_iter()
             .map(|(offset, bytes)| (offset.0 + body_start, bytes))
             .collect(),
-        Err(error) => return whole(format!("file:partition:{}", refusal_class(&error))),
+        Err(error) => {
+            let mut lost = whole(format!("file:partition:{}", refusal_class(&error)));
+            // The first refusal names the bytes the whole file stops at.
+            let (at, what) = match &error {
+                NatDefinitionParseError::Lexical { diagnostics } => diagnostics
+                    .first()
+                    .map_or((0, ""), |first| (first.at.0, first.message)),
+                NatDefinitionParseError::OutsideSeedGrammar { at, .. } => (at.0, ""),
+                _ => (0, ""),
+            };
+            let at = body_start + at;
+            let text =
+                String::from_utf8_lossy(&source[at.min(source.len())..(at + 24).min(source.len())])
+                    .split('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+            if let Some(first) = lost.first_mut() {
+                first.detail = format!("{what} at {at}: {text:?}");
+            }
+            return lost;
+        }
     };
     commands
         .iter()
@@ -297,6 +318,8 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
     );
     let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Files lost before partition, by what stopped them: (files, commands).
+    let mut stoppers: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut identical_files = 0usize;
     let mut total = 0usize;
     for file in &files {
@@ -315,6 +338,21 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
             identical_files += 1;
         }
         total += outcomes.len();
+        if let Some(first) = outcomes
+            .first()
+            .filter(|first| first.class.starts_with("file:"))
+        {
+            let reason = first.detail.split_once(" at ").map_or("", |(what, _)| what);
+            let text = first.detail.rsplit_once(": ").map_or("", |(_, text)| text);
+            let key = format!(
+                "{} | {reason} | {}",
+                first.class,
+                text.chars().take(12).collect::<String>()
+            );
+            let entry = stoppers.entry(key).or_default();
+            entry.0 += 1;
+            entry.1 += outcomes.len();
+        }
         for outcome in outcomes {
             let shown = examples.entry(outcome.class.clone()).or_default();
             if shown.len() < 2 {
@@ -339,5 +377,10 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
     );
     for (class, _) in rows.iter().take(40) {
         eprintln!("  {class}: {}", examples[*class].join(" | "));
+    }
+    let mut stopped: Vec<_> = stoppers.into_iter().collect();
+    stopped.sort_by_key(|entry| std::cmp::Reverse((entry.1).1));
+    for (key, (files, commands)) in stopped.iter().take(30) {
+        eprintln!("  stopper {commands} commands in {files} files: {key}");
     }
 }

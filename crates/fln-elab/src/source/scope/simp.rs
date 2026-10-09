@@ -11,6 +11,50 @@ use fln_env::{
 };
 use std::collections::BTreeMap;
 
+/// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
+/// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
+/// other radixes are refused.
+fn priority_value(
+    priority: &fln_syntax::tree::Syntax,
+) -> Result<u32, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let refuse = |expected| NatDefinitionElabError::UnexpectedSyntax { expected };
+    let Syntax::Node { kind, args, .. } = priority else {
+        return Err(refuse("numeric priority"));
+    };
+    let named = [
+        ("prioDefault", 1000),
+        ("prioLow", 100),
+        ("prioMid", 500),
+        ("prioHigh", 10000),
+    ];
+    if let Some((_, value)) = named
+        .iter()
+        .find(|(name, _)| kind == &Name::from_components([*name]))
+    {
+        return Ok(*value);
+    }
+    if kind == &Name::from_components(["prio(_)"]) {
+        let [_, inner, _] = args.as_slice() else {
+            return Err(refuse("parenthesized priority"));
+        };
+        return priority_value(inner);
+    }
+    let numeral = expect_node(
+        priority,
+        &Name::from_components(["num"]),
+        1,
+        "priority numeral",
+    )?;
+    let [Syntax::Atom { val, .. }] = numeral else {
+        return Err(refuse("priority numeral"));
+    };
+    if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse("decimal priority"));
+    }
+    val.parse::<u32>().map_err(|_| refuse("u32 priority"))
+}
+
 /// Decode a canonical inline request. This only describes metadata: it must be
 /// installed on the successor of ordinary declaration admission, never before.
 pub fn registration(
@@ -82,34 +126,7 @@ pub fn registration(
     };
     let priority = match expect_null_args(&parts[3], "simp priority")? {
         [] => 1000,
-        [priority] => {
-            let parts = expect_node(
-                priority,
-                &parser_kind(&["Priority", "numPrio"]),
-                1,
-                "numeric priority",
-            )?;
-            let numeral = expect_node(
-                &parts[0],
-                &Name::from_components(["num"]),
-                1,
-                "priority numeral",
-            )?;
-            let [Syntax::Atom { val, .. }] = numeral else {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "priority numeral",
-                });
-            };
-            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "decimal priority",
-                });
-            }
-            val.parse::<u32>()
-                .map_err(|_| NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "u32 priority",
-                })?
-        }
+        [priority] => priority_value(priority)?,
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "numeric priority",
@@ -423,8 +440,9 @@ mod tests {
             (&[0, 1, 0, 1, 0, 1, 0][..], atom("unknown")),
             (&[0, 1, 0, 1, 0, 1, 1][..], atom("↓")),
             (&[0, 1, 0, 1, 0, 1, 2, 0][..], atom("->")),
-            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("4294967296")),
-            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("-1")),
+            // The priority is the pin's `num` node itself (`numPrio` adds no node).
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0][..], atom("4294967296")),
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0][..], atom("-1")),
         ] {
             let mut syntax = parsed.syntax().clone();
             *child_mut(&mut syntax, path) = replacement;

@@ -278,7 +278,7 @@ impl Context {
             if simpa { "simpa" } else { "simp" },
             "simplification keyword",
         )?;
-        expect_empty_null(config, "default simplification configuration")?;
+        expect_default_config(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
             self.rewrite_locations(location)?;

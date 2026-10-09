@@ -33,7 +33,8 @@ fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
         7,
         "record modifiers",
     )?;
-    for part in parts {
+    super::doc_comment_slot(&parts[0])?;
+    for part in &parts[1..] {
         expect_empty_null(part, "absent record modifiers")?;
     }
     Ok(())

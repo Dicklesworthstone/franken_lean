@@ -259,12 +259,7 @@ fn local_tactic(
         }
         // `decide` is `"decide" optConfig` (`Init/Tactics.lean`); the empty configuration
         // is a node of its own in the pin's tree.
-        "decide" if range.end == start + 1 => {
-            args.push(Syntax::node(
-                parser_kind(&["Tactic", "optConfig"]),
-                vec![null_node(Vec::new())],
-            ));
-        }
+        "decide" if range.end == start + 1 => args.push(default_config()),
         "assumption" | "solve_by_elim" | "rfl" | "contradiction" | "constructor" | "left"
         | "right" | "skip" | "fail"
             if range.end == start + 1 => {}
@@ -472,8 +467,17 @@ fn rewrite(
     );
     Ok(Syntax::node(
         parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
-        vec![keyword, null_node(Vec::new()), rules, location],
+        vec![keyword, default_config(), rules, location],
     ))
+}
+
+/// The empty configuration of a tactic that takes `optConfig` (`decide`, `simp`, `simp_all`,
+/// `rw`, `rewrite`; vendored `src/Init/Tactics.lean`): a node of its own in the pin's tree.
+fn default_config() -> Syntax {
+    Syntax::node(
+        parser_kind(&["Tactic", "optConfig"]),
+        vec![null_node(Vec::new())],
+    )
 }
 
 /// Whole-context simplification shares rule syntax with simp, but has no
@@ -664,7 +668,7 @@ fn simplify(
         parser_kind(&["Tactic", "simp"]),
         vec![
             keyword,
-            null_node(Vec::new()),
+            default_config(),
             null_node(Vec::new()),
             only,
             arguments,

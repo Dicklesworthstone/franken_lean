@@ -82,11 +82,11 @@ fn doc_comment(token: &LexedToken) -> bool {
     matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--" || symbol == "/-!")
 }
 
-/// A declaration's doc comment the pin would validate: it attaches the docstring through
-/// `addMarkdownDocString`, whose `validateDocComment` checks every `lean-manual://` link and
-/// reports a malformed one as an error. That validation is not implemented, so such a doc
-/// comment is refused rather than accepted. A module doc (`/-!`) is stored unvalidated. Out of
-/// line so its temporaries stay out of `partition`'s frame (parsers run on small host stacks).
+/// A declaration's doc comment whose reference-manual links the pin refuses. The pin attaches
+/// the docstring through `addMarkdownDocString`, whose `validateDocComment` runs
+/// `rewriteManualLinksCore` (vendored `src/Lean/DocString/Links.lean`) and reports every link it
+/// cannot rewrite as an error. A module doc (`/-!`) is stored unvalidated. Out of line so its
+/// temporaries stay out of `partition`'s frame (parsers run on small host stacks).
 #[inline(never)]
 fn unvalidated_manual_link(
     view: &SourceView,
@@ -95,45 +95,181 @@ fn unvalidated_manual_link(
     let TokenKind::Symbol(symbol) = &token.kind else {
         return None;
     };
+    if symbol != "/--" {
+        return None;
+    }
     let text = view
         .normalized()
         .as_str()
         .get(token.extent.start().0..token.extent.end().0)?;
-    (symbol == "/--" && text.contains("lean-manual://")).then(|| {
-        NatDefinitionParseError::OutsideSeedGrammar {
-            at: view.to_original(token.extent.start()),
-            expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
-        }
+    // `getDocStringText`: the comment body after the opener's trailing whitespace, without `-/`.
+    let body = text.get(3..)?.trim_start_matches([' ', '\n']);
+    let docstring = body.strip_suffix("-/").unwrap_or(body);
+    manual_link_refused(docstring).then(|| NatDefinitionParseError::OutsideSeedGrammar {
+        at: view.to_original(token.extent.start()),
+        expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
     })
 }
 
-/// The doc comment at `tokens[index]` as a command of its own: a declaration's must not need
-/// manual-link validation and must be followed by what can carry it, as at the pin, which
-/// refuses `/-- d -/ #eval e` at the `#eval` and a doc at end of input. Out of line, with the
-/// refusals built here, so they occupy nothing of `partition`'s frame.
+/// Whether `rewriteManualLinksCore` reports an error on `docstring`, scanning exactly as it does:
+/// at each `lean-manual://`, the URL runs over URL characters, and a URL character that ends the
+/// string ends the URL without being part of it; the path must be `section/<id>` or
+/// `errorExplanation/<name>`, one nonempty item after the kind.
+fn manual_link_refused(docstring: &str) -> bool {
+    const SCHEME: &str = "lean-manual://";
+    let url_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '-' | '.'
+                    | '_'
+                    | '~'
+                    | ':'
+                    | '/'
+                    | '?'
+                    | '#'
+                    | '['
+                    | ']'
+                    | '@'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+            )
+    };
+    let mut at = 0;
+    while let Some(found) = docstring[at..].find(SCHEME) {
+        let start = at + found + SCHEME.len();
+        let rest = &docstring[start..];
+        let mut chars = rest.char_indices().peekable();
+        let mut path_end = None;
+        while let Some((offset, c)) = chars.next() {
+            if url_char(c) && chars.peek().is_some() {
+                continue;
+            }
+            path_end = Some(offset);
+            break;
+        }
+        // At the very end of the string there is no character to end the URL: no rewrite and
+        // no error.
+        let Some(path_end) = path_end else {
+            return false;
+        };
+        let path = &rest[..path_end];
+        let mut parts = path.split('/');
+        let kind = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+        let valid = matches!(kind, "section" | "errorExplanation")
+            && matches!(args.as_slice(), [item] if !item.is_empty());
+        if !valid {
+            return true;
+        }
+        at = start + path_end;
+    }
+    false
+}
+
+/// Whether the doc comment at `tokens[index]` leads a declaration this grammar parses (`Ok(true)`,
+/// also for a module doc, which is a command of its own) or a command only the pin parses
+/// (`Ok(false)`). A declaration's doc must not need manual-link validation and must be followed
+/// by what can carry it, as at the pin, which refuses `/-- d -/ #eval e` at the `#eval` and a
+/// doc at end of input. Out of line, with the refusals built here, so they occupy nothing of
+/// `partition`'s frame.
 #[inline(never)]
 fn doc_comment_is_carried(
     view: &SourceView,
     tokens: &[LexedToken],
     index: usize,
     source_len: usize,
-) -> Result<(), NatDefinitionParseError> {
+) -> Result<bool, NatDefinitionParseError> {
     let token = &tokens[index];
     if let Some(refusal) = unvalidated_manual_link(view, token) {
         return Err(refusal);
     }
-    if matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--")
-        && !tokens.get(index + 1).is_some_and(carries_doc_comment)
-    {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: tokens.get(index + 1).map_or(BytePos(source_len), |next| {
-                view.to_original(next.extent.start())
-            }),
-            expected: NatDefinitionExpectation::DefinitionKeyword,
-        });
+    if !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--") {
+        return Ok(true);
     }
-    Ok(())
+    let next = tokens.get(index + 1);
+    if next.is_some_and(carries_doc_comment) {
+        return Ok(true);
+    }
+    // A command the pin lets a doc comment lead and this grammar cannot parse (`syntax`,
+    // `macro`, `add_decl_doc`, ...): the doc stays with it, and that one command is refused
+    // where it is parsed, not the whole file here.
+    if next.is_some_and(|next| {
+        matches!(&next.kind, TokenKind::Symbol(symbol) if PIN_DOC_CARRIERS.contains(&symbol.as_str()))
+    }) {
+        return Ok(false);
+    }
+    Err(NatDefinitionParseError::OutsideSeedGrammar {
+        at: next.map_or(BytePos(source_len), |next| {
+            view.to_original(next.extent.start())
+        }),
+        expected: NatDefinitionExpectation::DefinitionKeyword,
+    })
 }
+
+/// Every command keyword the pin accepts after a declaration's doc comment, as its parser lists
+/// them when the doc is followed by anything else (measured 2026-10-07), with the attribute kinds
+/// `scoped` and `local` that lead `syntax`, `notation` and `macro`.
+const PIN_DOC_CARRIERS: &[&str] = &[
+    "#guard_msgs",
+    "abbrev",
+    "add_decl_doc",
+    "axiom",
+    "binder_predicate",
+    "builtin_cbv_simproc",
+    "builtin_cbv_simproc_decl",
+    "builtin_dsimproc",
+    "builtin_dsimproc_decl",
+    "builtin_grind_propagator",
+    "builtin_initialize",
+    "builtin_simproc",
+    "builtin_simproc_decl",
+    "cbv_simproc",
+    "cbv_simproc_decl",
+    "class",
+    "coinductive",
+    "declare_simp_like_tactic",
+    "declare_syntax_cat",
+    "def",
+    "dsimproc",
+    "dsimproc_decl",
+    "elab",
+    "elab_rules",
+    "example",
+    "grind_propagator",
+    "inductive",
+    "infix",
+    "infixl",
+    "infixr",
+    "initialize",
+    "instance",
+    "local",
+    "macro",
+    "macro_rules",
+    "notation",
+    "opaque",
+    "postfix",
+    "prefix",
+    "recommended_spelling",
+    "register_error_explanation",
+    "register_tactic_tag",
+    "register_try?_tactic",
+    "scoped",
+    "simproc",
+    "simproc_decl",
+    "structure",
+    "syntax",
+    "tactic_extension",
+    "theorem",
+    "unif_hint",
+];
 
 /// Whether `token` can follow a declaration's doc comment: the declaration keywords and the
 /// rest of `declModifiers` (attributes, then the modifiers), whose first slot the doc fills.
@@ -275,8 +411,6 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     let mut current_open = false;
     let mut open_in = false;
     let mut mutual_until = 0;
-    // The token after a doc comment begins its declaration wherever it sits on the line.
-    let mut after_doc = false;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
             continue;
@@ -297,21 +431,24 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 continue;
             }
             let command_line = (index == 0
-                || std::mem::take(&mut after_doc)
                 || source_view.line_of(token.extent.start())
                     > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
-            // A doc comment is its own command: a module doc (`moduleDoc`) always, and a
-            // declaration's (`declModifiers`' first slot) only before what can carry it, as
-            // at the pin, which refuses `/-- d -/ #eval e` at the `#eval`.
+            // A module doc (`moduleDoc`) is its own command. A declaration's doc comment
+            // (`declModifiers`' first slot) leads its declaration's command, as an attribute
+            // does, and only before what can carry it, as at the pin, which refuses
+            // `/-- d -/ #eval e` at the `#eval`.
             if depth == 0 && command_line && !open_in && doc_comment(token) {
-                doc_comment_is_carried(&view, &tokens, index, source.len())?;
+                let split = doc_comment_is_carried(&view, &tokens, index, source.len())?;
                 starts.push(view.to_original(token.extent.start()).0);
                 current_open = false;
                 declaration_column = None;
                 attribute_prefix = false;
                 prefix_column = None;
-                after_doc = symbol == "/--";
+                if split && symbol == "/--" {
+                    attribute_prefix = true;
+                    prefix_column = Some(column(token));
+                }
                 continue;
             }
             let scope_start = control(symbol) && command_line;
@@ -339,6 +476,10 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 attribute_prefix = inline_start || (continues_prefix && !declaration(symbol));
                 declaration_column = declaration(symbol)
                     .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
+            } else if depth == 0 && attribute_prefix {
+                // Any other keyword ends the prefix: it carries the prefix (`abbrev`, `opaque`,
+                // `axiom`, …) and belongs to its command, and the next declaration starts anew.
+                attribute_prefix = false;
             }
             match symbol.as_str() {
                 "(" | "[" | "@[" | "{" | ".{" | "⦃" | "⟨" => depth = depth.saturating_add(1),
@@ -567,10 +708,11 @@ mod tests {
         }
     }
 
-    /// Doc comments are commands of their own: a module doc wherever a command may start, a
-    /// declaration's only before what can carry it, the way the pin refuses `/-- d -/ #eval e`.
+    /// A module doc is a command of its own wherever a command may start; a declaration's doc
+    /// leads its declaration's command, and only before what can carry it, the way the pin
+    /// refuses `/-- d -/ #eval e`.
     #[test]
-    fn doc_comments_are_their_own_commands_and_must_be_carried() {
+    fn doc_comments_lead_their_declarations_and_must_be_carried() {
         let source = "/-! A module doc with `code`; it's prose. -/\n/-- The answer. -/\ndef answer : Nat := 42\n/-- Inline. -/ private def other : Nat := 1\n#eval answer\n";
         let commands = partition(source.as_bytes()).unwrap();
         let texts: Vec<_> = commands
@@ -581,18 +723,38 @@ mod tests {
             texts,
             [
                 "/-! A module doc with `code`; it's prose. -/",
-                "/-- The answer. -/",
-                "def answer : Nat := 42",
-                "/-- Inline. -/",
-                "private def other : Nat := 1",
+                "/-- The answer. -/\ndef answer : Nat := 42",
+                "/-- Inline. -/ private def other : Nat := 1",
                 "#eval answer",
             ]
         );
-        for doc in [texts[0], texts[1], texts[3]] {
+        assert_eq!(
+            parse(texts[0].as_bytes()).unwrap(),
+            Some(ScopeCommand::Trivia)
+        );
+        // A declaration's doc is the first slot of its `declModifiers`, as at the pin.
+        for declaration in [texts[1], texts[2]] {
             assert_eq!(
-                parse(doc.as_bytes()).unwrap(),
-                Some(ScopeCommand::Trivia),
-                "{doc}"
+                parse(declaration.as_bytes()).unwrap(),
+                None,
+                "{declaration}"
+            );
+            let parsed = crate::parse_source_command(declaration.as_bytes())
+                .unwrap_or_else(|error| panic!("{declaration}: {error:?}"));
+            let Syntax::Node { args, .. } = parsed.syntax() else {
+                panic!("a declaration");
+            };
+            let Syntax::Node {
+                args: modifiers, ..
+            } = &args[0]
+            else {
+                panic!("declModifiers");
+            };
+            assert!(
+                matches!(&modifiers[0], Syntax::Node { args, .. }
+                    if matches!(args.as_slice(), [Syntax::Node { kind, .. }]
+                        if kind == &parser_kind(&["Command", "docComment"]))),
+                "{declaration}"
             );
         }
         for bad in [
@@ -602,6 +764,21 @@ mod tests {
         ] {
             assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
+        // A command the pin lets a doc lead and this grammar does not parse keeps its doc: the
+        // file partitions, and that one command is refused where it is parsed.
+        let unparsed = "/-- d -/\nscoped syntax \"x\" : term\ndef y : Nat := 1\n";
+        let commands = partition(unparsed.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(
+            std::str::from_utf8(commands[0].1)
+                .unwrap()
+                .starts_with("/-- d -/\nscoped syntax")
+        );
+        assert!(!matches!(
+            parse(commands[0].1),
+            Ok(Some(ScopeCommand::Trivia))
+        ));
+        assert!(crate::parse_source_command(commands[0].1).is_err());
         // The pin validates a declaration doc's manual links ("Unknown documentation type `f`")
         // and stores a module doc's unvalidated; both verdicts measured 2026-10-07.
         let linked = "/-- see [](lean-manual://f) -/\ndef x := 44\n";
@@ -613,6 +790,22 @@ mod tests {
             })
         ));
         assert!(parse(b"/-- see [](lean-manual://f) -/").is_err());
+        // The links the pin rewrites pass, and the ones it reports refuse ("Expected one item
+        // after `section`", "Empty section ID"); all four verdicts measured 2026-10-08.
+        assert!(
+            partition(
+                b"/-- [s](lean-manual://section/foo) [e](lean-manual://errorExplanation/lean.x) -/\ndef x := 44\n"
+            )
+            .is_ok()
+        );
+        for bad in ["section/a/b", "section/", "f"] {
+            assert!(
+                manual_link_refused(&format!("see [s](lean-manual://{bad}) ")),
+                "{bad}"
+            );
+        }
+        // A link that reaches the end of the docstring has no character to end it: no error.
+        assert!(!manual_link_refused("trailing lean-manual://"));
         let module = partition(b"/-! see [](lean-manual://f) -/\ndef x := 44\n").unwrap();
         assert_eq!(parse(module[0].1).unwrap(), Some(ScopeCommand::Trivia));
     }

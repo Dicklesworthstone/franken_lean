@@ -282,7 +282,8 @@ fn header<'a>(
         7,
         "inductive modifiers",
     )?;
-    for part in modifiers {
+    super::doc_comment_slot(&modifiers[0])?;
+    for part in &modifiers[1..] {
         expect_empty_null(part, "absent inductive modifiers")?;
     }
     let parts = expect_node(

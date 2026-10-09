@@ -573,3 +573,59 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
         &["theorem explicit (n : Nat) : n = n := by simp only []"],
     );
 }
+
+/// The parser keeps every attribute the pin parses in the declaration's tree; the elaborator
+/// implements one global `simp` and refuses the rest, so no attribute is dropped and none is
+/// admitted without its meaning.
+#[test]
+fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
+    let base = engine();
+    for source in [
+        "@[inline] def x : Nat := 0",
+        "@[simp, inline] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[local simp] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
+        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
+        "@[extern \"lean_x\"] def x : Nat := 0",
+        "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp] example : (0 : Nat) = 0 := by rfl",
+    ] {
+        assert!(
+            fln_parse::parse_definition(source.as_bytes()).is_ok(),
+            "the pin parses {source}"
+        );
+        refused(&base, source);
+    }
+}
+
+/// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
+/// (vendored `src/Init/Notation.lean`), alone or in parentheses.
+#[test]
+fn named_simp_priorities_register_their_values() {
+    let base = engine();
+    for (priority, value) in [
+        ("default", 1000),
+        ("low", 100),
+        ("mid", 500),
+        ("high", 10000),
+        ("(high)", 10000),
+        ("((7))", 7),
+    ] {
+        let result = checked(
+            &base,
+            &[&format!(
+                "{WRAP}@[simp {priority}] theorem again.{{u}} {{A : Sort u}} (x : A) : wrap x = x := by rfl"
+            )],
+        );
+        let rules = simp::read(result.engine.environment()).unwrap();
+        let rule = rules
+            .iter()
+            .find(|rule| rule.declaration == Name::from_components(["again"]))
+            .unwrap_or_else(|| panic!("{priority}: {rules:?}"));
+        assert_eq!(rule.priority, value, "{priority}");
+    }
+}

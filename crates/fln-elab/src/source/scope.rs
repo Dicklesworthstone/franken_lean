@@ -442,7 +442,8 @@ pub fn elaborate_example(
     )?;
     // Attribute execution is a separate effect. Refuse unsupported modifiers
     // instead of silently losing an attribute failure when the scratch closes.
-    for modifier in modifiers {
+    super::doc_comment_slot(&modifiers[0])?;
+    for modifier in &modifiers[1..] {
         expect_empty_null(modifier, "unmodified example")?;
     }
     let example = expect_node(

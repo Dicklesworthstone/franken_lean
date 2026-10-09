@@ -37,6 +37,82 @@ struct Refused {
     at: usize,
 }
 
+/// Inline attributes, `declModifiers` slot 1: `Term.attributes` over the `attr` and `prio`
+/// categories (`Lean/Parser/Term.lean`, `Lean/Parser/Attr.lean`, `Init/Notation.lean`,
+/// `Init/Tactics.lean`, `Init/Grind/Attr.lean`). Captured 2026-10-08 from one file the pin
+/// elaborated without an error, in this order, after `def wrap (n : Nat) : Nat := n`; the two
+/// `scoped`/`local` rows sat inside `namespace N`.
+const ATTRIBUTES: &[Accepted] = &[
+    Accepted {
+        source: "@[simp high] theorem t1 (n : Nat) : wrap n = n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simp "simp" [] [] [(prioHigh "high")]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t1 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `wrap [`n]) "=" `n))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[simp ← (low)] theorem t2 (n : Nat) : n = wrap n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simp "simp" [] ["←"] [(«prio(_)» "(" (prioLow "low") ")")]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" (Term.app `wrap [`n])))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[simp ↓ 1001] theorem t3 (n : Nat) : wrap (wrap n) = n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simp "simp" [(Tactic.simpPre "↓")] [] [(num "1001")]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t3 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `wrap [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `wrap [`n]) ")")]) "=" `n))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[simp, grind =] theorem t4 (n : Nat) : wrap (wrap (wrap n)) = n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simp "simp" [] [] [])) "," (Term.attrInstance (Term.attrKind []) (Attr.grind "grind" [(Attr.grindMod (Attr.grindEq "=" []))]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t4 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `wrap [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `wrap [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `wrap [`n]) ")")]) ")")]) "=" `n))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[grind _=_] theorem t5 (n : Nat) : wrap (n + 0) = wrap n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.grind "grind" [(Attr.grindMod (Attr.grindEqBoth "_" "=" "_" []))]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t5 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `wrap [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "0")) ")")]) "=" (Term.app `wrap [`n])))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[inline] def f1 (n : Nat) : Nat := n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simple `inline []))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[specialize] def f2 (g : Nat → Nat) (n : Nat) : Nat := g n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.specialize "specialize" []))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`g] [":" (Term.arrow `Nat "→" `Nat)] [] ")") (Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `g [`n]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: r#"@[deprecated wrap (since := "2026-01-01")] def f3 (n : Nat) : Nat := n"#,
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Lean.deprecated "deprecated" [`wrap] [] ["(" "since" ":=" (str "\"2026-01-01\"") ")"]))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: r#"@[deprecated "use wrap"] def f3b (n : Nat) : Nat := n"#,
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Lean.deprecated "deprecated" [] [(str "\"use wrap\"")] []))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f3b []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[inherit_doc wrap] def f4 (n : Nat) : Nat := n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simple `inherit_doc [`wrap]))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f4 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: r#"@[extern "lean_fln_probe"] def f5 (n : Nat) : Nat := n"#,
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.extern "extern" [(Attr.externEntry [] [] (str "\"lean_fln_probe\""))]))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f5 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[implemented_by f1] def f6 (n : Nat) : Nat := n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simple `implemented_by [`f1]))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f6 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[reducible, macro_inline] def f7 (n : Nat) : Nat := n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simple `reducible [])) "," (Term.attrInstance (Term.attrKind []) (Attr.simple `macro_inline []))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f7 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[export lean_fln_probe_export] def f8 (n : Nat) : Nat := n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.export "export" `lean_fln_probe_export))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f8 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" `n (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[instance] def f9 : Inhabited Nat := Inhabited.mk 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.instance "instance" []))] "]")] [] [] [] [] []) (Command.definition "def" (Command.declId `f9 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `Inhabited [`Nat]))]) (Command.declValSimple ":=" (Term.app `Inhabited.mk [(num "0")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "@[scoped simp] theorem t6 (n : Nat) : wrap n + 0 = wrap n := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind [(Term.scoped "scoped")]) (Attr.simp "simp" [] [] []))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t6 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» (Term.app `wrap [`n]) "+" (num "0")) "=" (Term.app `wrap [`n])))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[local simp mid] theorem t7 (n : Nat) : 0 + wrap n = wrap n := Nat.zero_add _",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind [(Term.local "local")]) (Attr.simp "simp" [] [] [(prioMid "mid")]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t7 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» (num "0") "+" (Term.app `wrap [`n])) "=" (Term.app `wrap [`n])))) (Command.declValSimple ":=" (Term.app `Nat.zero_add [(Term.hole "_")]) (Termination.suffix [] []) [])))"#,
+    },
+];
+
 /// Declaration modifiers, `declModifiers` slots 2..6 (`Lean/Parser/Command.lean:114`).
 const MODIFIERS: &[Accepted] = &[
     Accepted {
@@ -431,6 +507,14 @@ fn rendered(source: &str) -> Result<String, DefinitionParseError> {
 #[test]
 fn declaration_modifiers_produce_the_pins_trees() {
     for row in MODIFIERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn inline_attributes_produce_the_pins_trees() {
+    for row in ATTRIBUTES {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

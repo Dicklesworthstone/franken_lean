@@ -9,101 +9,672 @@ pub struct SimpAttribute {
     pub rule: Option<(u32, bool)>,
 }
 
-/// Recognize one inline attribute without discarding or re-lexing source bytes.
-/// Other attribute families and modifiers remain outside this source profile.
+/// One inline attribute list as the pin parses it, held as token indices until the leaves
+/// exist. Vendored `src/Lean/Parser/Term.lean`:
+///
+/// ```text
+/// attributes   := "@[" sepBy1 attrInstance ", " "]"
+/// attrInstance := attrKind attr          attrKind := optional («scoped» <|> «local»)
+/// ```
+///
+/// `attr` is a category whose leading identifier is read as the symbol it spells
+/// (`LeadingIdentBehavior.symbol`, `src/Lean/Parser/Attr.lean`), so `simp`, `grind` and
+/// `specialize` are identifiers to the lexer and atoms in the tree. The attributes read here are
+/// the ones the pin syntax corpus shows over `Init` and `Std`, each with the tree the pin built
+/// for it (bead `fln-pin-syntax-corpus-7b5b`). Any other attribute, and any argument form not
+/// listed, is refused where it starts: an attribute is never dropped, and parsing one gives it
+/// no meaning. The elaborator decides which attributes it implements.
+#[derive(Debug)]
+enum Shape {
+    /// The token's own leaf.
+    Leaf(usize),
+    /// An identifier-shaped token in symbol position, as the atom `text`.
+    Atom(usize, &'static str),
+    /// Two touching tokens the pin lexes as the one symbol `text` (`grind!`).
+    Joined(usize, usize, &'static str),
+    /// A literal's atom under its `num` or `str` node.
+    Literal(&'static str, usize),
+    Node(Name, Vec<Shape>),
+    Null(Vec<Shape>),
+}
+
+/// Attribute priorities nest only through parentheses; deeper nesting than this is refused
+/// rather than recursed into on a small host stack.
+const PRIORITY_DEPTH: usize = 16;
+
+struct AttributeReader<'a> {
+    view: &'a SourceView,
+    tokens: &'a [LexedToken],
+    at: usize,
+}
+
+impl AttributeReader<'_> {
+    fn kind(&self, at: usize) -> Option<&TokenKind> {
+        self.tokens.get(at).map(|token| &token.kind)
+    }
+
+    fn symbol(&self, text: &str) -> bool {
+        matches!(self.kind(self.at), Some(TokenKind::Symbol(symbol)) if symbol == text)
+    }
+
+    /// The pin's symbol `text` at the cursor: the lexer's own symbol for it, or an unescaped
+    /// identifier spelling it.
+    fn word(&self, text: &str) -> bool {
+        match self.kind(self.at) {
+            Some(TokenKind::Symbol(symbol)) => symbol == text,
+            Some(TokenKind::Ident(_)) => {
+                self.view.normalized().span_str(self.tokens[self.at].extent) == Some(text)
+            }
+            _ => false,
+        }
+    }
+
+    fn ident(&self) -> bool {
+        matches!(self.kind(self.at), Some(TokenKind::Ident(_)))
+    }
+
+    fn literal(&self, kind: LiteralKind) -> bool {
+        matches!(self.kind(self.at), Some(TokenKind::Literal(found)) if *found == kind)
+    }
+
+    fn touching(&self, left: usize, right: usize) -> bool {
+        match (self.tokens.get(left), self.tokens.get(right)) {
+            (Some(left), Some(right)) => left.extent.end() == right.extent.start(),
+            _ => false,
+        }
+    }
+
+    fn bad(&self) -> NatDefinitionParseError {
+        NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(self.view, self.tokens, self.at),
+            expected: NatDefinitionExpectation::Attribute,
+        }
+    }
+
+    fn take(&mut self) -> usize {
+        self.at += 1;
+        self.at - 1
+    }
+
+    /// The symbol `text` at the cursor, as an atom.
+    fn atom(&mut self, text: &'static str) -> Result<Shape, NatDefinitionParseError> {
+        if !self.word(text) {
+            return Err(self.bad());
+        }
+        Ok(Shape::Atom(self.take(), text))
+    }
+
+    /// The first of `texts` at the cursor, as an atom.
+    fn one_of(&mut self, texts: &[&'static str]) -> Option<Shape> {
+        let text = texts.iter().find(|text| self.word(text))?;
+        Some(Shape::Atom(self.take(), text))
+    }
+
+    fn take_ident(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        if !self.ident() {
+            return Err(self.bad());
+        }
+        Ok(Shape::Leaf(self.take()))
+    }
+
+    fn take_literal(&mut self, kind: LiteralKind) -> Result<Shape, NatDefinitionParseError> {
+        if !self.literal(kind) {
+            return Err(self.bad());
+        }
+        let node = if kind == LiteralKind::Str {
+            "str"
+        } else {
+            "num"
+        };
+        Ok(Shape::Literal(node, self.take()))
+    }
+
+    /// `prio`: a numeral, `default`/`low`/`mid`/`high`, or a parenthesized priority
+    /// (vendored `src/Init/Notation.lean`, `src/Lean/Parser/Attr.lean` `numPrio`).
+    /// `numPrio` is not a `leading_parser`, so a numeral is its `num` node alone.
+    fn priority(&mut self, depth: usize) -> Result<Shape, NatDefinitionParseError> {
+        if self.literal(LiteralKind::Nat) {
+            return self.take_literal(LiteralKind::Nat);
+        }
+        for (text, kind) in [
+            ("default", "prioDefault"),
+            ("low", "prioLow"),
+            ("mid", "prioMid"),
+            ("high", "prioHigh"),
+        ] {
+            if self.word(text) {
+                return Ok(Shape::Node(
+                    Name::from_components([kind]),
+                    vec![Shape::Atom(self.take(), text)],
+                ));
+            }
+        }
+        if self.symbol("(") && depth < PRIORITY_DEPTH {
+            let open = Shape::Leaf(self.take());
+            let inner = self.priority(depth + 1)?;
+            if !self.symbol(")") {
+                return Err(self.bad());
+            }
+            let close = Shape::Leaf(self.take());
+            return Ok(Shape::Node(
+                Name::from_components(["prio(_)"]),
+                vec![open, inner, close],
+            ));
+        }
+        Err(self.bad())
+    }
+
+    fn starts_priority(&self) -> bool {
+        self.literal(LiteralKind::Nat)
+            || self.symbol("(")
+            || ["default", "low", "mid", "high"]
+                .iter()
+                .any(|text| self.word(text))
+    }
+
+    fn optional_priority(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        Ok(Shape::Null(if self.starts_priority() {
+            vec![self.priority(0)?]
+        } else {
+            Vec::new()
+        }))
+    }
+
+    /// `"simp" (simpPre <|> simpPost)? unicode("← ", "<- ")? (prio)?` and the simp sets
+    /// declared with the same grammar (vendored `src/Init/Tactics.lean`).
+    fn simp_like(&mut self, keyword: &'static str) -> Result<Shape, NatDefinitionParseError> {
+        let head = self.atom(keyword)?;
+        let phase = Shape::Null(
+            [("↓", "simpPre"), ("↑", "simpPost")]
+                .into_iter()
+                .find(|(text, _)| self.symbol(text))
+                .map(|(text, kind)| {
+                    vec![Shape::Node(
+                        parser_kind(&["Tactic", kind]),
+                        vec![Shape::Atom(self.take(), text)],
+                    )]
+                })
+                .unwrap_or_default(),
+        );
+        let reverse = Shape::Null(self.one_of(&["←", "<-"]).into_iter().collect());
+        let priority = self.optional_priority()?;
+        Ok(Shape::Node(
+            parser_kind(&["Attr", keyword]),
+            vec![head, phase, reverse, priority],
+        ))
+    }
+
+    /// `patternIgnore(a <|> b)` over single symbols: the alternative is a `token.<symbol>` node.
+    fn pattern_ignore(&mut self, texts: &[&'static str]) -> Option<Shape> {
+        let text = *texts.iter().find(|text| self.symbol(text))?;
+        Some(Shape::Node(
+            Name::from_components(["patternIgnore"]),
+            vec![Shape::Node(
+                Name::from_components(["token", text]),
+                vec![Shape::Atom(self.take(), text)],
+            )],
+        ))
+    }
+
+    fn grind_gen(&mut self) -> Shape {
+        Shape::Null(if self.word("gen") {
+            vec![grind_node(
+                "grindGen",
+                vec![Shape::Atom(self.take(), "gen")],
+            )]
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// `grindMod` (vendored `src/Init/Grind/Attr.lean`), its alternatives in the pin's order.
+    fn grind_modifier(&mut self) -> Result<Option<Shape>, NatDefinitionParseError> {
+        let next_is = |reader: &Self, offset: usize, text: &str| matches!(reader.kind(reader.at + offset), Some(TokenKind::Symbol(symbol)) if symbol == text);
+        let modifier = if self.symbol("_") && next_is(self, 1, "=") && next_is(self, 2, "_") {
+            let parts = vec![
+                Shape::Atom(self.take(), "_"),
+                Shape::Atom(self.take(), "="),
+                Shape::Atom(self.take(), "_"),
+                self.grind_gen(),
+            ];
+            grind_node("grindEqBoth", parts)
+        } else if self.symbol("=") && next_is(self, 1, "_") {
+            let parts = vec![
+                Shape::Atom(self.take(), "="),
+                Shape::Atom(self.take(), "_"),
+                self.grind_gen(),
+            ];
+            grind_node("grindEqRhs", parts)
+        } else if self.symbol("=") {
+            let parts = vec![Shape::Atom(self.take(), "="), self.grind_gen()];
+            grind_node("grindEq", parts)
+        } else if (self.symbol("←") || self.symbol("<-")) && next_is(self, 1, "=") {
+            let arrow = if self.symbol("←") { "←" } else { "<-" };
+            let group = Shape::Node(
+                Name::from_components(["group"]),
+                vec![
+                    Shape::Atom(self.take(), arrow),
+                    Shape::Atom(self.take(), "="),
+                ],
+            );
+            grind_node(
+                "grindEqBwd",
+                vec![Shape::Node(
+                    Name::from_components(["patternIgnore"]),
+                    vec![group],
+                )],
+            )
+        } else if let Some(arrow) = self.pattern_ignore(&["←", "<-"]) {
+            let generalize = self.grind_gen();
+            grind_node("grindBwd", vec![arrow, generalize])
+        } else if let Some(arrow) = self.pattern_ignore(&["→", "->"]) {
+            grind_node("grindFwd", vec![arrow])
+        } else if let Some(arrow) = self.pattern_ignore(&["⇐", "<="]) {
+            grind_node("grindRL", vec![arrow])
+        } else if let Some(arrow) = self.pattern_ignore(&["⇒", "=>"]) {
+            grind_node("grindLR", vec![arrow])
+        } else if self.word("cases") {
+            let cases = Shape::Atom(self.take(), "cases");
+            if self.word("eager") {
+                grind_node(
+                    "grindCasesEager",
+                    vec![cases, Shape::Atom(self.take(), "eager")],
+                )
+            } else {
+                grind_node("grindCases", vec![cases])
+            }
+        } else if let Some((text, kind)) = [
+            ("usr", "grindUsr"),
+            ("intro", "grindIntro"),
+            ("ext", "grindExt"),
+            ("gen", "grindGen"),
+            ("inj", "grindInj"),
+            ("funCC", "grindFunCC"),
+            ("unfold", "grindUnfold"),
+        ]
+        .into_iter()
+        .find(|(text, _)| self.word(text))
+        {
+            grind_node(kind, vec![Shape::Atom(self.take(), text)])
+        } else if self.word("symbol") {
+            let symbol = Shape::Atom(self.take(), "symbol");
+            let priority = self.priority(0)?;
+            grind_node("grindSym", vec![symbol, priority])
+        } else if let Some(dot) = self.pattern_ignore(&[".", "·"]) {
+            let generalize = self.grind_gen();
+            grind_node("grindDef", vec![dot, generalize])
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(grind_node("grindMod", vec![modifier])))
+    }
+
+    /// `"grind" (grindMod)?` and its `grind!` variant.
+    fn grind(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let bang = self.word("grind")
+            && matches!(self.kind(self.at + 1), Some(TokenKind::Symbol(symbol)) if symbol == "!")
+            && self.touching(self.at, self.at + 1);
+        let (head, kind) = if bang {
+            let first = self.take();
+            (Shape::Joined(first, self.take(), "grind!"), "grind!")
+        } else if self.word("grind!") {
+            (Shape::Atom(self.take(), "grind!"), "grind!")
+        } else {
+            (self.atom("grind")?, "grind")
+        };
+        let modifier = Shape::Null(self.grind_modifier()?.into_iter().collect());
+        Ok(Shape::Node(
+            parser_kind(&["Attr", kind]),
+            vec![head, modifier],
+        ))
+    }
+
+    /// `"deprecated" (ident)? (str)? (" (" &"since" " := " str ")")?` (vendored
+    /// `src/Init/Notation.lean`), whose kind is `Lean.deprecated`.
+    fn deprecated(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let head = self.atom("deprecated")?;
+        let replacement = Shape::Null(if self.ident() {
+            vec![Shape::Leaf(self.take())]
+        } else {
+            Vec::new()
+        });
+        let message = Shape::Null(if self.literal(LiteralKind::Str) {
+            vec![self.take_literal(LiteralKind::Str)?]
+        } else {
+            Vec::new()
+        });
+        let since = Shape::Null(if self.symbol("(") {
+            vec![
+                Shape::Leaf(self.take()),
+                self.atom("since")?,
+                {
+                    if !self.symbol(":=") {
+                        return Err(self.bad());
+                    }
+                    Shape::Leaf(self.take())
+                },
+                self.take_literal(LiteralKind::Str)?,
+                {
+                    if !self.symbol(")") {
+                        return Err(self.bad());
+                    }
+                    Shape::Leaf(self.take())
+                },
+            ]
+        } else {
+            Vec::new()
+        });
+        Ok(Shape::Node(
+            Name::from_components(["Lean", "deprecated"]),
+            vec![head, replacement, message, since],
+        ))
+    }
+
+    /// `"extern" (externEntry)*`, `externEntry := (ident)? (&"inline")? str`.
+    fn extern_attribute(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let head = self.atom("extern")?;
+        let mut entries = Vec::new();
+        while self.ident() || self.literal(LiteralKind::Str) {
+            let backend = Shape::Null(if self.ident() {
+                vec![Shape::Leaf(self.take())]
+            } else {
+                Vec::new()
+            });
+            let inline = Shape::Null(self.one_of(&["inline"]).into_iter().collect());
+            let name = self.take_literal(LiteralKind::Str)?;
+            entries.push(Shape::Node(
+                parser_kind(&["Attr", "externEntry"]),
+                vec![backend, inline, name],
+            ));
+        }
+        Ok(Shape::Node(
+            parser_kind(&["Attr", "extern"]),
+            vec![head, Shape::Null(entries)],
+        ))
+    }
+
+    /// One `attr`, dispatched on the symbol its leading token spells.
+    fn attribute(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let keyword_then_ident = |reader: &mut Self, keyword: &'static str| {
+            let head = reader.atom(keyword)?;
+            let name = reader.take_ident()?;
+            Ok(Shape::Node(
+                parser_kind(&["Attr", keyword]),
+                vec![head, name],
+            ))
+        };
+        if self.word("simp") {
+            return self.simp_like("simp");
+        }
+        if self.word("wf_preprocess") {
+            return self.simp_like("wf_preprocess");
+        }
+        if self.word("grind") || self.word("grind!") {
+            return self.grind();
+        }
+        if self.word("deprecated") {
+            return self.deprecated();
+        }
+        if self.word("extern") {
+            return self.extern_attribute();
+        }
+        for keyword in ["instance", "default_instance"] {
+            if self.word(keyword) {
+                let head = self.atom(keyword)?;
+                let priority = self.optional_priority()?;
+                return Ok(Shape::Node(
+                    parser_kind(&["Attr", keyword]),
+                    vec![head, priority],
+                ));
+            }
+        }
+        for keyword in ["export", "macro", "tactic_alt"] {
+            if self.word(keyword) {
+                return keyword_then_ident(self, keyword);
+            }
+        }
+        if self.word("specialize") {
+            let head = self.atom("specialize")?;
+            let mut arguments = Vec::new();
+            while self.ident() || self.literal(LiteralKind::Nat) {
+                arguments.push(if self.ident() {
+                    Shape::Leaf(self.take())
+                } else {
+                    self.take_literal(LiteralKind::Nat)?
+                });
+            }
+            return Ok(Shape::Node(
+                parser_kind(&["Attr", "specialize"]),
+                vec![head, Shape::Null(arguments)],
+            ));
+        }
+        if self.word("suggest_for") {
+            let head = self.atom("suggest_for")?;
+            let mut names = vec![self.take_ident()?];
+            while self.ident() {
+                names.push(Shape::Leaf(self.take()));
+            }
+            return Ok(Shape::Node(
+                Name::from_components(["Lean", "suggest_for"]),
+                vec![head, Shape::Null(names)],
+            ));
+        }
+        if self.word("cbv_eval") {
+            let head = self.atom("cbv_eval")?;
+            let reverse = Shape::Null(self.one_of(&["←", "<-"]).into_iter().collect());
+            let name = Shape::Null(if self.ident() {
+                vec![Shape::Leaf(self.take())]
+            } else {
+                Vec::new()
+            });
+            return Ok(Shape::Node(
+                parser_kind(&["Attr", "cbv_eval"]),
+                vec![head, reverse, name],
+            ));
+        }
+        if self.word("ext") {
+            // Only the bare form with an optional priority: `extIff`/`extFlat` are refused.
+            let head = self.atom("ext")?;
+            let priority = self.optional_priority()?;
+            return Ok(Shape::Node(
+                parser_kind(&["Attr", "ext"]),
+                vec![
+                    head,
+                    Shape::Null(Vec::new()),
+                    Shape::Null(Vec::new()),
+                    priority,
+                ],
+            ));
+        }
+        if self.word("norm_cast") {
+            // Only the bare form: a label or a numeral is refused.
+            let head = self.atom("norm_cast")?;
+            return Ok(Shape::Node(
+                parser_kind(&["Attr", "norm_cast"]),
+                vec![head, Shape::Null(Vec::new()), Shape::Null(Vec::new())],
+            ));
+        }
+        // Builtin attribute keywords whose own parsers are not read here (`class`, `recursor`,
+        // `tactic_tag`, …) must not fall through to `Attr.simple`, which the pin never tries for
+        // a symbol-indexed attribute.
+        if !self.ident()
+            || [
+                "class",
+                "recursor",
+                "tactic_tag",
+                "tactic_name",
+                "method_specs_simp",
+                "simproc",
+                "sevalproc",
+                "builtin_simproc",
+                "builtin_sevalproc",
+                "grind?",
+                "grind!?",
+            ]
+            .iter()
+            .any(|text| self.word(text))
+        {
+            return Err(self.bad());
+        }
+        // An escaped name (`«simp»`) is refused: which parser the pin indexes it under is not
+        // measured here.
+        if self
+            .view
+            .normalized()
+            .span_str(self.tokens[self.at].extent)
+            .is_some_and(|text| text.starts_with('«'))
+        {
+            return Err(self.bad());
+        }
+        // `Attr.simple := ident (prio <|> ident)?`.
+        let name = Shape::Leaf(self.take());
+        let argument = if self.starts_priority() {
+            vec![self.priority(0)?]
+        } else if self.ident() {
+            vec![Shape::Leaf(self.take())]
+        } else {
+            Vec::new()
+        };
+        Ok(Shape::Node(
+            parser_kind(&["Attr", "simple"]),
+            vec![name, Shape::Null(argument)],
+        ))
+    }
+
+    /// `attrKind attr`.
+    fn instance(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let scope = [("scoped", "scoped"), ("local", "local")]
+            .into_iter()
+            .find(|(text, _)| self.word(text))
+            .map(|(text, kind)| {
+                vec![Shape::Node(
+                    parser_kind(&["Term", kind]),
+                    vec![Shape::Atom(self.take(), text)],
+                )]
+            })
+            .unwrap_or_default();
+        let kind = Shape::Node(parser_kind(&["Term", "attrKind"]), vec![Shape::Null(scope)]);
+        let attribute = self.attribute()?;
+        Ok(Shape::Node(
+            parser_kind(&["Term", "attrInstance"]),
+            vec![kind, attribute],
+        ))
+    }
+
+    /// `"@[" sepBy1 attrInstance ", " "]"`, from the cursor at `@[`.
+    fn attributes(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let open = Shape::Leaf(self.take());
+        let mut instances = vec![self.instance()?];
+        while self.symbol(",") {
+            instances.push(Shape::Leaf(self.take()));
+            instances.push(self.instance()?);
+        }
+        if !self.symbol("]") {
+            return Err(self.bad());
+        }
+        let close = Shape::Leaf(self.take());
+        Ok(Shape::Node(
+            parser_kind(&["Term", "attributes"]),
+            vec![open, Shape::Null(instances), close],
+        ))
+    }
+}
+
+fn grind_node(kind: &str, parts: Vec<Shape>) -> Shape {
+    Shape::Node(parser_kind(&["Attr", kind]), parts)
+}
+
+fn build(shape: &Shape, leaves: &Leaves) -> Result<Syntax, DefinitionParseError> {
+    Ok(match shape {
+        Shape::Leaf(at) => leaves.leaf(*at)?,
+        Shape::Atom(at, text) => Syntax::Atom {
+            info: leaves.leaf(*at)?.info(),
+            val: (*text).into(),
+        },
+        Shape::Joined(first, last, text) => {
+            let (
+                SourceInfo::Original { leading, pos, .. },
+                SourceInfo::Original {
+                    trailing, end_pos, ..
+                },
+            ) = (leaves.leaf(*first)?.info(), leaves.leaf(*last)?.info())
+            else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::Attribute,
+                });
+            };
+            Syntax::Atom {
+                info: SourceInfo::Original {
+                    leading,
+                    pos,
+                    trailing,
+                    end_pos,
+                },
+                val: (*text).into(),
+            }
+        }
+        Shape::Literal(kind, at) => {
+            Syntax::node(Name::from_components([*kind]), vec![leaves.leaf(*at)?])
+        }
+        Shape::Node(kind, parts) => Syntax::node(
+            kind.clone(),
+            parts
+                .iter()
+                .map(|part| build(part, leaves))
+                .collect::<Result<_, _>>()?,
+        ),
+        Shape::Null(parts) => null_node(
+            parts
+                .iter()
+                .map(|part| build(part, leaves))
+                .collect::<Result<_, _>>()?,
+        ),
+    })
+}
+
+/// Read the attribute list at token `start`, if there is one: the token index after its `]` and
+/// its tree as token indices.
+fn read_inline(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+) -> Result<Option<(usize, Shape)>, NatDefinitionParseError> {
+    let mut reader = AttributeReader {
+        view,
+        tokens,
+        at: start,
+    };
+    if !reader.symbol("@[") {
+        return Ok(None);
+    }
+    let shape = reader.attributes()?;
+    Ok(Some((reader.at, shape)))
+}
+
+/// Where the declaration's attribute list, at token `start`, ends: the token index after its
+/// `]`, or `start` when the declaration has none. Refuses an attribute this grammar does not
+/// read, where it starts.
 pub(crate) fn inline_end(
     view: &SourceView,
     tokens: &[LexedToken],
+    start: usize,
 ) -> Result<usize, DefinitionParseError> {
-    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let bad = |at| NatDefinitionParseError::OutsideSeedGrammar {
-        at: original_position(view, tokens, at),
-        expected: NatDefinitionExpectation::DefinitionKeyword,
-    };
-    if !is(0, "@[") {
-        return Ok(0);
-    }
-    if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(n)) if *n == Name::from_components(["simp"]))
-        || view.normalized().span_str(tokens[1].extent) != Some("simp")
-    {
-        return Err(bad(1));
-    }
-    let mut at = 2;
-    at += usize::from(is(at, "←") || is(at, "<-"));
-    if matches!(
-        tokens.get(at).map(|t| &t.kind),
-        Some(TokenKind::Literal(LiteralKind::Nat))
-    ) {
-        let text = view
-            .normalized()
-            .span_str(tokens[at].extent)
-            .ok_or_else(|| bad(at))?;
-        if !text.bytes().all(|b| b.is_ascii_digit()) || text.parse::<u32>().is_err() {
-            return Err(bad(at));
-        }
-        at += 1;
-    }
-    if !is(at, "]") {
-        return Err(bad(at));
-    }
-    Ok(at + 1)
+    Ok(read_inline(view, tokens, start)?.map_or(start, |(end, _)| end))
 }
 
-/// The Reference declaration modifier/attribute production, with original
-/// lexer leaves (including CRLF mapping, comments and Unicode extents).
+/// The declaration's `declModifiers` attribute slot, from the original leaves: a null node
+/// holding the `Term.attributes` node [`inline_end`] measured.
 pub(crate) fn inline_syntax(
+    view: &SourceView,
     leaves: &Leaves,
     tokens: &[LexedToken],
-    end: usize,
+    start: usize,
 ) -> Result<Syntax, DefinitionParseError> {
-    let mut at = 2;
-    let reverse = if matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "←" || s == "<-")
-    {
-        at += 1;
-        null_node(vec![leaves.leaf(at - 1)?])
-    } else {
-        null_node(Vec::new())
+    let Some((_, shape)) = read_inline(view, tokens, start)? else {
+        return Ok(null_node(Vec::new()));
     };
-    let priority = if at + 1 < end {
-        null_node(vec![Syntax::node(
-            parser_kind(&["Priority", "numPrio"]),
-            vec![Syntax::node(
-                Name::from_components(["num"]),
-                vec![leaves.leaf(at)?],
-            )],
-        )])
-    } else {
-        null_node(Vec::new())
-    };
-    let simp = Syntax::node(
-        parser_kind(&["Attr", "simp"]),
-        vec![
-            Syntax::Atom {
-                info: leaves.leaf(1)?.info(),
-                val: "simp".into(),
-            },
-            null_node(Vec::new()),
-            reverse,
-            priority,
-        ],
-    );
-    Ok(null_node(vec![Syntax::node(
-        parser_kind(&["Term", "attributes"]),
-        vec![
-            leaves.leaf(0)?,
-            null_node(vec![Syntax::node(
-                parser_kind(&["Term", "attrInstance"]),
-                vec![
-                    Syntax::node(
-                        parser_kind(&["Term", "attrKind"]),
-                        vec![null_node(Vec::new())],
-                    ),
-                    simp,
-                ],
-            )]),
-            leaves.leaf(end - 1)?,
-        ],
-    )]))
+    Ok(null_node(vec![build(&shape, leaves)?]))
 }
 
 pub fn parse(source: &[u8]) -> Result<Option<SimpAttribute>, DefinitionParseError> {
@@ -212,27 +783,75 @@ mod tests {
     #[test]
     fn unsupported_inline_attributes_never_disappear_from_the_command() {
         for source in [
-            "@[other] def x := 0",
             "@[«simp»] def x := 0",
-            "@[simp, other] def x := 0",
             "@[simp][other] def x := 0",
             "@[simp] @[simp] def x := 0",
             "@[simp ← ←] def x := 0",
-            "@[simp 4294967296] def x := 0",
-            "@[simp 0xff] def x := 0",
-            "@[simp high] def x := 0",
-            "@[local simp] def x := 0",
-            "@[simp ↓] def x := 0",
+            "@[simp foo] def x := 0",
+            "@[simp, ] def x := 0",
+            "@[] def x := 0",
+            "@[class] def x := 0",
+            "@[ext (iff := false)] def x := 0",
             "@[simp] instance value : Inhabited Nat := Inhabited.mk 0",
             "@[simp] inductive T where | mk",
             "@[simp]",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+        // Attributes the pin parses keep their place in `declModifiers`; the elaborator, not
+        // the parser, refuses the ones it does not implement (`fln`'s source_default_simp).
+        for source in [
+            "@[other] def x := 0",
+            "@[simp, other] def x := 0",
+            "@[simp 4294967296] def x := 0",
+            "@[simp 0xff] def x := 0",
+            "@[simp high] def x := 0",
+            "@[local simp] def x := 0",
+            "@[simp ↓] def x := 0",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let Syntax::Node { args, .. } = parsed.syntax() else {
+                panic!("a declaration node");
+            };
+            let Syntax::Node {
+                args: modifiers, ..
+            } = &args[0]
+            else {
+                panic!("declModifiers");
+            };
+            assert!(
+                matches!(&modifiers[1], Syntax::Node { args, .. }
+                    if matches!(args.as_slice(), [Syntax::Node { kind, .. }]
+                        if kind == &parser_kind(&["Term", "attributes"]))),
+                "{source}"
+            );
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+        }
         let source = b"def x := 0\n@[other]\ndef y := 1\n";
         let commands = partition(source).unwrap();
         assert_eq!(commands.len(), 2);
-        assert!(parse_definition(commands[1].1).is_err());
+        let parsed = parse_definition(commands[1].1).unwrap();
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("a declaration node");
+        };
+        let Syntax::Node {
+            args: modifiers, ..
+        } = &args[0]
+        else {
+            panic!("declModifiers");
+        };
+        let Syntax::Node {
+            args: attributes, ..
+        } = &modifiers[1]
+        else {
+            panic!("the attribute slot");
+        };
+        assert_eq!(
+            attributes.len(),
+            1,
+            "the attribute stays with its declaration"
+        );
 
         // A modifier after the attribute is parsed into its own `declModifiers` slot
         // (`unsafe` is slot 5) rather than dropped; elaboration still refuses it.

@@ -48,9 +48,10 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         };
         expect_atom(keyword, "simp_all", "whole-context simplification keyword")?;
-        expect_empty_null(config, "default simplification configuration")?;
+        expect_default_config(config, "default simplification configuration")?;
         // Reuse the ordinary set parser without reparsing source or changing
         // the persistent registry. Its location slot is an empty null node.
+        let no_location = Syntax::node(Name::from_components(["null"]), Vec::new());
         let selection = [
             Syntax::Atom {
                 info: keyword.info(),
@@ -60,7 +61,7 @@ impl Context {
             discharger.clone(),
             only.clone(),
             arguments.clone(),
-            config.clone(),
+            no_location,
         ];
         self.txn.lctx = initial.lctx.clone();
         let mut rules = self.simp_rules(&selection)?;

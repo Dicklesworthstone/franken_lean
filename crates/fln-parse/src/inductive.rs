@@ -51,14 +51,19 @@ fn ctor(
     ))
 }
 
+/// `inductive` at token `keyword` (1 after a doc comment, else 0).
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
+    keyword: usize,
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
-    if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-        return Err(refuse(&view, &tokens, 1));
+    if !matches!(
+        tokens.get(keyword + 1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(&view, &tokens, keyword + 1));
     }
-    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, keyword + 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let end_body = records::deriving_start(&tokens, cursor);
     let mut end_header = cursor;
@@ -134,11 +139,11 @@ pub(super) fn parse(
     let command = Syntax::node(
         parser_kind(&["Command", "inductive"]),
         vec![
-            leaves.leaf(0)?,
+            leaves.leaf(keyword)?,
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
                 vec![
-                    leaves.leaf(1)?,
+                    leaves.leaf(keyword + 1)?,
                     levels::declaration_syntax(&leaves, universe_suffix)?,
                 ],
             ),
@@ -152,11 +157,12 @@ pub(super) fn parse(
             records::deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
+    let modifiers = records::modifiers_after_doc(&view, &leaves, &tokens, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(
             parser_kind(&["Command", "declaration"]),
-            vec![records::modifiers(), command],
+            vec![modifiers, command],
         ),
         epilogue,
     })

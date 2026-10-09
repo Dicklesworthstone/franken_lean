@@ -231,6 +231,20 @@ fn expect_empty_null(
     expect_node(syntax, &Name::str(Name::anonymous(), "null"), 0, expected).map(|_| ())
 }
 
+/// A tactic's configuration slot holding the default: the pin's empty `optConfig`
+/// (`Init/Tactics.lean`), or the empty null node of syntax the elaborator builds itself.
+fn expect_default_config(
+    syntax: &Syntax,
+    expected: &'static str,
+) -> Result<(), NatDefinitionElabError> {
+    if matches!(syntax, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "optConfig"]))
+    {
+        let parts = expect_node(syntax, &parser_kind(&["Tactic", "optConfig"]), 1, expected)?;
+        return expect_empty_null(&parts[0], expected);
+    }
+    expect_empty_null(syntax, expected)
+}
+
 fn expect_null_args<'a>(
     syntax: &'a Syntax,
     expected: &'static str,
