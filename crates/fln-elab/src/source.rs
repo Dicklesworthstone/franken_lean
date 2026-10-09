@@ -1155,14 +1155,24 @@ impl Context {
                 }
             };
             if !insert {
-                term.type_ = reduced;
+                // A completed term keeps its named type. Unfolding a
+                // function-backed monad here would store an anonymous Pi
+                // in inferred action aliases, losing the constructor that
+                // later Bind and MonadLiftT instance selection needs.
+                // Argument and receiver consumers still need the exposed
+                // telescope; conversion checks remain unchanged.
+                if matches!(
+                    insertion,
+                    ImplicitInsertion::ExplicitArgument | ImplicitInsertion::FieldReceiver
+                ) {
+                    term.type_ = reduced;
+                }
                 break;
             }
             if let ImplicitInsertion::Expected(Some(expected)) = insertion {
                 let expected = self.whnf(expected)?;
                 if matches!(expected.node(), ExprNode::ForallE { binder_info: style, .. } if style == binder_info)
                 {
-                    term.type_ = reduced;
                     break;
                 }
             }

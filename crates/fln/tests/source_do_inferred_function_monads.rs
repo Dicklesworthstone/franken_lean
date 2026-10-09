@@ -119,3 +119,31 @@ fn recovering_a_monad_never_invents_bind_or_accepts_a_wrong_continuation() {
         .into_complete()
         .unwrap();
 }
+
+#[test]
+fn inferred_global_and_local_action_aliases_keep_their_monad_constructor() {
+    execute(
+        r#"
+def savedMark := mark 1
+def savedAlias := savedMark
+def inferred := do
+  let first ← savedAlias
+  let second ← markAlias 2
+  finish (first * 100 + second)
+#eval score (inferred 3)
+"#,
+        "331312",
+    );
+    execute(
+        r#"
+def inferred := do
+  let saved := mark 1
+  let alias := saved
+  let first ← alias
+  let second ← markAlias 2
+  finish (first * 100 + second)
+#eval score (inferred 3)
+"#,
+        "331312",
+    );
+}
