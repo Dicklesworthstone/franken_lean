@@ -1,0 +1,314 @@
+name: Native array construction - implement and verify
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-array-construction-landing.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-array-updates-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install repository-pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Prepare array construction implementation and regression patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apply-array-construction.py" <<'PY'
+          from pathlib import Path
+          source = Path("crates/fln-vm/src/interpreter.rs")
+          text = source.read_text(encoding="utf-8")
+          replacements = [
+              ("mod arrays;", "mod array_construction;\nmod arrays;"),
+              ("    ArrayExtra(arrays::Intrinsic),", "    ArrayConstruction(array_construction::Intrinsic),\n    ArrayExtra(arrays::Intrinsic),"),
+              ("                .map(Self::ArrayExtra)\n", "                .map(Self::ArrayExtra)\n                .or_else(|| array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction))\n"),
+              ("        IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),", "        IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),\n        IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),"),
+              ("        | IntrinsicImplementation::ArrayExtra(_)", "        | IntrinsicImplementation::ArrayConstruction(_)\n        | IntrinsicImplementation::ArrayExtra(_)"),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1 or new in text:
+                  raise SystemExit(f"ambiguous or already applied interpreter anchor: {old!r}")
+              text = text.replace(old, new, 1)
+          source.write_text(text, encoding="utf-8")
+          module = Path("crates/fln-vm/src/interpreter/array_construction.rs")
+          if module.exists():
+              raise SystemExit("array construction adapter already exists")
+          module.write_text(r'''//! List/Array representation bridges and empty-array construction.
+          //!
+          //! The List runtime shape is nil = scalar 0, cons = tag 1 with two object
+          //! fields. Validate the entire spine; a malformed tail must not turn into a
+          //! successful, truncated array. Both directions are iterative and retain each
+          //! payload before the input container can be released.
+
+          use super::{
+              IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value,
+              expect_arity, with_nat_view,
+          };
+
+          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+          pub(super) enum Intrinsic {
+              FromList,
+              ToList,
+              Empty,
+          }
+
+          impl Intrinsic {
+              pub(super) fn for_row(row: &str) -> Option<Self> {
+                  Some(match row {
+                      "extern:Array.mk" => Self::FromList,
+                      "extern:Array.toList" => Self::ToList,
+                      "extern:Array.emptyWithCapacity" | "extern:Array.mkEmpty" => Self::Empty,
+                      _ => return None,
+                  })
+              }
+
+              pub(super) fn invoke(
+                  self,
+                  row: &str,
+                  args: &[Obj],
+              ) -> Result<IntrinsicResult, IntrinsicFailure> {
+                  expect_arity(row, args, 1)?;
+                  let result = match self {
+                      Self::FromList => {
+                          let mut cursor = args[0].clone_ref();
+                          let mut items = Vec::new();
+                          loop {
+                              if cursor.is_scalar() {
+                                  if cursor.unbox() == 0 {
+                                      break;
+                                  }
+                                  return Err(VmRefusal::InvalidCtorObject.into());
+                              }
+                              let header = cursor.header();
+                              if header.tag != 1 || header.other != 2 {
+                                  return Err(VmRefusal::InvalidCtorObject.into());
+                              }
+                              let head = cursor.try_ctor_child(0).ok_or(VmRefusal::InvalidCtorObject)?;
+                              let tail = cursor.try_ctor_child(1).ok_or(VmRefusal::InvalidCtorObject)?;
+                              items.push(head);
+                              cursor = tail;
+                          }
+                          Obj::mk_array(items)
+                      }
+                      Self::ToList => {
+                          let (size, _) = array_value(&args[0], "Array.toList", 0)?;
+                          let mut result = Obj::mk_nat(0);
+                          for index in (0..size).rev() {
+                              result = Obj::mk_ctor(1, vec![args[0].array_child(index), result], &[]);
+                          }
+                          result
+                      }
+                      Self::Empty => {
+                          // As with ByteArray.emptyWithCapacity, capacity is a hint,
+                          // not permission to allocate an arbitrary attacker-sized buffer.
+                          // The VM's copy-always arrays expose the canonical empty value.
+                          with_nat_view(&args[0], "Array.emptyWithCapacity", 0, |_| ())?;
+                          Obj::mk_array(Vec::new())
+                      }
+                  };
+                  Ok(IntrinsicResult::raw_object(result))
+              }
+          }
+          ''', encoding="utf-8")
+          tests = Path("crates/fln-vm/tests/flbc_interpreter.rs")
+          text = tests.read_text(encoding="utf-8")
+          if "fn array_construction_roundtrip_" in text:
+              raise SystemExit("array construction tests already exist")
+          tests.write_text(text + r'''
+
+          #[test]
+          fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
+              let _guard = lock();
+              let program = validated(vec![function(0, 0, 9, vec![
+                  Instruction::String { dst: r(0), value: "first".into() },
+                  Instruction::String { dst: r(1), value: "second".into() },
+                  Instruction::Array { dst: r(2), items: vec![r(0), r(1), r(0)] },
+                  Instruction::Copy { dst: r(3), src: r(2) },
+                  intrinsic(r(4), "extern:Array.toList", vec![r(2)]),
+                  Instruction::Copy { dst: r(5), src: r(4) },
+                  intrinsic(r(6), "extern:Array.mk", vec![r(4)]),
+                  Instruction::Ctor { dst: r(7), tag: 0, fields: vec![r(3), r(5), r(6)], scalar_bytes: Vec::new() },
+                  Instruction::Return { src: r(7) },
+              ])]);
+              let completed = returned(execute(&program, ExecutionLimits::default(), None));
+              let original = completed.value.ctor_child(0);
+              let list = completed.value.ctor_child(1);
+              let rebuilt = completed.value.ctor_child(2);
+              assert_eq!(array_update_strings(&original), ["first", "second", "first"]);
+              assert_eq!(array_update_strings(&rebuilt), ["first", "second", "first"]);
+              let mut cursor = list.clone_ref();
+              let mut count = 0;
+              while !cursor.is_scalar() {
+                  assert_eq!(cursor.header().tag, 1);
+                  assert_eq!(cursor.header().other, 2);
+                  let child = cursor.ctor_child(0);
+                  assert_eq!(child.identity_token(), original.array_child(count).identity_token());
+                  cursor = cursor.ctor_child(1);
+                  count += 1;
+              }
+              assert_eq!(cursor.unbox(), 0);
+              assert_eq!(count, 3);
+              let survivor = rebuilt.array_child(0);
+              drop(completed);
+              drop(original);
+              drop(list);
+              drop(rebuilt);
+              assert!(survivor.try_string_view().is_some());
+              assert_eq!(survivor.header().rc, 1);
+          }
+
+          #[test]
+          fn array_construction_empty_roundtrip_uses_the_scalar_nil_representation() {
+              let _guard = lock();
+              let program = validated(vec![function_with_callable_result(
+                  0, Vec::new(), CallableResultOwnership::Erased, 3, vec![
+                      Instruction::Nat { dst: r(0), value: 0 },
+                      intrinsic(r(1), "extern:Array.mk", vec![r(0)]),
+                      intrinsic(r(2), "extern:Array.toList", vec![r(1)]),
+                      Instruction::Return { src: r(2) },
+                  ],
+              )]);
+              let completed = returned(execute(&program, ExecutionLimits::default(), None));
+              assert!(completed.value.is_scalar());
+              assert_eq!(completed.value.unbox(), 0);
+          }
+
+          #[test]
+          fn array_construction_rejects_malformed_lists_without_publishing_a_prefix() {
+              let _guard = lock();
+              for malformed in [
+                  Instruction::Nat { dst: r(1), value: 1 },
+                  Instruction::Ctor { dst: r(1), tag: 0, fields: vec![r(0), r(0)], scalar_bytes: Vec::new() },
+                  Instruction::Ctor { dst: r(1), tag: 1, fields: vec![r(0)], scalar_bytes: Vec::new() },
+                  Instruction::Ctor { dst: r(1), tag: 1, fields: vec![r(0), r(0), r(0)], scalar_bytes: Vec::new() },
+                  Instruction::String { dst: r(1), value: "not a list".into() },
+              ] {
+                  let program = validated(vec![function(0, 0, 4, vec![
+                      Instruction::Nat { dst: r(0), value: 0 },
+                      malformed,
+                      // A valid cons preceding a bad tail must not be accepted either.
+                      Instruction::Ctor { dst: r(2), tag: 1, fields: vec![r(0), r(1)], scalar_bytes: Vec::new() },
+                      intrinsic(r(3), "extern:Array.mk", vec![r(2)]),
+                      Instruction::Return { src: r(3) },
+                  ])]);
+                  match execute(&program, ExecutionLimits::default(), None) {
+                      Outcome::Complete(VmExit::Refused { refusal: VmRefusal::InvalidCtorObject, .. }) => {}
+                      other => panic!("malformed list must refuse: {other:?}"),
+                  }
+              }
+          }
+
+          #[test]
+          fn array_construction_walks_long_lists_without_host_recursion() {
+              let _guard = lock();
+              let mut code = vec![
+                  Instruction::String { dst: r(0), value: "payload".into() },
+                  Instruction::Nat { dst: r(1), value: 0 },
+              ];
+              for _ in 0..10_000 {
+                  code.push(Instruction::Ctor { dst: r(1), tag: 1, fields: vec![r(0), r(1)], scalar_bytes: Vec::new() });
+              }
+              code.extend([
+                  intrinsic(r(2), "extern:Array.mk", vec![r(1)]),
+                  intrinsic(r(3), "extern:Array.toList", vec![r(2)]),
+                  intrinsic(r(4), "extern:Array.mk", vec![r(3)]),
+                  intrinsic(r(5), "extern:Array.size", vec![r(4)]),
+                  Instruction::Return { src: r(5) },
+              ]);
+              let program = validated(vec![function_with_callable_result(
+                  0, Vec::new(), CallableResultOwnership::OwnedOrScalar, 6, code,
+              )]);
+              assert_eq!(returned(execute(&program, ExecutionLimits::default(), None)).value.unbox(), 10_000);
+          }
+
+          #[test]
+          fn array_construction_empty_hints_validate_nats_without_unbounded_allocation() {
+              let _guard = lock();
+              for row in ["extern:Array.emptyWithCapacity", "extern:Array.mkEmpty"] {
+                  for huge in [false, true] {
+                      let hint = if huge {
+                          Instruction::NatBig { dst: r(0), limbs_le: vec![0, 1] }
+                      } else {
+                          Instruction::Nat { dst: r(0), value: 16 }
+                      };
+                      let program = validated(vec![function(0, 0, 2, vec![
+                          hint,
+                          intrinsic(r(1), row, vec![r(0)]),
+                          Instruction::Return { src: r(1) },
+                      ])]);
+                      assert_eq!(returned(execute(&program, ExecutionLimits::default(), None)).value.array_view().0, 0);
+                  }
+                  let program = validated(vec![function(0, 0, 2, vec![
+                      Instruction::String { dst: r(0), value: "bad hint".into() },
+                      intrinsic(r(1), row, vec![r(0)]),
+                      Instruction::Return { src: r(1) },
+                  ])]);
+                  match execute(&program, ExecutionLimits::default(), None) {
+                      Outcome::Complete(VmExit::Refused { refusal: VmRefusal::TypeMismatch { .. }, .. }) => {}
+                      other => panic!("{row}: bad hint was not refused: {other:?}"),
+                  }
+              }
+          }
+          ''', encoding="utf-8")
+          PY
+      - name: Test and commit array construction directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/array-construction-target"
+          git config user.name 'OpenAI coding assistant'
+          git config user.email 'noreply@openai.com'
+          for attempt in 1 2 3; do
+            git -C "$root" fetch origin main
+            work="$RUNNER_TEMP/array-construction-$attempt"
+            git -C "$root" worktree add --detach "$work" origin/main
+            cd "$work"
+            python3 -I "$RUNNER_TEMP/apply-array-construction.py"
+            rustfmt --edition 2024 crates/fln-vm/src/interpreter/array_construction.rs crates/fln-vm/src/interpreter.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git diff --check
+            cargo test --locked -p fln-vm --test flbc_interpreter array_construction_ -- --nocapture
+            cargo test --locked -p fln-vm --lib
+            cargo test --locked -p fln-vm --test flbc_interpreter
+            cargo clippy --locked -p fln-vm --lib --no-deps -- -D warnings
+            python3 -I - <<'PY'
+          import subprocess
+          allowed = {
+              "crates/fln-vm/src/interpreter.rs",
+              "crates/fln-vm/src/interpreter/array_construction.rs",
+              "crates/fln-vm/tests/flbc_interpreter.rs",
+          }
+          changed = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          unexpected = [line for line in changed if line[3:] not in allowed]
+          if unexpected:
+              raise SystemExit(f"unexpected worktree changes: {unexpected}")
+          PY
+            git add -- crates/fln-vm/src/interpreter.rs crates/fln-vm/src/interpreter/array_construction.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git commit -m "feat(vm): execute list-array conversions and empty array constructors" -m "Implement Array.mk, Array.toList, Array.emptyWithCapacity and Array.mkEmpty using native Marrow handles. Validate list spines before accepting a result, retain shared payload identities, and use iterative traversal in both directions. Test malformed tails, scalar nil, 10000-element round trips, ownership lifetimes and arbitrary-precision capacity hints. VM library and complete FLBC interpreter suites and library Clippy pass with the repository-pinned toolchain."
+            if git push origin HEAD:main; then
+              git rev-parse HEAD
+              exit 0
+            fi
+            echo "main advanced; replaying and retesting on its new tip"
+            cd "$root"
+          done
+          echo "Could not publish after three non-force fast-forward attempts" >&2
+          exit 1
