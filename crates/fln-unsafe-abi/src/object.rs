@@ -285,6 +285,40 @@ pub(crate) unsafe fn alloc_sarray(elem_size: u8, size: usize, capacity: usize) -
     o
 }
 
+/// Fallible byte-array allocation for a bounded file read. Its salient size
+/// starts at zero: capacity is uninitialized until fread supplies bytes.
+/// Overflow, an invalid allocator layout, and allocation exhaustion return
+/// null without minting an object or touching the file cursor.
+///
+/// # Safety
+/// Caller owns a non-null result, must initialize each byte before extending
+/// its salient size, and must keep that size at most the requested capacity.
+// UNSAFE-LEDGER: FLN-UL-0650
+#[allow(unsafe_code)]
+pub(crate) unsafe fn try_alloc_byte_array(capacity: usize) -> *mut LeanObject {
+    let Some(bytes) = size_of::<LeanSarrayObject>().checked_add(capacity) else {
+        return core::ptr::null_mut();
+    };
+    if Layout::from_size_align(bytes, align_of::<LeanSarrayObject>()).is_err() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the complete header and allocator layout are checked before
+    // nullable allocation; a non-null block is exclusively owned and large
+    // enough for all fields. No uninitialized capacity is salient yet.
+    unsafe {
+        let o = membrane::alloc_big_nullable(bytes);
+        if o.is_null() {
+            return o;
+        }
+        init_st_header(o, TAG_SCALAR_ARRAY, 1);
+        let a = o.cast::<LeanSarrayObject>();
+        (&raw mut (*a).m_size).write(0);
+        (&raw mut (*a).m_capacity).write(capacity);
+        membrane::note_alloc(o, bytes, TAG_SCALAR_ARRAY);
+        o
+    }
+}
+
 /// Sarray salient fields `(elem_size, m_size, m_capacity)` and data base
 /// (`lean.h:1043-1060`).
 ///

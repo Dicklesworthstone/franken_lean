@@ -38,7 +38,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use crate::layout::{LeanExternalClass, LeanObject};
+use crate::layout::{LeanExternalClass, LeanObject, LeanSarrayObject};
 use crate::{object, rc, tagged};
 
 // ---------------------------------------------------------------- platform
@@ -1190,9 +1190,9 @@ pub(crate) fn checked_put_str_result(
 
 /// `lean_io_prim_handle_read` (`io.cpp:584-607`), arm-for-arm: the
 /// overflow pre-check decodes ENOMEM; a zero-byte read answers ok before
-/// touching fread (the pin cites lean4#12138); a short read with EOF set
-/// clears the flag and answers the partial buffer; anything else decodes
-/// errno after releasing the buffer.
+/// touching fread (the pin cites lean4#12138); any positive read answers its
+/// partial buffer without clearing flags; zero at EOF clears the flag and
+/// answers an empty buffer; otherwise errno is decoded after buffer release.
 ///
 /// # Safety
 /// `h` is borrowed and live; caller owns the io_result.
@@ -1345,6 +1345,67 @@ pub(crate) enum FileReadFailure {
         errno: c_int,
         bytes_consumed: usize,
     },
+}
+
+/// Bounded pinned counted read: one fread, no lookahead or UTF-8 conversion.
+/// The complete requested buffer is obtained fallibly before touching FILE.
+/// A positive short read succeeds without clearing flags; zero at EOF clears
+/// the flag, while a zero request performs no FILE operation at all.
+///
+/// # Safety
+/// `handle` is scalar or a live object, borrowed until return. A successful
+/// Some result transfers one owned native IO.Result, and its count records
+/// the bytes fread actually initialized and consumed.
+// UNSAFE-LEDGER: FLN-UL-0651
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_read(
+    handle: *mut LeanObject,
+    count: usize,
+    limit: usize,
+) -> Result<Option<(*mut LeanObject, usize)>, FileReadFailure> {
+    // SAFETY: class precedes FILE access; fresh byte array has capacity=count
+    // and size=0. fread writes at most count bytes, and only its initialized
+    // prefix becomes salient. Every error releases that buffer exactly once.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        if count > limit {
+            return Err(FileReadFailure::InputLimit {
+                limit,
+                observed: count,
+                bytes_consumed: 0,
+            });
+        }
+        let buffer = object::try_alloc_byte_array(count);
+        if buffer.is_null() {
+            return Err(FileReadFailure::Allocation {
+                requested: count.saturating_add(size_of::<LeanSarrayObject>()),
+                bytes_consumed: 0,
+            });
+        }
+        if count == 0 {
+            return Ok(Some((io_result_mk_ok(buffer), 0)));
+        }
+        let file = io_get_handle(handle);
+        let guard = FileReadLock::acquire(file);
+        let (_, _, _, data) = object::sarray_fields(buffer);
+        let read = fread(data.cast::<c_void>(), 1, count, file);
+        let code = errno();
+        if read > 0 {
+            (*buffer.cast::<LeanSarrayObject>()).m_size = read;
+            drop(guard);
+            return Ok(Some((io_result_mk_ok(buffer), read)));
+        }
+        if feof(file) != 0 {
+            clearerr(file);
+            drop(guard);
+            return Ok(Some((io_result_mk_ok(buffer), 0)));
+        }
+        drop(guard);
+        rc::dec_ref(buffer);
+        checked_get_line_error(code, 0).map(|result| Some((result, 0)))
+    }
 }
 
 /// Bounded exact getLine over a borrowed native Handle. The input ceiling

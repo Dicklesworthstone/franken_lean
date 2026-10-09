@@ -3,15 +3,18 @@
 
 use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_transport};
 
+mod bytes;
 mod read;
 
-/// A bounded getLine failure. Consumed counts refer to original file bytes,
-/// including the input-cap lookahead; output observations count recovered
-/// UTF-8 bytes. Resource stops do not rewind an already advanced cursor.
+/// A bounded file-read failure. Consumed counts refer to original file bytes.
+/// getLine includes its input-cap lookahead and counts recovered UTF-8 output;
+/// counted read checks its entire requested size before any cursor effect.
+/// Resource stops do not rewind an already advanced cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileReadError {
     InvalidHandle,
     InvalidWorld,
+    InvalidCount,
     InputLimit {
         limit: usize,
         observed: usize,

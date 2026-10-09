@@ -857,6 +857,7 @@ enum IntrinsicImplementation {
     FileHandleMk,
     FileHandlePutStr,
     FileHandleGetLine,
+    FileHandleRead,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -1216,6 +1217,7 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.mk" => Self::FileHandleMk,
             "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
+            "extern:IO.FS.Handle.read" => Self::FileHandleRead,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -3619,6 +3621,11 @@ fn nat_magnitude_exhausted(allowed: u64, observed: u64, location: &str) -> Stop 
 const MAX_FILE_READ_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_READ_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+// Counted reads are also materialized into checked logical ByteArray values
+// by the source bridge. Bound this separate per-read expansion before fread;
+// larger requests are resource nonanswers, never truncated successes.
+const MAX_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 fn file_read_failure(error: FileReadError) -> IntrinsicFailure {
     match error {
         FileReadError::InputLimit { .. }
@@ -3645,7 +3652,7 @@ fn file_read_exhausted(error: FileReadError, location: &str) -> Stop {
             bytes_consumed,
         } => {
             return Stop::Inconclusive(Inconclusive::dependency_unavailable(format!(
-                "host buffer allocation for getLine: requested {requested} bytes after consuming {bytes_consumed} file bytes at {location}"
+                "host buffer allocation for file read: requested {requested} bytes after consuming {bytes_consumed} file bytes at {location}"
             )));
         }
         _ => {
@@ -3664,7 +3671,7 @@ fn file_read_exhausted(error: FileReadError, location: &str) -> Stop {
             observed: observed as u64,
         })
         .with_progress(format!(
-            "getLine {dimension} after consuming {consumed} file bytes at {location}"
+            "file read {dimension} after consuming {consumed} file bytes at {location}"
         )),
     )
 }
@@ -6381,6 +6388,13 @@ fn invoke_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(file_read_failure)
         }
+        IntrinsicImplementation::FileHandleRead => {
+            expect_arity(row, args, 2)?;
+            args[0]
+                .try_file_read(&args[1], &Obj::mk_nat(0), MAX_FILE_READ_CHUNK_BYTES)
+                .map(IntrinsicResult::owned)
+                .map_err(file_read_failure)
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -6938,6 +6952,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::FileHandleMk
         | IntrinsicImplementation::FileHandlePutStr
         | IntrinsicImplementation::FileHandleGetLine
+        | IntrinsicImplementation::FileHandleRead
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny
