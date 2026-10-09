@@ -421,19 +421,33 @@ fn retry_drifted(
     oracle: &[OracleRow],
     pin: &mut BTreeMap<String, Run>,
     mut rerun: impl FnMut(&str) -> Run,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut reproduced = Vec::new();
+    let mut unscored = Vec::new();
     for row in oracle {
         if pin.get(&row.file).is_some_and(|live| live.exit != row.exit) {
             let again = rerun(&row.file);
             if again.exit == row.exit {
                 reproduced.push(row.file.clone());
+            } else if RACING_THE_HOST.iter().any(|(file, _)| *file == row.file) {
+                unscored.push(row.file.clone());
             }
             pin.insert(row.file.clone(), again);
         }
     }
-    reproduced
+    (reproduced, unscored)
 }
+
+/// Files whose pin exit depends on a host process race that a retry cannot win, and why. When
+/// such a file's retry still drifts it is reported unscored for that run, its ledger row carried
+/// over unchanged; any other repeated drift still fails. Measured 2026-10-08: under load the
+/// retry lost every time, so every run failed and the ledger could not advance.
+const RACING_THE_HOST: &[(&str, &str)] = &[(
+    "elab/async_systems_info.lean",
+    "sets its own and its parent's scheduling priority to 3 and asserts it took \
+     (`tests/elab/async_systems_info.lean:59-71`); ananicy-cpp renices `lean` to 15, which only \
+     CAP_SYS_NICE could undo",
+)];
 
 /// Score one run against the oracle and the ledger. `pin` is the live pin result per file
 /// (the re-derived oracle) and `subject` FrankenLean's.
@@ -442,11 +456,26 @@ fn score(
     ledger: &[LedgerRow],
     pin: &BTreeMap<String, Run>,
     subject: &BTreeMap<String, Run>,
+    unscored: &[String],
 ) -> Report {
     let mut report = Report::default();
     let recorded: BTreeMap<&str, &LedgerRow> =
         ledger.iter().map(|row| (row.file.as_str(), row)).collect();
     for row in oracle {
+        if unscored.contains(&row.file) {
+            let why = RACING_THE_HOST
+                .iter()
+                .find(|(file, _)| *file == row.file)
+                .map_or("", |(_, why)| why);
+            report.lines.push(format!(
+                "{}\tunscored: the pin's exit raced the host this run ({why})",
+                row.file
+            ));
+            if let Some(previous) = recorded.get(row.file.as_str()) {
+                report.ledger.push((*previous).clone());
+            }
+            continue;
+        }
         let (Some(live_pin), Some(seen)) = (pin.get(&row.file), subject.get(&row.file)) else {
             report.problems.push(format!(
                 "{}: never observed; the run did not reach it",
@@ -907,7 +936,7 @@ fn upstream_suite_scoreboard_measures_the_drop_in_against_the_pin() {
     let copy = copy_suite(&root.join(SUITE));
     let mut pin = run_all(&reference, &copy, &files, WORKERS);
     let reuse = copy.join("fln-import-reuse");
-    let host_dependent_exits = retry_drifted(&oracle, &mut pin, |file| {
+    let (host_dependent_exits, unscored) = retry_drifted(&oracle, &mut pin, |file| {
         let (directory, name) = file.split_once('/').expect("dir/file");
         run(&reference, &copy.join(directory), name, &reuse)
     });
@@ -922,7 +951,15 @@ fn upstream_suite_scoreboard_measures_the_drop_in_against_the_pin() {
     let subject = run_subject(&frankenlean, &copy, &files, &oracle);
     // The copy is this run's own scratch tree, created above; nothing else is removed.
     let _ = std::fs::remove_dir_all(&copy);
-    let report = score(&oracle, &ledger, &pin, &subject);
+    eprintln!(
+        "upstream_suite_scoreboard: pin exits that raced the host and are not scored: {}",
+        if unscored.is_empty() {
+            "none".to_owned()
+        } else {
+            unscored.join(" ")
+        }
+    );
+    let report = score(&oracle, &ledger, &pin, &subject, &unscored);
     for line in &report.lines {
         eprintln!("{line}");
     }
@@ -1088,7 +1125,7 @@ fn a_planted_false_accept_fails_and_a_low_score_or_a_timeout_does_not() {
             ("elab_fail/bad.lean".to_owned(), ran(subject_exit, "", "")),
             ("elab/ok.lean".to_owned(), ran(subject_exit, "", "")),
         ]);
-        let report = score(&oracle, &ledger, &pin, &subject);
+        let report = score(&oracle, &ledger, &pin, &subject, &[]);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.per_directory["elab"].0, 0);
     }
@@ -1099,7 +1136,7 @@ fn a_planted_false_accept_fails_and_a_low_score_or_a_timeout_does_not() {
         ("elab_fail/bad.lean".to_owned(), ran(Some(0), "", "")),
         ("elab/ok.lean".to_owned(), ran(Some(0), "42\n", "")),
     ]);
-    let report = score(&oracle, &ledger, &pin, &subject);
+    let report = score(&oracle, &ledger, &pin, &subject, &[]);
     assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
     assert!(report.problems[0].starts_with("elab_fail/bad.lean: FrankenLean's `lean` accepts"));
     assert_eq!(report.per_directory["elab"], (1, 1, 1, 0, 0));
@@ -1113,7 +1150,13 @@ fn a_planted_regression_of_an_identical_row_fails_the_ratchet() {
     let pin = BTreeMap::from([("elab/ok.lean".to_owned(), ran(Some(0), "42\n", ""))]);
     for (exit, stdout) in [(Some(1), ""), (Some(0), "43\n"), (None, "")] {
         let subject = BTreeMap::from([("elab/ok.lean".to_owned(), ran(exit, stdout, ""))]);
-        let report = score(std::slice::from_ref(&accepted), &ledger, &pin, &subject);
+        let report = score(
+            std::slice::from_ref(&accepted),
+            &ledger,
+            &pin,
+            &subject,
+            &[],
+        );
         assert_eq!(
             report.problems.len(),
             1,
@@ -1130,7 +1173,13 @@ fn a_planted_regression_of_an_identical_row_fails_the_ratchet() {
     let mut volatile = accepted.clone();
     volatile.volatile = true;
     let subject = BTreeMap::from([("elab/ok.lean".to_owned(), ran(Some(0), "other\n", ""))]);
-    let report = score(std::slice::from_ref(&volatile), &ledger, &pin, &subject);
+    let report = score(
+        std::slice::from_ref(&volatile),
+        &ledger,
+        &pin,
+        &subject,
+        &[],
+    );
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 }
 
@@ -1147,7 +1196,7 @@ fn a_drifted_pin_exit_is_retried_once_and_only_a_reproduced_one_is_forgiven() {
         ("elab/steady.lean".to_owned(), ran(Some(0), "", "")),
     ]);
     let mut reruns = Vec::new();
-    let reproduced = retry_drifted(&rows, &mut pin, |file| {
+    let (reproduced, unscored) = retry_drifted(&rows, &mut pin, |file| {
         reruns.push(file.to_owned());
         ran(Some(if file == "elab/flaky.lean" { 0 } else { 1 }), "", "")
     });
@@ -1157,6 +1206,10 @@ fn a_drifted_pin_exit_is_retried_once_and_only_a_reproduced_one_is_forgiven() {
         "only drifted files rerun"
     );
     assert_eq!(reproduced, ["elab/flaky.lean"]);
+    assert!(
+        unscored.is_empty(),
+        "only a declared host race goes unscored"
+    );
     let ledger: Vec<_> = rows
         .iter()
         .map(|row| ledger_row(&row.file, Some(1), "n/a"))
@@ -1165,9 +1218,48 @@ fn a_drifted_pin_exit_is_retried_once_and_only_a_reproduced_one_is_forgiven() {
         .iter()
         .map(|row| (row.file.clone(), ran(Some(1), "", "")))
         .collect();
-    let report = score(&rows, &ledger, &pin, &subject);
+    let report = score(&rows, &ledger, &pin, &subject, &[]);
     assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
     assert!(report.problems[0].starts_with("elab/moved.lean: the pinned Reference no longer"));
+}
+
+/// A declared host race whose retry still drifts is reported unscored, not as a problem, and its
+/// ledger row is carried over unchanged; the same drift on any other file still fails.
+#[test]
+fn a_host_race_that_the_retry_loses_is_unscored_and_keeps_its_ledger_row() {
+    let racing = RACING_THE_HOST[0].0;
+    let rows = vec![
+        oracle_row(racing, 0, ""),
+        oracle_row("elab/moved.lean", 0, ""),
+    ];
+    let mut pin = BTreeMap::from([
+        (racing.to_owned(), ran(Some(1), "", "")),
+        ("elab/moved.lean".to_owned(), ran(Some(1), "", "")),
+    ]);
+    let (reproduced, unscored) = retry_drifted(&rows, &mut pin, |_| ran(Some(1), "", ""));
+    assert!(reproduced.is_empty());
+    assert_eq!(unscored, [racing]);
+    let ledger = vec![
+        ledger_row(racing, Some(1), "n/a"),
+        ledger_row("elab/moved.lean", Some(1), "n/a"),
+    ];
+    let subject: BTreeMap<_, _> = rows
+        .iter()
+        .map(|row| (row.file.clone(), ran(Some(1), "", "")))
+        .collect();
+    let report = score(&rows, &ledger, &pin, &subject, &unscored);
+    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+    assert!(report.problems[0].starts_with("elab/moved.lean: the pinned Reference no longer"));
+    assert!(
+        report.ledger.contains(&ledger[0]),
+        "the racing file keeps its ledger row"
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.starts_with(racing) && line.contains("unscored"))
+    );
 }
 
 #[test]
@@ -1178,11 +1270,23 @@ fn pin_drift_and_broken_scans_are_refused() {
     // A changed exit code is verdict drift; a changed stdout under the same exit code is
     // host-dependent output, reported and not failed.
     let drifted = BTreeMap::from([("elab/ok.lean".to_owned(), ran(Some(1), "", ""))]);
-    let report = score(std::slice::from_ref(&accepted), &ledger, &drifted, &subject);
+    let report = score(
+        std::slice::from_ref(&accepted),
+        &ledger,
+        &drifted,
+        &subject,
+        &[],
+    );
     assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
     assert!(report.problems[0].contains("no longer reproduces"));
     let host = BTreeMap::from([("elab/ok.lean".to_owned(), ran(Some(0), "43\n", ""))]);
-    let report = score(std::slice::from_ref(&accepted), &ledger, &host, &subject);
+    let report = score(
+        std::slice::from_ref(&accepted),
+        &ledger,
+        &host,
+        &subject,
+        &[],
+    );
     assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert_eq!(report.host_dependent, vec!["elab/ok.lean".to_owned()]);
 
