@@ -45,6 +45,14 @@ impl Preparation<'_> {
             match task {
                 Task::Value(expression) => {
                     let (head, arguments) = self.spine(&expression)?;
+                    // The checked IO world index is inert type metadata. Its
+                    // opaque carrier must not be evaluated while selecting a
+                    // monad-lifting dictionary, just as runtime type erasure
+                    // preserves the same admitted phantom index.
+                    if self.preserve_io_world_type(&head, &arguments)? {
+                        values.push(expression);
+                        continue;
+                    }
                     if let ExprNode::Const { name, levels } = head.node() {
                         // A verified primitive is inert as a function value,
                         // whether its logical declaration is an axiom or a

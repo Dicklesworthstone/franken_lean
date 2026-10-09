@@ -33,6 +33,7 @@
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;
+mod source_evaluation;
 mod source_execution;
 mod source_intrinsics;
 #[cfg(test)]
@@ -169,6 +170,7 @@ pub use fln_vm::interpreter::{
     ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit, nat_decimal,
     value_kind as vm_value_kind,
 };
+pub use source_evaluation::{IoEvaluationOutcome, IoEvaluationProjectionError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -6953,20 +6955,26 @@ impl Engine {
                 });
                 continue;
             }
-            let execution = match engine.execute_definition(declaration, options, limits) {
-                Ok(Outcome::Complete(execution)) => execution,
-                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
-                Ok(Outcome::InternalFault(fault)) => {
-                    return Ok(Outcome::InternalFault(fault));
-                }
-                Err(error) => {
-                    return Err(EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    });
-                }
+            let entry = if is_evaluation {
+                source_evaluation::Entry::Evaluation
+            } else {
+                source_evaluation::Entry::Value
             };
+            let execution =
+                match engine.execute_definition_entry(declaration, options, limits, entry) {
+                    Ok(Outcome::Complete(execution)) => execution,
+                    Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                    Ok(Outcome::InternalFault(fault)) => {
+                        return Ok(Outcome::InternalFault(fault));
+                    }
+                    Err(error) => {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        });
+                    }
+                };
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
@@ -7980,6 +7988,21 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        self.execute_definition_entry(
+            declaration,
+            options,
+            limits,
+            source_evaluation::Entry::Value,
+        )
+    }
+
+    fn execute_definition_entry(
+        &self,
+        declaration: Declaration,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        entry: source_evaluation::Entry,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
         let (expression, declared_type) = match &declaration {
             Declaration::Defn(definition) => {
                 (definition.value.clone(), definition.base.type_.clone())
@@ -8019,6 +8042,16 @@ impl Engine {
         };
 
         let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress);
+        let evaluated = match entry {
+            source_evaluation::Entry::Value => None,
+            source_evaluation::Entry::Evaluation => preparation
+                .evaluation_entry(&expression, &declared_type)
+                .map_err(EngineExecutionError::Ingress)?,
+        };
+        let (expression, declared_type, io_result_types) = match evaluated {
+            Some((expression, type_, types)) => (expression, type_, Some(types)),
+            None => (expression, declared_type, None),
+        };
         let runtime_type = preparation
             .normalize_type(&declared_type)
             .map_err(EngineExecutionError::Ingress)?;
@@ -8075,6 +8108,7 @@ impl Engine {
             engine: admission.engine,
             declaration: admission.declaration,
             runtime_type,
+            io_result_types,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -10250,6 +10284,9 @@ pub struct DefinitionExecution {
     /// type, not the runtime object's tag, to distinguish Nat from Bool. The
     /// exact checked declaration above remains unchanged.
     pub runtime_type: Expr,
+    /// Present only when the source command explicitly requested IO evaluation.
+    /// The public projection validates the retained logical ST/EST result.
+    io_result_types: Option<source_evaluation::IoResultTypes>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.

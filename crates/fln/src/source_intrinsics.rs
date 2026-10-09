@@ -8,6 +8,7 @@
 
 use super::*;
 use std::collections::HashSet;
+pub(super) mod io;
 pub(super) mod st;
 mod string_internal;
 mod string_length;

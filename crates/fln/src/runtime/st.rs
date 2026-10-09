@@ -162,6 +162,11 @@ fn local(index: u32) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
+    /// The same checked, runtime-only token representation used by ST actions.
+    pub(super) fn st_evaluation_world(&mut self) -> Result<Option<Expr>, IngressError> {
+        self.st_world()
+    }
+
     pub(crate) fn st_intrinsic_binding(&self, name: &Name) -> Option<IntrinsicBinding> {
         self.st
             .bindings

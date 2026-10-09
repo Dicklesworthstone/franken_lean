@@ -162,6 +162,9 @@ impl Preparation<'_> {
                     head = receiver;
                 }
                 ExprNode::Const { name, levels } => {
+                    if self.preserve_io_world_type(&head, &args)? {
+                        break;
+                    }
                     if let Some(carrier) = self.st_type_head(&head, &args)? {
                         head = carrier;
                         args.clear();

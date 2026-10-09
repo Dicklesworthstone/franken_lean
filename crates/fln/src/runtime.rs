@@ -8,6 +8,7 @@ mod conditionals;
 mod data_recursion;
 mod decisions;
 mod empty;
+mod evaluation;
 mod floats;
 mod global;
 mod indexed;
@@ -41,6 +42,7 @@ pub(super) struct Preparation<'a> {
     next_mutual: u32,
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
+    io_world_checked: bool,
     equality_family_checked: bool,
     conditional_contracts: [bool; 2],
     next_branch: usize,
@@ -109,6 +111,7 @@ impl<'a> Preparation<'a> {
             next_mutual: 0,
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
+            io_world_checked: false,
             equality_family_checked: false,
             conditional_contracts: [false; 2],
             next_branch: 0,
