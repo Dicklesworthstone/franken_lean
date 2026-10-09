@@ -180,6 +180,8 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
             },
             _ => ("elaboration", false, 1),
         },
+        // The `lean` front door's `CAPABILITY_NOT_IMPLEMENTED_EXIT`: not a verdict.
+        EngineExecutionError::NotImplemented { .. } => ("capability", false, 5),
         _ => ("input", false, 1),
     }
 }
@@ -291,6 +293,18 @@ impl Engine {
                             fln_parse::command_scope::ScopeCommand::SetOption { name, value },
                             body,
                         )),
+                        // A check-only pass prints nothing, so it cannot judge a guard's
+                        // messages: a non-answer, not an unjudged acceptance.
+                        fln_parse::command_scope::ScopeCommand::GuardMsgs { .. } => {
+                            return Err(SourceCheckError::Command {
+                                file,
+                                command: count,
+                                offset: start.0,
+                                error: Box::new(EngineExecutionError::NotImplemented {
+                                    feature: "`#guard_msgs` outside the `lean` front door",
+                                }),
+                            });
+                        }
                         other => Err(other),
                     };
                     let control = match expanded {
@@ -474,7 +488,8 @@ pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError>
                     Some(fln_parse::command_scope::ScopeCommand::Trivia) => {}
                     Some(
                         fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. },
+                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. }
+                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. },
                     ) => {
                         start = fln_parse::BytePos(start.0 + body);
                         command = &command[body..];

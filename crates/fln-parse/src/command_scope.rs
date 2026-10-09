@@ -48,6 +48,15 @@ pub enum ScopeCommand {
         value: fln_core::options::DataValue,
         body: usize,
     },
+    /// `[docComment] #guard_msgs [spec] in <command>` (`Lean.guardMsgsCmd`). `expected` is the
+    /// doc's text as the pin's `elabGuardMsgs` reads it: `getDocStringText` (between `/--` and
+    /// `-/`), ASCII-trimmed, `⏎` markers removed; `""` without a doc. `specified` records a
+    /// `(…)` spec, which this parser does not read. `body` is as in [`ScopeCommand::OpenIn`].
+    GuardMsgs {
+        expected: String,
+        specified: bool,
+        body: usize,
+    },
     Trivia,
 }
 
@@ -420,6 +429,13 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     if keyword == "set_option" {
         return set_option(&view, &tokens, source.len()).map(Some);
     }
+    let guarded = |index: usize| {
+        matches!(tokens.get(index).map(|t| &t.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "#guard_msgs")
+    };
+    if keyword == "#guard_msgs" || (keyword == "/--" && guarded(1)) {
+        return guard_msgs(&view, &tokens, source.len()).map(Some);
+    }
     if !control(keyword) {
         return Ok(None);
     }
@@ -542,6 +558,78 @@ fn set_option(
     }
 }
 
+/// `[docComment] #guard_msgs [spec] in <command>`, as the pin's `guardMsgsCmd` reads it. The
+/// expected text is the pin's: `getDocStringText` takes the doc between `/--` and `-/`, and
+/// `elabGuardMsgs` trims it (`trimAscii`) and removes trailing-whitespace markers
+/// (`removeTrailingWhitespaceMarker`, `⏎` before a line break). A spec is only skipped to its
+/// closing parenthesis and reported, never interpreted here.
+fn guard_msgs(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let symbol = |index: usize, text: &str| {
+        matches!(tokens.get(index).map(|t| &t.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == text)
+    };
+    let (expected, mut index) = if symbol(0, "/--") {
+        let doc = view
+            .normalized()
+            .as_str()
+            .get(tokens[0].extent.start().0..tokens[0].extent.end().0)
+            .and_then(|text| text.strip_prefix("/--"))
+            .and_then(|text| text.strip_suffix("-/"))
+            .ok_or_else(|| bad(0))?;
+        let expected = doc
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .replace("⏎\n", "\n");
+        (expected, 1)
+    } else {
+        (String::new(), 0)
+    };
+    if !symbol(index, "#guard_msgs") {
+        return Err(bad(index));
+    }
+    index += 1;
+    let specified = symbol(index, "(");
+    if specified {
+        let mut depth = 0_usize;
+        loop {
+            let Some(TokenKind::Symbol(text)) = tokens.get(index).map(|t| &t.kind) else {
+                if tokens.get(index).is_none() {
+                    return Err(bad(index));
+                }
+                index += 1;
+                continue;
+            };
+            match bracket(text) {
+                Some(true) => depth += 1,
+                Some(false) => depth = depth.saturating_sub(1),
+                None => {}
+            }
+            index += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    if !symbol(index, "in") {
+        return Err(bad(index));
+    }
+    let body = tokens.get(index + 1).ok_or_else(|| bad(index + 1))?;
+    Ok(ScopeCommand::GuardMsgs {
+        expected,
+        specified,
+        body: view.to_original(body.extent.start()).0,
+    })
+}
+
 /// Partition both scope commands and declarations, preserving every source byte.
 /// Delimiters protect nested terms and explicit universe argument lists; comments
 /// and strings are lexer events, not text searched for command-looking words.
@@ -659,6 +747,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 }
                 attribute_prefix = inline_start
                     || (continues_prefix && !declaration(symbol) && !line_command(symbol));
+                // `[doc] #guard_msgs … in <command>`: the guarded command belongs to it, whether
+                // the guard starts its command or continues its doc comment's.
+                if symbol == "#guard_msgs" {
+                    current_open = true;
+                }
                 declaration_column = declaration(symbol)
                     .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
             } else if depth == 0 && attribute_prefix {
@@ -907,6 +1000,60 @@ mod tests {
             "set_option o true false",
             "set_option o true in",
             "set_option 3 true",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn guard_msgs_reads_the_pins_expected_text_and_keeps_its_command() {
+        let guard = |source: &str| match parse(source.as_bytes()).unwrap() {
+            Some(ScopeCommand::GuardMsgs {
+                expected,
+                specified,
+                body,
+            }) => (expected, specified, source[body..].to_owned()),
+            other => panic!("{source}: {other:?}"),
+        };
+        // `getDocStringText`, `trimAscii` and `removeTrailingWhitespaceMarker`.
+        assert_eq!(
+            guard("/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2"),
+            ("info: 4".to_owned(), false, "#eval 2 + 2".to_owned())
+        );
+        assert_eq!(
+            guard("/--\ninfo: a⏎\nb\n-/\n#guard_msgs in #eval x"),
+            ("info: a\nb".to_owned(), false, "#eval x".to_owned())
+        );
+        assert_eq!(
+            guard("#guard_msgs in\nexample : True := trivial"),
+            (String::new(), false, "example : True := trivial".to_owned())
+        );
+        assert_eq!(
+            guard("/-- info: 1 -/ #guard_msgs (drop warning) in #eval 1"),
+            ("info: 1".to_owned(), true, "#eval 1".to_owned())
+        );
+
+        // The doc, the guard and its command are one command; the next is not.
+        let file = "def a := 1\n/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2\ndef b := 2\n";
+        let texts: Vec<_> = partition(file.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "def a := 1\n",
+                "/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2\n",
+                "def b := 2\n"
+            ]
+        );
+
+        for source in [
+            "#guard_msgs",
+            "#guard_msgs in",
+            "/-- info: 4 -/ #guard_msgs #eval 1",
+            "#guard_msgs (drop info in #eval 1",
         ] {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }

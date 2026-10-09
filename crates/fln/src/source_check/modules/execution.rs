@@ -140,7 +140,8 @@ pub fn preflight_source_program(
                 {
                     Some(
                         fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. },
+                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. }
+                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. },
                     ) => {
                         at.0 += body;
                         bytes = &bytes[body..];

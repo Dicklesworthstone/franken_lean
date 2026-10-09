@@ -11432,6 +11432,20 @@ fn render_lean_source_module_commands(
     render_lean_source_commands(&completed.entry)
 }
 
+/// One message as the pin's `GuardMsgs.messageToString` renders it without positions: the
+/// severity, a space unless the text starts a new line, and a final line break.
+fn guard_message(severity: &str, text: &str) -> String {
+    let mut message = format!("{severity}:");
+    if !text.starts_with('\n') {
+        message.push(' ');
+    }
+    message.push_str(text);
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+    message
+}
+
 fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
     if completed.execution_command_indices.len() != completed.batch.executions.len() {
         return source_failure(
@@ -11472,6 +11486,13 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     let mut previous_output_command = None;
     let mut evaluation_output_position = 0_usize;
     let mut check_output_position = 0_usize;
+    // `#guard_msgs` (bead `fln-guard-msgs-lls1`): a guarded command's messages are collected
+    // as the pin's `messageToString` renders them and judged below, never printed.
+    let mut guarded: std::collections::BTreeMap<usize, Vec<String>> = completed
+        .guards
+        .iter()
+        .map(|guard| (guard.command_index, Vec::new()))
+        .collect();
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
@@ -11539,6 +11560,28 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
+                if let Some(messages) = guarded.get_mut(&command_index) {
+                    // An IO action's output was written while it ran, not returned here.
+                    if matches!(value, SourceFinalValue::IoUnit) {
+                        return source_failure(
+                            "capability",
+                            &format!(
+                                "evaluation command {command_index}: `#guard_msgs` over an IO \
+                                 action is not implemented; its output is written while it runs"
+                            ),
+                            false,
+                            SourcePresentation::Lean,
+                            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+                        );
+                    }
+                    match lean_evaluation_line(command_index, &value) {
+                        Ok(line) => {
+                            messages.push(guard_message("info", line.trim_end_matches('\n')))
+                        }
+                        Err(refused) => return refused,
+                    }
+                    continue;
+                }
                 match lean_evaluation_line(command_index, &value) {
                     Ok(line) => stdout.push_str(&line),
                     Err(refused) => return refused,
@@ -11577,6 +11620,19 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     continue;
                 }
+                // `#check`'s line is not yet the pin's pretty-printed message in general.
+                if guarded.contains_key(&command_index) {
+                    return source_failure(
+                        "capability",
+                        &format!(
+                            "check command {command_index}: `#guard_msgs` over `#check` is not \
+                             implemented"
+                        ),
+                        false,
+                        SourcePresentation::Lean,
+                        CAPABILITY_NOT_IMPLEMENTED_EXIT,
+                    );
+                }
                 let line = match render_lean_source_check_line(
                     check,
                     completed.batch.engine.environment(),
@@ -11586,6 +11642,27 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 };
                 stdout.push_str(&line);
             }
+        }
+    }
+    // The pin's `elabGuardMsgs`, default spec: the checked messages joined by `---\n` and
+    // ASCII-trimmed, compared with the expected text after `WhitespaceMode.normalized`
+    // (line breaks become spaces). A pass prints nothing; a failure is the pin's error.
+    for guard in &completed.guards {
+        let messages = guarded.remove(&guard.command_index).unwrap_or_default();
+        let joined = messages.join("---\n");
+        let produced = joined.trim_ascii();
+        if guard.expected.replace('\n', " ") != produced.replace('\n', " ") {
+            return source_failure(
+                "guard-msgs",
+                &format!(
+                    "command {}: ❌️ Docstring on `#guard_msgs` does not match generated \
+                     message:\n\n{produced}",
+                    guard.command_index
+                ),
+                false,
+                SourcePresentation::Lean,
+                1,
+            );
         }
     }
     if evaluation_output_position != completed.batch.source_evaluation_indices.len() {
@@ -11698,6 +11775,9 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
         | fln::EngineExecutionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
         fln::EngineExecutionError::CheckerBridge { .. }
         | fln::EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
+        fln::EngineExecutionError::NotImplemented { .. } => {
+            ("capability", false, CAPABILITY_NOT_IMPLEMENTED_EXIT)
+        }
         _ => ("execution", true, 1),
     }
 }

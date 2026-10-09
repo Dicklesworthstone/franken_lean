@@ -138,7 +138,8 @@ impl SourceModuleSession {
                     match control {
                         Some(
                             ScopeCommand::OpenIn { body, .. }
-                            | ScopeCommand::SetOptionIn { body, .. },
+                            | ScopeCommand::SetOptionIn { body, .. }
+                            | ScopeCommand::GuardMsgs { body, .. },
                         ) => {
                             base += body;
                             command = &command[body..];

@@ -6556,6 +6556,7 @@ impl Engine {
             execution_command_indices: Vec::new(),
             outputs: Vec::new(),
             checks: Vec::new(),
+            guards: Vec::new(),
         }
     }
 
@@ -6599,6 +6600,7 @@ impl Engine {
                 requested: command_count,
             }
         })?;
+        let mut guards: Vec<SourceGuard> = Vec::new();
         let mut evaluation_indices = Vec::new();
         evaluation_indices
             .try_reserve_exact(command_count)
@@ -6712,6 +6714,51 @@ impl Engine {
                         {
                             queue.push_front(step);
                         }
+                    }
+                    // The guarded command runs as written, as the pin's `runAndCollectMessages`
+                    // runs it; its messages are judged by the presentation, against `expected`.
+                    // A spec (`(drop …)`, `(whitespace := …)`, …) is not read, and a guard inside
+                    // a guard would judge one command twice: both are refused, never ignored.
+                    ScopeCommand::GuardMsgs {
+                        expected,
+                        specified,
+                        body,
+                    } => {
+                        let not_implemented = |feature| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                            at: Some(original_offset),
+                        };
+                        if specified {
+                            return Err(not_implemented("`#guard_msgs` with a specification"));
+                        }
+                        if guards
+                            .last()
+                            .is_some_and(|guard| guard.command_index == command_index)
+                        {
+                            return Err(not_implemented("`#guard_msgs` inside `#guard_msgs`"));
+                        }
+                        // The pin passes such a guard by capturing the command's errors,
+                        // warnings or traces, whose text this engine does not reproduce. Running
+                        // the command here would turn the pin's pass into a rejection.
+                        if expected.lines().any(|line| {
+                            ["error:", "warning:", "trace:"]
+                                .iter()
+                                .any(|severity| line.trim_start().starts_with(severity))
+                        }) {
+                            return Err(not_implemented(
+                                "`#guard_msgs` expecting an error, warning or trace message",
+                            ));
+                        }
+                        guards.push(SourceGuard {
+                            command_index,
+                            expected,
+                        });
+                        queue.push_front(Step::Command(
+                            command_index,
+                            fln_parse::BytePos(original_offset.0 + body),
+                            &command_source[body..],
+                        ));
                     }
                     ScopeCommand::Namespace(_)
                     | ScopeCommand::Section(_)
@@ -7064,6 +7111,7 @@ impl Engine {
             execution_command_indices,
             outputs,
             checks,
+            guards,
         }))
     }
 
@@ -7911,6 +7959,17 @@ impl Engine {
                 },
                 limits.source_modules.max_dependency_presentations,
             )?;
+            // This presentation has no guard judge: refuse rather than print the guarded
+            // command's output as if no `#guard_msgs` were there.
+            if let Some(guard) = mixed.guards.first() {
+                return Err(EngineExecutionError::BatchCommand {
+                    index: guard.command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` in a source module build",
+                    }),
+                    at: None,
+                });
+            }
             let SourceCommandBatchExecution {
                 mut batch,
                 command_count,
@@ -7934,7 +7993,20 @@ impl Engine {
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         Ok(
             match self.execute_source_command_stream(commands, options, limits, false)? {
-                Outcome::Complete(completed) => Outcome::Complete(completed.batch),
+                // This door returns no per-command outputs, so nothing could judge a guard:
+                // refuse rather than run the guarded command unjudged.
+                Outcome::Complete(completed) => match completed.guards.first() {
+                    Some(guard) => {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: guard.command_index,
+                            error: Box::new(EngineExecutionError::NotImplemented {
+                                feature: "`#guard_msgs` outside the `lean` front door",
+                            }),
+                            at: None,
+                        });
+                    }
+                    None => Outcome::Complete(completed.batch),
+                },
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
             },
@@ -10423,6 +10495,17 @@ pub struct SourceCommandBatchExecution {
     pub execution_command_indices: Vec<usize>,
     pub outputs: Vec<SourceCommandOutput>,
     pub checks: Vec<SourceCheck>,
+    /// Commands run under `#guard_msgs`, in command order, at most one per command.
+    pub guards: Vec<SourceGuard>,
+}
+
+/// `#guard_msgs` around one source command (bead `fln-guard-msgs-lls1`). The command ran as
+/// written; a presentation judges its messages against `expected`, the pin's expected text,
+/// instead of printing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGuard {
+    pub command_index: usize,
+    pub expected: String,
 }
 
 /// A closed dependency graph followed by its selected entry command stream.
@@ -10924,6 +11007,11 @@ pub enum EngineExecutionError {
     },
     StandaloneCheckRequired,
     TerminalCheckRequired,
+    /// A source feature the pin implements and this engine does not: a non-answer, never a
+    /// verdict on the source (FL-INV-07).
+    NotImplemented {
+        feature: &'static str,
+    },
     /// A `namespace`/`section`/`end`/`open` command the scope stack refused (an
     /// unmatched `end`, an unknown namespace), in the pin's words where it has them.
     ScopeTransition {
@@ -10994,6 +11082,7 @@ impl fmt::Display for EngineExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
+            Self::NotImplemented { feature } => write!(formatter, "not implemented: {feature}"),
             Self::ScopeTransition { message } => formatter.write_str(message),
             Self::SourceModuleLimit { observed, limit } => write!(
                 formatter,

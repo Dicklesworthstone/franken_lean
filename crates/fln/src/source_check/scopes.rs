@@ -355,6 +355,11 @@ impl Scopes {
                     "`set_option … in` is expanded by the command loop, never applied".into(),
                 );
             }
+            // Only an executing presentation can judge a guard's messages; a check-only pass
+            // refuses it rather than accept the command unjudged.
+            ScopeCommand::GuardMsgs { .. } => {
+                return Err("`#guard_msgs` needs the executing `lean` front door".into());
+            }
             ScopeCommand::Trivia => {}
         }
         Ok(())
