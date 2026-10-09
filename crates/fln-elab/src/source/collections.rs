@@ -48,9 +48,57 @@ fn cons(head: Syntax, tail: Syntax) -> Syntax {
 pub(super) fn is_notation(syntax: &Syntax) -> bool {
     syntax.kind().is_some_and(|kind| {
         kind == &Name::from_components(["term[_]"])
+            || kind == &Name::from_components(["term#[_,]"])
+            || kind == &Name::from_components(["term{_:_//_}"])
             || kind == &Name::from_components(["term_::_"])
             || kind == &parser_kind(&["Term", "tuple"])
     })
+}
+
+/// `{x // p}` is `Subtype (fun (x : _) => p)` and `{x : T // p}` is `Subtype (fun (x : T) =>
+/// p)`, the macro's quoted `Subtype` resolved where it is defined (`Init/Core.lean`). Not a
+/// pattern here.
+fn expand_subtype(args: Vec<Syntax>, pattern: bool) -> Result<Syntax, NatDefinitionElabError> {
+    if pattern {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let Ok([open, name, type_, separator, predicate, close]) = <[Syntax; 6]>::try_from(args) else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(&open, "{", "subtype opener")?;
+    expect_atom(&separator, "//", "subtype separator")?;
+    expect_atom(&close, "}", "subtype closer")?;
+    if !matches!(name, Syntax::Ident { .. }) {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let annotation = match expect_null_args(&type_, "subtype binder type")? {
+        [] => null(Vec::new()),
+        [colon, domain] => {
+            expect_atom(colon, ":", "subtype binder colon")?;
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "typeSpec"]),
+                vec![atom(":"), domain.clone()],
+            )])
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
+    let lambda = Syntax::node(
+        parser_kind(&["Term", "fun"]),
+        vec![
+            atom("fun"),
+            Syntax::node(
+                parser_kind(&["Term", "basicFun"]),
+                vec![null(vec![name]), annotation, atom("=>"), predicate],
+            ),
+        ],
+    );
+    let head = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        val: Name::from_components(["_root_", "Subtype"]),
+        preresolved: Vec::new(),
+    };
+    Ok(application(head, vec![lambda]))
 }
 
 fn pair(first: Syntax, second: Syntax) -> Syntax {
@@ -116,6 +164,9 @@ impl Context {
         let Syntax::Node { kind, args, .. } = &mut syntax else {
             return Err(failure(SourceInferenceError::Scope));
         };
+        if kind == &Name::from_components(["term{_:_//_}"]) {
+            return expand_subtype(std::mem::take(args), pattern);
+        }
         if args.len() != 3 {
             return Err(failure(SourceInferenceError::Scope));
         }
@@ -151,10 +202,19 @@ impl Context {
                 preresolved: Vec::new(),
             });
         }
-        let literal = kind == &Name::from_components(["term[_]"]);
+        // `#[a, b]` is `List.toArray [a, b]` (`Init/Data/Array/Basic.lean`); not a pattern here.
+        let array = kind == &Name::from_components(["term#[_,]"]);
+        if array && pattern {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let literal = array || kind == &Name::from_components(["term[_]"]);
         let mut args = std::mem::take(args);
         if literal {
-            expect_atom(&args[0], "[", "list literal opener")?;
+            expect_atom(
+                &args[0],
+                if array { "#[" } else { "[" },
+                "list literal opener",
+            )?;
             expect_atom(&args[2], "]", "list literal closer")?;
             // Validate separators before taking ownership. A hand-constructed
             // malformed tree must not hide a term in a separator slot.
@@ -177,6 +237,16 @@ impl Context {
                 if index % 2 == 0 {
                     tail = cons(element, tail);
                 }
+            }
+            if array {
+                let to_array = Syntax::Ident {
+                    info: SourceInfo::None,
+                    raw_val: ByteSpan::default(),
+                    // The macro's quoted `List.toArray` is resolved where it is defined.
+                    val: Name::from_components(["_root_", "List", "toArray"]),
+                    preresolved: Vec::new(),
+                };
+                return Ok(application(to_array, vec![tail]));
             }
             Ok(tail)
         } else {

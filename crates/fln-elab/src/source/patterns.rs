@@ -199,6 +199,144 @@ pub(super) fn anonymous_head() -> Syntax {
     )
 }
 
+/// `‹T›` is `(by assumption : T)` (`macro "‹" type:term "›" : term`, `Init/Tactics.lean`).
+fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["term‹_›"]) && args.len() == 3);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let type_ = std::mem::replace(&mut args[1], null(vec![]));
+    let proof = Syntax::node(
+        parser_kind(&["Term", "byTactic"]),
+        vec![
+            atom("by"),
+            Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq"]),
+                vec![Syntax::node(
+                    parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                    vec![null(vec![Syntax::node(
+                        parser_kind(&["Tactic", "assumption"]),
+                        vec![atom("assumption")],
+                    )])],
+                )],
+            ),
+        ],
+    );
+    Syntax::node(
+        parser_kind(&["Term", "typeAscription"]),
+        vec![atom("("), proof, atom(":"), null(vec![type_]), atom(")")],
+    )
+}
+
+/// Whether `syntax` is a lambda with an anonymous-constructor binder, which
+/// [`expand_fun_patterns`] rewrites.
+fn fun_patterns(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Term", "fun"])
+            && matches!(args.get(1), Some(Syntax::Node { kind, args: basic, .. })
+                if kind == &parser_kind(&["Term", "basicFun"])
+                    && matches!(basic.first(), Some(Syntax::Node { args: binders, .. })
+                        if binders.iter().any(pattern_binder))))
+}
+
+/// An anonymous-constructor (`⟨a, b⟩`) or tuple (`(a, b)`) lambda binder.
+fn pattern_binder(binder: &Syntax) -> bool {
+    binder.kind() == Some(&parser_kind(&["Term", "anonymousCtor"]))
+        || binder.kind() == Some(&parser_kind(&["Term", "tuple"]))
+}
+
+/// `fun ⟨a, b⟩ c => e`, a lambda with an anonymous-constructor binder, is the pattern lambda
+/// `fun | ⟨a, b⟩, c => e`: the pin's `expandFunBinders` matches every written binder against a
+/// fresh local the same way, and a name or `_` binds as a pattern does. With a typed binder
+/// group or a result annotation the lambda is left as written, and refused.
+fn expand_fun_patterns(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Term", "fun"])
+            && matches!(args.get(1), Some(Syntax::Node { kind, args: basic, .. })
+                if kind == &parser_kind(&["Term", "basicFun"])
+                    && basic.len() == 4
+                    && matches!(&basic[1], Syntax::Node { args, .. } if args.is_empty())
+                    && matches!(&basic[0], Syntax::Node { args: binders, .. }
+                        if binders.iter().any(pattern_binder)
+                            && binders.iter().all(|b| {
+                                pattern_binder(b)
+                                    || matches!(b, Syntax::Ident { .. })
+                                    || b.kind() == Some(&parser_kind(&["Term", "hole"]))
+                            }))));
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked lambda");
+    };
+    let Syntax::Node { args: basic, .. } = &mut args[1] else {
+        unreachable!("checked basicFun");
+    };
+    let body = std::mem::replace(&mut basic[3], null(vec![]));
+    let arrow = std::mem::replace(&mut basic[2], null(vec![]));
+    let Syntax::Node { args: binders, .. } = &mut basic[0] else {
+        unreachable!("checked binders");
+    };
+    let mut patterns = Vec::new();
+    for (index, binder) in std::mem::take(binders).into_iter().enumerate() {
+        if index != 0 {
+            patterns.push(atom(","));
+        }
+        patterns.push(binder);
+    }
+    args[1] = Syntax::node(
+        parser_kind(&["Term", "matchAlts"]),
+        vec![null(vec![Syntax::node(
+            parser_kind(&["Term", "matchAlt"]),
+            vec![atom("|"), null(vec![null(patterns)]), arrow, body],
+        )])],
+    );
+    syntax
+}
+
+/// A field defined by equations, `toString | true => "t" | false => "f"`, is the field
+/// `toString := fun | true => "t" | false => "f"`. The equations become the pattern lambda when
+/// their own node is rebuilt (and are compiled there, as any `fun | …`); the field holding a bare
+/// lambda in its definition slot, which only this produces, then gets its `:=` definition.
+fn expand_field_equations(mut syntax: Syntax, pattern: bool) -> Syntax {
+    if pattern {
+        return syntax;
+    }
+    let equations = parser_kind(&["Term", "structInstFieldEqns"]);
+    let field = parser_kind(&["Term", "structInstField"]);
+    let lambda = parser_kind(&["Term", "fun"]);
+    match &mut syntax {
+        Syntax::Node { kind, args, .. }
+            if *kind == equations
+                && args.len() == 2
+                && matches!(&args[0], Syntax::Node { args, .. } if args.is_empty()) =>
+        {
+            let alternatives = std::mem::replace(&mut args[1], null(vec![]));
+            Syntax::node(lambda, vec![atom("fun"), alternatives])
+        }
+        Syntax::Node { kind, args, .. } if *kind == field && args.len() == 2 => {
+            if let Syntax::Node { args: payload, .. } = &mut args[1]
+                && payload.len() == 3
+                && payload[2].kind() == Some(&lambda)
+            {
+                let value = std::mem::replace(&mut payload[2], null(vec![]));
+                payload[2] = Syntax::node(
+                    parser_kind(&["Term", "structInstFieldDef"]),
+                    vec![atom(":="), null(vec![]), value],
+                );
+            }
+            syntax
+        }
+        _ => syntax,
+    }
+}
+
 fn pattern_function(syntax: &Syntax) -> bool {
     matches!(syntax, Syntax::Node {kind,args,..}
         if kind == &parser_kind(&["Term","fun"])
@@ -851,6 +989,9 @@ impl Context {
                 || binders::is_exists(node)
                 || binders::is_binder_predicate(node)
                 || record_terms::is_field_notation(node)
+                || fun_patterns(node)
+                || node.kind() == Some(&Name::from_components(["term‹_›"]))
+                || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
                 || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
@@ -917,6 +1058,9 @@ impl Context {
                     let node = self.expand_exists_node(node, pattern)?;
                     let node = self.expand_record_field_node(node, pattern)?;
                     let node = self.expand_offset_pattern(node, pattern)?;
+                    let node = expand_fun_patterns(node, pattern);
+                    let node = expand_field_equations(node, pattern);
+                    let node = expand_assumption(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)

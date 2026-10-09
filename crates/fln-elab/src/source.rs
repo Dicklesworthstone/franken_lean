@@ -1277,7 +1277,8 @@ impl Context {
         #[derive(Clone, Copy)]
         enum Arguments<'a> {
             Plain(&'a [Syntax]),
-            Separated(&'a [Syntax]),
+            /// Arguments between separator atoms (`,` in `⟨a, b⟩`, `then`/`else` in `bif`).
+            Separated(&'a [Syntax], &'static [&'static str]),
         }
         impl<'a> Arguments<'a> {
             fn split_first(self) -> Option<(&'a Syntax, Self)> {
@@ -1285,13 +1286,14 @@ impl Context {
                     Arguments::Plain(items) => items
                         .split_first()
                         .map(|(first, rest)| (first, Arguments::Plain(rest))),
-                    Arguments::Separated(items) => {
-                        let start = items.iter().position(
-                            |item| !matches!(item, Syntax::Atom { val, .. } if val.as_str() == ","),
-                        )?;
+                    Arguments::Separated(items, separators) => {
+                        let start = items.iter().position(|item| {
+                            !matches!(item, Syntax::Atom { val, .. }
+                                if separators.contains(&val.as_str()))
+                        })?;
                         items[start..]
                             .split_first()
-                            .map(|(first, rest)| (first, Arguments::Separated(rest)))
+                            .map(|(first, rest)| (first, Arguments::Separated(rest, separators)))
                     }
                 }
             }
@@ -1780,6 +1782,23 @@ impl Context {
                                     tasks.push(Task::Visit(discriminant, None, true));
                                     continue;
                                 }
+                                // `bif c then a else b` is `cond c a b` (`Init/Notation.lean`).
+                                if kind == &Name::from_components(["boolIfThenElse"]) {
+                                    let parts =
+                                        expect_node(syntax, kind, 6, "boolean conditional")?;
+                                    expect_atom(&parts[0], "bif", "boolean conditional")?;
+                                    expect_atom(&parts[2], "then", "boolean conditional")?;
+                                    expect_atom(&parts[4], "else", "boolean conditional")?;
+                                    let function =
+                                        self.constant(&Name::from_components(["cond"]))?;
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Separated(&parts[1..], &["then", "else"]),
+                                        expected,
+                                        false,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "subst"]) {
                                     let term = self.substitution(args, expected.as_ref())?;
                                     values.push(if finish {
@@ -1787,6 +1806,32 @@ impl Context {
                                     } else {
                                         term
                                     });
+                                    continue;
+                                }
+                                // `no_index e` is `e`: it only keeps `e` out of simp's
+                                // discrimination-tree keys (`Lean/Elab/BuiltinNotation.lean`).
+                                if kind == &parser_kind(&["Term", "noindex"]) {
+                                    let parts = expect_node(syntax, kind, 2, "no_index")?;
+                                    expect_atom(&parts[0], "no_index", "no_index")?;
+                                    tasks.push(Task::Visit(&parts[1], expected, finish));
+                                    continue;
+                                }
+                                // `e |>.f args` is `(e).f args` (`Term.pipeProj`'s macro,
+                                // `Lean/Elab/BuiltinNotation.lean`).
+                                if kind == &parser_kind(&["Term", "pipeProj"]) {
+                                    let parts =
+                                        expect_node(syntax, kind, 5, "pipeline projection")?;
+                                    expect_atom(&parts[1], "|>.", "pipeline projection")?;
+                                    expect_empty_null(&parts[3], "pipeline projection")?;
+                                    let field = record_terms::projection_field(&parts[2])?;
+                                    let arguments = expect_null_args(
+                                        &parts[4],
+                                        "pipeline projection arguments",
+                                    )?;
+                                    tasks.push(Task::Projection(
+                                        field, arguments, expected, false, finish,
+                                    ));
+                                    tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "proj"]) {
@@ -2033,7 +2078,7 @@ impl Context {
                                     };
                                     tasks.push(Task::Apply(
                                         function,
-                                        Arguments::Separated(elements),
+                                        Arguments::Separated(elements, &[","]),
                                         expected,
                                         false,
                                     ));
@@ -2048,6 +2093,46 @@ impl Context {
                                     tasks.push(Task::Apply(
                                         function,
                                         Arguments::Plain(&parts[1..]),
+                                        expected,
+                                        false,
+                                    ));
+                                    continue;
+                                }
+                                // `"!" b:40 => not b` and `prefix:100 "~~~" => Complement.complement`
+                                // (`Init/Notation.lean`; `not` is `Bool.not`, exported).
+                                let prefix = [
+                                    ("!", ["Bool", "not"]),
+                                    ("~~~", ["Complement", "complement"]),
+                                ]
+                                .into_iter()
+                                .find(|(spelling, _)| {
+                                    kind == &Name::str(
+                                        Name::anonymous(),
+                                        format!("term{spelling}_"),
+                                    )
+                                });
+                                if let Some((spelling, constant)) = prefix {
+                                    let parts = expect_node(syntax, kind, 2, "prefix operator")?;
+                                    expect_atom(&parts[0], spelling, "prefix operator")?;
+                                    let function =
+                                        self.constant(&Name::from_components(constant))?;
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(&parts[1..]),
+                                        expected,
+                                        false,
+                                    ));
+                                    continue;
+                                }
+                                // `postfix:max "⁻¹" => Inv.inv` (`Init/Prelude.lean`).
+                                if kind == &Name::str(Name::anonymous(), "term_⁻¹") {
+                                    let parts = expect_node(syntax, kind, 2, "inverse")?;
+                                    expect_atom(&parts[1], "⁻¹", "inverse postfix")?;
+                                    let function =
+                                        self.constant(&Name::from_components(["Inv", "inv"]))?;
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(&parts[..1]),
                                         expected,
                                         false,
                                     ));
@@ -3237,8 +3322,15 @@ impl Context {
             3,
             "suffices declaration",
         )?;
-        let name = if parts[0].kind() == Some(&Name::from_components(["null"])) {
-            let [id, colon] = expect_null_args(&parts[0], "suffices binder")? else {
+        // `atomic (group (binderIdent " : ")) <|> hygieneInfo`.
+        let name = if parts[0].kind() == Some(&Name::from_components(["group"])) {
+            let [id, colon] = expect_node(
+                &parts[0],
+                &Name::from_components(["group"]),
+                2,
+                "suffices binder",
+            )?
+            else {
                 return Err(failure(SourceInferenceError::Scope));
             };
             expect_atom(colon, ":", "suffices binder colon")?;
@@ -4245,6 +4337,52 @@ fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefiniti
 /// `instance … where fields` (`Command.whereStructInst`) as the structure instance
 /// `{ fields }` it elaborates to. The ordinary field expansion subsequently lowers
 /// method binders and result annotations, for both `where` and record literals.
+/// A field defined by equations, `f | p => e …` (`structInstFieldEqns`), as the field
+/// `f := fun | p => e …`, which the pattern-lambda lowering reads; any other field unchanged.
+fn field_equations_as_lambda(field: &Syntax) -> Syntax {
+    let Syntax::Node { kind, args, .. } = field else {
+        return field.clone();
+    };
+    let Some(Syntax::Node { args: payload, .. }) = args.get(1) else {
+        return field.clone();
+    };
+    let [
+        binders,
+        annotation,
+        Syntax::Node {
+            kind: definition,
+            args: equations,
+            ..
+        },
+    ] = payload.as_slice()
+    else {
+        return field.clone();
+    };
+    if definition != &parser_kind(&["Term", "structInstFieldEqns"])
+        || equations.len() != 2
+        || !matches!(&equations[0], Syntax::Node { args, .. } if args.is_empty())
+    {
+        return field.clone();
+    }
+    let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+    let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+    let lambda = Syntax::node(
+        parser_kind(&["Term", "fun"]),
+        vec![atom("fun"), equations[1].clone()],
+    );
+    let value = Syntax::node(
+        parser_kind(&["Term", "structInstFieldDef"]),
+        vec![atom(":="), null(Vec::new()), lambda],
+    );
+    Syntax::node(
+        kind.clone(),
+        vec![
+            args[0].clone(),
+            null(vec![binders.clone(), annotation.clone(), value]),
+        ],
+    )
+}
+
 fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
     let parts = expect_node(
         syntax,
@@ -4276,7 +4414,7 @@ fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabErr
             2,
             "instance field",
         )?;
-        rows.push(item.clone());
+        rows.push(field_equations_as_lambda(item));
     }
     Ok(Syntax::node(
         parser_kind(&["Term", "structInst"]),

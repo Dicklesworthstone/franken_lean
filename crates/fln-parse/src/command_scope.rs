@@ -7,6 +7,7 @@ pub mod instances;
 pub mod modifiers;
 pub mod mutual;
 pub mod reducibility;
+pub mod trees;
 pub mod variables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,50 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
         })
         .collect())
 }
+/// [`tokens`] for [`partition`], which goes past a refusal of one token: a symbol the table
+/// does not have (a notation this table lacks, such as a scoped one) or a character literal with
+/// no closing quote (`x#'lt` without the scoped `#'`). The pin's frontend reports such an error on
+/// the command that holds it and goes on with the next command; here that command keeps its
+/// bytes, so parsing it refuses it where the token starts. Every other refusal (an unterminated
+/// comment, string or identifier escape, which runs on past the command) still refuses the whole
+/// source.
+fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+    use fln_syntax::literal::LiteralError;
+    use fln_syntax::run::RunError;
+    use fln_syntax::token::TokenError;
+    let run = lex_run(view.normalized(), table());
+    let diagnostics: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Refused {
+                error:
+                    RunError::Token(
+                        TokenError::NotAToken { .. }
+                        | TokenError::Literal(LiteralError::MissingEndOfCharLiteral { .. }),
+                    ),
+                ..
+            }
+            | Event::Token(_)
+            | Event::Trivia(_) => None,
+            Event::Refused { error, .. } => Some(ParseDiagnostic {
+                message: error.message(),
+                at: view.to_original(error.at()),
+            }),
+        })
+        .collect();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+    Ok(run
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Token(token) => Some(token),
+            _ => None,
+        })
+        .collect())
+}
 fn control(s: &str) -> bool {
     matches!(
         s,
@@ -92,6 +137,19 @@ fn control(s: &str) -> bool {
             | "omit"
             | "set_option"
     )
+}
+/// A command this grammar does not parse, at the head of a line where a declaration's body
+/// cannot go on: it ends the declaration before it rather than becoming its tokens. (`set_option`
+/// is a scope command, [`control`].)
+fn line_command(s: &str) -> bool {
+    !declaration(s)
+        && !modifiers::is_modifier(s)
+        && !matches!(s, "local" | "scoped")
+        && (PIN_DOC_CARRIERS.contains(&s)
+            || matches!(
+                s,
+                "grind_pattern" | "seal" | "unseal" | "export" | "init_grind_norm"
+            ))
 }
 /// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
 fn doc_comment(token: &LexedToken) -> bool {
@@ -190,11 +248,12 @@ fn manual_link_refused(docstring: &str) -> bool {
     false
 }
 
-/// Whether the doc comment at `tokens[index]` leads a declaration this grammar parses (`Ok(true)`,
-/// also for a module doc, which is a command of its own) or a command only the pin parses
-/// (`Ok(false)`). A declaration's doc must not need manual-link validation and must be followed
-/// by what can carry it, as at the pin, which refuses `/-- d -/ #eval e` at the `#eval` and a
-/// doc at end of input. Out of line, with the refusals built here, so they occupy nothing of
+/// Refuses the doc comment at `tokens[index]` unless it is a module doc (a command of its own) or
+/// leads what can carry it: a declaration this grammar parses, or a command only the pin parses
+/// (`syntax`, `macro`, `add_decl_doc`, ...), with which the doc stays, so that one command is
+/// refused where it is parsed rather than the whole file here. A declaration's doc must not need
+/// manual-link validation, and the pin refuses `/-- d -/ #eval e` at the `#eval` and a doc at
+/// end of input. Out of line, with the refusals built here, so they occupy nothing of
 /// `partition`'s frame.
 #[inline(never)]
 fn doc_comment_is_carried(
@@ -202,25 +261,21 @@ fn doc_comment_is_carried(
     tokens: &[LexedToken],
     index: usize,
     source_len: usize,
-) -> Result<bool, NatDefinitionParseError> {
+) -> Result<(), NatDefinitionParseError> {
     let token = &tokens[index];
     if let Some(refusal) = unvalidated_manual_link(view, token) {
         return Err(refusal);
     }
     if !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--") {
-        return Ok(true);
+        return Ok(());
     }
     let next = tokens.get(index + 1);
-    if next.is_some_and(carries_doc_comment) {
-        return Ok(true);
-    }
-    // A command the pin lets a doc comment lead and this grammar cannot parse (`syntax`,
-    // `macro`, `add_decl_doc`, ...): the doc stays with it, and that one command is refused
-    // where it is parsed, not the whole file here.
     if next.is_some_and(|next| {
-        matches!(&next.kind, TokenKind::Symbol(symbol) if PIN_DOC_CARRIERS.contains(&symbol.as_str()))
+        carries_doc_comment(next)
+            || matches!(&next.kind, TokenKind::Symbol(symbol)
+                if PIN_DOC_CARRIERS.contains(&symbol.as_str()))
     }) {
-        return Ok(false);
+        return Ok(());
     }
     Err(NatDefinitionParseError::OutsideSeedGrammar {
         at: next.map_or(BytePos(source_len), |next| {
@@ -491,10 +546,11 @@ fn set_option(
 /// and strings are lexer events, not text searched for command-looking words.
 /// Scope directives must start a source line. Within a declaration they must
 /// also leave its layout block; `end` is still a valid local name in a proof.
+/// A token the table lacks ends only the command holding it ([`partition_tokens`]).
 pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let tokens = tokens(&view)?;
+    let tokens = partition_tokens(&view)?;
     let mut starts = Vec::new();
     let mut depth = 0_usize;
     let source_view = view.normalized();
@@ -544,27 +600,35 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // does, and only before what can carry it, as at the pin, which refuses
             // `/-- d -/ #eval e` at the `#eval`.
             if depth == 0 && command_line && !open_in && doc_comment(token) {
-                let split = doc_comment_is_carried(&view, &tokens, index, source.len())?;
+                doc_comment_is_carried(&view, &tokens, index, source.len())?;
                 starts.push(view.to_original(token.extent.start()).0);
                 current_open = false;
                 declaration_column = None;
                 attribute_prefix = false;
                 prefix_column = None;
-                if split && symbol == "/--" {
+                // The command after a declaration's doc continues the doc's command, whether
+                // this grammar parses it or not.
+                if symbol == "/--" {
                     attribute_prefix = true;
                     prefix_column = Some(column(token));
                 }
                 continue;
             }
-            let scope_start = control(symbol) && command_line;
+            let scope_start = (control(symbol) || line_command(symbol)) && command_line;
             // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
             // …) precede the declaration keyword in one command (`declModifiers`).
-            let prefix = symbol == "@[" || modifiers::is_modifier(symbol);
+            // `local` and `scoped` (`attrKind`) lead `instance`, `notation`, `syntax`, … the same way.
+            let prefix = symbol == "@["
+                || modifiers::is_modifier(symbol)
+                || (command_line || attribute_prefix) && (symbol == "local" || symbol == "scoped");
             let inline_start = prefix && command_line;
             // `class inductive` and `class abbrev` are one declaration keyword at the pin.
             let after_class = index > 0
                 && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "class");
-            let continues_prefix = (attribute_prefix && (declaration(symbol) || prefix))
+            // A command keyword after the prefix is its command's (`@[inherit_doc f]` then
+            // `infixr:100 …` on the next line).
+            let continues_prefix = (attribute_prefix
+                && (declaration(symbol) || prefix || line_command(symbol)))
                 || (after_class && declaration(symbol));
             if depth == 0 && current_open && symbol == "in" {
                 open_in = true;
@@ -582,7 +646,8 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     current_open = scope_start && (symbol == "open" || symbol == "set_option");
                     prefix_column = inline_start.then(|| column(token));
                 }
-                attribute_prefix = inline_start || (continues_prefix && !declaration(symbol));
+                attribute_prefix = inline_start
+                    || (continues_prefix && !declaration(symbol) && !line_command(symbol));
                 declaration_column = declaration(symbol)
                     .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
             } else if depth == 0 && attribute_prefix {
@@ -633,6 +698,34 @@ mod tests {
         ] {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    /// The pin's command boundaries (`Lines.lean`, dumped at the pin): a line-start command this
+    /// grammar cannot parse ends the declaration before it, `set_option … in` leads the next
+    /// command, and attributes and `noncomputable scoped`/`local` lead theirs.
+    #[test]
+    fn line_start_commands_end_the_declaration_before_them() {
+        let source = "theorem a : True := by\n  trivial\n\ngrind_pattern Nat.add_zero => n + 0\n\
+                      set_option pp.all true in\ntheorem b : True := trivial\n\
+                      @[inherit_doc f]\ninfixr:100 \" <&&> \" => Nat.add\n\
+                      noncomputable scoped instance i : Inhabited Nat := ⟨0⟩\n\
+                      local notation \"xx\" => 1\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        let heads: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap().lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "theorem a : True := by",
+                "grind_pattern Nat.add_zero => n + 0",
+                "set_option pp.all true in",
+                "@[inherit_doc f]",
+                "noncomputable scoped instance i : Inhabited Nat := ⟨0⟩",
+                "local notation \"xx\" => 1",
+            ]
+        );
     }
 
     #[test]
@@ -1014,5 +1107,35 @@ mod tests {
         assert!(!manual_link_refused("trailing lean-manual://"));
         let module = partition(b"/-! see [](lean-manual://f) -/\ndef x := 44\n").unwrap();
         assert_eq!(parse(module[0].1).unwrap(), Some(ScopeCommand::Trivia));
+    }
+
+    #[test]
+    fn a_token_the_table_lacks_refuses_its_own_command_and_no_other() {
+        // `#'` is BitVec's scoped notation and `✓` no table's: each command holding one is kept
+        // whole and refused where it is parsed; the commands around it partition as before.
+        for bad in ["theorem t : x#'lt = 1 := rfl", "def ok : Nat := ✓"] {
+            let source = format!("def a : Nat := 1\n{bad}\ndef b : Nat := 2\n");
+            let commands = partition(source.as_bytes()).unwrap();
+            assert_eq!(commands.len(), 3, "{source}");
+            assert_eq!(commands[1].1, format!("{bad}\n").as_bytes(), "{source}");
+            assert!(
+                matches!(
+                    crate::parse_source_command(commands[1].1),
+                    Err(NatDefinitionParseError::Lexical { .. })
+                ),
+                "{source}"
+            );
+            assert!(
+                crate::parse_source_command(commands[2].1).is_ok(),
+                "{source}"
+            );
+        }
+        // A refusal that runs on past its command still refuses the whole source.
+        for bad in [
+            "def s := \"open\ndef b : Nat := 2\n",
+            "def c := /- open\ndef b := 2\n",
+        ] {
+            assert!(partition(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 }

@@ -629,7 +629,12 @@ impl Context {
                 } else {
                     keyword
                 };
-                expect_atom(keyword, mode.keyword(), "goal control keyword")?;
+                // `cdotTk := unicode("· ", ". ")`: the ASCII dot is the same focus.
+                let ascii_cdot = control::is_cdot(kind)
+                    && matches!(keyword, Syntax::Atom { val, .. } if val == ".");
+                if !ascii_cdot {
+                    expect_atom(keyword, mode.keyword(), "goal control keyword")?;
+                }
                 self.start_goal_control(proof, goal, sequence, mode)?;
             } else if kind == &parser_kind(&["Tactic", "tacticHave__"])
                 || kind == &parser_kind(&["Tactic", "tacticLet__"])
@@ -703,7 +708,7 @@ impl Context {
                 };
                 expect_atom(keyword, "refine", "refinement tactic")?;
                 return Ok(ProofAction::Refine { syntax: term, goal });
-            } else if kind == &parser_kind(&["Tactic", "by_cases"]) {
+            } else if kind == &Name::from_components(["tacticBy_cases_:_"]) {
                 let [keyword, binder, proposition] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };

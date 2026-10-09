@@ -91,7 +91,13 @@ fn declaration(
     let explicit_type =
         if cursor < end && matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":") {
             let colon = cursor;
-            let type_end = type_end(tokens, colon + 1, ":=").min(end);
+            let mut type_end = type_end(tokens, colon + 1, ":=").min(end);
+            // A declaration defined by equations ends its type at the first alternative's `|`,
+            // unless a `match` in the type owns it.
+            let pipe = crate::type_end(tokens, colon + 1, "|").min(end);
+            if !crate::top_level_match(tokens, colon + 1, pipe) {
+                type_end = type_end.min(pipe);
+            }
             cursor = type_end;
             null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
@@ -109,6 +115,32 @@ fn declaration(
         } else {
             null_node(Vec::new())
         };
+    // `letEqnsDecl := letIdLhs matchAlts` (`Lean/Parser/Term.lean`): `go : T | p => e | …`.
+    if cursor < end && matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == "|") {
+        let alternatives = matching::declaration_equations(
+            leaves,
+            view,
+            tokens,
+            cursor..end,
+            DefinitionGrammar::Scalar,
+        )?;
+        let declaration = Syntax::node(
+            parser_kind(&["Term", "letEqnsDecl"]),
+            vec![
+                Syntax::node(parser_kind(&["Term", "letId"]), vec![leaves.leaf(name)?]),
+                null_node(bounded_binder_syntax(
+                    leaves,
+                    view,
+                    tokens,
+                    parameters,
+                    DefinitionGrammar::Scalar,
+                )?),
+                explicit_type,
+                alternatives,
+            ],
+        );
+        return Ok(rec_declaration(declaration));
+    }
     if cursor >= end || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=") {
         return Err(refuse(view, tokens, cursor.min(end)));
     }
@@ -139,7 +171,13 @@ fn declaration(
             value,
         ],
     );
-    Ok(Syntax::node(
+    Ok(rec_declaration(declaration))
+}
+
+/// A `letRecDecl` around one `letIdDecl` or `letEqnsDecl`, with no attributes or termination
+/// hints.
+fn rec_declaration(declaration: Syntax) -> Syntax {
+    Syntax::node(
         parser_kind(&["Term", "letRecDecl"]),
         vec![
             null_node(Vec::new()),
@@ -150,7 +188,7 @@ fn declaration(
                 vec![null_node(Vec::new()), null_node(Vec::new())],
             ),
         ],
-    ))
+    )
 }
 
 /// `instance … where fields` (`Command.whereStructInst`, `"where" structInstFields
@@ -228,6 +266,34 @@ fn struct_field(
     name: usize,
     end: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    // A field defined by equations (`toString | true => "t" | false => "f"`):
+    // `structInstFieldEqns` over the alternatives (`Lean/Parser/Term.lean`).
+    if matches!(tokens.get(name + 1).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "|") {
+        let alternatives = matching::declaration_equations(
+            leaves,
+            view,
+            tokens,
+            name + 1..end,
+            DefinitionGrammar::Scalar,
+        )?;
+        return Ok(Syntax::node(
+            parser_kind(&["Term", "structInstField"]),
+            vec![
+                Syntax::node(
+                    parser_kind(&["Term", "structInstLVal"]),
+                    vec![leaves.leaf(name)?, null_node(Vec::new())],
+                ),
+                null_node(vec![
+                    null_node(Vec::new()),
+                    null_node(Vec::new()),
+                    Syntax::node(
+                        parser_kind(&["Term", "structInstFieldEqns"]),
+                        vec![null_node(Vec::new()), alternatives],
+                    ),
+                ]),
+            ],
+        ));
+    }
     let mut cursor = name + 1;
     let mut prefix = term_binders::Prefix::field(leaves, view, tokens, name, &mut cursor, end)?;
     while !prefix.body() {

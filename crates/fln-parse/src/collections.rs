@@ -21,6 +21,15 @@ struct List {
     elements_and_separators: Vec<Syntax>,
     /// The indexed term of a [`Bracket::Index`], with where it starts.
     base: Option<(Syntax, usize)>,
+    /// A [`Bracket::Subtype`]'s binder, optional type and `//`.
+    subtype: Option<Subtype>,
+}
+
+struct Subtype {
+    name: usize,
+    colon: Option<usize>,
+    separator: Option<usize>,
+    type_: Option<Syntax>,
 }
 
 /// Which comma-separated bracket a [`List`] is.
@@ -36,19 +45,32 @@ pub(super) enum Bracket {
     /// `(a, b)`: `Lean.Parser.Term.tuple`, `"(" optional (term ", " sepBy1 term ", "
     /// (allowTrailingSep := true)) ")"` (`Lean/Parser/Term.lean`). Opened at its first comma.
     Tuple,
+    /// `#[a, b]`: `syntax (name := «term#[_,]») "#[" withoutPosition(term,*,?) "]"`
+    /// (`Init/Data/Array/Basic.lean`), a list literal's shape.
+    Array,
+    /// `#v[a, b]`: `Vector.«term#v[_,]»` (`Init/Data/Vector/Basic.lean`), the array literal's
+    /// shape.
+    Vector,
+    /// `{x // p}` and `{x : T // p}`: `«term{_:_//_}»` (`Init/Core.lean`), the type ended by
+    /// `//` and the predicate by `}`.
+    Subtype,
 }
 
 impl Bracket {
     fn close(self) -> &'static str {
         match self {
-            Bracket::List | Bracket::Index => "]",
+            Bracket::List | Bracket::Index | Bracket::Array | Bracket::Vector => "]",
             Bracket::AnonymousCtor => "⟩",
             Bracket::Tuple => ")",
+            Bracket::Subtype => "}",
         }
     }
     fn kind(self) -> Name {
         match self {
             Bracket::List => list_kind(),
+            Bracket::Array => Name::from_components(["term#[_,]"]),
+            Bracket::Vector => Name::from_components(["Vector", "term#v[_,]"]),
+            Bracket::Subtype => Name::from_components(["term{_:_//_}"]),
             Bracket::AnonymousCtor => parser_kind(&["Term", "anonymousCtor"]),
             Bracket::Index => Name::from_components(["term__[_]"]),
             Bracket::Tuple => parser_kind(&["Term", "tuple"]),
@@ -85,6 +107,7 @@ impl Lists {
             bracket,
             elements_and_separators: Vec::new(),
             base: None,
+            subtype: None,
         });
         frames.push(frame(at));
     }
@@ -123,6 +146,7 @@ impl Lists {
             bracket: Bracket::Tuple,
             elements_and_separators: vec![first, leaves.leaf(at)?],
             base: None,
+            subtype: None,
         });
         frames.push(frame(open));
         Ok(true)
@@ -148,16 +172,147 @@ impl Lists {
             bracket: Bracket::Index,
             elements_and_separators: Vec::new(),
             base: Some(base),
+            subtype: None,
         });
         frames.push(frame(at));
         true
     }
 
-    /// Whether `symbol` is a delimiter of the innermost open bracket: `,` or its own close.
+    /// Whether `symbol` is a delimiter of the innermost open bracket: `,` or its own close;
+    /// for a subtype, its `//` while the type is open, and its `}`.
     pub(super) fn delimits(&self, symbol: &str) -> bool {
-        self.active
-            .last()
-            .is_some_and(|list| symbol == "," || symbol == list.bracket.close())
+        self.active.last().is_some_and(|list| match &list.subtype {
+            Some(subtype) => symbol == "}" || (symbol == "//" && subtype.separator.is_none()),
+            None => {
+                symbol == ","
+                    || symbol == list.bracket.close()
+                    || (list.bracket == Bracket::Index && symbol == "]'")
+            }
+        })
+    }
+
+    /// A subtype's `//` (ending its type) or `}` (ending its predicate and the subtype).
+    fn subtype_delimiter(
+        &mut self,
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        frames: &mut Vec<BoundedTermFrame>,
+        at: usize,
+        symbol: &str,
+    ) -> Result<usize, NatDefinitionParseError> {
+        let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, at),
+            expected: NatDefinitionExpectation::ScalarValue,
+        };
+        let current = frames.pop().expect("validated subtype frame");
+        if current.ascription.is_some()
+            || (current.application.is_empty()
+                && current.operands.is_empty()
+                && current.operators.is_empty())
+        {
+            return Err(refusal());
+        }
+        let term = finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
+        let list = self.active.last_mut().expect("validated active subtype");
+        let subtype = list.subtype.as_mut().expect("validated subtype state");
+        if symbol == "//" && subtype.separator.is_none() {
+            subtype.type_ = Some(term);
+            subtype.separator = Some(at);
+            frames.push(frame(list.open));
+            return Ok(at + 1);
+        }
+        if symbol != "}" {
+            return Err(refusal());
+        }
+        let list = self.active.pop().expect("completed subtype");
+        let subtype = list.subtype.expect("subtype state");
+        let type_ = match (subtype.colon, subtype.type_) {
+            (Some(colon), Some(type_)) => null_node(vec![leaves.leaf(colon)?, type_]),
+            (None, None) => null_node(Vec::new()),
+            _ => return Err(refusal()),
+        };
+        let syntax = Syntax::node(
+            list.bracket.kind(),
+            vec![
+                leaves.leaf(list.open)?,
+                leaves.leaf(subtype.name)?,
+                type_,
+                leaves.leaf(subtype.separator.expect("a subtype's //"))?,
+                term,
+                leaves.leaf(at)?,
+            ],
+        );
+        frames
+            .last_mut()
+            .expect("subtype has an enclosing term frame")
+            .application
+            .push((syntax, list.open));
+        Ok(at + 1)
+    }
+
+    /// `{x // p}` or `{x : T // p}` at the `{` at `at`: opens the subtype and returns where its
+    /// first term starts, or `None` for any other brace (a structure instance's).
+    pub(super) fn open_subtype(
+        &mut self,
+        tokens: &[LexedToken],
+        frames: &mut Vec<BoundedTermFrame>,
+        at: usize,
+    ) -> Option<usize> {
+        let symbol = |i: usize, text: &str| matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+        if !matches!(
+            tokens.get(at + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(_))
+        ) {
+            return None;
+        }
+        let subtype = if symbol(at + 2, "//") {
+            Subtype {
+                name: at + 1,
+                colon: None,
+                separator: Some(at + 2),
+                type_: None,
+            }
+        } else if symbol(at + 2, ":") {
+            // A `//` at this brace's own depth, before its `}`.
+            let mut depth = 0usize;
+            let mut separated = false;
+            for token in tokens.iter().skip(at + 3) {
+                let TokenKind::Symbol(s) = &token.kind else {
+                    continue;
+                };
+                match crate::canonical_bracket(s.as_str()) {
+                    "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                    "}" if depth == 0 => break,
+                    ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                    "//" if depth == 0 => {
+                        separated = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !separated {
+                return None;
+            }
+            Subtype {
+                name: at + 1,
+                colon: Some(at + 2),
+                separator: None,
+                type_: None,
+            }
+        } else {
+            return None;
+        };
+        self.active.push(List {
+            open: at,
+            bracket: Bracket::Subtype,
+            elements_and_separators: Vec::new(),
+            base: None,
+            subtype: Some(subtype),
+        });
+        frames.push(frame(at));
+        Some(at + 3)
     }
 
     /// A list does not own commas or closing delimiters inside a record,
@@ -198,7 +353,19 @@ impl Lists {
             .expect("validated active list")
             .bracket
             .close();
-        if symbol != "," && symbol != close {
+        if self
+            .active
+            .last()
+            .is_some_and(|list| list.subtype.is_some())
+        {
+            return self.subtype_delimiter(leaves, view, tokens, frames, at, symbol);
+        }
+        let proved = symbol == "]'"
+            && self
+                .active
+                .last()
+                .is_some_and(|list| list.bracket == Bracket::Index);
+        if symbol != "," && symbol != close && !proved {
             return Err(refusal());
         }
         let current = frames.pop().expect("validated list element frame");
@@ -232,6 +399,26 @@ impl Lists {
         let mut list = self.active.pop().expect("completed list");
         let mut next = at + 1;
         let (syntax, start) = match list.base.take() {
+            Some((base, start)) if proved => {
+                // `syntax:max term noWs "[" withoutPosition(term) "]'" term:max : term`
+                // (`Init/GetElem.lean`): the proof is one argument-level term.
+                let index = list.elements_and_separators.pop().expect("one index term");
+                let (proof, end) = index_proof(leaves, view, tokens, next, limit)?;
+                next = end;
+                (
+                    Syntax::node(
+                        Name::from_components(["term__[_]'_"]),
+                        vec![
+                            base,
+                            leaves.leaf(list.open)?,
+                            index,
+                            leaves.leaf(at)?,
+                            proof,
+                        ],
+                    ),
+                    start,
+                )
+            }
             Some((base, start)) => {
                 let index = list.elements_and_separators.pop().expect("one index term");
                 let suffix = (next < limit && touching(tokens, at, next))
@@ -306,4 +493,51 @@ impl Lists {
             .push((syntax, start));
         Ok(next)
     }
+}
+
+/// The `term:max` after `]'`: a name, `_`, or one parenthesized or anonymous-constructor group,
+/// and the token after it.
+#[inline(never)]
+fn index_proof(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+    limit: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, at),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
+    let end = match tokens
+        .get(at)
+        .filter(|_| at < limit)
+        .map(|token| &token.kind)
+    {
+        Some(TokenKind::Ident(_)) => at + 1,
+        Some(TokenKind::Symbol(s)) if s == "_" => at + 1,
+        Some(TokenKind::Symbol(s)) if matches!(canonical_bracket(s), "(" | "⟨") => {
+            let mut depth = 0usize;
+            let mut close = None;
+            for (index, token) in tokens.iter().enumerate().take(limit).skip(at) {
+                if let TokenKind::Symbol(s) = &token.kind {
+                    match canonical_bracket(s) {
+                        "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                        ")" | "]" | "}" | "⦄" | "⟩" => {
+                            depth = depth.checked_sub(1).ok_or_else(refusal)?;
+                            if depth == 0 {
+                                close = Some(index);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            close.ok_or_else(refusal)? + 1
+        }
+        _ => return Err(refusal()),
+    };
+    let proof = nested_term(leaves, view, tokens, at..end)?;
+    Ok((proof, end))
 }

@@ -10,6 +10,8 @@ pub(super) struct RecordFrame {
     sources: Vec<Syntax>,
     source_mode: bool,
     with_token: Option<usize>,
+    /// The column of the field being read: a line starting at or before it ends that field.
+    field_column: Option<usize>,
 }
 enum Field {
     Abbreviation(usize),
@@ -55,11 +57,18 @@ fn push_field(
     if name >= end || !matches!(tokens[name].kind, TokenKind::Ident(_)) {
         return Err(refuse(view, tokens, name));
     }
+    record.field_column = Some(column(view, tokens, name));
     *cursor += 1;
+    // A name alone on its line is an abbreviation too: the next line starts the next field.
+    let line_ends = *cursor < end
+        && view.normalized().line_of(tokens[*cursor].extent.start())
+            > view.normalized().line_of(tokens[name].extent.end())
+        && column(view, tokens, *cursor) <= column(view, tokens, name);
     if *cursor < end
         && (symbol(tokens, *cursor, ",")
             || symbol(tokens, *cursor, "}")
-            || symbol(tokens, *cursor, ":"))
+            || symbol(tokens, *cursor, ":")
+            || line_ends)
     {
         // A colon after a field abbreviation is the enclosing record's type,
         // as in `{ value : Box Nat }`.
@@ -128,6 +137,7 @@ pub(super) fn open(
         sources: Vec::new(),
         source_mode,
         with_token: None,
+        field_column: None,
     };
     push_field(record, frames, leaves, view, tokens, cursor, end)
 }
@@ -167,47 +177,14 @@ pub(super) fn delimiter(
         return Err(refuse(view, tokens, at));
     }
     let mut annotation = null_node(Vec::new());
-    if let Some(colon) = record.colon {
+    if record.colon.is_none() {
+        finish_field(leaves, view, tokens, current, &mut record, at)?;
+    } else if let Some(colon) = record.colon {
         if !symbol(tokens, at, "}") {
             return Err(refuse(view, tokens, at));
         }
         let type_ = finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
         annotation = null_node(vec![leaves.leaf(colon)?, type_]);
-    } else if let Some(field) = record.field.take() {
-        let syntax = match field {
-            Field::Definition => {
-                let field =
-                    finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
-                if field.kind() != Some(&parser_kind(&["Term", "structInstField"])) {
-                    return Err(refuse(view, tokens, at));
-                }
-                field
-            }
-            Field::Abbreviation(name) => {
-                if !current.application.is_empty()
-                    || !current.operands.is_empty()
-                    || !current.operators.is_empty()
-                {
-                    return Err(refuse(view, tokens, at));
-                }
-                Syntax::node(
-                    parser_kind(&["Term", "structInstField"]),
-                    vec![
-                        Syntax::node(
-                            parser_kind(&["Term", "structInstLVal"]),
-                            vec![leaves.leaf(name)?, null_node(Vec::new())],
-                        ),
-                        null_node(Vec::new()),
-                    ],
-                )
-            }
-        };
-        record.rows.push(syntax);
-    } else if !current.application.is_empty()
-        || !current.operands.is_empty()
-        || !current.operators.is_empty()
-    {
-        return Err(refuse(view, tokens, at));
     }
     if symbol(tokens, at, ",") {
         if record.rows.is_empty()
@@ -252,6 +229,120 @@ pub(super) fn delimiter(
             .push((term, open));
     }
     Ok(())
+}
+
+/// The field (or bare frame) that `current` holds, into `record.rows`.
+fn finish_field(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    current: BoundedTermFrame,
+    record: &mut RecordFrame,
+    at: usize,
+) -> Result<(), NatDefinitionParseError> {
+    if let Some(field) = record.field.take() {
+        let syntax = match field {
+            Field::Definition => {
+                let field =
+                    finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
+                if field.kind() != Some(&parser_kind(&["Term", "structInstField"])) {
+                    return Err(refuse(view, tokens, at));
+                }
+                field
+            }
+            Field::Abbreviation(name) => {
+                if !current.application.is_empty()
+                    || !current.operands.is_empty()
+                    || !current.operators.is_empty()
+                {
+                    return Err(refuse(view, tokens, at));
+                }
+                Syntax::node(
+                    parser_kind(&["Term", "structInstField"]),
+                    vec![
+                        Syntax::node(
+                            parser_kind(&["Term", "structInstLVal"]),
+                            vec![leaves.leaf(name)?, null_node(Vec::new())],
+                        ),
+                        null_node(Vec::new()),
+                    ],
+                )
+            }
+        };
+        record.rows.push(syntax);
+    } else if !current.application.is_empty()
+        || !current.operands.is_empty()
+        || !current.operators.is_empty()
+    {
+        return Err(refuse(view, tokens, at));
+    }
+    Ok(())
+}
+
+/// Whether the token at `at` begins a line at or before the column of the innermost record's
+/// current field, with no bracket opened inside that field: `structInstFields` is `sepByIndent
+/// … (allowTrailingSep := true)` read `withoutPosition`, so a line break separates fields as `,`
+/// does, and before the closing `}` it is a trailing separator.
+#[inline(never)]
+pub(super) fn layout(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &[BoundedTermFrame],
+    at: usize,
+) -> bool {
+    let Some(innermost) = frames.iter().rposition(|frame| frame.record.is_some()) else {
+        return false;
+    };
+    let record = frames[innermost].record.as_ref().expect("a record frame");
+    let Some(field_column) = record.field_column else {
+        return false;
+    };
+    !record.source_mode
+        && record.colon.is_none()
+        && record.field.is_some()
+        && frames[innermost + 1..]
+            .iter()
+            .all(|frame| frame.open.is_none() && frame.record.is_none())
+        && at > 0
+        && view.normalized().line_of(tokens[at].extent.start())
+            > view.normalized().line_of(tokens[at - 1].extent.end())
+        && column(view, tokens, at) <= field_column
+}
+
+/// A line break that [`layout`] found: the field ends, an empty separator follows it, and the
+/// token at `at` either closes the record (left to the `}` delimiter) or starts the next field.
+/// Returns where the driver resumes.
+#[inline(never)]
+pub(super) fn line_break(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &mut Vec<BoundedTermFrame>,
+    at: usize,
+    end: usize,
+) -> Result<usize, NatDefinitionParseError> {
+    let mut current = frames.pop().expect("record term frame");
+    let mut record = current.record.take().expect("record line break");
+    finish_field(leaves, view, tokens, current, &mut record, at)?;
+    record.rows.push(null_node(Vec::new()));
+    record.field_column = None;
+    let mut cursor = at;
+    if symbol(tokens, at, "}") {
+        frames.push(frame(record));
+    } else {
+        push_field(record, frames, leaves, view, tokens, &mut cursor, end)?;
+    }
+    Ok(cursor)
+}
+
+fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
+    let pos = tokens[at].extent.start();
+    pos.0
+        - view
+            .normalized()
+            .line_start(view.normalized().line_of(pos))
+            .expect("token line")
+            .0
 }
 
 #[cfg(test)]

@@ -269,13 +269,16 @@ fn plan(
                 })
         });
         let mut statement_separator = false;
-        match symbol.as_str() {
+        // A compound symbol acts as the bracket it contains (`]'` in `xs[i]'h` closes `[`).
+        match crate::canonical_bracket(symbol.as_str()) {
             "try" => {
                 let baseline = statement.ok_or_else(|| refuse(view, tokens, at))?;
                 tries.open(view, tokens, at, depth, baseline, &mut do_scopes, range.end)?;
             }
             ":" if tries.in_header(at) => {}
-            "if" => conditionals.push(ConditionalPlan {
+            // `bif c then a else b` is a term, never a `do` statement's conditional.
+            "bif" if statement.is_some() => return Err(refuse(view, tokens, at)),
+            "if" | "bif" => conditionals.push(ConditionalPlan {
                 statement: statement.is_some(),
                 start: at,
                 depth,
@@ -625,6 +628,8 @@ fn pattern(
         /// `⟨p, …⟩` (`Term.anonymousCtor`): the brackets, the separating commas, and the
         /// number of element patterns on the value stack.
         Anonymous(usize, usize, Vec<usize>, usize),
+        /// `(p, q, …)` (`Term.tuple`, `[p "," [q "," …]]`): as [`Task::Anonymous`].
+        Tuple(usize, usize, Vec<usize>, usize),
     }
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
@@ -675,6 +680,25 @@ fn pattern(
                 values.push(Syntax::node(
                     parser_kind(&["Term", "anonymousCtor"]),
                     vec![leaves.leaf(open)?, null_node(items), leaves.leaf(close)?],
+                ));
+            }
+            Task::Tuple(open, close, commas, count) => {
+                let mut elements = values.split_off(values.len() - count).into_iter();
+                let first = elements.next().expect("a tuple's first element");
+                let mut rest = Vec::with_capacity(count * 2);
+                for (index, element) in elements.enumerate() {
+                    if index > 0 {
+                        rest.push(leaves.leaf(commas[index])?);
+                    }
+                    rest.push(element);
+                }
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "tuple"]),
+                    vec![
+                        hygienic_lparen(leaves.leaf(open)?),
+                        null_node(vec![first, leaves.leaf(commas[0])?, null_node(rest)]),
+                        leaves.leaf(close)?,
+                    ],
                 ));
             }
             Task::Group(open, close) => {
@@ -744,8 +768,28 @@ fn pattern(
                     if close + 1 != range.end {
                         return Err(refuse(view, tokens, close + 1));
                     }
+                    let inner = range.start + 1..close;
+                    let elements = if inner.is_empty() {
+                        Vec::new()
+                    } else {
+                        columns(tokens, inner.clone())
+                    };
+                    if elements.len() > 1 {
+                        if elements.iter().any(|(range, _)| range.is_empty()) {
+                            return Err(refuse(view, tokens, range.start));
+                        }
+                        let commas = elements.iter().filter_map(|(_, comma)| *comma).collect();
+                        tasks.push(Task::Tuple(range.start, close, commas, elements.len()));
+                        tasks.extend(
+                            elements
+                                .into_iter()
+                                .rev()
+                                .map(|(range, _)| Task::Parse(range)),
+                        );
+                        continue;
+                    }
                     tasks.push(Task::Group(range.start, close));
-                    tasks.push(Task::Parse(range.start + 1..close));
+                    tasks.push(Task::Parse(inner));
                     continue;
                 }
                 let mut cursor = range.start;
@@ -1047,6 +1091,7 @@ fn parse_planned(
         && (equations
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
+                    || is_symbol(tokens, at, "bif")
                     || is_symbol(tokens, at, "match")
                     || is_symbol(tokens, at, "try")
                     || (opens_do && is_symbol(tokens, at, "|"))
@@ -1076,6 +1121,11 @@ fn build_conditional(
     updates: &HashSet<usize>,
 ) -> Result<(), NatDefinitionParseError> {
     let then_at = plan.then_at.expect("planned then");
+    if is_symbol(tokens, plan.start, "bif") {
+        return build_bool_conditional(
+            leaves, view, tokens, plan, grammar, splices, updates, then_at,
+        );
+    }
 
     let pattern_test = plan.statement && is_symbol(tokens, plan.start + 1, "let");
     let named = !pattern_test && is_symbol(tokens, plan.start + 2, ":");
@@ -1200,6 +1250,46 @@ fn build_conditional(
         )
     };
     splices.insert(plan.start, (plan.end, syntax));
+    Ok(())
+}
+
+/// `bif c then a else b` (`boolIfThenElse`, `Init/Notation.lean`, which expands to `cond c a b`):
+/// no evidence binding and always an `else`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn build_bool_conditional(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: ConditionalPlan,
+    grammar: DefinitionGrammar,
+    splices: &mut Splices,
+    updates: &HashSet<usize>,
+    then_at: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let Some(else_at) = plan.else_at else {
+        return Err(refuse(view, tokens, plan.end));
+    };
+    let mut parts = vec![leaves.leaf(plan.start)?];
+    for (range, separator) in [
+        (plan.start + 1..then_at, Some(then_at)),
+        (then_at + 1..else_at, Some(else_at)),
+        (else_at + 1..plan.end, None),
+    ] {
+        parts.push(branch_value(
+            leaves, view, tokens, range, grammar, splices, updates,
+        )?);
+        if let Some(separator) = separator {
+            parts.push(leaves.leaf(separator)?);
+        }
+    }
+    splices.insert(
+        plan.start,
+        (
+            plan.end,
+            Syntax::node(Name::from_components(["boolIfThenElse"]), parts),
+        ),
+    );
     Ok(())
 }
 
@@ -1473,6 +1563,7 @@ mod tests {
     #[test]
     fn deeply_nested_matches_parse_without_host_recursion() {
         std::thread::Builder::new()
+            .name("deeply_nested_matches_parse_without_host_recursion".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let text = format!(
@@ -1529,6 +1620,7 @@ mod matrix_tests {
     #[test]
     fn deeply_nested_pattern_groups_fit_a_small_stack() {
         std::thread::Builder::new()
+            .name("deeply_nested_pattern_groups_fit_a_small_stack".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let text = format!(
@@ -1588,6 +1680,7 @@ mod equation_depth_tests {
     #[test]
     fn nested_rhs_matches_in_equations_use_a_heap_plan() {
         std::thread::Builder::new()
+            .name("nested_rhs_matches_in_equations_use_a_heap_plan".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let mut source = String::from("def nested : Bool -> Nat\n | true => ");
@@ -1656,6 +1749,7 @@ mod pattern_function_tests {
     #[test]
     fn nested_pattern_functions_use_a_heap_plan() {
         std::thread::Builder::new()
+            .name("nested_pattern_functions_use_a_heap_plan".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let source = format!(
@@ -1704,7 +1798,10 @@ mod literal_pattern_tests {
     }
     #[test]
     fn grouped_literal_patterns_are_heap_parsed() {
-        std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
+        std::thread::Builder::new()
+            .name("grouped_literal_patterns_are_heap_parsed".to_string())
+            .stack_size(128 * 1024)
+            .spawn(|| {
             let source = format!("def f : Nat -> Nat | {}340282366920938463463374607431768211456{} => 7 | _ => 9", "(".repeat(1000), ")".repeat(1000));
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
@@ -1760,6 +1857,7 @@ mod conditional_tests {
     #[test]
     fn deeply_nested_conditionals_use_heap_plans() {
         std::thread::Builder::new()
+            .name("deeply_nested_conditionals_use_heap_plans".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let source = format!(

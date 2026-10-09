@@ -751,7 +751,11 @@ impl Context {
         {
             self.tick()?;
             if index % 2 == 1 {
-                expect_atom(syntax, ",", "record field separator")?;
+                // `sepByIndent … (allowTrailingSep := true)`: a `,`, or a line break, which is
+                // the pin's empty separator node.
+                if expect_empty_null(syntax, "record line separator").is_err() {
+                    expect_atom(syntax, ",", "record field separator")?;
+                }
                 continue;
             }
             let field = expect_node(

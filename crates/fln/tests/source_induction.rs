@@ -46,6 +46,33 @@ fn dependent_hypotheses_are_specialized_and_reintroduced() {
         "theorem dependent (n : Nat) (h : n = n) : n = n := by\n  cases n with\n  | zero => exact h\n  | succ k => exact h",
     );
 }
+/// `| zero | succ k => t` is one alternative with two left-hand sides (`inductionAltLHS+`): `t`
+/// runs on each constructor's goal, so a body that fails on one of them is refused. An
+/// alternative without `=>`, whose goal the enclosing sequence would take, is refused too.
+#[test]
+fn shared_alternatives_run_their_body_on_each_constructor() {
+    check("theorem self (n : Nat) : n = n := by\n  cases n with\n  | zero | succ k => rfl");
+    check("theorem self (b : Bool) : b = b := by cases b with | false | true => rfl");
+    let base = engine();
+    for source in [
+        // The `succ k` goal is `k + 1 = 0`.
+        "theorem bad (n : Nat) : n = 0 := by\n  cases n with\n  | zero | succ k => rfl",
+        "theorem bad (n : Nat) : n = n := by\n  cases n with\n  | zero | zero => rfl",
+        "theorem bodiless (n : Nat) : n = n := by\n  cases n with\n  | zero => rfl\n  | succ k\n  rfl",
+    ] {
+        assert!(
+            !matches!(
+                base.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits())
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
 #[test]
 fn bare_cases_exposes_goals_to_the_following_sequence() {
     check("theorem self (b : Bool) : b = b := by\n  cases b\n  rfl\n  rfl");

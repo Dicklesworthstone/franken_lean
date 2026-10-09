@@ -1027,11 +1027,44 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
             ("∩", "Inter.inter"),
             ("\\", "SDiff.sdiff"),
             ("<$>", "Functor.map"),
+            (">>=", "Bind.bind"),
+            ("⊕", "Sum"),
+            ("•", "HSMul.hSMul"),
         ] {
             if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
                 return Some(BoundedInfixIntrinsic::Fixed {
                     spelling,
                     intrinsic: Name::from_components(constant.split('.')),
+                });
+            }
+        }
+        // The bounded ranges, declared in namespace `Std` (`Init/Data/Range/Polymorphic`):
+        // `macro_rules | `($a...<$b) => ``(Rco.mk $a $b)` and the rest.
+        for (spelling, constant) in [
+            ("...<", "Rco"),
+            ("...", "Rco"),
+            ("...=", "Rcc"),
+            ("<...<", "Roo"),
+            ("<...", "Roo"),
+            ("<...=", "Roc"),
+        ] {
+            if kind == &Name::from_components(["Std", format!("term_{spelling}_").as_str()]) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(["Std", constant, "mk"]),
+                });
+            }
+        }
+        // Declared in namespace `List` (`Init/Data/List/Basic.lean`), so their kinds are too.
+        for (spelling, constant) in [
+            ("<+:", "IsPrefix"),
+            ("<:+", "IsSuffix"),
+            ("<:+:", "IsInfix"),
+        ] {
+            if kind == &Name::str(Name::from_components(["List"]), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(["List", constant]),
                 });
             }
         }

@@ -204,6 +204,25 @@ impl Prefix {
                 }
                 continue;
             }
+            // `funBinder` admits a term (`Lean/Parser/Term.lean`): an anonymous-constructor
+            // pattern `⟨x, _⟩`, which the elaborator destructures or refuses.
+            // A tuple pattern `(a, b)` likewise: a parenthesis holding a top-level comma.
+            let tuple = self.lambda
+                && symbol(tokens, *cursor, "(")
+                && pattern_close(tokens, *cursor, end)
+                    .is_some_and(|close| top_level_comma(tokens, *cursor + 1, close));
+            if self.lambda && (symbol(tokens, *cursor, "⟨") || tuple) {
+                let close = pattern_close(tokens, *cursor, end)
+                    .ok_or_else(|| refuse(view, tokens, *cursor))?;
+                self.binders.push(crate::nested_term(
+                    leaves,
+                    view,
+                    tokens,
+                    *cursor..close + 1,
+                )?);
+                *cursor = close + 1;
+                continue;
+            }
             let kind = match tokens.get(*cursor).map(|t| &t.kind) {
                 Some(TokenKind::Symbol(s)) => match s.as_str() {
                     "(" => Some(("explicitBinder", ")")),
@@ -621,6 +640,42 @@ pub(super) fn arrow_openers(
         }
     }
     result
+}
+
+/// Whether a comma sits at bracket depth 0 in `tokens[from..to]`.
+fn top_level_comma(tokens: &[LexedToken], from: usize, to: usize) -> bool {
+    let mut depth = 0usize;
+    for token in &tokens[from..to] {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                "," if depth == 0 => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// The bracket closing the one opened at `open` (`⟩` or `)`), before `end`.
+fn pattern_close(tokens: &[LexedToken], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().take(end).skip(open) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return (s == "⟩" || s == ")").then_some(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

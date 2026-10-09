@@ -87,10 +87,33 @@ impl Context {
                 Syntax::Node { kind, args, .. }
                     if kind == &parser_kind(&["Tactic", "locationType"]) =>
                 {
-                    let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                    // `patternIgnore(token.«⊢»)` or `patternIgnore(group("|" "-"))`.
+                    let [Syntax::Node { kind, args, .. }] = args.as_slice() else {
                         return Err(error(TacticError::MalformedScript));
                     };
-                    if val != "⊢" && val != "|-" {
+                    let [
+                        Syntax::Node {
+                            kind: marker,
+                            args: atoms,
+                            ..
+                        },
+                    ] = args.as_slice()
+                    else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    let goal = match atoms.as_slice() {
+                        [Syntax::Atom { val, .. }] => {
+                            marker == &Name::from_components(["token", "⊢"]) && val == "⊢"
+                        }
+                        [
+                            Syntax::Atom { val: bar, .. },
+                            Syntax::Atom { val: dash, .. },
+                        ] => {
+                            marker == &Name::from_components(["group"]) && bar == "|" && dash == "-"
+                        }
+                        _ => false,
+                    };
+                    if kind != &Name::from_components(["patternIgnore"]) || !goal {
                         return Err(error(TacticError::MalformedScript));
                     }
                     result.target = true;

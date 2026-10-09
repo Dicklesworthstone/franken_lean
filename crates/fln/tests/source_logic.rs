@@ -287,6 +287,254 @@ fn the_pipeline_applies_its_function_and_refuses_an_applied_one() {
     }
 }
 
+const NOT: &str = "def Bool.not : Bool → Bool\n  | true => false\n  | false => true\n";
+/// `&&` is `Bool.and` (`infixl:35 " && " => and`, `Init/Notation.lean`), which the source seed
+/// lacks: tests that use it declare Init's (`Init/Prelude.lean`).
+const AND: &str =
+    "def Bool.and (x y : Bool) : Bool :=\n  match x with\n  | false => false\n  | true => y\n";
+
+/// `!b` is `Bool.not b` with its operand at precedence 40 (`notation:max "!" b:40`), so
+/// `!false && false` is `(!false) && false`, which is `false`; read as `!(false && false)` it
+/// would be `true`.
+#[test]
+fn boolean_negation_takes_the_operand_before_a_conjunction() {
+    // The source seed has no `Bool.not`: the test declares Init's (`Init/Prelude.lean`).
+    check(&format!(
+        "{NOT}{AND}theorem tight : (!false && false) = false := rfl\n\
+         theorem whole : (!(false && false)) = true := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{NOT}{AND}theorem wrong : (!false && false) = true := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `e |>.f args` is `(e).f args`: a field, a method with arguments, and a chain.
+#[test]
+fn a_pipeline_projection_is_its_field_application() {
+    check(
+        "structure Pair where\n  first : Nat\n  second : Nat\n\
+         def p : Pair := { first := 1, second := 2 }\n\
+         theorem field : (p |>.second) = 2 := rfl\n\
+         theorem method : ([1, 2, 3] |>.length) = 3 := rfl\n\
+         theorem chained : ([1, 2] |>.append [3] |>.length) = 3 := rfl\n",
+    );
+    let (engine, limits) = engine();
+    let source = "theorem wrong : ([1, 2, 3] |>.length) = 4 := rfl\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `fun ⟨x, _⟩ => x` destructures its argument as `fun | ⟨x, _⟩ => x` does, also next to an
+/// ordinary binder.
+#[test]
+fn a_pattern_binder_destructures_the_lambdas_argument() {
+    check(
+        "structure Pair where\n  first : Nat\n  second : Nat\n\
+         def left : Pair → Nat := fun ⟨x, _⟩ => x\n\
+         def total : Nat → Pair → Nat := fun n ⟨a, b⟩ => n + a + b\n\
+         theorem left_ok : left ⟨3, 4⟩ = 3 := rfl\n\
+         theorem total_ok : total 1 ⟨2, 3⟩ = 6 := rfl\n",
+    );
+    let (engine, limits) = engine();
+    let source = "structure Pair where\n  first : Nat\n  second : Nat\n\
+                  def left : Pair → Nat := fun ⟨x, _⟩ => x\n\
+                  theorem wrong : left ⟨3, 4⟩ = 4 := rfl\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `no_index e` elaborates as `e` (it only affects simp's indexing).
+#[test]
+fn no_index_is_its_term() {
+    check("theorem kept : no_index (1 + 1) = 2 := rfl\n");
+    let (engine, limits) = engine();
+    let source = "theorem wrong : no_index (1 + 1) = 3 := rfl\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// A `where` field defined by equations is that field as a pattern lambda; a theorem whose type
+/// ends in a `match` reads every alternative as the match's.
+#[test]
+fn field_equations_and_matches_in_types_check() {
+    check(
+        "structure Flip where\n  flip : Bool → Bool\n\
+         def f : Flip where\n  flip\n    | true => false\n    | false => true\n\
+         theorem flipped : f.flip true = false := rfl\n\
+         theorem typed (b : Bool) : b = match b with | true => true | false => false := by\n  \
+         cases b <;> rfl\n",
+    );
+    let (engine, limits) = engine();
+    let source = "structure Flip where\n  flip : Bool → Bool\n\
+                  def f : Flip where\n  flip\n    | true => false\n    | false => true\n\
+                  theorem wrong : f.flip true = true := rfl\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+const COND: &str = "def cond {α : Type} (c : Bool) (x y : α) : α :=\n  match c with\n  | true => x\n  | false => y\n";
+
+/// `. tac` is the focus `· tac` in its ASCII spelling (`cdotTk := unicode("· ", ". ")`).
+#[test]
+fn the_ascii_focus_dot_solves_one_goal() {
+    check(
+        "theorem both (p q : Prop) (hp : p) (hq : q) : And p q := by\n  constructor\n  . exact hp\n  . exact hq\n",
+    );
+    let (engine, limits) = engine();
+    let source = "theorem swapped (p q : Prop) (hp : p) (hq : q) : And p q := by\n  constructor\n  . exact hq\n  . exact hp\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `‹T›` is `(by assumption : T)`: a hypothesis of that type, which must be in scope.
+#[test]
+fn the_assumption_notation_finds_its_hypothesis() {
+    check("theorem found (p q : Prop) (hq : q) (hp : p) : p := ‹p›\n");
+    let (engine, limits) = engine();
+    let source = "theorem missing (p q : Prop) (hq : q) : p := ‹p›\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `bif c then a else b` is `cond c a b`: it reduces to the branch its condition selects.
+#[test]
+fn a_boolean_conditional_selects_its_branch() {
+    // The source seed has no `cond`: the test declares Init's (`Init/Prelude.lean`).
+    check(&format!(
+        "{COND}{AND}theorem yes : (bif true then 1 else 2) = 1 := rfl\n\
+         theorem no : (bif false && true then 1 else 2) = 2 := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{COND}theorem wrong : (bif true then 1 else 2) = 2 := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `grind_pattern` parses as the pin's `Command.grindPattern`; the checker does not read the
+/// pattern, so it refuses the command rather than ignoring it.
+#[test]
+fn grind_patterns_are_refused_not_ignored() {
+    check("theorem plain : True := True.intro\n");
+    let (engine, limits) = engine();
+    let source = "theorem plain : True := True.intro\ngrind_pattern plain => True\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// A `section` with a header parses as the pin's `Command.section` with its `sectionHeader`, and
+/// `export` as `Command.export`; the scope layer refuses an attribute command or an `open … in` it
+/// does not model. The pin accepts each of these files; the checker models neither the module
+/// system's `public`, nor `noncomputable` scopes, nor export aliases, nor the `inline` attribute,
+/// nor `open` of selected names, so it refuses them rather than reading a plain scope or dropping
+/// what it does not read.
+#[test]
+fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
+    check("section\ntheorem plain : True := True.intro\nend\n");
+    let (engine, limits) = engine();
+    for source in [
+        "public section\ntheorem plain : True := True.intro\nend\n",
+        "noncomputable section\ntheorem plain : True := True.intro\nend\n",
+        "@[expose] public section\ntheorem plain : True := True.intro\nend\n",
+        "theorem plain : True := True.intro\nexport Nat (succ)\n",
+        "def d : Nat := 1\nattribute [inline] d\n",
+        "open Nat (succ) in\ntheorem plain : True := True.intro\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
 /// While its body elaborates, `letI`'s value shows and `haveI`'s does not, as for `let` and
 /// `have`: the pin accepts `shown` and refuses `hidden` with a type mismatch at `rfl`.
 #[test]
@@ -371,6 +619,57 @@ fn a_hole_binder_binds_an_unnamed_parameter() {
     );
 }
 
+/// `{n : Nat // n = 3}` is `Subtype (fun (n : Nat) => n = 3)` (`Init/Notation.lean:579`): its
+/// value carries the predicate's proof, and a value without one is refused. The seed has no
+/// `Subtype`, so the root one the macro names is declared here.
+#[test]
+fn a_subtype_is_its_predicate_carrier() {
+    let subtype =
+        "structure Subtype {A : Type} (p : A → Prop) where\n  val : A\n  property : p val\n";
+    check(&format!(
+        "{subtype}def three : {{n : Nat // n = 3}} := ⟨3, rfl⟩\n\
+         theorem value : three.val = 3 := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{subtype}def four : {{n : Nat // n = 3}} := ⟨4, rfl⟩\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `#[a, b]` is `List.toArray [a, b]` (`Init/Data/Array/Basic.lean`). The seed has no
+/// `Array`, so the root `List.toArray` the macro names is declared here; over Init the pin
+/// accepts `literal` and refuses `swapped` the same way.
+#[test]
+fn an_array_literal_is_its_list_converted() {
+    let array = "structure Array (A : Type) where\n  toList : List A\n\
+                 def List.toArray {A : Type} (l : List A) : Array A := Array.mk l\n";
+    check(&format!(
+        "{array}theorem literal : #[1, 2] = List.toArray [1, 2] := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{array}theorem swapped : #[1, 2] = List.toArray [2, 1] := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
 /// `(a, b, c)` is `Prod.mk a (Prod.mk b c)`: the pin's `mkPairs` nests to the right
 /// (`Lean/Elab/BuiltinNotation.lean:247`), so the left-nested reading is a type error.
 #[test]
@@ -420,7 +719,9 @@ fn an_unspaced_bracket_indexes_rather_than_applies() {
 
 /// A tactic this elaborator parses but cannot run (`omega`) is refused, never skipped: under
 /// `try` the pin's `omega` closes the goal and the following `rfl` then fails, so the pin
-/// rejects what skipping `omega` would accept.
+/// rejects what skipping `omega` would accept. The tactic `if` (the pin's `tacDepIfThenElse`) is
+/// refused too: the pin rejects `one_branch`, whose `else` branch fails, so running only the
+/// `then` branch would accept it.
 #[test]
 fn a_parsed_tactic_without_an_elaborator_is_refused_even_under_try() {
     check("theorem skipped (a : Nat) : a + 0 = a := by\n  try skip\n  rfl\n");
@@ -428,6 +729,7 @@ fn a_parsed_tactic_without_an_elaborator_is_refused_even_under_try() {
     for source in [
         "theorem bare (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega\n",
         "theorem attempted (a : Nat) : a + 0 = a := by\n  try omega\n  rfl\n",
+        "theorem one_branch (n : Nat) : n = 0 := by\n  if h : n = 0 then\n    exact h\n  else\n    rfl\n",
     ] {
         assert!(
             !matches!(
@@ -475,16 +777,24 @@ fn a_proof_script_simp_rule_is_refused_rather_than_dropped() {
 fn a_proof_nested_in_a_tactic_term_closes_only_what_it_proves() {
     check("theorem nested (h : 1 = 1) : 1 = 1 ∧ 2 = 2 := by exact ⟨h, by rfl⟩\n");
     let (engine, limits) = engine();
-    let source = "theorem unproved (h : 1 = 1) : 1 = 1 ∧ 2 = 3 := by exact ⟨h, by rfl⟩\n";
-    assert!(
-        !matches!(
-            engine.check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
+    // The pin parses each of these and refuses it in elaboration: a goal the nested proof does
+    // not close, a nested proof as a `cases` target (not an inductive premise), and a `have`
+    // whose nested `rfl` has no relation to close.
+    for source in [
+        "theorem unproved (h : 1 = 1) : 1 = 1 ∧ 2 = 3 := by exact ⟨h, by rfl⟩\n",
+        "theorem target (b : Bool) : 0 = 0 := by cases (by cases b)\n",
+        "theorem value : 0 = 0 := by\n  have h := (by rfl)\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
             ),
-            Ok(fln::Outcome::Complete(_))
-        ),
-        "{source}"
-    );
+            "{source}"
+        );
+    }
 }

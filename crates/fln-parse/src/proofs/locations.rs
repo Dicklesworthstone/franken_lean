@@ -62,40 +62,24 @@ pub(super) fn split(
             let leaf = leaves.leaf(index)?;
             names.push(match &tokens[index].kind {
                 TokenKind::Ident(_) => leaf,
-                TokenKind::Symbol(symbol) if symbol == "⊢" => {
-                    Syntax::node(parser_kind(&["Tactic", "locationType"]), vec![leaf])
-                }
                 // The pin's `locationType := patternIgnore(atomic("|" noWs "-") <|> "⊢")`:
-                // `|-` is not a token, it is `|` and `-` with nothing between them. The
-                // goal marker keeps its one-atom shape, spanning both tokens exactly.
+                // `⊢` is the token node `token.«⊢»`, and `|-` is not a token at all but `|`
+                // and `-` with nothing between them, a `group` of the two atoms.
+                TokenKind::Symbol(symbol) if symbol == "⊢" => goal_marker(Syntax::node(
+                    Name::from_components(["token", "⊢"]),
+                    vec![leaf],
+                )),
                 TokenKind::Symbol(symbol)
                     if symbol == "|"
                         && index + 1 < range.end
                         && matches!(&tokens[index + 1].kind, TokenKind::Symbol(s) if s == "-")
                         && tokens[index].extent.end() == tokens[index + 1].extent.start() =>
                 {
-                    let (
-                        SourceInfo::Original { leading, pos, .. },
-                        SourceInfo::Original {
-                            trailing, end_pos, ..
-                        },
-                    ) = (leaf.info(), leaves.leaf(index + 1)?.info())
-                    else {
-                        return Err(refusal(view, tokens, index));
-                    };
                     index += 1;
-                    Syntax::node(
-                        parser_kind(&["Tactic", "locationType"]),
-                        vec![Syntax::atom(
-                            SourceInfo::Original {
-                                leading,
-                                pos,
-                                trailing,
-                                end_pos,
-                            },
-                            "|-",
-                        )],
-                    )
+                    goal_marker(Syntax::node(
+                        Name::from_components(["group"]),
+                        vec![leaf, leaves.leaf(index)?],
+                    ))
                 }
                 _ => return Err(refusal(view, tokens, index)),
             });
@@ -118,6 +102,16 @@ pub(super) fn split(
         ],
     );
     Ok((range.start..at, null_node(vec![location])))
+}
+
+fn goal_marker(marker: Syntax) -> Syntax {
+    Syntax::node(
+        parser_kind(&["Tactic", "locationType"]),
+        vec![Syntax::node(
+            Name::from_components(["patternIgnore"]),
+            vec![marker],
+        )],
+    )
 }
 
 #[cfg(test)]

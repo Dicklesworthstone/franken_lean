@@ -997,80 +997,84 @@ impl Context {
         }
         for row in rows {
             self.tick()?;
-            // `inductionAlt := inductionAltLHS+ " => " body`, one left-hand side read;
-            // `inductionAltLHS := "| " (("@"? ident) <|> hole) binderIdent*`.
+            // `inductionAlt := inductionAltLHS+ " => " body`: each left-hand side is one
+            // constructor's alternative and they share the body (`| zero | succ m => t` runs `t`
+            // on both goals); `inductionAltLHS := "| " (("@"? ident) <|> hole) binderIdent*`.
             let alternative = expect_node(
                 row,
                 &parser_kind(&["Tactic", "inductionAlt"]),
                 2,
                 "elimination alternative",
             )?;
-            let [lhs] = expect_null_args(&alternative[0], "alternative left-hand side")? else {
+            let sides = expect_null_args(&alternative[0], "alternative left-hand side")?;
+            if sides.is_empty() {
                 return Err(error(TacticError::MalformedScript));
-            };
+            }
             let [arrow, body] = expect_null_args(&alternative[1], "alternative body")? else {
                 return Err(error(TacticError::MalformedScript));
             };
             if !matches!(arrow, Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
                 return Err(error(TacticError::MalformedScript));
             }
-            let lhs = expect_node(
-                lhs,
-                &parser_kind(&["Tactic", "inductionAltLHS"]),
-                3,
-                "alternative left-hand side",
-            )?;
-            expect_atom(&lhs[0], "|", "elimination alternative")?;
-            let constructor = expect_node(
-                &lhs[1],
-                &Name::from_components(["group"]),
-                2,
-                "alternative constructor",
-            )?;
-            expect_empty_null(&constructor[0], "constructor without `@`")?;
-            let fields = [&lhs[0], &constructor[1], &lhs[2], arrow, body];
-            let Syntax::Ident { val, .. } = fields[1] else {
-                return Err(error(TacticError::MalformedScript));
-            };
-            let ctor = if family.ctors.contains(val) {
-                val.clone()
-            } else {
-                name.append_core(val)
-            };
-            if !family.ctors.contains(&ctor) {
-                return Err(error(TacticError::EliminationCoverage));
-            }
-            let mut names = Vec::new();
-            let mut unique = HashSet::new();
-            for field in expect_null_args(fields[2], "elimination binders")? {
+            for lhs in sides {
                 self.tick()?;
-                // `binderIdent := ident <|> hole`: `_` is a `Term.hole`.
-                let name = match field {
-                    Syntax::Ident { val, .. } => val.clone(),
-                    Syntax::Node { kind, .. } if kind == &parser_kind(&["Term", "hole"]) => {
-                        Name::anonymous()
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
+                let lhs = expect_node(
+                    lhs,
+                    &parser_kind(&["Tactic", "inductionAltLHS"]),
+                    3,
+                    "alternative left-hand side",
+                )?;
+                expect_atom(&lhs[0], "|", "elimination alternative")?;
+                let constructor = expect_node(
+                    &lhs[1],
+                    &Name::from_components(["group"]),
+                    2,
+                    "alternative constructor",
+                )?;
+                expect_empty_null(&constructor[0], "constructor without `@`")?;
+                let Syntax::Ident { val, .. } = &constructor[1] else {
+                    return Err(error(TacticError::MalformedScript));
                 };
-                if !name.is_anonymous() && !unique.insert(name.clone()) {
-                    return Err(error(TacticError::EliminationArity));
+                let ctor = if family.ctors.contains(val) {
+                    val.clone()
+                } else {
+                    name.append_core(val)
+                };
+                if !family.ctors.contains(&ctor) {
+                    return Err(error(TacticError::EliminationCoverage));
                 }
-                names.push(name);
-            }
-            if scripts
-                .insert(
-                    ctor,
-                    Alternative {
-                        names,
-                        body: AlternativeBody::Script(fields[4]),
-                        explicit_fields: false,
-                        exact_fields: false,
-                        whole: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(error(TacticError::EliminationCoverage));
+                let mut names = Vec::new();
+                let mut unique = HashSet::new();
+                for field in expect_null_args(&lhs[2], "elimination binders")? {
+                    self.tick()?;
+                    // `binderIdent := ident <|> hole`: `_` is a `Term.hole`.
+                    let name = match field {
+                        Syntax::Ident { val, .. } => val.clone(),
+                        Syntax::Node { kind, .. } if kind == &parser_kind(&["Term", "hole"]) => {
+                            Name::anonymous()
+                        }
+                        _ => return Err(error(TacticError::MalformedScript)),
+                    };
+                    if !name.is_anonymous() && !unique.insert(name.clone()) {
+                        return Err(error(TacticError::EliminationArity));
+                    }
+                    names.push(name);
+                }
+                if scripts
+                    .insert(
+                        ctor,
+                        Alternative {
+                            names,
+                            body: AlternativeBody::Script(body),
+                            explicit_fields: false,
+                            exact_fields: false,
+                            whole: None,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(error(TacticError::EliminationCoverage));
+                }
             }
         }
         if scoped

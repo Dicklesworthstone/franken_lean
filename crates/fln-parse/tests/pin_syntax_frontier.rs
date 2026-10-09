@@ -7,14 +7,16 @@
 //! `pin_syntax_corpus_against_the_pin` fills (see `fln_syntax::pin_syntax::cache_root`); with no
 //! cache the lane is a typed SKIP. The production parser is the drop-in's: the header parser,
 //! then `command_scope::partition` over the body, then each command through
-//! `command_scope::parse` (scope commands) or `parse_source_command`.
+//! `command_scope::parse` (scope commands) or `parse_source_command`. A scope command's tree is
+//! the one `command_scope::trees` builds for it.
 //!
 //! Each pin command lands in exactly one class:
 //! - `identical`: the same tree, every leaf at the same file position;
 //! - `positions`: the same tree shape, some leaf elsewhere;
 //! - `tree`: FrankenLean built a different tree (the first differing node's kind is named);
 //! - `refused:<what>`: FrankenLean's parser refused the command;
-//! - `no-tree`: FrankenLean reads the command as a scope command and builds no syntax tree;
+//! - `no-tree`: FrankenLean reads the command as a scope command and builds no syntax tree for
+//!   it;
 //! - `boundary`: FrankenLean's partition starts no command where the pin's does;
 //! - `file:<what>`: the file failed before its commands were partitioned.
 //!
@@ -230,24 +232,38 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
             let Some(bytes) = ours.get(&start) else {
                 return outcome("boundary".to_owned(), start);
             };
+            let compared = |ours: &Syntax| match compare(pin, ours, start) {
+                Ok(None) => outcome("identical".to_owned(), start),
+                Ok(Some(leaf)) => Outcome {
+                    class: "positions".to_owned(),
+                    start,
+                    detail: leaf,
+                },
+                Err(kind) => outcome(format!("tree:{kind}"), start),
+            };
             match command_scope::parse(bytes) {
                 Ok(Some(scope)) => {
-                    return outcome(format!("no-tree:{}", scope_name(&scope)), start);
+                    // The command after an `in` may be one the parser refuses.
+                    return match command_scope::trees::tree(bytes) {
+                        Ok(Some(syntax)) => compared(&syntax),
+                        Ok(None) => outcome(format!("no-tree:{}", scope_name(&scope)), start),
+                        Err(error) => outcome(format!("refused:{}", refusal_class(&error)), start),
+                    };
                 }
                 Ok(None) => {}
-                Err(error) => return outcome(format!("refused:{}", refusal_class(&error)), start),
+                // A scope command the scope layer refuses to read (`attribute [bv_normalize] f`,
+                // `open A (x) in …`) is compared through its tree where the parser builds one, as
+                // a declaration the checker refuses is.
+                Err(error) => {
+                    return match command_scope::trees::tree(bytes) {
+                        Ok(Some(syntax)) => compared(&syntax),
+                        _ => outcome(format!("refused:{}", refusal_class(&error)), start),
+                    };
+                }
             }
             match parse_source_command(bytes) {
                 Err(error) => outcome(format!("refused:{}", refusal_class(&error)), start),
-                Ok(parsed) => match compare(pin, parsed.syntax(), start) {
-                    Ok(None) => outcome("identical".to_owned(), start),
-                    Ok(Some(leaf)) => Outcome {
-                        class: "positions".to_owned(),
-                        start,
-                        detail: leaf,
-                    },
-                    Err(kind) => outcome(format!("tree:{kind}"), start),
-                },
+                Ok(parsed) => compared(parsed.syntax()),
             }
         })
         .collect()

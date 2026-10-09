@@ -30,6 +30,15 @@ fn named_fields_are_reordered_to_the_constructor_telescope() {
         "structure Point where\n  x : Nat\n  y : Nat\ndef point : Point := { y := 9, x := 7 }\ntheorem x_ok : Point.x point = 7 := by rfl\ntheorem y_ok : Point.y point = 9 := by rfl",
     );
 }
+/// Fields may be separated by line breaks as well as commas, and a line break may trail the last
+/// field before a `}` on its own line: the pin's empty separator, read as a `,`.
+#[test]
+fn line_breaks_separate_fields_as_commas_do() {
+    check(
+        &engine(),
+        "structure Point where\n  x : Nat\n  y : Nat\ndef p : Point := {\n  x := 7,\n  y := 9\n}\ndef q : Point := { x := 1\n                   y := 2 }\ntheorem p_ok : Point.y p = 9 := by rfl\ntheorem q_ok : Point.y q = 2 := by rfl",
+    );
+}
 #[test]
 fn dependent_fields_see_actual_earlier_values_even_when_written_last() {
     check(

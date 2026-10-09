@@ -561,6 +561,56 @@ impl AttributeReader<'_> {
         ))
     }
 
+    /// `"attribute" "[" sepBy1 (eraseAttr <|> attrInstance) ", " "]" ident+`, from the cursor at
+    /// `attribute`, with `eraseAttr := "-" rawIdent` (`Lean/Parser/Command.lean`).
+    fn command(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let keyword = Shape::Leaf(self.take());
+        if !self.symbol("[") {
+            return Err(self.bad());
+        }
+        let open = Shape::Leaf(self.take());
+        let mut instances = Vec::new();
+        loop {
+            if self.symbol("-") {
+                let minus = Shape::Leaf(self.take());
+                if !self.ident() {
+                    return Err(self.bad());
+                }
+                instances.push(Shape::Node(
+                    parser_kind(&["Command", "eraseAttr"]),
+                    vec![minus, Shape::Leaf(self.take())],
+                ));
+            } else {
+                instances.push(self.instance()?);
+            }
+            if !self.symbol(",") {
+                break;
+            }
+            instances.push(Shape::Leaf(self.take()));
+        }
+        if !self.symbol("]") {
+            return Err(self.bad());
+        }
+        let close = Shape::Leaf(self.take());
+        let mut names = Vec::new();
+        while self.ident() {
+            names.push(Shape::Leaf(self.take()));
+        }
+        if names.is_empty() || self.at != self.tokens.len() {
+            return Err(self.bad());
+        }
+        Ok(Shape::Node(
+            parser_kind(&["Command", "attribute"]),
+            vec![
+                keyword,
+                open,
+                Shape::Null(instances),
+                close,
+                Shape::Null(names),
+            ],
+        ))
+    }
+
     /// `"@[" sepBy1 attrInstance ", " "]"`, from the cursor at `@[`.
     fn attributes(&mut self) -> Result<Shape, NatDefinitionParseError> {
         let open = Shape::Leaf(self.take());
@@ -631,6 +681,23 @@ fn build(shape: &Shape, leaves: &Leaves) -> Result<Syntax, DefinitionParseError>
                 .collect::<Result<_, _>>()?,
         ),
     })
+}
+
+/// The pin's tree for an `attribute` command, or `None` for a form this grammar does not read.
+pub(crate) fn command_syntax(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    leaves: &Leaves,
+) -> Result<Option<Syntax>, DefinitionParseError> {
+    let mut reader = AttributeReader {
+        view,
+        tokens,
+        at: 0,
+    };
+    match reader.command() {
+        Ok(shape) => build(&shape, leaves).map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Read the attribute list at token `start`, if there is one: the token index after its `]` and

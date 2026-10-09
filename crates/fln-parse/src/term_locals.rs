@@ -9,6 +9,12 @@ pub(super) enum Prefix {
     Binders(Box<term_binders::Prefix>),
     Assertion(Box<Assertion>),
     Do(Box<term_do::Prefix>),
+    /// `← e` (`Term.nestedAction`, `"← " doElem` at minimum precedence): the `←` token; its
+    /// body is the rest of the enclosing group.
+    Nested(usize),
+    /// `return e` outside `do` (`Term.termReturn`, `"return" (ppSpace term)?`): the keyword; its
+    /// body, possibly empty, is the rest of the enclosing group.
+    Return(usize),
 }
 impl From<term_binders::Prefix> for Prefix {
     fn from(value: term_binders::Prefix) -> Self {
@@ -233,11 +239,16 @@ impl Prefix {
                 *cursor += 2;
             }
         } else if form.declares() {
-            if *cursor < end && matches!(&tokens[*cursor].kind, TokenKind::Ident(_)) {
+            // `letId := binderIdent`: a name or the hole `_`.
+            if *cursor < end
+                && (matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
+                    || word(tokens, *cursor, "_"))
+            {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
             }
-            if matches!(form, Form::Let | Form::LetI) && assertion.name.is_none() {
+            // `letI : C := v` names its local by hygiene, as an anonymous `have` does.
+            if form == Form::Let && assertion.name.is_none() {
                 return Err(refuse(view, tokens, *cursor));
             }
             if *cursor < end && word(tokens, *cursor, ":") {
@@ -261,7 +272,9 @@ impl Prefix {
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self {
             Prefix::Do(prefix) => prefix.jump_keyword(),
-            Prefix::Binders(_) | Prefix::Assertion(_) => None,
+            Prefix::Binders(_) | Prefix::Assertion(_) | Prefix::Nested(_) | Prefix::Return(_) => {
+                None
+            }
         }
     }
     pub(super) fn body(&self) -> bool {
@@ -269,12 +282,14 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
+            Self::Nested(_) | Self::Return(_) => true,
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
+            Self::Nested(_) | Self::Return(_) => false,
             Self::Assertion(p) => match p.phase {
                 Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
@@ -306,6 +321,7 @@ impl Prefix {
                     .map(|(p, next)| (Self::Binders(Box::new(p)), next));
             }
             Self::Assertion(p) => p,
+            Self::Nested(_) | Self::Return(_) => return Err(refuse(view, tokens, at)),
         };
         let mut next = at + 1;
         match p.phase {
@@ -354,6 +370,23 @@ impl Prefix {
         let p = match self {
             Self::Do(p) => return p.finish(leaves, body),
             Self::Binders(p) => return p.finish(leaves, body),
+            Self::Nested(arrow) => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "nestedAction"]),
+                    vec![
+                        leaves.leaf(arrow)?,
+                        Syntax::node(parser_kind(&["Term", "doExpr"]), vec![body]),
+                    ],
+                );
+                return Ok((syntax, arrow));
+            }
+            Self::Return(keyword) => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "termReturn"]),
+                    vec![leaves.leaf(keyword)?, null_node(vec![body])],
+                );
+                return Ok((syntax, keyword));
+            }
             Self::Assertion(p) => p,
         };
         let syntax = if p.form == Form::Show {
@@ -377,11 +410,15 @@ impl Prefix {
                 ],
             )
         } else if p.form == Form::Suffices {
+            // `atomic (group (binderIdent " : ")) <|> hygieneInfo`.
             let binder = match p.name {
-                Some(at) => null_node(vec![
-                    leaves.leaf(at)?,
-                    leaves.leaf(p.colon.expect("suffices colon"))?,
-                ]),
+                Some(at) => Syntax::node(
+                    Name::from_components(["group"]),
+                    vec![
+                        leaves.leaf(at)?,
+                        leaves.leaf(p.colon.expect("suffices colon"))?,
+                    ],
+                ),
                 None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let intro = p.proof_intro.expect("suffices proof introducer");
@@ -411,7 +448,13 @@ impl Prefix {
         } else {
             let separator = separator(leaves, p.separator)?;
             let name = match p.name {
-                Some(at) => leaves.leaf(at)?,
+                // `_` is a symbol, so its leaf is an atom: the hole `Term.hole`.
+                Some(at) => match leaves.leaf(at)? {
+                    hole @ Syntax::Atom { .. } => {
+                        Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
+                    }
+                    name => name,
+                },
                 None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let annotation = match (p.colon, p.annotation) {

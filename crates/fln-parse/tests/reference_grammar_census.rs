@@ -259,8 +259,8 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
     // what remains is the grammar's own typed refusal at that same token, which says nothing
     // about validity. Each such parser is added only with the pin's own tree for it
-    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `>>=` comes next.
-    let (source, token) = ("def p : Option Nat := some 1 >>= some", ">>=");
+    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `$` comes next.
+    let (source, token) = ("def p : Nat := id $ 1", "$");
     let at = BytePos(source.find(token).expect("the token is in the source"));
     assert!(
         matches!(
@@ -282,6 +282,8 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     assert!(parse_source_command("def p : Nat := id <| 1".as_bytes()).is_ok());
     // `|>` was the sixth, with the pin's trees in `PIPE_RIGHT`.
     assert!(parse_source_command("def p : Nat := 1 |> id".as_bytes()).is_ok());
+    // `>>=` was the seventh, with the pin's trees in `BIND_LIST_RELATIONS_AND_PREFIXES`.
+    assert!(parse_source_command("def p : Option Nat := some 1 >>= some".as_bytes()).is_ok());
     // `⟨` was the third: the anonymous-constructor parser (Term.anonymousCtor) now takes it.
     assert!(
         parse_source_command(
