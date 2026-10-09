@@ -1,17 +1,18 @@
-name: Validate and land native runtime specialization
+name: Validate and land native source options
 
 on:
   push:
     branches: [main]
     paths:
-      - .github/patches/runtime-bare-universes.patch
+      - .github/patches/source-options.patch.gz
+      - .github/patches/source-options-amend.patch
       - .github/workflows/fln-runtime-bare-universes.yml
 
 permissions:
   contents: write
 
 concurrency:
-  group: fln-runtime-bare-universes
+  group: fln-source-options
   cancel-in-progress: false
 
 env:
@@ -28,93 +29,105 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Retain exact source context for review
+      - name: Record the exact base and install the repository Rust pin
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/runtime-evidence"
-          git rev-parse HEAD > "$RUNNER_TEMP/runtime-evidence/base.txt"
-          git archive --format=tar.gz HEAD \
-            crates/fln/src crates/fln/tests crates/fln-parse/src crates/fln-parse/tests \
-            crates/fln-elab/src crates/fln-cli/src crates/fln-cli/tests \
-            crates/fln-server/src crates/fln-core/src crates/fln-syntax/src \
-            .beads COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md \
-            AGENTS.md IMPLEMENTATION_STATUS.md Cargo.toml Cargo.lock rust-toolchain.toml \
-            > "$RUNNER_TEMP/runtime-evidence/context.tar.gz"
-
-      - uses: actions/upload-artifact@v4
+          mkdir -p "$RUNNER_TEMP/source-options"
+          git rev-parse HEAD > "$RUNNER_TEMP/source-options/base.txt"
+          rustup show active-toolchain
+          gzip -dc .github/patches/source-options.patch.gz > "$RUNNER_TEMP/source-options/candidate.patch"
+          git apply --check "$RUNNER_TEMP/source-options/candidate.patch"
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
-          name: runtime-source-context
-          path: ${{ runner.temp }}/runtime-evidence/context.tar.gz
-          retention-days: 7
-
-      - name: Install the repository's exact Rust pin
-        run: rustup show active-toolchain
-
-      - name: Demonstrate regression against the unchanged runtime
+          path: target
+          key: source-options-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: source-options-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Observe the unchanged source front door
         shell: bash
         run: |
           set -euo pipefail
-          PATCH=.github/patches/runtime-bare-universes.patch
-          if git apply --reverse --check "$PATCH"; then
-            echo "The candidate already landed; no source mutation is required."
-            exit 1
-          fi
-          git apply --check "$PATCH"
-          git apply --include='crates/fln/src/runtime/specialize/arguments/tests.rs' \
-            --include='crates/fln/tests/runtime_interleaved_specialization.rs' "$PATCH"
-          rustfmt --edition 2024 crates/fln/src/runtime/specialize/arguments/tests.rs \
-            crates/fln/tests/runtime_interleaved_specialization.rs
+          cargo build --locked -p fln-cli --bin lean 2>&1 | tee "$RUNNER_TEMP/source-options/baseline-build.log"
+          printf 'set_option diagnostics false\ndef answer : Nat := 42\n#eval answer\n' > "$RUNNER_TEMP/source-options/baseline.lean"
           set +e
-          cargo test --locked -p fln --lib --test runtime_interleaved_specialization \
-            --no-fail-fast bare_universe -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/runtime-evidence/before.log"
-          result=${PIPESTATUS[0]}
+          target/debug/lean "$RUNNER_TEMP/source-options/baseline.lean" > "$RUNNER_TEMP/source-options/baseline.stdout" 2> "$RUNNER_TEMP/source-options/baseline.stderr"
+          status=$?
           set -e
-          test "$result" -ne 0
-          grep -q 'test result: FAILED' "$RUNNER_TEMP/runtime-evidence/before.log"
-          if grep -q 'error\[E[0-9]' "$RUNNER_TEMP/runtime-evidence/before.log"; then
-            echo "Compilation failure is not regression evidence" >&2
-            exit 1
+          printf '%s\n' "$status" > "$RUNNER_TEMP/source-options/baseline.exit"
+          test "$status" -ne 0
+      - name: Apply source options and format only the changed files
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply "$RUNNER_TEMP/source-options/candidate.patch"
+          if test -f .github/patches/source-options-amend.patch; then
+            git apply --check .github/patches/source-options-amend.patch
+            git apply .github/patches/source-options-amend.patch
           fi
-
-      - name: Apply and validate the runtime implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          git apply --include='crates/fln/src/runtime.rs' .github/patches/runtime-bare-universes.patch
-          rustfmt --edition 2024 crates/fln/src/runtime.rs
+          git add -N -- crates/fln-elab/src/source/options.rs crates/fln-parse/src/command_scope/options.rs crates/fln/tests/source_options.rs
+          git diff --name-only > "$RUNNER_TEMP/source-options/paths.txt"
+          while IFS= read -r path; do
+            rustfmt --edition 2024 --config skip_children=true "$path"
+          done < "$RUNNER_TEMP/source-options/paths.txt"
           git diff --check
-          cargo test --locked -p fln --lib --test runtime_interleaved_specialization \
-            --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/runtime-evidence/after.log"
-          cargo clippy --locked -p fln --lib --test runtime_interleaved_specialization \
-            -- -D warnings 2>&1 | tee "$RUNNER_TEMP/runtime-evidence/clippy.log"
-          git diff --binary > "$RUNNER_TEMP/runtime-evidence/verified.patch"
-
-      - name: Commit verified source directly to main without overwriting concurrent work
+      - name: Compile all targets
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/source-options/check.log"
+      - name: Verify parser and elaborator behavior
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-parse -p fln-elab --lib --no-fail-fast -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/source-options/parse-elab.log"
+      - name: Verify source options, scopes, and native execution
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test source_options --test source_scopes --test runtime_interleaved_specialization --no-fail-fast -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/source-options/engine.log"
+          cargo build --locked -p fln-cli --bin lean 2>&1 | tee "$RUNNER_TEMP/source-options/after-build.log"
+          target/debug/lean "$RUNNER_TEMP/source-options/baseline.lean" > "$RUNNER_TEMP/source-options/after.stdout" 2> "$RUNNER_TEMP/source-options/after.stderr"
+          grep -qx '42' "$RUNNER_TEMP/source-options/after.stdout"
+      - name: Clippy on the changed packages and regression target
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/source-options/clippy-lib.log"
+          cargo clippy --locked -p fln --test source_options -- -D warnings 2>&1 | tee "$RUNNER_TEMP/source-options/clippy-tests.log"
+      - name: Publish only tested source changes directly to main
         shell: bash
         run: |
           set -euo pipefail
-          git add -- crates/fln/src/runtime.rs \
-            crates/fln/src/runtime/specialize/arguments/tests.rs \
-            crates/fln/tests/runtime_interleaved_specialization.rs
+          git add -- crates/fln-parse/src/command_scope.rs crates/fln-parse/src/command_scope/options.rs \
+            crates/fln-elab/src/source.rs crates/fln-elab/src/source/options.rs crates/fln-elab/src/source/scope.rs \
+            crates/fln/src/lib.rs crates/fln/src/source_check.rs crates/fln/src/source_check/scopes.rs \
+            crates/fln/src/source_check/modules/execution.rs crates/fln/src/source_check/inspect/navigation.rs \
+            crates/fln/src/source_records.rs crates/fln/tests/source_options.rs
+          git diff --cached --binary > "$RUNNER_TEMP/source-options/verified.patch"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(runtime): specialize bare universe-instantiated values and callbacks' \
-            -m 'Reuse the checked specialization cache for constants without term arguments. Preserve private runtime identities, dependency discovery, callable interfaces, and logical environments. Nine regression tests cover aliases, callbacks, cache isolation, invalid levels, collisions, and resource limits.'
+          git commit -m 'feat(source): implement typed scoped set_option commands and file isolation' \
+            -m 'Parse the pinned literal syntax and nested command-local wrappers. Carry effective options into source elaboration, restore sections/namespaces and reset file/module boundaries. Use one bounded option-policy table: live native consumers, pinned defaults, or explicitly disabled unsupported features. Reject unknown options, type mismatches, unsupported values, and out-of-range literals without publication.'
           git fetch origin main
           test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
           git push origin HEAD:main
-          git rev-parse HEAD > "$RUNNER_TEMP/runtime-evidence/landed.txt"
-
+          git rev-parse HEAD > "$RUNNER_TEMP/source-options/landed.txt"
+      - name: Retain exact source and verification output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff HEAD --binary > "$RUNNER_TEMP/source-options/remaining.patch"
+          if test -f "$RUNNER_TEMP/source-options/paths.txt"; then
+            tar -czf "$RUNNER_TEMP/source-options/touched-source.tar.gz" -T "$RUNNER_TEMP/source-options/paths.txt"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: runtime-specialization-verification
-          path: |
-            ${{ runner.temp }}/runtime-evidence/*.log
-            ${{ runner.temp }}/runtime-evidence/*.txt
-            ${{ runner.temp }}/runtime-evidence/*.patch
+          name: source-options-verification
+          path: ${{ runner.temp }}/source-options
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/cache/save@v4
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: target
+          key: source-options-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
