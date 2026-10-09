@@ -1,0 +1,120 @@
+name: Validate and land native runtime specialization
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/patches/runtime-bare-universes.patch
+      - .github/workflows/fln-runtime-bare-universes.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-runtime-bare-universes
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Retain exact source context for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/runtime-evidence/base.txt"
+          git archive --format=tar.gz HEAD \
+            crates/fln/src crates/fln/tests crates/fln-parse/src crates/fln-parse/tests \
+            crates/fln-elab/src crates/fln-cli/src crates/fln-cli/tests \
+            crates/fln-server/src crates/fln-core/src crates/fln-syntax/src \
+            .beads COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md \
+            AGENTS.md IMPLEMENTATION_STATUS.md Cargo.toml Cargo.lock rust-toolchain.toml \
+            > "$RUNNER_TEMP/runtime-evidence/context.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-source-context
+          path: ${{ runner.temp }}/runtime-evidence/context.tar.gz
+          retention-days: 7
+
+      - name: Install the repository's exact Rust pin
+        run: rustup show active-toolchain
+
+      - name: Demonstrate regression against the unchanged runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCH=.github/patches/runtime-bare-universes.patch
+          if git apply --reverse --check "$PATCH"; then
+            echo "The candidate already landed; no source mutation is required."
+            exit 1
+          fi
+          git apply --check "$PATCH"
+          git apply --include='crates/fln/src/runtime/specialize/arguments/tests.rs' \
+            --include='crates/fln/tests/runtime_interleaved_specialization.rs' "$PATCH"
+          rustfmt --edition 2024 crates/fln/src/runtime/specialize/arguments/tests.rs \
+            crates/fln/tests/runtime_interleaved_specialization.rs
+          set +e
+          cargo test --locked -p fln --lib --test runtime_interleaved_specialization \
+            --no-fail-fast bare_universe -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/runtime-evidence/before.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          grep -q 'test result: FAILED' "$RUNNER_TEMP/runtime-evidence/before.log"
+          if grep -q 'error\[E[0-9]' "$RUNNER_TEMP/runtime-evidence/before.log"; then
+            echo "Compilation failure is not regression evidence" >&2
+            exit 1
+          fi
+
+      - name: Apply and validate the runtime implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --include='crates/fln/src/runtime.rs' .github/patches/runtime-bare-universes.patch
+          rustfmt --edition 2024 crates/fln/src/runtime.rs
+          git diff --check
+          cargo test --locked -p fln --lib --test runtime_interleaved_specialization \
+            --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/runtime-evidence/after.log"
+          cargo clippy --locked -p fln --lib --test runtime_interleaved_specialization \
+            -- -D warnings 2>&1 | tee "$RUNNER_TEMP/runtime-evidence/clippy.log"
+          git diff --binary > "$RUNNER_TEMP/runtime-evidence/verified.patch"
+
+      - name: Commit verified source directly to main without overwriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- crates/fln/src/runtime.rs \
+            crates/fln/src/runtime/specialize/arguments/tests.rs \
+            crates/fln/tests/runtime_interleaved_specialization.rs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(runtime): specialize bare universe-instantiated values and callbacks' \
+            -m 'Reuse the checked specialization cache for constants without term arguments. Preserve private runtime identities, dependency discovery, callable interfaces, and logical environments. Nine regression tests cover aliases, callbacks, cache isolation, invalid levels, collisions, and resource limits.'
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git push origin HEAD:main
+          git rev-parse HEAD > "$RUNNER_TEMP/runtime-evidence/landed.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-specialization-verification
+          path: |
+            ${{ runner.temp }}/runtime-evidence/*.log
+            ${{ runner.temp }}/runtime-evidence/*.txt
+            ${{ runner.temp }}/runtime-evidence/*.patch
+          if-no-files-found: error
+          retention-days: 14
