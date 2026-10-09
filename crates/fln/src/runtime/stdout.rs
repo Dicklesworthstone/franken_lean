@@ -1,10 +1,11 @@
-//! Bounded native stdout with ordinary logical Stream callbacks.
+//! Bounded native stdin/stdout with ordinary logical Stream callbacks.
 //!
 //! Native Stream and packed IO.Result values never become admitted data by
 //! relabeling. The exact getter returns a private carrier; its putStr callback
 //! returns a private, checked transport record. Golem wrappers reconstruct
 //! checked Unit, IO.Error and EST.Out layouts, retaining the incoming world.
-//! The other stream callbacks remain the VM's explicit native-call refusals.
+//! getLine likewise reconstructs checked String/error results. The other
+//! stream callbacks remain the VM's explicit native-call refusals.
 
 use super::*;
 use crate::source_intrinsics::io::stdout;
@@ -18,6 +19,16 @@ use std::collections::BTreeMap;
 const RAW_STREAM: &str = "_fln_runtime_stdout_stream";
 const TRANSPORT: &str = "_fln_runtime_stdout_result";
 const GETTER: &str = "_fln_runtime_stdout_get";
+const STDIN_GETTER: &str = "_fln_runtime_stdin_get";
+const READ_TRANSPORT: &str = "_fln_runtime_stdio_read_result";
+const READ_PAYLOAD: &str = "_fln_runtime_stdio_read_payload";
+
+fn getter_name(getter: stdout::Getter) -> Name {
+    name(match getter {
+        stdout::Getter::Stdout => GETTER,
+        stdout::Getter::Stdin => STDIN_GETTER,
+    })
+}
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -31,9 +42,11 @@ struct Layout {
     stream: records::Shape,
     get_result: records::Shape,
     io_result: records::Shape,
+    read_result: records::Shape,
     error: ErrorLayout,
     raw_stream: Expr,
     transport: Expr,
+    read_transport: Expr,
     world: Expr,
 }
 
@@ -87,17 +100,21 @@ impl Preparation<'_> {
         Ok(name)
     }
 
-    fn stdout_bind_getter(&mut self, result_type: Expr) -> Result<(), IngressError> {
-        let private = name(GETTER);
+    fn stdout_bind_getter(
+        &mut self,
+        getter: stdout::Getter,
+        result_type: Expr,
+    ) -> Result<(), IngressError> {
+        let private = getter_name(getter);
         if self.environment.contains(&private) {
             return Err(unsupported("stdout private getter name collision"));
         }
+        let source = getter.source_name().to_display_string();
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
-            .find(|row| row.id == "extern:IO.getStdout")
+            .find(|row| row.name == source)
             .ok_or_else(|| unsupported("stdout generated getter row"))?;
-        if row.name != "IO.getStdout"
-            || row.kind != "opaque"
+        if row.kind != "opaque"
             || row.levels != 0
             || row.arity != 0
             || row.effect != "io"
@@ -125,16 +142,37 @@ impl Preparation<'_> {
     }
 
     fn stdout_layout(&mut self) -> Result<Option<Layout>, IngressError> {
-        if let Some(layout) = &self.stdout.layout {
-            return Ok(Some(layout.clone()));
+        self.stdio_layout(stdout::Getter::Stdout)
+    }
+
+    fn stdio_layout(&mut self, getter: stdout::Getter) -> Result<Option<Layout>, IngressError> {
+        // Layout sharing never authorizes the other getter. Each source name
+        // must pass its own exact opaque and required extern gate before its
+        // distinct private binding is installed.
+        if self.stdout.bindings.contains_key(&getter_name(getter)) {
+            return Ok(self.stdout.layout.clone());
         }
-        if !stdout::contract_matches(
-            self.environment,
-            &mut self.externs,
-            &mut self.visited,
-            self.limits,
-        )? {
+        let matched = match getter {
+            stdout::Getter::Stdout => stdout::contract_matches(
+                self.environment,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?,
+            stdout::Getter::Stdin => stdout::getter_matches(
+                self.environment,
+                getter,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?,
+        };
+        if !matched {
             return Ok(None);
+        }
+        if let Some(layout) = self.stdout.layout.clone() {
+            self.stdout_bind_getter(getter, layout.raw_stream.clone())?;
+            return Ok(Some(layout));
         }
         let Some(world) = self.st_evaluation_world()? else {
             return Ok(None);
@@ -149,6 +187,10 @@ impl Preparation<'_> {
             c("EST.Out"),
             [c("IO.Error"), c("IO.RealWorld"), c("Unit")],
         ))?;
+        let read_result = self.io_checked_shape(apply(
+            c("EST.Out"),
+            [c("IO.Error"), c("IO.RealWorld"), c("String")],
+        ))?;
         if get_result.constructors.len() != 1
             || get_result.constructors[0].fields.len() != 2
             || io_result.constructors.len() != 2
@@ -156,6 +198,12 @@ impl Preparation<'_> {
                 .constructors
                 .iter()
                 .any(|constructor| constructor.fields.len() != 2)
+            || read_result.constructors.len() != 2
+            || read_result
+                .constructors
+                .iter()
+                .enumerate()
+                .any(|(index, ctor)| ctor.tag != index as u8 || ctor.fields.len() != 2)
         {
             return Err(unsupported("stdout checked world-result layout"));
         }
@@ -172,16 +220,51 @@ impl Preparation<'_> {
             ],
         )?;
         let mut native_fields = stream.constructors[0].fields.clone();
+        let payload = c(READ_PAYLOAD);
+        if self.environment.contains(&name(READ_PAYLOAD)) {
+            return Err(unsupported("stdio read private payload name collision"));
+        }
+        if let Some(known) = self.value_types.native.get(&payload) {
+            if *known != (ValueType::Abi, CallableResultOwnership::Erased) {
+                return Err(unsupported("stdio read private payload representation"));
+            }
+        } else {
+            self.value_types.native.try_reserve(1).map_err(|_| {
+                IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: self.value_types.native.len().saturating_add(1),
+                }
+            })?;
+            self.value_types.native.insert(
+                payload.clone(),
+                (ValueType::Abi, CallableResultOwnership::Erased),
+            );
+        }
+        let read_transport = self.io_private_record(
+            READ_TRANSPORT,
+            vec![
+                payload,
+                c("Bool"),
+                c("Nat"),
+                c("Nat"),
+                c("Bool"),
+                c("String"),
+                c("String"),
+            ],
+        )?;
+        native_fields[3] = function(std::slice::from_ref(&world), read_transport.clone());
         native_fields[4] = function(&[c("String"), world.clone()], transport.clone());
         let raw_stream = self.io_private_record(RAW_STREAM, native_fields)?;
-        self.stdout_bind_getter(raw_stream.clone())?;
+        self.stdout_bind_getter(getter, raw_stream.clone())?;
         let layout = Layout {
             stream,
             get_result,
             io_result,
+            read_result,
             error,
             raw_stream,
             transport,
+            read_transport,
             world,
         };
         self.stdout.layout = Some(layout.clone());
@@ -244,7 +327,40 @@ impl Preparation<'_> {
             for argument in (0..count).rev() {
                 body = Expr::app(body, b(argument)?);
             }
-            if index == 4 {
+            if index == 3 {
+                if domains != [layout.world.clone()] || tail != layout.read_result.source {
+                    return Err(unsupported("stdio getLine callback telescope"));
+                }
+                let field =
+                    |index| Ok::<_, IngressError>(Expr::proj(name(READ_TRANSPORT), index, b(0)?));
+                // Native success alone authorizes ABI-to-String refinement;
+                // the error arm's scalar placeholder is never a String.
+                let success = apply(
+                    Expr::const_(layout.read_result.constructors[0].name.clone(), Vec::new()),
+                    [field(0)?, b(1)?],
+                );
+                let error = self.io_transport_error(
+                    &layout.error,
+                    [field(2)?, field(3)?, field(4)?, field(5)?, field(6)?],
+                )?;
+                let failure = apply(
+                    Expr::const_(layout.read_result.constructors[1].name.clone(), Vec::new()),
+                    [error, b(1)?],
+                );
+                let returned = choose(
+                    layout.read_result.source.clone(),
+                    field(1)?,
+                    failure,
+                    success,
+                );
+                body = Expr::let_e(
+                    self.stdout_adapter_name()?,
+                    layout.read_transport.clone(),
+                    body,
+                    returned,
+                    false,
+                );
+            } else if index == 4 {
                 if domains != [c("String"), layout.world.clone()] || tail != layout.io_result.source
                 {
                     return Err(unsupported("stdout putStr callback telescope"));
@@ -295,10 +411,17 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if requested != &stdout::source_name() || !levels.is_empty() {
+        let Some(getter) = stdout::Getter::from_name(requested) else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
             return Ok(None);
         }
-        let Some(layout) = self.stdout_layout()? else {
+        let layout = match getter {
+            stdout::Getter::Stdout => self.stdout_layout()?,
+            stdout::Getter::Stdin => self.stdio_layout(getter)?,
+        };
+        let Some(layout) = layout else {
             return Ok(None);
         };
         if arguments.len() > 1 {
@@ -312,7 +435,7 @@ impl Preparation<'_> {
         let body = Expr::let_e(
             self.stdout_adapter_name()?,
             layout.raw_stream,
-            c(GETTER),
+            Expr::const_(getter_name(getter), Vec::new()),
             returned,
             false,
         );

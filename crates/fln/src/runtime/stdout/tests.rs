@@ -7,6 +7,8 @@ use fln_comp::flbc::{self, Instruction};
 use fln_olean::source_extensions as metadata;
 use fln_rt::obj::Obj;
 
+mod input;
+
 const STACK: usize = 256 * 1024 * 1024;
 
 fn raw_pin_environment() -> Option<Environment> {

@@ -853,6 +853,7 @@ enum IntrinsicImplementation {
     IoCheckCancelled,
     IoInitializing,
     IoGetStdout,
+    IoGetStdin,
     FileHandleMk,
     FileHandlePutStr,
     FileHandleGetLine,
@@ -1211,6 +1212,7 @@ impl IntrinsicImplementation {
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
             "extern:IO.initializing" => Self::IoInitializing,
             "extern:IO.getStdout" => Self::IoGetStdout,
+            "extern:IO.getStdin" => Self::IoGetStdin,
             "extern:IO.FS.Handle.mk" => Self::FileHandleMk,
             "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
@@ -2685,10 +2687,14 @@ fn run(
                 // Native callbacks never enter the Golem function-id cache.
                 // The public source Stream contains Golem wrappers; only a
                 // private, exactly saturated adapter reaches this branch.
-                if closure.is_stdio_put_str_closure() {
-                    if let Err(refusal) =
-                        validate_stdio_apply(args.len(), &argument_ownership, result_ownership)
-                    {
+                let reading = closure.is_stdio_get_line_closure();
+                if reading || closure.is_stdio_put_str_closure() {
+                    if let Err(refusal) = validate_stdio_apply(
+                        args.len(),
+                        &argument_ownership,
+                        result_ownership,
+                        reading,
+                    ) {
                         return Ok(VmExit::Refused {
                             refusal,
                             usage: usage(steps, peak_stack_depth),
@@ -2699,7 +2705,7 @@ fn run(
                         &args,
                         &argument_ownership,
                     )?;
-                    let value = match execute_stdio_apply(&closure, &args) {
+                    let value = match execute_stdio_apply(&closure, &args, reading) {
                         Ok(value) => value,
                         Err(refusal) => {
                             return stdio_apply_failure(refusal, steps, peak_stack_depth);
@@ -2902,13 +2908,15 @@ fn run(
                                 // callback to an existing overapplication
                                 // continuation. Use the identical saturated
                                 // contract and retain the caller's return.
-                                if value.is_stdio_put_str_closure() {
+                                let reading = value.is_stdio_get_line_closure();
+                                if reading || value.is_stdio_put_str_closure() {
                                     let result = validate_stdio_apply(
                                         args.len(),
                                         &argument_ownership,
                                         result_ownership,
+                                        reading,
                                     )
-                                    .and_then(|()| execute_stdio_apply(&value, &args));
+                                    .and_then(|()| execute_stdio_apply(&value, &args, reading));
                                     let result = match result {
                                         Ok(result) => result,
                                         Err(refusal) => {
@@ -3053,15 +3061,21 @@ fn validate_stdio_apply(
     argument_count: usize,
     argument_ownership: &[ArgumentOwnership],
     result_ownership: CallableResultOwnership,
+    reading: bool,
 ) -> Result<(), VmRefusal> {
-    if argument_count != 2 {
+    let expected = if reading { 1 } else { 2 };
+    if argument_count != expected {
         return Err(VmRefusal::NativeStdoutContract {
-            reason: "the callback requires exactly String and world; native currying is unsupported",
+            reason: "the callback requires its exact saturated world telescope; native currying is unsupported",
         });
     }
-    if argument_ownership != [ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed] {
+    if argument_ownership.len() != expected
+        || argument_ownership
+            .iter()
+            .any(|value| *value != ArgumentOwnership::Borrowed)
+    {
         return Err(VmRefusal::NativeStdoutContract {
-            reason: "the private adapter requires two borrowed arguments",
+            reason: "the private stream adapter requires borrowed arguments",
         });
     }
     if result_ownership != CallableResultOwnership::Owned {
@@ -3073,6 +3087,19 @@ fn validate_stdio_apply(
 }
 
 fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmExit, Stop> {
+    if let VmRefusal::NativeFileRead { error } = &refusal
+        && matches!(
+            error,
+            FileReadError::InputLimit { .. }
+                | FileReadError::OutputLimit { .. }
+                | FileReadError::Allocation { .. }
+        )
+    {
+        return Err(file_read_exhausted(
+            *error,
+            "native Stream.getLine callback",
+        ));
+    }
     if let VmRefusal::NativeStdoutCapture { error } = &refusal {
         use fln_rt::obj::StdoutCaptureError;
         return Err(match error {
@@ -3103,7 +3130,18 @@ fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmEx
     })
 }
 
-fn execute_stdio_apply(closure: &Obj, args: &[Obj]) -> Result<Obj, VmRefusal> {
+fn execute_stdio_apply(closure: &Obj, args: &[Obj], reading: bool) -> Result<Obj, VmRefusal> {
+    if reading {
+        let [world] = args else {
+            return Err(VmRefusal::NativeStdoutContract {
+                reason: "getLine requires exactly one world argument",
+            });
+        };
+        return closure
+            .try_stdio_get_line(world, MAX_FILE_READ_INPUT_BYTES, MAX_FILE_READ_OUTPUT_BYTES)
+            .map_err(|error| VmRefusal::NativeFileRead { error })?
+            .ok_or(VmRefusal::UnsupportedNativeClosure);
+    }
     let [text, world] = args else {
         return Err(VmRefusal::NativeStdoutContract {
             reason: "the callback requires exactly String and world",
@@ -6307,6 +6345,15 @@ fn invoke_intrinsic(
                 .into(),
             )
         }
+        IntrinsicImplementation::IoGetStdin => {
+            expect_arity(row, args, 0)?;
+            Obj::stdio_stdin().map(IntrinsicResult::owned).ok_or(
+                VmRefusal::NativeStdoutContract {
+                    reason: "stdin is not the exact native six-method stream over one Handle",
+                }
+                .into(),
+            )
+        }
         IntrinsicImplementation::FileHandleMk => {
             expect_arity(row, args, 2)?;
             // The generated native row erases the logical world argument.
@@ -6887,6 +6934,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::IoCheckCancelled
         | IntrinsicImplementation::IoInitializing
         | IntrinsicImplementation::IoGetStdout
+        | IntrinsicImplementation::IoGetStdin
         | IntrinsicImplementation::FileHandleMk
         | IntrinsicImplementation::FileHandlePutStr
         | IntrinsicImplementation::FileHandleGetLine

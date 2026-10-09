@@ -147,11 +147,19 @@ pub(crate) fn stream_fields() -> [Expr; 6] {
 }
 
 pub(super) fn declarations() -> Vec<ConstantInfo> {
+    declarations_for(Getter::Stdout)
+}
+
+pub(super) fn declarations_for(getter: Getter) -> Vec<ConstantInfo> {
     let mut output = Vec::new();
     let stream = c("IO.FS.Stream");
     let action = Expr::app(c("BaseIO"), stream.clone());
     output.push(ConstantInfo::Opaque(OpaqueVal {
-        base: base("IO.getStdout", vec![], action.clone()),
+        base: ConstantVal {
+            name: getter.source_name(),
+            level_params: vec![],
+            type_: action.clone(),
+        },
         value: apply(
             constant("Inhabited.default", vec![Level::one()]),
             [
@@ -168,7 +176,7 @@ pub(super) fn declarations() -> Vec<ConstantInfo> {
             ],
         ),
         is_unsafe: false,
-        all: vec![name("IO.getStdout")],
+        all: vec![getter.source_name()],
     }));
     output.push(inductive(
         "IO.FS.Stream",

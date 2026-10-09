@@ -1089,6 +1089,32 @@ pub(crate) unsafe fn stream_put_str_handle(closure: *mut LeanObject) -> Option<*
     }
 }
 
+/// Borrow the Handle captured by exactly stream_of_handle's getLine method.
+/// No caller-supplied function pointer is executed.
+///
+/// # Safety
+/// `closure` is a scalar or live object. The returned Handle cannot outlive it.
+// UNSAFE-LEDGER: FLN-UL-0647
+#[allow(unsafe_code)]
+pub(crate) unsafe fn stream_get_line_handle(closure: *mut LeanObject) -> Option<*mut LeanObject> {
+    if closure.is_null() || tagged::is_scalar(closure) {
+        return None;
+    }
+    // SAFETY: tag precedes closure fields; exact arity/fixed count precedes
+    // the sole capture read; the external class is checked before its FILE.
+    unsafe {
+        if rc::read_header(closure).tag != crate::contract::TAG_CLOSURE {
+            return None;
+        }
+        let (target, arity, fixed, captures) = object::closure_fields(closure);
+        if target != stream_get_line_fn as *const () as *mut c_void || arity != 2 || fixed != 1 {
+            return None;
+        }
+        let handle = captures.read();
+        is_native_file_handle(handle).then_some(handle)
+    }
+}
+
 /// Shared putStr write, with errno captured immediately after fwrite.
 ///
 /// # Safety
@@ -1835,9 +1861,17 @@ pub(crate) fn get_stdout() -> *mut LeanObject {
 /// Safe-door getter: inspect before retaining so even a scalar TLS override
 /// never reaches get_current's native non-scalar reference-count precondition.
 pub(crate) fn checked_get_stdout() -> Option<*mut LeanObject> {
+    checked_get_current(IX_STDOUT)
+}
+
+pub(crate) fn checked_get_stdin() -> Option<*mut LeanObject> {
+    checked_get_current(IX_STDIN)
+}
+
+fn checked_get_current(index: usize) -> Option<*mut LeanObject> {
     CURRENT.with(|current| {
         let mut slots = current.borrow_mut();
-        let stream = seeded(&mut slots, IX_STDOUT);
+        let stream = seeded(&mut slots, index);
         // SAFETY: the TLS slot owns a live object/scalar. The complete native
         // stream observer proves non-scalar before inc_ref_n. Retention occurs
         // while the same TLS borrow protects the inspected slot from changes.

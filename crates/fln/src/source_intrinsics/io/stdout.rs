@@ -15,6 +15,27 @@ pub(crate) fn source_name() -> Name {
     Name::from_components(["IO", "getStdout"])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Getter {
+    Stdout,
+    Stdin,
+}
+
+impl Getter {
+    pub(crate) fn source_name(self) -> Name {
+        match self {
+            Self::Stdout => source_name(),
+            Self::Stdin => Name::from_components(["IO", "getStdin"]),
+        }
+    }
+
+    pub(crate) fn from_name(requested: &Name) -> Option<Self> {
+        [Self::Stdout, Self::Stdin]
+            .into_iter()
+            .find(|getter| requested == &getter.source_name())
+    }
+}
+
 pub(in crate::source_intrinsics) fn word_bound_models() -> Vec<ConstantInfo> {
     let mut constants = bounds::declarations();
     let power = Name::from_components(["Nat", "pow"]);
@@ -64,7 +85,24 @@ pub(crate) fn contract_matches(
     visited: &mut usize,
     limits: IngressLimits,
 ) -> Result<bool, IngressError> {
-    if !extern_attribute_matches(environment, &source_name(), true, externs, visited, limits)? {
+    getter_matches(environment, Getter::Stdout, externs, visited, limits)
+}
+
+pub(crate) fn getter_matches(
+    environment: &Environment,
+    getter: Getter,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    if !extern_attribute_matches(
+        environment,
+        &getter.source_name(),
+        true,
+        externs,
+        visited,
+        limits,
+    )? {
         return Ok(false);
     }
     if !results::contract_matches(environment, externs, visited, limits)? {
@@ -72,7 +110,11 @@ pub(crate) fn contract_matches(
             kind: "native stdout requires the complete checked IO result models",
         });
     }
-    let models = model::declarations();
+    let mut models = match getter {
+        Getter::Stdout => model::declarations(),
+        Getter::Stdin => model::declarations_for(getter),
+    };
+    models.extend(crate::source_intrinsics::string_internal::scalar_records());
     let mut comparison = Comparison { visited, limits };
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {

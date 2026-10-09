@@ -378,7 +378,7 @@ fn stdout_native_dispatch_refuses_non_string_world_and_unreviewed_methods() {
         return;
     }
     {
-        for field in [0, 1, 2, 3, 5] {
+        for field in [0, 1, 2, 5] {
             let program = callback_program(
                 false,
                 field,

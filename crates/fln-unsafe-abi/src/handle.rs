@@ -807,6 +807,47 @@ impl Obj {
         crate::stdio::checked_get_stdout().map(Obj)
     }
 
+    /// Retain this thread's stdin only after the complete native six-method
+    /// stream and its single shared Handle have been validated under TLS borrow.
+    pub fn stdio_stdin() -> Option<Obj> {
+        crate::stdio::checked_get_stdin().map(Obj)
+    }
+
+    /// Recognize exactly the native getLine callback over one live Handle.
+    pub fn is_stdio_get_line_closure(&self) -> bool {
+        // SAFETY: Obj is live; the observer checks category, pointer, arity
+        // and capture before borrowing its exact Handle, and invokes nothing.
+        unsafe { crate::stdio::stream_get_line_handle(self.0).is_some() }
+    }
+
+    /// Read through the exact native getLine callback without general native
+    /// apply. None means an unrelated callback and precedes all input effects.
+    /// Success returns the same private seven-field packet as try_file_get_line;
+    /// resource/post-read failures retain its consumed-byte observations.
+    pub fn try_stdio_get_line(
+        &self,
+        world: &Obj,
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+    ) -> Result<Option<Obj>, fs::FileReadError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(fs::FileReadError::InvalidWorld);
+        }
+        // SAFETY: the observer lends a live Handle from the borrowed closure.
+        // Retain before wrapping as Obj, then let ordinary RAII settle exactly
+        // that reference after the bounded call; the native pointer is not run.
+        let handle = unsafe {
+            let Some(handle) = crate::stdio::stream_get_line_handle(self.0) else {
+                return Ok(None);
+            };
+            rc::inc_ref_n(handle, 1);
+            Obj(handle)
+        };
+        handle
+            .try_file_get_line(world, max_input_bytes, max_output_bytes)
+            .map(Some)
+    }
+
     /// Whether this is precisely Marrow's putStr callback over a live Handle.
     /// Arbitrary native closures, shells, and other stream methods are false.
     pub fn is_stdio_put_str_closure(&self) -> bool {
@@ -1291,3 +1332,6 @@ impl Drop for Obj {
 
 #[cfg(test)]
 mod stdio_tests;
+
+#[cfg(test)]
+mod stdio_input_tests;
