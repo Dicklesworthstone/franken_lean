@@ -9390,6 +9390,7 @@ fn executable_dependencies(
         let intrinsic = match preparation
             .st_intrinsic_binding(&name)
             .or_else(|| preparation.io_intrinsic_binding(&name))
+            .or_else(|| preparation.fs_intrinsic_binding(&name))
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
             .or_else(|| preparation.string_push_intrinsic_binding(&name))
         {

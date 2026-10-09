@@ -189,6 +189,11 @@ pub(super) fn declarations() -> Vec<ConstantInfo> {
             .rev()
             .fold(stream, |body, field| pi(field, body)),
     ));
+    output
+}
+
+pub(super) fn result_declarations() -> Vec<ConstantInfo> {
+    let mut output = Vec::new();
     let errors = error_cases();
     output.push(inductive(
         "IO.Error",

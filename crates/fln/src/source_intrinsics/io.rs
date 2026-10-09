@@ -6,8 +6,10 @@
 
 use super::*;
 
+pub(crate) mod fs;
 mod model;
 pub(crate) mod primitives;
+pub(crate) mod results;
 pub(crate) mod stdout;
 
 /// Recognize the pinned IO aliases and opaque state carrier. No IO primitive

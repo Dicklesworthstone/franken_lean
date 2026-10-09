@@ -34,9 +34,17 @@ pub(in crate::source_intrinsics) fn word_bound_models() -> Vec<ConstantInfo> {
     constants
 }
 
+pub(in crate::source_intrinsics) fn result_models() -> Vec<ConstantInfo> {
+    model::result_declarations()
+}
+
 #[cfg(test)]
 pub(crate) fn assert_pin_models(environment: &Environment) {
-    for expected in model::declarations().into_iter().chain(word_bound_models()) {
+    for expected in model::declarations()
+        .into_iter()
+        .chain(result_models())
+        .chain(word_bound_models())
+    {
         assert!(
             Comparison {
                 visited: &mut 0,
@@ -59,22 +67,13 @@ pub(crate) fn contract_matches(
     if !extern_attribute_matches(environment, &source_name(), true, externs, visited, limits)? {
         return Ok(false);
     }
-    if !io_world_contract_matches(environment, externs, visited, limits)? {
+    if !results::contract_matches(environment, externs, visited, limits)? {
         return Err(IngressError::UnsupportedNode {
-            kind: "native stdout requires the complete checked IO world",
+            kind: "native stdout requires the complete checked IO result models",
         });
     }
-    // The transport's u32 is a valid Fin value only for the intended bound.
-    // Pin the dictionary/projection path and its full Nat.pow computation
-    // before value-index erasure can hide a changed literal or exponentiation.
-    let mut models = model::declarations();
-    models.extend(word_bound_models());
+    let models = model::declarations();
     let mut comparison = Comparison { visited, limits };
-    if !comparison.declaration(environment, fln_elab::seed::bool_seed_declaration())? {
-        return Err(IngressError::UnsupportedNode {
-            kind: "native stdout requires the checked Boolean family",
-        });
-    }
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {
             return Err(IngressError::UnsupportedNode {

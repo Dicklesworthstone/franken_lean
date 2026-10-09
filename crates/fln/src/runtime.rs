@@ -10,9 +10,11 @@ mod decisions;
 mod empty;
 mod evaluation;
 mod floats;
+mod fs;
 mod global;
 mod indexed;
 mod io;
+mod io_result;
 mod mutual;
 mod nat;
 mod partial;
@@ -57,6 +59,7 @@ pub(super) struct Preparation<'a> {
     specializations: specialize::Store,
     st: st::Store,
     io: io::Store,
+    fs: fs::Store,
     stdout: stdout::Store,
     string_push: string_push::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
@@ -129,6 +132,7 @@ impl<'a> Preparation<'a> {
             specializations: specialize::Store::default(),
             st: st::Store::default(),
             io: io::Store::default(),
+            fs: fs::Store::default(),
             stdout: stdout::Store::default(),
             string_push: string_push::Store::default(),
             data_shapes: std::collections::HashMap::new(),
@@ -412,6 +416,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(action) = self.fs_call(&head, &args)? {
+                            tasks.push(Task::Visit(action));
+                            continue;
+                        }
                         if let Some(action) = self.stdout_call(&head, &args)? {
                             tasks.push(Task::Visit(action));
                             continue;
@@ -691,6 +699,10 @@ impl<'a> Preparation<'a> {
                                 continue;
                             }
                             if let Some(action) = self.io_call(&expr, &[])? {
+                                tasks.push(Task::Visit(action));
+                                continue;
+                            }
+                            if let Some(action) = self.fs_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
                                 continue;
                             }

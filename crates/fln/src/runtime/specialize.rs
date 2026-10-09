@@ -98,6 +98,7 @@ impl Preparation<'_> {
             || self.specializations.constructor_types.contains_key(name)
             || self.st_intrinsic_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
+            || self.fs_intrinsic_type(name).is_some()
             || self.stdout_intrinsic_type(name).is_some()
             || self.string_push_intrinsic_type(name).is_some()
     }
@@ -167,6 +168,11 @@ impl Preparation<'_> {
                 ExprNode::Const { name, levels } => {
                     if self.preserve_io_world_type(&head, &args)? {
                         break;
+                    }
+                    if let Some(carrier) = self.fs_type_head(&head, &args)? {
+                        head = carrier;
+                        args.clear();
+                        continue;
                     }
                     if let Some(carrier) = self.st_type_head(&head, &args)? {
                         head = carrier;
@@ -696,6 +702,7 @@ impl Preparation<'_> {
             && let Some(type_) = self
                 .st_intrinsic_type(name)
                 .or_else(|| self.io_intrinsic_type(name))
+                .or_else(|| self.fs_intrinsic_type(name))
                 .or_else(|| self.stdout_intrinsic_type(name))
                 .or_else(|| self.string_push_intrinsic_type(name))
         {
