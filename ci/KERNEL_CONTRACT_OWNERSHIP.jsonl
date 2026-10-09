@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":605,"projection_hash":"37aefa41085d483379742b1f09316159d0aff19545fec99126d401e93824e3a0"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":608,"projection_hash":"807127362a636500927a83cd018c65fe9bbf0baa37bbd415d292f7aa671b004c"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -153,6 +153,7 @@
 {"id":"fln-gkhu"}
 {"id":"fln-glml"}
 {"id":"fln-golem-ordinary-loops-fbj6"}
+{"id":"fln-guard-msgs-lls1"}
 {"id":"fln-h1k"}
 {"id":"fln-h1k.1"}
 {"id":"fln-h1k.2"}
@@ -214,6 +215,7 @@
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
 {"id":"fln-merkle-decl-digest-80ni"}
 {"id":"fln-mirror-price-cszo"}
+{"id":"fln-module-header-tric"}
 {"id":"fln-msou"}
 {"id":"fln-n1ao"}
 {"id":"fln-narm"}
@@ -259,6 +261,7 @@
 {"id":"fln-s8oo"}
 {"id":"fln-s97y"}
 {"id":"fln-selftest-symlink-blocks-bundle-4yhd"}
+{"id":"fln-set-option-t69b"}
 {"id":"fln-simp-default-set-a4nb"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
