@@ -158,8 +158,27 @@ pub(super) fn elaborate_record_scoped(
             "named structure field",
         )?;
         empty_modifiers(&parts[0])?;
+        // `h : P := by tac` is the pin's `binderTactic`, an `autoParam` field: an omitted field
+        // is filled by running its tactic. It is read as a default proved by that tactic, as the
+        // checker read the field before its tree was the pin's: the constructor then takes `P`,
+        // where the pin's takes `autoParam P _` (`autoParam` is a reducible `P`).
+        let tactic_default;
         let default = match expect_null_args(&parts[3], "field default")? {
             [] => None,
+            [syntax] if syntax.kind() == Some(&parser_kind(&["Term", "binderTactic"])) => {
+                let tactic = expect_node(
+                    syntax,
+                    &parser_kind(&["Term", "binderTactic"]),
+                    3,
+                    "field tactic",
+                )?;
+                expect_atom(&tactic[0], ":=", "field tactic assignment")?;
+                tactic_default = Syntax::node(
+                    parser_kind(&["Term", "byTactic"]),
+                    vec![tactic[1].clone(), tactic[2].clone()],
+                );
+                Some(&tactic_default)
+            }
             [syntax] => {
                 let parts = expect_node(
                     syntax,

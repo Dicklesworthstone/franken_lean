@@ -16,7 +16,13 @@ use do_scopes::DoScopes;
 pub(super) type Splices = HashMap<usize, (usize, Syntax)>;
 struct Alternative {
     pipe: usize,
+    /// `| p | q => e`: the pipes after the first, each separating a group of patterns that
+    /// shares the right-hand side (`matchAlt`'s `sepBy1 (sepBy1 term ", ") " | "`).
+    shared: Vec<usize>,
     arrow: Option<usize>,
+    /// The first `by` or `do` at the alternative's depth after its `=>`: its sequence takes every
+    /// `;` after it (`=> calc … := by skip; rfl`, `=> do f x; loop i`).
+    by_at: Option<usize>,
     end: usize,
 }
 struct ConditionalPlan {
@@ -149,6 +155,7 @@ fn plan(
     let mut tries = exceptions::Planner::default();
     let mut done = Vec::new();
     let mut do_scopes = DoScopes::default();
+    let mut pending_matches: Option<(usize, usize)> = None;
     for at in range.clone() {
         let depth = delimiters.len();
         let failure = fallback::candidate(tokens, at, depth, lets.last(), active.len());
@@ -200,7 +207,9 @@ fn plan(
             do_scopes.closed(active.last().expect("ended do match").start);
             close(view, tokens, &mut active, &mut done, at)?;
         }
-        let statement = do_scopes.statement_at(view, tokens, at, depth);
+        let statement = do_scopes
+            .statement_at(view, tokens, at, depth)
+            .or_else(|| do_scopes.arrow_element(view, tokens, at, depth));
         if term_locals::word(tokens, at, "do") {
             do_scopes.open(view, tokens, at, depth, None, range.end)?;
         }
@@ -266,6 +275,7 @@ fn plan(
                 && p.alternatives.last().is_some_and(|alt| {
                     alt.arrow
                         .is_some_and(|arrow| is_symbol(tokens, arrow + 1, "by") && at > arrow + 1)
+                        || alt.by_at.is_some_and(|by| at > by)
                 })
         });
         let mut statement_separator = false;
@@ -379,14 +389,15 @@ fn plan(
             "let"
                 if conditionals
                     .last()
-                    .is_some_and(|p| p.statement && p.depth == depth && p.start + 1 == at) =>
+                    .is_some_and(|p| p.depth == depth && p.start + 1 == at) =>
             {
                 // A pattern-test header is not a term-local let telescope.
                 // Its binding ends at `then`, not at a later branch semicolon.
             }
+            // A term `if let` binds with `:=` only (`termIfLet`); a statement may bind with `←`.
             ":=" | "←" | "<-"
                 if conditionals.last().is_some_and(|p| {
-                    p.statement
+                    (p.statement || is_symbol(tokens, at, ":="))
                         && p.depth == depth
                         && p.then_at.is_none()
                         && p.pattern_assignment.is_none()
@@ -406,6 +417,17 @@ fn plan(
                 at,
                 statement.is_some(),
             )),
+            // A `do` owns the `;`s after it as a `by` does (`=> do f x; loop i`).
+            "by" | "do" => {
+                if let Some(current) = active.last_mut()
+                    && current.depth == depth
+                    && let Some(alt) = current.alternatives.last_mut()
+                    && alt.arrow.is_some_and(|arrow| at > arrow)
+                    && alt.by_at.is_none()
+                {
+                    alt.by_at = Some(at);
+                }
+            }
             ";" | ":" if proof_body => {}
             ";" => {
                 // A let's separator ends matches in its VALUE, not the outer
@@ -499,6 +521,10 @@ fn plan(
                 }
                 current.with = Some(at);
             }
+            // `e matches p | q`: the `|`s on the `matches` line at its depth are its own.
+            "matches" => pending_matches = Some((depth, at)),
+            "|" if pending_matches
+                .is_some_and(|(d, start)| d == depth && !later_line(view, tokens, at, start)) => {}
             "|" => {
                 while conditionals.last().is_some_and(|p| {
                     p.depth == depth
@@ -553,20 +579,36 @@ fn plan(
                 {
                     return Err(refuse(view, tokens, at));
                 }
+                // Before the `=>`, a pipe starts another group of the same alternative.
+                let shared = current
+                    .alternatives
+                    .last()
+                    .is_some_and(|last| last.arrow.is_none());
                 if let Some(last) = current.alternatives.last_mut() {
-                    if last.arrow.is_none_or(|arrow| arrow + 1 >= at) {
-                        return Err(refuse(view, tokens, at));
+                    if shared {
+                        if at == last.shared.last().copied().unwrap_or(last.pipe) + 1 {
+                            return Err(refuse(view, tokens, at));
+                        }
+                        last.shared.push(at);
+                    } else {
+                        if last.arrow.is_some_and(|arrow| arrow + 1 >= at) {
+                            return Err(refuse(view, tokens, at));
+                        }
+                        last.end = at;
                     }
-                    last.end = at;
                 }
-                // The preceding arm ended at this pipe, but the match has
-                // not ended: retain it while scanning the next pattern/header.
-                do_scopes.closed(current.start);
-                current.alternatives.push(Alternative {
-                    pipe: at,
-                    arrow: None,
-                    end: range.end,
-                });
+                if !shared {
+                    // The preceding arm ended at this pipe, but the match has
+                    // not ended: retain it while scanning the next pattern/header.
+                    do_scopes.closed(current.start);
+                    current.alternatives.push(Alternative {
+                        pipe: at,
+                        shared: Vec::new(),
+                        arrow: None,
+                        by_at: None,
+                        end: range.end,
+                    });
+                }
             }
             "=>" | "↦" if active.last().is_some_and(|p| p.depth == depth) => {
                 let current = active.last_mut().expect("matching depth");
@@ -612,6 +654,27 @@ fn pattern(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    // `x@p` around a list pattern (`l@(x :: _)`): the name, then the pattern it names.
+    if range.len() >= 3
+        && matches!(tokens[range.start].kind, TokenKind::Ident(_))
+        && is_symbol(tokens, range.start + 1, "@")
+        && tokens[range.start].extent.end() == tokens[range.start + 1].extent.start()
+        && tokens[range.start + 1].extent.end() == tokens[range.start + 2].extent.start()
+        && range
+            .clone()
+            .any(|at| is_symbol(tokens, at, "[") || is_symbol(tokens, at, "::"))
+    {
+        let named = collections::pattern(leaves, view, tokens, range.start + 2..range.end)?;
+        return Ok(Syntax::node(
+            parser_kind(&["Term", "namedPattern"]),
+            vec![
+                leaves.leaf(range.start)?,
+                leaves.leaf(range.start + 1)?,
+                null_node(Vec::new()),
+                named,
+            ],
+        ));
+    }
     if range
         .clone()
         .any(|at| is_symbol(tokens, at, "[") || is_symbol(tokens, at, "::"))
@@ -630,6 +693,13 @@ fn pattern(
         Anonymous(usize, usize, Vec<usize>, usize),
         /// `(p, q, …)` (`Term.tuple`, `[p "," [q "," …]]`): as [`Task::Anonymous`].
         Tuple(usize, usize, Vec<usize>, usize),
+        /// `x@p` (`Term.namedPattern`): the name and the `@`.
+        Named(usize, usize),
+        /// `(p : T)` (`Term.typeAscription`): the brackets and the colon; the type is a term.
+        Ascription(usize, usize, usize),
+        /// `..` as an application's last argument (`Term.ellipsis`): every remaining explicit
+        /// argument a hole.
+        Ellipsis(usize),
     }
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
@@ -651,6 +721,38 @@ fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Ascription(open, colon, close) => {
+                let pattern = values.pop().expect("planned ascribed pattern");
+                let type_ = bounded_term(
+                    leaves,
+                    view,
+                    tokens,
+                    colon + 1..close,
+                    DefinitionGrammar::Scalar,
+                )?;
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "typeAscription"]),
+                    vec![
+                        hygienic_lparen(leaves.leaf(open)?),
+                        pattern,
+                        leaves.leaf(colon)?,
+                        null_node(vec![type_]),
+                        leaves.leaf(close)?,
+                    ],
+                ));
+            }
+            Task::Named(name, at) => {
+                let pattern = values.pop().expect("planned named pattern");
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "namedPattern"]),
+                    vec![
+                        leaves.leaf(name)?,
+                        leaves.leaf(at)?,
+                        null_node(Vec::new()),
+                        pattern,
+                    ],
+                ));
+            }
             Task::Offset(plus, literal) => {
                 let base = values.pop().expect("planned offset base");
                 values.push(Syntax::node(
@@ -712,6 +814,12 @@ fn pattern(
                     ],
                 ));
             }
+            Task::Ellipsis(at) => {
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "ellipsis"]),
+                    vec![leaves.leaf(at)?],
+                ));
+            }
             Task::Application(start) => {
                 let arguments = values.split_off(start + 1);
                 let head = values.pop().expect("planned constructor head");
@@ -723,6 +831,26 @@ fn pattern(
             Task::Parse(range) => {
                 if range.is_empty() {
                     return Err(refuse(view, tokens, range.start));
+                }
+                // `namedPattern := ident noWs "@" noWs (ident ":")? term:max`: the name touches
+                // the `@`, which touches one atomic pattern ending the range (`l@(x :: _)`).
+                let touching = |left: usize, right: usize| {
+                    tokens[left].extent.end() == tokens[right].extent.start()
+                };
+                if range.len() >= 3
+                    && matches!(tokens[range.start].kind, TokenKind::Ident(_))
+                    && is_symbol(tokens, range.start + 1, "@")
+                    && touching(range.start, range.start + 1)
+                    && touching(range.start + 1, range.start + 2)
+                    && (range.len() == 3
+                        || pairs.get(&(range.start + 2)) == Some(&(range.end - 1))
+                        || (range.len() == 4
+                            && is_symbol(tokens, range.start + 2, ".")
+                            && touching(range.start + 2, range.start + 3)))
+                {
+                    tasks.push(Task::Named(range.start, range.start + 1));
+                    tasks.push(Task::Parse(range.start + 2..range.end));
+                    continue;
                 }
                 // `+` binds looser than application, so a trailing `+ k` outside every
                 // parenthesis splits the pattern: `n + 2`, `(succ n) + 1`.
@@ -788,6 +916,27 @@ fn pattern(
                         );
                         continue;
                     }
+                    // `(p : T)`: a colon outside the inner brackets ascribes the pattern.
+                    let mut depth = 0usize;
+                    let colon = inner.clone().find(|&at| {
+                        if let TokenKind::Symbol(s) = &tokens[at].kind {
+                            match crate::canonical_bracket(s.as_str()) {
+                                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                                ":" if depth == 0 => return true,
+                                _ => {}
+                            }
+                        }
+                        false
+                    });
+                    if let Some(colon) = colon {
+                        if colon == inner.start || colon + 1 == close {
+                            return Err(refuse(view, tokens, colon));
+                        }
+                        tasks.push(Task::Ascription(range.start, colon, close));
+                        tasks.push(Task::Parse(inner.start..colon));
+                        continue;
+                    }
                     tasks.push(Task::Group(range.start, close));
                     tasks.push(Task::Parse(inner));
                     continue;
@@ -829,8 +978,30 @@ fn pattern(
                 let start = values.len();
                 values.push(head);
                 let mut arguments = Vec::new();
+                let mut ellipsis = None;
                 while cursor < range.end {
                     let begin = cursor;
+                    // `f a ..`: only the last argument may be the ellipsis.
+                    if is_symbol(tokens, cursor, "..") {
+                        if cursor + 1 != range.end {
+                            return Err(refuse(view, tokens, cursor));
+                        }
+                        ellipsis = Some(cursor);
+                        break;
+                    }
+                    // `x@p` as an argument (`.inner _ l@(.inner ..)`): the name, a touching `@` and
+                    // the atomic pattern touching it are one argument.
+                    let touches = |left: usize, right: usize| {
+                        right < range.end
+                            && tokens[left].extent.end() == tokens[right].extent.start()
+                    };
+                    if matches!(tokens[cursor].kind, TokenKind::Ident(_))
+                        && is_symbol(tokens, cursor + 1, "@")
+                        && touches(cursor, cursor + 1)
+                        && touches(cursor + 1, cursor + 2)
+                    {
+                        cursor += 2;
+                    }
                     if is_symbol(tokens, cursor, "(") || is_symbol(tokens, cursor, "⟨") {
                         cursor = pairs[&cursor] + 1;
                     } else if is_symbol(tokens, cursor, ".") {
@@ -843,14 +1014,65 @@ fn pattern(
                     }
                     arguments.push(begin..cursor);
                 }
-                if !arguments.is_empty() {
+                if !arguments.is_empty() || ellipsis.is_some() {
                     tasks.push(Task::Application(start));
+                    tasks.extend(ellipsis.map(Task::Ellipsis));
                     tasks.extend(arguments.into_iter().rev().map(Task::Parse));
                 }
             }
         }
     }
     Ok(values.pop().expect("one complete pattern"))
+}
+
+/// The else-if clauses an `else` followed by an `if` makes: when the `else` branch is exactly one
+/// `doIf` statement, its condition and sequence become the first clause and its own clauses and
+/// `else` follow; otherwise the branch is kept as written.
+fn else_if_clauses(else_atom: Syntax, otherwise: Syntax) -> (Vec<Syntax>, Syntax) {
+    fn args(syntax: &Syntax) -> &[Syntax] {
+        match syntax {
+            Syntax::Node { args, .. } => args,
+            _ => &[],
+        }
+    }
+    let nested = match args(&otherwise) {
+        [_, sequence] if sequence.kind() == Some(&parser_kind(&["Term", "doSeqIndent"])) => {
+            match args(sequence) {
+                [items] => match args(items) {
+                    [item] => match args(item) {
+                        [element, semi]
+                            if args(semi).is_empty()
+                                && element.kind() == Some(&parser_kind(&["Term", "doIf"]))
+                                && args(element).len() == 6 =>
+                        {
+                            Some(args(element).to_vec())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(parts) = nested else {
+        return (Vec::new(), otherwise);
+    };
+    let mut clauses = vec![Syntax::node(
+        Name::from_components(["group"]),
+        vec![
+            Syntax::node(
+                Name::from_components(["group"]),
+                vec![else_atom, parts[0].clone()],
+            ),
+            parts[1].clone(),
+            parts[2].clone(),
+            parts[3].clone(),
+        ],
+    )];
+    clauses.extend(args(&parts[4]).iter().cloned());
+    (clauses, parts[5].clone())
 }
 
 /// The separators are returned as indices so reconstruction keeps their exact
@@ -972,6 +1194,11 @@ fn let_values(
                 let mut value = values.pop().expect("let continuation follows its values");
                 for binding in bindings.into_iter().rev() {
                     let local_value = values.pop().expect("let value precedes its continuation");
+                    // A pattern, an equations or a hinted recursive binding is not read here.
+                    if binding.pattern.is_some() || binding.equations || binding.termination.is_some()
+                    {
+                        return Err(refuse(view, tokens, binding.name));
+                    }
                     let annotation = match binding.explicit_type {
                         Some((colon, type_range)) => null_node(vec![Syntax::node(
                             parser_kind(&["Term", "typeSpec"]),
@@ -1004,11 +1231,20 @@ fn let_values(
                             local_value,
                         ],
                     );
+                    // The binding's attributes, never dropped: the elaborator refuses them.
+                    let attributes = match binding.attributes {
+                        Some(at) => crate::command_scope::attributes::inline_syntax(
+                            view, leaves, tokens, at,
+                        )?,
+                        None => null_node(vec![]),
+                    };
                     value = local_binding_syntax(
                         leaves,
                         binding.keyword,
                         binding.recursive,
+                        attributes,
                         declaration,
+                        crate::empty_termination_suffix(),
                         binding.separator,
                         value,
                     )?;
@@ -1127,7 +1363,7 @@ fn build_conditional(
         );
     }
 
-    let pattern_test = plan.statement && is_symbol(tokens, plan.start + 1, "let");
+    let pattern_test = is_symbol(tokens, plan.start + 1, "let");
     let named = !pattern_test && is_symbol(tokens, plan.start + 2, ":");
     let binding = if named {
         null_node(vec![
@@ -1137,7 +1373,10 @@ fn build_conditional(
     } else {
         null_node(vec![])
     };
-    let condition = if pattern_test {
+    let condition = if pattern_test && !plan.statement {
+        // Read with the branches below (`termIfLet`).
+        Syntax::Missing
+    } else if pattern_test {
         if_let::condition(leaves, view, tokens, &plan, grammar, splices, updates)?
     } else {
         let begin = plan.start + if named { 3 } else { 1 };
@@ -1184,17 +1423,8 @@ fn build_conditional(
             ]),
             None => null_node(vec![]),
         };
-        let syntax = Syntax::node(
-            parser_kind(&["Term", "doIf"]),
-            vec![
-                leaves.leaf(plan.start)?,
-                condition,
-                leaves.leaf(then_at)?,
-                yes,
-                null_node(vec![]),
-                otherwise,
-            ],
-        );
+        let syntax =
+            statement_conditional(leaves, view, tokens, &plan, then_at, condition, yes, otherwise)?;
         splices.insert(plan.start, (plan.end, syntax));
         return Ok(());
     }
@@ -1217,9 +1447,93 @@ fn build_conditional(
         splices,
         updates,
     )?;
+    let syntax = term_conditional(
+        leaves, view, tokens, &plan, grammar, splices, updates, condition, yes, no,
+    )?;
+    splices.insert(plan.start, (plan.end, syntax));
+    Ok(())
+}
+
+/// A statement `if`'s `doIf` node, built once its child ranges are parsed so that their
+/// construction temporaries are not live while a child range is parsed.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn statement_conditional(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: &ConditionalPlan,
+    then_at: usize,
+    condition: Syntax,
+    yes: Syntax,
+    otherwise: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    // `elseIf := atomic(group(withPosition("else " checkLineEq " if ")))`: an `if` right after
+    // the `else` on its line, alone in its branch, is an else-if clause of this `if`, its own
+    // clauses and `else` becoming this one's. On the next line it stays a nested `if`.
+    let (else_ifs, otherwise) = match plan.else_at {
+        Some(else_at)
+            if is_symbol(tokens, else_at + 1, "if")
+                && !later_line(view, tokens, else_at + 1, else_at) =>
+        {
+            else_if_clauses(leaves.leaf(else_at)?, otherwise)
+        }
+        _ => (Vec::new(), otherwise),
+    };
+    Ok(Syntax::node(
+        parser_kind(&["Term", "doIf"]),
+        vec![
+            leaves.leaf(plan.start)?,
+            condition,
+            leaves.leaf(then_at)?,
+            yes,
+            null_node(else_ifs),
+            otherwise,
+        ],
+    ))
+}
+
+/// A term `if`'s node, built once both branches are parsed (`termIfLet` reads its pattern and
+/// value here).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn term_conditional(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: &ConditionalPlan,
+    grammar: DefinitionGrammar,
+    splices: &mut Splices,
+    updates: &HashSet<usize>,
+    condition: Syntax,
+    yes: Syntax,
+    no: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
     // The pin's `if` notations (`Init/Prelude.lean`): `termIfThenElse` and, with evidence
-    // `if h : c`, `termDepIfThenElse`, whose name is a `binderIdent`.
-    let syntax = if named {
+    // `if h : c`, `termDepIfThenElse`, whose name is a `binderIdent`; `if let p := e` is
+    // `termIfLet` (`Init/Notation.lean`).
+    let pattern_test = is_symbol(tokens, plan.start + 1, "let");
+    let named = !pattern_test && is_symbol(tokens, plan.start + 2, ":");
+    let then_at = plan.then_at.expect("planned then");
+    let else_at = plan.else_at.expect("ordinary conditional requires else");
+    Ok(if pattern_test {
+        let (pattern, assignment, value) =
+            if_let::term_parts(leaves, view, tokens, plan, grammar, splices, updates)?;
+        Syntax::node(
+            Name::from_components(["termIfLet"]),
+            vec![
+                leaves.leaf(plan.start)?,
+                leaves.leaf(plan.start + 1)?,
+                pattern,
+                assignment,
+                value,
+                leaves.leaf(then_at)?,
+                yes,
+                leaves.leaf(else_at)?,
+                no,
+            ],
+        )
+    } else if named {
         Syntax::node(
             Name::from_components(["termDepIfThenElse"]),
             vec![
@@ -1248,9 +1562,7 @@ fn build_conditional(
                 no,
             ],
         )
-    };
-    splices.insert(plan.start, (plan.end, syntax));
-    Ok(())
+    })
 }
 
 /// `bif c then a else b` (`boolIfThenElse`, `Init/Notation.lean`, which expands to `cond c a b`):
@@ -1318,11 +1630,12 @@ fn build_match(
         1
     } else if equation_root || plan.function {
         let first = plan.alternatives.first().expect("validated equation row");
-        columns(
-            tokens,
-            first.pipe + 1..first.arrow.expect("validated arrow"),
-        )
-        .len()
+        let first_group_end = first
+            .shared
+            .first()
+            .copied()
+            .unwrap_or_else(|| first.arrow.expect("validated arrow"));
+        columns(tokens, first.pipe + 1..first_group_end).len()
     } else {
         discriminant_columns.len()
     };
@@ -1385,16 +1698,25 @@ fn build_match(
     let mut alternatives = Vec::new();
     for alt in plan.alternatives {
         let arrow = alt.arrow.expect("validated alternative");
-        let pattern_columns = columns(tokens, alt.pipe + 1..arrow);
-        if pattern_columns.len() != arity {
-            return Err(refuse(view, tokens, alt.pipe));
-        }
-        let mut patterns = Vec::new();
-        for (range, comma) in pattern_columns {
-            patterns.push(pattern(leaves, view, tokens, range)?);
-            if let Some(comma) = comma {
-                patterns.push(leaves.leaf(comma)?);
+        let mut groups = Vec::new();
+        let mut group_start = alt.pipe + 1;
+        for separator in alt.shared.iter().copied().chain(std::iter::once(arrow)) {
+            let pattern_columns = columns(tokens, group_start..separator);
+            if pattern_columns.len() != arity {
+                return Err(refuse(view, tokens, group_start - 1));
             }
+            let mut patterns = Vec::new();
+            for (range, comma) in pattern_columns {
+                patterns.push(pattern(leaves, view, tokens, range)?);
+                if let Some(comma) = comma {
+                    patterns.push(leaves.leaf(comma)?);
+                }
+            }
+            if !groups.is_empty() {
+                groups.push(leaves.leaf(group_start - 1)?);
+            }
+            groups.push(null_node(patterns));
+            group_start = separator + 1;
         }
         let rhs = if plan.statement {
             bounded_do_sequence_spliced(
@@ -1421,7 +1743,7 @@ fn build_match(
             parser_kind(&["Term", "matchAlt"]),
             vec![
                 leaves.leaf(alt.pipe)?,
-                null_node(vec![null_node(patterns)]),
+                null_node(groups),
                 leaves.leaf(arrow)?,
                 rhs,
             ],
@@ -1432,6 +1754,11 @@ fn build_match(
         vec![null_node(alternatives)],
     );
     if equation_root {
+        // The rows reach the end of the definition: tokens after a row the planner closed early
+        // are refused, never dropped.
+        if plan.end != range.end {
+            return Err(refuse(view, tokens, plan.end));
+        }
         if !splices.is_empty() {
             return Err(refuse(view, tokens, range.start));
         }
@@ -1526,6 +1853,18 @@ fn parse_compound(
 mod tests {
     use super::*;
     #[test]
+    fn equation_rows_never_drop_the_tokens_after_a_closed_row() {
+        // A `;` closes a row whose value is not a proof; what follows is refused (the pin
+        // reports an unexpected token there), never dropped.
+        assert!(
+            parse_definition("def g1 : Nat → Nat\n  | 0 => 0; 1\n  | _ => 1".as_bytes()).is_err()
+        );
+        // After a `by` anywhere in the row, the `;` is the tactic sequence's.
+        let source = "def cs3 : Nat → Nat\n  | 0 => 0\n  | n + 1 =>\n    calc\n      n + 1 = n + 1 := by skip; rfl\n";
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    }
+    #[test]
     fn matches_preserve_all_original_token_leaves() {
         for text in [
             "def f (b : Bool) : Nat := match b with | true => 1 | false => 0",
@@ -1555,10 +1894,11 @@ mod tests {
             "def f := match b with | true 1",
             "def f := match b, c with | true => 1",
             "def f := match b with | true => 1\n  | false => 0",
-            "def f := match b with | .some (x : Nat) => x",
         ] {
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
+        // An ascribed pattern is the pin's `Term.typeAscription`.
+        assert!(parse_definition(b"def f := match b with | .some (x : Nat) => x").is_ok());
     }
     #[test]
     fn deeply_nested_matches_parse_without_host_recursion() {

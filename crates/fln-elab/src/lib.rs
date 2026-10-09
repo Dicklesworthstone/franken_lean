@@ -1030,6 +1030,8 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
             (">>=", "Bind.bind"),
             ("⊕", "Sum"),
             ("•", "HSMul.hSMul"),
+            ("≍", "HEq"),
+            ("≈", "HasEquiv.Equiv"),
         ] {
             if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
                 return Some(BoundedInfixIntrinsic::Fixed {
@@ -1067,6 +1069,13 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
                     intrinsic: Name::from_components(["List", constant]),
                 });
             }
+        }
+        // `infixl:33 " ^^ " => xor` in namespace `Bool` (`Init/Data/Bool.lean`).
+        if kind == &Name::str(Name::from_components(["Bool"]), "term_^^_") {
+            return Some(BoundedInfixIntrinsic::Fixed {
+                spelling: "^^",
+                intrinsic: Name::from_components(["Bool", "xor"]),
+            });
         }
         for (spelling, negated) in [("∈", false), ("∉", true)] {
             if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {

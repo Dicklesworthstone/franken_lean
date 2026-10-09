@@ -113,9 +113,17 @@ fn unused_helpers_keep_invalid_domains_and_result_annotations_as_obligations() {
 
 #[test]
 fn local_helpers_can_contain_nested_helpers_and_proof_bodies() {
+    // The local proof is parenthesized: `:= by rfl; reflexive n` hands `; reflexive n` to the
+    // `by` block, as the pin does ("unknown tactic"), and is refused.
     checked(
         &engine(),
-        "def outer (n : Nat) : Nat := let f (x : Nat) : Nat := let g (y : Nat) : Nat := n + x + y; g 2; f 3\ntheorem result : outer 37 = 42 := by rfl\ntheorem proof (n : Nat) : n = n := let reflexive (x : Nat) : x = x := by rfl; reflexive n",
+        "def outer (n : Nat) : Nat := let f (x : Nat) : Nat := let g (y : Nat) : Nat := n + x + y; g 2; f 3\ntheorem result : outer 37 = 42 := by rfl\ntheorem proof (n : Nat) : n = n := let reflexive (x : Nat) : x = x := (by rfl); reflexive n",
+    );
+    assert!(
+        fln_parse::parse_definition(
+            b"theorem proof (n : Nat) : n = n := let reflexive (x : Nat) : x = x := by rfl; reflexive n"
+        )
+        .is_err()
     );
 }
 

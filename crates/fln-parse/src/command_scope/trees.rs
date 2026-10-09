@@ -51,6 +51,28 @@ fn scope_tree(
         ))
     };
     let node = |kind: &str, args: Vec<Syntax>| Syntax::node(parser_kind(&["Command", kind]), args);
+    // `variable`, `include` and `omit` may end at a top-level `in` before a command
+    // (`Command.in`); the head is read up to it.
+    let stop = if matches!(keyword.as_str(), "variable" | "include" | "omit") {
+        let mut depth = 0usize;
+        let mut stop = tokens.len();
+        for (at, token) in tokens.iter().enumerate().skip(1) {
+            if let TokenKind::Symbol(s) = &token.kind {
+                match crate::canonical_bracket(s.as_str()) {
+                    "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                    ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                    "in" if depth == 0 => {
+                        stop = at;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        stop
+    } else {
+        tokens.len()
+    };
     let tree = match keyword.as_str() {
         "namespace" if tokens.len() == 2 && ident(1) => {
             let leaves = leaves()?;
@@ -66,15 +88,37 @@ fn scope_tree(
             };
             node("end", vec![leaves.leaf(0)?, name])
         }
-        "universe" | "include" | "omit" if idents(1, tokens.len()) => {
+        "universe" | "include" if idents(1, stop) => {
             let leaves = leaves()?;
-            node(
-                keyword,
-                vec![leaves.leaf(0)?, names(&leaves, 1, tokens.len())?],
-            )
+            node(keyword, vec![leaves.leaf(0)?, names(&leaves, 1, stop)?])
+        }
+        // `"omit" (ident <|> Term.instBinder)+`.
+        "omit" => {
+            let Ok((groups, end)) =
+                crate::signature_binders(view, &tokens[..stop], 1, DefinitionGrammar::Scalar)
+            else {
+                return Ok(None);
+            };
+            if groups.is_empty()
+                || end != stop
+                || groups
+                    .iter()
+                    .any(|group| !matches!(group.kind, "bare" | "instBinder"))
+            {
+                return Ok(None);
+            }
+            let leaves = leaves()?;
+            let items = crate::bounded_binder_syntax(
+                &leaves,
+                view,
+                tokens,
+                groups,
+                DefinitionGrammar::Scalar,
+            )?;
+            node("omit", vec![leaves.leaf(0)?, null_node(items)])
         }
         "variable" => {
-            let Ok(binders) = variables::parse(view, tokens) else {
+            let Ok(binders) = variables::parse_until(view, tokens, stop) else {
                 return Ok(None);
             };
             let leaves = leaves()?;
@@ -91,6 +135,10 @@ fn scope_tree(
             return Ok(section(&leaves, tokens)?.map(|(tree, _)| tree));
         }
     };
+    if stop < tokens.len() {
+        let leaves = leaves()?;
+        return within(source, view, tokens, &leaves, tree, stop).map(Some);
+    }
     Ok(Some(tree))
 }
 
@@ -192,13 +240,33 @@ fn open(
     tokens: &[LexedToken],
 ) -> Result<Option<Syntax>, DefinitionParseError> {
     let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
-    let idents = |from: usize, to: usize| from < to && (from..to).all(ident);
     // The declaration ends at a top-level `in` (no `in` can occur inside an `openDecl`).
     let end = (1..tokens.len())
         .find(|&at| is(at, "in"))
         .unwrap_or(tokens.len());
     let leaves = Leaves::build(view.normalized(), tokens)?;
+    let Some(declaration) = open_declaration(&leaves, tokens, 1, end)? else {
+        return Ok(None);
+    };
+    let node = |kind: &str, args: Vec<Syntax>| Syntax::node(parser_kind(&["Command", kind]), args);
+    let command = node("open", vec![leaves.leaf(0)?, declaration]);
+    if end == tokens.len() {
+        return Ok(Some(command));
+    }
+    within(source, view, tokens, &leaves, command, end).map(Some)
+}
+
+/// `openDecl` over `tokens[start..end]`, the tokens after `open` (for the command and for the
+/// tactic `open … in`): `openHiding <|> openRenaming <|> openOnly <|> openSimple <|> openScoped`.
+pub(crate) fn open_declaration(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+) -> Result<Option<Syntax>, DefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+    let idents = |from: usize, to: usize| from < to && (from..to).all(ident);
     let names = |from: usize, to: usize| -> Result<Syntax, DefinitionParseError> {
         Ok(null_node(
             (from..to)
@@ -207,27 +275,37 @@ fn open(
         ))
     };
     let node = |kind: &str, args: Vec<Syntax>| Syntax::node(parser_kind(&["Command", kind]), args);
-    let declaration = if is(1, "scoped") && idents(2, end) {
-        node("openScoped", vec![leaves.leaf(1)?, names(2, end)?])
-    } else if ident(1) && is(2, "(") && end > 4 && is(end - 1, ")") && idents(3, end - 1) {
+    let (first, second, third) = (start, start + 1, start + 2);
+    Ok(Some(if is(first, "scoped") && idents(second, end) {
+        node("openScoped", vec![leaves.leaf(first)?, names(second, end)?])
+    } else if ident(first)
+        && is(second, "(")
+        && end > start + 3
+        && is(end - 1, ")")
+        && idents(third, end - 1)
+    {
         node(
             "openOnly",
             vec![
-                leaves.leaf(1)?,
-                leaves.leaf(2)?,
-                names(3, end - 1)?,
+                leaves.leaf(first)?,
+                leaves.leaf(second)?,
+                names(third, end - 1)?,
                 leaves.leaf(end - 1)?,
             ],
         )
-    } else if ident(1) && is(2, "hiding") && idents(3, end) {
+    } else if ident(first) && is(second, "hiding") && idents(third, end) {
         node(
             "openHiding",
-            vec![leaves.leaf(1)?, leaves.leaf(2)?, names(3, end)?],
+            vec![
+                leaves.leaf(first)?,
+                leaves.leaf(second)?,
+                names(third, end)?,
+            ],
         )
-    } else if ident(1) && is(2, "renaming") {
+    } else if ident(first) && is(second, "renaming") {
         // `sepBy1 openRenamingItem ", "`, `openRenamingItem := ident unicodeSymbol " → " " -> " ident`.
         let mut items = Vec::new();
-        let mut at = 3;
+        let mut at = third;
         loop {
             if !(ident(at) && (is(at + 1, "→") || is(at + 1, "->")) && ident(at + 2)) {
                 return Ok(None);
@@ -248,18 +326,13 @@ fn open(
         }
         node(
             "openRenaming",
-            vec![leaves.leaf(1)?, leaves.leaf(2)?, null_node(items)],
+            vec![leaves.leaf(first)?, leaves.leaf(second)?, null_node(items)],
         )
-    } else if idents(1, end) {
-        node("openSimple", vec![names(1, end)?])
+    } else if idents(first, end) {
+        node("openSimple", vec![names(first, end)?])
     } else {
         return Ok(None);
-    };
-    let command = node("open", vec![leaves.leaf(0)?, declaration]);
-    if end == tokens.len() {
-        return Ok(Some(command));
-    }
-    within(source, view, tokens, &leaves, command, end).map(Some)
+    }))
 }
 
 /// `set_option ident optionValue`, `optionValue := "true" <|> "false" <|> str <|> num` (each a

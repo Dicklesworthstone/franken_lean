@@ -538,6 +538,21 @@ fn index_proof(
         }
         _ => return Err(refusal()),
     };
+    // The proof is `term:max`: projections touching it (`(h).1`, `h.out`) are its own.
+    let touching =
+        |left: usize, right: usize| tokens[left].extent.end() == tokens[right].extent.start();
+    let mut end = end;
+    while end + 1 < limit
+        && matches!(&tokens[end].kind, TokenKind::Symbol(s) if s == ".")
+        && touching(end - 1, end)
+        && touching(end, end + 1)
+        && matches!(
+            &tokens[end + 1].kind,
+            TokenKind::Ident(_) | TokenKind::Literal(LiteralKind::Nat)
+        )
+    {
+        end += 2;
+    }
     let proof = nested_term(leaves, view, tokens, at..end)?;
     Ok((proof, end))
 }

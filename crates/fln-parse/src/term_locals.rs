@@ -15,11 +15,34 @@ pub(super) enum Prefix {
     /// `return e` outside `do` (`Term.termReturn`, `"return" (ppSpace term)?`): the keyword; its
     /// body, possibly empty, is the rest of the enclosing group.
     Return(usize),
+    /// A bounded range after an application's last argument (`f a lo...<hi`): the application's
+    /// head and earlier arguments. The range (`syntax:max`) takes only that argument on its left
+    /// and the rest of the group on its right, so the body is the range, `f a (lo...<hi)`.
+    RangeArgument(Vec<(Syntax, usize)>),
+    /// A range unbounded below, `*...b`, `*...<b` or `*...=b` (`syntax:max ("*..." term)`,
+    /// `Init/Data/Range/Polymorphic/PRange.lean`, namespace `Std`): the symbol and its kind's
+    /// last component (`term*..._`); the bound is the rest of the enclosing group.
+    StarRange(usize, &'static str),
 }
 impl From<term_binders::Prefix> for Prefix {
     fn from(value: term_binders::Prefix) -> Self {
         Self::Binders(Box::new(value))
     }
+}
+
+/// The application a [`Prefix::RangeArgument`] closes: its head and earlier arguments, then the
+/// range as the last argument.
+#[inline(never)]
+fn range_argument(mut head: Vec<(Syntax, usize)>, body: Syntax) -> (Syntax, usize) {
+    let start = head.first().map_or(0, |(_, at)| *at);
+    let function = head.remove(0).0;
+    let mut arguments: Vec<Syntax> = head.into_iter().map(|(term, _)| term).collect();
+    arguments.push(body);
+    let syntax = Syntax::node(
+        parser_kind(&["Term", "app"]),
+        vec![function, null_node(arguments)],
+    );
+    (syntax, start)
 }
 
 pub(super) struct Assertion {
@@ -272,9 +295,12 @@ impl Prefix {
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self {
             Prefix::Do(prefix) => prefix.jump_keyword(),
-            Prefix::Binders(_) | Prefix::Assertion(_) | Prefix::Nested(_) | Prefix::Return(_) => {
-                None
-            }
+            Prefix::Binders(_)
+            | Prefix::Assertion(_)
+            | Prefix::Nested(_)
+            | Prefix::Return(_)
+            | Prefix::RangeArgument(_)
+            | Prefix::StarRange(..) => None,
         }
     }
     pub(super) fn body(&self) -> bool {
@@ -282,14 +308,16 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
-            Self::Nested(_) | Self::Return(_) => true,
+            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => true,
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
-            Self::Nested(_) | Self::Return(_) => false,
+            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
+                false
+            }
             Self::Assertion(p) => match p.phase {
                 Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
@@ -321,7 +349,9 @@ impl Prefix {
                     .map(|(p, next)| (Self::Binders(Box::new(p)), next));
             }
             Self::Assertion(p) => p,
-            Self::Nested(_) | Self::Return(_) => return Err(refuse(view, tokens, at)),
+            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
+                return Err(refuse(view, tokens, at));
+            }
         };
         let mut next = at + 1;
         match p.phase {
@@ -373,12 +403,17 @@ impl Prefix {
             Self::Nested(arrow) => {
                 let syntax = Syntax::node(
                     parser_kind(&["Term", "nestedAction"]),
-                    vec![
-                        leaves.leaf(arrow)?,
-                        Syntax::node(parser_kind(&["Term", "doExpr"]), vec![body]),
-                    ],
+                    vec![leaves.leaf(arrow)?, super::term_do::arrow_element(body)],
                 );
                 return Ok((syntax, arrow));
+            }
+            Self::RangeArgument(head) => return Ok(range_argument(head, body)),
+            Self::StarRange(at, label) => {
+                let syntax = Syntax::node(
+                    Name::from_components(["Std", label]),
+                    vec![leaves.leaf(at)?, body],
+                );
+                return Ok((syntax, at));
             }
             Self::Return(keyword) => {
                 let syntax = Syntax::node(

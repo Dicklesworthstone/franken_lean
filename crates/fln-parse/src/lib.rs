@@ -254,12 +254,22 @@ struct ExplicitBinderTokens {
 struct LetBindingTokens {
     keyword: usize,
     recursive: Option<usize>,
+    /// `let rec @[attr] f …`: where the attribute list starts.
+    attributes: Option<usize>,
     name: usize,
     parameters: Vec<ExplicitBinderTokens>,
     explicit_type: Option<(usize, std::ops::Range<usize>)>,
     assignment: usize,
     value: std::ops::Range<usize>,
     separator: Option<usize>,
+    /// `letEqnsDecl := letIdLhs matchAlts`: `value` holds the alternatives from the first `|`.
+    equations: bool,
+    /// `letPatDecl := term optType " := " term`: the pattern (`let ⟨a, b⟩ := p`), where `name` is
+    /// its first token.
+    pattern: Option<std::ops::Range<usize>>,
+    /// A `let rec` declaration's `Termination.suffix` (`termination_by …`, `decreasing_by …`),
+    /// which ends `value`.
+    termination: Option<std::ops::Range<usize>>,
 }
 
 struct BoundedTermFrame {
@@ -347,6 +357,27 @@ enum BoundedInfix {
     ListIsPrefix,
     ListIsSuffix,
     ListIsInfix,
+    /// `infixl:33 " ^^ " => xor`, declared in namespace `Bool` (`Init/Data/Bool.lean`): its kind is
+    /// `Bool.«term_^^_»`.
+    BoolXor,
+    /// `syntax:60 term:60 " <*> " term:61 : term`, and `" <* "`, `" *> "` (`Init/Notation.lean`).
+    Seq,
+    SeqLeft,
+    SeqRight,
+    /// `infix:50 " ≍ " => HEq` (`Init/Notation.lean`).
+    HEq,
+    /// `syntax:20 term:21 " <|> " term:20 : term` (`Init/Notation.lean`).
+    OrElse,
+    /// `infix:50 " ≈ " => HasEquiv.Equiv` (`Init/Core.lean`).
+    Equiv,
+    /// `syntax:50 term:51 " matches " sepBy1(term:51, " | ") : term` (`Lean.«term_Matches_|»`,
+    /// `Init/Notation.lean`), and the `|` between its patterns, which is an operator only while
+    /// a `matches` waits for its patterns.
+    Matches,
+    MatchesBar,
+    /// `syntax:min term atomic(" $" ws) term:min : term` (`«term_$__»`, `Init/Notation.lean`),
+    /// `<|`'s alternative spelling: a space follows the `$`.
+    Dollar,
     /// The bounded ranges `a...<b`, `a...b`, `a...=b`, `a<...<b`, `a<...b` and `a<...=b`
     /// (`syntax:max (term "...<" term) : term`, `Init/Data/Range/Polymorphic/PRange.lean`,
     /// declared in namespace `Std`): the bound after the symbol is a whole term.
@@ -421,8 +452,54 @@ impl BoundedInfix {
             Self::ListIsPrefix => "<+:",
             Self::ListIsSuffix => "<:+",
             Self::ListIsInfix => "<:+:",
+            Self::BoolXor => "^^",
+            Self::Seq => "<*>",
+            Self::SeqLeft => "<*",
+            Self::SeqRight => "*>",
+            Self::HEq => "≍",
+            Self::OrElse => "<|>",
+            Self::Equiv => "≈",
+            Self::Matches => "matches",
+            Self::MatchesBar => "|",
+            Self::Dollar => "$",
         }
     }
+    /// The bounded ranges are `syntax:max (term "...<" term)`: a trailing parser at `max`, so
+    /// it takes only the operand before it (`a ∈ lo...=hi` is `a ∈ (lo...=hi)`), and its right
+    /// side is a whole `term`, which no later operator ends.
+    const fn is_range(self) -> bool {
+        matches!(
+            self,
+            Self::RangeCo
+                | Self::RangeCoDots
+                | Self::RangeCc
+                | Self::RangeOo
+                | Self::RangeOoDots
+                | Self::RangeOc
+        )
+    }
+
+    /// The precedence this operator binds its left operand at.
+    const fn left_precedence(self) -> u16 {
+        match self {
+            _ if self.is_range() => 1024,
+            // `term:51 " matches "`; a `|` closes the pattern before it, never the `matches`.
+            Self::Matches => 51,
+            Self::MatchesBar => 52,
+            _ => self.precedence() as u16,
+        }
+    }
+
+    /// The precedence an operator waiting for its right operand holds against the next one.
+    const fn right_precedence(self) -> u16 {
+        match self {
+            _ if self.is_range() => 0,
+            // Each pattern is a `term:51`.
+            Self::Matches | Self::MatchesBar => 51,
+            _ => self.precedence() as u16,
+        }
+    }
+
     const fn precedence(self) -> u8 {
         match self {
             Self::Arrow => 25,
@@ -449,7 +526,7 @@ impl BoundedInfix {
             Self::Union => 65,
             Self::Inter | Self::SDiff => 70,
             Self::FunctorMap => 100,
-            Self::PipeLeft | Self::PipeRight => 10,
+            Self::PipeLeft | Self::PipeRight | Self::Dollar => 10,
             Self::PipeProj => 10,
             Self::Bind => 55,
             Self::Sum => 30,
@@ -461,6 +538,12 @@ impl BoundedInfix {
             | Self::RangeOoDots
             | Self::RangeOc => 10,
             Self::ListIsPrefix | Self::ListIsSuffix | Self::ListIsInfix => 50,
+            Self::BoolXor => 33,
+            Self::Seq | Self::SeqLeft | Self::SeqRight => 60,
+            Self::HEq => 50,
+            Self::OrElse => 20,
+            Self::Equiv | Self::Matches => 50,
+            Self::MatchesBar => 51,
         }
     }
 
@@ -482,8 +565,10 @@ impl BoundedInfix {
                 | Self::Comp
                 | Self::FunctorMap
                 | Self::PipeLeft
+                | Self::Dollar
                 | Self::Sum
                 | Self::SMul
+                | Self::OrElse
         )
     }
 
@@ -510,6 +595,8 @@ impl BoundedInfix {
                 | Self::RangeOo
                 | Self::RangeOoDots
                 | Self::RangeOc
+                | Self::HEq
+                | Self::Equiv
         )
     }
 
@@ -528,6 +615,8 @@ impl BoundedInfix {
                     format!("term_{}_", self.symbol()),
                 );
             }
+            Self::BoolXor => return Name::str(Name::from_components(["Bool"]), "term_^^_"),
+            Self::Dollar => return Name::str(Name::anonymous(), "term_$__"),
             Self::RangeCo
             | Self::RangeCoDots
             | Self::RangeCc
@@ -704,6 +793,37 @@ fn source_module_token_table() -> &'static TokenTable {
     reference_tokens::production_table()
 }
 
+/// Whether a bracketed binder at `index` may start a dependent arrow
+/// (`leading_parser:25 bracketedBinder " → " term`): not as an application's argument (after an
+/// operand, at `max`), and not as the operand of an operator that takes its right side above 25
+/// (`a ∈ [b] → c` is `(a ∈ [b]) → c`, with `[b]` a list).
+fn dependent_arrow_may_start(
+    tokens: &[LexedToken],
+    start: usize,
+    index: usize,
+    grammar: DefinitionGrammar,
+) -> bool {
+    if index == start {
+        return true;
+    }
+    let previous = &tokens[index - 1].kind;
+    match previous {
+        TokenKind::Ident(_) | TokenKind::Literal(_) => false,
+        TokenKind::Symbol(s)
+            if s == "_" || matches!(canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩") =>
+        {
+            false
+        }
+        _ => bounded_infix(Some(previous), grammar).is_none_or(|operator| {
+            if operator.is_right_associative() {
+                operator.precedence() <= 25
+            } else {
+                operator.precedence() < 25
+            }
+        }),
+    }
+}
+
 fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option<BoundedInfix> {
     let Some(TokenKind::Symbol(symbol)) = kind else {
         return None;
@@ -769,6 +889,15 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "<+:" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ListIsPrefix),
         "<:+" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ListIsSuffix),
         "<:+:" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ListIsInfix),
+        "^^" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::BoolXor),
+        "<*>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Seq),
+        "<*" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SeqLeft),
+        "*>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SeqRight),
+        "≍" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::HEq),
+        "<|>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::OrElse),
+        "≈" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equiv),
+        "matches" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Matches),
+        "$" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Dollar),
         _ => None,
     }
 }
@@ -899,10 +1028,27 @@ fn find_let_separator(
 ) -> Option<(usize, Option<usize>, usize)> {
     let mut delimiters = Vec::new();
     let mut nested_lets = Vec::new();
+    // After a `do`, `by` or `decreasing_by` in the value, every `;` is that block's: only a line
+    // ends the value.
+    let mut block = false;
     for (index, token) in tokens.iter().enumerate().skip(from) {
         if delimiters.is_empty() {
             if local_line_break(view, tokens, keyword, from, index) {
                 return Some((index, None, index));
+            }
+            if term_locals::word(tokens, index, "do")
+                || term_locals::word(tokens, index, "by")
+                || term_locals::word(tokens, index, "decreasing_by")
+            {
+                block = true;
+            }
+            // A token no tactic or statement sequence continues with ends that block: the next
+            // match alternative or conditional branch (`| .zero => by rfl | .succ j => (by rfl);`).
+            if term_locals::word(tokens, index, "|")
+                || term_locals::word(tokens, index, "then")
+                || term_locals::word(tokens, index, "else")
+            {
+                block = false;
             }
             while nested_lets
                 .last()
@@ -934,7 +1080,7 @@ fn find_let_separator(
                     }
                 }
                 "let" if delimiters.is_empty() => nested_lets.push(index),
-                ";" if delimiters.is_empty() => {
+                ";" if delimiters.is_empty() && !block => {
                     if nested_lets.is_empty() {
                         return Some((index, Some(index), index + 1));
                     }
@@ -1067,18 +1213,50 @@ fn bounded_let_bindings(
     ) {
         let keyword = body_start;
         let recursive = term_locals::word(tokens, keyword + 1, "rec").then_some(keyword + 1);
-        let name = keyword + 1 + usize::from(recursive.is_some());
-        if !matches!(
-            tokens.get(name).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        ) {
+        let after_keyword = keyword + 1 + usize::from(recursive.is_some());
+        // `letRecDecl`'s attributes (`let rec @[specialize] loop …`).
+        let attributes = (recursive.is_some()
+            && matches!(tokens.get(after_keyword).map(|t| &t.kind),
+                Some(TokenKind::Symbol(s)) if s == "@["))
+        .then_some(after_keyword);
+        let name = match attributes {
+            Some(at) => command_scope::attributes::inline_end(view, tokens, at)?,
+            None => after_keyword,
+        };
+        // `let ⟨a, b⟩ := p` / `let (a, b) := p`: a pattern up to its `:=` (or its type's `:`).
+        let pattern = (recursive.is_none()
+            && matches!(tokens.get(name).map(|t| &t.kind),
+                Some(TokenKind::Symbol(s)) if s == "⟨" || s == "("))
+        .then(|| {
+            let mut depth = 0usize;
+            for (at, token) in tokens.iter().enumerate().skip(name) {
+                if let TokenKind::Symbol(s) = &token.kind {
+                    match canonical_bracket(s.as_str()) {
+                        "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                        ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                        ":=" | ":" if depth == 0 => return Some(name..at),
+                        _ => {}
+                    }
+                }
+            }
+            None
+        })
+        .flatten();
+        if pattern.is_none()
+            && !matches!(
+                tokens.get(name).map(|token| &token.kind),
+                Some(TokenKind::Ident(_))
+            )
+        {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, name),
                 expected: NatDefinitionExpectation::LocalIdentifier,
             });
         }
-        let (parameters, mut declaration_cursor) =
-            bounded_binders(view, tokens, name + 1, DefinitionGrammar::Scalar)?;
+        let (parameters, mut declaration_cursor) = match &pattern {
+            Some(range) => (Vec::new(), range.end),
+            None => signature_binders(view, tokens, name + 1, DefinitionGrammar::Scalar)?,
+        };
         let explicit_type = if matches!(
             tokens.get(declaration_cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":"
@@ -1087,21 +1265,37 @@ fn bounded_let_bindings(
             declaration_cursor += 1;
             let start = declaration_cursor;
             declaration_cursor = type_end(tokens, start, ":=");
+            // A local defined by equations ends its type at the first alternative's `|`, unless
+            // a `match` in the type owns it.
+            let pipe = type_end(tokens, start, "|");
+            if !top_level_match(tokens, start, pipe) {
+                declaration_cursor = declaration_cursor.min(pipe);
+            }
             Some((colon, start..declaration_cursor))
         } else {
             None
         };
         let assignment = declaration_cursor;
-        if !matches!(
+        let equations = matches!(
             tokens.get(assignment).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == ":="
-        ) {
+            Some(TokenKind::Symbol(symbol)) if symbol == "|"
+        );
+        if !equations
+            && !matches!(
+                tokens.get(assignment).map(|token| &token.kind),
+                Some(TokenKind::Symbol(symbol)) if symbol == ":="
+            )
+        {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, assignment),
                 expected: NatDefinitionExpectation::LocalAssignment,
             });
         }
-        let value_start = assignment + 1;
+        let value_start = if equations {
+            assignment
+        } else {
+            assignment + 1
+        };
         let Some((value_end, separator, next)) =
             find_let_separator(view, tokens, keyword, value_start)
         else {
@@ -1110,19 +1304,21 @@ fn bounded_let_bindings(
                 expected: NatDefinitionExpectation::LetSeparator,
             });
         };
+        let mut value_end = value_end;
+        let mut termination = None;
         if recursive.is_some() {
+            // `letRecDecl`'s `Termination.suffix`: a `termination_by` or `decreasing_by` at depth 0
+            // ends the value. The fixpoint annotations are not read.
+            if let Some(at) = termination_start(tokens, value_start, value_end) {
+                termination = Some(at..value_end);
+                value_end = at;
+            }
             let mut depth = 0usize;
             for at in value_start..value_end {
                 if depth == 0
-                    && [
-                        "termination_by",
-                        "decreasing_by",
-                        "partial_fixpoint",
-                        "coinductive_fixpoint",
-                        "inductive_fixpoint",
-                    ]
-                    .iter()
-                    .any(|word| term_locals::word(tokens, at, word))
+                    && ["partial_fixpoint", "coinductive_fixpoint", "inductive_fixpoint"]
+                        .iter()
+                        .any(|word| term_locals::word(tokens, at, word))
                 {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, at),
@@ -1141,12 +1337,16 @@ fn bounded_let_bindings(
         let_bindings.push(LetBindingTokens {
             keyword,
             recursive,
+            attributes,
             name,
             parameters,
             explicit_type,
             assignment,
             value: value_start..value_end,
             separator,
+            equations: equations && pattern.is_none(),
+            pattern,
+            termination,
         });
         body_start = next;
     }
@@ -1191,7 +1391,11 @@ fn bounded_value_syntax_to(
                 expected: NatDefinitionExpectation::LocalAssignment,
             });
         }
-        let local_value = bounded_term(leaves, view, tokens, binding.value, grammar)?;
+        let local_value = if binding.equations {
+            matching::declaration_equations(leaves, view, tokens, binding.value.clone(), grammar)?
+        } else {
+            bounded_term(leaves, view, tokens, binding.value.clone(), grammar)?
+        };
         let explicit_type = match binding.explicit_type {
             Some((colon, type_range)) => null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
@@ -1206,27 +1410,56 @@ fn bounded_value_syntax_to(
             parser_kind(&["Term", "letId"]),
             vec![leaves.leaf(binding.name)?],
         );
-        let local_declaration = Syntax::node(
-            parser_kind(&["Term", "letIdDecl"]),
-            vec![
-                local_id,
-                null_node(bounded_binder_syntax(
-                    leaves,
-                    view,
-                    tokens,
-                    binding.parameters,
-                    grammar,
-                )?),
-                explicit_type,
-                leaves.leaf(binding.assignment)?,
-                local_value,
-            ],
-        );
+        let binders = null_node(bounded_binder_syntax(
+            leaves,
+            view,
+            tokens,
+            binding.parameters,
+            grammar,
+        )?);
+        let local_declaration = if let Some(pattern) = binding.pattern.clone() {
+            Syntax::node(
+                parser_kind(&["Term", "letPatDecl"]),
+                vec![
+                    bounded_term(leaves, view, tokens, pattern, grammar)?,
+                    null_node(Vec::new()),
+                    explicit_type,
+                    leaves.leaf(binding.assignment)?,
+                    local_value,
+                ],
+            )
+        } else if binding.equations {
+            Syntax::node(
+                parser_kind(&["Term", "letEqnsDecl"]),
+                vec![local_id, binders, explicit_type, local_value],
+            )
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "letIdDecl"]),
+                vec![
+                    local_id,
+                    binders,
+                    explicit_type,
+                    leaves.leaf(binding.assignment)?,
+                    local_value,
+                ],
+            )
+        };
+        let attributes = match binding.attributes {
+            Some(at) => command_scope::attributes::inline_syntax(view, leaves, tokens, at)?,
+            None => null_node(vec![]),
+        };
+        let termination = match binding.termination.clone() {
+            Some(range) => termination_suffix(leaves, view, tokens, range)?,
+            None => empty_termination_suffix(),
+        };
         value = local_binding_syntax(
             leaves,
             binding.keyword,
             binding.recursive,
+            attributes,
             local_declaration,
+            termination,
             binding.separator,
             value,
         )?;
@@ -1234,14 +1467,25 @@ fn bounded_value_syntax_to(
     Ok(value)
 }
 
+/// `Termination.suffix` with neither clause.
+fn empty_termination_suffix() -> Syntax {
+    Syntax::node(
+        parser_kind(&["Termination", "suffix"]),
+        vec![null_node(vec![]), null_node(vec![])],
+    )
+}
+
 /// Share the pinned let/letrec wrappers between top-level and nested lets.
 /// A recursive group currently contains one declaration; commas are not erased
 /// or interpreted as an ordinary let. Every keyword retains its original span.
+#[allow(clippy::too_many_arguments)]
 fn local_binding_syntax(
     leaves: &Leaves,
     keyword: usize,
     recursive: Option<usize>,
+    attributes: Syntax,
     declaration: Syntax,
+    termination: Syntax,
     separator: Option<usize>,
     body: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
@@ -1259,18 +1503,19 @@ fn local_binding_syntax(
             parser_kind(&["Term", "letRecDecl"]),
             vec![
                 null_node(vec![]),
-                null_node(vec![]),
+                attributes,
                 declaration,
-                Syntax::node(
-                    parser_kind(&["Termination", "suffix"]),
-                    vec![null_node(vec![]), null_node(vec![])],
-                ),
+                termination,
             ],
         );
         Ok(Syntax::node(
             parser_kind(&["Term", "letrec"]),
             vec![
-                null_node(vec![leaves.leaf(keyword)?, rec_atom]),
+                // `group("let " nonReservedSymbol "rec ")`.
+                Syntax::node(
+                    Name::str(Name::anonymous(), "group"),
+                    vec![leaves.leaf(keyword)?, rec_atom],
+                ),
                 Syntax::node(
                     parser_kind(&["Term", "letRecDecls"]),
                     vec![null_node(vec![declaration])],
@@ -1333,13 +1578,17 @@ fn finish_bounded_application(
                 continue;
             }
             let prefix = match &term {
-                Syntax::Atom { val, .. } if val == "@" => Some("explicit"),
-                Syntax::Atom { val, .. } if val == "inferInstanceAs" => Some("inferInstanceAs"),
+                Syntax::Atom { val, .. } if val == "@" => Some(parser_kind(&["Term", "explicit"])),
+                Syntax::Atom { val, .. } if val == "inferInstanceAs" => {
+                    Some(parser_kind(&["Term", "inferInstanceAs"]))
+                }
                 // `"no_index" term:max` (`Term.noindex`, `Lean/Parser/Term.lean`).
-                Syntax::Atom { val, .. } if val == "no_index" => Some("noindex"),
+                Syntax::Atom { val, .. } if val == "no_index" => Some(parser_kind(&["Term", "noindex"])),
                 // `"panic! " (interpolatedStr(term) <|> term)` (`Term.panic`); an interpolated
                 // message is not read.
-                Syntax::Atom { val, .. } if val == "panic!" => Some("panic"),
+                Syntax::Atom { val, .. } if val == "panic!" => Some(parser_kind(&["Term", "panic"])),
+                // `syntax:max "↑" term:max : term` (`coeNotation`, `Init/Coe.lean`), at the root.
+                Syntax::Atom { val, .. } if val == "↑" => Some(Name::from_components(["coeNotation"])),
                 _ => None,
             };
             if let Some(kind) = prefix {
@@ -1349,10 +1598,7 @@ fn finish_bounded_application(
                         expected: grammar.value_expectation(),
                     });
                 };
-                explicit.push((
-                    Syntax::node(parser_kind(&["Term", kind]), vec![term, head]),
-                    at,
-                ));
+                explicit.push((Syntax::node(kind, vec![term, head]), at));
             } else {
                 explicit.push((term, at));
             }
@@ -1369,8 +1615,14 @@ fn finish_bounded_application(
     if terms.len() == 1 {
         return Ok(terms.pop().expect("the nonempty term has one member").0);
     }
-    // `.c a b` and `[1, 2].map f`: a dotted identifier or a projection heads an application.
-    if !(grammar == DefinitionGrammar::Scalar && dotted_head(&terms))
+    // `.c a b` and `[1, 2].map f`: a dotted identifier or a projection heads an application, and
+    // so does `·` right after a parenthesis (`(· trivial)`, the function applying its argument to
+    // `trivial`). Elsewhere a `. x` is more likely a notation the token table lacks (`a /. b`,
+    // scoped), so it stays refused.
+    let cdot_head = terms[0].0.kind() == Some(&parser_kind(&["Term", "cdot"]))
+        && terms[0].1 > 0
+        && matches!(&tokens[terms[0].1 - 1].kind, TokenKind::Symbol(s) if s == "(");
+    if !(grammar == DefinitionGrammar::Scalar && (dotted_head(&terms) || cdot_head))
         && !matches!(
             tokens.get(*first_index).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
@@ -1417,7 +1669,9 @@ fn reduce_bounded_infix(
             expected: grammar.value_expectation(),
         });
     };
-    let node = if operator.operator == BoundedInfix::PipeProj {
+    let node = if matches!(operator.operator, BoundedInfix::Matches | BoundedInfix::MatchesBar) {
+        matches_node(operator, left, right)
+    } else if operator.operator == BoundedInfix::PipeProj {
         let (field, arguments) = match &right {
             Syntax::Node { kind, args, .. }
                 if *kind == parser_kind(&["Term", "app"]) && args.len() == 2 =>
@@ -1490,6 +1744,33 @@ fn reduce_bounded_infix(
     };
     frame.operands.push((node, left_at));
     Ok(())
+}
+
+/// The pattern list `p | q | …` of a `matches` while it is read, right-nested by its `|`s.
+const MATCHES_PATTERNS: &str = "«fln matches patterns»";
+
+/// `e matches p | q`: a `|` joins two patterns into the list, flattening the list on its right;
+/// `matches` builds `Lean.«term_Matches_|»` with that list (or its one pattern) as `sepBy1`'s node.
+#[inline(never)]
+fn matches_node(operator: BoundedInfixToken, left: Syntax, right: Syntax) -> Syntax {
+    let patterns = |syntax: Syntax| -> Vec<Syntax> {
+        if let Syntax::Node { kind, args, .. } = &syntax
+            && *kind == Name::from_components([MATCHES_PATTERNS])
+        {
+            return args.clone();
+        }
+        vec![syntax]
+    };
+    if operator.operator == BoundedInfix::MatchesBar {
+        let mut items = vec![left, operator.syntax];
+        items.extend(patterns(right));
+        Syntax::node(Name::from_components([MATCHES_PATTERNS]), items)
+    } else {
+        Syntax::node(
+            Name::from_components(["Lean", "term_Matches_|"]),
+            vec![left, operator.syntax, null_node(patterns(right))],
+        )
+    }
 }
 
 /// `(a b : α) × β` is the pin's dependent pair, `macro:35 xs:bracketedExplicitBinders " × "
@@ -1616,6 +1897,17 @@ fn push_bounded_infix(
     index: usize,
     syntax: Syntax,
 ) -> Result<(), NatDefinitionParseError> {
+    // `atomic(" $" ws)`: a `$` touching the next token is an antiquotation, not `<|`'s spelling.
+    if operator == BoundedInfix::Dollar
+        && tokens
+            .get(index + 1)
+            .is_none_or(|next| tokens[index].extent.end() == next.extent.start())
+    {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::EndOfCommand,
+        });
+    }
     // `inferInstanceAs <| T` (`"inferInstanceAs" ("$" <|> "<|") term:minPrec`): the keyword is
     // the left operand alone, and `reduce_bounded_infix` builds its node.
     if operator == BoundedInfix::PipeLeft
@@ -1625,17 +1917,25 @@ fn push_bounded_infix(
         let keyword = frame.application.pop().expect("the lone keyword");
         frame.operands.push(keyword);
     } else {
+        // A range after an application takes only its last argument at the pin
+        // (`f x...=y` is `f (x...=y)`); that tree is not built here, so it is refused.
+        if operator.is_range() && frame.application.len() > 1 {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, index),
+                expected: NatDefinitionExpectation::EndOfCommand,
+            });
+        }
         push_bounded_operand(view, tokens, frame, grammar, index)?;
     }
     while frame
         .operators
         .last()
-        .is_some_and(|previous| previous.operator.precedence() > operator.precedence())
+        .is_some_and(|previous| previous.operator.right_precedence() > operator.left_precedence())
     {
         reduce_bounded_infix(view, tokens, frame, grammar)?;
     }
     if frame.operators.last().is_some_and(|previous| {
-        previous.operator.precedence() == operator.precedence()
+        previous.operator.right_precedence() == operator.left_precedence()
             && (previous.operator.is_non_associative() || operator.is_non_associative())
     }) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -1643,8 +1943,13 @@ fn push_bounded_infix(
             expected: NatDefinitionExpectation::EndOfCommand,
         });
     }
+    // At equal precedence the previous operator's right operand decides: a left-associative
+    // one reads `term:p+1` there, so this operator cannot continue it (`a |> f <| x` is
+    // `(a |> f) <| x`); a right-associative one reads `term:p`, so this operator nests inside
+    // it (`a <| b |> c` is `a <| (b |> c)`).
     while frame.operators.last().is_some_and(|previous| {
-        previous.operator.precedence() == operator.precedence() && !operator.is_right_associative()
+        previous.operator.right_precedence() == operator.left_precedence()
+            && !previous.operator.is_right_associative()
     }) {
         reduce_bounded_infix(view, tokens, frame, grammar)?;
     }
@@ -2028,6 +2333,119 @@ fn push_postfix(
     Ok(())
 }
 
+/// `a...*` or `a<...*` (`syntax:max (term "...*") : term`, namespace `Std`) at `index`: the
+/// argument before it is the range's lower bound.
+#[inline(never)]
+fn push_range_postfix(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    leaves: &Leaves,
+    frames: &mut [BoundedTermFrame],
+    index: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let frame = frames.last_mut().expect("an application frame");
+    let Some((operand, at)) = frame.application.pop() else {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::ScalarValue,
+        });
+    };
+    let label = if matches!(&tokens[index].kind, TokenKind::Symbol(s) if s == "...*") {
+        "term_...*"
+    } else {
+        "term_<...*"
+    };
+    frame.application.push((
+        Syntax::node(
+            Name::from_components(["Std", label]),
+            vec![operand, leaves.leaf(index)?],
+        ),
+        at,
+    ));
+    Ok(())
+}
+
+/// `nomatch e, …` (`Term.nomatch`) at `index`: its discriminants run to the first bracket that
+/// closes outside it, or to `limit`, split at commas outside brackets. Returns where it ends.
+#[inline(never)]
+fn push_nomatch(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    leaves: &Leaves,
+    frames: &mut [BoundedTermFrame],
+    index: usize,
+    limit: usize,
+) -> Result<usize, NatDefinitionParseError> {
+    let mut depth = 0usize;
+    let mut end = limit;
+    let mut commas = Vec::new();
+    for (at, token) in tokens.iter().enumerate().take(limit).skip(index + 1) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    if depth == 0 {
+                        end = at;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                "," if depth == 0 => commas.push(at),
+                _ => {}
+            }
+        }
+    }
+    let mut items = Vec::new();
+    let mut start = index + 1;
+    for at in commas.iter().copied().chain(std::iter::once(end)) {
+        if at == start {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, at),
+                expected: NatDefinitionExpectation::ScalarValue,
+            });
+        }
+        items.push(nested_term(leaves, view, tokens, start..at)?);
+        if at < end {
+            items.push(leaves.leaf(at)?);
+        }
+        start = at + 1;
+    }
+    frames
+        .last_mut()
+        .expect("root term frame")
+        .application
+        .push((
+            Syntax::node(
+                parser_kind(&["Term", "nomatch"]),
+                vec![leaves.leaf(index)?, null_node(items)],
+            ),
+            index,
+        ));
+    Ok(end)
+}
+
+/// The first `deriving` at bracket depth 0 from `from` that is not `deriving instance`.
+fn deriving_start(tokens: &[LexedToken], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().skip(from) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                "deriving"
+                    if depth == 0
+                        && !matches!(tokens.get(at + 1).map(|t| &t.kind),
+                            Some(TokenKind::Symbol(next)) if next == "instance") =>
+                {
+                    return Some(at);
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// The first `termination_by` or `decreasing_by` at bracket depth 0 in `tokens[from..to]`.
 fn termination_start(tokens: &[LexedToken], from: usize, to: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -2225,6 +2643,37 @@ fn bounded_do_sequence_spliced(
     updates: &std::collections::HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     bounded_term_frames(leaves, view, tokens, range, grammar, splices, updates, true)
+}
+
+/// A range after an application takes its last argument (`f a lo...<hi` is `f a (lo...<hi)`): the
+/// head moves to a frame of its own, which gets the range back as its last argument when the group
+/// ends. Only a plain head (an identifier, no `@`/`@&` marker atoms) moves; any other stays
+/// refused in `push_bounded_infix`.
+#[inline(never)]
+fn split_range_argument(tokens: &[LexedToken], frames: &mut Vec<BoundedTermFrame>) {
+    let movable = frames.last().is_some_and(|frame| {
+        frame.application.len() > 1
+            && matches!(
+                tokens.get(frame.application[0].1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            )
+            && !frame
+                .application
+                .iter()
+                .any(|(term, _)| matches!(term, Syntax::Atom { .. }))
+    });
+    if !movable {
+        return;
+    }
+    let frame = frames.last_mut().expect("the root term frame remains live");
+    let last = frame.application.pop().expect("an argument");
+    let head = std::mem::take(&mut frame.application);
+    frames.push(term_binders::frame(term_locals::Prefix::RangeArgument(head)));
+    frames
+        .last_mut()
+        .expect("the range frame")
+        .application
+        .push(last);
 }
 
 // Source construction is not part of the term driver's live parsing state.
@@ -2425,7 +2874,7 @@ fn dot_term(
         && tokens[index].extent.end() == tokens[cursor].extent.start()
         && matches!(&tokens[cursor].kind, TokenKind::Literal(LiteralKind::Nat))
     {
-        let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
+        let (receiver, start) = projection_receiver(view, tokens, frame, index)?.ok_or_else(refusal)?;
         frame.application.push((
             Syntax::node(
                 parser_kind(&["Term", "proj"]),
@@ -2466,7 +2915,7 @@ fn dot_term(
         ));
         return Ok(true);
     }
-    let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
+    let (receiver, start) = projection_receiver(view, tokens, frame, index)?.ok_or_else(refusal)?;
     frame.application.push((
         Syntax::node(
             parser_kind(&["Term", "proj"]),
@@ -2475,6 +2924,30 @@ fn dot_term(
         start,
     ));
     Ok(true)
+}
+
+/// What a projection touching the last application item projects: that item, or, after a named
+/// argument (which is no term a trailing parser extends), the whole application
+/// (`f (l := l).1 H` is `(f (l := l)).1 H` at the pin).
+#[inline(never)]
+fn projection_receiver(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frame: &mut BoundedTermFrame,
+    index: usize,
+) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
+    let named = frame.application.len() > 1
+        && frame.application.last().is_some_and(|(item, _)| {
+            item.kind() == Some(&parser_kind(&["Term", "namedArgument"]))
+        });
+    if !named {
+        return Ok(frame.application.pop());
+    }
+    let items = std::mem::take(&mut frame.application);
+    let start = items[0].1;
+    let application =
+        finish_bounded_application(view, tokens, items, DefinitionGrammar::Scalar, index)?;
+    Ok(Some((application, start)))
 }
 
 /// The pin reads a projection's field index with `fieldIdx`, digits only, rather than
@@ -2541,539 +3014,17 @@ fn bounded_term_frames(
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
-        if grammar == DefinitionGrammar::Scalar
-            && record_terms::layout(view, tokens, &frames, index)
-        {
-            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index, true)?;
-            cursor = record_terms::line_break(leaves, view, tokens, &mut frames, index, range.end)?;
-            continue;
-        }
-        if grammar == DefinitionGrammar::Scalar
-            && let Some(ends) = term_do::layout(view, tokens, &frames, index)
-        {
-            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index, false)?;
-            let mut frame = frames.pop().expect("waiting do frame");
-            let prefix = frame.prefix.take().expect("waiting do prefix");
-            let value = if matches!(&prefix, term_locals::Prefix::Do(p) if p.done()) {
-                null_node(vec![])
-            } else {
-                finish_bounded_frame(view, tokens, frame, grammar, index)?
-            };
-            if ends {
-                let (syntax, start) = prefix.finish(leaves, value)?;
-                frames
-                    .last_mut()
-                    .expect("do parent")
-                    .application
-                    .push((syntax, start));
-                cursor = index;
-            } else {
-                let (prefix, next) =
-                    prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
-                frames.push(term_binders::frame(prefix));
-                cursor = next;
-            }
-            continue;
-        }
-        if grammar == DefinitionGrammar::Scalar
-            && term_locals::layout_boundary(view, tokens, &frames, index)
-        {
-            finish_lambda_frames(
-                leaves,
-                view,
-                tokens,
-                &mut frames,
-                grammar,
-                index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
-            )?;
-            let mut frame = frames.pop().expect("waiting assertion value frame");
-            let prefix = frame.prefix.take().expect("waiting assertion prefix");
-            let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-            let (prefix, next) =
-                prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
-            frames.push(term_binders::frame(prefix));
+        if let Some(next) = bounded_term_layout(
+            leaves, view, tokens, &range, grammar, splices, &arrows, &mut lists, &mut frames, index,
+            cursor,
+        )? {
             cursor = next;
             continue;
         }
-        if let Some((end, syntax)) = splices.remove(&index) {
-            if end > range.end {
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(view, tokens, index),
-                    expected: NatDefinitionExpectation::MatchAlternative,
-                });
-            }
-            frames
-                .last_mut()
-                .expect("root term frame")
-                .application
-                .push((syntax, index));
-            cursor = end;
-            continue;
-        }
-        if grammar == DefinitionGrammar::Scalar
-            && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
-                if matches!(crate::canonical_bracket(s.as_str()), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
-                || term_locals::word(tokens, index, "from")
-                || frames
-                    .last()
-                    .and_then(|frame| frame.prefix.as_ref())
-                    .is_some_and(|prefix| prefix.closes_header(tokens, index)))
-        {
-            finish_lambda_frames(
-                leaves,
-                view,
-                tokens,
-                &mut frames,
-                grammar,
-                index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
-            )?;
-            if let Some(mut frame) = frames.pop_if(|frame| {
-                frame
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|prefix| prefix.closes_header(tokens, index))
-            }) {
-                let prefix = frame.prefix.take().expect("binder annotation prefix");
-                let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                let (prefix, end) =
-                    prefix.finish_header(leaves, view, tokens, index, domain, range.end)?;
-                frames.push(term_binders::frame(prefix));
-                cursor = end;
-                continue;
-            }
-        }
-        if grammar == DefinitionGrammar::Scalar && arrows.contains(&index) {
-            let prefix =
-                term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
-            frames.push(term_binders::frame(prefix));
-            continue;
-        }
-        if grammar == DefinitionGrammar::Scalar
-            && !lists.current(&frames)
-            && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == ",")
-            && lists.open_tuple(leaves, view, tokens, &mut frames, index)?
-        {
-            continue;
-        }
-        if grammar == DefinitionGrammar::Scalar
-            && lists.current(&frames)
-            && matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
-                if lists.delimits(symbol))
-        {
-            cursor = lists.delimiter(leaves, view, tokens, &mut frames, index, range.end)?;
-            continue;
-        }
-        match tokens.get(index).map(|token| &token.kind) {
-            _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
-                let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
-                frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
-                    prefix,
-                ))));
-            }
-            _ if grammar == DefinitionGrammar::Scalar
-                && (term_locals::word(tokens, index, "let")
-                    || term_locals::word(tokens, index, "have")
-                    || term_locals::word(tokens, index, "letI")
-                    || term_locals::word(tokens, index, "haveI")
-                    || term_locals::word(tokens, index, "show")
-                    || term_locals::word(tokens, index, "suffices")) =>
-            {
-                let prefix =
-                    term_locals::Prefix::assertion(view, tokens, index, &mut cursor, range.end)?;
-                frames.push(term_binders::frame(prefix));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
-            {
-                if !lists.open_index(tokens, &mut frames, index) {
-                    lists.open(&mut frames, index, collections::Bracket::List);
-                }
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "⟨" =>
-            {
-                lists.open(&mut frames, index, collections::Bracket::AnonymousCtor);
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "#[" =>
-            {
-                lists.open(&mut frames, index, collections::Bracket::Array);
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "#v[" =>
-            {
-                lists.open(&mut frames, index, collections::Bracket::Vector);
-            }
-            // `f ..`: `Term.ellipsis`, an argument standing for the rest. A structure
-            // instance's own `..` is its record parser's.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && symbol == ".."
-                    && frames.last().is_some_and(|frame| {
-                        frame.record.is_none() && !frame.application.is_empty()
-                    }) =>
-            {
-                push_ellipsis(leaves, &mut frames, index)?;
-            }
-            // `(← e)`: a nested action, `leftArrow` being `unicode("← ", "<- ")`.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && (symbol == "←" || symbol == "<-") =>
-            {
-                frames.push(term_binders::frame(term_locals::Prefix::Nested(index)));
-            }
-            // `return e` outside `do`: the do parser reads its own statements first.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "return" =>
-            {
-                frames.push(term_binders::frame(term_locals::Prefix::Return(index)));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
-            {
-                let (term, end) = proofs::calculation(leaves, view, tokens, index, range.end)?;
-                splices.retain(|start, _| *start < index || *start >= end);
-                frames
-                    .last_mut()
-                    .expect("root term frame")
-                    .application
-                    .push((term, index));
-                cursor = end;
-            }
-            // `postfix:max "⁻¹" => Inv.inv` (`Init/Prelude.lean`): the argument before it.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "⁻¹" =>
-            {
-                push_postfix(view, tokens, leaves, &mut frames, index)?;
-            }
-            // `‹T›` (`«term‹_›»`, `macro "‹" type:term "›"`): the type is one bracketed term.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "‹" =>
-            {
-                cursor = push_assumption(view, tokens, leaves, &mut frames, index, range.end)?;
-            }
-            // `5#w` (`BitVec.«term__#__»`): a numeral, `#`, and a width, with no space between.
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "#" =>
-            {
-                cursor = push_bitvec_literal(view, tokens, leaves, &mut frames, index, range.end)?;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
-            {
-                let (proof, end) = proof_term(leaves, view, tokens, &frames, index, range.end)?;
-                // Tactic arguments are parsed by their own bounded term call.
-                // Its returned syntax already owns these matches. That parser
-                // bounds how deeply by blocks re-enter it.
-                splices.retain(|start, _| *start < index || *start >= end);
-                frames
-                    .last_mut()
-                    .expect("root term frame")
-                    .application
-                    .push((proof, index));
-                cursor = end;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && (symbol == "@"
-                        || symbol == "inferInstanceAs"
-                        || symbol == "@&"
-                        || symbol == "no_index"
-                        || symbol == "panic!") =>
-            {
-                // `"inferInstanceAs" (("$" <|> "<|") term:minPrec <|> term:argPrec)`
-                // (`Lean/Parser/Term.lean`): the `<|` form is folded with the pipeline's
-                // operands; `$` is not read.
-                if symbol == "inferInstanceAs"
-                    && matches!(tokens.get(index + 1).map(|t| &t.kind),
-                        Some(TokenKind::Symbol(next)) if next == "$")
-                {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index + 1),
-                        expected: grammar.value_expectation(),
-                    });
-                }
-                frames
-                    .last_mut()
-                    .expect("root term frame")
-                    .application
-                    .push((leaves.leaf(index)?, index));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "?" =>
-            {
-                let valid = cursor < range.end
-                    && tokens[index].extent.end() == tokens[cursor].extent.start()
-                    && (matches!(&tokens[cursor].kind, TokenKind::Ident(name) if !name.is_anonymous() && name.parent().is_anonymous())
-                        || matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == "_"));
-                if !valid {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: grammar.value_expectation(),
-                    });
-                }
-                let term = Syntax::node(
-                    parser_kind(&["Term", "syntheticHole"]),
-                    vec![leaves.leaf(index)?, leaves.leaf(cursor)?],
-                );
-                cursor += 1;
-                frames
-                    .last_mut()
-                    .expect("root term frame")
-                    .application
-                    .push((term, index));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && (symbol == "Type" || symbol == "Sort") =>
-            {
-                let (term, end) = levels::sort(leaves, view, tokens, index, range.end)?;
-                frames
-                    .last_mut()
-                    .expect("root term frame")
-                    .application
-                    .push((term, index));
-                cursor = end;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == ".{" =>
-            {
-                let frame = frames.last_mut().expect("root term frame");
-                let (head, start) = frame.application.pop().ok_or_else(|| {
-                    NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index),
-                        expected: grammar.value_expectation(),
-                    }
-                })?;
-                let (term, end) = levels::explicit(leaves, view, tokens, head, index, range.end)?;
-                frame.application.push((term, start));
-                cursor = end;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && (symbol == "¬"
-                        || symbol == "!"
-                        || symbol == "~~~"
-                        || (symbol == "-"
-                            && frames
-                                .last()
-                                .is_some_and(|frame| frame.application.is_empty()))) =>
-            {
-                frames.push(BoundedTermFrame {
-                    record: None,
-                    ascription: None,
-                    open: None,
-                    prefix: None,
-                    negation: Some(index),
-                    application: Vec::new(),
-                    operands: Vec::new(),
-                    operators: Vec::new(),
-                });
-            }
-            kind if is_bounded_term_atom(kind, grammar) => {
-                let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
-                frames
-                    .last_mut()
-                    .expect("the root term frame remains live")
-                    .application
-                    .push((term, index));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && matches!(symbol.as_str(), "forall" | "∀" | "∃" | "fun" | "λ") =>
-            {
-                let prefix = term_binders::Prefix::start(
-                    leaves,
-                    view,
-                    tokens,
-                    index,
-                    &mut cursor,
-                    range.end,
-                )?;
-                frames.push(term_binders::frame(prefix));
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && (symbol == "." || symbol == "·") =>
-            {
-                if dot_term(
-                    leaves,
-                    view,
-                    tokens,
-                    frames.last_mut().expect("root term frame"),
-                    range.clone(),
-                    index,
-                    cursor,
-                )? {
-                    cursor += 1;
-                }
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
-            {
-                if let Some(next) = lists.open_subtype(tokens, &mut frames, index) {
-                    cursor = next;
-                    continue;
-                }
-                record_terms::open(
-                    leaves,
-                    view,
-                    tokens,
-                    &mut frames,
-                    index,
-                    &mut cursor,
-                    range.end,
-                    updates.contains(&index),
-                )?;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar
-                    && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
-            {
-                finish_lambda_frames(
-                    leaves,
-                    view,
-                    tokens,
-                    &mut frames,
-                    grammar,
-                    index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
-                )?;
-                if frames.last().is_some_and(|frame| frame.record.is_some()) {
-                    record_terms::delimiter(
-                        leaves,
-                        view,
-                        tokens,
-                        &mut frames,
-                        index,
-                        &mut cursor,
-                        range.end,
-                    )?;
-                } else if symbol == ":"
-                    && !lists.current(&frames)
-                    && frames
-                        .last()
-                        .is_some_and(|frame| frame.open.is_some() && frame.ascription.is_none())
-                {
-                    let frame = frames.pop().expect("parenthesis frame");
-                    let open = frame.open;
-                    let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                    frames.push(BoundedTermFrame {
-                        record: None,
-                        ascription: Some((value, index)),
-                        open,
-                        prefix: None,
-                        negation: None,
-                        application: Vec::new(),
-                        operands: Vec::new(),
-                        operators: Vec::new(),
-                    });
-                } else {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index),
-                        expected: grammar.value_expectation(),
-                    });
-                }
-            }
-            Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
-                // A named argument is an application argument, never a free
-                // term or a hygienic parenthesis. Preserve its five raw leaves
-                // and parse its value on this same bounded frame stack.
-                let ascription = if grammar == DefinitionGrammar::Scalar
-                    && cursor + 1 < range.end
-                    && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
-                    && matches!(&tokens[cursor + 1].kind, TokenKind::Symbol(s) if s == ":=")
-                {
-                    if frames
-                        .last()
-                        .is_none_or(|frame| frame.application.is_empty())
-                    {
-                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                            at: original_position(view, tokens, index),
-                            expected: grammar.value_expectation(),
-                        });
-                    }
-                    let name = leaves.leaf(cursor)?;
-                    let assignment = cursor + 1;
-                    cursor += 2;
-                    Some((name, assignment))
-                } else {
-                    None
-                };
-                frames.push(BoundedTermFrame {
-                    record: None,
-                    ascription,
-                    open: Some(index),
-                    prefix: None,
-                    negation: None,
-                    application: Vec::new(),
-                    operands: Vec::new(),
-                    operators: Vec::new(),
-                });
-            }
-            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
-                finish_lambda_frames(
-                    leaves,
-                    view,
-                    tokens,
-                    &mut frames,
-                    grammar,
-                    index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
-                )?;
-                if lists.current(&frames) {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index),
-                        expected: grammar.value_expectation(),
-                    });
-                }
-                if frames.len() == 1 {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index),
-                        expected: NatDefinitionExpectation::EndOfCommand,
-                    });
-                }
-                let frame = frames
-                    .pop()
-                    .expect("a closing parenthesis has an inner frame");
-                let (grouped, open) =
-                    finish_parenthesized_frame(leaves, view, tokens, frame, grammar, index)?;
-                frames
-                    .last_mut()
-                    .expect("the parent term frame remains live")
-                    .application
-                    .push((grouped, open));
-            }
-            kind if bounded_infix(kind, grammar).is_some() => {
-                let operator = bounded_infix(kind, grammar)
-                    .expect("the guarded bounded infix remains recognized");
-                while frames
-                    .last()
-                    .and_then(|frame| frame.negation)
-                    .is_some_and(|prefix| {
-                        operator.precedence() < prefix_precedence(&tokens[prefix])
-                    })
-                {
-                    finish_negation_frame(leaves, view, tokens, &mut frames, grammar, index)?;
-                }
-                let syntax = leaves.leaf(index)?;
-                let frame = frames.last_mut().expect("the root term frame remains live");
-                push_bounded_infix(view, tokens, frame, grammar, operator, index, syntax)?;
-            }
-            _ => {
-                // A do element classified as `break`/`continue` (tokens at the pin) puts its
-                // own keyword on its empty frame as the one leaf `item` requires.
-                if grammar == DefinitionGrammar::Scalar
-                    && push_jump_keyword(leaves, &mut frames, index)
-                {
-                    continue;
-                }
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(view, tokens, index),
-                    expected: grammar.value_expectation(),
-                });
-            }
-        }
+        cursor = bounded_term_token(
+            leaves, view, tokens, &range, grammar, splices, updates, &mut lists, &mut frames, index,
+            cursor,
+        )?;
     }
     finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end, true)?;
     if frames.len() != 1 {
@@ -3085,6 +3036,667 @@ fn bounded_term_frames(
     let frame = frames.pop().expect("the bounded term has a root frame");
     finish_bounded_frame(view, tokens, frame, grammar, range.end)
 }
+
+// The term driver's per-token steps live in their own frames: a step that parses a nested range
+// (a do statement, a branch, a proof) keeps only its own temporaries and the driver's loop state
+// on the native stack, never every other step's.
+
+/// The layout and header boundaries checked before a token's own meaning: the next cursor when
+/// one of them consumed the token.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn bounded_term_layout(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: &std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    arrows: &std::collections::HashSet<usize>,
+    lists: &mut collections::Lists,
+    frames: &mut Vec<BoundedTermFrame>,
+    index: usize,
+    mut cursor: usize,
+) -> Result<Option<usize>, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::Scalar
+        && record_terms::layout(view, tokens, frames, index)
+    {
+        finish_lambda_frames(leaves, view, tokens, frames, grammar, index, true)?;
+        cursor = record_terms::line_break(leaves, view, tokens, frames, index, range.end)?;
+        return Ok(Some(cursor));
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && let Some(ends) = term_do::layout(view, tokens, frames, index)
+    {
+        finish_lambda_frames(leaves, view, tokens, frames, grammar, index, false)?;
+        let mut frame = frames.pop().expect("waiting do frame");
+        let prefix = frame.prefix.take().expect("waiting do prefix");
+        let value = if matches!(&prefix, term_locals::Prefix::Do(p) if p.done()) {
+            null_node(vec![])
+        } else {
+            finish_bounded_frame(view, tokens, frame, grammar, index)?
+        };
+        if ends {
+            let (syntax, start) = prefix.finish(leaves, value)?;
+            frames
+                .last_mut()
+                .expect("do parent")
+                .application
+                .push((syntax, start));
+            cursor = index;
+        } else {
+            let (prefix, next) =
+                prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
+            frames.push(term_binders::frame(prefix));
+            cursor = next;
+        }
+        return Ok(Some(cursor));
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && term_locals::layout_boundary(view, tokens, frames, index)
+    {
+        finish_lambda_frames(
+            leaves,
+            view,
+            tokens,
+            frames,
+            grammar,
+            index,
+            matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+        )?;
+        let mut frame = frames.pop().expect("waiting assertion value frame");
+        let prefix = frame.prefix.take().expect("waiting assertion prefix");
+        let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+        let (prefix, next) =
+            prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
+        frames.push(term_binders::frame(prefix));
+        cursor = next;
+        return Ok(Some(cursor));
+    }
+    if let Some((end, syntax)) = splices.remove(&index) {
+        if end > range.end {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, index),
+                expected: NatDefinitionExpectation::MatchAlternative,
+            });
+        }
+        frames
+            .last_mut()
+            .expect("root term frame")
+            .application
+            .push((syntax, index));
+        cursor = end;
+        return Ok(Some(cursor));
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
+            if matches!(crate::canonical_bracket(s.as_str()), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
+            || term_locals::word(tokens, index, "from")
+            // A prefix operand (`show ¬k = 0 by …`) is folded before its header closes.
+            || frames
+                .iter()
+                .rev()
+                .find(|frame| frame.negation.is_none())
+                .and_then(|frame| frame.prefix.as_ref())
+                .is_some_and(|prefix| prefix.closes_header(tokens, index)))
+    {
+        finish_lambda_frames(
+            leaves,
+            view,
+            tokens,
+            frames,
+            grammar,
+            index,
+            matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+        )?;
+        if let Some(mut frame) = frames.pop_if(|frame| {
+            frame
+                .prefix
+                .as_ref()
+                .is_some_and(|prefix| prefix.closes_header(tokens, index))
+        }) {
+            let prefix = frame.prefix.take().expect("binder annotation prefix");
+            let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+            let (prefix, end) =
+                prefix.finish_header(leaves, view, tokens, index, domain, range.end)?;
+            frames.push(term_binders::frame(prefix));
+            cursor = end;
+            return Ok(Some(cursor));
+        }
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && arrows.contains(&index)
+        && dependent_arrow_may_start(tokens, range.start, index, grammar)
+    {
+        let prefix =
+            term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
+        frames.push(term_binders::frame(prefix));
+        return Ok(Some(cursor));
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && !lists.current(frames)
+        && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == ",")
+        && lists.open_tuple(leaves, view, tokens, frames, index)?
+    {
+        return Ok(Some(cursor));
+    }
+    if grammar == DefinitionGrammar::Scalar
+        && lists.current(frames)
+        && matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
+            if lists.delimits(symbol))
+    {
+        cursor = lists.delimiter(leaves, view, tokens, frames, index, range.end)?;
+        return Ok(Some(cursor));
+    }
+    Ok(None)
+}
+
+/// A token's own meaning on the frame stack: the next cursor.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn bounded_term_token(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: &std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    updates: &std::collections::HashSet<usize>,
+    lists: &mut collections::Lists,
+    frames: &mut Vec<BoundedTermFrame>,
+    index: usize,
+    mut cursor: usize,
+) -> Result<usize, NatDefinitionParseError> {
+    match tokens.get(index).map(|token| &token.kind) {
+        _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
+            let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
+            frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
+                prefix,
+            ))));
+        }
+        _ if grammar == DefinitionGrammar::Scalar
+            && (term_locals::word(tokens, index, "let")
+                || term_locals::word(tokens, index, "have")
+                || term_locals::word(tokens, index, "letI")
+                || term_locals::word(tokens, index, "haveI")
+                || term_locals::word(tokens, index, "show")
+                || term_locals::word(tokens, index, "suffices")) =>
+        {
+            let prefix =
+                term_locals::Prefix::assertion(view, tokens, index, &mut cursor, range.end)?;
+            frames.push(term_binders::frame(prefix));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
+        {
+            if !lists.open_index(tokens, frames, index) {
+                lists.open(frames, index, collections::Bracket::List);
+            }
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "⟨" =>
+        {
+            lists.open(frames, index, collections::Bracket::AnonymousCtor);
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "#[" =>
+        {
+            lists.open(frames, index, collections::Bracket::Array);
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "#v[" =>
+        {
+            lists.open(frames, index, collections::Bracket::Vector);
+        }
+        // `f ..`: `Term.ellipsis`, an argument standing for the rest. A structure
+        // instance's own `..` is its record parser's.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && symbol == ".."
+                && frames.last().is_some_and(|frame| {
+                    frame.record.is_none() && !frame.application.is_empty()
+                }) =>
+        {
+            push_ellipsis(leaves, frames, index)?;
+        }
+        // `(← e)`: a nested action, `leftArrow` being `unicode("← ", "<- ")`.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && (symbol == "←" || symbol == "<-") =>
+        {
+            frames.push(term_binders::frame(term_locals::Prefix::Nested(index)));
+        }
+        // `return e` outside `do`: the do parser reads its own statements first.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "return" =>
+        {
+            frames.push(term_binders::frame(term_locals::Prefix::Return(index)));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
+        {
+            let (term, end) = proofs::calculation(leaves, view, tokens, index, range.end)?;
+            splices.retain(|start, _| *start < index || *start >= end);
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((term, index));
+            cursor = end;
+        }
+        // The ranges with an unbounded side (`Init/Data/Range/Polymorphic/PRange.lean`, namespace
+        // `Std`): `*...b`, `*...<b` and `*...=b` take the rest of the group as their bound,
+        // `*...*` stands alone, and `a...*`, `a<...*` (`syntax:max (term "...*")`) take the
+        // argument before them.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && matches!(symbol.as_str(), "*..." | "*...<" | "*...=") =>
+        {
+            let label = match symbol.as_str() {
+                "*..." => "term*..._",
+                "*...<" => "term*...<_",
+                _ => "term*...=_",
+            };
+            frames.push(term_binders::frame(term_locals::Prefix::StarRange(index, label)));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "*...*" =>
+        {
+            let term = Syntax::node(
+                Name::from_components(["Std", "term*...*"]),
+                vec![leaves.leaf(index)?],
+            );
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((term, index));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "...*" | "<...*") =>
+        {
+            push_range_postfix(view, tokens, leaves, frames, index)?;
+        }
+        // `postfix:max "⁻¹" => Inv.inv` (`Init/Prelude.lean`): the argument before it.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "⁻¹" =>
+        {
+            push_postfix(view, tokens, leaves, frames, index)?;
+        }
+        // `‹T›` (`«term‹_›»`, `macro "‹" type:term "›"`): the type is one bracketed term.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "‹" =>
+        {
+            cursor = push_assumption(view, tokens, leaves, frames, index, range.end)?;
+        }
+        // `"nofun"` (`Term.nofun`) and `"nomatch " term,+` (`Term.nomatch`), whose
+        // discriminants run to the end of the enclosing term.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "nofun" =>
+        {
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((
+                    Syntax::node(parser_kind(&["Term", "nofun"]), vec![leaves.leaf(index)?]),
+                    index,
+                ));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "nomatch" =>
+        {
+            cursor = push_nomatch(view, tokens, leaves, frames, index, range.end)?;
+        }
+        // `5#w` (`BitVec.«term__#__»`): a numeral, `#`, and a width, with no space between.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "#" =>
+        {
+            cursor = push_bitvec_literal(view, tokens, leaves, frames, index, range.end)?;
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
+        {
+            let (proof, end) = proof_term(leaves, view, tokens, frames, index, range.end)?;
+            // Tactic arguments are parsed by their own bounded term call.
+            // Its returned syntax already owns these matches. That parser
+            // bounds how deeply by blocks re-enter it.
+            splices.retain(|start, _| *start < index || *start >= end);
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((proof, index));
+            cursor = end;
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && (symbol == "@"
+                    || symbol == "inferInstanceAs"
+                    || symbol == "@&"
+                    || symbol == "no_index"
+                    || symbol == "panic!"
+                    || symbol == "↑") =>
+        {
+            // `"inferInstanceAs" (("$" <|> "<|") term:minPrec <|> term:argPrec)`
+            // (`Lean/Parser/Term.lean`): the `<|` form is folded with the pipeline's
+            // operands; `$` is not read.
+            if symbol == "inferInstanceAs"
+                && matches!(tokens.get(index + 1).map(|t| &t.kind),
+                    Some(TokenKind::Symbol(next)) if next == "$")
+            {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index + 1),
+                    expected: grammar.value_expectation(),
+                });
+            }
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((leaves.leaf(index)?, index));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "?" =>
+        {
+            let valid = cursor < range.end
+                && tokens[index].extent.end() == tokens[cursor].extent.start()
+                && (matches!(&tokens[cursor].kind, TokenKind::Ident(name) if !name.is_anonymous() && name.parent().is_anonymous())
+                    || matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == "_"));
+            if !valid {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, cursor),
+                    expected: grammar.value_expectation(),
+                });
+            }
+            let term = Syntax::node(
+                parser_kind(&["Term", "syntheticHole"]),
+                vec![leaves.leaf(index)?, leaves.leaf(cursor)?],
+            );
+            cursor += 1;
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((term, index));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && (symbol == "Type" || symbol == "Sort") =>
+        {
+            let (term, end) = levels::sort(leaves, view, tokens, index, range.end)?;
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((term, index));
+            cursor = end;
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == ".{" =>
+        {
+            let frame = frames.last_mut().expect("root term frame");
+            let (head, start) = frame.application.pop().ok_or_else(|| {
+                NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                }
+            })?;
+            let (term, end) = levels::explicit(leaves, view, tokens, head, index, range.end)?;
+            frame.application.push((term, start));
+            cursor = end;
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && (symbol == "¬"
+                    || symbol == "!"
+                    || symbol == "~~~"
+                    || (symbol == "-"
+                        && frames
+                            .last()
+                            .is_some_and(|frame| frame.application.is_empty()))) =>
+        {
+            frames.push(BoundedTermFrame {
+                record: None,
+                ascription: None,
+                open: None,
+                prefix: None,
+                negation: Some(index),
+                application: Vec::new(),
+                operands: Vec::new(),
+                operators: Vec::new(),
+            });
+        }
+        kind if is_bounded_term_atom(kind, grammar) => {
+            let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
+            frames
+                .last_mut()
+                .expect("the root term frame remains live")
+                .application
+                .push((term, index));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && matches!(symbol.as_str(), "forall" | "∀" | "∃" | "fun" | "λ") =>
+        {
+            let prefix = term_binders::Prefix::start(
+                leaves,
+                view,
+                tokens,
+                index,
+                &mut cursor,
+                range.end,
+            )?;
+            frames.push(term_binders::frame(prefix));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && (symbol == "." || symbol == "·") =>
+        {
+            if dot_term(
+                leaves,
+                view,
+                tokens,
+                frames.last_mut().expect("root term frame"),
+                range.clone(),
+                index,
+                cursor,
+            )? {
+                cursor += 1;
+            }
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
+        {
+            if let Some(next) = lists.open_subtype(tokens, frames, index) {
+                cursor = next;
+                return Ok(cursor);
+            }
+            record_terms::open(
+                leaves,
+                view,
+                tokens,
+                frames,
+                index,
+                &mut cursor,
+                range.end,
+                updates.contains(&index),
+            )?;
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
+        {
+            finish_lambda_frames(
+                leaves,
+                view,
+                tokens,
+                frames,
+                grammar,
+                index,
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+            )?;
+            if frames.last().is_some_and(|frame| frame.record.is_some()) {
+                record_terms::delimiter(
+                    leaves,
+                    view,
+                    tokens,
+                    frames,
+                    index,
+                    &mut cursor,
+                    range.end,
+                )?;
+            } else if symbol == ":"
+                && !lists.current(frames)
+                && frames
+                    .last()
+                    .is_some_and(|frame| frame.open.is_some() && frame.ascription.is_none())
+            {
+                let frame = frames.pop().expect("parenthesis frame");
+                let open = frame.open;
+                let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+                frames.push(BoundedTermFrame {
+                    record: None,
+                    ascription: Some((value, index)),
+                    open,
+                    prefix: None,
+                    negation: None,
+                    application: Vec::new(),
+                    operands: Vec::new(),
+                    operators: Vec::new(),
+                });
+            } else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                });
+            }
+        }
+        Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
+            // A named argument is an application argument, never a free
+            // term or a hygienic parenthesis. Preserve its five raw leaves
+            // and parse its value on this same bounded frame stack.
+            let ascription = if grammar == DefinitionGrammar::Scalar
+                && cursor + 1 < range.end
+                && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
+                && matches!(&tokens[cursor + 1].kind, TokenKind::Symbol(s) if s == ":=")
+            {
+                if frames
+                    .last()
+                    .is_none_or(|frame| frame.application.is_empty())
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: grammar.value_expectation(),
+                    });
+                }
+                let name = leaves.leaf(cursor)?;
+                let assignment = cursor + 1;
+                cursor += 2;
+                Some((name, assignment))
+            } else {
+                None
+            };
+            frames.push(BoundedTermFrame {
+                record: None,
+                ascription,
+                open: Some(index),
+                prefix: None,
+                negation: None,
+                application: Vec::new(),
+                operands: Vec::new(),
+                operators: Vec::new(),
+            });
+        }
+        Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
+            finish_lambda_frames(
+                leaves,
+                view,
+                tokens,
+                frames,
+                grammar,
+                index,
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+            )?;
+            if lists.current(frames) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                });
+            }
+            if frames.len() == 1 {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: NatDefinitionExpectation::EndOfCommand,
+                });
+            }
+            let frame = frames
+                .pop()
+                .expect("a closing parenthesis has an inner frame");
+            let (grouped, open) =
+                finish_parenthesized_frame(leaves, view, tokens, frame, grammar, index)?;
+            frames
+                .last_mut()
+                .expect("the parent term frame remains live")
+                .application
+                .push((grouped, open));
+        }
+        // A `|` between the patterns of a `matches` waiting in this frame.
+        Some(TokenKind::Symbol(symbol))
+            if symbol == "|"
+                && frames.last().is_some_and(|frame| {
+                    frame
+                        .operators
+                        .iter()
+                        .any(|token| token.operator == BoundedInfix::Matches)
+                }) =>
+        {
+            let syntax = leaves.leaf(index)?;
+            let frame = frames.last_mut().expect("the matches frame");
+            push_bounded_infix(
+                view,
+                tokens,
+                frame,
+                grammar,
+                BoundedInfix::MatchesBar,
+                index,
+                syntax,
+            )?;
+        }
+        kind if bounded_infix(kind, grammar).is_some() => {
+            let operator = bounded_infix(kind, grammar)
+                .expect("the guarded bounded infix remains recognized");
+            while frames
+                .last()
+                .and_then(|frame| frame.negation)
+                .is_some_and(|prefix| {
+                    operator.left_precedence() < u16::from(prefix_precedence(&tokens[prefix]))
+                })
+            {
+                finish_negation_frame(leaves, view, tokens, frames, grammar, index)?;
+            }
+            if operator.is_range() {
+                split_range_argument(tokens, frames);
+            }
+            let syntax = leaves.leaf(index)?;
+            let frame = frames.last_mut().expect("the root term frame remains live");
+            push_bounded_infix(view, tokens, frame, grammar, operator, index, syntax)?;
+        }
+        _ => {
+            // A do element classified as `break`/`continue` (tokens at the pin) puts its
+            // own keyword on its empty frame as the one leaf `item` requires.
+            if grammar == DefinitionGrammar::Scalar
+                && push_jump_keyword(leaves, frames, index)
+            {
+                return Ok(cursor);
+            }
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, index),
+                expected: grammar.value_expectation(),
+            });
+        }
+    }
+    Ok(cursor)
+}
+
 
 /// Parse the first production command subset:
 ///
@@ -3141,6 +3753,87 @@ fn source_declaration(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionPa
         source_view: parsed.source_view,
         syntax: parsed.syntax,
         epilogue: parsed.epilogue,
+        query_term: None,
+    })
+}
+
+/// `deriving instance C, … for T, …` (`Command.deriving`, `"deriving " "instance "
+/// derivingClass,+ " for " ident,+`, each class a name). The checker does not derive instances:
+/// it refuses the command.
+#[inline(never)]
+fn deriving_command(
+    view: SourceView,
+    tokens: &[LexedToken],
+) -> Result<ParsedSourceCommand, DefinitionParseError> {
+    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens.get(at).map_or_else(
+            || {
+                tokens
+                    .last()
+                    .map_or(BytePos(0), |last| view.to_original(last.extent.end()))
+            },
+            |token| view.to_original(token.extent.start()),
+        ),
+        expected: NatDefinitionExpectation::DefinitionKeyword,
+    };
+    if !is(1, "instance") {
+        return Err(refuse(1));
+    }
+    // `ident,+` from `at`: the index after it.
+    let list_end = |at: usize| -> Result<usize, NatDefinitionParseError> {
+        let mut at = at;
+        loop {
+            if !ident(at) {
+                return Err(refuse(at));
+            }
+            at += 1;
+            if !is(at, ",") {
+                return Ok(at);
+            }
+            at += 1;
+        }
+    };
+    let classes_end = list_end(2)?;
+    if !is(classes_end, "for") {
+        return Err(refuse(classes_end));
+    }
+    let types_end = list_end(classes_end + 1)?;
+    if types_end != tokens.len() {
+        return Err(refuse(types_end));
+    }
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    let mut classes = Vec::new();
+    for at in 2..classes_end {
+        classes.push(if ident(at) {
+            Syntax::node(
+                parser_kind(&["Command", "derivingClass"]),
+                vec![null_node(Vec::new()), leaves.leaf(at)?],
+            )
+        } else {
+            leaves.leaf(at)?
+        });
+    }
+    let types = (classes_end + 1..types_end)
+        .map(|at| leaves.leaf(at))
+        .collect::<Result<Vec<_>, _>>()?;
+    let epilogue = leaves.attachment().epilogue();
+    Ok(ParsedSourceCommand {
+        kind: SourceCommandKind::Definition,
+        source_view: view,
+        syntax: Syntax::node(
+            parser_kind(&["Command", "deriving"]),
+            vec![
+                leaves.leaf(0)?,
+                null_node(Vec::new()),
+                leaves.leaf(1)?,
+                null_node(classes),
+                leaves.leaf(classes_end)?,
+                null_node(types),
+            ],
+        ),
+        epilogue,
         query_term: None,
     })
 }
@@ -3420,6 +4113,22 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
         Event::Token(token) => Some(token),
         Event::Trivia(_) | Event::Refused { .. } => None,
     });
+    // A syntax declaration (`syntax "x" : term`, `/-- d -/ scoped syntax …`, `syntax n := …`):
+    // the pin's tree, which the checker refuses.
+    if first.is_some_and(|token| {
+        matches!(&token.kind, TokenKind::Symbol(s)
+            if matches!(s.as_str(), "syntax" | "/--" | "@[" | "scoped" | "local" | "private"
+                | "protected" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
+                | "recommended_spelling"))
+    }) && run.events.iter().any(|event| {
+        matches!(event, Event::Token(token)
+            if matches!(&token.kind, TokenKind::Symbol(s) if matches!(s.as_str(),
+                "syntax" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
+                    | "recommended_spelling")))
+    }) && let Some(declaration) = command_scope::syntax_decls::declaration(source)?
+    {
+        return Ok(declaration);
+    }
     // A `section` with a header (`public section`, `noncomputable section`, …), which
     // `command_scope::parse` does not read as a scope: its tree, which the checker refuses.
     if first.is_some_and(|token| {
@@ -3503,6 +4212,17 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     epilogue,
                     query_term: Some(query_term),
                 })
+            }
+            TokenKind::Symbol(symbol) if symbol == "deriving" => {
+                let tokens = run
+                    .events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Token(token) => Some(token),
+                        Event::Trivia(_) | Event::Refused { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                deriving_command(view, &tokens)
             }
             TokenKind::Symbol(symbol) if symbol == "export" => {
                 let tokens = run
@@ -3596,14 +4316,62 @@ fn is_hole(tokens: &[LexedToken], at: usize) -> bool {
 fn bounded_binders(
     view: &SourceView,
     tokens: &[LexedToken],
-    mut cursor: usize,
+    cursor: usize,
     grammar: DefinitionGrammar,
 ) -> Result<(Vec<ExplicitBinderTokens>, usize), NatDefinitionParseError> {
+    binder_groups(view, tokens, cursor, grammar, false)
+}
+
+/// A declaration's or a local definition's binders: `declSig`'s and `letIdDecl`'s
+/// `(binderIdent <|> bracketedBinder)*`, where a bare name (or `_`) is a binder of its own.
+fn signature_binders(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    cursor: usize,
+    grammar: DefinitionGrammar,
+) -> Result<(Vec<ExplicitBinderTokens>, usize), NatDefinitionParseError> {
+    binder_groups(
+        view,
+        tokens,
+        cursor,
+        grammar,
+        grammar == DefinitionGrammar::Scalar,
+    )
+}
+
+fn binder_groups(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut cursor: usize,
+    grammar: DefinitionGrammar,
+    bare: bool,
+) -> Result<(Vec<ExplicitBinderTokens>, usize), NatDefinitionParseError> {
     let mut parameter_groups = Vec::new();
-    while matches!(
-        tokens.get(cursor).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
-    ) {
+    loop {
+        if bare
+            && (matches!(
+                tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) || is_hole(tokens, cursor))
+        {
+            parameter_groups.push(ExplicitBinderTokens {
+                open: cursor,
+                names: cursor..cursor + 1,
+                colon: cursor,
+                type_range: cursor..cursor,
+                close: cursor,
+                kind: "bare",
+                default: None,
+            });
+            cursor += 1;
+            continue;
+        }
+        if !matches!(
+            tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
+        ) {
+            break;
+        }
         let open = cursor;
         let (kind, closing) = match tokens.get(cursor).map(|token| &token.kind) {
             Some(TokenKind::Symbol(symbol)) if symbol == "{" => ("implicitBinder", "}"),
@@ -3767,6 +4535,15 @@ fn bounded_binder_syntax(
 ) -> Result<Vec<Syntax>, NatDefinitionParseError> {
     let mut parameters = Vec::new();
     for group in parameter_groups {
+        if group.kind == "bare" {
+            let leaf = leaves.leaf(group.open)?;
+            parameters.push(if is_hole(tokens, group.open) {
+                Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])
+            } else {
+                leaf
+            });
+            continue;
+        }
         if group.kind == "instBinder" {
             let names = if group.names.is_empty() {
                 Vec::new()
@@ -4002,21 +4779,20 @@ fn parse_definition_with_grammar(
         .collect::<Vec<_>>();
     let tokens = split_field_indices(view.normalized(), tokens);
 
-    // A declaration's doc comment leads its command (`declModifiers`' first slot).
-    let keyword = usize::from(grammar == DefinitionGrammar::Scalar && leading_doc_comment(&tokens));
+    let (doc_end, attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
+    // `declModifiers` then `inductive`: the modifiers' node is built as a definition's.
     if grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.get(keyword).map(|token| &token.kind),
+        && matches!(tokens.get(declaration_start).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == "inductive")
     {
-        return inductive::parse(view, tokens, keyword);
+        return inductive::parse(view, tokens, (doc_end, attributes_end, declaration_start));
     }
+    // `declModifiers` then `structure`/`class`: the modifiers' node is built as a definition's.
     if grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.get(keyword).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
+        && matches!(tokens.get(declaration_start).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
     {
-        return records::parse(view, tokens, keyword);
+        return records::parse(view, tokens, (doc_end, attributes_end, declaration_start));
     }
-
-    let (doc_end, attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
     // `scoped instance` / `local instance`: the instance's `attrKind` (`Term.scoped`,
     // `Term.local`), which the elaborator refuses.
     let instance_scope = (grammar == DefinitionGrammar::Scalar
@@ -4043,12 +4819,6 @@ fn parse_definition_with_grammar(
     // `opaque := "opaque " declId declSig (declValSimple)?` (`Lean/Parser/Command.lean`).
     let is_opaque =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "opaque");
-    if attributes_end != doc_end && is_instance {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(&view, &tokens, declaration_start),
-            expected: NatDefinitionExpectation::DefinitionKeyword,
-        });
-    }
     let mut cursor = declaration_start + 1;
     // `(priority := n)`, never an anonymous instance's first explicit binder `(x : T)`.
     let priority_range = if is_instance
@@ -4056,20 +4826,30 @@ fn parse_definition_with_grammar(
         && matches!(tokens.get(cursor + 2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == ":=")
     {
         let start = cursor;
+        // `prio`: a numeral, `default`, `low`, `mid` or `high`, and sums of them; the
+        // elaborator reads a numeral only.
+        let prio_token = |at: usize| match tokens.get(at).map(|t| &t.kind) {
+            Some(TokenKind::Literal(LiteralKind::Nat)) => true,
+            Some(TokenKind::Ident(n)) => ["default", "low", "mid", "high"]
+                .iter()
+                .any(|word| *n == Name::from_components([*word])),
+            Some(TokenKind::Symbol(s)) => s == "+" || s == "-",
+            _ => false,
+        };
+        let close = (start + 3..tokens.len()).find(|&at| !prio_token(at));
         if !matches!(tokens.get(start+1).map(|t|&t.kind),Some(TokenKind::Ident(n)) if n==&Name::from_components(["priority"]))
             || !matches!(tokens.get(start+2).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==":=")
-            || !matches!(
-                tokens.get(start + 3).map(|t| &t.kind),
-                Some(TokenKind::Literal(LiteralKind::Nat))
-            )
-            || !matches!(tokens.get(start+4).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==")")
+            || close.is_none_or(|close| {
+                close == start + 3
+                    || !matches!(&tokens[close].kind, TokenKind::Symbol(s) if s == ")")
+            })
         {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, start),
                 expected: NatDefinitionExpectation::DeclarationIdentifier,
             });
         }
-        cursor += 5;
+        cursor = close.expect("checked") + 1;
         Some(start..cursor)
     } else {
         None
@@ -4101,7 +4881,7 @@ fn parse_definition_with_grammar(
         (None, cursor)
     };
     cursor = after_levels;
-    let (parameter_groups, next) = bounded_binders(&view, &tokens, cursor, grammar)?;
+    let (parameter_groups, next) = signature_binders(&view, &tokens, cursor, grammar)?;
     cursor = next;
     let explicit_result_type = if matches!(
         tokens.get(cursor).map(|token| &token.kind),
@@ -4164,6 +4944,13 @@ fn parse_definition_with_grammar(
         });
     }
     let value_index = assignment_index + 1;
+    // `optDefDeriving := ("deriving " notSymbol("instance") sepBy1(ident, ", "))?` after a
+    // definition's value (`Lean/Parser/Command.lean`): its classes end the value.
+    let deriving_at = (grammar == DefinitionGrammar::Scalar
+        && matches!(&tokens[declaration_start].kind, TokenKind::Symbol(s) if s == "def"))
+    .then(|| deriving_start(&tokens, value_index))
+    .flatten();
+    let token_end = deriving_at.unwrap_or(tokens.len());
     // A trailing `where` block of a `:=` definition or theorem (`declValSimple`'s
     // `whereDecls`). An instance's own `where` is its structure body, never this.
     let where_index = (!equations
@@ -4180,7 +4967,7 @@ fn parse_definition_with_grammar(
     };
     // `Termination.suffix`: `termination_by` and `decreasing_by` after the value or the
     // equations, at bracket depth 0, before any `where`.
-    let value_end = where_index.unwrap_or(tokens.len());
+    let value_end = where_index.unwrap_or(token_end);
     let termination_at = (grammar == DefinitionGrammar::Scalar && !structure_where && !bare_opaque)
         .then(|| termination_start(&tokens, body_start, value_end))
         .flatten();
@@ -4245,7 +5032,7 @@ fn parse_definition_with_grammar(
             &leaves,
             &view,
             &tokens,
-            assignment_index..termination_at.unwrap_or(tokens.len()),
+            assignment_index..termination_at.unwrap_or(token_end),
             grammar,
         )?
     } else {
@@ -4303,24 +5090,24 @@ fn parse_definition_with_grammar(
         let priority = match priority_range {
             None => null_node(Vec::new()),
             Some(range) => {
-                let start = range.start;
-                let keyword = leaves.leaf(start + 1)?;
-                let priority = Syntax::node(
-                    parser_kind(&["Command", "namedPrio"]),
-                    vec![
-                        leaves.leaf(start)?,
-                        Syntax::Atom {
-                            info: keyword.info(),
-                            val: "priority".into(),
-                        },
-                        leaves.leaf(start + 2)?,
-                        Syntax::node(
-                            Name::from_components(["num"]),
-                            vec![leaves.leaf(start + 3)?],
-                        ),
-                        leaves.leaf(start + 4)?,
-                    ],
-                );
+                let Some((priority, end)) = command_scope::syntax_decls::named_priority(
+                    &view,
+                    &tokens,
+                    &leaves,
+                    range.start,
+                )?
+                else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(&view, &tokens, range.start),
+                        expected: NatDefinitionExpectation::DeclarationIdentifier,
+                    });
+                };
+                if end != range.end {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(&view, &tokens, end),
+                        expected: NatDefinitionExpectation::DeclarationIdentifier,
+                    });
+                }
                 null_node(vec![priority])
             }
         };
@@ -4370,7 +5157,10 @@ fn parse_definition_with_grammar(
             declaration_value,
         ];
         if !is_theorem && !is_abbrev && !is_opaque {
-            parts.push(null_node(Vec::new()));
+            parts.push(match deriving_at {
+                Some(at) => records::deriving_clause(&leaves, &view, &tokens, at)?,
+                None => null_node(Vec::new()),
+            });
         }
         let kind = if is_theorem {
             "theorem"

@@ -130,6 +130,33 @@ fn generalize_refuses_unproved_or_invalid_generalizations() {
     check("theorem t : 3 = 3 := by generalize 3 = x; rfl");
 }
 
+/// `generalize` parses as the pin's `generalizeArg,+ (location)?`. The pin accepts both files;
+/// this elaborator generalizes one argument at the goal, so a location or a second argument is
+/// refused rather than read as one goal-only generalization.
+#[test]
+fn generalize_refuses_locations_and_several_arguments() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    for source in [
+        "theorem t (n : Nat) (h0 : n = n) : n = n := by\n  generalize n = m at h0\n  rfl",
+        "theorem t (a b : Nat) : a + b = a + b := by\n  generalize a = x, b = y\n  rfl",
+    ] {
+        let result = engine.check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits),
+        );
+        assert!(
+            !matches!(result, Ok(fln::Outcome::Complete(_))),
+            "accepted {source}"
+        );
+    }
+}
+
 #[test]
 fn generalization_resource_stops_are_not_successful_tactic_alternatives() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));

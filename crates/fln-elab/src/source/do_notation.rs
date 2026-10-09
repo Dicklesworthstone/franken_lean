@@ -56,6 +56,48 @@ fn take(
     }
     Ok(std::mem::take(args))
 }
+/// The pin's `doIf` carries `else if` clauses beside its `else`. They mean the nested `doIf`
+/// (`else if c then s` is `else (if c then s)`), which every later step of this expansion reads,
+/// so the clauses are nested here, the innermost last.
+fn nest_else_ifs(syntax: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    let mut parts = node(syntax, "doIf", 6)?;
+    let mut rest = parts.pop().expect("doIf else");
+    let clauses = children(parts.pop().expect("doIf else-if clauses"))?;
+    for clause in clauses.into_iter().rev() {
+        // `group (group "else" "if") doIfCond "then" doSeq`.
+        let mut clause = take(clause, Name::from_components(["group"]), Some(4))?;
+        let sequence = clause.pop().expect("else-if sequence");
+        let then = clause.pop().expect("else-if then");
+        let condition = clause.pop().expect("else-if condition");
+        let mut head = take(
+            clause.pop().expect("else-if keywords"),
+            Name::from_components(["group"]),
+            Some(2),
+        )?;
+        let if_keyword = head.pop().expect("else-if if");
+        let else_keyword = head.pop().expect("else-if else");
+        expect_atom(&else_keyword, "else", "else-if else")?;
+        expect_atom(&if_keyword, "if", "else-if if")?;
+        expect_atom(&then, "then", "else-if then")?;
+        let nested = Syntax::node(
+            parser_kind(&["Term", "doIf"]),
+            vec![if_keyword, condition, then, sequence, null(vec![]), rest],
+        );
+        rest = null(vec![
+            else_keyword,
+            Syntax::node(
+                parser_kind(&["Term", "doSeqIndent"]),
+                vec![null(vec![Syntax::node(
+                    parser_kind(&["Term", "doSeqItem"]),
+                    vec![nested, null(vec![])],
+                )])],
+            ),
+        ]);
+    }
+    parts.push(null(vec![]));
+    parts.push(rest);
+    Ok(Syntax::node(parser_kind(&["Term", "doIf"]), parts))
+}
 fn node(syntax: Syntax, kind: &str, count: usize) -> Result<Vec<Syntax>, NatDefinitionElabError> {
     take(syntax, parser_kind(&["Term", kind]), Some(count))
 }
@@ -282,6 +324,44 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "doIf"])) {
+            return nest_else_ifs(syntax);
+        }
+        // `leftArrow doElemParser` with a `doIf`/`doMatch` (`let x ← if …`, `x ← match …`): the
+        // pin compiles that element as the one-element sequence of `let x ← do if …`
+        // (`doSeqToCode [doElem]`), so it becomes that nested sequence, which shares the
+        // surrounding control scope.
+        if (syntax.kind() == Some(&parser_kind(&["Term", "doIdDecl"]))
+            || syntax.kind() == Some(&parser_kind(&["Term", "doPatDecl"])))
+            && matches!(&syntax, Syntax::Node { args, .. }
+                if args.get(3).is_some_and(|element| {
+                    element.kind() == Some(&parser_kind(&["Term", "doIf"]))
+                        || element.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+                }))
+        {
+            if pattern {
+                return Err(invalid());
+            }
+            let mut syntax = syntax;
+            let Syntax::Node { args, .. } = &mut syntax else {
+                unreachable!("checked binding");
+            };
+            let element = std::mem::replace(&mut args[3], null(vec![]));
+            args[3] = Syntax::node(
+                parser_kind(&["Term", "doNested"]),
+                vec![
+                    atom("do"),
+                    Syntax::node(
+                        parser_kind(&["Term", "doSeqIndent"]),
+                        vec![null(vec![Syntax::node(
+                            parser_kind(&["Term", "doSeqItem"]),
+                            vec![element, null(vec![])],
+                        )])],
+                    ),
+                ],
+            );
+            return Ok(syntax);
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "doTry"])) {
             if pattern {
                 return Err(invalid());
@@ -434,6 +514,18 @@ impl Context {
             }
             return Ok(Syntax::node(
                 parser_kind(&["Term", "let"]),
+                vec![parts.remove(0), config, declaration, atom(";"), body],
+            ));
+        }
+        // `have d` followed by the rest of the block is the term `have d; rest`
+        // (`doHave := "have" letConfig letDecl`).
+        if element.kind() == Some(&parser_kind(&["Term", "doHave"])) {
+            let mut parts = node(element, "doHave", 3)?;
+            let declaration = parts.pop().expect("have declaration");
+            let config = parts.pop().expect("have config");
+            expect_atom(&parts[0], "have", "have keyword")?;
+            return Ok(Syntax::node(
+                parser_kind(&["Term", "have"]),
                 vec![parts.remove(0), config, declaration, atom(";"), body],
             ));
         }

@@ -159,7 +159,11 @@ impl Prefix {
 
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match &self.phase {
-            Phase::Group(group) => symbol(tokens, at, group.close),
+            // `(h : T := v)`: `explicitBinder`'s `binderDefault <|> binderTactic` follows the type.
+            Phase::Group(group) => {
+                symbol(tokens, at, group.close)
+                    || (group.kind == "explicitBinder" && !self.lambda && symbol(tokens, at, ":="))
+            }
             Phase::SharedType(_) | Phase::Predicate(_) => self.separator(tokens, at),
             Phase::Body => false,
         }
@@ -283,7 +287,7 @@ impl Prefix {
                         close,
                     };
                     self.binders
-                        .push(self.group_syntax(leaves, tokens, group, *cursor, None)?);
+                        .push(self.group_syntax(leaves, tokens, group, *cursor, None, None)?);
                     *cursor += 1;
                     continue;
                 }
@@ -318,6 +322,7 @@ impl Prefix {
         group: Group,
         at: usize,
         domain: Option<Syntax>,
+        default: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionParseError> {
         let names = group
             .names
@@ -380,7 +385,7 @@ impl Prefix {
         };
         let mut parts = vec![leaves.leaf(group.open)?, null_node(names), type_];
         if group.kind == "explicitBinder" {
-            parts.push(null_node(vec![]));
+            parts.push(null_node(default.into_iter().collect()));
         }
         parts.push(leaves.leaf(at)?);
         Ok(Syntax::node(parser_kind(&["Term", group.kind]), parts))
@@ -398,8 +403,47 @@ impl Prefix {
         let mut cursor = at + 1;
         match std::mem::replace(&mut self.phase, Phase::Body) {
             Phase::Group(group) => {
-                self.binders
-                    .push(self.group_syntax(leaves, tokens, group, at, Some(domain))?);
+                // The type ended at `:=`: the default runs to the group's own closing bracket.
+                let (close, default) = if symbol(tokens, at, ":=") {
+                    let mut depth = 0usize;
+                    let mut close = None;
+                    for (index, token) in tokens.iter().enumerate().take(end).skip(at + 1) {
+                        if let TokenKind::Symbol(s) = &token.kind {
+                            match crate::canonical_bracket(s.as_str()) {
+                                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                                ")" | "]" | "}" | "⦄" | "⟩" if depth == 0 => {
+                                    close = Some(index);
+                                    break;
+                                }
+                                ")" | "]" | "}" | "⦄" | "⟩" => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let close = close
+                        .filter(|close| symbol(tokens, *close, group.close) && *close > at + 1)
+                        .ok_or_else(|| refuse(view, tokens, at))?;
+                    let default = crate::binder_default(
+                        leaves,
+                        view,
+                        tokens,
+                        at,
+                        close,
+                        DefinitionGrammar::Scalar,
+                    )?;
+                    (close, Some(default))
+                } else {
+                    (at, None)
+                };
+                cursor = close + 1;
+                self.binders.push(self.group_syntax(
+                    leaves,
+                    tokens,
+                    group,
+                    close,
+                    Some(domain),
+                    default,
+                )?);
                 self.header(leaves, view, tokens, &mut cursor, end)?;
             }
             Phase::SharedType(colon) => {

@@ -21,6 +21,32 @@ fn check(source: &str) -> fln::SourceFileCheck {
         .into_complete()
         .unwrap()
 }
+/// `with tac` before the alternatives and a `_` alternative parse as the pin's `inductionAlts` and
+/// `Term.hole`; the elaborator models neither, so it refuses these files, which the pin accepts,
+/// rather than dropping the tactic or misnaming the alternative.
+#[test]
+fn a_with_tactic_and_a_wildcard_alternative_are_refused() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for source in [
+        "theorem t (n : Nat) : n = n := by\n  cases n with try skip\n  | zero => rfl\n  | succ m => rfl\n",
+        "theorem t (n : Nat) : n = n := by\n  cases n with\n  | _ => rfl\n",
+    ] {
+        let result = engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        );
+        assert!(
+            !matches!(result, Ok(fln::Outcome::Complete(_))),
+            "accepted {source}"
+        );
+    }
+}
+
 #[test]
 fn cases_specializes_the_goal_and_matches_constructor_names() {
     check(

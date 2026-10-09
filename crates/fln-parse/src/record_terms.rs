@@ -10,7 +10,8 @@ pub(super) struct RecordFrame {
     sources: Vec<Syntax>,
     source_mode: bool,
     with_token: Option<usize>,
-    /// The column of the field being read: a line starting at or before it ends that field.
+    /// The column of the record's first field, where `sepByIndent`'s `withPosition` stands: a
+    /// line starting at exactly that column ends the field before it (`checkColEq`).
     field_column: Option<usize>,
 }
 enum Field {
@@ -57,7 +58,9 @@ fn push_field(
     if name >= end || !matches!(tokens[name].kind, TokenKind::Ident(_)) {
         return Err(refuse(view, tokens, name));
     }
-    record.field_column = Some(column(view, tokens, name));
+    record
+        .field_column
+        .get_or_insert(column(view, tokens, name));
     *cursor += 1;
     // A name alone on its line is an abbreviation too: the next line starts the next field.
     let line_ends = *cursor < end
@@ -279,10 +282,11 @@ fn finish_field(
     Ok(())
 }
 
-/// Whether the token at `at` begins a line at or before the column of the innermost record's
-/// current field, with no bracket opened inside that field: `structInstFields` is `sepByIndent
-/// … (allowTrailingSep := true)` read `withoutPosition`, so a line break separates fields as `,`
-/// does, and before the closing `}` it is a trailing separator.
+/// Whether the token at `at` begins a line at the column of the innermost record's first field,
+/// with no bracket opened inside the current field: `structInstFields` is `sepByIndent …
+/// (allowTrailingSep := true)`, whose line-break separator is `checkColEq >>
+/// checkLinebreakBefore >> pushNone`, so such a line break separates fields as `,` does, and
+/// before a closing `}` at that column it is a trailing separator (a `}` further left has none).
 #[inline(never)]
 pub(super) fn layout(
     view: &SourceView,
@@ -306,7 +310,7 @@ pub(super) fn layout(
         && at > 0
         && view.normalized().line_of(tokens[at].extent.start())
             > view.normalized().line_of(tokens[at - 1].extent.end())
-        && column(view, tokens, at) <= field_column
+        && column(view, tokens, at) == field_column
 }
 
 /// A line break that [`layout`] found: the field ends, an empty separator follows it, and the
@@ -325,7 +329,6 @@ pub(super) fn line_break(
     let mut record = current.record.take().expect("record line break");
     finish_field(leaves, view, tokens, current, &mut record, at)?;
     record.rows.push(null_node(Vec::new()));
-    record.field_column = None;
     let mut cursor = at;
     if symbol(tokens, at, "}") {
         frames.push(frame(record));

@@ -299,8 +299,15 @@ pub(super) fn tactic(
                 let named = comma > start + 2
                     && matches!(&tokens[start].kind, TokenKind::Ident(_))
                     && is(tokens, start + 1, ":");
+                // `elimTarget := atomic(binderIdent " : ")? term`, as `cases`'s.
                 let binder = if named {
-                    null_node(vec![leaves.leaf(start)?, leaves.leaf(start + 1)?])
+                    null_node(vec![
+                        Syntax::node(
+                            Name::from_components(["Lean", "binderIdent"]),
+                            vec![leaves.leaf(start)?],
+                        ),
+                        leaves.leaf(start + 1)?,
+                    ])
                 } else {
                     null_node(Vec::new())
                 };
@@ -367,6 +374,14 @@ pub(super) fn tactic(
             Ok(Syntax::node(
                 Name::from_components(["Lean", "Elab", "Tactic", "Ext", "ext"]),
                 vec![atom, null_node(units), depth],
+            ))
+        }
+        // `syntax "ext1" (colGt ppSpace rintroPat)* : tactic` (`Init/Ext.lean`).
+        "ext1" => {
+            let units = patterns.rintro_units(body.clone())?;
+            Ok(Syntax::node(
+                Name::from_components(["Lean", "Elab", "Tactic", "Ext", "tacticExt1___"]),
+                vec![atom, null_node(units)],
             ))
         }
         // `"rintro" (ppSpace colGt rintroPat)+ (" : " term)?`; only `rintroPat.one`.

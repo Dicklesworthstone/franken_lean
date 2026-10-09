@@ -28,25 +28,53 @@ pub(super) fn plan(
     if newline(view, tokens, first) && baseline == 0 {
         return Err(refusal(view, tokens, first));
     }
+    // `calcSteps := ppLine withPosition(calcFirstStep) withPosition((ppLine linebreak calcStep)*)`
+    // (`Init/NotationExtra.lean`): the steps after the first have a position of their own, the
+    // column of the first token on a later line, which may be left of a first step written on
+    // the `calc` line (`calc a = b := h⏎    _ = c := k`). Any token that can start a term opens
+    // it, so after a one-step calculation the next tactic line is read as a step: the pin reads
+    // `calc a = b := h⏎  exact h` as the step `exact h`, which has no `:=`, and rejects it. Only a
+    // token that cannot start a term ends the calculation there.
+    let mut rest: Option<usize> = None;
     let mut rows = vec![first];
     let mut end = limit;
     let mut depth = 0;
     for at in first..limit {
         if depth == 0 {
             if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩"))
-                || at > first && newline(view, tokens, at) && column(view, tokens, at) < baseline
             {
                 end = at;
                 break;
             }
-            if at > first && newline(view, tokens, at) && column(view, tokens, at) == baseline {
-                rows.push(at);
+            if at > first && newline(view, tokens, at) {
+                let at_column = column(view, tokens, at);
+                let position = rest.unwrap_or(baseline);
+                if at_column == position
+                    || rest.is_none() && at_column < baseline && starts_term(tokens, at)
+                {
+                    rest = Some(at_column);
+                    rows.push(at);
+                } else if at_column < position {
+                    end = at;
+                    break;
+                }
             }
         }
         delimiter_depth(&tokens[at], &mut depth);
     }
     if depth != 0 {
         return Err(refusal(view, tokens, end));
+    }
+    // The steps' position ignores the enclosing layout, so a one-step calculation cut short by
+    // its enclosing block (`· calc a = b := h⏎  · trivial`) would take that block's next line as
+    // a step at the pin.
+    if rest.is_none()
+        && end == limit
+        && limit < tokens.len()
+        && newline(view, tokens, limit)
+        && starts_term(tokens, limit)
+    {
+        return Err(refusal(view, tokens, limit));
     }
     let mut steps = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().copied().enumerate() {
@@ -85,6 +113,17 @@ pub(super) fn plan(
     Ok(Calculation { start, steps, end })
 }
 
+/// Whether the token at `at` can begin a term, and so a calculation step. The tokens that cannot
+/// are the separators, the clause keywords and the tactic combinators that follow a tactic.
+fn starts_term(tokens: &[LexedToken], at: usize) -> bool {
+    !matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(
+        s.as_str(),
+        "|" | "," | ";" | ":" | ":=" | "=>" | "<;>" | "at" | "with" | "then" | "else" | "from"
+            | "in" | "using" | "generalizing" | "where" | "deriving" | "termination_by"
+            | "decreasing_by"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +157,22 @@ mod tests {
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    /// After a one-step calculation the pin reads the next line as a step whatever its column
+    /// or its enclosing block, and rejects one without `:=`; with `:=` it is a step.
+    #[test]
+    fn a_one_step_calculation_takes_the_next_line_as_a_step() {
+        for source in [
+            "theorem t (a b : Nat) (h : a = b) : a = b := by\n  calc a = b := h\n  done\n",
+            "theorem t (a b : Nat) (h : a = b) : b = b := by\n  calc a = b := h\n  exact rfl\n",
+            "theorem t (a b : Nat) (h : a = b) : a = b ∧ True := by\n  constructor\n  · calc a = b := h\n  · trivial\n",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        let source =
+            "theorem t (a b c : Nat) (h : a = b) (k : b = c) : a = c := by\n  calc a = b := h\n  b = c := k\n";
+        assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
     }
 
     fn tokens(view: &SourceView) -> Vec<LexedToken> {

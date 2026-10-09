@@ -179,9 +179,9 @@ impl Context {
         };
         let mode = if kind == &parser_kind(&["Tactic", "first"]) {
             Mode::First
-        } else if kind == &parser_kind(&["Tactic", "try"]) {
+        } else if kind == &parser_kind(&["Tactic", "tacticTry_"]) {
             Mode::Try
-        } else if kind == &parser_kind(&["Tactic", "repeat"]) {
+        } else if kind == &parser_kind(&["Tactic", "tacticRepeat_"]) {
             Mode::Repeat
         } else {
             return Ok(None);
@@ -201,11 +201,18 @@ impl Context {
         let mut branches = Vec::new();
         if mode == Mode::First {
             let rows = expect_null_args(body, "tactic alternatives")?;
-            if rows.is_empty() || rows.len() % 2 != 0 {
+            if rows.is_empty() {
                 return Err(error(TacticError::MalformedScript));
             }
-            for pair in rows.as_chunks::<2>().0 {
+            // Each alternative is a `group` of its `|` and its sequence.
+            for row in rows {
                 self.tick()?;
+                let pair = expect_node(
+                    row,
+                    &Name::str(Name::anonymous(), "group"),
+                    2,
+                    "alternative",
+                )?;
                 expect_atom(&pair[0], "|", "alternative separator")?;
                 branches.push(self.proof_instructions(&pair[1])?);
             }

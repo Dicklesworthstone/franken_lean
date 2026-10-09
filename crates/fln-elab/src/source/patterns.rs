@@ -199,6 +199,179 @@ pub(super) fn anonymous_head() -> Syntax {
     )
 }
 
+/// `if let p := e then a else b` is `match e with | p => a | _ => b` (`termIfLet`'s macro,
+/// `Init/Notation.lean`).
+fn expand_if_let(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["termIfLet"]) && args.len() == 9);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let mut take = |index: usize| std::mem::replace(&mut args[index], null(vec![]));
+    let (case, value, yes, no) = (take(2), take(4), take(6), take(8));
+    let alternative = |pattern: Syntax, body: Syntax| {
+        Syntax::node(
+            parser_kind(&["Term", "matchAlt"]),
+            vec![atom("|"), null(vec![null(vec![pattern])]), atom("=>"), body],
+        )
+    };
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(vec![
+                    alternative(case, yes),
+                    alternative(
+                        Syntax::node(parser_kind(&["Term", "hole"]), vec![atom("_")]),
+                        no,
+                    ),
+                ])],
+            ),
+        ],
+    )
+}
+
+/// `e matches p | q` is `match e with | p => true | q => true | _ => false` (the macro of
+/// `Lean.«term_Matches_|»`, `Init/Notation.lean`, which shares one `true` between the
+/// alternatives; one alternative per pattern means the same).
+fn expand_matches(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["Lean", "term_Matches_|"]) && args.len() == 3);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let value = std::mem::replace(&mut args[0], null(vec![]));
+    let Syntax::Node { args: listed, .. } = &mut args[2] else {
+        return syntax;
+    };
+    let alternative = |pattern: Syntax, body: Syntax| {
+        Syntax::node(
+            parser_kind(&["Term", "matchAlt"]),
+            vec![atom("|"), null(vec![null(vec![pattern])]), atom("=>"), body],
+        )
+    };
+    let mut alternatives: Vec<Syntax> = listed
+        .iter()
+        .step_by(2)
+        .map(|pattern| {
+            alternative(
+                pattern.clone(),
+                identifier(Name::from_components(["Bool", "true"])),
+            )
+        })
+        .collect();
+    alternatives.push(alternative(
+        wildcard(),
+        identifier(Name::from_components(["Bool", "false"])),
+    ));
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(parser_kind(&["Term", "matchAlts"]), vec![null(alternatives)]),
+        ],
+    )
+}
+
+/// Whether `syntax` is a term `let` whose declaration is a pattern (`letPatDecl`, `let ⟨a, b⟩ := p`)
+/// with no `letConfig` option, which [`expand_let_pattern`] rewrites.
+fn let_pattern(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Term", "let"])
+            && args.len() == 5
+            && matches!(&args[1], Syntax::Node { kind, args: config, .. }
+                if kind == &parser_kind(&["Term", "letConfig"])
+                    && matches!(config.as_slice(), [Syntax::Node { args: options, .. }]
+                        if options.is_empty()))
+            && matches!(&args[2], Syntax::Node { kind, args: declaration, .. }
+                if kind == &parser_kind(&["Term", "letDecl"])
+                    && matches!(declaration.as_slice(), [Syntax::Node { kind, args: parts, .. }]
+                        if kind == &parser_kind(&["Term", "letPatDecl"])
+                            && parts.len() == 5
+                            && parts[0].kind() != Some(&parser_kind(&["Term", "hole"]))
+                            && matches!(&parts[1], Syntax::Node { args, .. } if args.is_empty()))))
+}
+
+/// `let p := v; b` with a pattern is `match v with | p => b`, and `let p : T := v; b` is
+/// `match (v : T) with | p => b` (`elabLetDeclCore`'s `letPatDecl` case, `Lean/Elab/Binders.lean`).
+fn expand_let_pattern(mut syntax: Syntax, pattern: bool) -> Syntax {
+    if pattern || !let_pattern(&syntax) {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked let");
+    };
+    let body = std::mem::replace(&mut args[4], null(vec![]));
+    let Syntax::Node { args: declaration, .. } = &mut args[2] else {
+        unreachable!("checked declaration");
+    };
+    let Syntax::Node { args: parts, .. } = &mut declaration[0] else {
+        unreachable!("checked pattern declaration");
+    };
+    let case = std::mem::replace(&mut parts[0], null(vec![]));
+    let value = std::mem::replace(&mut parts[4], null(vec![]));
+    let annotation = match &mut parts[2] {
+        Syntax::Node { args: spec, .. } => match spec.as_mut_slice() {
+            [Syntax::Node { args: typed, .. }] if typed.len() == 2 => {
+                Some(std::mem::replace(&mut typed[1], null(vec![])))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let value = match annotation {
+        Some(type_) => Syntax::node(
+            parser_kind(&["Term", "typeAscription"]),
+            vec![atom("("), value, atom(":"), null(vec![type_]), atom(")")],
+        ),
+        None => value,
+    };
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(vec![Syntax::node(
+                    parser_kind(&["Term", "matchAlt"]),
+                    vec![atom("|"), null(vec![null(vec![case])]), atom("=>"), body],
+                )])],
+            ),
+        ],
+    )
+}
+
 /// `‹T›` is `(by assumption : T)` (`macro "‹" type:term "›" : term`, `Init/Tactics.lean`).
 fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
     let rewrite = !pattern
@@ -991,6 +1164,9 @@ impl Context {
                 || record_terms::is_field_notation(node)
                 || fun_patterns(node)
                 || node.kind() == Some(&Name::from_components(["term‹_›"]))
+                || node.kind() == Some(&Name::from_components(["termIfLet"]))
+                || let_pattern(node)
+                || node.kind() == Some(&Name::from_components(["Lean", "term_Matches_|"]))
                 || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
                 || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
@@ -1033,6 +1209,10 @@ impl Context {
                             || kind == &parser_kind(&["Term", "doIfLet"])
                         {
                             index == 1
+                        } else if kind == &Name::from_components(["termIfLet"])
+                            || kind == &Name::from_components(["Lean", "term_Matches_|"])
+                        {
+                            index == 2
                         } else if kind == &parser_kind(&["Term", "doPatDecl"])
                             || kind == &parser_kind(&["Term", "letPatDecl"])
                         {
@@ -1061,6 +1241,9 @@ impl Context {
                     let node = expand_fun_patterns(node, pattern);
                     let node = expand_field_equations(node, pattern);
                     let node = expand_assumption(node, pattern);
+                    let node = expand_if_let(node, pattern);
+                    let node = expand_let_pattern(node, pattern);
+                    let node = expand_matches(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)

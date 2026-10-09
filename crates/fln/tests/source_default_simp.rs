@@ -593,6 +593,9 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
+        // An instance's attributes likewise, inert or not; the instance alone is admitted below.
+        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
+        "@[default_instance] instance : OfNat Bool 7 := ⟨false⟩",
     ] {
         assert!(
             fln_parse::parse_definition(source.as_bytes()).is_ok(),
@@ -600,6 +603,7 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         );
         refused(&base, source);
     }
+    checked(&base, &["instance : OfNat Bool 7 := ⟨false⟩"]);
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000

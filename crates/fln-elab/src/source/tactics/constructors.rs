@@ -753,7 +753,13 @@ impl Context {
         for row in rows {
             let name = match row {
                 Syntax::Ident { val, .. } if seen.insert(val.clone()) => val.clone(),
-                Syntax::Atom { val, .. } if val == "_" => Name::anonymous(),
+                // `ident <|> hole`: a `_` is a `Term.hole`.
+                Syntax::Node { kind, args, .. }
+                    if kind == &parser_kind(&["Term", "hole"])
+                        && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
+                {
+                    Name::anonymous()
+                }
                 _ => return Err(error(TacticError::MalformedScript)),
             };
             names.push(name);

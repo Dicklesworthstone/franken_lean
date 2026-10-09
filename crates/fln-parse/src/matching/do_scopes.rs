@@ -165,6 +165,34 @@ impl DoScopes {
         })
     }
 
+    /// `leftArrow doElemParser` (`doIdDecl`, `doPatDecl`, `nestedAction`): an `if` or `match` right
+    /// after a `←` is a do element, not a term. `doIf`'s `withPositionAfterLinebreak` anchors it at
+    /// its own column after a line break, and otherwise at the enclosing sequence's position, which
+    /// a bracket's `withoutPosition` clears.
+    pub(super) fn arrow_element(
+        &self,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        at: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if at == 0
+            || !(is_symbol(tokens, at - 1, "←") || is_symbol(tokens, at - 1, "<-"))
+            || !(is_symbol(tokens, at, "if") || is_symbol(tokens, at, "match"))
+        {
+            return None;
+        }
+        if later_line(view, tokens, at, at - 1) {
+            return Some(column(view, tokens, at));
+        }
+        Some(
+            self.sequences
+                .last()
+                .filter(|s| s.depth == depth)
+                .map_or(0, |s| s.baseline),
+        )
+    }
+
     pub(super) fn after(
         &mut self,
         tokens: &[LexedToken],

@@ -493,7 +493,11 @@ impl Context {
                         proof.cursor += 1;
                         return Ok(ProofAction::Attempt(spec));
                     }
-                    if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"])) {
+                    // `done` with no goal left succeeds, as `skip` does (`evalDone`,
+                    // `Lean/Elab/Tactic/BuiltinTactic.lean`).
+                    if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"]))
+                        || instruction.kind() == Some(&parser_kind(&["Tactic", "done"]))
+                    {
                         proof.cursor += 1;
                         continue;
                     }
@@ -613,6 +617,14 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "fail"]) {
                 return Err(error(TacticError::ExplicitFailure));
+            } else if kind == &parser_kind(&["Tactic", "done"]) {
+                // An unsolved goal reaches `done`: it fails, and `first` may catch that.
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "done", "done")?;
+                let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
+                return Err(error(TacticError::UnsolvedGoals { count }));
             } else if kind == &parser_kind(&["Tactic", "tactic_<;>_"]) {
                 let [left, separator, right] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -856,17 +868,29 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {
+                // `"generalize " generalizeArg,+ (location)?`: one argument, at the goal.
+                let [keyword, arguments, location] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "generalize", "generalize keyword")?;
+                expect_empty_null(location, "goal-only generalize location")?;
+                let [argument] = expect_null_args(arguments, "generalize arguments")? else {
+                    return Err(error(TacticError::MalformedScript));
+                };
                 let [
-                    keyword,
                     witness,
                     expression,
                     equality,
                     Syntax::Ident { val: name, .. },
-                ] = args.as_slice()
+                ] = expect_node(
+                    argument,
+                    &parser_kind(&["Tactic", "generalizeArg"]),
+                    4,
+                    "generalize argument",
+                )?
                 else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(keyword, "generalize", "generalize keyword")?;
                 expect_atom(equality, "=", "generalize equality")?;
                 let equality = match expect_null_args(witness, "generalize witness")? {
                     [] => None,
@@ -925,20 +949,23 @@ impl Context {
                     left,
                 );
                 self.close_proof_goal(goal, value)?;
-            } else if kind == &parser_kind(&["Tactic", "calc"]) {
-                let [term] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
+            } else if kind == &Name::from_components(["Lean", "calcTactic"]) {
+                // The tactic's steps are read as the term's (`start_calculation`).
                 return Ok(ProofAction::Term {
-                    syntax: term,
+                    syntax: instruction,
                     goal,
                     apply: false,
                 });
-            } else if kind == &parser_kind(&["Tactic", "solve_by_elim"]) {
-                let [keyword] = args.as_slice() else {
+            } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
+                let [keyword, star, config, only, arguments, using] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "solve_by_elim", "local proof search tactic")?;
+                expect_empty_null(star, "solve_by_elim star")?;
+                expect_default_config(config, "solve_by_elim configuration")?;
+                expect_empty_null(only, "solve_by_elim only")?;
+                expect_empty_null(arguments, "solve_by_elim arguments")?;
+                expect_empty_null(using, "solve_by_elim using")?;
                 self.solve_by_elim_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {

@@ -22,12 +22,8 @@ fn ctor(
     // `ctor := optional docComment >> "| " >> declModifiers >> rawIdent >> optDeclSig`
     // (`Lean/Parser/Command.lean`): a constructor's doc comes before its `|`.
     let doc = if symbol(tokens, range.start, "/--") {
-        null_node(vec![crate::doc_comment_syntax(
-            view,
-            leaves,
-            tokens,
-            range.start,
-        )?])
+        // `doc_comment_syntax` is already the optional slot: `null[docComment]`.
+        crate::doc_comment_syntax(view, leaves, tokens, range.start)?
     } else {
         null_node(vec![])
     };
@@ -63,12 +59,14 @@ fn ctor(
     ))
 }
 
-/// `inductive` at token `keyword` (1 after a doc comment, else 0).
+/// `inductive` at token `keyword` of `prefix` (the doc comment's end, the attributes' end and the
+/// keyword, as `declaration_prefix` finds them).
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
-    keyword: usize,
+    prefix: (usize, usize, usize),
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
+    let (doc_end, attributes_end, keyword) = prefix;
     if !matches!(
         tokens.get(keyword + 1).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
@@ -81,10 +79,13 @@ pub(super) fn parse(
     let mut end_header = cursor;
     let mut nesting = Vec::new();
     while end_header < end_body {
+        // Without `where`, the first constructor's doc comment ends the header (`ctor` opens
+        // with `optional docComment`).
         if nesting.is_empty()
             && (symbol(&tokens, end_header, "where")
                 || symbol(&tokens, end_header, ":=")
-                || symbol(&tokens, end_header, "|"))
+                || symbol(&tokens, end_header, "|")
+                || symbol(&tokens, end_header, "/--"))
         {
             break;
         }
@@ -173,7 +174,8 @@ pub(super) fn parse(
             records::deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
-    let modifiers = records::modifiers_after_doc(&view, &leaves, &tokens, keyword)?;
+    let modifiers =
+        crate::declaration_modifiers(&view, &leaves, &tokens, doc_end, attributes_end, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(

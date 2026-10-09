@@ -418,6 +418,14 @@ impl AttributeReader<'_> {
         if self.word("extern") {
             return self.extern_attribute();
         }
+        // `syntax (name := coe) "coe" : attr`, declared in namespace `Lean.Attr`.
+        if self.word("coe") {
+            let head = self.atom("coe")?;
+            return Ok(Shape::Node(
+                Name::from_components(["Lean", "Attr", "coe"]),
+                vec![head],
+            ));
+        }
         for keyword in ["instance", "default_instance"] {
             if self.word(keyword) {
                 let head = self.atom(keyword)?;
@@ -859,8 +867,6 @@ mod tests {
             "@[] def x := 0",
             "@[class] def x := 0",
             "@[ext (iff := false)] def x := 0",
-            "@[simp] instance value : Inhabited Nat := Inhabited.mk 0",
-            "@[simp] inductive T where | mk",
             "@[simp]",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
@@ -868,6 +874,8 @@ mod tests {
         // Attributes the pin parses keep their place in `declModifiers`; the elaborator, not
         // the parser, refuses the ones it does not implement (`fln`'s source_default_simp).
         for source in [
+            "@[simp] instance value : Inhabited Nat := Inhabited.mk 0",
+            "@[simp] inductive T where | mk",
             "@[other] def x := 0",
             "@[simp, other] def x := 0",
             "@[simp 4294967296] def x := 0",

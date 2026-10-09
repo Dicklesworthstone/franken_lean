@@ -41,7 +41,6 @@ fn malformed_or_unsupported_do_never_drops_a_statement() {
         "do let n : ← read; return n",
         "do let n ← ; return n",
         "do return 7; return 8",
-        "do let mut n := 0; return n",
         "do for n ns do return n",
         "do if c then",
         "do break 7",
@@ -49,6 +48,15 @@ fn malformed_or_unsupported_do_never_drops_a_statement() {
     ] {
         let source = format!("def work := {value}");
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+    // `let mut` and a reassignment are the pin's `doLet` with its `mut` slot and `doReassign`;
+    // the elaborator refuses both (`mutable_do_variables_are_refused_not_dropped`, `crates/fln`).
+    for value in [
+        "do let mut n := 0; return n",
+        "do let mut n := 0; n := n + 1; return n",
+    ] {
+        let source = format!("def work := {value}");
+        assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
     }
 }
 #[test]

@@ -34,6 +34,106 @@ instance idOfNat {A : Type} {n : Nat} [inst : OfNat A n] : OfNat (Id A) n := ins
 "#,
     )
 }
+/// A `do` `if` with `else if` clauses (the pin's `doIf` clause list) means the nested `if` in
+/// its `else`: `de1 1` takes the second branch and `de1 7` the last, and a wrong value is refused.
+#[test]
+fn do_else_if_clauses_are_the_nested_conditionals() {
+    let base = engine();
+    let de1 = "def de1 (n : Nat) : Id Nat := do\n  if n = 0 then\n    return 1\n  \
+               else if n = 1 then\n    return 2\n  else\n    return 3\n";
+    checked(
+        &base,
+        &format!("{de1}theorem de1_one : de1 1 = 2 := by rfl\ntheorem de1_two : de1 7 = 3 := by rfl\n"),
+    );
+    let source = format!("{de1}theorem de1_wrong : de1 1 = 3 := by rfl\n");
+    assert!(
+        !matches!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits()),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+/// `let x ← if …` and `let x ← match …` bind a do element (`leftArrow doElemParser`), which the
+/// pin compiles as the nested sequence `let x ← do if …`: the branches are do sequences in the
+/// surrounding control scope, so a `return` in a branch returns from the function (`ae5 true` is
+/// `5`, never `15`). A nested action `(← if …)` is still refused; `bif` is a term and binds.
+#[test]
+fn if_and_match_after_an_arrow_bind_do_elements() {
+    let base = engine();
+    checked(
+        &base,
+        "def ae1 (c : Bool) : Id Nat := do\n  let x ← if c then (1 : Id Nat) else (2 : Id Nat)\n  return x\n\
+         theorem ae1_t : ae1 true = 1 := by rfl\ntheorem ae1_f : ae1 false = 2 := by rfl\n\
+         def ae2 (o : Option Nat) : Id Nat := do\n  let x ← match o with\n    | Option.some _ => (3 : Id Nat)\n    | Option.none => (0 : Id Nat)\n  return x\n\
+         theorem ae2_s : ae2 (Option.some 7) = 3 := by rfl\ntheorem ae2_n : ae2 Option.none = 0 := by rfl\n\
+         def ae5 (c : Bool) : Id Nat := do\n  let x ← if c then return 5 else (1 : Id Nat)\n  return x + 10\n\
+         theorem ae5_t : ae5 true = 5 := by rfl\ntheorem ae5_f : ae5 false = 11 := by rfl\n",
+    );
+    for source in [
+        "def ae1 (c : Bool) : Id Nat := do\n  let x ← if c then (1 : Id Nat) else (2 : Id Nat)\n  return x\n\
+         theorem ae1_wrong : ae1 true = 2 := by rfl\n",
+        "def ae5 (c : Bool) : Id Nat := do\n  let x ← if c then return 5 else (1 : Id Nat)\n  return x + 10\n\
+         theorem ae5_wrong : ae5 true = 15 := by rfl\n",
+        "def ae3 (c : Bool) : Id Nat := do\n  let x := (← if c then (1 : Id Nat) else (2 : Id Nat))\n  return x\n",
+    ] {
+        assert!(
+            !matches!(
+                base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits()),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+    checked(
+        &base,
+        "def cond {α : Type} (c : Bool) (x y : α) : α :=\n  match c with\n  | true => x\n  | false => y\n\
+         def ae4 (c : Bool) : Id Nat := do\n  let x ← bif c then (1 : Id Nat) else (2 : Id Nat)\n  return x\n\
+         theorem ae4_true : ae4 true = 1 := by rfl\n",
+    );
+}
+/// A do-level `have` (`doHave`) is the term `have` over the rest of the block: the hypothesis is
+/// in scope there and the block's value is unchanged; `have` binds with `:=` only.
+#[test]
+fn do_level_have_scopes_over_the_rest_of_the_block() {
+    let base = engine();
+    let hv = "def hv (n : Nat) : Id Nat := do\n  have h : n = n := rfl\n  have : n + 1 = n + 1 := rfl\n  return (n + 1)\n";
+    checked(&base, &format!("{hv}theorem hv_val : hv 4 = 5 := by rfl\n"));
+    for source in [
+        format!("{hv}theorem hv_wrong : hv 4 = 4 := by rfl\n"),
+        "def hv_arrow (n : Nat) : Id Nat := do\n  have h ← (n : Id Nat)\n  return h\n".to_string(),
+    ] {
+        assert!(
+            !matches!(
+                base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits()),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+/// A pattern's update `(a, b) := e` parses as the pin's `doReassign` of a `letPatDecl`; the
+/// elaborator refuses reassignment, as it refuses `x := e`, after parsing.
+#[test]
+fn pattern_reassignment_is_refused_after_parsing() {
+    let source = "def tr (n : Nat) : Id Nat := do\n  let mut a := 0\n  let mut b := 0\n  (a, b) := (n, n)\n  return a\n";
+    match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
+        Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
+        Ok(_) => {}
+        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+    }
+}
+/// A `while` loop parses as the pin's `doWhile`; the elaborator does not lower it (the pin's macro
+/// is `repeat if c then s else break`), so it refuses the definition after parsing.
+#[test]
+fn while_loops_are_refused_after_parsing() {
+    let source = "def wl (n : Nat) : Id Nat := do\n  let mut i := 0\n  while i < n do\n    i := i + 1\n  return i\n";
+    match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
+        Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
+        Ok(_) => {}
+        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+    }
+}
 #[test]
 fn named_binds_pure_lets_and_returns_are_council_checked() {
     checked(

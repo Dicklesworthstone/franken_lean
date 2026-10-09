@@ -7,6 +7,7 @@ pub mod instances;
 pub mod modifiers;
 pub mod mutual;
 pub mod reducibility;
+pub(crate) mod syntax_decls;
 pub mod trees;
 pub mod variables;
 
@@ -614,7 +615,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 }
                 continue;
             }
-            let scope_start = (control(symbol) || line_command(symbol)) && command_line;
+            // `deriving instance … for …` is a command; `deriving C` alone is a declaration's
+            // clause and stays with it.
+            let deriving_command = symbol == "deriving"
+                && matches!(tokens.get(index + 1).map(|t| &t.kind),
+                    Some(TokenKind::Symbol(next)) if next == "instance");
+            let scope_start =
+                (control(symbol) || line_command(symbol) || deriving_command) && command_line;
             // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
             // …) precede the declaration keyword in one command (`declModifiers`).
             // `local` and `scoped` (`attrKind`) lead `instance`, `notation`, `syntax`, … the same way.
@@ -625,6 +632,9 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // `class inductive` and `class abbrev` are one declaration keyword at the pin.
             let after_class = index > 0
                 && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "class");
+            // `deriving instance …` is one command: its `instance` starts none.
+            let after_deriving = index > 0
+                && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "deriving");
             // A command keyword after the prefix is its command's (`@[inherit_doc f]` then
             // `infixr:100 …` on the next line).
             let continues_prefix = (attribute_prefix
@@ -636,6 +646,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 continue;
             }
             if depth == 0
+                && !after_deriving
                 && (scope_start || declaration(symbol) || inline_start || continues_prefix)
             {
                 if !continues_prefix {
@@ -1065,19 +1076,21 @@ mod tests {
         }
         // A command the pin lets a doc lead and this grammar does not parse keeps its doc: the
         // file partitions, and that one command is refused where it is parsed.
-        let unparsed = "/-- d -/\nscoped syntax \"x\" : term\ndef y : Nat := 1\n";
+        let unparsed = "/-- d -/\nmacro \"x\" : term => `(0)\ndef y : Nat := 1\n";
         let commands = partition(unparsed.as_bytes()).unwrap();
         assert_eq!(commands.len(), 2, "{commands:?}");
         assert!(
             std::str::from_utf8(commands[0].1)
                 .unwrap()
-                .starts_with("/-- d -/\nscoped syntax")
+                .starts_with("/-- d -/\nmacro")
         );
         assert!(!matches!(
             parse(commands[0].1),
             Ok(Some(ScopeCommand::Trivia))
         ));
         assert!(crate::parse_source_command(commands[0].1).is_err());
+        // A syntax declaration is parsed with its doc (`Command.syntax`).
+        assert!(crate::parse_source_command(b"/-- d -/\nscoped syntax \"x\" : term").is_ok());
         // The pin validates a declaration doc's manual links ("Unknown documentation type `f`")
         // and stores a module doc's unvalidated; both verdicts measured 2026-10-07.
         let linked = "/-- see [](lean-manual://f) -/\ndef x := 44\n";

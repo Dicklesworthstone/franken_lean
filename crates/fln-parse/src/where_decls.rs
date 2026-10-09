@@ -78,14 +78,42 @@ pub(super) fn syntax(
     ))
 }
 
-/// One `letRecDecl` spanning `name..end`.
+/// One `letRecDecl` spanning `start..end`: its doc comment and attributes, then its name.
 fn declaration(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
-    name: usize,
+    start: usize,
     end: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let doc = if is(start, "/--") {
+        crate::doc_comment_syntax(view, leaves, tokens, start)?
+    } else {
+        null_node(Vec::new())
+    };
+    let attributes_at = start + usize::from(is(start, "/--"));
+    let name = crate::command_scope::attributes::inline_end(view, tokens, attributes_at)?;
+    let attributes =
+        crate::command_scope::attributes::inline_syntax(view, leaves, tokens, attributes_at)?;
+    if !matches!(tokens.get(name).map(|t| &t.kind), Some(TokenKind::Ident(_))) || name >= end {
+        return Err(refuse(view, tokens, name.min(end)));
+    }
+    // `letRecDecl`'s `Termination.suffix`: a `termination_by`/`decreasing_by` at depth 0 ends the
+    // declaration's value.
+    let (end, suffix) = match crate::termination_start(tokens, name + 1, end) {
+        Some(at) => (at, crate::termination_suffix(leaves, view, tokens, at..end)?),
+        None => (
+            end,
+            Syntax::node(
+                parser_kind(&["Termination", "suffix"]),
+                vec![null_node(Vec::new()), null_node(Vec::new())],
+            ),
+        ),
+    };
+    let wrap = |declaration: Syntax| {
+        rec_declaration(declaration, doc.clone(), attributes.clone(), suffix.clone())
+    };
     let (parameters, mut cursor) =
         bounded_binders(view, tokens, name + 1, DefinitionGrammar::Scalar)?;
     let explicit_type =
@@ -139,7 +167,7 @@ fn declaration(
                 alternatives,
             ],
         );
-        return Ok(rec_declaration(declaration));
+        return Ok(wrap(declaration));
     }
     if cursor >= end || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":=") {
         return Err(refuse(view, tokens, cursor.min(end)));
@@ -171,22 +199,19 @@ fn declaration(
             value,
         ],
     );
-    Ok(rec_declaration(declaration))
+    Ok(wrap(declaration))
 }
 
-/// A `letRecDecl` around one `letIdDecl` or `letEqnsDecl`, with no attributes or termination
-/// hints.
-fn rec_declaration(declaration: Syntax) -> Syntax {
+/// A `letRecDecl` around one `letIdDecl` or `letEqnsDecl`, with its doc comment, attributes and
+/// termination hints.
+fn rec_declaration(declaration: Syntax, doc: Syntax, attributes: Syntax, suffix: Syntax) -> Syntax {
     Syntax::node(
         parser_kind(&["Term", "letRecDecl"]),
         vec![
-            null_node(Vec::new()),
-            null_node(Vec::new()),
+            doc,
+            attributes,
             Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
-            Syntax::node(
-                parser_kind(&["Termination", "suffix"]),
-                vec![null_node(Vec::new()), null_node(Vec::new())],
-            ),
+            suffix,
         ],
     )
 }
@@ -201,7 +226,12 @@ pub(super) fn struct_instance(
     tokens: &[LexedToken],
     keyword: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let starts = declaration_starts(view, tokens, keyword)?;
+    // `instance … where` with no field: every field takes its default.
+    let starts = if keyword + 1 == tokens.len() {
+        Vec::new()
+    } else {
+        declaration_starts(view, tokens, keyword)?
+    };
     let mut fields = Vec::with_capacity(starts.len() * 2);
     for (index, &name) in starts.iter().enumerate() {
         let end = starts.get(index + 1).copied().unwrap_or(tokens.len());
@@ -231,14 +261,22 @@ fn declaration_starts(
     keyword: usize,
 ) -> Result<Vec<usize>, NatDefinitionParseError> {
     let first = keyword + 1;
+    // A declaration may lead with its doc comment and its attributes (`letRecDecl`), whose
+    // name line belongs to it.
+    let prefix = |at: usize| {
+        matches!(tokens.get(at).map(|t| &t.kind),
+            Some(TokenKind::Symbol(s)) if s == "/--" || s == "@[")
+    };
     if !matches!(
         tokens.get(first).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
-    ) {
+    ) && !prefix(first)
+    {
         return Err(refuse(view, tokens, first));
     }
     let indent = column(view, tokens, first);
     let mut starts = vec![first];
+    let mut pending_name = prefix(first);
     let mut depth = 0usize;
     for at in first + 1..tokens.len() {
         if opens(tokens, at) {
@@ -246,11 +284,18 @@ fn declaration_starts(
         } else if closes(tokens, at) {
             depth = depth.saturating_sub(1);
         } else if depth == 0
-            && matches!(tokens[at].kind, TokenKind::Ident(_))
+            && (matches!(tokens[at].kind, TokenKind::Ident(_)) || prefix(at))
             && line(view, tokens, at) > line(view, tokens, at - 1)
             && column(view, tokens, at) == indent
         {
+            if pending_name {
+                pending_name = prefix(at);
+                continue;
+            }
             starts.push(at);
+            pending_name = prefix(at);
+        } else if depth == 0 && matches!(tokens[at].kind, TokenKind::Ident(_)) {
+            pending_name = false;
         }
     }
     Ok(starts)

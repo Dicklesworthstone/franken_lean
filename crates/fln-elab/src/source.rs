@@ -1546,7 +1546,7 @@ impl Context {
                         }
                         Task::CalcNext(build) => {
                             if let Some(step) = build.steps.get(build.cursor) {
-                                let relation = &step[0];
+                                let relation = step.0;
                                 // The pin elaborates a calc relation with
                                 // `elabType`; its result may inhabit any Sort.
                                 let expected = self.type_expected()?;
@@ -1559,7 +1559,7 @@ impl Context {
                         Task::CalcRelation(mut build) => {
                             let relation = values.pop().expect("calculation relation visit");
                             let relation = self.prepare_calculation_step(&mut build, relation)?;
-                            let proof = &build.steps[build.cursor][2];
+                            let proof = build.steps[build.cursor].1;
                             tasks.push(Task::CalcProof(build, relation.clone()));
                             tasks.push(Task::Visit(proof, Some(relation), true));
                         }
@@ -1927,7 +1927,9 @@ impl Context {
                                     }
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "calc"]) {
+                                if kind == &Name::from_components(["Lean", "calc"])
+                                    || kind == &Name::from_components(["Lean", "calcTactic"])
+                                {
                                     tasks.push(Task::CalcNext(
                                         self.start_calculation(syntax, expected)?,
                                     ));
@@ -2138,6 +2140,36 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                // The ranges with an unbounded side, in namespace `Std`
+                                // (`Init/Data/Range/Polymorphic/PRange.lean`): `macro_rules`
+                                // makes `*...b` and `*...<b` `Rio.mk b`, `*...=b` `Ric.mk b`,
+                                // `a...*` `Rci.mk a`, `a<...*` `Roi.mk a` and `*...*` `Rii.mk`.
+                                let unbounded = [
+                                    ("term*..._", "*...", "Rio", 1..2),
+                                    ("term*...<_", "*...<", "Rio", 1..2),
+                                    ("term*...=_", "*...=", "Ric", 1..2),
+                                    ("term_...*", "...*", "Rci", 0..1),
+                                    ("term_<...*", "<...*", "Roi", 0..1),
+                                    ("term*...*", "*...*", "Rii", 1..1),
+                                ]
+                                .into_iter()
+                                .find(|(label, ..)| kind == &Name::from_components(["Std", label]));
+                                if let Some((_, spelling, constant, operands)) = unbounded {
+                                    let arity = if operands.is_empty() { 1 } else { 2 };
+                                    let parts = expect_node(syntax, kind, arity, "unbounded range")?;
+                                    let symbol = if operands.start == 0 { arity - 1 } else { 0 };
+                                    expect_atom(&parts[symbol], spelling, "unbounded range")?;
+                                    let function = self.constant(&Name::from_components([
+                                        "Std", constant, "mk",
+                                    ]))?;
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(&parts[operands]),
+                                        expected,
+                                        false,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &Name::str(Name::anonymous(), "term-_") {
                                     let parts =
                                         expect_node(syntax, kind, 2, "arithmetic negation")?;
@@ -2174,6 +2206,9 @@ impl Context {
                                 // here rather than read as `(f x) a`.
                                 let pipeline = if kind == &Name::from_components(["term_<|_"]) {
                                     Some(("<|", 0, 2))
+                                } else if kind == &Name::from_components(["term_$__"]) {
+                                    // `f $ a`, `<|`'s other spelling (`Init/Notation.lean:557`).
+                                    Some(("$", 0, 2))
                                 } else if kind == &Name::from_components(["term_|>_"]) {
                                     Some(("|>", 2, 0))
                                 } else {
@@ -3379,7 +3414,13 @@ impl Context {
             let [keywords, declarations, separator, body] = parts else {
                 return Err(failure(SourceInferenceError::Scope));
             };
-            let [keyword, rec] = expect_null_args(keywords, "let rec keywords")? else {
+            let [keyword, rec] = expect_node(
+                keywords,
+                &Name::str(Name::anonymous(), "group"),
+                2,
+                "let rec keywords",
+            )?
+            else {
                 return Err(failure(SourceInferenceError::Scope));
             };
             expect_atom(keyword, "let", "recursive local keyword")?;
@@ -3401,7 +3442,24 @@ impl Context {
                 4,
                 "local recursive definition",
             )?;
-            expect_empty_null(&declaration[0], "absent local doc comment")?;
+            // A local declaration's doc comment has no meaning the kernel sees.
+            match expect_null_args(&declaration[0], "local doc comment")? {
+                [] => {}
+                [doc] => {
+                    let doc = expect_node(
+                        doc,
+                        &parser_kind(&["Command", "docComment"]),
+                        2,
+                        "local doc comment",
+                    )?;
+                    expect_atom(&doc[0], "/--", "local doc comment opener")?;
+                }
+                _ => {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "one local doc comment",
+                    });
+                }
+            }
             expect_empty_null(&declaration[1], "absent local attributes")?;
             let termination = expect_node(
                 &declaration[3],
@@ -4321,7 +4379,10 @@ fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefiniti
         result = Syntax::node(
             parser_kind(&["Term", "letrec"]),
             vec![
-                null(vec![atom("let"), atom("rec")]),
+                Syntax::node(
+                    Name::str(Name::anonymous(), "group"),
+                    vec![atom("let"), atom("rec")],
+                ),
                 Syntax::node(
                     parser_kind(&["Term", "letRecDecls"]),
                     vec![null(vec![declaration])],

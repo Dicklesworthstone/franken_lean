@@ -38,6 +38,20 @@ pub(super) fn deriving_suffix(
     tokens: &[LexedToken],
     start: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    Ok(Syntax::node(
+        parser_kind(&["Command", "optDeriving"]),
+        vec![deriving_clause(leaves, view, tokens, start)?],
+    ))
+}
+
+/// `("deriving " derivingClass,+)?` from `start` to the last token, as its optional node: empty,
+/// or the keyword and the classes (each a name), as `optDeriving` and `optDefDeriving` hold it.
+pub(super) fn deriving_clause(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
     let mut suffix = Vec::new();
     if start < tokens.len() {
         if !symbol(tokens, start, "deriving") || start + 1 == tokens.len() {
@@ -62,27 +76,13 @@ pub(super) fn deriving_suffix(
         }
         suffix = vec![leaves.leaf(start)?, null_node(classes)];
     }
-    Ok(Syntax::node(
-        parser_kind(&["Command", "optDeriving"]),
-        vec![null_node(suffix)],
-    ))
+    Ok(null_node(suffix))
 }
 pub(super) fn modifiers() -> Syntax {
     Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
         (0..7).map(|_| null_node(Vec::new())).collect(),
     )
-}
-
-/// The declaration's `declModifiers`: its doc comment when the keyword at `keyword` follows one
-/// (`keyword` is 1), every other slot empty.
-pub(super) fn modifiers_after_doc(
-    view: &SourceView,
-    leaves: &Leaves,
-    tokens: &[LexedToken],
-    keyword: usize,
-) -> Result<Syntax, NatDefinitionParseError> {
-    modifiers_with_doc(view, leaves, tokens, (keyword != 0).then_some(0))
 }
 
 /// A `declModifiers` node holding only the doc comment at token `doc`, if any.
@@ -142,6 +142,12 @@ fn field(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let doc = doc_at(tokens, range.start).then_some(range.start);
     let range = range.start + usize::from(doc.is_some())..range.end;
+    // `private` or `protected` before the field's name.
+    let visibility = ["private", "protected"]
+        .into_iter()
+        .find(|word| symbol(tokens, range.start, word))
+        .map(|word| (word, range.start));
+    let range = range.start + usize::from(visibility.is_some())..range.end;
     if !matches!(
         tokens.get(range.start).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
@@ -163,27 +169,45 @@ fn field(
     let default = if type_limit < range.end {
         let bounded_tokens = &tokens[..range.end];
         let (bindings, body_start) = bounded_let_bindings(view, bounded_tokens, type_limit + 1)?;
-        null_node(vec![Syntax::node(
-            parser_kind(&["Term", "binderDefault"]),
-            vec![
-                leaves.leaf(type_limit)?,
-                bounded_value_syntax(
-                    leaves,
-                    view,
-                    bounded_tokens,
-                    bindings,
-                    body_start,
-                    DefinitionGrammar::Scalar,
-                )?,
-            ],
-        )])
+        let value = bounded_value_syntax(
+            leaves,
+            view,
+            bounded_tokens,
+            bindings,
+            body_start,
+            DefinitionGrammar::Scalar,
+        )?;
+        // `:= by tac` is `binderTactic` (an `autoParam` field), not a default value that happens
+        // to be a proof: `" := " " by " tacticSeq` wins over `binderDefault` at the pin.
+        let tactic = symbol(tokens, type_limit + 1, "by")
+            && value.kind() == Some(&parser_kind(&["Term", "byTactic"]));
+        null_node(vec![match (tactic, &value) {
+            (true, Syntax::Node { args, .. }) if args.len() == 2 => Syntax::node(
+                parser_kind(&["Term", "binderTactic"]),
+                vec![leaves.leaf(type_limit)?, args[0].clone(), args[1].clone()],
+            ),
+            _ => Syntax::node(
+                parser_kind(&["Term", "binderDefault"]),
+                vec![leaves.leaf(type_limit)?, value],
+            ),
+        }])
     } else {
         null_node(Vec::new())
     };
+    let mut field_modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
+    // `declModifiers := docComment? attributes? visibility? protected? …`: `private` is a
+    // visibility, `protected` a slot of its own.
+    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut field_modifiers) {
+        let slot = if word == "protected" { 3 } else { 2 };
+        args[slot] = null_node(vec![Syntax::node(
+            parser_kind(&["Command", word]),
+            vec![leaves.leaf(at)?],
+        )]);
+    }
     Ok(Syntax::node(
         parser_kind(&["Command", "structSimpleBinder"]),
         vec![
-            modifiers_with_doc(view, leaves, tokens, doc)?,
+            field_modifiers,
             leaves.leaf(range.start)?,
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
@@ -337,12 +361,14 @@ fn parents(
     )]))
 }
 
-/// `structure`/`class` at token `keyword` (1 after a doc comment, else 0).
+/// `structure`/`class` after its `declModifiers`: `prefix` is where the doc comment, the
+/// attributes and the modifier keywords end, the last being the keyword's token.
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
-    keyword: usize,
+    prefix: (usize, usize, usize),
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
+    let (doc_end, attributes_end, keyword) = prefix;
     let is_class = symbol(&tokens, keyword, "class");
     if !matches!(
         tokens.get(keyword + 1).map(|t| &t.kind),
@@ -376,10 +402,46 @@ pub(super) fn parse(
         if !symbol(&tokens, end_header, "where") {
             return Err(refuse(&view, &tokens, end_header));
         }
-        let fields = fields(&leaves, &view, body_tokens, keyword, end_header + 1)?;
+        // `structCtor := declModifiers ident " :: "`: the constructor's own name, after its doc
+        // comment and visibility if any (which otherwise lead the first field).
+        let mut name = end_header + 1;
+        let doc = doc_at(&tokens, name).then_some(name);
+        name += usize::from(doc.is_some());
+        let visibility = ["private", "protected"]
+            .into_iter()
+            .find(|word| symbol(&tokens, name, word))
+            .map(|word| (word, name));
+        name += usize::from(visibility.is_some());
+        let named_ctor = matches!(tokens.get(name).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+            && symbol(&tokens, name + 1, "::");
+        let ctor = if named_ctor {
+            let mut ctor_modifiers = modifiers_with_doc(&view, &leaves, &tokens, doc)?;
+            if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut ctor_modifiers)
+            {
+                let slot = if word == "protected" { 3 } else { 2 };
+                args[slot] = null_node(vec![Syntax::node(
+                    parser_kind(&["Command", word]),
+                    vec![leaves.leaf(at)?],
+                )]);
+            }
+            null_node(vec![Syntax::node(
+                parser_kind(&["Command", "structCtor"]),
+                vec![
+                    ctor_modifiers,
+                    leaves.leaf(name)?,
+                    null_node(Vec::new()),
+                    leaves.leaf(name + 1)?,
+                ],
+            )])
+        } else {
+            null_node(Vec::new())
+        };
+        let first_field = if named_ctor { name + 2 } else { end_header + 1 };
+        // Fields are indented past the command's start, its modifiers included.
+        let fields = fields(&leaves, &view, body_tokens, 0, first_field)?;
         null_node(vec![
             leaves.leaf(end_header)?,
-            null_node(Vec::new()),
+            ctor,
             Syntax::node(
                 parser_kind(&["Command", "structFields"]),
                 vec![null_node(fields)],
@@ -409,7 +471,8 @@ pub(super) fn parse(
             deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
-    let modifiers = modifiers_after_doc(&view, &leaves, &tokens, keyword)?;
+    let modifiers =
+        crate::declaration_modifiers(&view, &leaves, &tokens, doc_end, attributes_end, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(
@@ -457,7 +520,6 @@ mod tests {
             "structure A where\n  x : Nat\nderiving",
             "structure A where\n  x Nat",
             "class A where\n  x : (Nat",
-            "structure A where\n  mk ::",
             "structure A extra",
         ] {
             assert!(
@@ -469,6 +531,8 @@ mod tests {
             "structure Empty",
             "structure Empty where",
             "structure Empty : Type where",
+            // A named constructor and no fields (`structCtor`), which the elaborator refuses.
+            "structure A where\n  mk ::",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
         }
