@@ -6695,11 +6695,30 @@ impl Engine {
                             queue.push_front(step);
                         }
                     }
+                    // The pin's `in` macro: `section set_option o v <command> end`.
+                    ScopeCommand::SetOptionIn { name, value, body } => {
+                        for step in [
+                            Step::Scope(command_index, ScopeCommand::Section(None)),
+                            Step::Scope(command_index, ScopeCommand::SetOption { name, value }),
+                            Step::Command(
+                                command_index,
+                                fln_parse::BytePos(original_offset.0 + body),
+                                &command_source[body..],
+                            ),
+                            Step::Scope(command_index, ScopeCommand::End(None)),
+                        ]
+                        .into_iter()
+                        .rev()
+                        {
+                            queue.push_front(step);
+                        }
+                    }
                     ScopeCommand::Namespace(_)
                     | ScopeCommand::Section(_)
                     | ScopeCommand::End(_)
                     | ScopeCommand::Open(_)
                     | ScopeCommand::OpenScoped(_)
+                    | ScopeCommand::SetOption { .. }
                     | ScopeCommand::Universe(_) => {
                         scopes.check_limits(&control).map_err(|(resource, limit)| {
                             scope_error(
@@ -6977,21 +6996,34 @@ impl Engine {
             } else {
                 source_evaluation::Entry::Value
             };
-            let execution =
-                match engine.execute_definition_entry(declaration, options, limits, entry) {
-                    Ok(Outcome::Complete(execution)) => execution,
-                    Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
-                    Ok(Outcome::InternalFault(fault)) => {
-                        return Ok(Outcome::InternalFault(fault));
-                    }
-                    Err(error) => {
-                        return Err(EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        });
-                    }
-                };
+            // Golem reads its options at command entry (`maxHeartbeats`). An option `set_option`
+            // set and the table honored in this scope overrides the batch's value.
+            let scoped_options = (!scope.options.is_empty()).then(|| {
+                let mut merged = options.clone();
+                for (name, value) in scope.options.entries() {
+                    merged.insert(name.clone(), value.clone());
+                }
+                merged
+            });
+            let execution = match engine.execute_definition_entry(
+                declaration,
+                scoped_options.as_ref().unwrap_or(options),
+                limits,
+                entry,
+            ) {
+                Ok(Outcome::Complete(execution)) => execution,
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => {
+                    return Ok(Outcome::InternalFault(fault));
+                }
+                Err(error) => {
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    });
+                }
+            };
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }

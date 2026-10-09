@@ -270,20 +270,38 @@ impl Engine {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
                     }
-                    if let fln_parse::command_scope::ScopeCommand::OpenIn {
-                        names,
-                        scoped,
-                        body,
-                    } = control
-                    {
-                        for step in open_in_steps(start, command, names, scoped, body)
-                            .into_iter()
-                            .rev()
-                        {
-                            queue.push_front(step);
+                    let expanded = match control {
+                        fln_parse::command_scope::ScopeCommand::OpenIn {
+                            names,
+                            scoped,
+                            body,
+                        } => Ok((
+                            if scoped {
+                                fln_parse::command_scope::ScopeCommand::OpenScoped(names)
+                            } else {
+                                fln_parse::command_scope::ScopeCommand::Open(names)
+                            },
+                            body,
+                        )),
+                        fln_parse::command_scope::ScopeCommand::SetOptionIn {
+                            name,
+                            value,
+                            body,
+                        } => Ok((
+                            fln_parse::command_scope::ScopeCommand::SetOption { name, value },
+                            body,
+                        )),
+                        other => Err(other),
+                    };
+                    let control = match expanded {
+                        Ok((scope, body)) => {
+                            for step in in_steps(start, command, scope, body).into_iter().rev() {
+                                queue.push_front(step);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
+                        Err(control) => control,
+                    };
                     if let fln_parse::command_scope::ScopeCommand::Variable(syntax) = control {
                         let variables = source_records::elaboration_outcome(
                             fln_elab::source::scope::variables::declare(
@@ -454,7 +472,10 @@ pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError>
             loop {
                 match parse_control_command(command, start, file, count)? {
                     Some(fln_parse::command_scope::ScopeCommand::Trivia) => {}
-                    Some(fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }) => {
+                    Some(
+                        fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
+                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. },
+                    ) => {
                         start = fln_parse::BytePos(start.0 + body);
                         command = &command[body..];
                         continue;
@@ -512,22 +533,17 @@ enum SourceStep<'source> {
 
 /// `open A in <command>` as the pin's `Command.in` macro elaborates it: `section`, `open A`,
 /// the command, `end`. The command keeps its true offset in the file.
-fn open_in_steps<'source>(
+/// The same macro serves `set_option o v in <command>`, with `set_option o v` as `scope`.
+fn in_steps<'source>(
     start: fln_parse::BytePos,
     command: &'source [u8],
-    names: Vec<Name>,
-    scoped: bool,
+    scope: fln_parse::command_scope::ScopeCommand,
     body: usize,
 ) -> [SourceStep<'source>; 4] {
     use fln_parse::command_scope::ScopeCommand;
-    let open = if scoped {
-        ScopeCommand::OpenScoped(names)
-    } else {
-        ScopeCommand::Open(names)
-    };
     [
         SourceStep::Scope(start, ScopeCommand::Section(None)),
-        SourceStep::Scope(start, open),
+        SourceStep::Scope(start, scope),
         SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
         SourceStep::Scope(start, ScopeCommand::End(None)),
     ]

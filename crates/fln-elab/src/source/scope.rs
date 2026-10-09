@@ -1,6 +1,7 @@
 //! Explicit command scope for native source elaboration. It carries no admission
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
+pub mod options;
 pub mod simp;
 pub mod variables;
 use crate::aliases::AliasTable;
@@ -18,6 +19,9 @@ pub struct SourceScope {
     /// a recursor the pin's code generator refuses (`codegen.rs`, bead
     /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
     pub frontier_recursors: bool,
+    /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
+    /// section or namespace. Every elaboration in this scope starts with them.
+    pub options: KVMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +259,7 @@ impl Context {
     pub(super) fn scoped(env: &Environment, kernel: Budget, scope: &SourceScope) -> Self {
         let mut context = Self::new(env, kernel);
         context.source_scope = scope.clone();
+        context.txn.options = scope.options.clone();
         context.txn.lctx = scope.variables.locals().clone();
         context.next = scope.variables.next();
         context
@@ -544,6 +549,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            options: KVMap::new(),
         };
         let env = [
             "Decidable.decide",
@@ -729,6 +735,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            options: KVMap::new(),
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
             scope.resolve_with_aliases(&n(name), |x| env.contains(x), &aliases, protected)
@@ -797,6 +804,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            options: KVMap::new(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];
         let resolve = |name: &str| scope.resolve(&n(name), |x| names.contains(x));

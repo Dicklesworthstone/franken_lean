@@ -31,6 +31,21 @@ pub enum ScopeCommand {
         scoped: bool,
         body: usize,
     },
+    /// `set_option <name> <value>` (`Lean.Parser.Command.«set_option»`): the option holds to the
+    /// end of the enclosing `section` or `namespace`. `value` is the pin's `optionValue` (`true`,
+    /// `false`, a string or a numeral) as read; whether it is admitted is the option table's
+    /// decision, not the parser's.
+    SetOption {
+        name: Name,
+        value: fln_core::options::DataValue,
+    },
+    /// `set_option <name> <value> in <command>`: the pin's `in` macro elaborates it as
+    /// `section set_option <name> <value> <command> end`. `body` is as in [`ScopeCommand::OpenIn`].
+    SetOptionIn {
+        name: Name,
+        value: fln_core::options::DataValue,
+        body: usize,
+    },
     Trivia,
 }
 
@@ -75,6 +90,7 @@ fn control(s: &str) -> bool {
             | "variable"
             | "include"
             | "omit"
+            | "set_option"
     )
 }
 /// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
@@ -345,6 +361,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         }
         return attributes::parse(source).map(|attribute| attribute.map(ScopeCommand::Simp));
     }
+    if keyword == "set_option" {
+        return set_option(&view, &tokens, source.len()).map(Some);
+    }
     if !control(keyword) {
         return Ok(None);
     }
@@ -395,6 +414,78 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     Ok(Some(command))
 }
 
+/// `set_option`'s operands, as the pin's `«set_option»` reads them: an identifier, then
+/// `optionValue` (`nonReservedSymbol "true" <|> nonReservedSymbol "false" <|> strLit <|> numLit`,
+/// vendored `src/Lean/Parser/Command.lean`), then the end of the command or `in` and one more
+/// command. A numeral is read in its own radix and refused past `u64`, the width of the
+/// `DataValue` it becomes. A string is read only without escapes or gaps, so nothing here decodes
+/// one differently from the pin; one with a backslash is refused.
+fn set_option(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    use fln_core::options::DataValue;
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let Some(TokenKind::Ident(name)) = tokens.get(1).map(|token| &token.kind) else {
+        return Err(bad(1));
+    };
+    let Some(operand) = tokens.get(2) else {
+        return Err(bad(2));
+    };
+    let text = view
+        .normalized()
+        .as_str()
+        .get(operand.extent.start().0..operand.extent.end().0)
+        .ok_or_else(|| bad(2))?;
+    let value = match &operand.kind {
+        TokenKind::Ident(word) if *word == Name::from_components(["true"]) => {
+            DataValue::OfBool(true)
+        }
+        TokenKind::Ident(word) if *word == Name::from_components(["false"]) => {
+            DataValue::OfBool(false)
+        }
+        TokenKind::Literal(LiteralKind::Nat) => {
+            let (digits, radix) = match text.get(..2) {
+                Some("0x" | "0X") => (&text[2..], 16),
+                Some("0b" | "0B") => (&text[2..], 2),
+                Some("0o" | "0O") => (&text[2..], 8),
+                _ => (text, 10),
+            };
+            DataValue::OfNat(u64::from_str_radix(digits, radix).map_err(|_| bad(2))?)
+        }
+        TokenKind::Literal(LiteralKind::Str) => {
+            let inner = text
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .filter(|inner| !inner.contains('\\'))
+                .ok_or_else(|| bad(2))?;
+            DataValue::OfString(inner.to_owned())
+        }
+        _ => return Err(bad(2)),
+    };
+    match tokens.get(3) {
+        None => Ok(ScopeCommand::SetOption {
+            name: name.clone(),
+            value,
+        }),
+        Some(token) if matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "in") => {
+            let body = tokens.get(4).ok_or_else(|| bad(4))?;
+            Ok(ScopeCommand::SetOptionIn {
+                name: name.clone(),
+                value,
+                body: view.to_original(body.extent.start()).0,
+            })
+        }
+        Some(_) => Err(bad(3)),
+    }
+}
+
 /// Partition both scope commands and declarations, preserving every source byte.
 /// Delimiters protect nested terms and explicit universe argument lists; comments
 /// and strings are lexer events, not text searched for command-looking words.
@@ -421,7 +512,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     // body's layout block is measured from the command's first token, not its keyword.
     let mut prefix_column = None;
     // `open A in <command>` is one command: after an `open`'s `in`, the next command that
-    // starts belongs to it.
+    // starts belongs to it. `set_option o v in <command>` is the same `in`.
     let mut current_open = false;
     let mut open_in = false;
     let mut mutual_until = 0;
@@ -488,7 +579,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                         starts.push(view.to_original(token.extent.start()).0);
                     }
                     open_in = false;
-                    current_open = scope_start && symbol == "open";
+                    current_open = scope_start && (symbol == "open" || symbol == "set_option");
                     prefix_column = inline_start.then(|| column(token));
                 }
                 attribute_prefix = inline_start || (continues_prefix && !declaration(symbol));
@@ -646,6 +737,75 @@ mod tests {
         // An `in` inside a later declaration does not reach back to an earlier open.
         let file = "open A\ndef f := Id.run do\n  for x in [1] do pure ()\n  pure 0\ndef g := 1";
         assert_eq!(partition(file.as_bytes()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn set_option_reads_the_pins_option_values_and_its_in_form() {
+        use fln_core::options::DataValue;
+        let option = |source: &str| match parse(source.as_bytes()).unwrap() {
+            Some(ScopeCommand::SetOption { name, value }) => (name.to_display_string(), value),
+            other => panic!("{source}: {other:?}"),
+        };
+        assert_eq!(
+            option("set_option linter.unusedVariables false"),
+            ("linter.unusedVariables".into(), DataValue::OfBool(false))
+        );
+        assert_eq!(
+            option("set_option autoLift true"),
+            ("autoLift".into(), DataValue::OfBool(true))
+        );
+        assert_eq!(
+            option("set_option maxHeartbeats 400000 -- more"),
+            ("maxHeartbeats".into(), DataValue::OfNat(400_000))
+        );
+        assert_eq!(option("set_option o 0x10").1, DataValue::OfNat(16));
+        assert_eq!(option("set_option o 0b101").1, DataValue::OfNat(5));
+        assert_eq!(
+            option("set_option o \"text\"").1,
+            DataValue::OfString("text".into())
+        );
+
+        let source = "set_option pp.all true in\n#check 1";
+        assert_eq!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::SetOptionIn {
+                name: Name::from_components(["pp", "all"]),
+                value: DataValue::OfBool(true),
+                body: source.find("#check").unwrap(),
+            })
+        );
+        // The body belongs to the option; the command after it does not.
+        let file =
+            "set_option autoLift false in\ndef x := 1\ndef y := 2\nset_option autoLift true\n";
+        let texts: Vec<_> = partition(file.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "set_option autoLift false in\ndef x := 1\n",
+                "def y := 2\n",
+                "set_option autoLift true\n"
+            ]
+        );
+
+        // Not the pin's `optionValue`, a value past `u64`, a string with an escape, no value,
+        // trailing tokens, and `in` without a command: each refused, none ignored.
+        for source in [
+            "set_option",
+            "set_option o",
+            "set_option o maybe",
+            "set_option o 1.5",
+            "set_option o 18446744073709551616",
+            "set_option o \"a\\nb\"",
+            "set_option o true false",
+            "set_option o true in",
+            "set_option 3 true",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
     }
 
     #[test]

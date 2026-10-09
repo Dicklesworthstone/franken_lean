@@ -138,7 +138,10 @@ pub fn preflight_source_program(
                 match fln_parse::command_scope::parse(bytes)
                     .map_err(|error| parse_error(module.name, index, at, error))?
                 {
-                    Some(fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }) => {
+                    Some(
+                        fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
+                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. },
+                    ) => {
                         at.0 += body;
                         bytes = &bytes[body..];
                     }

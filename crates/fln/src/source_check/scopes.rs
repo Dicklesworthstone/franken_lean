@@ -338,6 +338,23 @@ impl Scopes {
                 }
                 self.current.universes.extend(names);
             }
+            // Only the option table admits an option; a refusal names it. An honored option is
+            // kept in the scope, so `end` restores the value the enclosing scope had.
+            ScopeCommand::SetOption { name, value } => {
+                match fln_elab::source::scope::options::admit(&name, &value)
+                    .map_err(|refusal| refusal.to_string())?
+                {
+                    fln_elab::source::scope::options::Effect::Honored => {
+                        self.current.options.insert(name, value);
+                    }
+                    fln_elab::source::scope::options::Effect::NoChange => {}
+                }
+            }
+            ScopeCommand::SetOptionIn { .. } => {
+                return Err(
+                    "`set_option … in` is expanded by the command loop, never applied".into(),
+                );
+            }
             ScopeCommand::Trivia => {}
         }
         Ok(())
@@ -377,7 +394,9 @@ mod tests {
             vec![n("Library"), n("Library.Parser"), n("Library.Parser.Term")]
         );
         assert_eq!(
-            scopes.current.resolve(&n("value"), |name| name == &n("Library.Parser.Term.value")),
+            scopes
+                .current
+                .resolve(&n("value"), |name| name == &n("Library.Parser.Term.value")),
             Ok(Some(n("Library.Parser.Term.value")))
         );
     }
@@ -410,7 +429,11 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(scopes.current, before);
-        assert!(scopes.apply(ScopeCommand::Open(vec![n("A"), n("Missing")])).is_err());
+        assert!(
+            scopes
+                .apply(ScopeCommand::Open(vec![n("A"), n("Missing")]))
+                .is_err()
+        );
         assert_eq!(scopes.current, before);
     }
 
@@ -418,10 +441,14 @@ mod tests {
     fn scoped_open_does_not_make_names_available_to_later_items() {
         let mut scopes = scopes(&["A", "A.B"]);
         let before = scopes.current.clone();
-        assert!(scopes.transition(
-            ScopeCommand::OpenScoped(vec![n("A"), n("B")]),
-            &Environment::new(),
-        ).is_err());
+        assert!(
+            scopes
+                .transition(
+                    ScopeCommand::OpenScoped(vec![n("A"), n("B")]),
+                    &Environment::new(),
+                )
+                .is_err()
+        );
         assert_eq!(scopes.current, before);
     }
 
@@ -432,7 +459,9 @@ mod tests {
         scopes.current.namespace = n("Outer");
         scopes.namespaces.insert(escaped.clone());
         open(&mut scopes, &["_root_.Root"]);
-        scopes.apply(ScopeCommand::Open(vec![escaped.clone()])).unwrap();
+        scopes
+            .apply(ScopeCommand::Open(vec![escaped.clone()]))
+            .unwrap();
         assert_eq!(scopes.current.opened, vec![n("Root"), escaped]);
     }
 
