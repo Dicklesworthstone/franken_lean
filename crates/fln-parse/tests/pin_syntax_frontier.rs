@@ -36,11 +36,9 @@ const MANIFEST: &str = "crates/fln-syntax/tests/corpus/pin_syntax_manifest.tsv";
 const PRODUCER: &str = "scripts/extract/dump_command_syntax.lean";
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("the workspace root is two levels above the crate")
+    // The tree this run was launched from, refused if the binary was compiled in
+    // another checkout (bead fln-cross-tree-baked-root-k60n).
+    fln_core::checked_workspace_root!()
 }
 
 fn pin_commit(root: &Path) -> String {

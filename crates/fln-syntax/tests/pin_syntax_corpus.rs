@@ -33,11 +33,9 @@ const PRODUCER: &str = "scripts/extract/dump_command_syntax.lean";
 const WORKERS: usize = 8;
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("the workspace root is two levels above the crate")
+    // The tree this run was launched from, refused if the binary was compiled in
+    // another checkout (bead fln-cross-tree-baked-root-k60n).
+    fln_core::checked_workspace_root!()
 }
 
 /// The pin's tag and commit, from `SUITE.lock`'s `reference leanprover/lean4` line.
