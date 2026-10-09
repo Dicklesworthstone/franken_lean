@@ -37,6 +37,39 @@ fn apply(name: &[&str], mut arguments: Vec<Syntax>) -> Syntax {
     )
 }
 impl Context {
+    fn do_exception_remaining(
+        &mut self,
+        function: &Typed,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
+        let mut head = &function.value;
+        let mut supplied = 0_usize;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            supplied = supplied.checked_add(1).ok_or_else(invalid)?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        if name != &Name::from_components(["MonadExcept", "tryCatch"])
+            && name != &Name::from_components(["tryCatchThe"])
+            && name != &Name::from_components(["tryFinally"])
+        {
+            return Ok(None);
+        }
+        let Some(info) = self.txn.env.find(name) else {
+            return Ok(None);
+        };
+        let mut declaration_type = info.constant_val().type_.clone();
+        let mut arity = 0_usize;
+        while let ExprNode::ForallE { body, .. } = declaration_type.node() {
+            self.tick()?;
+            arity = arity.checked_add(1).ok_or_else(invalid)?;
+            declaration_type = body.clone();
+        }
+        Ok(arity.checked_sub(supplied).filter(|n| *n != 0))
+    }
+
     /// Choose an exception combinator's still-unknown monad/result parameters
     /// before its protected action, not just before its last argument. Nested
     /// handlers and finalizers need that expected monad while resolving the
@@ -47,33 +80,7 @@ impl Context {
         function: &Typed,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        let mut head = &function.value;
-        let mut supplied = 0_usize;
-        while let ExprNode::App { f, .. } = head.node() {
-            self.tick()?;
-            supplied = supplied.checked_add(1).ok_or_else(invalid)?;
-            head = f;
-        }
-        let ExprNode::Const { name, .. } = head.node() else {
-            return Ok(());
-        };
-        if name != &Name::from_components(["MonadExcept", "tryCatch"])
-            && name != &Name::from_components(["tryCatchThe"])
-            && name != &Name::from_components(["tryFinally"])
-        {
-            return Ok(());
-        }
-        let Some(info) = self.txn.env.find(name) else {
-            return Ok(());
-        };
-        let mut declaration_type = info.constant_val().type_.clone();
-        let mut arity = 0_usize;
-        while let ExprNode::ForallE { body, .. } = declaration_type.node() {
-            self.tick()?;
-            arity = arity.checked_add(1).ok_or_else(invalid)?;
-            declaration_type = body.clone();
-        }
-        let Some(remaining) = arity.checked_sub(supplied).filter(|n| *n != 0) else {
+        let Some(remaining) = self.do_exception_remaining(function)? else {
             // Later arguments of a function-valued result do not belong to
             // the operation's own telescope and must not change its choices.
             return Ok(());
@@ -113,6 +120,78 @@ impl Context {
             self.constrain_type(element, target_element)?;
         }
         Ok(())
+    }
+
+    /// Infer only the protected action when its monad is still unknown. The
+    /// declared penultimate slot distinguishes it from a handler, finalizer,
+    /// type argument, or later argument of a function-valued result.
+    pub(in crate::source) fn do_exception_infer_action(
+        &mut self,
+        function: &Typed,
+        domain: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.do_exception_remaining(function)? != Some(2)
+            || !matches!(
+                function.type_.node(),
+                ExprNode::ForallE {
+                    binder_info: BinderInfo::Default,
+                    ..
+                }
+            )
+        {
+            return Ok(false);
+        }
+        let domain = self.instantiate(domain)?;
+        Ok(
+            matches!(domain.node(), ExprNode::App { f, .. } if matches!(f.node(), ExprNode::MVar { .. })),
+        )
+    }
+
+    /// A function-backed action may already have a normalized world/state Pi
+    /// type. Use its original inferred application to choose still-unknown
+    /// parameters, then check the unchanged action against the original domain.
+    pub(in crate::source) fn finish_do_exception_action(
+        &mut self,
+        action: Typed,
+        domain: &Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let expected = self.instantiate(domain)?;
+        if let ExprNode::App {
+            f: monad,
+            a: element,
+        } = expected.node()
+            && matches!(monad.node(), ExprNode::MVar { .. })
+            && let Some(original) = self.known_type(&action.value)?
+        {
+            // Preserve a visible constructor such as Id before reducing any
+            // abbreviation to its body. Only recover through aliases when the
+            // original type does not already provide a known application.
+            let original = if matches!(original.node(), ExprNode::App { f, .. } if !f.has_expr_mvar())
+            {
+                original
+            } else {
+                self.whnf_with_transparency(
+                    &original,
+                    UnificationTransparency::Abbreviations,
+                    true,
+                )?
+            };
+            if let ExprNode::App {
+                f: actual_monad,
+                a: actual_element,
+            } = original.node()
+                && !actual_monad.has_expr_mvar()
+            {
+                self.constrain_type(monad, actual_monad)?;
+                let element = self.instantiate(element)?;
+                if matches!(element.node(), ExprNode::MVar { .. }) {
+                    self.constrain_type(&element, actual_element)?;
+                }
+            }
+        }
+        let action = self.finish_term(action, Some(domain))?;
+        self.constrain_type(&action.type_, domain)?;
+        Ok(action)
     }
 
     /// The pin lowers `catch | ...` to a fresh named handler whose body is a

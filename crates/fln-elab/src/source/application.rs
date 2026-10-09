@@ -38,6 +38,7 @@ pub(super) struct Argument<'a> {
     pub(super) value: ApplicationValue<'a>,
     pub(super) domain: Expr,
     pub(super) codomain: Expr,
+    pub(super) infer_exception_action: bool,
 }
 
 pub(super) fn has_named(arguments: &[Syntax]) -> bool {
@@ -171,6 +172,8 @@ impl Context {
                 }
                 return Ok(Some(Argument {
                     value,
+                    infer_exception_action: self
+                        .do_exception_infer_action(&state.function, &domain)?,
                     domain,
                     codomain,
                 }));

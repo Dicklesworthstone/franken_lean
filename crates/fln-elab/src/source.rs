@@ -1318,7 +1318,8 @@ impl Context {
             StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
-            CheckArgument(&'a Syntax, Expr),
+            CheckArgument(&'a Syntax, Expr, bool),
+            InferredExceptionArgument(Expr),
             ArgumentComplete(usize),
             ForCollection(Option<Expr>),
             Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
@@ -1477,7 +1478,7 @@ impl Context {
                         pending.close_scope(self)?;
                     }
                     match task {
-                        Task::CheckArgument(syntax, expected) => {
+                        Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
                                 &pending,
@@ -1490,7 +1491,16 @@ impl Context {
                                 attempts.push(Attempt::Argument(Box::new(checkpoint)));
                                 tasks.push(Task::ArgumentComplete(index));
                             }
-                            tasks.push(Task::Visit(syntax, Some(expected), true));
+                            if infer_exception_action {
+                                tasks.push(Task::InferredExceptionArgument(expected));
+                                tasks.push(Task::Visit(syntax, None, true));
+                            } else {
+                                tasks.push(Task::Visit(syntax, Some(expected), true));
+                            }
+                        }
+                        Task::InferredExceptionArgument(expected) => {
+                            let action = values.pop().expect("inferred protected action visit");
+                            values.push(self.finish_do_exception_action(action, &expected)?);
                         }
                         Task::ArgumentComplete(index) => {
                             if index + 1 != attempts.len() {
@@ -2585,12 +2595,24 @@ impl Context {
                                 match argument.value {
                                     application::ApplicationValue::Syntax(syntax) => {
                                         tasks.push(Task::NamedArgument(state, argument.codomain));
-                                        tasks.push(Task::CheckArgument(syntax, argument.domain));
+                                        tasks.push(Task::CheckArgument(
+                                            syntax,
+                                            argument.domain,
+                                            argument.infer_exception_action,
+                                        ));
                                     }
                                     application::ApplicationValue::Elaborated(value) => {
-                                        let value =
-                                            self.finish_term(value, Some(&argument.domain))?;
-                                        self.constrain_type(&value.type_, &argument.domain)?;
+                                        let value = if argument.infer_exception_action {
+                                            self.finish_do_exception_action(
+                                                value,
+                                                &argument.domain,
+                                            )?
+                                        } else {
+                                            let value =
+                                                self.finish_term(value, Some(&argument.domain))?;
+                                            self.constrain_type(&value.type_, &argument.domain)?;
+                                            value
+                                        };
                                         self.add_named_argument(
                                             &mut state,
                                             &argument.codomain,
@@ -2651,7 +2673,7 @@ impl Context {
                                 tasks.push(Task::Argument(
                                     function, codomain, rest, expected, explicit,
                                 ));
-                                tasks.push(Task::CheckArgument(first, domain));
+                                tasks.push(Task::CheckArgument(first, domain, false));
                             } else {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?
