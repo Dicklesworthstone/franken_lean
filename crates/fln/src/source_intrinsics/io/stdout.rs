@@ -15,7 +15,7 @@ pub(crate) fn source_name() -> Name {
     Name::from_components(["IO", "getStdout"])
 }
 
-fn word_bound_models() -> Vec<ConstantInfo> {
+pub(in crate::source_intrinsics) fn word_bound_models() -> Vec<ConstantInfo> {
     let mut constants = bounds::declarations();
     let power = Name::from_components(["Nat", "pow"]);
     for declaration in fln_elab::seed::imported_nat_intrinsic_model_declarations(&power)

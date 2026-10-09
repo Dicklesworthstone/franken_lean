@@ -79,7 +79,7 @@ fn definitions() -> [ConstantInfo; 2] {
     ]
 }
 
-fn character_records() -> Vec<ConstantInfo> {
+pub(super) fn character_records() -> Vec<ConstantInfo> {
     let width = Expr::lit(Literal::Nat(NatLit::from_u64(32)));
     let width = apply(
         Expr::const_(name("OfNat.ofNat"), vec![Level::zero()]),

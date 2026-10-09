@@ -22,6 +22,7 @@ mod records;
 mod specialize;
 mod st;
 mod stdout;
+mod string_push;
 mod transport;
 mod variants;
 
@@ -57,6 +58,7 @@ pub(super) struct Preparation<'a> {
     st: st::Store,
     io: io::Store,
     stdout: stdout::Store,
+    string_push: string_push::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -128,6 +130,7 @@ impl<'a> Preparation<'a> {
             st: st::Store::default(),
             io: io::Store::default(),
             stdout: stdout::Store::default(),
+            string_push: string_push::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
@@ -413,6 +416,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(value) = self.string_push_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(projected) = self.projection_call(&head, &args)? {
                             tasks.push(Task::Visit(projected));
                             continue;
@@ -689,6 +696,10 @@ impl<'a> Preparation<'a> {
                             }
                             if let Some(action) = self.stdout_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
+                                continue;
+                            }
+                            if let Some(value) = self.string_push_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
                                 continue;
                             }
                             if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
