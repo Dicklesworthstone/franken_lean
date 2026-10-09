@@ -5,18 +5,23 @@
 
 use super::*;
 
+mod bytes;
 mod model;
+pub(crate) use bytes::word_matches;
+#[cfg(test)]
+pub(crate) use bytes::{HELPERS as BYTE_HELPERS, assert_pin_layouts as assert_pin_byte_layouts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
     Open,
     PutStr,
     GetLine,
+    Read,
 }
 
 impl Operation {
     pub(crate) fn from_name(requested: &Name) -> Option<Self> {
-        [Self::Open, Self::PutStr, Self::GetLine]
+        [Self::Open, Self::PutStr, Self::GetLine, Self::Read]
             .into_iter()
             .find(|operation| requested == &operation.source_name())
     }
@@ -30,6 +35,7 @@ impl Operation {
                 Self::Open => "mk",
                 Self::PutStr => "putStr",
                 Self::GetLine => "getLine",
+                Self::Read => "read",
             },
         ])
     }
@@ -92,6 +98,9 @@ pub(crate) fn primitive_matches(
         // String alone cannot authorize a different checked logical layout.
         models.extend(crate::source_intrinsics::string_internal::scalar_records());
     }
+    if operation == Operation::Read {
+        bytes::contract_matches(environment, externs, visited, limits)?;
+    }
     let mut comparison = Comparison { visited, limits };
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {
@@ -113,6 +122,7 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
         model::primitive(Operation::Open),
         model::primitive(Operation::PutStr),
         model::primitive(Operation::GetLine),
+        model::primitive(Operation::Read),
     ]) {
         assert!(
             Comparison {

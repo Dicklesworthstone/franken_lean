@@ -175,6 +175,7 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
         ),
         Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
         Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
+        Operation::Read => (vec![c("IO.FS.Handle"), c("USize")], c("ByteArray")),
     };
     let action = Expr::app(c("IO"), result.clone());
     let default = apply(
