@@ -74,7 +74,7 @@ instance loggedException : MonadExcept Nat Logged := MonadExcept.mk (fun {A : Ty
 instance loggedFinalizer : MonadFinally Logged := MonadFinally.mk (fun x f => loggedFinally x f)
 def succeed {A : Type} (a : A) : Logged A := @Pure.pure Logged loggedPure A a
 def raise {A : Type} (e : Nat) : Logged A := @MonadExcept.throw Nat Logged loggedException A e
-def mark (n : Nat) : Logged Nat := fun s => Report.mk (Attempt.ok n) (s * 10 + n)
+def mark (n : Nat) : Logged PUnit := fun s => Report.mk (Attempt.ok PUnit.unit) (s * 10 + n)
 def observed (action : Logged Nat) : Nat :=
   let r := action 0
   match r.output with
@@ -206,7 +206,6 @@ def nested : Logged Nat := do
 def followed : Logged Nat := do
   try
     mark 1
-    succeed (7 : Nat)
   finally
     mark 2
   mark 3

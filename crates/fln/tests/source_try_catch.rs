@@ -127,7 +127,7 @@ def run : Trial Nat := do
   try
     raise (3 : Nat)
   catch e =>
-    succeed (e + 4)
+    succeed PUnit.unit
   return 42
 #eval result run
 "#,
@@ -206,9 +206,9 @@ fn handler_is_lazy_and_does_not_catch_the_following_sequence() {
 def success : Trial Nat := do { try { succeed (7 : Nat) } catch e => { raise (999 : Nat) } }
 def suffix : Trial Nat := do
   try
-    succeed (7 : Nat)
+    succeed PUnit.unit
   catch e =>
-    succeed (999 : Nat)
+    succeed PUnit.unit
   raise (12 : Nat)
 #eval result success
 #eval result suffix
