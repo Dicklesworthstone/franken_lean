@@ -28,6 +28,162 @@ fn execute(source: &str, expected: &str) {
     );
 }
 
+// Build these telescopes directly so parser support for explicit universe
+// syntax cannot hide a failure in the post-admission runtime path.
+fn bare_universe_name(label: &str) -> fln::Name {
+    fln::Name::from_components([label])
+}
+
+fn bare_universe_const(label: &str, levels: Vec<fln::Level>) -> fln::Expr {
+    fln::Expr::const_(bare_universe_name(label), levels)
+}
+
+fn admit_bare_universe_definition(
+    engine: Engine,
+    label: &str,
+    level_params: Vec<fln::Name>,
+    type_: fln::Expr,
+    value: fln::Expr,
+) -> Engine {
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+    let name = bare_universe_name(label);
+    engine
+        .admit_declaration(
+            fln::Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params,
+                    type_,
+                },
+                value,
+                safety: DefinitionSafety::Safe,
+                hints: ReducibilityHints::Abbrev,
+                all: vec![name],
+            }),
+            &KVMap::new(),
+            limits().admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
+fn bare_universe_base() -> Engine {
+    engine()
+        .execute_source_definitions(
+            &[b"def bareLiteralAnswer : Nat := 42"],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
+#[test]
+fn bare_universe_aliases_execute_after_dual_admission_without_logical_changes() {
+    let mut base = admit_bare_universe_definition(
+        bare_universe_base(),
+        "bareLeaf",
+        vec![bare_universe_name("u")],
+        bare_universe_const("Nat", vec![]),
+        bare_universe_const("bareLiteralAnswer", vec![]),
+    );
+    base = admit_bare_universe_definition(
+        base,
+        "bareAlias",
+        vec![bare_universe_name("u")],
+        bare_universe_const("Nat", vec![]),
+        bare_universe_const("bareLeaf", vec![fln::Level::param(bare_universe_name("u"))]),
+    );
+    base = admit_bare_universe_definition(
+        base,
+        "bareEntry",
+        vec![],
+        bare_universe_const("Nat", vec![]),
+        bare_universe_const("bareAlias", vec![fln::Level::one()]),
+    );
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let run = || {
+        base.execute_source_definitions(&[b"#eval bareEntry"], &options, limits())
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let first = run();
+    assert_eq!(first.executions.len(), 1);
+    let VmExit::Returned(value) = &first.executions[0].exit else {
+        panic!("bare universe alias did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    let second = run();
+    assert_eq!(
+        first.executions[0].flbc_artifact,
+        second.executions[0].flbc_artifact
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn bare_universe_callbacks_keep_their_checked_runtime_interface() {
+    use fln::{BinderInfo, Expr};
+    let nat = bare_universe_const("Nat", vec![]);
+    let callback_type = Expr::forall_e(
+        bare_universe_name("x"),
+        nat.clone(),
+        nat.clone(),
+        BinderInfo::Default,
+    );
+    let callback_value = Expr::lam(
+        bare_universe_name("x"),
+        nat.clone(),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let base = admit_bare_universe_definition(
+        bare_universe_base(),
+        "bareCopy",
+        vec![bare_universe_name("u")],
+        callback_type.clone(),
+        callback_value,
+    );
+    // The instanced constant is a value, not an App node. It must be
+    // specialized before partial application builds its callable closure.
+    let value = Expr::let_e(
+        bare_universe_name("saved"),
+        callback_type,
+        bare_universe_const("bareCopy", vec![fln::Level::one()]),
+        Expr::app(
+            Expr::bvar(0).unwrap(),
+            bare_universe_const("bareLiteralAnswer", vec![]),
+        ),
+        false,
+    );
+    let base = admit_bare_universe_definition(base, "bareCallbackEntry", vec![], nat, value);
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let run = base
+        .execute_source_definitions(&[b"#eval bareCallbackEntry"], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(run.executions.len(), 1);
+    let VmExit::Returned(value) = &run.executions[0].exit else {
+        panic!("bare universe callback did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
 const KEEP: &str = "def keep (ignored : Nat) {A : Type} (x : A) : A := x\n";
 
 #[test]

@@ -3,6 +3,197 @@
 use super::*;
 use fln_env::constants::{ConstantVal, ReducibilityHints};
 
+// These worlds exercise post-admission compiler mechanics, not admission itself.
+// The integration tests admit the corresponding declarations through both seats.
+fn bare_universe_definition(label: &str, value: Expr) -> DefinitionVal {
+    let declaration_name = name(label);
+    DefinitionVal {
+        base: ConstantVal {
+            name: declaration_name.clone(),
+            level_params: vec![name("u")],
+            type_: ty("Nat"),
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![declaration_name],
+    }
+}
+
+#[test]
+fn bare_universe_values_receive_private_ground_definitions() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition.clone()))
+        .unwrap();
+    let input = Expr::const_(definition.base.name.clone(), vec![Level::one()]);
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let prepared = preparation.expression(&input).unwrap();
+    let ExprNode::Const { name, levels } = prepared.node() else {
+        panic!("a nullary value must remain a constant, not execute during preparation");
+    };
+    assert_ne!(name, &definition.base.name);
+    assert!(levels.is_empty());
+    let specialized = preparation.specialized_definition(name).unwrap();
+    assert!(specialized.base.level_params.is_empty());
+    assert_eq!(specialized.base.type_, definition.base.type_);
+    assert_eq!(specialized.value, definition.value);
+    assert!(!environment.contains(name));
+    assert_eq!(
+        environment.find(&definition.base.name),
+        Some(&ConstantInfo::Defn(definition.clone()))
+    );
+}
+
+#[test]
+fn bare_universe_cache_keys_distinguish_universes_and_reuse_repeated_values() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let zero = Expr::const_(name("bareAnswer"), vec![Level::zero()]);
+    let one = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    let first = preparation.expression(&zero).unwrap();
+    let second = preparation.expression(&one).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(preparation.expression(&zero).unwrap(), first);
+    assert_eq!(preparation.expression(&one).unwrap(), second);
+    assert_eq!(preparation.specializations.definitions.len(), 2);
+}
+
+#[test]
+fn bare_universe_alias_dependencies_reach_the_executable_catalog() {
+    let inner = bare_universe_definition("bareInner", nat::literal(42));
+    let outer = bare_universe_definition(
+        "bareOuter",
+        Expr::const_(inner.base.name.clone(), vec![Level::param(name("u"))]),
+    );
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(inner))
+        .unwrap()
+        .add_decl(ConstantInfo::Defn(outer))
+        .unwrap();
+    let limits = IngressLimits::default();
+    let mut preparation = Preparation::new(&environment, limits);
+    let prepared = preparation
+        .expression(&Expr::const_(name("bareOuter"), vec![Level::one()]))
+        .unwrap();
+    let catalog =
+        executable_dependencies(&environment, &prepared, limits, &mut preparation).unwrap();
+    assert_eq!(catalog.functions.len(), 2);
+    assert_eq!(preparation.specializations.definitions.len(), 2);
+    for function in &catalog.functions {
+        assert_eq!(function.universe_arity, 0);
+        assert!(function.parameters.is_empty());
+        assert!(!environment.contains(&function.name));
+    }
+    assert!(
+        catalog
+            .functions
+            .iter()
+            .any(|function| function.body == nat::literal(42))
+    );
+    let mut referenced = std::collections::BTreeSet::new();
+    let mut visited = 0;
+    for function in &catalog.functions {
+        collect_executable_constants(&function.body, &mut referenced, &mut visited, limits)
+            .unwrap();
+    }
+    assert_eq!(referenced.len(), 1);
+    assert!(
+        referenced
+            .iter()
+            .all(|name| catalog.functions.iter().any(|f| &f.name == name))
+    );
+}
+
+#[test]
+fn bare_universe_path_leaves_monomorphic_constants_unchanged() {
+    let mut definition = bare_universe_definition("monoAnswer", nat::literal(42));
+    definition.base.level_params.clear();
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let input = ty("monoAnswer");
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    assert_eq!(preparation.expression(&input).unwrap(), input);
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn bare_universe_specialization_never_guesses_open_or_mismatched_levels() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    for levels in [
+        vec![],
+        vec![Level::zero(), Level::one()],
+        vec![Level::param(name("unresolved"))],
+    ] {
+        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+        let input = Expr::const_(name("bareAnswer"), levels);
+        assert!(preparation.specialize_call(&input, &[]).unwrap().is_none());
+        assert!(preparation.specializations.definitions.is_empty());
+    }
+}
+
+#[test]
+fn bare_universe_specialization_refuses_reserved_name_collisions() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let mut collision = bare_universe_definition("collision", nat::literal(0));
+    collision.base.name = Name::num(name("_fln_runtime_specialization"), 0);
+    collision.base.level_params.clear();
+    collision.all = vec![collision.base.name.clone()];
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap()
+        .add_decl(ConstantInfo::Defn(collision.clone()))
+        .unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    assert!(matches!(
+        preparation.expression(&input),
+        Err(IngressError::UnsupportedNode {
+            kind: "runtime specialization name collision"
+        })
+    ));
+    assert!(preparation.specializations.definitions.is_empty());
+    assert_eq!(
+        environment.find(&collision.base.name),
+        Some(&ConstantInfo::Defn(collision.clone()))
+    );
+}
+
+#[test]
+fn bare_universe_specialization_obeys_table_limits_and_allows_a_clean_retry() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    let mut limits = IngressLimits::default();
+    limits.fir.max_functions = 0;
+    let mut preparation = Preparation::new(&environment, limits);
+    assert!(matches!(
+        preparation.expression(&input),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::ProgramTables,
+            limit: 0,
+            observed: 1,
+        })
+    ));
+    assert!(preparation.specializations.definitions.is_empty());
+    let first = Preparation::new(&environment, IngressLimits::default())
+        .expression(&input)
+        .unwrap();
+    let retry = Preparation::new(&environment, IngressLimits::default())
+        .expression(&input)
+        .unwrap();
+    assert_eq!(first, retry);
+}
+
 fn b(index: u32) -> Expr {
     Expr::bvar(index).unwrap()
 }

@@ -89,6 +89,16 @@ impl Preparation<'_> {
     pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
         self.specializations.definitions.get(name).cloned()
     }
+
+    /// Private function, constructor and native-primitive identities remain
+    /// eligible for callable preparation without logical declarations. This is
+    /// only a dispatch filter: ordinary signature and contract checks still run.
+    pub(super) fn has_private_callable(&self, name: &Name) -> bool {
+        self.specializations.definitions.contains_key(name)
+            || self.specializations.constructor_types.contains_key(name)
+            || self.st_intrinsic_type(name).is_some()
+    }
+
     fn definition(&self, name: &Name) -> Option<DefinitionVal> {
         match self.environment.find(name) {
             Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {

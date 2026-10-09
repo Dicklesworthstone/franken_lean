@@ -656,9 +656,28 @@ impl<'a> Preparation<'a> {
                             });
                             tasks.push(Task::Visit(expr.clone()));
                         }
-                        ExprNode::Const { name, .. } => {
+                        ExprNode::Const { name, levels } => {
+                            // No source or private callable means no constructor,
+                            // producer or partial-application transformation can
+                            // apply. Preserve the unresolved name for ingress to
+                            // diagnose, rather than repeat those catalog searches.
+                            if !self.environment.contains(name) && !self.has_private_callable(name)
+                            {
+                                values.push(expr.clone());
+                                continue;
+                            }
                             if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
                                 tasks.push(Task::Visit(constructor));
+                                continue;
+                            }
+                            // Ground universes are static arguments even when no
+                            // term argument is supplied. Use the ordinary checked
+                            // specialization cache before deriving a callable or
+                            // collecting this value's executable dependencies.
+                            if !levels.is_empty()
+                                && let Some(specialized) = self.specialize_call(&expr, &[])?
+                            {
+                                tasks.push(Task::Visit(specialized));
                                 continue;
                             }
                             if let Some(producer) = self.global_producer(&expr, &[])? {
