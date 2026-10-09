@@ -152,7 +152,8 @@ fn select(
                 {
                     sites.push(Site::By(a.0..b.0));
                 }
-            } else if kind.parent() == parser_kind(&["Tactic"])
+            } else if (kind.parent() == parser_kind(&["Tactic"])
+                || kind == &Name::from_components(["Lean", "cdot"]))
                 && ![
                     "tacticSeq",
                     "tacticSeq1Indented",

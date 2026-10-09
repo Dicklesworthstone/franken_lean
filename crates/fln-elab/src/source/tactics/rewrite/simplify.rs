@@ -322,7 +322,13 @@ impl Context {
         for _ in &defaults {
             self.tick()?;
         }
-        let arguments = expect_null_args(arguments, "optional simp rule list")?;
+        let mut arguments = expect_null_args(arguments, "optional simp rule list")?;
+        // `simpa`'s rule list is its own `simpArgs` node (`simpaArgsRest`); `simp`'s is inline.
+        if let [Syntax::Node { kind, args, .. }] = arguments
+            && kind == &parser_kind(&["Tactic", "simpArgs"])
+        {
+            arguments = args.as_slice();
+        }
         if arguments.is_empty() {
             return Ok(defaults);
         }
@@ -400,10 +406,10 @@ impl Context {
                 [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
                 _ => return Err(error(TacticError::MalformedScript)),
             };
-            // `term` below runs the normal heap-driven elaborator. The source
-            // parser already forbids nested proof scripts, but a caller can
-            // supply Syntax directly: enforce the same boundary here so this
-            // one level of re-entry can never grow with source-controlled depth.
+            // `term` below runs the normal heap-driven elaborator on the native
+            // stack. Refuse a nested proof script in the rule, whether the
+            // source parser or a direct Syntax caller built it, so this one
+            // level of re-entry can never grow with source-controlled depth.
             let mut pending = vec![&parts[2]];
             while let Some(term) = pending.pop() {
                 self.tick()?;

@@ -14,6 +14,8 @@ pub(super) struct Prefix {
     dependent_arrow: bool,
     binders: Vec<Syntax>,
     annotation: Option<(usize, Syntax)>,
+    /// `∀ x ∈ s, p` and `∃ x < n, p` (`Init/BinderPredicates.lean`): the operator and its term.
+    predicate: Option<(usize, Syntax)>,
     separator: Option<usize>,
     phase: Phase,
 }
@@ -21,7 +23,16 @@ pub(super) struct Prefix {
 enum Phase {
     Group(Group),
     SharedType(usize),
+    /// A binder predicate's term, ended by the quantifier's comma.
+    Predicate(usize),
     Body,
+}
+
+/// The binder predicates `Init/BinderPredicates.lean` declares: `syntax "∈ " term : binderPred`
+/// and the like, each its own `Lean.binderPred<op>_` kind.
+fn predicate_operator(tokens: &[LexedToken], at: usize) -> bool {
+    matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s))
+        if matches!(s.as_str(), "∈" | "∉" | "⊆" | "⊂" | "⊇" | "⊃" | "<" | "≤" | ">" | "≥" | "≠"))
 }
 
 struct Group {
@@ -96,6 +107,7 @@ impl Prefix {
             dependent_arrow,
             binders: Vec::new(),
             annotation: None,
+            predicate: None,
             separator: None,
             phase: Phase::Body,
         };
@@ -121,6 +133,7 @@ impl Prefix {
             dependent_arrow: false,
             binders: Vec::new(),
             annotation: None,
+            predicate: None,
             separator: None,
             phase: Phase::Body,
         };
@@ -147,7 +160,7 @@ impl Prefix {
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match &self.phase {
             Phase::Group(group) => symbol(tokens, at, group.close),
-            Phase::SharedType(_) => self.separator(tokens, at),
+            Phase::SharedType(_) | Phase::Predicate(_) => self.separator(tokens, at),
             Phase::Body => false,
         }
     }
@@ -179,6 +192,16 @@ impl Prefix {
                 }
                 self.binders.push(binder_name(leaves, tokens, *cursor)?);
                 *cursor += 1;
+                // `"∀ " binderIdent binderPred ", " term`: one name, then the predicate.
+                if self.binders.len() == 1
+                    && !self.lambda
+                    && !self.record_field
+                    && predicate_operator(tokens, *cursor)
+                {
+                    self.phase = Phase::Predicate(*cursor);
+                    *cursor += 1;
+                    return Ok(());
+                }
                 continue;
             }
             let kind = match tokens.get(*cursor).map(|t| &t.kind) {
@@ -364,6 +387,10 @@ impl Prefix {
                 self.annotation = Some((colon, domain));
                 self.separator = Some(at);
             }
+            Phase::Predicate(operator) => {
+                self.predicate = Some((operator, domain));
+                self.separator = Some(at);
+            }
             Phase::Body => unreachable!("only a header can finish here"),
         }
         Ok((self, cursor))
@@ -374,6 +401,33 @@ impl Prefix {
         leaves: &Leaves,
         body: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+        if let Some((operator, term)) = self.predicate {
+            let operator = leaves.leaf(operator)?;
+            let predicate = match &operator {
+                Syntax::Atom { val, .. } => lean_kind(&format!("binderPred{val}_")),
+                _ => unreachable!("a predicate operator is a symbol"),
+            };
+            let binder = self
+                .binders
+                .into_iter()
+                .next()
+                .expect("one predicate binder");
+            let syntax = Syntax::node(
+                lean_kind(if self.exists {
+                    "term∃__,_"
+                } else {
+                    "term∀__,_"
+                }),
+                vec![
+                    leaves.leaf(self.keyword)?,
+                    Syntax::node(lean_kind("binderIdent"), vec![binder]),
+                    Syntax::node(predicate, vec![operator, term]),
+                    leaves.leaf(self.separator.expect("completed prefix separator"))?,
+                    body,
+                ],
+            );
+            return Ok((syntax, self.keyword));
+        }
         if self.exists {
             let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
             let syntax = Syntax::node(

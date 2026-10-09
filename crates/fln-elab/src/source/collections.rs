@@ -53,7 +53,55 @@ pub(super) fn is_notation(syntax: &Syntax) -> bool {
     })
 }
 
+fn pair(first: Syntax, second: Syntax) -> Syntax {
+    let head = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        // The macro's quoted `Prod.mk` is resolved where the macro is defined.
+        val: Name::from_components(["_root_", "Prod", "mk"]),
+        preresolved: Vec::new(),
+    };
+    application(head, vec![first, second])
+}
+
 impl Context {
+    /// A tuple's body `[e "," [es,*]]` as `mkPairs` builds it (`expandTuple`,
+    /// `Lean/Elab/BuiltinNotation.lean:414`): `Prod.mk e₀ (Prod.mk e₁ … eₙ)`, nested right.
+    fn expand_pairs(&mut self, mut body: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+        let parts = expect_null_args(&body, "tuple body")?;
+        let [_, separator, rest] = parts else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(separator, ",", "tuple separator")?;
+        // `sepBy1 term ", " (allowTrailingSep := true)`: terms at even positions, at least one.
+        let rest = expect_null_args(rest, "tuple elements")?;
+        if rest.is_empty() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for (index, element) in rest.iter().enumerate() {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(element, ",", "tuple separator")?;
+            }
+        }
+        let Syntax::Node { args: parts, .. } = &mut body else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut rest = parts.pop().expect("validated tuple elements");
+        let first = parts.swap_remove(0);
+        let Syntax::Node { args: rest, .. } = &mut rest else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut elements: Vec<Syntax> = std::mem::take(rest).into_iter().step_by(2).collect();
+        elements.insert(0, first);
+        let mut tuple = elements.pop().expect("a tuple has two elements");
+        while let Some(element) = elements.pop() {
+            self.tick()?;
+            tuple = pair(element, tuple);
+        }
+        Ok(tuple)
+    }
+
     /// Called by the existing inside-out pattern-planning traversal. Children
     /// are already lowered; the pattern flag comes from matchAlt's pattern slot.
     /// This leaves that traversal's recursion-root and source-row witnesses intact.
@@ -88,10 +136,10 @@ impl Context {
             if !matches!(hygiene, [Syntax::Ident { val, .. }] if val.is_anonymous()) {
                 return Err(failure(SourceInferenceError::Scope));
             }
-            if !expect_null_args(&args[1], "empty tuple optional body")?.is_empty() {
-                return Err(failure(SourceInferenceError::Scope));
-            }
             expect_atom(&args[2], ")", "empty tuple closer")?;
+            if !expect_null_args(&args[1], "tuple optional body")?.is_empty() {
+                return self.expand_pairs(std::mem::replace(&mut args[1], null(Vec::new())));
+            }
             // The pinned expandTuple macro chooses Unit.unit, whose universe
             // is fixed. A generic PUnit.unit would accept additional types.
             // Root qualification preserves that macro reference under local
@@ -220,6 +268,77 @@ mod tests {
         };
         args[1] = null(vec![]);
         assert!(context().expand_collection_node(tuple, false).is_err());
+    }
+
+    fn tuple(body: Vec<Syntax>) -> Syntax {
+        let mut tuple = empty_tuple();
+        let Syntax::Node { args, .. } = &mut tuple else {
+            unreachable!();
+        };
+        args[1] = null(body);
+        tuple
+    }
+
+    /// `Prod.mk head tail`, or `None` for anything else.
+    fn pair_parts(syntax: &Syntax) -> Option<(&Syntax, &Syntax)> {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return None;
+        };
+        if kind != &parser_kind(&["Term", "app"]) {
+            return None;
+        }
+        let Syntax::Ident { val, .. } = &args[0] else {
+            return None;
+        };
+        if val != &Name::from_components(["_root_", "Prod", "mk"]) {
+            return None;
+        }
+        match expect_null_args(&args[1], "pair arguments").ok()? {
+            [head, tail] => Some((head, tail)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_tuple_expands_to_right_nested_root_pairs() {
+        let body = || {
+            vec![
+                number("1"),
+                atom(","),
+                null(vec![number("2"), atom(","), number("3")]),
+            ]
+        };
+        let expanded = context()
+            .expand_collection_node(tuple(body()), false)
+            .unwrap();
+        let (first, rest) = pair_parts(&expanded).expect("an outer pair");
+        assert_eq!(first, &number("1"));
+        let (second, third) = pair_parts(rest).expect("an inner pair");
+        assert_eq!((second, third), (&number("2"), &number("3")));
+        // A trailing comma adds no element.
+        let trailing = vec![number("1"), atom(","), null(vec![number("2"), atom(",")])];
+        let expanded = context()
+            .expand_collection_node(tuple(trailing), false)
+            .unwrap();
+        assert_eq!(pair_parts(&expanded), Some((&number("1"), &number("2"))));
+    }
+
+    #[test]
+    fn a_malformed_tuple_body_is_refused_not_reinterpreted() {
+        for body in [
+            vec![number("1")],
+            vec![number("1"), atom(",")],
+            vec![number("1"), atom(","), null(vec![])],
+            vec![number("1"), atom(";"), null(vec![number("2")])],
+            vec![number("1"), atom(","), null(vec![number("2"), number("3")])],
+            vec![number("1"), atom(","), number("2")],
+        ] {
+            assert!(
+                context()
+                    .expand_collection_node(tuple(body), false)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

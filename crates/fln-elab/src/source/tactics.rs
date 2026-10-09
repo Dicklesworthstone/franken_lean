@@ -356,10 +356,10 @@ impl Context {
                 self.tick()?;
                 if index % 2 == 0 {
                     pending.push((row, false));
-                } else if !row.is_missing()
-                    && !matches!(row, Syntax::Atom { val, .. } if val == ";")
-                {
-                    return Err(error(TacticError::MalformedScript));
+                } else if !matches!(row, Syntax::Atom { val, .. } if val == ";") {
+                    // Otherwise a line break, which the pin's `sepByIndent` records as `[]`.
+                    expect_empty_null(row, "tactic separator")
+                        .map_err(|_| error(TacticError::MalformedScript))?;
                 }
             }
         }
@@ -623,13 +623,21 @@ impl Context {
                 let [keyword, sequence] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
+                // `·` is its own `cdotTk` node.
+                let keyword = if control::is_cdot(kind) {
+                    &expect_node(keyword, &Name::from_components(["Lean", "cdotTk"]), 1, "·")?[0]
+                } else {
+                    keyword
+                };
                 expect_atom(keyword, mode.keyword(), "goal control keyword")?;
                 self.start_goal_control(proof, goal, sequence, mode)?;
-            } else if kind == &parser_kind(&["Tactic", "have"])
-                || kind == &parser_kind(&["Tactic", "let"])
+            } else if kind == &parser_kind(&["Tactic", "tacticHave__"])
+                || kind == &parser_kind(&["Tactic", "tacticLet__"])
             {
-                let opaque = kind == &parser_kind(&["Tactic", "have"]);
-                let [keyword, name, annotation, assign, value] = args.as_slice() else {
+                // `"have" letConfig letDecl` and `"let" letConfig letDecl`: one `letIdDecl`
+                // with no binders and the default configuration.
+                let opaque = kind == &parser_kind(&["Tactic", "tacticHave__"]);
+                let [keyword, config, declaration] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(
@@ -637,10 +645,45 @@ impl Context {
                     if opaque { "have" } else { "let" },
                     "local tactic declaration",
                 )?;
+                let config = expect_node(
+                    config,
+                    &parser_kind(&["Term", "letConfig"]),
+                    1,
+                    "local tactic configuration",
+                )?;
+                expect_empty_null(&config[0], "default local configuration")?;
+                let [declaration] = expect_node(
+                    declaration,
+                    &parser_kind(&["Term", "letDecl"]),
+                    1,
+                    "local tactic declaration",
+                )?
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let [id, binders, annotation, assign, value] = expect_node(
+                    declaration,
+                    &parser_kind(&["Term", "letIdDecl"]),
+                    5,
+                    "local tactic declaration",
+                )?
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_empty_null(binders, "local tactic without binders")?;
                 expect_atom(assign, ":=", "local tactic assignment")?;
-                let name = match expect_null_args(name, "local tactic name")? {
-                    [] if opaque => Name::from_components(["this"]),
-                    [Syntax::Ident { val, .. }]
+                let [id] =
+                    expect_node(id, &parser_kind(&["Term", "letId"]), 1, "local tactic name")?
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let name = match id {
+                    Syntax::Node { kind, .. }
+                        if opaque && kind == &Name::from_components(["hygieneInfo"]) =>
+                    {
+                        Name::from_components(["this"])
+                    }
+                    Syntax::Ident { val, .. }
                         if !val.is_anonymous() && val.parent().is_anonymous() =>
                     {
                         val.clone()

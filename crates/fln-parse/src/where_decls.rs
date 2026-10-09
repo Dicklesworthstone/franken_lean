@@ -15,11 +15,11 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionP
 }
 
 fn opens(tokens: &[LexedToken], at: usize) -> bool {
-    matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | ".{" | "[" | "⦃" | "⟨"))
+    matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), "(" | "{" | ".{" | "[" | "⦃" | "⟨"))
 }
 
 fn closes(tokens: &[LexedToken], at: usize) -> bool {
-    matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "⟩"))
+    matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "}" | "]" | "⦄" | "⟩"))
 }
 
 /// The `where` keyword ending a definition body that starts at `from`, if any: the first

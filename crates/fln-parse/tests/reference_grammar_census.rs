@@ -259,8 +259,8 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
     // what remains is the grammar's own typed refusal at that same token, which says nothing
     // about validity. Each such parser is added only with the pin's own tree for it
-    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `<|` comes next.
-    let (source, token) = ("def p : Nat := id <| 1", "<|");
+    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `>>=` comes next.
+    let (source, token) = ("def p : Option Nat := some 1 >>= some", ">>=");
     let at = BytePos(source.find(token).expect("the token is in the source"));
     assert!(
         matches!(
@@ -270,7 +270,7 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
         "{source}: the grammar, not the lexer, refuses at {token}"
     );
     // `≤` was the second: the relation parsers (`«term_≤_»`) now take it, with the pin's tree
-    // in `RELATIONS_AND_EXISTENTIALS` (`omega` itself is still outside the tactic grammar).
+    // in `RELATIONS_AND_EXISTENTIALS` (`omega` parses too, and the elaborator refuses it).
     assert!(
         parse_source_command("theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := h".as_bytes())
             .is_ok()
@@ -278,6 +278,10 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     // `×` was the fourth: Init's infixes now take it, with the pin's tree in
     // `INFIXES_AND_UNTYPED_BINDERS`.
     assert!(parse_source_command("def p (α β : Type) : Type := α × β".as_bytes()).is_ok());
+    // `<|` was the fifth, with the pin's trees in `INFIXES_AND_UNTYPED_BINDERS`.
+    assert!(parse_source_command("def p : Nat := id <| 1".as_bytes()).is_ok());
+    // `|>` was the sixth, with the pin's trees in `PIPE_RIGHT`.
+    assert!(parse_source_command("def p : Nat := 1 |> id".as_bytes()).is_ok());
     // `⟨` was the third: the anonymous-constructor parser (Term.anonymousCtor) now takes it.
     assert!(
         parse_source_command(

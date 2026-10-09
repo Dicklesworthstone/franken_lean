@@ -37,13 +37,15 @@ pub(super) fn block_end(
             }
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" => delimiters.push(")"),
                 "{" | ".{" => delimiters.push("}"),
                 "[" | "@[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
                 "⟨" => delimiters.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if delimiters.pop() != Some(symbol.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if delimiters.pop() != Some(crate::canonical_bracket(symbol.as_str())) =>
+                {
                     return Err(refusal(view, tokens, index));
                 }
                 _ => {}
@@ -80,7 +82,7 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
             starts.push(index);
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" | "{" | ".{" | "[" | "@[" | "⦃" | "⟨" => depth += 1,
                 ")" | "}" | "]" | "⦄" | "⟩" => depth -= 1, // block_end checked balance
                 _ => {}

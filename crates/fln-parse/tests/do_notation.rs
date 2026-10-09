@@ -45,7 +45,6 @@ fn malformed_or_unsupported_do_never_drops_a_statement() {
         "do for n ns do return n",
         "do if c then",
         "do break 7",
-        "do let (x, y) ← pair; return x",
         "do read;; return 7",
     ] {
         let source = format!("def work := {value}");

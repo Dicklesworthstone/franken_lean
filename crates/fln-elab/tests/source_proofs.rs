@@ -147,15 +147,17 @@ fn incorrect_proofs_are_refuted_and_nonprop_theorems_reach_k1() {
 }
 #[test]
 fn unsupported_tactics_and_nested_by_are_not_reinterpreted() {
-    for source in [
-        "theorem bad (P : Prop) : P := by sorry",
-        "theorem bad (P : Prop) : P := by exact (by assumption)",
-    ] {
-        assert!(matches!(
-            check_definition_source(source.as_bytes(), &env(), budget()),
-            Err(DefinitionFrontendError::Parse(_))
-        ));
-    }
+    assert!(matches!(
+        check_definition_source(b"theorem bad (P : Prop) : P := by sorry", &env(), budget()),
+        Err(DefinitionFrontendError::Parse(_))
+    ));
+    // A nested proof runs its own tactics: it closes a goal it proves and nothing else.
+    accepted("theorem good (P : Prop) (p : P) : P := by exact (by assumption)");
+    let source = "theorem bad (P : Prop) : P := by exact (by assumption)";
+    assert!(!matches!(
+        check_definition_source(source.as_bytes(), &env(), budget()),
+        Ok(result) if matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. }))
+    ));
     assert!(fln_parse::parse_nat_definition(b"theorem bad : Nat := 0").is_err());
 }
 #[test]

@@ -21,7 +21,7 @@ pub(super) fn deriving_start(tokens: &[LexedToken], start: usize) -> usize {
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate().skip(start) {
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "deriving" if depth == 0 => return index,
                 "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
                 ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
@@ -238,13 +238,15 @@ fn fields(
             first = index;
         }
         if let TokenKind::Symbol(s) = &tokens[index].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => stack.push(")"),
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 "⟨" => stack.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(view, tokens, index));
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
@@ -311,13 +313,15 @@ fn parents(
             }
             first = index + 1;
         } else if let TokenKind::Symbol(s) = &tokens[index].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => stack.push(")"),
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 "⟨" => stack.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(view, tokens, index));
                 }
                 _ => {}

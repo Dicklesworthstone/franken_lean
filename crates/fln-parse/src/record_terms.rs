@@ -83,7 +83,7 @@ pub(super) fn update_openers(
     let mut updates = std::collections::HashSet::new();
     for index in range {
         if let TokenKind::Symbol(s) = &tokens[index].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "{" | ".{" => stack.push((index, "}", true)),
                 "(" => stack.push((index, ")", false)),
                 "[" => stack.push((index, "]", false)),

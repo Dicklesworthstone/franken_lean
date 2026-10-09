@@ -2,14 +2,50 @@
 //!
 //! Tactic arguments use the ordinary term driver. Local declarations own their
 //! nested `by` blocks through the heap sequence planner; they never recursively
-//! call this parser on source-controlled nesting depth. Other nested proof-term
-//! positions remain outside the bounded grammar.
+//! call this parser on source-controlled nesting depth. A `by` inside a tactic's
+//! term argument (`exact ⟨h, by rfl⟩`) does re-enter [`parse`] on the native
+//! stack, so such blocks nest at most [`PROOF_NESTING`] deep.
 
 use super::*;
+use std::cell::Cell;
 use std::ops::Range;
 mod elimination;
 pub(super) use elimination::calculation;
 mod locations;
+
+/// Proof blocks open on one thread at once; the next is refused rather than recursed into on
+/// a small host stack. A count, not a stack measurement, so the refusal is the same on every
+/// host and build.
+const PROOF_NESTING: usize = 8;
+
+thread_local! {
+    static OPEN_PROOFS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// One open [`parse`] call, closed when dropped.
+struct OpenProof;
+
+impl OpenProof {
+    fn enter(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        by: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        OPEN_PROOFS.with(|open| {
+            if open.get() >= PROOF_NESTING {
+                return Err(refusal(view, tokens, by));
+            }
+            open.set(open.get() + 1);
+            Ok(OpenProof)
+        })
+    }
+}
+
+impl Drop for OpenProof {
+    fn drop(&mut self) {
+        OPEN_PROOFS.with(|open| open.set(open.get() - 1));
+    }
+}
 
 fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
@@ -25,17 +61,25 @@ pub(super) fn parse(
     by: usize,
     limit: usize,
 ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let _open = OpenProof::enter(view, tokens, by)?;
     let mut depth = 0_usize;
     let mut forall_commas = 0_usize;
     let mut end = by + 1;
     while end < limit {
         match &tokens[end].kind {
             TokenKind::Symbol(symbol)
-                if matches!(symbol.as_str(), "(" | "[" | "{" | ".{" | "⦃" | "⟨") =>
+                if matches!(
+                    crate::canonical_bracket(symbol.as_str()),
+                    "(" | "[" | "{" | ".{" | "⦃" | "⟨"
+                ) =>
             {
                 depth += 1
             }
-            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⦄" | "⟩") =>
+            TokenKind::Symbol(symbol)
+                if matches!(
+                    crate::canonical_bracket(symbol.as_str()),
+                    ")" | "]" | "}" | "⦄" | "⟩"
+                ) =>
             {
                 if depth == 0 {
                     break;
@@ -112,14 +156,6 @@ fn tactic(
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
-    // Nested proof blocks are owned by the heap-planned local-declaration
-    // production. Other tactic arguments must not recursively reenter parse.
-    if let Some(at) = range
-        .clone()
-        .find(|&at| matches!(&tokens[at].kind, TokenKind::Symbol(s) if s == "by"))
-    {
-        return Err(refusal(view, tokens, at));
-    }
     let keyword = match &tokens[start].kind {
         TokenKind::Ident(name) => [
             "intro",
@@ -148,6 +184,11 @@ fn tactic(
             "decide",
             "skip",
             "fail",
+            "omega",
+            "unfold",
+            "split",
+            "rwa",
+            "intros",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -165,7 +206,8 @@ fn tactic(
         "simp" => simplify(leaves, view, tokens, range, atom),
         "simp_all" => simplify_all(leaves, view, tokens, range, atom),
         "simpa" => simpa(leaves, view, tokens, range, atom),
-        "rw" | "rewrite" => rewrite(leaves, view, tokens, range, atom, keyword == "rw"),
+        "rw" | "rewrite" | "rwa" => rewrite(leaves, view, tokens, range, atom, keyword),
+        "unfold" | "split" => located(leaves, view, tokens, range, atom, keyword),
         "generalize" => generalize(leaves, view, tokens, range, atom),
         "by_cases" => by_cases(leaves, view, tokens, range, atom),
         "change" => change(leaves, view, tokens, range, atom),
@@ -201,7 +243,8 @@ fn local_tactic(
             }
             args.push(null_node(names));
         }
-        "intro" => {
+        // `intros` is `"intros" (ppSpace colGt (ident <|> hole))*` (`Init/Tactics.lean`).
+        "intro" | "intros" => {
             let mut names = Vec::new();
             for index in start + 1..range.end {
                 if matches!(&tokens[index].kind, TokenKind::Ident(_)) {
@@ -258,9 +301,9 @@ fn local_tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
-        // `decide` is `"decide" optConfig` (`Init/Tactics.lean`); the empty configuration
-        // is a node of its own in the pin's tree.
-        "decide" if range.end == start + 1 => args.push(default_config()),
+        // `decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the empty
+        // configuration is a node of its own in the pin's tree.
+        "decide" | "omega" if range.end == start + 1 => args.push(default_config()),
         "assumption" | "solve_by_elim" | "rfl" | "contradiction" | "constructor" | "left"
         | "right" | "skip" | "fail"
             if range.end == start + 1 => {}
@@ -412,7 +455,7 @@ fn rewrite(
     tokens: &[LexedToken],
     range: Range<usize>,
     keyword: Syntax,
-    close: bool,
+    form: &str,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let (range, location) = locations::split(leaves, view, tokens, range)?;
     let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
@@ -472,9 +515,59 @@ fn rewrite(
             leaves.leaf(range.end - 1)?,
         ],
     );
+    Ok(match form {
+        // `macro "rwa " rws:rwRuleSeq loc:(location)? : tactic` (`Init/Tactics.lean`) takes no
+        // configuration.
+        "rwa" => Syntax::node(
+            parser_kind(&["Tactic", "tacticRwa__"]),
+            vec![keyword, rules, location],
+        ),
+        _ => Syntax::node(
+            parser_kind(&["Tactic", if form == "rw" { "rwSeq" } else { "rewriteSeq" }]),
+            vec![keyword, default_config(), rules, location],
+        ),
+    })
+}
+
+/// `"unfold" (ppSpace colGt ident)+ (location)?` and `"split" (ppSpace colGt term)?
+/// (location)?` (`Init/Tactics.lean`).
+#[inline(never)]
+fn located(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+    form: &str,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let (range, location) = locations::split(leaves, view, tokens, range)?;
+    let arguments = range.start + 1..range.end;
+    let argument = if form == "unfold" {
+        if arguments.is_empty() {
+            return Err(refusal(view, tokens, range.start));
+        }
+        let mut names = Vec::new();
+        for at in arguments {
+            if !matches!(&tokens[at].kind, TokenKind::Ident(_)) {
+                return Err(refusal(view, tokens, at));
+            }
+            names.push(leaves.leaf(at)?);
+        }
+        null_node(names)
+    } else if arguments.is_empty() {
+        null_node(Vec::new())
+    } else {
+        null_node(vec![bounded_term(
+            leaves,
+            view,
+            tokens,
+            arguments,
+            DefinitionGrammar::Scalar,
+        )?])
+    };
     Ok(Syntax::node(
-        parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
-        vec![keyword, default_config(), rules, location],
+        parser_kind(&["Tactic", form]),
+        vec![keyword, argument, location],
     ))
 }
 
@@ -524,10 +617,20 @@ fn simpa(
     let mut using_at = None;
     for at in range.start + 1..range.end {
         match &tokens[at].kind {
-            TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | ".{" | "⦃" | "⟨") => {
+            TokenKind::Symbol(s)
+                if matches!(
+                    crate::canonical_bracket(s.as_str()),
+                    "(" | "[" | "{" | ".{" | "⦃" | "⟨"
+                ) =>
+            {
                 depth += 1
             }
-            TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩") => {
+            TokenKind::Symbol(s)
+                if matches!(
+                    crate::canonical_bracket(s.as_str()),
+                    ")" | "]" | "}" | "⦄" | "⟩"
+                ) =>
+            {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;
@@ -573,6 +676,14 @@ fn simpa(
     let mut slots = std::mem::take(args).into_iter();
     let keyword = slots.next().expect("simp keyword");
     let mut rest: Vec<Syntax> = slots.take(4).collect();
+    // Its rule list is a `simpArgs` node of its own (`(ppSpace simpArgs)?`), where `simp`
+    // writes the brackets inline.
+    if let Syntax::Node { args: list, .. } = &mut rest[3]
+        && list.len() == 3
+    {
+        let inline = std::mem::take(list);
+        *list = vec![Syntax::node(parser_kind(&["Tactic", "simpArgs"]), inline)];
+    }
     rest.push(using);
     *args = vec![
         keyword,
@@ -833,7 +944,6 @@ mod simp_tests {
             "simp only [h,,k]",
             "simp only [<-]",
             "simp only [h] garbage",
-            "simp only [by rfl]",
             "simp [-]",
             "simp [-1]",
             "simp [-h x]",
@@ -1165,6 +1275,42 @@ mod construction_refinement_tests {
             .join()
             .unwrap();
     }
+
+    /// `depth` proof blocks, each but the outermost inside its parent's `exact` term.
+    fn nested_proofs(depth: usize) -> String {
+        let mut body = String::from("rfl");
+        for _ in 1..depth {
+            body = format!("exact ⟨h, by {body}⟩");
+        }
+        format!("theorem t (h : 1 = 1) : 1 = 1 := by {body}\n")
+    }
+
+    // A debug build needs between 384 and 512 KiB here for the refused level.
+    #[test]
+    fn proofs_nested_in_tactic_terms_stop_at_the_limit_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("nested-proof-parser".to_string())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deepest = nested_proofs(PROOF_NESTING);
+                let parsed = parse_definition(deepest.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), deepest.as_bytes());
+                let refused = nested_proofs(PROOF_NESTING + 1);
+                let innermost = BytePos(refused.rfind("by").unwrap());
+                assert!(matches!(
+                    parse_definition(refused.as_bytes()),
+                    Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at,
+                        expected: NatDefinitionExpectation::Tactic,
+                    }) if at == innermost
+                ));
+                // The refusal closed every block it had opened.
+                assert!(parse_definition(deepest.as_bytes()).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1197,8 +1343,6 @@ mod simpa_tests {
             "simpa (config := {})",
             "simpa only [← *]",
             "simpa using (p",
-            "simpa only [by rfl]",
-            "simpa using (by rfl)",
             // `at` is a keyword at the pin, so the `using` term stops before it and the
             // Reference refuses the trailing `at h`; the hand table read `p at h` as one term.
             "simpa using p at h",
@@ -1307,7 +1451,6 @@ mod simp_all_tests {
             "simp_all at *",
             "simp_all only at h",
             "simp_all [] using h",
-            "simp_all only [by rfl]",
             "simp_all [h,,k]",
         ] {
             let source = format!("theorem t : True := by {tactic}");

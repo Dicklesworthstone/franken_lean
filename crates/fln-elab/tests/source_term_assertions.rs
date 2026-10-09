@@ -134,6 +134,21 @@ fn have_retains_the_nondependent_let_marker() {
     ));
 }
 
+/// `letI`/`haveI` elaborate as `let`/`have` and then inline the value, so no binder remains
+/// (the pin prints both definitions as `7`).
+#[test]
+fn inlined_locals_leave_no_binder() {
+    for source in [
+        "def value : Nat := letI n : Nat := 7; n",
+        "def value : Nat := haveI n : Nat := 7; n",
+    ] {
+        let Declaration::Defn(d) = accepted(source) else {
+            panic!("definition")
+        };
+        assert!(!matches!(d.value.node(), ExprNode::LetE { .. }), "{source}");
+    }
+}
+
 use fln_elab::seed::source_seed_declarations;
 use fln_env::{
     environment::{DeclarationBudget, DeclarationCommitted, Environment},

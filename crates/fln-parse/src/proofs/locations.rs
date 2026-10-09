@@ -13,10 +13,20 @@ pub(super) fn split(
     let mut suffix = None;
     for at in range.clone() {
         match &tokens[at].kind {
-            TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | ".{" | "⦃" | "⟨") => {
+            TokenKind::Symbol(s)
+                if matches!(
+                    crate::canonical_bracket(s.as_str()),
+                    "(" | "[" | "{" | ".{" | "⦃" | "⟨"
+                ) =>
+            {
                 depth += 1;
             }
-            TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩") => {
+            TokenKind::Symbol(s)
+                if matches!(
+                    crate::canonical_bracket(s.as_str()),
+                    ")" | "]" | "}" | "⦄" | "⟩"
+                ) =>
+            {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;

@@ -20,8 +20,12 @@ impl Mode {
         }
     }
 }
+/// The pin's `syntax (name := cdot) cdotTk tacticSeqIndentGt : tactic` (`Init/NotationExtra.lean`).
+pub(super) fn is_cdot(kind: &Name) -> bool {
+    kind == &Name::from_components(["Lean", "cdot"])
+}
 pub(super) fn mode(kind: &Name) -> Option<Mode> {
-    if kind == &parser_kind(&["Tactic", "cdot"]) {
+    if is_cdot(kind) {
         Some(Mode::Solve)
     } else if kind == &parser_kind(&["Tactic", "focus"]) {
         Some(Mode::Focus)

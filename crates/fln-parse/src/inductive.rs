@@ -89,13 +89,15 @@ pub(super) fn parse(
             break;
         }
         if let TokenKind::Symbol(s) = &tokens[end_header].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => nesting.push(")"),
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 "⟨" => nesting.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if nesting.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if nesting.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(&view, &tokens, end_header));
                 }
                 _ => {}
@@ -126,14 +128,14 @@ pub(super) fn parse(
             begins.push(if doc { at - 1 } else { at });
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => nesting.push(")"),
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 "⟨" => nesting.push("⟩"),
                 ")" | "}" | "]" | "⦄" | "⟩" => {
-                    if nesting.pop() != Some(s.as_str()) {
+                    if nesting.pop() != Some(crate::canonical_bracket(s.as_str())) {
                         return Err(refuse(&view, &tokens, at));
                     }
                 }

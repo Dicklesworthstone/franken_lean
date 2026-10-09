@@ -709,6 +709,139 @@ impl Context {
     }
 }
 
+/// The binder-predicate quantifiers `∀ x ∈ s, p` and `∃ x < n, p` (`Init/BinderPredicates.lean`).
+pub(super) fn is_binder_predicate(syntax: &Syntax) -> bool {
+    syntax.kind().is_some_and(|kind| {
+        kind == &Name::from_components(["Lean", "term∀__,_"])
+            || kind == &Name::from_components(["Lean", "term∃__,_"])
+    })
+}
+
+fn infix(kind: &str, left: Syntax, operator: &str, right: Syntax) -> Syntax {
+    Syntax::node(
+        Name::str(Name::anonymous(), kind),
+        vec![left, Syntax::atom(SourceInfo::None, operator), right],
+    )
+}
+
+impl Context {
+    /// The pin's `macro_rules` for binder predicates: `∀ x pred, p` is `∀ x,
+    /// satisfies_binder_pred% x pred → p` and `∃ x pred, p` is `∃ x, … ∧ p`, where
+    /// `satisfies_binder_pred% x (∈ s)` is `x ∈ s` (each operator alike). `∃ x, q` is then
+    /// `Exists fun x => q`, as the `∃` expansion builds it. A `_` binder is the pin's fresh
+    /// `x`, here a numeric name no source identifier spells. Any other node is unchanged.
+    pub(super) fn expand_binder_predicate_node(
+        &mut self,
+        syntax: Syntax,
+        pattern: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if !is_binder_predicate(&syntax) {
+            return Ok(syntax);
+        }
+        if pattern {
+            return Err(invalid());
+        }
+        let exists = syntax.kind() == Some(&Name::from_components(["Lean", "term∃__,_"]));
+        let Ok((_, parts)) = node_parts(syntax) else {
+            return Err(invalid());
+        };
+        let Ok([keyword, binder, predicate, separator, body]) = <[Syntax; 5]>::try_from(parts)
+        else {
+            return Err(invalid());
+        };
+        expect_atom(
+            &keyword,
+            if exists { "∃" } else { "∀" },
+            "binder predicate keyword",
+        )?;
+        expect_atom(&separator, ",", "binder predicate separator")?;
+        let name = match node_parts(binder) {
+            Ok((kind, args)) if kind == Name::from_components(["Lean", "binderIdent"]) => {
+                let Ok([name]) = <[Syntax; 1]>::try_from(args) else {
+                    return Err(invalid());
+                };
+                match name {
+                    Syntax::Ident { .. } => name,
+                    _ if name.kind() == Some(&parser_kind(&["Term", "hole"])) => {
+                        let serial = self.next;
+                        self.fresh_name()?;
+                        Syntax::Ident {
+                            info: SourceInfo::None,
+                            raw_val: fln_syntax::source::ByteSpan::default(),
+                            val: Name::num(Name::anonymous(), serial),
+                            preresolved: Vec::new(),
+                        }
+                    }
+                    _ => return Err(invalid()),
+                }
+            }
+            _ => return Err(invalid()),
+        };
+        let Ok((kind, args)) = node_parts(predicate) else {
+            return Err(invalid());
+        };
+        let Ok([operator, bound]) = <[Syntax; 2]>::try_from(args) else {
+            return Err(invalid());
+        };
+        let Syntax::Atom { val: spelling, .. } = &operator else {
+            return Err(invalid());
+        };
+        if !matches!(
+            spelling.as_str(),
+            "∈" | "∉" | "⊆" | "⊂" | "⊇" | "⊃" | "<" | "≤" | ">" | "≥" | "≠"
+        ) || kind != Name::from_components(["Lean", format!("binderPred{spelling}_").as_str()])
+        {
+            return Err(invalid());
+        }
+        let condition = infix(&format!("term_{spelling}_"), name.clone(), spelling, bound);
+        let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+        if exists {
+            let body = infix("term_∧_", condition, "∧", body);
+            let lambda = Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![
+                    Syntax::atom(SourceInfo::None, "fun"),
+                    Syntax::node(
+                        parser_kind(&["Term", "basicFun"]),
+                        vec![
+                            null(vec![name]),
+                            null(Vec::new()),
+                            Syntax::atom(SourceInfo::None, "=>"),
+                            body,
+                        ],
+                    ),
+                ],
+            );
+            return Ok(Syntax::node(
+                parser_kind(&["Term", "app"]),
+                vec![
+                    Syntax::Ident {
+                        info: SourceInfo::None,
+                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        val: Name::from_components(["Exists"]),
+                        preresolved: Vec::new(),
+                    },
+                    null(vec![lambda]),
+                ],
+            ));
+        }
+        let body = Syntax::node(
+            parser_kind(&["Term", "arrow"]),
+            vec![condition, Syntax::atom(SourceInfo::None, "→"), body],
+        );
+        Ok(Syntax::node(
+            parser_kind(&["Term", "forall"]),
+            vec![
+                Syntax::atom(SourceInfo::None, "∀"),
+                null(vec![name]),
+                null(Vec::new()),
+                Syntax::atom(SourceInfo::None, ","),
+                body,
+            ],
+        ))
+    }
+}
+
 impl Context {
     /// A Nat offset pattern, `p + k` with a numeral `k` (the pin's `Nat` literal
     /// offsets in `Lean.Meta.Match`): in a pattern position it is `Nat.succ` applied

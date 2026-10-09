@@ -103,7 +103,7 @@ fn newline(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
 }
 fn delimiter_depth(token: &LexedToken, depth: &mut usize) {
     if let TokenKind::Symbol(s) = &token.kind {
-        match s.as_str() {
+        match crate::canonical_bracket(s.as_str()) {
             "(" | "[" | "{" | ".{" | "⦃" | "⟨" => *depth += 1,
             ")" | "]" | "}" | "⦄" | "⟩" => *depth = depth.saturating_sub(1),
             _ => {}
@@ -501,13 +501,12 @@ fn finish_binding(
     value: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let keyword = if plan.opaque { "have" } else { "let" };
-    let name = null_node(
-        plan.name
-            .map(|at| leaves.leaf(at))
-            .transpose()?
-            .into_iter()
-            .collect(),
-    );
+    let keyword_atom = atom(leaves, plan.start, keyword)?;
+    // An anonymous `have` names its `letId` with the hygiene identifier (`hygieneInfo`).
+    let name = match plan.name {
+        Some(at) => leaves.leaf(at)?,
+        None => crate::hygiene_info_following(&keyword_atom),
+    };
     let annotation = match plan.annotation {
         Some((colon, range)) => null_node(vec![Syntax::node(
             parser_kind(&["Term", "typeSpec"]),
@@ -525,20 +524,138 @@ fn finish_binding(
         ),
         None => value,
     };
-    Ok(Syntax::node(
-        parser_kind(&["Tactic", keyword]),
+    // `macro "have" c:letConfig d:letDecl : tactic` and `let` likewise (`Init/Tactics.lean`):
+    // the term forms' `letConfig` and `letDecl`.
+    let declaration = Syntax::node(
+        parser_kind(&["Term", "letIdDecl"]),
         vec![
-            atom(leaves, plan.start, keyword)?,
-            name,
+            Syntax::node(parser_kind(&["Term", "letId"]), vec![name]),
+            null_node(Vec::new()),
             annotation,
             leaves.leaf(plan.assign)?,
             value,
+        ],
+    );
+    Ok(Syntax::node(
+        parser_kind(&[
+            "Tactic",
+            if plan.opaque {
+                "tacticHave__"
+            } else {
+                "tacticLet__"
+            },
+        ]),
+        vec![
+            keyword_atom,
+            Syntax::node(
+                parser_kind(&["Term", "letConfig"]),
+                vec![null_node(Vec::new())],
+            ),
+            Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
         ],
     ))
 }
 
 /// Sequence-level combinators cannot capture operators inside term arguments,
 /// local proof values, or constructor alternatives. Those own their subranges.
+/// One `cases`/`induction` tactic from its plan and its alternatives' bodies. Out of line: the
+/// task loop's frame stays live while nested terms are parsed on small host stacks
+/// (`deeply_grouped_generalization_uses_a_small_stack`), and every arm of it shares that frame.
+#[inline(never)]
+fn finish_elimination(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: Elimination,
+    children: Vec<Syntax>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    // The pin's trees (`Init/Tactics.lean`): `cases`/`induction` take a list of
+    // `elimTarget`s, then `using`, (for `induction`) `generalizing`, and the
+    // `inductionAlts`; an alternative is `inductionAltLHS+` and its `=> body`.
+    let binder = |at: usize| -> Result<Syntax, NatDefinitionParseError> {
+        let leaf = leaves.leaf(at)?;
+        Ok(if symbol(tokens, at, "_") {
+            Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])
+        } else {
+            leaf
+        })
+    };
+    let mut alts = Vec::new();
+    for (alt, body) in plan.alternatives.into_iter().zip(children) {
+        let names = (alt.pipe + 2..alt.arrow)
+            .map(binder)
+            .collect::<Result<Vec<_>, _>>()?;
+        let lhs = Syntax::node(
+            parser_kind(&["Tactic", "inductionAltLHS"]),
+            vec![
+                leaves.leaf(alt.pipe)?,
+                Syntax::node(
+                    Name::from_components(["group"]),
+                    vec![null_node(Vec::new()), leaves.leaf(alt.pipe + 1)?],
+                ),
+                null_node(names),
+            ],
+        );
+        alts.push(Syntax::node(
+            parser_kind(&["Tactic", "inductionAlt"]),
+            vec![
+                null_node(vec![lhs]),
+                null_node(vec![leaves.leaf(alt.arrow)?, body]),
+            ],
+        ));
+    }
+    let keyword = if word(tokens, plan.start, "cases") {
+        "cases"
+    } else {
+        "induction"
+    };
+    let target = Syntax::node(
+        parser_kind(&["Tactic", "elimTarget"]),
+        vec![
+            match plan.equation {
+                Some(at) => null_node(vec![
+                    Syntax::node(
+                        Name::from_components(["Lean", "binderIdent"]),
+                        vec![binder(at)?],
+                    ),
+                    leaves.leaf(at + 1)?,
+                ]),
+                None => null_node(Vec::new()),
+            },
+            binding_term(leaves, view, tokens, plan.target)?,
+        ],
+    );
+    let alternatives = match plan.with {
+        Some(at) => null_node(vec![Syntax::node(
+            parser_kind(&["Tactic", "inductionAlts"]),
+            vec![leaves.leaf(at)?, null_node(Vec::new()), null_node(alts)],
+        )]),
+        None => null_node(Vec::new()),
+    };
+    let mut parts = vec![
+        atom(leaves, plan.start, keyword)?,
+        null_node(vec![target]),
+        null_node(Vec::new()),
+    ];
+    if keyword == "induction" {
+        parts.push(match plan.generalizing {
+            Some(range) => null_node(vec![
+                atom(leaves, range.start, "generalizing")?,
+                null_node(
+                    (range.start + 1..range.end)
+                        .map(|at| leaves.leaf(at))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ]),
+            None => null_node(Vec::new()),
+        });
+    } else if plan.generalizing.is_some() {
+        return Err(refusal(view, tokens, plan.start));
+    }
+    parts.push(alternatives);
+    Ok(Syntax::node(parser_kind(&["Tactic", keyword]), parts))
+}
+
 /// A sequence of exactly one tactic as that tactic (`<;>`'s operands are `tactic`s); any other
 /// syntax is returned unchanged.
 fn single_tactic(syntax: Syntax) -> Syntax {
@@ -785,10 +902,20 @@ fn run(
             }
             Task::FinishControl(plan) => {
                 let body = values.pop().expect("scoped tactic sequence");
-                values.push(Syntax::node(
-                    parser_kind(&["Tactic", plan.kind]),
-                    vec![atom(leaves, plan.start, plan.keyword)?, body],
-                ));
+                let keyword = atom(leaves, plan.start, plan.keyword)?;
+                values.push(if plan.kind == "cdot" {
+                    // `syntax cdotTk := unicode("· ", ". ")` and `syntax (name := cdot) cdotTk
+                    // tacticSeqIndentGt : tactic`, in namespace `Lean` (`Init/NotationExtra.lean`).
+                    Syntax::node(
+                        Name::from_components(["Lean", "cdot"]),
+                        vec![
+                            Syntax::node(Name::from_components(["Lean", "cdotTk"]), vec![keyword]),
+                            body,
+                        ],
+                    )
+                } else {
+                    Syntax::node(parser_kind(&["Tactic", plan.kind]), vec![keyword, body])
+                });
             }
             Task::StartCalcTactic(plan, exact) => {
                 tasks.push(Task::CalcTactic(exact));
@@ -889,7 +1016,8 @@ fn run(
                     if let Some(separator) = separator {
                         rows.push(leaves.leaf(separator)?);
                     } else if index + 1 < count {
-                        rows.push(Syntax::Missing);
+                        // A line break: `sepByIndent`'s `checkColEq >> pushNone` (`Parser/Extra.lean`).
+                        rows.push(null_node(Vec::new()));
                     }
                 }
                 values.push(Syntax::node(
@@ -902,65 +1030,7 @@ fn run(
             }
             Task::FinishElimination(plan) => {
                 let children = values.split_off(values.len() - plan.alternatives.len());
-                let mut alts = Vec::new();
-                for (alt, body) in plan.alternatives.into_iter().zip(children) {
-                    let names = (alt.pipe + 2..alt.arrow)
-                        .map(|at| leaves.leaf(at))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    alts.push(Syntax::node(
-                        parser_kind(&["Tactic", "inductionAlt"]),
-                        vec![
-                            leaves.leaf(alt.pipe)?,
-                            leaves.leaf(alt.pipe + 1)?,
-                            null_node(names),
-                            leaves.leaf(alt.arrow)?,
-                            body,
-                        ],
-                    ));
-                }
-                let generalizing = if let Some(range) = plan.generalizing {
-                    let mut fields = vec![atom(leaves, range.start, "generalizing")?];
-                    fields.extend(
-                        (range.start + 1..range.end)
-                            .map(|at| leaves.leaf(at))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                    null_node(fields)
-                } else {
-                    null_node(Vec::new())
-                };
-                let keyword = if word(tokens, plan.start, "cases") {
-                    "cases"
-                } else {
-                    "induction"
-                };
-                values.push(Syntax::node(
-                    parser_kind(&["Tactic", keyword]),
-                    vec![
-                        atom(leaves, plan.start, keyword)?,
-                        Syntax::node(
-                            parser_kind(&["Tactic", "elimTarget"]),
-                            vec![
-                                match plan.equation {
-                                    Some(at) => {
-                                        null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?])
-                                    }
-                                    None => null_node(Vec::new()),
-                                },
-                                binding_term(leaves, view, tokens, plan.target)?,
-                            ],
-                        ),
-                        generalizing,
-                        null_node(
-                            plan.with
-                                .map(|at| leaves.leaf(at))
-                                .transpose()?
-                                .into_iter()
-                                .collect(),
-                        ),
-                        null_node(alts),
-                    ],
-                ));
+                values.push(finish_elimination(leaves, view, tokens, plan, children)?);
             }
         }
     }

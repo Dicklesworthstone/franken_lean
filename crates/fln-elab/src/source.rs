@@ -1343,9 +1343,11 @@ impl Context {
             LocalFunctionAnnotation(local_functions::Build<'a>),
             LocalFunctionStart(local_functions::Build<'a>, Option<usize>),
             LocalFunctionValue(local_functions::Build<'a>, usize),
-            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool),
-            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool),
-            LetBody(LocalContext, FVarId, Name, Typed, bool),
+            // The last two flags: opaque (`have`), and inline (`letI`/`haveI`, whose
+            // value replaces the bound variable instead of becoming a `let`).
+            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool, bool),
+            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool, bool),
+            LetBody(LocalContext, FVarId, Name, Typed, bool, bool),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -1743,6 +1745,7 @@ impl Context {
                                         name.clone(),
                                         value,
                                         false,
+                                        false,
                                     ));
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
@@ -1811,6 +1814,7 @@ impl Context {
                                         continuation,
                                         expected,
                                         true,
+                                        false,
                                     ));
                                     tasks.push(Task::Visit(
                                         annotation,
@@ -1893,17 +1897,28 @@ impl Context {
                                 if kind == &parser_kind(&["Term", "let"])
                                     || kind == &parser_kind(&["Term", "have"])
                                     || kind == &parser_kind(&["Term", "letrec"])
+                                    || kind == &parser_kind(&["Term", "letI"])
+                                    || kind == &parser_kind(&["Term", "haveI"])
                                 {
-                                    let opaque = kind == &parser_kind(&["Term", "have"]);
+                                    let opaque = kind == &parser_kind(&["Term", "have"])
+                                        || kind == &parser_kind(&["Term", "haveI"]);
+                                    // `letI`/`haveI` elaborate as `let`/`have` and then inline
+                                    // the value (`Lean/Elab/BuiltinNotation.lean`).
+                                    let inline = kind == &parser_kind(&["Term", "letI"])
+                                        || kind == &parser_kind(&["Term", "haveI"]);
                                     let recursive = kind == &parser_kind(&["Term", "letrec"]);
                                     let binding = self.let_parts(args, opaque, recursive)?;
-                                    if recursive
-                                        || !expect_null_args(
-                                            binding.parameters,
-                                            "local function parameters",
-                                        )?
-                                        .is_empty()
-                                    {
+                                    let parameters = !expect_null_args(
+                                        binding.parameters,
+                                        "local function parameters",
+                                    )?
+                                    .is_empty();
+                                    if inline && parameters {
+                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                            expected: "an inlined local without parameters",
+                                        });
+                                    }
+                                    if recursive || parameters {
                                         let build = self.start_local_function(binding, expected)?;
                                         if let Some(annotation) = build.binding.annotation {
                                             tasks.push(Task::LocalFunctionAnnotation(build));
@@ -1931,7 +1946,7 @@ impl Context {
                                     } = binding;
                                     if let Some(annotation) = annotation {
                                         tasks.push(Task::LetAnnotation(
-                                            name, value, body, expected, opaque,
+                                            name, value, body, expected, opaque, inline,
                                         ));
                                         tasks.push(Task::Visit(
                                             annotation,
@@ -1940,7 +1955,7 @@ impl Context {
                                         ));
                                     } else {
                                         tasks.push(Task::LetValue(
-                                            name, None, body, expected, opaque,
+                                            name, None, body, expected, opaque, inline,
                                         ));
                                         tasks.push(Task::Visit(value, None, true));
                                     }
@@ -2065,6 +2080,37 @@ impl Context {
                                         self.explicit_application_head(&parts[0])?;
                                     tasks.push(Task::StartApplication(
                                         head, arguments, expected, explicit,
+                                    ));
+                                    continue;
+                                }
+                                // `f <| a` and `a |> f` are the application `f a`
+                                // (`Init/Notation.lean:522`). The pin's macros also flatten
+                                // `f x <| a` and `a |> f x` into `f x a`; that form is refused
+                                // here rather than read as `(f x) a`.
+                                let pipeline = if kind == &Name::from_components(["term_<|_"]) {
+                                    Some(("<|", 0, 2))
+                                } else if kind == &Name::from_components(["term_|>_"]) {
+                                    Some(("|>", 2, 0))
+                                } else {
+                                    None
+                                };
+                                if let Some((operator, function, argument)) = pipeline {
+                                    let parts = expect_node(syntax, kind, 3, "pipeline")?;
+                                    expect_atom(&parts[1], operator, "pipeline operator")?;
+                                    if matches!(&parts[function], Syntax::Node { kind, .. }
+                                        if kind == &parser_kind(&["Term", "app"]))
+                                    {
+                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                            expected: "a pipeline whose function is not an application",
+                                        });
+                                    }
+                                    let (head, explicit) =
+                                        self.explicit_application_head(&parts[function])?;
+                                    tasks.push(Task::StartApplication(
+                                        head,
+                                        std::slice::from_ref(&parts[argument]),
+                                        expected,
+                                        explicit,
                                     ));
                                     continue;
                                 }
@@ -2901,9 +2947,10 @@ impl Context {
                                 build.binding.body,
                                 build.expected,
                                 build.binding.opaque,
+                                false,
                             ));
                         }
-                        Task::LetAnnotation(name, value, body, expected, opaque) => {
+                        Task::LetAnnotation(name, value, body, expected, opaque, inline) => {
                             let annotation = values.pop().expect("let annotation visit");
                             self.sort_level(&annotation)?;
                             tasks.push(Task::LetValue(
@@ -2912,6 +2959,7 @@ impl Context {
                                 body,
                                 expected,
                                 opaque,
+                                inline,
                             ));
                             tasks.push(Task::Visit(value, Some(annotation.value), true));
                         }
@@ -2934,7 +2982,7 @@ impl Context {
                                 value.type_.clone(),
                                 BinderInfo::Default,
                             );
-                            tasks.push(Task::LetBody(saved, id, name, value, false));
+                            tasks.push(Task::LetBody(saved, id, name, value, false, false));
                             tasks.push(Task::Visit(body, Some(result_type), true));
                         }
                         Task::DoBindJoinStart(name, continuation, body, result_type, annotated) => {
@@ -2986,7 +3034,7 @@ impl Context {
                         Task::DoBindJoinValue(saved, id, name, body) => {
                             let continuation = values.pop().expect("nested do continuation visit");
                             values.push(body);
-                            tasks.push(Task::LetBody(saved, id, name, continuation, false));
+                            tasks.push(Task::LetBody(saved, id, name, continuation, false, false));
                         }
                         Task::DoNestedAnnotation(body, expected, finish) => {
                             let annotation =
@@ -2994,7 +3042,7 @@ impl Context {
                             self.sort_level(&annotation)?;
                             tasks.push(Task::Visit(body, expected, finish));
                         }
-                        Task::LetValue(name, annotation, body, expected, opaque) => {
+                        Task::LetValue(name, annotation, body, expected, opaque, inline) => {
                             let mut value = values.pop().expect("let value visit");
                             if let Some(annotation) = annotation {
                                 value.type_ = annotation;
@@ -3019,10 +3067,10 @@ impl Context {
                                     value.value.clone(),
                                 );
                             }
-                            tasks.push(Task::LetBody(saved, id, name, value, opaque));
+                            tasks.push(Task::LetBody(saved, id, name, value, opaque, inline));
                             tasks.push(Task::Visit(body, expected, true));
                         }
-                        Task::LetBody(saved, id, name, value, opaque) => {
+                        Task::LetBody(saved, id, name, value, opaque, inline) => {
                             if opaque {
                                 // Do not postpone equations past the context that
                                 // gives this assertion its opaque interpretation.
@@ -3042,16 +3090,13 @@ impl Context {
                                 .abstract_fvar(&id, 0)
                                 .map_err(|_| failure(SourceInferenceError::Scope))?;
                             let type_ = self.substitute(&abstract_type, &value.value)?;
-                            values.push(Typed {
-                                value: Expr::let_e(
-                                    name,
-                                    value.type_,
-                                    value.value,
-                                    abstract_body,
-                                    opaque,
-                                ),
-                                type_,
-                            });
+                            let value = if inline {
+                                // `letI`/`haveI`: the value replaces the variable.
+                                self.substitute(&abstract_body, &value.value)?
+                            } else {
+                                Expr::let_e(name, value.type_, value.value, abstract_body, opaque)
+                            };
+                            values.push(Typed { value, type_ });
                             self.txn.lctx = saved;
                         }
                     }
@@ -3280,11 +3325,17 @@ impl Context {
             let [keyword, config, declaration, separator, body] = parts else {
                 return Err(failure(SourceInferenceError::Scope));
             };
-            expect_atom(
-                keyword,
-                if opaque { "have" } else { "let" },
-                "local binding keyword",
-            )?;
+            // `letI`/`haveI` share the grammar; the caller reads which from the node kind.
+            let (plain, inlined) = if opaque {
+                ("have", "haveI")
+            } else {
+                ("let", "letI")
+            };
+            if !matches!(keyword, Syntax::Atom { val, .. } if val == plain || val == inlined) {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "local binding keyword",
+                });
+            }
             let config = expect_node(
                 config,
                 &parser_kind(&["Term", "letConfig"]),
@@ -3565,13 +3616,22 @@ impl Context {
                 _ => return Err(failure(SourceInferenceError::ExpectedType)),
             };
             for name in names {
-                let Syntax::Ident { val: name, .. } = name else {
-                    return Err(failure(SourceInferenceError::Scope));
+                let name = match name {
+                    Syntax::Ident { val, .. } => val.clone(),
+                    // `_` binds a name no source identifier spells, as an unnamed instance
+                    // binder does above (the pin's `mkFreshIdent`).
+                    Syntax::Node { kind, args, .. }
+                        if kind == &parser_kind(&["Term", "hole"])
+                            && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
+                    {
+                        self.fresh_name()?
+                    }
+                    _ => return Err(failure(SourceInferenceError::Scope)),
                 };
                 let id = FVarId(self.fresh_name()?);
                 self.txn
                     .lctx
-                    .add_param(id.clone(), name.clone(), domain.clone(), style);
+                    .add_param(id.clone(), name, domain.clone(), style);
                 parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
             }
         }
@@ -3774,43 +3834,43 @@ fn definition_in_context_named(
     let struct_instance;
     let empty_suffix;
     let empty_where;
-    let (body, termination, where_clause) = if is_instance
-        && definition[3].kind() == Some(&parser_kind(&["Command", "whereStructInst"]))
-    {
-        struct_instance = where_struct_instance(&definition[3])?;
-        empty_suffix = Syntax::node(
-            parser_kind(&["Termination", "suffix"]),
-            vec![
-                Syntax::node(Name::from_components(["null"]), Vec::new()),
-                Syntax::node(Name::from_components(["null"]), Vec::new()),
-            ],
-        );
-        empty_where = Syntax::node(Name::from_components(["null"]), Vec::new());
-        (&struct_instance, &empty_suffix, &empty_where)
-    } else if equations {
-        let parts = expect_node(
-            &definition[3],
-            &parser_kind(&["Command", "declValEqns"]),
-            1,
-            "equation value",
-        )?;
-        let parts = expect_node(
-            &parts[0],
-            &parser_kind(&["Term", "matchAltsWhereDecls"]),
-            3,
-            "equation alternatives",
-        )?;
-        (&parts[0], &parts[1], &parts[2])
-    } else {
-        let parts = expect_node(
-            &definition[3],
-            &parser_kind(&["Command", "declValSimple"]),
-            4,
-            "definition value",
-        )?;
-        expect_atom(&parts[0], ":=", "definition assignment")?;
-        (&parts[1], &parts[2], &parts[3])
-    };
+    // `whereStructInst` is any declaration's value (`declVal`, `Lean/Parser/Command.lean`).
+    let (body, termination, where_clause) =
+        if definition[3].kind() == Some(&parser_kind(&["Command", "whereStructInst"])) {
+            struct_instance = where_struct_instance(&definition[3])?;
+            empty_suffix = Syntax::node(
+                parser_kind(&["Termination", "suffix"]),
+                vec![
+                    Syntax::node(Name::from_components(["null"]), Vec::new()),
+                    Syntax::node(Name::from_components(["null"]), Vec::new()),
+                ],
+            );
+            empty_where = Syntax::node(Name::from_components(["null"]), Vec::new());
+            (&struct_instance, &empty_suffix, &empty_where)
+        } else if equations {
+            let parts = expect_node(
+                &definition[3],
+                &parser_kind(&["Command", "declValEqns"]),
+                1,
+                "equation value",
+            )?;
+            let parts = expect_node(
+                &parts[0],
+                &parser_kind(&["Term", "matchAltsWhereDecls"]),
+                3,
+                "equation alternatives",
+            )?;
+            (&parts[0], &parts[1], &parts[2])
+        } else {
+            let parts = expect_node(
+                &definition[3],
+                &parser_kind(&["Command", "declValSimple"]),
+                4,
+                "definition value",
+            )?;
+            expect_atom(&parts[0], ":=", "definition assignment")?;
+            (&parts[1], &parts[2], &parts[3])
+        };
     let termination = expect_node(
         termination,
         &parser_kind(&["Termination", "suffix"]),

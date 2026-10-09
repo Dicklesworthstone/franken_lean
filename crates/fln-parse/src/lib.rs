@@ -246,6 +246,8 @@ struct ExplicitBinderTokens {
     type_range: std::ops::Range<usize>,
     close: usize,
     kind: &'static str,
+    /// An explicit binder's default value `:= v`: the `:=` token.
+    default: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +329,10 @@ enum BoundedInfix {
     Inter,
     SDiff,
     FunctorMap,
+    /// `syntax:min term " <| " term:min` (`Init/Notation.lean:522`): application, right-nested.
+    PipeLeft,
+    /// `syntax:min term " |> " term:min1` (`Init/Notation.lean`): application, left-nested.
+    PipeRight,
 }
 
 impl BoundedInfix {
@@ -377,6 +383,8 @@ impl BoundedInfix {
             Self::Inter => "∩",
             Self::SDiff => "\\",
             Self::FunctorMap => "<$>",
+            Self::PipeLeft => "<|",
+            Self::PipeRight => "|>",
         }
     }
     const fn precedence(self) -> u8 {
@@ -405,6 +413,7 @@ impl BoundedInfix {
             Self::Union => 65,
             Self::Inter | Self::SDiff => 70,
             Self::FunctorMap => 100,
+            Self::PipeLeft | Self::PipeRight => 10,
         }
     }
 
@@ -425,6 +434,7 @@ impl BoundedInfix {
                 | Self::PProd
                 | Self::Comp
                 | Self::FunctorMap
+                | Self::PipeLeft
         )
     }
 
@@ -674,6 +684,8 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "∩" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Inter),
         "\\" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SDiff),
         "<$>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::FunctorMap),
+        "<|" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PipeLeft),
+        "|>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PipeRight),
         _ => None,
     }
 }
@@ -763,7 +775,7 @@ fn local_line_break(
     if at <= from || at >= tokens.len() || from >= tokens.len() {
         return false;
     }
-    if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(s.as_str(), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄" | "⟩"))
+    if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄" | "⟩"))
     {
         return false;
     }
@@ -819,20 +831,22 @@ fn find_let_separator(
         if delimiters.is_empty()
             && (term_locals::word(tokens, index, "let")
                 || term_locals::word(tokens, index, "have")
+                || term_locals::word(tokens, index, "letI")
+                || term_locals::word(tokens, index, "haveI")
                 || term_locals::word(tokens, index, "suffices"))
         {
             nested_lets.push(index);
             continue;
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" => delimiters.push(")"),
                 "{" | ".{" => delimiters.push("}"),
                 "[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
                 "⟨" => delimiters.push("⟩"),
                 ")" | "}" | "]" | "⦄" | "⟩" => {
-                    if delimiters.pop() != Some(symbol.as_str()) {
+                    if delimiters.pop() != Some(crate::canonical_bracket(symbol.as_str())) {
                         return None;
                     }
                 }
@@ -852,6 +866,39 @@ fn find_let_separator(
 
 /// Find a type's delimiter without splitting a parenthesized application or
 /// arrow. The term parser still validates every token in the selected range.
+/// The single bracket a symbol acts as for nesting. The pin's tokens put brackets inside longer
+/// symbols: `#[`, `%[`, `.(`, `-[`, `` `(tactic| `` and `wp⟦` open, and `]'` (`xs[i]'h`,
+/// `Init/GetElem.lean`) and `+1]` close. A symbol holding only opening brackets acts as the
+/// opener its last one is closed by, and one holding only closing brackets as its first; `⟦`
+/// and `⟧` nest as parentheses. Any other symbol is returned unchanged, so a scanner matching
+/// `"("`, `"["`, `"{"`, `"⦃"`, `"⟨"` and their closers sees every bracket the pin nests.
+pub(crate) fn canonical_bracket(symbol: &str) -> &str {
+    const PAIRS: [(char, char, &str, &str); 6] = [
+        ('(', ')', "(", ")"),
+        ('[', ']', "[", "]"),
+        ('{', '}', "{", "}"),
+        ('⟨', '⟩', "⟨", "⟩"),
+        ('⦃', '⦄', "⦃", "⦄"),
+        ('⟦', '⟧', "(", ")"),
+    ];
+    if matches!(
+        symbol,
+        "(" | "[" | "{" | ".{" | "⦃" | "⟨" | ")" | "]" | "}" | "⦄" | "⟩"
+    ) {
+        return symbol;
+    }
+    let opener = symbol
+        .chars()
+        .rev()
+        .find(|c| PAIRS.iter().any(|p| p.0 == *c));
+    let closer = symbol.chars().find(|c| PAIRS.iter().any(|p| p.1 == *c));
+    match (opener, closer) {
+        (Some(open), None) => PAIRS.iter().find(|p| p.0 == open).map_or(symbol, |p| p.2),
+        (None, Some(close)) => PAIRS.iter().find(|p| p.1 == close).map_or(symbol, |p| p.3),
+        _ => symbol,
+    }
+}
+
 fn type_end(tokens: &[LexedToken], from: usize, delimiter: &str) -> usize {
     let mut delimiters = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(from) {
@@ -859,7 +906,7 @@ fn type_end(tokens: &[LexedToken], from: usize, delimiter: &str) -> usize {
             if delimiters.is_empty() && symbol == delimiter {
                 return index;
             }
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" => delimiters.push(")"),
                 "{" | ".{" => delimiters.push("}"),
                 "[" => delimiters.push("]"),
@@ -969,7 +1016,7 @@ fn bounded_let_bindings(
                     });
                 }
                 if let TokenKind::Symbol(s) = &tokens[at].kind {
-                    match s.as_str() {
+                    match crate::canonical_bracket(s.as_str()) {
                         "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
                         ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
                         _ => {}
@@ -1145,7 +1192,12 @@ fn finish_bounded_application(
         // original leaves without another recursive parser invocation.
         let mut explicit = Vec::with_capacity(terms.len());
         while let Some((term, at)) = terms.pop() {
-            if matches!(&term, Syntax::Atom { val, .. } if val == "@") {
+            let prefix = match &term {
+                Syntax::Atom { val, .. } if val == "@" => Some("explicit"),
+                Syntax::Atom { val, .. } if val == "inferInstanceAs" => Some("inferInstanceAs"),
+                _ => None,
+            };
+            if let Some(kind) = prefix {
                 let Some((head, _)) = explicit.pop() else {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, at),
@@ -1153,7 +1205,7 @@ fn finish_bounded_application(
                     });
                 };
                 explicit.push((
-                    Syntax::node(parser_kind(&["Term", "explicit"]), vec![term, head]),
+                    Syntax::node(parser_kind(&["Term", kind]), vec![term, head]),
                     at,
                 ));
             } else {
@@ -1225,6 +1277,19 @@ fn reduce_bounded_infix(
             parser_kind(&["Term", "subst"]),
             vec![left, operator.syntax, null_node(vec![right])],
         )
+    } else if let Some((binders, kind)) =
+        matches!(operator.operator, BoundedInfix::Prod | BoundedInfix::PProd)
+            .then(|| dependent_pair(&left))
+            .flatten()
+            .map(|binders| {
+                let pprod = operator.operator == BoundedInfix::PProd;
+                (binders, if pprod { "term_×'__1" } else { "term_×__1" })
+            })
+    {
+        Syntax::node(
+            Name::from_components([kind]),
+            vec![binders, operator.syntax, right],
+        )
     } else {
         Syntax::node(
             operator.operator.syntax_kind(),
@@ -1233,6 +1298,107 @@ fn reduce_bounded_infix(
     };
     frame.operands.push((node, left_at));
     Ok(())
+}
+
+/// `(a b : α) × β` is the pin's dependent pair, `macro:35 xs:bracketedExplicitBinders " × "
+/// b:term:35` (`Init/NotationExtra.lean:93`, and `×'` for `PSigma`): the left operand is a
+/// `Lean.bracketedExplicitBinders`, not an ascription. Rebuilds it from the parenthesized
+/// ascription the term parser read, giving the `(` back the whitespace its hygiene identifier
+/// took; `None` when the operand is anything else.
+#[inline(never)]
+fn dependent_pair(left: &Syntax) -> Option<Syntax> {
+    let Syntax::Node { kind, args, .. } = left else {
+        return None;
+    };
+    if kind != &parser_kind(&["Term", "typeAscription"]) {
+        return None;
+    }
+    let [opener, value, colon, annotation, close] = args.as_slice() else {
+        return None;
+    };
+    let Syntax::Node { args: paren, .. } = opener else {
+        return None;
+    };
+    let [
+        Syntax::Atom {
+            info: open_info,
+            val,
+        },
+        Syntax::Node { args: hygiene, .. },
+    ] = paren.as_slice()
+    else {
+        return None;
+    };
+    let SourceInfo::Original {
+        leading,
+        pos,
+        end_pos,
+        ..
+    } = open_info
+    else {
+        return None;
+    };
+    let [
+        Syntax::Ident {
+            info: hygiene_info, ..
+        },
+    ] = hygiene.as_slice()
+    else {
+        return None;
+    };
+    let SourceInfo::Original { trailing, .. } = hygiene_info else {
+        return None;
+    };
+    let names: Vec<&Syntax> = match value {
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "app"]) => {
+            let [head, Syntax::Node { args: rest, .. }] = args.as_slice() else {
+                return None;
+            };
+            std::iter::once(head).chain(rest.iter()).collect()
+        }
+        other => vec![other],
+    };
+    let binder = |name: &Syntax| match name {
+        Syntax::Ident { .. } => Some(name.clone()),
+        Syntax::Node { kind, .. } if kind == &parser_kind(&["Term", "hole"]) => Some(name.clone()),
+        _ => None,
+    };
+    let names = names
+        .into_iter()
+        .map(|name| {
+            binder(name).map(|name| {
+                Syntax::node(Name::from_components(["Lean", "binderIdent"]), vec![name])
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let Syntax::Node {
+        args: annotation, ..
+    } = annotation
+    else {
+        return None;
+    };
+    let [type_] = annotation.as_slice() else {
+        return None;
+    };
+    let open = Syntax::Atom {
+        info: SourceInfo::Original {
+            leading: *leading,
+            pos: *pos,
+            trailing: *trailing,
+            end_pos: *end_pos,
+        },
+        val: val.clone(),
+    };
+    Some(Syntax::node(
+        Name::from_components(["Lean", "bracketedExplicitBinders"]),
+        vec![
+            open,
+            null_node(names),
+            colon.clone(),
+            type_.clone(),
+            close.clone(),
+        ],
+    ))
 }
 
 fn push_bounded_operand(
@@ -1852,7 +2018,7 @@ fn bounded_term_frames(
                 &mut frames,
                 grammar,
                 index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
             )?;
             let mut frame = frames.pop().expect("waiting assertion value frame");
             let prefix = frame.prefix.take().expect("waiting assertion prefix");
@@ -1880,7 +2046,7 @@ fn bounded_term_frames(
         }
         if grammar == DefinitionGrammar::Scalar
             && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
-                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
+                if matches!(crate::canonical_bracket(s.as_str()), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
                 || term_locals::word(tokens, index, "from")
                 || frames
                     .last()
@@ -1894,7 +2060,7 @@ fn bounded_term_frames(
                 &mut frames,
                 grammar,
                 index,
-                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
             )?;
             if let Some(mut frame) = frames.pop_if(|frame| {
                 frame
@@ -1918,11 +2084,18 @@ fn bounded_term_frames(
             continue;
         }
         if grammar == DefinitionGrammar::Scalar
+            && !lists.current(&frames)
+            && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == ",")
+            && lists.open_tuple(leaves, view, tokens, &mut frames, index)?
+        {
+            continue;
+        }
+        if grammar == DefinitionGrammar::Scalar
             && lists.current(&frames)
             && matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
                 if lists.delimits(symbol))
         {
-            lists.delimiter(leaves, view, tokens, &mut frames, index)?;
+            cursor = lists.delimiter(leaves, view, tokens, &mut frames, index, range.end)?;
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
@@ -1935,6 +2108,8 @@ fn bounded_term_frames(
             _ if grammar == DefinitionGrammar::Scalar
                 && (term_locals::word(tokens, index, "let")
                     || term_locals::word(tokens, index, "have")
+                    || term_locals::word(tokens, index, "letI")
+                    || term_locals::word(tokens, index, "haveI")
                     || term_locals::word(tokens, index, "show")
                     || term_locals::word(tokens, index, "suffices")) =>
             {
@@ -1945,7 +2120,9 @@ fn bounded_term_frames(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
             {
-                lists.open(&mut frames, index, collections::Bracket::List);
+                if !lists.open_index(tokens, &mut frames, index) {
+                    lists.open(&mut frames, index, collections::Bracket::List);
+                }
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "⟨" =>
@@ -1970,8 +2147,8 @@ fn bounded_term_frames(
                 let limit = term_locals::proof_limit(view, tokens, &frames, index, range.end);
                 let (proof, end) = proofs::parse(leaves, view, tokens, index, limit)?;
                 // Tactic arguments are parsed by their own bounded term call.
-                // Its returned syntax already owns these matches. Nested by
-                // blocks are forbidden by that parser, bounding re-entry depth.
+                // Its returned syntax already owns these matches. That parser
+                // bounds how deeply by blocks re-enter it.
                 splices.retain(|start, _| *start < index || *start >= end);
                 frames
                     .last_mut()
@@ -1981,8 +2158,20 @@ fn bounded_term_frames(
                 cursor = end;
             }
             Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && symbol == "@" =>
+                if grammar == DefinitionGrammar::Scalar
+                    && (symbol == "@" || symbol == "inferInstanceAs") =>
             {
+                // `"inferInstanceAs" (("$" <|> "<|") term:minPrec <|> term:argPrec)`
+                // (`Lean/Parser/Term.lean`): only the argument form is read here.
+                if symbol == "inferInstanceAs"
+                    && matches!(tokens.get(index + 1).map(|t| &t.kind),
+                        Some(TokenKind::Symbol(next)) if next == "<|" || next == "$")
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index + 1),
+                        expected: grammar.value_expectation(),
+                    });
+                }
                 frames
                     .last_mut()
                     .expect("root term frame")
@@ -2120,7 +2309,7 @@ fn bounded_term_frames(
                     &mut frames,
                     grammar,
                     index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
                 )?;
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {
                     record_terms::delimiter(
@@ -2202,7 +2391,7 @@ fn bounded_term_frames(
                     &mut frames,
                     grammar,
                     index,
-                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), ")" | "]" | "}" | "⦄" | "⟩" | ",")),
                 )?;
                 if lists.current(&frames) {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -2351,6 +2540,8 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     symbol.as_str(),
                     "def"
                         | "theorem"
+                        | "abbrev"
+                        | "opaque"
                         | "example"
                         | "instance"
                         | "structure"
@@ -2437,6 +2628,42 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     }
 }
 
+/// `binderDefault := " := " term` or, for a proof, `binderTactic := " := " " by " tacticSeq`
+/// (`Lean/Parser/Term.lean`): the `by` block's own two parts, with no `byTactic` node.
+#[inline(never)]
+fn binder_default(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    assign: usize,
+    close: usize,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let value = bounded_term(leaves, view, tokens, assign + 1..close, grammar)?;
+    let tactic = matches!(&tokens[assign + 1].kind, TokenKind::Symbol(s) if s == "by");
+    let proof = match &value {
+        Syntax::Node { kind, args, .. }
+            if tactic && kind == &parser_kind(&["Term", "byTactic"]) && args.len() == 2 =>
+        {
+            Some([args[0].clone(), args[1].clone()])
+        }
+        _ => None,
+    };
+    let assign = leaves.leaf(assign)?;
+    Ok(match proof {
+        Some([by, sequence]) => Syntax::node(
+            parser_kind(&["Term", "binderTactic"]),
+            vec![assign, by, sequence],
+        ),
+        None => Syntax::node(parser_kind(&["Term", "binderDefault"]), vec![assign, value]),
+    })
+}
+
+/// Whether token `at` is the hole `_`.
+fn is_hole(tokens: &[LexedToken], at: usize) -> bool {
+    matches!(tokens.get(at).map(|token| &token.kind), Some(TokenKind::Symbol(s)) if s == "_")
+}
+
 fn bounded_binders(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -2481,15 +2708,18 @@ fn bounded_binders(
                 type_range: start..cursor,
                 close: cursor,
                 kind,
+                default: None,
             });
             cursor += 1;
             continue;
         }
         let names_start = cursor;
+        // `binderIdent` is an identifier or a hole (`Lean/Parser/Term.lean`).
         while matches!(
             tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
-        ) {
+        ) || is_hole(tokens, cursor)
+        {
             cursor += 1;
         }
         if cursor == names_start {
@@ -2514,6 +2744,7 @@ fn bounded_binders(
                 type_range: cursor..cursor,
                 close: cursor,
                 kind,
+                default: None,
             });
             cursor += 1;
             continue;
@@ -2543,6 +2774,15 @@ fn bounded_binders(
         }
         let close = cursor;
         cursor += 1;
+        // `explicitBinder`'s `binderDefault <|> binderTactic` (`Lean/Parser/Term.lean`): a
+        // top-level `:=` ends the type.
+        let assign = type_end(&tokens[..close], type_range.start, ":=");
+        let (type_range, default) =
+            if grammar == DefinitionGrammar::Scalar && kind == "explicitBinder" && assign < close {
+                (type_range.start..assign, Some(assign))
+            } else {
+                (type_range, None)
+            };
         parameter_groups.push(ExplicitBinderTokens {
             open,
             names: names_start..colon,
@@ -2550,6 +2790,7 @@ fn bounded_binders(
             type_range,
             close,
             kind,
+            default,
         });
     }
     Ok((parameter_groups, cursor))
@@ -2583,8 +2824,15 @@ fn bounded_binder_syntax(
         }
         let names = group
             .names
-            .map(|index| leaves.leaf(index))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|index| {
+                let leaf = leaves.leaf(index)?;
+                Ok(if is_hole(tokens, index) {
+                    Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])
+                } else {
+                    leaf
+                })
+            })
+            .collect::<Result<Vec<_>, NatDefinitionParseError>>()?;
         let binder_type = if group.colon == group.close {
             null_node(Vec::new())
         } else {
@@ -2595,7 +2843,17 @@ fn bounded_binder_syntax(
         };
         let mut children = vec![leaves.leaf(group.open)?, null_node(names), binder_type];
         if group.kind == "explicitBinder" {
-            children.push(null_node(Vec::new()));
+            children.push(match group.default {
+                Some(assign) => null_node(vec![binder_default(
+                    leaves,
+                    view,
+                    tokens,
+                    assign,
+                    group.close,
+                    grammar,
+                )?]),
+                None => null_node(Vec::new()),
+            });
         }
         children.push(leaves.leaf(group.close)?);
         parameters.push(Syntax::node(parser_kind(&["Term", group.kind]), children));
@@ -2771,7 +3029,7 @@ fn parse_definition_with_grammar(
     let (doc_end, attributes_end, declaration_start) = declaration_prefix(&view, &tokens, grammar)?;
     if !matches!(
         tokens.get(declaration_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance"))
+        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance" | "abbrev" | "opaque"))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
@@ -2783,6 +3041,9 @@ fn parse_definition_with_grammar(
     let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
     let is_example =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "example");
+    // `opaque := "opaque " declId declSig (declValSimple)?` (`Lean/Parser/Command.lean`).
+    let is_opaque =
+        matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "opaque");
     if attributes_end != doc_end && is_instance {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
@@ -2851,8 +3112,8 @@ fn parse_definition_with_grammar(
         cursor += 1;
         let start = cursor;
         cursor = type_end(&tokens, start, ":=");
-        if is_instance && grammar == DefinitionGrammar::Scalar {
-            // `instance : C where …` (`Command.whereStructInst`).
+        if grammar == DefinitionGrammar::Scalar {
+            // `instance : C where …` and `def f : T where …` (`Command.whereStructInst`).
             cursor = cursor.min(type_end(&tokens, start, "where"));
         }
         if grammar == DefinitionGrammar::Scalar {
@@ -2869,7 +3130,7 @@ fn parse_definition_with_grammar(
     } else {
         None
     };
-    if (is_theorem || is_instance) && explicit_result_type.is_none() {
+    if (is_theorem || is_instance || is_opaque) && explicit_result_type.is_none() {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, cursor),
             expected: NatDefinitionExpectation::TheoremType,
@@ -2879,12 +3140,21 @@ fn parse_definition_with_grammar(
     let equations = grammar == DefinitionGrammar::Scalar
         && matches!(tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == "|");
-    let instance_where = is_instance
-        && grammar == DefinitionGrammar::Scalar
+    // A structure body after the signature, for any declaration (`declVal`).
+    let structure_where = grammar == DefinitionGrammar::Scalar
         && matches!(tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == "where");
+    // An `opaque` with no value; one with a value takes only `declValSimple`.
+    let bare_opaque = is_opaque && assignment_index == tokens.len();
+    if is_opaque && (equations || structure_where) {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(&view, &tokens, assignment_index),
+            expected: NatDefinitionExpectation::Assignment,
+        });
+    }
     if !equations
-        && !instance_where
+        && !structure_where
+        && !bare_opaque
         && !matches!(
             tokens.get(assignment_index).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":="
@@ -2898,10 +3168,14 @@ fn parse_definition_with_grammar(
     let value_index = assignment_index + 1;
     // A trailing `where` block of a `:=` definition or theorem (`declValSimple`'s
     // `whereDecls`). An instance's own `where` is its structure body, never this.
-    let where_index = (!equations && !is_instance && grammar == DefinitionGrammar::Scalar)
+    let where_index = (!equations
+        && !is_instance
+        && !structure_where
+        && !bare_opaque
+        && grammar == DefinitionGrammar::Scalar)
         .then(|| where_decls::start(&tokens, value_index))
         .flatten();
-    let (let_bindings, body_start) = if equations || instance_where {
+    let (let_bindings, body_start) = if equations || structure_where || bare_opaque {
         (Vec::new(), assignment_index)
     } else {
         bounded_let_bindings(&view, &tokens, value_index)?
@@ -2941,7 +3215,7 @@ fn parse_definition_with_grammar(
     } else {
         null_node(Vec::new())
     };
-    let result_type = if is_theorem || is_instance {
+    let result_type = if is_theorem || is_instance || is_opaque {
         let Syntax::Node { args, .. } = &result_type else {
             unreachable!("optional type container");
         };
@@ -2952,7 +3226,7 @@ fn parse_definition_with_grammar(
     let optional_signature = Syntax::node(
         parser_kind(&[
             "Command",
-            if is_theorem || is_instance {
+            if is_theorem || is_instance || is_opaque {
                 "declSig"
             } else {
                 "optDeclSig"
@@ -2960,7 +3234,7 @@ fn parse_definition_with_grammar(
         ]),
         vec![null_node(parameters), result_type],
     );
-    let value = if instance_where {
+    let value = if structure_where || bare_opaque {
         null_node(Vec::new())
     } else if equations {
         matching::declaration_equations(
@@ -2988,7 +3262,9 @@ fn parse_definition_with_grammar(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let declaration_value = if instance_where {
+    let declaration_value = if bare_opaque {
+        null_node(Vec::new())
+    } else if structure_where {
         where_decls::struct_instance(&leaves, &view, &tokens, assignment_index)?
     } else if equations {
         // `declValEqns := matchAltsWhereDecls` (`Lean/Parser/Command.lean`): the
@@ -3056,19 +3332,34 @@ fn parse_definition_with_grammar(
             ],
         )
     } else {
+        // `abbrev` is `"abbrev " declId optDeclSig declVal` (`Lean/Parser/Command.lean`): a
+        // definition's parts without its `deriving` slot.
+        let is_abbrev = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "abbrev");
+        // An `opaque` value is optional: `[]` or `[declValSimple]`.
+        let declaration_value = if is_opaque && !bare_opaque {
+            null_node(vec![declaration_value])
+        } else {
+            declaration_value
+        };
         let mut parts = vec![
             definition_keyword,
             declaration_id.expect("named declaration"),
             optional_signature,
             declaration_value,
         ];
-        if !is_theorem {
+        if !is_theorem && !is_abbrev && !is_opaque {
             parts.push(null_node(Vec::new()));
         }
-        Syntax::node(
-            parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
-            parts,
-        )
+        let kind = if is_theorem {
+            "theorem"
+        } else if is_abbrev {
+            "abbrev"
+        } else if is_opaque {
+            "opaque"
+        } else {
+            "definition"
+        };
+        Syntax::node(parser_kind(&["Command", kind]), parts)
     };
     let syntax = Syntax::node(
         parser_kind(&["Command", "declaration"]),

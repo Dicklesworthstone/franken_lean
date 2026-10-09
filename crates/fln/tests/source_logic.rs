@@ -259,3 +259,232 @@ fn the_empty_collection_notation_is_its_class_constant() {
          theorem empty_is_zero : (∅ : Bag) = Bag.mk 0 := rfl\n",
     );
 }
+
+/// `f <| a` is the application `f a` (`Init/Notation.lean:522`). The pin's macro also flattens
+/// `f x <| a` into `f x a`; that form is refused rather than read as `(f x) a`.
+#[test]
+fn the_pipeline_applies_its_function_and_refuses_an_applied_one() {
+    check(
+        "theorem pipe : (Nat.succ <| Nat.succ <| 0) = 2 := rfl\n\
+         theorem pipe_right : (0 |> Nat.succ |> Nat.succ) = 2 := rfl\n",
+    );
+    let (engine, limits) = engine();
+    for source in [
+        "theorem applied : (Nat.add 1 <| 1) = 2 := rfl\n",
+        "theorem applied : (1 |> Nat.add 1) = 2 := rfl\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+/// While its body elaborates, `letI`'s value shows and `haveI`'s does not, as for `let` and
+/// `have`: the pin accepts `shown` and refuses `hidden` with a type mismatch at `rfl`.
+#[test]
+fn an_inlined_let_shows_its_value_and_an_inlined_have_hides_it() {
+    check("theorem shown : True := letI n : Nat := 7; have h : n = 7 := rfl; True.intro\n");
+    let (engine, limits) = engine();
+    let source = "theorem hidden : True := haveI n : Nat := 7; have h : n = 7 := rfl; True.intro\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `def d : T where fields` is `def d : T := { fields }` for any declaration, as for an instance
+/// (`declVal`): each field holds its own value.
+#[test]
+fn a_declaration_where_body_is_its_structure_instance() {
+    let pair = "structure Pair where\n  first : Nat\n  second : Nat\n\
+                def paired : Pair where\n  first := 1\n  second := 2\n";
+    check(&format!("{pair}theorem first : paired.first = 1 := rfl\n"));
+    let (engine, limits) = engine();
+    let source = format!("{pair}theorem swapped : paired.first = 2 := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `∀ n ≠ k, p` is `∀ n, n ≠ k → p`, the pin's `macro_rules` in `Init/BinderPredicates.lean`:
+/// a hypothesis of the hand-written expansion proves the notation exactly, and its twin with
+/// another bound is refused. (The seed has no `Exists`, and its `<` is the scalar `Nat.decLt`
+/// rather than `LT.lt`, so `∃` and `<` are covered by their parse rows only.)
+#[test]
+fn a_binder_predicate_is_its_hypothesis() {
+    check("theorem same (h : ∀ n, n ≠ (0 : Nat) → n = n) : ∀ n ≠ (0 : Nat), n = n := h\n");
+    let (engine, limits) = engine();
+    let source = "theorem other (h : ∀ n, n ≠ (0 : Nat) → n = n) : ∀ n ≠ (1 : Nat), n = n := h\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// A declaration binder may be the hole `_` (`binderIdent`): it binds a name no source
+/// identifier spells, and the rest of the signature is checked as usual.
+#[test]
+fn a_hole_binder_binds_an_unnamed_parameter() {
+    check("theorem unnamed {_ : Nat} (_ _ : Nat) (n : Nat) : n = n := rfl\n");
+    let (engine, limits) = engine();
+    let source = "theorem unproved (_ : Nat) (n : Nat) : n = n + 1 := rfl\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `(a, b, c)` is `Prod.mk a (Prod.mk b c)`: the pin's `mkPairs` nests to the right
+/// (`Lean/Elab/BuiltinNotation.lean:247`), so the left-nested reading is a type error.
+#[test]
+fn a_tuple_is_its_right_nested_pairs() {
+    let prod = "structure Prod (A B : Type) where\n  fst : A\n  snd : B\n";
+    check(&format!(
+        "{prod}theorem second (a b : Nat) : (a, b).2 = b := rfl\n\
+         theorem nested (a b c : Nat) : (a, b, c) = Prod.mk a (Prod.mk b c) := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source =
+        format!("{prod}theorem left (a b c : Nat) : (a, b, c) = Prod.mk (Prod.mk a b) c := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `f[1]` is index notation (`syntax:max term noWs "[" … "]"`, `Init/GetElem.lean:81`), not `f`
+/// applied to the list `[1]`: the pin finds no `GetElem` instance for a function and refuses
+/// the theorem that the application reading proves.
+#[test]
+fn an_unspaced_bracket_indexes_rather_than_applies() {
+    let preamble = "theorem applied (f : List Nat → Nat) (h : ∀ l, f l = 0) : ";
+    check(&format!("{preamble}f [1] = 0 := h _\n"));
+    let (engine, limits) = engine();
+    let source = format!("{preamble}f[1] = 0 := h _\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// A tactic this elaborator parses but cannot run (`omega`) is refused, never skipped: under
+/// `try` the pin's `omega` closes the goal and the following `rfl` then fails, so the pin
+/// rejects what skipping `omega` would accept.
+#[test]
+fn a_parsed_tactic_without_an_elaborator_is_refused_even_under_try() {
+    check("theorem skipped (a : Nat) : a + 0 = a := by\n  try skip\n  rfl\n");
+    let (engine, limits) = engine();
+    for source in [
+        "theorem bare (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega\n",
+        "theorem attempted (a : Nat) : a + 0 = a := by\n  try omega\n  rfl\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+/// A simp rule that is a proof script is refused, never dropped. The pin parses each of these
+/// and then refuses it (`rfl` meets a metavariable goal); without the rule each would close.
+#[test]
+fn a_proof_script_simp_rule_is_refused_rather_than_dropped() {
+    for (tactic, goal) in [
+        ("simp only", "(x : Nat) : x = x"),
+        ("simp_all only", ": True"),
+        ("simpa only", ": True"),
+    ] {
+        check(&format!("theorem dropped {goal} := by {tactic} []\n"));
+        let (engine, limits) = engine();
+        let source = format!("theorem kept {goal} := by {tactic} [by rfl]\n");
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+/// A `by` inside a tactic's term argument is its own proof: it closes the goal it proves and
+/// is refused on one it cannot.
+#[test]
+fn a_proof_nested_in_a_tactic_term_closes_only_what_it_proves() {
+    check("theorem nested (h : 1 = 1) : 1 = 1 ∧ 2 = 2 := by exact ⟨h, by rfl⟩\n");
+    let (engine, limits) = engine();
+    let source = "theorem unproved (h : 1 = 1) : 1 = 1 ∧ 2 = 3 := by exact ⟨h, by rfl⟩\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}

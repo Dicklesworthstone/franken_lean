@@ -192,13 +192,13 @@ impl Planner {
                     return Err(refuse(view, tokens, arrow));
                 }
                 if let TokenKind::Symbol(symbol) = &tokens[arrow].kind {
-                    match symbol.as_str() {
+                    match crate::canonical_bracket(symbol.as_str()) {
                         "(" => delimiters.push(")"),
                         "[" => delimiters.push("]"),
                         "{" | ".{" => delimiters.push("}"),
                         "⦃" => delimiters.push("⦄"),
                         ")" | "]" | "}" | "⦄" => {
-                            if delimiters.pop() != Some(symbol.as_str()) {
+                            if delimiters.pop() != Some(crate::canonical_bracket(symbol.as_str())) {
                                 return Err(refuse(view, tokens, arrow));
                             }
                         }

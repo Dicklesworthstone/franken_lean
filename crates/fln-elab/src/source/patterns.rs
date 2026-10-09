@@ -849,6 +849,7 @@ impl Context {
                 || collections::is_notation(node)
                 || cdot::is_cdot(node)
                 || binders::is_exists(node)
+                || binders::is_binder_predicate(node)
                 || record_terms::is_field_notation(node)
                 || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
@@ -912,6 +913,7 @@ impl Context {
                     let node = self.expand_cdot_node(node, pattern)?;
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
+                    let node = self.expand_binder_predicate_node(node, pattern)?;
                     let node = self.expand_exists_node(node, pattern)?;
                     let node = self.expand_record_field_node(node, pattern)?;
                     let node = self.expand_offset_pattern(node, pattern)?;

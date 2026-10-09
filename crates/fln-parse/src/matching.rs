@@ -395,7 +395,8 @@ fn plan(
                     .expect("pattern condition")
                     .pattern_assignment = Some(at);
             }
-            "let" => lets.push((
+            // `have k : T := v` annotates like `let`: its `:` does not end the branch.
+            "let" | "have" | "letI" | "haveI" | "suffices" => lets.push((
                 depth,
                 active.len(),
                 conditionals.len(),
@@ -476,8 +477,10 @@ fn plan(
                 {
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
-                if matches!(symbol.as_str(), ")" | "}" | "]" | "⦄" | "⟩")
-                    && delimiters.pop() != Some(symbol.as_str())
+                if matches!(
+                    crate::canonical_bracket(symbol.as_str()),
+                    ")" | "}" | "]" | "⦄" | "⟩"
+                ) && delimiters.pop() != Some(crate::canonical_bracket(symbol.as_str()))
                 {
                     return Err(refuse(view, tokens, at));
                 }
@@ -814,7 +817,7 @@ fn columns(tokens: &[LexedToken], range: Range<usize>) -> Vec<(Range<usize>, Opt
     let mut result = Vec::new();
     for at in range.clone() {
         if let TokenKind::Symbol(symbol) = &tokens[at].kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
                 ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
                 "," if depth == 0 => {

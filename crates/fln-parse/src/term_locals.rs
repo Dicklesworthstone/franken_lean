@@ -32,8 +32,29 @@ pub(super) struct Assertion {
 enum Form {
     Let,
     Have,
+    /// `"letI " letConfig letDecl` and `"haveI "` (`Lean/Parser/Term.lean`): `let`'s and
+    /// `have`'s grammar under their own kinds.
+    LetI,
+    HaveI,
     Show,
     Suffices,
+}
+
+impl Form {
+    /// A local declaration (`letDecl`), not `show`/`suffices`.
+    fn declares(self) -> bool {
+        matches!(self, Form::Let | Form::Have | Form::LetI | Form::HaveI)
+    }
+    fn keyword(self) -> &'static str {
+        match self {
+            Form::Let => "let",
+            Form::Have => "have",
+            Form::LetI => "letI",
+            Form::HaveI => "haveI",
+            Form::Show => "show",
+            Form::Suffices => "suffices",
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -147,7 +168,7 @@ pub(super) fn proof_limit(
             return at;
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
                 ")" | "]" | "}" | "⦄" | "⟩" if depth == 0 => return at,
                 ")" | "]" | "}" | "⦄" | "⟩" => depth -= 1,
@@ -177,6 +198,10 @@ impl Prefix {
     ) -> Result<Self, NatDefinitionParseError> {
         let form = if word(tokens, keyword, "let") {
             Form::Let
+        } else if word(tokens, keyword, "letI") {
+            Form::LetI
+        } else if word(tokens, keyword, "haveI") {
+            Form::HaveI
         } else if word(tokens, keyword, "show") {
             Form::Show
         } else if word(tokens, keyword, "suffices") {
@@ -207,12 +232,12 @@ impl Prefix {
                 assertion.colon = Some(*cursor + 1);
                 *cursor += 2;
             }
-        } else if matches!(form, Form::Have | Form::Let) {
+        } else if form.declares() {
             if *cursor < end && matches!(&tokens[*cursor].kind, TokenKind::Ident(_)) {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
             }
-            if form == Form::Let && assertion.name.is_none() {
+            if matches!(form, Form::Let | Form::LetI) && assertion.name.is_none() {
                 return Err(refuse(view, tokens, *cursor));
             }
             if *cursor < end && word(tokens, *cursor, ":") {
@@ -251,7 +276,7 @@ impl Prefix {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
             Self::Assertion(p) => match p.phase {
-                Phase::Annotation if !matches!(p.form, Form::Have | Form::Let) => {
+                Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
                 }
                 Phase::Annotation => word(tokens, at, ":="),
@@ -286,7 +311,7 @@ impl Prefix {
         match p.phase {
             Phase::Annotation => {
                 p.annotation = Some(expression);
-                if !matches!(p.form, Form::Have | Form::Let) {
+                if !p.form.declares() {
                     p.proof_intro = Some(at);
                     p.phase = if p.form == Form::Show {
                         Phase::Body
@@ -407,7 +432,7 @@ impl Prefix {
                     p.value.expect("have value"),
                 ],
             );
-            let keyword = if p.form == Form::Let { "let" } else { "have" };
+            let keyword = p.form.keyword();
             Syntax::node(
                 parser_kind(&["Term", keyword]),
                 vec![
