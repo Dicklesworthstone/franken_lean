@@ -52,6 +52,9 @@ fn repeated_dependent_outputs_share_their_type_and_value_dictionary() {
     );
 }
 
+/// The pin resumes from `low` for both prerequisites once `Accept Bool true` fails. With
+/// `pp.explicit`, `#print result` at v4.32.0 is
+/// `@inferInstance Root (@root Nat Nat 7 7 low low accept)`, and `#eval result.first` prints 7.
 #[test]
 fn dependent_cached_answers_resume_after_later_prerequisites_fail() {
     checked(
@@ -68,7 +71,7 @@ class Root where
   second : Nat
 instance root {A B : Type} {a : A} {b : B} [left : D A a] [right : D B b] [ok : Accept B b] : Root := Root.mk left.value right.value
 def result : Root := inferInstance
-theorem firstValue : result.first = 99 := by rfl
+theorem firstValue : result.first = 7 := by rfl
 theorem secondValue : result.second = 7 := by rfl"#,
     );
 }
