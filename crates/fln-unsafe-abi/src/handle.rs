@@ -62,6 +62,18 @@ unsafe extern "C" fn counting_foreach(_data: *mut c_void, _fn: *mut LeanObject) 
 /// An owned CompatHeap reference (or boxed scalar). See the module invariant.
 pub struct Obj(*mut LeanObject);
 
+/// Bounded stdout callback failures. Invalid inputs are rejected before the
+/// write. The other variants describe a completed write attempt: their byte
+/// count is exactly what fwrite reported, not an OS-flush or rollback promise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioPutStrError {
+    InvalidCallback,
+    InvalidString,
+    InvalidWorld,
+    UnrepresentableWrite { errno: i32, bytes_written: usize },
+    MalformedResult { bytes_written: usize },
+}
+
 // The single allowance for this module: every method body below manipulates
 // raw membrane objects under the documented linear-ownership invariant.
 
@@ -783,6 +795,52 @@ impl Obj {
         }
     }
 
+    /// Retain this thread's stdout only when it is the exact six-method
+    /// native stream_of_handle carrier over one live Handle. A malformed,
+    /// foreign, or Golem-shell TLS override returns None before core can
+    /// assign private callable types to its fields.
+    pub fn stdio_stdout() -> Option<Obj> {
+        crate::stdio::checked_get_stdout().map(Obj)
+    }
+
+    /// Whether this is precisely Marrow's putStr callback over a live Handle.
+    /// Arbitrary native closures, shells, and other stream methods are false.
+    pub fn is_stdio_put_str_closure(&self) -> bool {
+        // SAFETY: the Obj invariant supplies a live object or scalar; the
+        // checked observer does not invoke the stored function pointer.
+        unsafe { crate::stdio::stream_put_str_handle(self.0).is_some() }
+    }
+
+    /// Apply the one reviewed native stdout callback to canonical String and
+    /// world scalar 0, borrowing all three inputs. No general closure apply
+    /// machinery is reached. Invalid input errors precede effects; an
+    /// unrepresentable write error or malformed result preserves fwrite's count.
+    ///
+    /// Ok is an owned neutral tag-0 record with exactly six object fields:
+    /// [success Bool, errorTag Nat, osCode Nat, hasFilename Bool, filename
+    /// String, details String]. Success uses [1, 0, 0, 0, "", ""]. This is
+    /// transport data, never the logical Unit, IO.Error, or EST.Out layout.
+    pub fn try_stdio_put_str(&self, text: &Obj, world: &Obj) -> Result<Obj, StdioPutStrError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(StdioPutStrError::InvalidWorld);
+        }
+        if !canonical_stdio_string(text) {
+            return Err(StdioPutStrError::InvalidString);
+        }
+        // SAFETY: the observer checks the native callback and Handle before
+        // the primitive; canonical_stdio_string established the String law.
+        // The returned native result carries exactly one owned reference.
+        let native = unsafe { crate::stdio::checked_stream_put_str(self.0, text.0) }.map_err(
+            |(errno, bytes_written)| StdioPutStrError::UnrepresentableWrite {
+                errno,
+                bytes_written,
+            },
+        )?;
+        let (result, bytes_written) = native.ok_or(StdioPutStrError::InvalidCallback)?;
+        let result = Obj(result);
+        stdio_result_transport(&result).ok_or(StdioPutStrError::MalformedResult { bytes_written })
+    }
+
     /// Fallible `ST.Ref` read.
     ///
     /// Returns `None` when the handle is not a ref or the cell is empty.
@@ -1077,6 +1135,127 @@ impl Obj {
     }
 }
 
+fn canonical_stdio_string(value: &Obj) -> bool {
+    let Some((size, _, length, bytes)) = value.try_string_view() else {
+        return false;
+    };
+    std::str::from_utf8(&bytes[..size - 1]).is_ok_and(|text| text.chars().count() == length)
+}
+
+fn native_stdio_ctor_shape(value: &Obj, tag: u8, fields: u8, scalar_bytes: usize) -> bool {
+    if value.is_scalar() {
+        return false;
+    }
+    let header = value.header();
+    let word = size_of::<usize>();
+    let expected_size =
+        (size_of::<LeanObject>() + usize::from(fields) * word + scalar_bytes).div_ceil(word) * word;
+    header.tag == tag && header.other == fields && value.byte_size() == expected_size
+}
+
+/// Decode the pinned native IO.Result and packed IO.Error layouts into a
+/// neutral transport. No native packed constructor escapes as a logical
+/// constructor: core must supply independently admitted reconstruction.
+pub(crate) fn stdio_result_transport(result: &Obj) -> Option<Obj> {
+    if result.is_scalar() || result.header().tag > 1 {
+        return None;
+    }
+    let success = result.header().tag == 0;
+    if !native_stdio_ctor_shape(result, u8::from(!success), 1, 0) {
+        return None;
+    }
+    let payload = result.try_ctor_child(0)?;
+    let (tag, code, filename, details) = if success {
+        if !payload.is_scalar() || payload.unbox() != 0 {
+            return None;
+        }
+        (0, 0, None, Obj::mk_string(""))
+    } else if payload.is_scalar() {
+        if payload.unbox() != 17 {
+            return None;
+        }
+        (17, 0, None, Obj::mk_string(""))
+    } else {
+        let tag = payload.header().tag;
+        match tag {
+            // The pin's optional-filename constructors contain two object
+            // fields followed by the unboxed UInt32 operating-system code.
+            0 | 12..=16 => {
+                if !native_stdio_ctor_shape(&payload, tag, 2, 4) {
+                    return None;
+                }
+                let option = payload.try_ctor_child(0)?;
+                let filename = if option.is_scalar() {
+                    if option.unbox() != 0 {
+                        return None;
+                    }
+                    None
+                } else {
+                    if !native_stdio_ctor_shape(&option, 1, 1, 0) {
+                        return None;
+                    }
+                    Some(option.try_ctor_child(0)?)
+                };
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(2 * size_of::<usize>())?,
+                    filename,
+                    payload.try_ctor_child(1)?,
+                )
+            }
+            // interrupted and noFileOrDirectory require a filename.
+            10 | 11 => {
+                if !native_stdio_ctor_shape(&payload, tag, 2, 4) {
+                    return None;
+                }
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(2 * size_of::<usize>())?,
+                    Some(payload.try_ctor_child(0)?),
+                    payload.try_ctor_child(1)?,
+                )
+            }
+            1..=9 => {
+                if !native_stdio_ctor_shape(&payload, tag, 1, 4) {
+                    return None;
+                }
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(size_of::<usize>())?,
+                    None,
+                    payload.try_ctor_child(0)?,
+                )
+            }
+            18 => {
+                if !native_stdio_ctor_shape(&payload, tag, 1, 0) {
+                    return None;
+                }
+                (tag, 0, None, payload.try_ctor_child(0)?)
+            }
+            _ => return None,
+        }
+    };
+    if !canonical_stdio_string(&details)
+        || filename
+            .as_ref()
+            .is_some_and(|value| !canonical_stdio_string(value))
+    {
+        return None;
+    }
+    Some(Obj::mk_ctor(
+        0,
+        vec![
+            Obj::mk_nat(usize::from(success)),
+            Obj::mk_nat(usize::from(tag)),
+            Obj::mk_nat(code as usize),
+            Obj::mk_nat(usize::from(filename.is_some())),
+            filename.unwrap_or_else(|| Obj::mk_string("")),
+            details,
+        ],
+        &[],
+    ))
+}
+
 // UNSAFE-LEDGER: FLN-UL-0050
 #[allow(unsafe_code)]
 impl Drop for Obj {
@@ -1088,3 +1267,6 @@ impl Drop for Obj {
         }
     }
 }
+
+#[cfg(test)]
+mod stdio_tests;

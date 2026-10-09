@@ -8,10 +8,11 @@
 //!
 //! Interpreter closures are real Marrow closure objects. Their first fixed
 //! slot is a tagged function-table word followed by captured ABI values. The
-//! raw function field remains the explicit shell sentinel, so applying a
-//! native/plugin closure is a typed unsupported result until the G0 trampoline
-//! exists; this slice does not misreport that boundary as zero-conversion
-//! plugin interoperability.
+//! raw function field remains the explicit shell sentinel. The one reviewed
+//! native exception is Marrow's exact stream putStr callback: saturated
+//! String/world application returns a neutral error transport for core's
+//! admitted IO reconstruction. All other native/plugin targets are refused;
+//! this is not a general plugin trampoline.
 //!
 //! The pure effect nucleus uses the same identity: `ST.Ref` cells, evaluated
 //! thunks, and finished tasks are Marrow objects all the way through their
@@ -31,8 +32,8 @@
 //! `IO.checkCanceled`
 //! observes false, and `IO.cancel` is the pinned no-op on a finished task;
 //! host execution cancellation remains a distinct non-authoritative stop.
-//! Scheduled tasks, concurrent thunk forcing, ambient IO, and capability
-//! effects remain outside this slice.
+//! Scheduled tasks, concurrent thunk forcing, and stream operations beyond
+//! bounded stdout putStr remain outside this slice.
 
 use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
@@ -54,7 +55,7 @@ use fln_core::options::{
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
-use fln_rt::obj::Obj;
+use fln_rt::obj::{Obj, StdioPutStrError};
 use std::fmt;
 
 mod array_construction;
@@ -851,6 +852,7 @@ enum IntrinsicImplementation {
     IoCancel,
     IoCheckCancelled,
     IoInitializing,
+    IoGetStdout,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -1205,6 +1207,7 @@ impl IntrinsicImplementation {
             "extern:IO.cancel" => Self::IoCancel,
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
             "extern:IO.initializing" => Self::IoInitializing,
+            "extern:IO.getStdout" => Self::IoGetStdout,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -1468,6 +1471,16 @@ pub enum VmRefusal {
     InvalidCtorObject,
     InvalidRefObject,
     UnsupportedNativeClosure,
+    NativeStdoutContract {
+        reason: &'static str,
+    },
+    NativeStdoutWriteError {
+        errno: i32,
+        bytes_written: usize,
+    },
+    NativeStdoutResult {
+        bytes_written: usize,
+    },
     MalformedClosure {
         reason: &'static str,
     },
@@ -1631,7 +1644,25 @@ impl fmt::Display for VmRefusal {
             Self::UnsupportedNativeClosure => {
                 write!(
                     f,
-                    "native closure application requires the plugin trampoline"
+                    "native closure is outside the reviewed stdout putStr callback boundary"
+                )
+            }
+            Self::NativeStdoutContract { reason } => {
+                write!(f, "native stdout putStr refused: {reason}")
+            }
+            Self::NativeStdoutWriteError {
+                errno,
+                bytes_written,
+            } => {
+                write!(
+                    f,
+                    "native stdout write failed with errno {errno} after fwrite reported {bytes_written} bytes; this error requires an unavailable filename"
+                )
+            }
+            Self::NativeStdoutResult { bytes_written } => {
+                write!(
+                    f,
+                    "native stdout returned an unsupported result after fwrite reported {bytes_written} bytes"
                 )
             }
             Self::MalformedClosure { reason } => {
@@ -2620,6 +2651,41 @@ fn run(
                 result_ownership,
             } => {
                 let closure = clone_register(current_frame(&stack)?, closure)?;
+                // Native callbacks never enter the Golem function-id cache.
+                // The public source Stream contains Golem wrappers; only a
+                // private, exactly saturated adapter reaches this branch.
+                if closure.is_stdio_put_str_closure() {
+                    if let Err(refusal) =
+                        validate_stdio_apply(args.len(), &argument_ownership, result_ownership)
+                    {
+                        return Ok(VmExit::Refused {
+                            refusal,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                    let args = transfer_apply_arguments(
+                        current_frame_mut(&mut stack)?,
+                        &args,
+                        &argument_ownership,
+                    )?;
+                    let value = match execute_stdio_apply(&closure, &args) {
+                        Ok(value) => value,
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    };
+                    if tail {
+                        tail_calls::prepare_return(current_frame_mut(&mut stack)?, dst);
+                    }
+                    set_register(current_frame_mut(&mut stack)?, dst, value)?;
+                    if !tail {
+                        advance(current_frame_mut(&mut stack)?)?;
+                    }
+                    continue;
+                }
                 let plan = match plan_cached_apply(
                     program,
                     &closure,
@@ -2804,6 +2870,33 @@ fn run(
                                 argument_ownership,
                                 result_ownership,
                             } => {
+                                // A Golem function can return this private
+                                // callback to an existing overapplication
+                                // continuation. Use the identical saturated
+                                // contract and retain the caller's return.
+                                if value.is_stdio_put_str_closure() {
+                                    let result = validate_stdio_apply(
+                                        args.len(),
+                                        &argument_ownership,
+                                        result_ownership,
+                                    )
+                                    .and_then(|()| execute_stdio_apply(&value, &args));
+                                    let result = match result {
+                                        Ok(result) => result,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
+                                    set_register(
+                                        current_frame_mut(&mut stack)?,
+                                        destination,
+                                        result,
+                                    )?;
+                                    continue;
+                                }
                                 match prepare_owned_apply(
                                     program,
                                     &value,
@@ -2925,6 +3018,67 @@ fn run(
             }
         }
     }
+}
+
+fn validate_stdio_apply(
+    argument_count: usize,
+    argument_ownership: &[ArgumentOwnership],
+    result_ownership: CallableResultOwnership,
+) -> Result<(), VmRefusal> {
+    if argument_count != 2 {
+        return Err(VmRefusal::NativeStdoutContract {
+            reason: "the callback requires exactly String and world; native currying is unsupported",
+        });
+    }
+    if argument_ownership != [ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed] {
+        return Err(VmRefusal::NativeStdoutContract {
+            reason: "the private adapter requires two borrowed arguments",
+        });
+    }
+    if result_ownership != CallableResultOwnership::Owned {
+        return Err(VmRefusal::NativeStdoutContract {
+            reason: "the private adapter returns an owned transport record",
+        });
+    }
+    Ok(())
+}
+
+fn execute_stdio_apply(closure: &Obj, args: &[Obj]) -> Result<Obj, VmRefusal> {
+    let [text, world] = args else {
+        return Err(VmRefusal::NativeStdoutContract {
+            reason: "the callback requires exactly String and world",
+        });
+    };
+    // Validate before the effect, even though well-typed source wrappers have
+    // already established these types. FLBC may be presented directly.
+    string_value(text, "native stdout putStr", 0)?;
+    if !world.is_scalar() || world.unbox() != 0 {
+        return Err(type_mismatch(
+            "native stdout putStr",
+            1,
+            "world scalar 0",
+            world,
+        ));
+    }
+    closure
+        .try_stdio_put_str(text, world)
+        .map_err(|error| match error {
+            StdioPutStrError::InvalidCallback => VmRefusal::UnsupportedNativeClosure,
+            StdioPutStrError::InvalidString => VmRefusal::InvalidStringObject,
+            StdioPutStrError::InvalidWorld => {
+                type_mismatch("native stdout putStr", 1, "world scalar 0", world)
+            }
+            StdioPutStrError::UnrepresentableWrite {
+                errno,
+                bytes_written,
+            } => VmRefusal::NativeStdoutWriteError {
+                errno,
+                bytes_written,
+            },
+            StdioPutStrError::MalformedResult { bytes_written } => {
+                VmRefusal::NativeStdoutResult { bytes_written }
+            }
+        })
 }
 
 fn make_golem_closure(
@@ -6025,6 +6179,18 @@ fn invoke_intrinsic(
             // phase observation rather than a process-global approximation.
             Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
         }
+        IntrinsicImplementation::IoGetStdout => {
+            expect_arity(row, args, 0)?;
+            // The generated zero-argument BaseIO extern returns the actual
+            // current native stream. Core wraps it only after validating the
+            // pinned Stream model; no source-level IO result is made here.
+            Obj::stdio_stdout().map(IntrinsicResult::owned).ok_or(
+                VmRefusal::NativeStdoutContract {
+                    reason: "stdout is not the exact native six-method stream over one Handle",
+                }
+                .into(),
+            )
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -6577,6 +6743,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::IoCancel
         | IntrinsicImplementation::IoCheckCancelled
         | IntrinsicImplementation::IoInitializing
+        | IntrinsicImplementation::IoGetStdout
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny

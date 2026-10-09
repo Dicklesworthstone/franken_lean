@@ -61,7 +61,7 @@ fn fallible_constructor_scalar_reads_check_width_and_offset() {
     )));
 }
 
-fn lock() -> MutexGuard<'static, ()> {
+pub(crate) fn lock() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
