@@ -227,13 +227,27 @@ fn utf8_n_strlen_impl(s: &[u8]) -> usize {
 /// copy, so the caller owes nothing beyond the slice being readable.
 // UNSAFE-LEDGER: FLN-UL-0068
 #[allow(unsafe_code)]
-unsafe fn mk_string_lossy_recover(s: &[u8], mut pos: usize, mut i: usize) -> *mut LeanObject {
+unsafe fn mk_string_lossy_recover(s: &[u8], pos: usize, i: usize) -> *mut LeanObject {
     let mut out: Vec<u8> = s[..pos].to_vec();
+    let i = visit_lossy_recovery(s, pos, i, |part| out.extend_from_slice(part));
+    // SAFETY: constructor over an owned byte copy with the recomputed count.
+    unsafe { object::mk_string_unchecked(&out, i) }
+}
+
+/// The exact pin recovery walk shared by raw string construction and bounded
+/// file reads. In particular one replacement skips ALL subsequent continuation
+/// bytes; Rust's from_utf8_lossy does not have the same contract.
+fn visit_lossy_recovery(
+    s: &[u8],
+    mut pos: usize,
+    mut i: usize,
+    mut emit: impl FnMut(&[u8]),
+) -> usize {
     let mut start = pos;
     while pos < s.len() {
         if !validate_utf8_one(s, &mut pos) {
-            out.extend_from_slice(&s[start..pos]);
-            out.extend_from_slice("\u{FFFD}".as_bytes());
+            emit(&s[start..pos]);
+            emit("\u{FFFD}".as_bytes());
             pos += 1;
             while pos < s.len() && s[pos] & 0xC0 == 0x80 {
                 pos += 1;
@@ -242,9 +256,58 @@ unsafe fn mk_string_lossy_recover(s: &[u8], mut pos: usize, mut i: usize) -> *mu
         }
         i += 1;
     }
-    out.extend_from_slice(&s[start..pos]);
-    // SAFETY: constructor over an owned byte copy with the recomputed count.
-    unsafe { object::mk_string_unchecked(&out, i) }
+    emit(&s[start..pos]);
+    i
+}
+
+pub(crate) enum BoundedStringError {
+    Limit { limit: usize, observed: usize },
+    Allocation { requested: usize },
+}
+
+/// Construct the exact pinned recovered String after measuring its UTF-8 size.
+/// Buffer growth is fallible and bounded before copying; the resulting native
+/// allocation uses the same reviewed String allocator as all membrane strings.
+pub(crate) fn bounded_string_from_bytes(
+    bytes: &[u8],
+    limit: usize,
+) -> Result<*mut LeanObject, BoundedStringError> {
+    let mut pos = 0;
+    let mut characters = 0;
+    let valid = validate_utf8(bytes, &mut pos, &mut characters);
+    let mut needed = Some(pos);
+    if !valid {
+        visit_lossy_recovery(bytes, pos, characters, |part| {
+            needed = needed.and_then(|n| n.checked_add(part.len()));
+        });
+    }
+    let needed = needed.ok_or(BoundedStringError::Limit {
+        limit,
+        observed: usize::MAX,
+    })?;
+    if needed > limit {
+        return Err(BoundedStringError::Limit {
+            limit,
+            observed: needed,
+        });
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(needed)
+        .map_err(|_| BoundedStringError::Allocation { requested: needed })?;
+    output.extend_from_slice(&bytes[..pos]);
+    if !valid {
+        characters = visit_lossy_recovery(bytes, pos, characters, |part| {
+            output.extend_from_slice(part)
+        });
+    }
+    // SAFETY: both branches produce the same canonical bytes and exact
+    // character count as mk_string_from_bytes_impl; the copy stays borrowed.
+    // UNSAFE-LEDGER: FLN-UL-0638
+    #[allow(unsafe_code)]
+    unsafe {
+        Ok(object::mk_string_unchecked(&output, characters))
+    }
 }
 
 /// Shared body of `lean_mk_string_from_bytes` (`object.cpp:2005-2012`).

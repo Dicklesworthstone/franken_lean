@@ -1276,6 +1276,164 @@ pub(crate) unsafe fn prim_handle_get_line(h: *mut LeanObject) -> *mut LeanObject
     }
 }
 
+/// A borrowed FILE lock, never sent or retained beyond a live Handle call.
+struct FileReadLock(*mut c_void);
+
+impl FileReadLock {
+    // SAFETY: caller keeps a live Handle owner throughout this guard's scope.
+    // UNSAFE-LEDGER: FLN-UL-0639
+    #[allow(unsafe_code)]
+    unsafe fn acquire(file: *mut c_void) -> Self {
+        // SAFETY: the caller supplies a live FILE; the guard owns one lock.
+        unsafe { flockfile(file) };
+        Self(file)
+    }
+}
+
+impl Drop for FileReadLock {
+    // UNSAFE-LEDGER: FLN-UL-0640
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: acquire took this one lock; the live borrowed Handle still
+        // owns FILE, and every return/unwind drops the guard exactly once.
+        unsafe { funlockfile(self.0) };
+    }
+}
+
+pub(crate) enum FileReadFailure {
+    InputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    OutputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    Allocation {
+        requested: usize,
+        bytes_consumed: usize,
+    },
+    Unrepresentable {
+        errno: c_int,
+        bytes_consumed: usize,
+    },
+}
+
+/// Bounded exact getLine over a borrowed native Handle. The input ceiling
+/// permits one lookahead: EOF at the exact ceiling succeeds; an additional
+/// byte produces a resource stop with consumed=ceiling+1. No cursor rollback
+/// is attempted. The output ceiling is measured after exact UTF-8 recovery.
+///
+/// # Safety
+/// `handle` is scalar or a live object and remains borrowed until return.
+/// A successful Some result owns one native IO.Result reference and reports
+/// bytes consumed even if the result is a logical IO error.
+// UNSAFE-LEDGER: FLN-UL-0641
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_get_line(
+    handle: *mut LeanObject,
+    input_limit: usize,
+    output_limit: usize,
+) -> Result<Option<(*mut LeanObject, usize)>, FileReadFailure> {
+    // SAFETY: exact class checked before FILE access; all getc calls happen
+    // under the RAII lock while the caller retains the Handle. Error decoder
+    // filename preconditions are checked before native error construction.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        let file = io_get_handle(handle);
+        let guard = FileReadLock::acquire(file);
+        let mut bytes = Vec::new();
+        let last_errno;
+        loop {
+            if bytes.len() < input_limit && bytes.len() == bytes.capacity() {
+                let additional = (input_limit - bytes.len()).min(4096);
+                bytes
+                    .try_reserve_exact(additional)
+                    .map_err(|_| FileReadFailure::Allocation {
+                        requested: bytes.len().saturating_add(additional),
+                        bytes_consumed: bytes.len(),
+                    })?;
+            }
+            let c = getc_unlocked(file);
+            let code = errno();
+            if c == -1 {
+                last_errno = code;
+                break;
+            }
+            if bytes.len() == input_limit {
+                let consumed = bytes.len().saturating_add(1);
+                return Err(FileReadFailure::InputLimit {
+                    limit: input_limit,
+                    observed: consumed,
+                    bytes_consumed: consumed,
+                });
+            }
+            bytes.push(c as u8);
+            if c == c_int::from(b'\n') {
+                last_errno = code;
+                break;
+            }
+        }
+        let consumed = bytes.len();
+        let failed = ferror(file) != 0;
+        if !failed && feof(file) != 0 {
+            clearerr(file);
+        }
+        drop(guard);
+        if failed {
+            return checked_get_line_error(last_errno, consumed)
+                .map(|result| Some((result, consumed)));
+        }
+        let string =
+            crate::export::bounded_string_from_bytes(&bytes, output_limit).map_err(|error| {
+                match error {
+                    crate::export::BoundedStringError::Limit { limit, observed } => {
+                        FileReadFailure::OutputLimit {
+                            limit,
+                            observed,
+                            bytes_consumed: consumed,
+                        }
+                    }
+                    crate::export::BoundedStringError::Allocation { requested } => {
+                        FileReadFailure::Allocation {
+                            requested,
+                            bytes_consumed: consumed,
+                        }
+                    }
+                }
+            })?;
+        Ok(Some((io_result_mk_ok(string), consumed)))
+    }
+}
+
+/// Decode only error arms whose filename precondition is available. Every
+/// failure here follows a read attempt and retains its consumed-byte count.
+pub(crate) fn checked_get_line_error(
+    code: c_int,
+    consumed: usize,
+) -> Result<*mut LeanObject, FileReadFailure> {
+    if matches!(code, EINTR | ENOENT) {
+        return Err(FileReadFailure::Unrepresentable {
+            errno: code,
+            bytes_consumed: consumed,
+        });
+    }
+    // SAFETY: every remaining errno permits a null filename in the exact
+    // decoder; the returned IO.Result owns the newly built error reference.
+    // UNSAFE-LEDGER: FLN-UL-0644
+    #[allow(unsafe_code)]
+    unsafe {
+        Ok(io_result_mk_error(decode_io_error(
+            code,
+            core::ptr::null_mut(),
+        )))
+    }
+}
+
 /// `lean_io_prim_handle_flush` (`io.cpp:550-556`).
 ///
 /// # Safety

@@ -3,6 +3,38 @@
 
 use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_transport};
 
+mod read;
+
+/// A bounded getLine failure. Consumed counts refer to original file bytes,
+/// including the input-cap lookahead; output observations count recovered
+/// UTF-8 bytes. Resource stops do not rewind an already advanced cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileReadError {
+    InvalidHandle,
+    InvalidWorld,
+    InputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    OutputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    Allocation {
+        requested: usize,
+        bytes_consumed: usize,
+    },
+    Unrepresentable {
+        errno: i32,
+        bytes_consumed: usize,
+    },
+    MalformedResult {
+        bytes_consumed: usize,
+    },
+}
+
 /// Invalid inputs are rejected before filesystem effects. The remaining
 /// failures describe an attempted open/write and promise no rollback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,19 +144,7 @@ fn file_result_transport(result: &Obj, handle_success: bool) -> Option<Obj> {
         } {
             return None;
         }
-        return Some(Obj::mk_ctor(
-            0,
-            vec![
-                payload,
-                Obj::mk_nat(1),
-                Obj::mk_nat(0),
-                Obj::mk_nat(0),
-                Obj::mk_nat(0),
-                Obj::mk_string(""),
-                Obj::mk_string(""),
-            ],
-            &[],
-        ));
+        return Some(file_success_transport(payload));
     }
     // Reuse the complete nineteen-constructor packed error validation. No
     // error value is interpreted as an owned native Handle.
@@ -135,6 +155,39 @@ fn file_result_transport(result: &Obj, handle_success: bool) -> Option<Obj> {
         fields.push(error.try_ctor_child(field)?);
     }
     Some(Obj::mk_ctor(0, fields, &[]))
+}
+
+fn file_success_transport(payload: Obj) -> Obj {
+    Obj::mk_ctor(
+        0,
+        vec![
+            payload,
+            Obj::mk_nat(1),
+            Obj::mk_nat(0),
+            Obj::mk_nat(0),
+            Obj::mk_nat(0),
+            Obj::mk_string(""),
+            Obj::mk_string(""),
+        ],
+        &[],
+    )
+}
+
+fn string_result_transport(result: &Obj) -> Option<Obj> {
+    if result.is_scalar() {
+        return None;
+    }
+    if result.header().tag == 1 {
+        return file_result_transport(result, false);
+    }
+    if !native_stdio_ctor_shape(result, 0, 1, 0) {
+        return None;
+    }
+    let payload = result.try_ctor_child(0)?;
+    if !canonical_stdio_string(&payload) {
+        return None;
+    }
+    Some(file_success_transport(payload))
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ use fln_core::options::{
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
-use fln_rt::obj::{FileIoError, Obj, StdioPutStrError};
+use fln_rt::obj::{FileIoError, FileReadError, Obj, StdioPutStrError};
 use std::fmt;
 
 mod array_construction;
@@ -855,6 +855,7 @@ enum IntrinsicImplementation {
     IoGetStdout,
     FileHandleMk,
     FileHandlePutStr,
+    FileHandleGetLine,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -1212,6 +1213,7 @@ impl IntrinsicImplementation {
             "extern:IO.getStdout" => Self::IoGetStdout,
             "extern:IO.FS.Handle.mk" => Self::FileHandleMk,
             "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
+            "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -1491,6 +1493,9 @@ pub enum VmRefusal {
     NativeFileIo {
         error: FileIoError,
     },
+    NativeFileRead {
+        error: FileReadError,
+    },
     MalformedClosure {
         reason: &'static str,
     },
@@ -1684,6 +1689,9 @@ impl fmt::Display for VmRefusal {
             Self::NativeFileIo { error } => {
                 write!(f, "native filesystem IO boundary: {error:?}")
             }
+            Self::NativeFileRead { error } => {
+                write!(f, "native filesystem read boundary: {error:?}")
+            }
             Self::MalformedClosure { reason } => {
                 write!(f, "Golem closure shell is malformed: {reason}")
             }
@@ -1821,6 +1829,7 @@ struct IntrinsicResult {
 enum IntrinsicFailure {
     Refused(VmRefusal),
     NatMagnitudeLimit { allowed: u64, observed: u64 },
+    FileReadResource(FileReadError),
 }
 
 impl From<VmRefusal> for IntrinsicFailure {
@@ -2563,6 +2572,9 @@ fn run(
                                 observed,
                                 &location.to_string(),
                             ));
+                        }
+                        Err(IntrinsicFailure::FileReadResource(error)) => {
+                            return Err(file_read_exhausted(error, &location.to_string()));
                         }
                     }
                 }
@@ -3561,6 +3573,61 @@ fn nat_magnitude_exhausted(allowed: u64, observed: u64, location: &str) -> Stop 
             observed,
         })
         .with_progress(location),
+    )
+}
+
+// These ceilings bound the new getLine implementation only. They are not
+// Lean heartbeats, Nat arithmetic limits, or a claim of unbounded file IO.
+const MAX_FILE_READ_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILE_READ_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+fn file_read_failure(error: FileReadError) -> IntrinsicFailure {
+    match error {
+        FileReadError::InputLimit { .. }
+        | FileReadError::OutputLimit { .. }
+        | FileReadError::Allocation { .. } => IntrinsicFailure::FileReadResource(error),
+        _ => VmRefusal::NativeFileRead { error }.into(),
+    }
+}
+
+fn file_read_exhausted(error: FileReadError, location: &str) -> Stop {
+    let (dimension, limit, observed, consumed) = match error {
+        FileReadError::InputLimit {
+            limit,
+            observed,
+            bytes_consumed,
+        } => ("input", limit, observed, bytes_consumed),
+        FileReadError::OutputLimit {
+            limit,
+            observed,
+            bytes_consumed,
+        } => ("recovered UTF-8 output", limit, observed, bytes_consumed),
+        FileReadError::Allocation {
+            requested,
+            bytes_consumed,
+        } => {
+            return Stop::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                "host buffer allocation for getLine: requested {requested} bytes after consuming {bytes_consumed} file bytes at {location}"
+            )));
+        }
+        _ => {
+            return Stop::InternalFault(InternalFault::new(
+                "FLBC-FILE-READ-RESOURCE",
+                "non-resource file failure reached resource handler",
+            ));
+        }
+    };
+    Stop::Inconclusive(
+        Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::Memory {
+                limit_bytes: limit as u64,
+            },
+            allowed: limit as u64,
+            observed: observed as u64,
+        })
+        .with_progress(format!(
+            "getLine {dimension} after consuming {consumed} file bytes at {location}"
+        )),
     )
 }
 
@@ -6256,6 +6323,17 @@ fn invoke_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::FileHandleGetLine => {
+            expect_arity(row, args, 1)?;
+            args[0]
+                .try_file_get_line(
+                    &Obj::mk_nat(0),
+                    MAX_FILE_READ_INPUT_BYTES,
+                    MAX_FILE_READ_OUTPUT_BYTES,
+                )
+                .map(IntrinsicResult::owned)
+                .map_err(file_read_failure)
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -6811,6 +6889,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::IoGetStdout
         | IntrinsicImplementation::FileHandleMk
         | IntrinsicImplementation::FileHandlePutStr
+        | IntrinsicImplementation::FileHandleGetLine
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny
