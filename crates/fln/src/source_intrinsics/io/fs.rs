@@ -1,7 +1,7 @@
-//! Exact contracts for the native Handle.mk and Handle.putStr leaves.
+//! Exact contracts for the native Handle.mk, putStr and getLine leaves.
 //!
 //! Ordinary writeFile/withFile/bind bodies stay executable source. Only the
-//! two decorated opaque declarations can select these effectful native rows.
+//! decorated opaque declarations can select these effectful native rows.
 
 use super::*;
 
@@ -11,11 +11,12 @@ mod model;
 pub(crate) enum Operation {
     Open,
     PutStr,
+    GetLine,
 }
 
 impl Operation {
     pub(crate) fn from_name(requested: &Name) -> Option<Self> {
-        [Self::Open, Self::PutStr]
+        [Self::Open, Self::PutStr, Self::GetLine]
             .into_iter()
             .find(|operation| requested == &operation.source_name())
     }
@@ -28,6 +29,7 @@ impl Operation {
             match self {
                 Self::Open => "mk",
                 Self::PutStr => "putStr",
+                Self::GetLine => "getLine",
             },
         ])
     }
@@ -85,6 +87,11 @@ pub(crate) fn primitive_matches(
     if operation == Operation::Open {
         models.extend(model::open_layout());
     }
+    if operation == Operation::GetLine {
+        // This leaf produces native String values. Nominal recognition of
+        // String alone cannot authorize a different checked logical layout.
+        models.extend(crate::source_intrinsics::string_internal::scalar_records());
+    }
     let mut comparison = Comparison { visited, limits };
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {
@@ -105,6 +112,7 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
         model::handle(),
         model::primitive(Operation::Open),
         model::primitive(Operation::PutStr),
+        model::primitive(Operation::GetLine),
     ]) {
         assert!(
             Comparison {

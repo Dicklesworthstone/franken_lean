@@ -10,6 +10,8 @@ use fln_olean::source_extensions as metadata;
 use fln_rt::obj::Obj;
 use std::path::{Path, PathBuf};
 
+mod read;
+
 const STACK: usize = 256 * 1024 * 1024;
 
 fn raw_pin_environment() -> Option<Environment> {

@@ -169,8 +169,12 @@ pub(super) fn open_layout() -> Vec<ConstantInfo> {
 
 pub(super) fn primitive(operation: Operation) -> ConstantInfo {
     let (domains, result) = match operation {
-        Operation::Open => ([c("System.FilePath"), c("IO.FS.Mode")], c("IO.FS.Handle")),
-        Operation::PutStr => ([c("IO.FS.Handle"), c("String")], c("Unit")),
+        Operation::Open => (
+            vec![c("System.FilePath"), c("IO.FS.Mode")],
+            c("IO.FS.Handle"),
+        ),
+        Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
+        Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
     };
     let action = Expr::app(c("IO"), result.clone());
     let default = apply(

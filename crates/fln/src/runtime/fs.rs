@@ -1,4 +1,4 @@
-//! Deferred file writing through the two genuine checked Handle primitives.
+//! Deferred file writing and line reading through checked Handle primitives.
 //!
 //! FilePath and Mode retain their admitted logical layouts. Native handles
 //! have a separate owned ABI carrier, never Handle's opaque Unit default.
@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 const HANDLE: &str = "_fln_runtime_fs_handle";
 const PAYLOAD: &str = "_fln_runtime_fs_payload";
 const TRANSPORT: &str = "_fln_runtime_fs_result";
+const READ_TRANSPORT: &str = "_fln_runtime_fs_read_result";
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -22,6 +23,7 @@ pub(super) struct Store {
     handle_checked: bool,
     bindings: BTreeMap<Name, (IntrinsicBinding, Expr)>,
     layout: Option<Layout>,
+    read_layout: Option<Layout>,
 }
 
 #[derive(Clone)]
@@ -29,6 +31,7 @@ struct Layout {
     error: ErrorLayout,
     handle: Expr,
     transport: Expr,
+    transport_name: Name,
     world: Expr,
 }
 
@@ -50,8 +53,8 @@ fn function(domains: &[Expr], result: Expr) -> Expr {
     })
 }
 
-fn field(index: u64) -> Result<Expr, IngressError> {
-    Ok(Expr::proj(name(TRANSPORT), index, b(0)?))
+fn field(layout: &Layout, index: u64) -> Result<Expr, IngressError> {
+    Ok(Expr::proj(layout.transport_name.clone(), index, b(0)?))
 }
 
 impl Preparation<'_> {
@@ -148,8 +151,14 @@ impl Preparation<'_> {
         self.fs_handle()
     }
 
-    fn fs_layout(&mut self) -> Result<Layout, IngressError> {
-        if let Some(layout) = &self.fs.layout {
+    fn fs_layout(&mut self, operation: Operation) -> Result<Layout, IngressError> {
+        let reading = operation == Operation::GetLine;
+        let cached = if reading {
+            &self.fs.read_layout
+        } else {
+            &self.fs.layout
+        };
+        if let Some(layout) = cached {
             return Ok(layout.clone());
         }
         let handle = self
@@ -160,8 +169,9 @@ impl Preparation<'_> {
             .ok_or_else(|| unsupported("filesystem checked world"))?;
         let error = self.io_error_layout()?;
         let payload = self.fs_abi_carrier(PAYLOAD, CallableResultOwnership::Erased)?;
+        let transport_label = if reading { READ_TRANSPORT } else { TRANSPORT };
         let transport = self.io_private_record(
-            TRANSPORT,
+            transport_label,
             vec![
                 payload,
                 c("Bool"),
@@ -176,9 +186,14 @@ impl Preparation<'_> {
             error,
             handle,
             transport,
+            transport_name: name(transport_label),
             world,
         };
-        self.fs.layout = Some(layout.clone());
+        if reading {
+            self.fs.read_layout = Some(layout.clone());
+        } else {
+            self.fs.layout = Some(layout.clone());
+        }
         Ok(layout)
     }
 
@@ -199,9 +214,14 @@ impl Preparation<'_> {
             .iter()
             .find(|row| row.name == source)
             .ok_or_else(|| unsupported("filesystem generated primitive row"))?;
+        let arity = if operation == Operation::GetLine {
+            1
+        } else {
+            2
+        };
         if row.kind != "opaque"
             || row.levels != 0
-            || row.arity != 2
+            || row.arity != arity
             || row.effect != "io"
             || row.ownership != "rule(borrowed-args,owned-result)"
         {
@@ -216,6 +236,7 @@ impl Preparation<'_> {
                 vec![ValueType::Abi, ValueType::String],
                 vec![layout.handle.clone(), c("String")],
             ),
+            Operation::GetLine => (vec![ValueType::Abi], vec![layout.handle.clone()]),
         };
         self.fs.bindings.insert(
             private.clone(),
@@ -225,7 +246,7 @@ impl Preparation<'_> {
                     universe_arity: 0,
                     row: row.id.to_owned(),
                     arguments,
-                    argument_ownership: vec![ArgumentOwnership::Borrowed; 2],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed; domains.len()],
                     result: ValueType::Constructor,
                     result_ownership: ResultOwnership::Owned,
                     effect: EffectClass::Io,
@@ -268,8 +289,13 @@ impl Preparation<'_> {
         let value = match operation {
             // The error-arm placeholder is never projected as a Handle.
             // Only the safe native open producer authorizes this payload.
-            Operation::Open => field(0)?,
+            Operation::Open => field(layout, 0)?,
             Operation::PutStr => Expr::const_(layout.error.unit_constructor.clone(), Vec::new()),
+            // The native producer validates canonical String success. The
+            // typed EST.Out constructor inserts an explicit ABI-to-String
+            // refinement here, inside the lazy success arm only. Error
+            // packets carry scalar zero and never reach that projection.
+            Operation::GetLine => field(layout, 0)?,
         };
         let success = apply(
             Expr::const_(result.constructors[0].name.clone(), Vec::new()),
@@ -277,13 +303,24 @@ impl Preparation<'_> {
         );
         let error = self.io_transport_error(
             &layout.error,
-            [field(2)?, field(3)?, field(4)?, field(5)?, field(6)?],
+            [
+                field(layout, 2)?,
+                field(layout, 3)?,
+                field(layout, 4)?,
+                field(layout, 5)?,
+                field(layout, 6)?,
+            ],
         )?;
         let failure = apply(
             Expr::const_(result.constructors[1].name.clone(), Vec::new()),
             [error, b(1)?],
         );
-        Ok(choose(result.source.clone(), field(1)?, failure, success))
+        Ok(choose(
+            result.source.clone(),
+            field(layout, 1)?,
+            failure,
+            success,
+        ))
     }
 
     /// All source arguments remain ordinary strict applications of a closed,
@@ -318,14 +355,20 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        if arguments.len() > 3 {
+        let source_arity = if operation == Operation::GetLine {
+            1
+        } else {
+            2
+        };
+        if arguments.len() > source_arity + 1 {
             return Ok(None);
         }
-        let layout = self.fs_layout()?;
+        let layout = self.fs_layout(operation)?;
         let primitive = self.fs_bind_primitive(operation, &layout)?;
         let result_type = match operation {
             Operation::Open => c("IO.FS.Handle"),
             Operation::PutStr => c("Unit"),
+            Operation::GetLine => c("String"),
         };
         let result = self.io_checked_shape(apply(
             c("EST.Out"),
@@ -361,14 +404,15 @@ impl Preparation<'_> {
                     return Err(unsupported("filesystem checked Mode layout"));
                 }
                 (
-                    [path.source.clone(), mode.source.clone()],
-                    [
+                    vec![path.source.clone(), mode.source.clone()],
+                    vec![
                         Expr::proj(path.projection(&path.constructors[0]), 0, b(2)?),
                         self.fs_mode_ordinal(b(1)?)?,
                     ],
                 )
             }
-            Operation::PutStr => ([layout.handle.clone(), c("String")], [b(2)?, b(1)?]),
+            Operation::PutStr => (vec![layout.handle.clone(), c("String")], vec![b(2)?, b(1)?]),
+            Operation::GetLine => (vec![layout.handle.clone()], vec![b(1)?]),
         };
         let returned = self.fs_result(operation, &layout, &result)?;
         let mut body = Expr::let_e(
@@ -378,7 +422,8 @@ impl Preparation<'_> {
             returned,
             false,
         );
-        let domains = [domains[0].clone(), domains[1].clone(), layout.world];
+        let mut domains = domains;
+        domains.push(layout.world);
         for domain in domains.iter().rev() {
             body = Expr::lam(
                 self.fs_adapter_name()?,
