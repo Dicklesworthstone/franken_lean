@@ -19,7 +19,19 @@ fn ctor(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let start = range.start;
+    // `ctor := optional docComment >> "| " >> declModifiers >> rawIdent >> optDeclSig`
+    // (`Lean/Parser/Command.lean`): a constructor's doc comes before its `|`.
+    let doc = if symbol(tokens, range.start, "/--") {
+        null_node(vec![crate::doc_comment_syntax(
+            view,
+            leaves,
+            tokens,
+            range.start,
+        )?])
+    } else {
+        null_node(vec![])
+    };
+    let start = range.start + usize::from(symbol(tokens, range.start, "/--"));
     if !symbol(tokens, start, "|")
         || !matches!(
             tokens.get(start + 1).map(|t| &t.kind),
@@ -39,7 +51,7 @@ fn ctor(
     Ok(Syntax::node(
         parser_kind(&["Command", "ctor"]),
         vec![
-            null_node(vec![]),
+            doc,
             leaves.leaf(start)?,
             records::modifiers(),
             leaves.leaf(start + 1)?,
@@ -109,7 +121,9 @@ pub(super) fn parse(
     let mut begins = Vec::new();
     for at in end_header..end_body {
         if nesting.is_empty() && symbol(&tokens, at, "|") {
-            begins.push(at);
+            // A constructor's doc comment begins it.
+            let doc = at > end_header && symbol(&tokens, at - 1, "/--");
+            begins.push(if doc { at - 1 } else { at });
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
             match s.as_str() {

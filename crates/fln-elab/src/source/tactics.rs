@@ -613,7 +613,7 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "fail"]) {
                 return Err(error(TacticError::ExplicitFailure));
-            } else if kind == &parser_kind(&["Tactic", "andThen"]) {
+            } else if kind == &parser_kind(&["Tactic", "tactic_<;>_"]) {
                 let [left, separator, right] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
@@ -724,10 +724,14 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "injection"]) {
                 self.inject_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "subst"]) {
-                let [keyword, Syntax::Ident { val, .. }] = args.as_slice() else {
+                let [keyword, names] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "subst", "substitution tactic")?;
+                let [Syntax::Ident { val, .. }] = expect_null_args(names, "substituted name")?
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
                 self.substitute_proof_goal(proof, goal, val)?;
             } else if kind == &parser_kind(&["Tactic", "cases"])
                 || kind == &parser_kind(&["Tactic", "induction"])
@@ -751,10 +755,17 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simpa"]) {
-                let [keyword, _, _, _, _, using] = args.as_slice() else {
+                let [keyword, _, _, rest] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "simpa", "simplifying completion")?;
+                let rest = expect_node(
+                    rest,
+                    &parser_kind(&["Tactic", "simpaArgsRest"]),
+                    5,
+                    "simpa arguments",
+                )?;
+                let using = &rest[4];
                 match expect_null_args(using, "optional simpa evidence")? {
                     [] => self.simpa_proof_term(proof, goal, args, None)?,
                     [keyword, using] => {
@@ -837,7 +848,7 @@ impl Context {
                 expect_atom(keyword, "symm", "symmetry tactic")?;
                 expect_empty_null(location, "goal-only symmetry location")?;
                 self.symmetrize_proof_goal(proof, goal)?;
-            } else if kind == &parser_kind(&["Tactic", "rfl"]) {
+            } else if kind == &parser_kind(&["Tactic", "tacticRfl"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };

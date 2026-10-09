@@ -234,6 +234,45 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<MatchParts<'a>, NatDefinitionElabError> {
+        // The pin's `if` notations (`Init/Prelude.lean`): `termIfThenElse` and, with evidence,
+        // `termDepIfThenElse`, whose name is a `binderIdent`.
+        let dependent = syntax.kind() == Some(&Name::from_components(["termDepIfThenElse"]));
+        if dependent || syntax.kind() == Some(&Name::from_components(["termIfThenElse"])) {
+            let kind = syntax.kind().expect("a node").clone();
+            let parts = expect_node(syntax, &kind, if dependent { 8 } else { 6 }, "conditional")?;
+            let (binding, rest) = if dependent {
+                let name = expect_node(
+                    &parts[1],
+                    &Name::from_components(["Lean", "binderIdent"]),
+                    1,
+                    "conditional evidence",
+                )?;
+                expect_atom(&parts[2], ":", "conditional evidence separator")?;
+                let Syntax::Ident { val, .. } = &name[0] else {
+                    return Err(error(MatchError::InvalidPattern));
+                };
+                if val.is_anonymous() || !val.parent().is_anonymous() {
+                    return Err(error(MatchError::InvalidPattern));
+                }
+                (Some(val), &parts[3..])
+            } else {
+                (None, &parts[1..])
+            };
+            expect_atom(&parts[0], "if", "conditional keyword")?;
+            expect_atom(&rest[1], "then", "conditional then")?;
+            expect_atom(&rest[3], "else", "conditional else")?;
+            return Ok(MatchParts {
+                discriminant: &rest[0],
+                equation: None,
+                alternatives: &[],
+                generated: true,
+                conditional: Some(ConditionalParts {
+                    binding,
+                    yes: &rest[2],
+                    no: &rest[4],
+                }),
+            });
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "ifThenElse"])) {
             let parts = expect_node(
                 syntax,

@@ -63,8 +63,26 @@ impl Context {
         left: &'a Syntax,
         right: &'a Syntax,
     ) -> Result<(), NatDefinitionElabError> {
-        let left = self.proof_instructions(left)?;
-        let right = self.proof_instructions(right)?;
+        // The pin's operands are single tactics (or a parenthesized sequence); a sequence is
+        // what this elaborator's own syntax may still hold.
+        let operand = |this: &mut Self, syntax: &'a Syntax| {
+            if syntax.kind() == Some(&parser_kind(&["Tactic", "tacticSeq"])) {
+                return this.proof_instructions(syntax);
+            }
+            if let Syntax::Node { kind, args, .. } = syntax
+                && kind == &parser_kind(&["Tactic", "paren"])
+            {
+                let [open, body, close] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(open, "(", "tactic sequence opening")?;
+                expect_atom(close, ")", "tactic sequence closing")?;
+                return this.proof_instructions(body);
+            }
+            Ok(vec![syntax])
+        };
+        let left = operand(self, left)?;
+        let right = operand(self, right)?;
         if right.is_empty() {
             return Err(error(TacticError::MalformedScript));
         }

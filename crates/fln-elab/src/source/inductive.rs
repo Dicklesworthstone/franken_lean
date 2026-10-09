@@ -642,7 +642,24 @@ fn bodies(
             5,
             "inductive constructor",
         )?;
-        expect_empty_null(&parts[0], "absent constructor documentation")?;
+        // A constructor's doc comment has no meaning the kernel sees.
+        match expect_null_args(&parts[0], "constructor documentation")? {
+            [] => {}
+            [doc] => {
+                let doc = expect_node(
+                    doc,
+                    &parser_kind(&["Command", "docComment"]),
+                    2,
+                    "constructor doc comment",
+                )?;
+                expect_atom(&doc[0], "/--", "constructor doc comment opener")?;
+            }
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "one constructor doc comment",
+                });
+            }
+        }
         expect_atom(&parts[1], "|", "constructor separator")?;
         let modifiers = expect_node(
             &parts[2],

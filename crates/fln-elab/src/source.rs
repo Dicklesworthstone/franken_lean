@@ -655,6 +655,18 @@ impl Context {
             if kind == &parser_kind(&["Term", "cdot"]) {
                 return Err(failure(SourceInferenceError::CdotOutsideParentheses));
             }
+            // `notation "∅" => EmptyCollection.emptyCollection` (`Init/Core.lean:581`): the
+            // constant, whose implicit type and instance the caller inserts.
+            if kind == &Name::from_components(["term∅"]) {
+                let [symbol] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(symbol, "∅", "empty collection")?;
+                return self.constant(&Name::from_components([
+                    "EmptyCollection",
+                    "emptyCollection",
+                ]));
+            }
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
@@ -1736,6 +1748,8 @@ impl Context {
                                 if kind == &parser_kind(&["Term", "match"])
                                     || kind == &parser_kind(&["Term", "matchMatrix"])
                                     || kind == &parser_kind(&["Term", "ifThenElse"])
+                                    || kind == &Name::from_components(["termIfThenElse"])
+                                    || kind == &Name::from_components(["termDepIfThenElse"])
                                 {
                                     let parts = self.match_parts(syntax)?;
                                     let discriminant = parts.discriminant;
@@ -2039,6 +2053,17 @@ impl Context {
                                     if !intrinsic.spelled_by(&parts[1]) {
                                         return Err(NatDefinitionElabError::UnexpectedSyntax {
                                             expected: "scalar operator",
+                                        });
+                                    }
+                                    // `(a : α) × β a` is the pin's dependent pair
+                                    // (`Init/NotationExtra.lean:93`, `Sigma`/`PSigma`), not
+                                    // `Prod` of an ascription.
+                                    if matches!(intrinsic.spelling(), "×" | "×'")
+                                        && matches!(&parts[0], Syntax::Node { kind, .. }
+                                            if kind == &parser_kind(&["Term", "typeAscription"]))
+                                    {
+                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                            expected: "a product of types, not a dependent pair",
                                         });
                                     }
                                     tasks.push(Task::Infix(intrinsic, expected));
@@ -2671,11 +2696,20 @@ impl Context {
                                     }
                                     _ => None,
                                 };
+                            let negated = matches!(
+                                intrinsic,
+                                BoundedInfixIntrinsic::Membership { negated: true }
+                            );
+                            let swapped =
+                                matches!(intrinsic, BoundedInfixIntrinsic::Membership { .. });
                             let name = if let Some(name) = notation {
                                 name
                             } else {
                                 match intrinsic {
                                     BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                                    BoundedInfixIntrinsic::Membership { .. } => {
+                                        Name::from_components(["Membership", "mem"])
+                                    }
                                     BoundedInfixIntrinsic::ScalarBeq => {
                                         if self.instantiate(&left.type_)? == string_const()
                                             && self.instantiate(&right.type_)? == string_const()
@@ -2688,7 +2722,12 @@ impl Context {
                                 }
                             };
                             let mut function = self.constant(&name)?;
-                            for argument in [left, right] {
+                            let operands = if swapped {
+                                [right, left]
+                            } else {
+                                [left, right]
+                            };
+                            for argument in operands {
                                 function = self.insert_implicits(
                                     function,
                                     ImplicitInsertion::ExplicitArgument,
@@ -2705,6 +2744,21 @@ impl Context {
                                 self.constrain_type(&argument.type_, &domain)?;
                                 function.type_ = self.substitute(&body, &argument.value)?;
                                 function.value = Expr::app(function.value, argument.value);
+                            }
+                            if negated {
+                                let mut not = self.constant(&Name::from_components(["Not"]))?;
+                                let ExprNode::ForallE {
+                                    binder_type, body, ..
+                                } = not.type_.node()
+                                else {
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                };
+                                let (domain, body) = (binder_type.clone(), body.clone());
+                                let membership = self.finish_term(function, Some(&domain))?;
+                                self.constrain_type(&membership.type_, &domain)?;
+                                not.type_ = self.substitute(&body, &membership.value)?;
+                                not.value = Expr::app(not.value, membership.value);
+                                function = not;
                             }
                             values.push(self.finish_term(function, expected.as_ref())?);
                         }
@@ -3462,11 +3516,22 @@ impl Context {
                 return Err(failure(SourceInferenceError::Scope));
             }
             let type_parts = expect_null_args(&parts[2], "binder type")?;
-            let [colon, type_syntax] = type_parts else {
-                return Err(failure(SourceInferenceError::ExpectedType));
+            let domain = match type_parts {
+                [colon, type_syntax] => {
+                    expect_atom(colon, ":", "binder type ascription")?;
+                    self.type_term(type_syntax)?
+                }
+                // `{α}`: the pin elaborates an omitted binder type as a hole
+                // (`Lean/Elab/Binders.lean`, `mkHole`), which unification must fill.
+                [] => {
+                    let hole = Syntax::node(
+                        parser_kind(&["Term", "hole"]),
+                        vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "_")],
+                    );
+                    self.type_term(&hole)?
+                }
+                _ => return Err(failure(SourceInferenceError::ExpectedType)),
             };
-            expect_atom(colon, ":", "binder type ascription")?;
-            let domain = self.type_term(type_syntax)?;
             for name in names {
                 let Syntax::Ident { val: name, .. } = name else {
                     return Err(failure(SourceInferenceError::Scope));

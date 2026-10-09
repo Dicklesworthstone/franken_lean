@@ -311,6 +311,22 @@ enum BoundedInfix {
     /// `h ▸ e` (`Term.subst`, `trailing_parser:75 " ▸ " >> sepBy1 (termParser 75) " ▸ "`):
     /// the operand at precedence 75 makes it right-nested, like `infixr:75`.
     Subst,
+    /// Init's other infix notations (`Init/Notation.lean:272-428`, `Init/Core.lean:539-560`):
+    /// `notation:50 a:50 " ∈ " b:50` and `" ∉ "` (right-nested: the right operand admits
+    /// another), `infixr:35 " × "`/`" ×' "`, `infixr:90 " ∘ "`, `infix:50 " ∣ "`/`" ⊆ "`/`" ⊂ "`,
+    /// `infixl:65 " ∪ "`, `infixl:70 " ∩ "`, `infix:70 " \\ "` and `infixr:100 " <$> "`.
+    Mem,
+    NotMem,
+    Prod,
+    PProd,
+    Comp,
+    Dvd,
+    Subset,
+    SSubset,
+    Union,
+    Inter,
+    SDiff,
+    FunctorMap,
 }
 
 impl BoundedInfix {
@@ -349,6 +365,18 @@ impl BoundedInfix {
             Self::BoolOr => "||",
             Self::ListCons => "::",
             Self::Subst => "▸",
+            Self::Mem => "∈",
+            Self::NotMem => "∉",
+            Self::Prod => "×",
+            Self::PProd => "×'",
+            Self::Comp => "∘",
+            Self::Dvd => "∣",
+            Self::Subset => "⊆",
+            Self::SSubset => "⊂",
+            Self::Union => "∪",
+            Self::Inter => "∩",
+            Self::SDiff => "\\",
+            Self::FunctorMap => "<$>",
         }
     }
     const fn precedence(self) -> u8 {
@@ -371,6 +399,12 @@ impl BoundedInfix {
             Self::BoolOr => 30,
             Self::ListCons => 67,
             Self::Subst => 75,
+            Self::Mem | Self::NotMem | Self::Dvd | Self::Subset | Self::SSubset => 50,
+            Self::Prod | Self::PProd => 35,
+            Self::Comp => 90,
+            Self::Union => 65,
+            Self::Inter | Self::SDiff => 70,
+            Self::FunctorMap => 100,
         }
     }
 
@@ -385,6 +419,12 @@ impl BoundedInfix {
                 | Self::OrAscii
                 | Self::ListCons
                 | Self::Subst
+                | Self::Mem
+                | Self::NotMem
+                | Self::Prod
+                | Self::PProd
+                | Self::Comp
+                | Self::FunctorMap
         )
     }
 
@@ -401,6 +441,10 @@ impl BoundedInfix {
                 | Self::GeUnicode
                 | Self::Ne
                 | Self::Bne
+                | Self::Dvd
+                | Self::Subset
+                | Self::SSubset
+                | Self::SDiff
         )
     }
 
@@ -618,6 +662,18 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "<<<" => Some(BoundedInfix::NatShiftLeft),
         ">>>" => Some(BoundedInfix::NatShiftRight),
         "^" => Some(BoundedInfix::NatPow),
+        "∈" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Mem),
+        "∉" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::NotMem),
+        "×" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Prod),
+        "×'" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PProd),
+        "∘" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Comp),
+        "∣" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Dvd),
+        "⊆" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Subset),
+        "⊂" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SSubset),
+        "∪" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Union),
+        "∩" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Inter),
+        "\\" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SDiff),
+        "<$>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::FunctorMap),
         _ => None,
     }
 }
@@ -641,7 +697,7 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
             Some(TokenKind::Literal(
                 LiteralKind::Str | LiteralKind::Char | LiteralKind::Scientific
             ))
-        ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_"))))
+        ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_" | "∅"))))
 }
 
 fn bounded_term_leaf(
@@ -680,6 +736,8 @@ fn bounded_term_leaf(
                 )),
                 "Prop" => Ok(Syntax::node(parser_kind(&["Term", "prop"]), vec![leaf])),
                 "_" => Ok(Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])),
+                // `notation "∅" => EmptyCollection.emptyCollection` (`Init/Core.lean:581`).
+                "∅" => Ok(Syntax::node(Name::from_components(["term∅"]), vec![leaf])),
                 _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: original_position(view, tokens, index),
                     expected: grammar.value_expectation(),
@@ -2440,6 +2498,26 @@ fn bounded_binders(
                 expected: NatDefinitionExpectation::ParameterIdentifier,
             });
         }
+        // A declaration's binders take their type optionally (`bracketedBinder (requireType :=
+        // false)`, vendored `src/Lean/Parser/Term.lean`): `{α}` is a group with no binder type,
+        // recorded with `colon` at its closing bracket.
+        if grammar == DefinitionGrammar::Scalar
+            && matches!(
+                tokens.get(cursor).map(|token| &token.kind),
+                Some(TokenKind::Symbol(symbol)) if symbol == closing
+            )
+        {
+            parameter_groups.push(ExplicitBinderTokens {
+                open,
+                names: names_start..cursor,
+                colon: cursor,
+                type_range: cursor..cursor,
+                close: cursor,
+                kind,
+            });
+            cursor += 1;
+            continue;
+        }
         if !matches!(
             tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":"
@@ -2507,14 +2585,15 @@ fn bounded_binder_syntax(
             .names
             .map(|index| leaves.leaf(index))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut children = vec![
-            leaves.leaf(group.open)?,
-            null_node(names),
+        let binder_type = if group.colon == group.close {
+            null_node(Vec::new())
+        } else {
             null_node(vec![
                 leaves.leaf(group.colon)?,
                 bounded_type(leaves, view, tokens, group.type_range, grammar)?,
-            ]),
-        ];
+            ])
+        };
+        let mut children = vec![leaves.leaf(group.open)?, null_node(names), binder_type];
         if group.kind == "explicitBinder" {
             children.push(null_node(Vec::new()));
         }
@@ -3972,13 +4051,9 @@ mod nat_definition_tests {
                 ..
             })
         ));
-        assert!(matches!(
-            parse_definition(b"def answer := Nat.add () 2"),
-            Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::ScalarValue,
-                ..
-            })
-        ));
+        // `()` is the pin's empty tuple, `Unit.unit` (486525ea), not a malformed delimiter:
+        // the application parses and its argument's type is the elaborator's to refuse.
+        assert!(parse_definition(b"def answer := Nat.add () 2").is_ok());
         assert!(matches!(
             parse_definition(b"def answer := Nat.add 40 2)"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {

@@ -246,7 +246,8 @@ fn local_tactic(
         "subst"
             if range.end == start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>
         {
-            args.push(leaves.leaf(start + 1)?);
+            // `"subst" (colGt term:max)+` (`Init/Tactics.lean`): the names are a list.
+            args.push(null_node(vec![leaves.leaf(start + 1)?]));
         }
         "fail"
             if range.end == start + 2
@@ -265,7 +266,13 @@ fn local_tactic(
             if range.end == start + 1 => {}
         _ => return Err(refusal(view, tokens, start)),
     }
-    Ok(Syntax::node(parser_kind(&["Tactic", keyword]), args))
+    // `rfl` is `macro "rfl" : tactic` in `Init/Tactics.lean`, whose kind is `tacticRfl`.
+    let kind = if keyword == "rfl" {
+        "tacticRfl"
+    } else {
+        keyword
+    };
+    Ok(Syntax::node(parser_kind(&["Tactic", kind]), args))
 }
 
 #[inline(never)]
@@ -560,8 +567,19 @@ fn simpa(
     if !matches!(&args[5], Syntax::Node { args, .. } if args.is_empty()) {
         return Err(refusal(view, tokens, prefix_end));
     }
+    // `simpa := "simpa" "?"? "!"? simpaArgsRest` and `simpaArgsRest := optConfig
+    // (discharger)? (&" only")? (simpArgs)? (" using " term)?` (`Init/Tactics.lean`).
     *kind = parser_kind(&["Tactic", "simpa"]);
-    args[5] = using;
+    let mut slots = std::mem::take(args).into_iter();
+    let keyword = slots.next().expect("simp keyword");
+    let mut rest: Vec<Syntax> = slots.take(4).collect();
+    rest.push(using);
+    *args = vec![
+        keyword,
+        null_node(Vec::new()),
+        null_node(Vec::new()),
+        Syntax::node(parser_kind(&["Tactic", "simpaArgsRest"]), rest),
+    ];
     Ok(parsed)
 }
 

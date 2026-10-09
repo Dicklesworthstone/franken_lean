@@ -955,6 +955,11 @@ enum BoundedInfixIntrinsic {
         intrinsic: Name,
     },
     ScalarBeq,
+    /// `notation:50 a:50 " ∈ " b:50 => Membership.mem b a` and `a ∉ b => ¬ (a ∈ b)`
+    /// (vendored `src/Init/Notation.lean:420-422`): the operands swap, and `∉` negates.
+    Membership {
+        negated: bool,
+    },
 }
 
 impl BoundedInfixIntrinsic {
@@ -962,6 +967,8 @@ impl BoundedInfixIntrinsic {
         match self {
             Self::Fixed { spelling, .. } => spelling,
             Self::ScalarBeq => "==",
+            Self::Membership { negated: false } => "∈",
+            Self::Membership { negated: true } => "∉",
         }
     }
 
@@ -1005,6 +1012,34 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
     }
     if allow_string && kind == &Name::str(Name::anonymous(), "term_==_") {
         return Some(BoundedInfixIntrinsic::ScalarBeq);
+    }
+    if allow_string {
+        // Init's plain `infix`/`infixl`/`infixr` notations: ordinary applications of the
+        // function each names (`Init/Notation.lean:272-428`, `Init/Core.lean:539-560`).
+        for (spelling, constant) in [
+            ("×", "Prod"),
+            ("×'", "PProd"),
+            ("∘", "Function.comp"),
+            ("∣", "Dvd.dvd"),
+            ("⊆", "HasSubset.Subset"),
+            ("⊂", "HasSSubset.SSubset"),
+            ("∪", "Union.union"),
+            ("∩", "Inter.inter"),
+            ("\\", "SDiff.sdiff"),
+            ("<$>", "Functor.map"),
+        ] {
+            if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(constant.split('.')),
+                });
+            }
+        }
+        for (spelling, negated) in [("∈", false), ("∉", true)] {
+            if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Membership { negated });
+            }
+        }
     }
     let rows = [
         ("term_|||_", "|||", ["Nat", "lor"]),
@@ -1151,6 +1186,11 @@ fn elaborate_nonlet_term(
                     })?;
                 let intrinsic = match intrinsic {
                     BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                    BoundedInfixIntrinsic::Membership { .. } => {
+                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                            expected: "an operator of the bounded definition grammar",
+                        });
+                    }
                     BoundedInfixIntrinsic::ScalarBeq => {
                         let left_type = infer_expr_type(&left, locals, environment);
                         let right_type = infer_expr_type(&right, locals, environment);

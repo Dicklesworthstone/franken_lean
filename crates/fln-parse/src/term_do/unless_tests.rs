@@ -1,7 +1,12 @@
 //! Guarded do blocks retain original leaves and the enclosing control scope.
 use super::*;
 fn count(syntax: &Syntax, kind: &str) -> usize {
-    let kind = parser_kind(&["Term", kind]);
+    // The pin's term `if` is the root-namespace notation `termIfThenElse`.
+    let kind = if kind == "termIfThenElse" {
+        Name::from_components([kind])
+    } else {
+        parser_kind(&["Term", kind])
+    };
     let mut work = vec![syntax];
     let mut result = 0;
     while let Some(syntax) = work.pop() {
@@ -68,7 +73,7 @@ fn parenthesized_predicates_and_escaped_guard_names_are_not_reinterpreted() {
     let source = "def run := do { «unless»; unless (if a then b else c) do { visit (do return 7) }; return 42 }";
     let parsed = parse_definition(source.as_bytes()).unwrap();
     assert_eq!(count(parsed.syntax(), "doUnless"), 1);
-    assert_eq!(count(parsed.syntax(), "ifThenElse"), 1);
+    assert_eq!(count(parsed.syntax(), "termIfThenElse"), 1);
     assert_eq!(count(parsed.syntax(), "do"), 2);
     assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
 }

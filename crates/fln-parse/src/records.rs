@@ -82,14 +82,30 @@ pub(super) fn modifiers_after_doc(
     tokens: &[LexedToken],
     keyword: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    modifiers_with_doc(view, leaves, tokens, (keyword != 0).then_some(0))
+}
+
+/// A `declModifiers` node holding only the doc comment at token `doc`, if any.
+fn modifiers_with_doc(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    doc: Option<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
     let mut parts: Vec<Syntax> = (0..7).map(|_| null_node(Vec::new())).collect();
-    if keyword != 0 {
-        parts[0] = crate::doc_comment_syntax(view, leaves, tokens, 0)?;
+    if let Some(doc) = doc {
+        parts[0] = crate::doc_comment_syntax(view, leaves, tokens, doc)?;
     }
     Ok(Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
         parts,
     ))
+}
+
+/// Whether token `at` is a declaration doc comment (`/--`), which leads a field as it leads a
+/// declaration: `structSimpleBinder`'s own `declModifiers` (`Lean/Parser/Command.lean`).
+fn doc_at(tokens: &[LexedToken], at: usize) -> bool {
+    symbol(tokens, at, "/--")
 }
 pub(super) fn optional_type(
     leaves: &Leaves,
@@ -124,6 +140,8 @@ fn field(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let doc = doc_at(tokens, range.start).then_some(range.start);
+    let range = range.start + usize::from(doc.is_some())..range.end;
     if !matches!(
         tokens.get(range.start).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
@@ -165,7 +183,7 @@ fn field(
     Ok(Syntax::node(
         parser_kind(&["Command", "structSimpleBinder"]),
         vec![
-            modifiers(),
+            modifiers_with_doc(view, leaves, tokens, doc)?,
             leaves.leaf(range.start)?,
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
@@ -210,7 +228,9 @@ fn fields(
         let begins_line = index > first
             && source.line_of(tokens[index].extent.start())
                 > source.line_of(tokens[index - 1].extent.end());
-        if stack.is_empty() && begins_line && column(index) <= base {
+        // A field's doc comment and its name start lines of one field.
+        let after_doc = index == first + 1 && doc_at(tokens, first);
+        if stack.is_empty() && begins_line && !after_doc && column(index) <= base {
             if column(index) != base {
                 return Err(refuse(view, tokens, index));
             }

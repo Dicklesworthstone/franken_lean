@@ -206,3 +206,56 @@ fn logical_notation_has_reference_precedence_associativity_and_application_scope
     "#,
     );
 }
+
+/// Init's plain infixes are applications of the functions they name, in the pin's operand
+/// order: `a ∈ b` is `Membership.mem b a` and `a ∉ b` is `¬ (a ∈ b)`
+/// (`Init/Notation.lean:272-428`). A binder group may omit its type (`{A}`).
+#[test]
+fn init_infixes_apply_their_functions_in_the_pins_operand_order() {
+    check(
+        "structure Prod (A B : Type) where\n  fst : A\n  snd : B\n\
+         def pair (A B : Type) : Type := A × B\n\
+         theorem pair_is_prod (A B : Type) : pair A B = Prod A B := rfl\n\
+         def Function.comp {A B C : Type} (f : B -> C) (g : A -> B) : A -> C := fun x => f (g x)\n\
+         theorem comp_applies (f g : Nat -> Nat) (x : Nat) : (f ∘ g) x = f (g x) := rfl\n\
+         class Membership (A : Type) (G : Type) where\n  mem : G -> A -> Prop\n\
+         structure Bag where\n  val : Nat\n\
+         instance bagMembership : Membership Nat Bag := Membership.mk (fun b n => b.val = n)\n\
+         theorem three_in : 3 ∈ Bag.mk 3 := rfl\n\
+         theorem not_in_negates : (4 ∉ Bag.mk 3) = Not ((Bag.mk 3).val = 4) := rfl\n\
+         theorem untyped {n} (h : n = 1) : n = 1 := h\n",
+    );
+}
+
+/// `(a : A) × B` is the pin's dependent pair (`Init/NotationExtra.lean:93`), never `Prod` of
+/// an ascription. Read as `Prod B Nat` this definition would check; the pin refuses it
+/// (measured 2026-10-08: the `Sigma` over `Type` is not in `Type`).
+#[test]
+fn a_dependent_pair_is_not_read_as_a_product() {
+    let (engine, limits) = engine();
+    let source = "structure Prod (A B : Type) where\n  fst : A\n  snd : B\n\
+                  def dependent (B : Type) : Type := (B : Type) × Nat\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            ),
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
+}
+
+/// `∅` is `EmptyCollection.emptyCollection` (`Init/Core.lean:581`), its type and instance
+/// inserted from the expected type.
+#[test]
+fn the_empty_collection_notation_is_its_class_constant() {
+    check(
+        "class EmptyCollection (A : Type) where\n  emptyCollection : A\n\
+         structure Bag where\n  val : Nat\n\
+         instance emptyBag : EmptyCollection Bag := EmptyCollection.mk (Bag.mk 0)\n\
+         theorem empty_is_zero : (∅ : Bag) = Bag.mk 0 := rfl\n",
+    );
+}

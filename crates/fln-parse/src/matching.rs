@@ -1164,18 +1164,38 @@ fn build_conditional(
         splices,
         updates,
     )?;
-    let syntax = Syntax::node(
-        parser_kind(&["Term", "ifThenElse"]),
-        vec![
-            leaves.leaf(plan.start)?,
-            binding,
-            condition,
-            leaves.leaf(then_at)?,
-            yes,
-            leaves.leaf(else_at)?,
-            no,
-        ],
-    );
+    // The pin's `if` notations (`Init/Prelude.lean`): `termIfThenElse` and, with evidence
+    // `if h : c`, `termDepIfThenElse`, whose name is a `binderIdent`.
+    let syntax = if named {
+        Syntax::node(
+            Name::from_components(["termDepIfThenElse"]),
+            vec![
+                leaves.leaf(plan.start)?,
+                Syntax::node(
+                    Name::from_components(["Lean", "binderIdent"]),
+                    vec![leaves.leaf(plan.start + 1)?],
+                ),
+                leaves.leaf(plan.start + 2)?,
+                condition,
+                leaves.leaf(then_at)?,
+                yes,
+                leaves.leaf(else_at)?,
+                no,
+            ],
+        )
+    } else {
+        Syntax::node(
+            Name::from_components(["termIfThenElse"]),
+            vec![
+                leaves.leaf(plan.start)?,
+                condition,
+                leaves.leaf(then_at)?,
+                yes,
+                leaves.leaf(else_at)?,
+                no,
+            ],
+        )
+    };
     splices.insert(plan.start, (plan.end, syntax));
     Ok(())
 }

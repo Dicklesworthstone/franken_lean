@@ -5,6 +5,10 @@ use fln_parse::{parse_definition, parse_nat_definition};
 use fln_syntax::tree::Syntax;
 
 fn kind(label: &str) -> Name {
+    // The pin's term `if` is the root-namespace notation `termIfThenElse`.
+    if label == "termIfThenElse" {
+        return Name::from_components([label]);
+    }
     Name::from_components(["Lean", "Parser", "Term", label])
 }
 fn nodes<'a>(syntax: &'a Syntax, label: &str) -> Vec<&'a [Syntax]> {
@@ -114,7 +118,7 @@ fn expression_conditionals_and_nested_do_keep_their_own_grammar() {
     ] {
         let p = roundtrip(source);
         assert_eq!(nodes(p.syntax(), "doIf").len(), 1);
-        assert_eq!(nodes(p.syntax(), "ifThenElse").len(), 1);
+        assert_eq!(nodes(p.syntax(), "termIfThenElse").len(), 1);
     }
     for source in [
         "def run := if flag then 7",

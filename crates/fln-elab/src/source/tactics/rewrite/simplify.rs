@@ -269,8 +269,24 @@ impl Context {
         args: &'a [Syntax],
     ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
         self.tick()?;
-        let [keyword, config, discharger, only, arguments, location] = args else {
-            return Err(error(TacticError::MalformedScript));
+        // `simp`'s six slots, or the pin's `simpa` (`"simpa" "?"? "!"? simpaArgsRest`), whose
+        // arguments are `simpaArgsRest`'s first four slots and whose fifth is its evidence.
+        let (keyword, config, discharger, only, arguments, location) = match args {
+            [keyword, config, discharger, only, arguments, location] => {
+                (keyword, config, discharger, only, arguments, Some(location))
+            }
+            [keyword, question, bang, rest] => {
+                expect_empty_null(question, "plain simpa")?;
+                expect_empty_null(bang, "plain simpa")?;
+                let rest = expect_node(
+                    rest,
+                    &parser_kind(&["Tactic", "simpaArgsRest"]),
+                    5,
+                    "simpa arguments",
+                )?;
+                (keyword, &rest[0], &rest[1], &rest[2], &rest[3], None)
+            }
+            _ => return Err(error(TacticError::MalformedScript)),
         };
         let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");
         expect_atom(
@@ -281,6 +297,7 @@ impl Context {
         expect_default_config(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
+            let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
         let use_default = match expect_null_args(only, "optional explicit simp set")? {

@@ -113,6 +113,66 @@ const ATTRIBUTES: &[Accepted] = &[
     },
 ];
 
+/// The `if` notations (`termIfThenElse`, and `termDepIfThenElse` with evidence). Captured
+/// 2026-10-08 from one file the pin elaborated without an error.
+const CONDITIONALS: &[Accepted] = &[
+    Accepted {
+        source: "def ifs (n : Nat) : Nat := if n = 0 then 1 else n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `ifs []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (termIfThenElse "if" («term_=_» `n "=" (num "0")) "then" (num "1") "else" `n) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def difs (n : Nat) : Nat := if h : n = 0 then 1 else n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `difs []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (termDepIfThenElse "if" (Lean.binderIdent `h) ":" («term_=_» `n "=" (num "0")) "then" (num "1") "else" `n) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// Init's plain infix notations (`Init/Notation.lean:272-428`, `Init/Core.lean:539`) and
+/// binder groups without a type (`bracketedBinder (requireType := false)`,
+/// `Lean/Parser/Term.lean`). Captured 2026-10-08 from one file the pin elaborated without an
+/// error, in this order.
+const INFIXES_AND_UNTYPED_BINDERS: &[Accepted] = &[
+    Accepted {
+        source: "def s1 (α β : Type) : Type := α × β",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`α `β] [":" (Term.type "Type" [])] [] ")")] [(Term.typeSpec ":" (Term.type "Type" []))]) (Command.declValSimple ":=" («term_×_» `α "×" `β) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem m1 (xs : List Nat) (h : 1 ∈ xs) : 1 ∈ xs := h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `m1 []) (Command.declSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `List [`Nat])] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∈_» (num "1") "∈" `xs)] [] ")")] (Term.typeSpec ":" («term_∈_» (num "1") "∈" `xs))) (Command.declValSimple ":=" `h (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem m2 (xs : List Nat) (h : 1 ∉ xs) : 1 ∉ xs := h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `m2 []) (Command.declSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `List [`Nat])] [] ")") (Term.explicitBinder "(" [`h] [":" («term_∉_» (num "1") "∉" `xs)] [] ")")] (Term.typeSpec ":" («term_∉_» (num "1") "∉" `xs))) (Command.declValSimple ":=" `h (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def c1 (f g : Nat → Nat) : Nat → Nat := f ∘ g",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `c1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`f `g] [":" (Term.arrow `Nat "→" `Nat)] [] ")")] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" («term_∘_» `f "∘" `g) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem d1 (h : 2 ∣ 4) : 2 ∣ 4 := h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `d1 []) (Command.declSig [(Term.explicitBinder "(" [`h] [":" («term_∣_» (num "2") "∣" (num "4"))] [] ")")] (Term.typeSpec ":" («term_∣_» (num "2") "∣" (num "4")))) (Command.declValSimple ":=" `h (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def u1 (f : Nat → Nat) (x : Option Nat) : Option Nat := f <$> x",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `u1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`f] [":" (Term.arrow `Nat "→" `Nat)] [] ")") (Term.explicitBinder "(" [`x] [":" (Term.app `Option [`Nat])] [] ")")] [(Term.typeSpec ":" (Term.app `Option [`Nat]))]) (Command.declValSimple ":=" («term_<$>_» `f "<$>" `x) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem s2 (a b : List Nat) (h : a ⊆ b) : a ⊆ b := h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `s2 []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" (Term.app `List [`Nat])] [] ")") (Term.explicitBinder "(" [`h] [":" («term_⊆_» `a "⊆" `b)] [] ")")] (Term.typeSpec ":" («term_⊆_» `a "⊆" `b))) (Command.declValSimple ":=" `h (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem i1 {α} (a : α) : a = a := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `i1 []) (Command.declSig [(Term.implicitBinder "{" [`α] [] "}") (Term.explicitBinder "(" [`a] [":" `α] [] ")")] (Term.typeSpec ":" («term_=_» `a "=" `a))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def i2 {α β} (f : α → β) (a : α) : β := f a",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `i2 []) (Command.optDeclSig [(Term.implicitBinder "{" [`α `β] [] "}") (Term.explicitBinder "(" [`f] [":" (Term.arrow `α "→" `β)] [] ")") (Term.explicitBinder "(" [`a] [":" `α] [] ")")] [(Term.typeSpec ":" `β)]) (Command.declValSimple ":=" (Term.app `f [`a]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem i3 ⦃n⦄ (h : n = 1) : n = 1 := h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `i3 []) (Command.declSig [(Term.strictImplicitBinder "⦃" [`n] [] "⦄") (Term.explicitBinder "(" [`h] [":" («term_=_» `n "=" (num "1"))] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" (num "1")))) (Command.declValSimple ":=" `h (Termination.suffix [] []) [])))"#,
+    },
+];
+
 /// Declaration modifiers, `declModifiers` slots 2..6 (`Lean/Parser/Command.lean:114`).
 const MODIFIERS: &[Accepted] = &[
     Accepted {
@@ -515,6 +575,22 @@ fn declaration_modifiers_produce_the_pins_trees() {
 #[test]
 fn inline_attributes_produce_the_pins_trees() {
     for row in ATTRIBUTES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn conditionals_produce_the_pins_trees() {
+    for row in CONDITIONALS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn infixes_and_untyped_binders_produce_the_pins_trees() {
+    for row in INFIXES_AND_UNTYPED_BINDERS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

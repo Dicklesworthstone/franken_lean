@@ -273,6 +273,20 @@ const PIN_DOC_CARRIERS: &[&str] = &[
 
 /// Whether `token` can follow a declaration's doc comment: the declaration keywords and the
 /// rest of `declModifiers` (attributes, then the modifiers), whose first slot the doc fills.
+/// Whether a symbol opens (`Some(true)`) or closes (`Some(false)`) a bracket, for the
+/// partition's nesting depth. The pin's tokens put brackets inside longer symbols: `#[`, `%[`,
+/// `.(`, `-[`, `` `(tactic| ``, `wp⟦` open, and `]'` (`xs[i]'h`, `Init/GetElem.lean`) and
+/// `+1]` close, so a symbol is read by the brackets it contains.
+fn bracket(symbol: &str) -> Option<bool> {
+    const OPEN: &[char] = &['(', '[', '{', '⟨', '⟦', '⦃'];
+    const CLOSE: &[char] = &[')', ']', '}', '⟩', '⟧', '⦄'];
+    match (symbol.contains(OPEN), symbol.contains(CLOSE)) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
 fn carries_doc_comment(token: &LexedToken) -> bool {
     matches!(&token.kind, TokenKind::Symbol(symbol)
     if modifiers::is_modifier(symbol)
@@ -456,7 +470,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // …) precede the declaration keyword in one command (`declModifiers`).
             let prefix = symbol == "@[" || modifiers::is_modifier(symbol);
             let inline_start = prefix && command_line;
-            let continues_prefix = attribute_prefix && (declaration(symbol) || prefix);
+            // `class inductive` and `class abbrev` are one declaration keyword at the pin.
+            let after_class = index > 0
+                && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "class");
+            let continues_prefix = (attribute_prefix && (declaration(symbol) || prefix))
+                || (after_class && declaration(symbol));
             if depth == 0 && current_open && symbol == "in" {
                 open_in = true;
                 current_open = false;
@@ -481,10 +499,10 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 // `axiom`, …) and belongs to its command, and the next declaration starts anew.
                 attribute_prefix = false;
             }
-            match symbol.as_str() {
-                "(" | "[" | "@[" | "{" | ".{" | "⦃" | "⟨" => depth = depth.saturating_add(1),
-                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
-                _ => {}
+            match bracket(symbol) {
+                Some(true) => depth = depth.saturating_add(1),
+                Some(false) => depth = depth.saturating_sub(1),
+                None => {}
             }
         }
     }
@@ -706,6 +724,34 @@ mod tests {
                 String::from_utf8_lossy(command)
             );
         }
+    }
+
+    /// The pin's tokens carry brackets inside longer symbols (`]'` in `xs[i]'h`, `#[`, `⟦`).
+    /// The partition's nesting depth reads them, so the next command starts where the pin
+    /// starts it instead of inside the previous one.
+    #[test]
+    fn brackets_inside_longer_symbols_keep_the_nesting_depth() {
+        for source in [
+            "theorem a (xs : Array Nat) (i : Nat) (h : i < xs.size) : xs[i]'h = xs[i]'h := rfl\ntheorem b : 1 = 1 := rfl\n",
+            "def a : Array Nat := #[1, 2]\ndef b : Nat := 1\n",
+        ] {
+            assert_eq!(partition(source.as_bytes()).unwrap().len(), 2, "{source}");
+        }
+        assert_eq!(bracket("]'"), Some(false));
+        assert_eq!(bracket("#["), Some(true));
+        assert_eq!(bracket("`(tactic|"), Some(true));
+        assert_eq!(bracket("+1]"), Some(false));
+        assert_eq!(bracket("=>"), None);
+    }
+
+    /// `class inductive` is one declaration (`Init/Prelude.lean`'s `Nonempty`): its constructors'
+    /// docs belong to it, and the next declaration starts a command of its own.
+    #[test]
+    fn class_inductive_is_one_command() {
+        let source = "/-- d -/\nclass inductive Nonempty (α : Sort u) : Prop where\n  /-- c -/\n  | intro (val : α) : Nonempty α\n\ndef x : Nat := 1\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands[1].1.starts_with(b"def x"));
     }
 
     /// A module doc is a command of its own wherever a command may start; a declaration's doc

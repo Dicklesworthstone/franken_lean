@@ -539,20 +539,44 @@ fn finish_binding(
 
 /// Sequence-level combinators cannot capture operators inside term arguments,
 /// local proof values, or constructor alternatives. Those own their subranges.
+/// A sequence of exactly one tactic as that tactic (`<;>`'s operands are `tactic`s); any other
+/// syntax is returned unchanged.
+fn single_tactic(syntax: Syntax) -> Syntax {
+    let unwrap = |syntax: &Syntax, kind: &str| match syntax {
+        Syntax::Node {
+            kind: found, args, ..
+        } if found == &parser_kind(&["Tactic", kind]) && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    };
+    let Some(indented) = unwrap(&syntax, "tacticSeq") else {
+        return syntax;
+    };
+    let Some(items) = unwrap(&indented, "tacticSeq1Indented") else {
+        return syntax;
+    };
+    match &items {
+        Syntax::Node { args, .. } if args.len() == 1 => args[0].clone(),
+        _ => syntax,
+    }
+}
+
+/// The last top-level `<;>`: `macro:1 x:tactic " <;> " y:tactic:2` (`Init/Tactics.lean`) takes
+/// its right operand at precedence 2, so `a <;> b <;> c` nests to the left.
 fn chain_at(tokens: &[LexedToken], range: Range<usize>) -> Option<usize> {
     let mut depth = 0;
+    let mut last = None;
     for at in range {
         if depth == 0 {
             if symbol(tokens, at, "<;>") {
-                return Some(at);
+                last = Some(at);
             }
             if symbol(tokens, at, ":=") || symbol(tokens, at, "with") {
-                return None;
+                return last;
             }
         }
         delimiter_depth(&tokens[at], &mut depth);
     }
-    None
+    last
 }
 
 fn split(
@@ -733,10 +757,12 @@ fn run(
                 tasks.push(Task::Sequence(plan.left, None));
             }
             Task::FinishChain(separator) => {
-                let right = values.pop().expect("sequenced tactic right operand");
-                let left = values.pop().expect("sequenced tactic left operand");
+                // Each operand is one `tactic` at the pin, not a sequence.
+                let right = single_tactic(values.pop().expect("sequenced tactic right operand"));
+                let left = single_tactic(values.pop().expect("sequenced tactic left operand"));
+                // `macro:1 x:tactic tk:" <;> " y:tactic:2 : tactic` (`Init/Tactics.lean`).
                 values.push(Syntax::node(
-                    parser_kind(&["Tactic", "andThen"]),
+                    parser_kind(&["Tactic", "tactic_<;>_"]),
                     vec![left, leaves.leaf(separator)?, right],
                 ));
             }
