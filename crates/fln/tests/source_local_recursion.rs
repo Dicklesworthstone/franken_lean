@@ -181,7 +181,7 @@ fn ordinary_let_helpers_and_header_shadowing_do_not_become_recursive() {
 fn local_recursion_can_produce_types_and_proofs() {
     checked(
         &engine(),
-        "def ty (n : Nat) : Type := let rec loop (k : Nat) : Type := match k with | .zero => Nat | .succ j => loop j; loop n\ndef value : ty 3 := 7\ntheorem result : value = 7 := by rfl\ntheorem reflexive (n : Nat) : n = n := let rec proof (k : Nat) : k = k := match k with | .zero => by rfl | .succ j => by rfl; proof n",
+        "def ty (n : Nat) : Type := let rec loop (k : Nat) : Type := match k with | .zero => Nat | .succ j => loop j; loop n\ndef value : ty 3 := (7 : Nat)\ntheorem result : value = (7 : Nat) := by rfl\ntheorem reflexive (n : Nat) : n = n := let rec proof (k : Nat) : k = k := match k with | .zero => by rfl | .succ j => (by rfl); proof n",
     );
 }
 

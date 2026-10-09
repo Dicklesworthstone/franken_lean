@@ -65,7 +65,7 @@ fn tactic_cases_return_real_constructor_fields_and_compute() {
 fn dependent_hypotheses_are_specialized_and_original_inputs_are_not_exposed() {
     check(
         FAMILIES,
-        "theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by cases t with | node n xs => exact h\ndef payload (t : Tree Nat) : Type := match t with | .node n xs => Nat\ndef unpack (t : Tree Nat) : payload t := by cases t with | node n xs => exact n\ntheorem unpackComputes : unpack (Tree.node 8 (@Forest.nil Nat)) = 8 := by rfl",
+        "theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by cases t with | node n xs => exact h\ndef payload (t : Tree Nat) : Type := match t with | .node n xs => Nat\ndef unpack (t : Tree Nat) : payload t := by cases t with | node n xs => exact n\ntheorem unpackComputes : unpack (Tree.node 8 (@Forest.nil Nat)) = (8 : Nat) := by rfl",
     );
 }
 #[test]

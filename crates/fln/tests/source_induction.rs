@@ -94,7 +94,7 @@ fn empty_inductives_eliminate_without_fabricating_a_branch() {
 #[test]
 fn dependent_record_case_analysis_returns_the_field_at_its_actual_type() {
     check(
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef unpack (p : Package) : p.carrier := by\n  cases p with\n  | mk carrier value => exact value\ndef p : Package := { carrier := Nat, value := 31 }\ntheorem unpack_ok : unpack p = 31 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef unpack (p : Package) : p.carrier := by\n  cases p with\n  | mk carrier value => exact value\ndef p : Package := { carrier := Nat, value := 31 }\ntheorem unpack_ok : unpack p = (31 : Nat) := by rfl",
     );
 }
 #[test]
@@ -165,7 +165,7 @@ theorem copy_ok {A : Type} (xs : Chain A) : copy xs = xs := by
 #[test]
 fn transitive_data_dependencies_are_reintroduced_at_the_branch_type() {
     check(
-        "def Carrier (n : Nat) : Type := match n with | .zero => Nat | .succ k => Bool\ndef keep (n : Nat) (x : Carrier n) (h : x = x) : Carrier n := by\n  cases n with\n  | zero => exact x\n  | succ k => exact x\ntheorem keep_ok : keep 0 9 rfl = 9 := by rfl",
+        "def Carrier (n : Nat) : Type := match n with | .zero => Nat | .succ k => Bool\ndef keep (n : Nat) (x : Carrier n) (h : x = x) : Carrier n := by\n  cases n with\n  | zero => exact x\n  | succ k => exact x\ntheorem keep_ok : keep 0 (9 : Nat) rfl = (9 : Nat) := by rfl",
     );
 }
 #[test]

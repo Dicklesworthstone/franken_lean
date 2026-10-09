@@ -140,7 +140,7 @@ fn neutral_sibling_motives_do_not_require_a_default_or_positive_result_universe(
 #[test]
 fn dependent_targets_rebind_the_selected_major_without_capturing_a_sibling() {
     check(
-        "def payload (t : Tree Nat) : Type := match t with | .node n children => Nat\ndef dependent (t : Tree Nat) : payload t := match t with | .node n children => n\ntheorem dependentComputes : dependent (Tree.node 5 (@Forest.nil Nat)) = 5 := by rfl",
+        "def payload (t : Tree Nat) : Type := match t with | .node n children => Nat\ndef dependent (t : Tree Nat) : payload t := match t with | .node n children => n\ntheorem dependentComputes : dependent (Tree.node 5 (@Forest.nil Nat)) = (5 : Nat) := by rfl",
     );
 }
 

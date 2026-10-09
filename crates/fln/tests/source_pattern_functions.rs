@@ -80,7 +80,7 @@ fn expected_indexed_results_are_refined_in_each_branch() {
  theorem t : tail 0 (Vec.cons 0 7 Vec.nil) = Vec.nil := by rfl\n\
  structure Package where\n carrier : Type\n value : carrier\n\
  def unpack : forall p : Package, p.carrier := fun | .mk A value => value\n\
- def package : Package := { carrier := Nat, value := 8 }\n theorem p : unpack package = 8 := by rfl",
+ def package : Package := { carrier := Nat, value := 8 }\n theorem p : unpack package = (8 : Nat) := by rfl",
     );
 }
 #[test]
