@@ -55,7 +55,7 @@ use fln_core::options::{
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
-use fln_rt::obj::{Obj, StdioPutStrError};
+use fln_rt::obj::{FileIoError, Obj, StdioPutStrError};
 use std::fmt;
 
 mod array_construction;
@@ -853,6 +853,8 @@ enum IntrinsicImplementation {
     IoCheckCancelled,
     IoInitializing,
     IoGetStdout,
+    FileHandleMk,
+    FileHandlePutStr,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -1208,6 +1210,8 @@ impl IntrinsicImplementation {
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
             "extern:IO.initializing" => Self::IoInitializing,
             "extern:IO.getStdout" => Self::IoGetStdout,
+            "extern:IO.FS.Handle.mk" => Self::FileHandleMk,
+            "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -1484,6 +1488,9 @@ pub enum VmRefusal {
     NativeStdoutCapture {
         error: fln_rt::obj::StdoutCaptureError,
     },
+    NativeFileIo {
+        error: FileIoError,
+    },
     MalformedClosure {
         reason: &'static str,
     },
@@ -1673,6 +1680,9 @@ impl fmt::Display for VmRefusal {
                     f,
                     "stdout memory capture refused before the current write: {error:?}"
                 )
+            }
+            Self::NativeFileIo { error } => {
+                write!(f, "native filesystem IO boundary: {error:?}")
             }
             Self::MalformedClosure { reason } => {
                 write!(f, "Golem closure shell is malformed: {reason}")
@@ -6230,6 +6240,22 @@ fn invoke_intrinsic(
                 .into(),
             )
         }
+        IntrinsicImplementation::FileHandleMk => {
+            expect_arity(row, args, 2)?;
+            // The generated native row erases the logical world argument.
+            // Core's checked action wrapper controls when this call occurs;
+            // VM uses its sole erased token, never a caller-provided pointer.
+            Obj::try_file_open(&args[0], &args[1], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileHandlePutStr => {
+            expect_arity(row, args, 2)?;
+            args[0]
+                .try_file_put_str(&args[1], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -6783,6 +6809,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::IoCheckCancelled
         | IntrinsicImplementation::IoInitializing
         | IntrinsicImplementation::IoGetStdout
+        | IntrinsicImplementation::FileHandleMk
+        | IntrinsicImplementation::FileHandlePutStr
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny

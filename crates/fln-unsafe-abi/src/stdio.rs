@@ -55,6 +55,7 @@ unsafe extern "C" {
     // three-argument redeclaration of a symbol std itself imports.
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
+    fn close(fd: c_int) -> c_int;
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn fread(ptr: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn feof(f: *mut c_void) -> c_int;
@@ -884,10 +885,81 @@ pub(crate) unsafe fn prim_handle_mk(filename: *mut LeanObject, mode: u8) -> *mut
             _ => b"a\0",
         };
         let fp = fdopen(fd, fp_mode.as_ptr().cast::<c_char>());
-        if fp.is_null() {
-            return io_result_mk_error(decode_io_error(errno(), filename));
+        let code = if fp.is_null() { errno() } else { 0 };
+        finish_handle_open(fd, fp, code, filename)
+    }
+}
+
+/// Settle the descriptor returned by open after fdopen. A failed fdopen has
+/// not taken ownership of fd; close it before allocating the captured error.
+/// File creation/truncation may already have happened and is not rolled back.
+///
+/// # Safety
+/// `fd` is owned after successful open; `file` is either null or the FILE
+/// that has taken ownership of that exact descriptor. `filename` is borrowed
+/// canonical String and `code` is errno captured immediately after failure.
+// UNSAFE-LEDGER: FLN-UL-0628
+#[allow(unsafe_code)]
+pub(crate) unsafe fn finish_handle_open(
+    fd: c_int,
+    file: *mut c_void,
+    code: c_int,
+    filename: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: successful fdopen transfers fd to FILE and its Handle finalizer;
+    // otherwise this is the unique descriptor owner. On Linux close settles
+    // the descriptor even on EINTR; retrying could close a reused descriptor.
+    unsafe {
+        if file.is_null() {
+            close(fd);
+            io_result_mk_error(decode_io_error(code, filename))
+        } else {
+            io_result_mk_ok(io_wrap_handle(file))
         }
-        io_result_mk_ok(io_wrap_handle(fp))
+    }
+}
+
+/// Recognize exactly the native FILE-owning Handle class, never an arbitrary
+/// external object or a logical Unit constructor.
+///
+/// # Safety
+/// `handle` is a scalar or a live membrane object, borrowed for this call.
+// UNSAFE-LEDGER: FLN-UL-0629
+#[allow(unsafe_code)]
+pub(crate) unsafe fn is_native_file_handle(handle: *mut LeanObject) -> bool {
+    // SAFETY: category check precedes external fields; the class is immutable
+    // and the owning live Obj keeps its nonnull FILE alive throughout.
+    unsafe {
+        if handle.is_null()
+            || tagged::is_scalar(handle)
+            || rc::read_header(handle).tag != crate::contract::TAG_EXTERNAL
+        {
+            return false;
+        }
+        let (class, file) = object::external_fields(handle);
+        class == handle_class() && !file.is_null()
+    }
+}
+
+/// Direct checked Handle.putStr, sharing the exact byte effect and error
+/// transport policy with the reviewed stdout callback.
+///
+/// # Safety
+/// `handle` is scalar or a live object, `text` a canonical live String. Both
+/// are borrowed. A returned native IO.Result owns one reference.
+// UNSAFE-LEDGER: FLN-UL-0630
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_put_str(
+    handle: *mut LeanObject,
+    text: *mut LeanObject,
+) -> Result<Option<(*mut LeanObject, usize)>, (c_int, usize)> {
+    // SAFETY: the class check precedes the primitive. Shared completion rejects
+    // filename-dependent decoder arms while preserving the completed count.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        checked_put_str_result(handle_put_str_status(handle, text)).map(Some)
     }
 }
 
@@ -1485,6 +1557,7 @@ unsafe impl Sync for InitialStream {}
 /// once per process: SIGPIPE ignored, the three streams built over the
 /// process's own stdio FILE*s and marked persistent.
 fn initial_streams() -> &'static [InitialStream; 3] {
+    initialize_io_signals();
     static INITIAL: OnceLock<[InitialStream; 3]> = OnceLock::new();
     INITIAL.get_or_init(|| {
         // SAFETY: the glibc FILE* globals are live for the process's life
@@ -1494,7 +1567,6 @@ fn initial_streams() -> &'static [InitialStream; 3] {
         // UNSAFE-LEDGER: FLN-UL-0295
         #[allow(unsafe_code)]
         unsafe {
-            signal(SIGPIPE, SIG_IGN);
             let mk = |fp: *mut c_void| {
                 let s = stream_of_handle(io_wrap_handle(fp));
                 rc::mark_persistent(s);
@@ -1503,6 +1575,21 @@ fn initial_streams() -> &'static [InitialStream; 3] {
             [mk(stdin), mk(stdout), mk(stderr)]
         }
     })
+}
+
+/// The shared pin runtime signal policy. Filesystem-only execution needs it
+/// before a possible pipe write, without creating or selecting any streams.
+pub(crate) fn initialize_io_signals() {
+    static INITIAL: OnceLock<()> = OnceLock::new();
+    INITIAL.get_or_init(|| {
+        // SAFETY: the pin establishes SIG_IGN for SIGPIPE once at runtime
+        // initialization; the existing stdio path and file path share it.
+        // UNSAFE-LEDGER: FLN-UL-0634
+        #[allow(unsafe_code)]
+        unsafe {
+            signal(SIGPIPE, SIG_IGN);
+        }
+    });
 }
 
 thread_local! {

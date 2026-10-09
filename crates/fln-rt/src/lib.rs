@@ -28,6 +28,7 @@ mod region_contract;
 
 /// The safe CompatHeap object surface (see the crate docs).
 pub mod obj {
+    pub use fln_unsafe_abi::handle::fs::FileIoError;
     pub use fln_unsafe_abi::handle::stdout_capture::{
         CapturedStdout, StdoutCapture, StdoutCaptureError,
     };

@@ -25,6 +25,7 @@ use crate::rc::{self, Header};
 use crate::shadow;
 use crate::tagged;
 
+pub mod fs;
 pub mod stdout_capture;
 
 /// Boxed-convention function types for the callable-closure constructors: every
