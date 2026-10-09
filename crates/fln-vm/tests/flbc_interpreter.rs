@@ -11816,3 +11816,260 @@ fn array_updates_swap_covers_every_index_pair() {
         }
     }
 }
+
+#[test]
+fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        9,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "first".into(),
+            },
+            Instruction::String {
+                dst: r(1),
+                value: "second".into(),
+            },
+            Instruction::Array {
+                dst: r(2),
+                items: vec![r(0), r(1), r(0)],
+            },
+            Instruction::Copy {
+                dst: r(3),
+                src: r(2),
+            },
+            intrinsic(r(4), "extern:Array.toList", vec![r(2)]),
+            Instruction::Copy {
+                dst: r(5),
+                src: r(4),
+            },
+            intrinsic(r(6), "extern:Array.mk", vec![r(4)]),
+            Instruction::Ctor {
+                dst: r(7),
+                tag: 0,
+                fields: vec![r(3), r(5), r(6)],
+                scalar_bytes: Vec::new(),
+            },
+            Instruction::Return { src: r(7) },
+        ],
+    )]);
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    let original = completed.value.ctor_child(0);
+    let list = completed.value.ctor_child(1);
+    let rebuilt = completed.value.ctor_child(2);
+    assert_eq!(
+        array_update_strings(&original),
+        ["first", "second", "first"]
+    );
+    assert_eq!(array_update_strings(&rebuilt), ["first", "second", "first"]);
+    let mut cursor = list.clone_ref();
+    let mut count = 0;
+    while !cursor.is_scalar() {
+        assert_eq!(cursor.header().tag, 1);
+        assert_eq!(cursor.header().other, 2);
+        let child = cursor.ctor_child(0);
+        assert_eq!(
+            child.identity_token(),
+            original.array_child(count).identity_token()
+        );
+        cursor = cursor.ctor_child(1);
+        count += 1;
+    }
+    assert_eq!(cursor.unbox(), 0);
+    assert_eq!(count, 3);
+    let survivor = rebuilt.array_child(0);
+    drop(completed);
+    drop(original);
+    drop(list);
+    drop(rebuilt);
+    assert!(survivor.try_string_view().is_some());
+    assert_eq!(survivor.header().rc, 1);
+}
+
+#[test]
+fn array_construction_empty_roundtrip_uses_the_scalar_nil_representation() {
+    let _guard = lock();
+    let program = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Erased,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:Array.mk", vec![r(0)]),
+            intrinsic(r(2), "extern:Array.toList", vec![r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert!(completed.value.is_scalar());
+    assert_eq!(completed.value.unbox(), 0);
+}
+
+#[test]
+fn array_construction_rejects_malformed_lists_without_publishing_a_prefix() {
+    let _guard = lock();
+    for malformed in [
+        Instruction::Nat {
+            dst: r(1),
+            value: 1,
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 0,
+            fields: vec![r(0), r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0), r(0), r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::String {
+            dst: r(1),
+            value: "not a list".into(),
+        },
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            4,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 0,
+                },
+                malformed,
+                // A valid cons preceding a bad tail must not be accepted either.
+                Instruction::Ctor {
+                    dst: r(2),
+                    tag: 1,
+                    fields: vec![r(0), r(1)],
+                    scalar_bytes: Vec::new(),
+                },
+                intrinsic(r(3), "extern:Array.mk", vec![r(2)]),
+                Instruction::Return { src: r(3) },
+            ],
+        )]);
+        match execute(&program, ExecutionLimits::default(), None) {
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::InvalidCtorObject,
+                ..
+            }) => {}
+            other => panic!("malformed list must refuse: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn array_construction_walks_long_lists_without_host_recursion() {
+    let _guard = lock();
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: "payload".into(),
+        },
+        Instruction::Nat {
+            dst: r(1),
+            value: 0,
+        },
+    ];
+    for _ in 0..10_000 {
+        code.push(Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0), r(1)],
+            scalar_bytes: Vec::new(),
+        });
+    }
+    code.extend([
+        intrinsic(r(2), "extern:Array.mk", vec![r(1)]),
+        intrinsic(r(3), "extern:Array.toList", vec![r(2)]),
+        intrinsic(r(4), "extern:Array.mk", vec![r(3)]),
+        intrinsic(r(5), "extern:Array.size", vec![r(4)]),
+        Instruction::Return { src: r(5) },
+    ]);
+    let program = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::OwnedOrScalar,
+        6,
+        code,
+    )]);
+    assert_eq!(
+        returned(execute(&program, ExecutionLimits::default(), None))
+            .value
+            .unbox(),
+        10_000
+    );
+}
+
+#[test]
+fn array_construction_empty_hints_validate_nats_without_unbounded_allocation() {
+    let _guard = lock();
+    for row in ["extern:Array.emptyWithCapacity", "extern:Array.mkEmpty"] {
+        for huge in [false, true] {
+            let hint = if huge {
+                Instruction::NatBig {
+                    dst: r(0),
+                    limbs_le: vec![0, 1],
+                }
+            } else {
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 16,
+                }
+            };
+            let program = validated(vec![function(
+                0,
+                0,
+                2,
+                vec![
+                    hint,
+                    intrinsic(r(1), row, vec![r(0)]),
+                    Instruction::Return { src: r(1) },
+                ],
+            )]);
+            assert_eq!(
+                returned(execute(&program, ExecutionLimits::default(), None))
+                    .value
+                    .array_view()
+                    .0,
+                0
+            );
+        }
+        let program = validated(vec![function(
+            0,
+            0,
+            2,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "bad hint".into(),
+                },
+                intrinsic(r(1), row, vec![r(0)]),
+                Instruction::Return { src: r(1) },
+            ],
+        )]);
+        match execute(&program, ExecutionLimits::default(), None) {
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            }) => {}
+            other => panic!("{row}: bad hint was not refused: {other:?}"),
+        }
+    }
+}

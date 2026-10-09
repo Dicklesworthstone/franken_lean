@@ -57,6 +57,7 @@ use fln_rt::abi;
 use fln_rt::obj::Obj;
 use std::fmt;
 
+mod array_construction;
 mod arrays;
 mod floats;
 mod tail_calls;
@@ -869,6 +870,7 @@ enum IntrinsicImplementation {
     TaskSpawn,
     TaskMap,
     TaskBind,
+    ArrayConstruction(array_construction::Intrinsic),
     ArrayExtra(arrays::Intrinsic),
     Unsupported,
 }
@@ -1224,6 +1226,9 @@ impl IntrinsicImplementation {
             "extern:Task.bind" => Self::TaskBind,
             _ => arrays::Intrinsic::for_row(row)
                 .map(Self::ArrayExtra)
+                .or_else(|| {
+                    array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction)
+                })
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
                 .unwrap_or(Self::Unsupported),
         }
@@ -3705,6 +3710,7 @@ fn invoke_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
+        IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
@@ -6587,6 +6593,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ThunkGet
         | IntrinsicImplementation::TaskPure
         | IntrinsicImplementation::TaskGet
+        | IntrinsicImplementation::ArrayConstruction(_)
         | IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
