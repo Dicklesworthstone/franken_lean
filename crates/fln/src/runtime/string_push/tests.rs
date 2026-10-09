@@ -3,6 +3,7 @@
 
 use super::*;
 use fln_comp::flbc::{self, Instruction};
+use fln_olean::source_extensions as metadata;
 
 const STACK: usize = 256 * 1024 * 1024;
 
@@ -25,10 +26,15 @@ fn raw_pin_environment() -> Option<Environment> {
         "Init/System/IO",
     ] {
         let path = library.join(module).with_extension("olean");
+        let parts = [
+            std::fs::read(&path).unwrap(),
+            std::fs::read(path.with_extension("olean.server")).unwrap(),
+            std::fs::read(path.with_extension("olean.private")).unwrap(),
+        ];
         let decoded = decode_olean_module_artifacts(
-            &std::fs::read(&path).unwrap(),
-            &std::fs::read(path.with_extension("olean.server")).unwrap(),
-            &std::fs::read(path.with_extension("olean.private")).unwrap(),
+            &parts[0],
+            &parts[1],
+            &parts[2],
             OleanDecodeLimits::new(STACK),
         )
         .unwrap();
@@ -37,8 +43,85 @@ fn raw_pin_environment() -> Option<Environment> {
                 environment = environment.add_decl(constant).unwrap();
             }
         }
+        if module == "Init/Data/ToString/Basic" {
+            let view = if decoded.module.is_module {
+                fln_olean::region::OleanView::parse_with_dependencies(
+                    &parts[2],
+                    &[parts[0].as_slice(), parts[1].as_slice()],
+                )
+            } else {
+                fln_olean::region::OleanView::parse(&parts[0])
+            }
+            .unwrap();
+            let blocks = view
+                .extension_payloads(OleanWalkBudget::default(), STACK)
+                .unwrap();
+            environment = activate_to_string_metadata(
+                environment,
+                metadata::decode(&blocks, metadata::DecodeLimits::default()).unwrap(),
+            );
+        }
     }
     Some(environment)
+}
+
+fn activate_to_string_metadata(
+    environment: Environment,
+    decoded: metadata::SourceExtensions,
+) -> Environment {
+    use fln_elab::instances::imported;
+    let classes: Vec<_> = decoded
+        .classes
+        .into_iter()
+        .filter(|row| row.name == name("ToString"))
+        .collect();
+    let instances: Vec<_> = decoded
+        .instances
+        .into_iter()
+        .filter(|row| row.declaration == name("instToStringString"))
+        .collect();
+    assert_eq!(classes.len(), 1, "the actual ToString class journal");
+    assert_eq!(instances.len(), 1, "the actual String instance journal");
+    let mut activation = imported::ImportActivation::new(environment);
+    for row in classes {
+        activation = activation
+            .register_class(
+                &row.name,
+                &imported::ClassParameters {
+                    out_params: row.out_params,
+                    out_level_params: row.out_level_params,
+                },
+            )
+            .unwrap();
+    }
+    for row in instances {
+        assert_eq!(row.value, c("instToStringString"));
+        activation = activation
+            .register_instance(
+                &row.declaration,
+                &imported::InstanceParameters {
+                    priority: row.priority,
+                    synth_order: row.synth_order,
+                    scope: row.scope,
+                    keys: row.keys.into_iter().map(instance_key).collect(),
+                },
+            )
+            .unwrap();
+    }
+    activation.finish().unwrap()
+}
+
+fn instance_key(key: metadata::InstanceKey) -> fln_elab::instances::discr_tree::Key {
+    use fln_elab::instances::discr_tree::Key;
+    match key {
+        metadata::InstanceKey::Star => Key::Star,
+        metadata::InstanceKey::Other => Key::Other,
+        metadata::InstanceKey::Lit(literal) => Key::Lit(literal),
+        metadata::InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        metadata::InstanceKey::Const(name, arity) => Key::Const(name, arity),
+        metadata::InstanceKey::Arrow => Key::Arrow,
+        metadata::InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+    }
 }
 
 fn register(environment: &Environment, label: &str, foreign: bool) -> Environment {
@@ -257,6 +340,24 @@ fn checked_string_push_preserves_characters_partial_applications_and_replay() {
             "def nestedPush (s : String) (c : Char) : String := let append := String.push s; append c\n#eval nestedPush \"nested\" (Char.ofNat 9731)",
             "nested☃",
         ),
+        ("#eval String.push \"λ\" '🙂'", "λ🙂"),
+        ("#eval \"snow\".push '☃'", "snow☃"),
+        ("#eval String.push \"zero\" '\\x00'", "zero\0"),
+        ("#eval String.push \"surrogate\" '\\uD800'", "surrogate\0"),
+        ("#eval String.push \"line\" '\\n'", "line\n"),
+        ("#eval String.push \"heart\" '\\u2665'", "heart♥"),
+        (
+            "def quotedPushAlias : String → Char → String := String.push\n#eval quotedPushAlias \"left\" 'λ'",
+            "leftλ",
+        ),
+        (
+            "def quotedAppendMark : Char → String := String.push \"saved\"\n#eval quotedAppendMark '🙂'",
+            "saved🙂",
+        ),
+        (
+            "def quotedNestedPush (s : String) (c : Char) : String := let append := String.push s; append c\n#eval quotedNestedPush \"nested\" '☃'",
+            "nested☃",
+        ),
     ];
     for (source, expected) in cases {
         let batch = run(&engine, source);
@@ -310,6 +411,15 @@ fn pinned_io_println_uses_string_push_and_writes_one_newline_per_execution() {
         let bytes = String::from_utf8(output.stdout).unwrap();
         assert_eq!(bytes.matches("fln-println-marker-λ🙂\n").count(), 3);
         assert_eq!(bytes.matches("fln-println-dormant-marker").count(), 0);
+        assert_eq!(
+            bytes.matches("fln-println-ordinary-dormant-marker").count(),
+            0
+        );
+        assert_eq!(
+            bytes.matches("fln-println-ordinary-marker-λ🙂\n").count(),
+            1
+        );
+        assert_eq!(bytes.matches("fln-println-do-marker-☃\n").count(), 1);
         return;
     }
     let raw = raw_pin_environment().unwrap();
@@ -317,7 +427,7 @@ fn pinned_io_println_uses_string_push_and_writes_one_newline_per_execution() {
     let engine = Engine::from_environment(environment);
     let deferred = run(
         &engine,
-        "def savedPrintln : IO Unit := @IO.println String instToStringString \"fln-println-dormant-marker\"",
+        "def savedPrintln : IO Unit := @IO.println String instToStringString \"fln-println-dormant-marker\"\ndef savedOrdinaryPrintln : IO Unit := IO.println \"fln-println-ordinary-dormant-marker\"",
     );
     for execution in &deferred.batch.executions {
         let VmExit::Returned(returned) = &execution.exit else {
@@ -342,5 +452,18 @@ fn pinned_io_println_uses_string_push_and_writes_one_newline_per_execution() {
         .into_complete()
         .unwrap();
         assert_io_unit_packet(&replay);
+    }
+    for source in [
+        "#eval IO.println \"fln-println-ordinary-marker-λ🙂\"",
+        "#eval do IO.println \"fln-println-do-marker-☃\"",
+    ] {
+        let batch = run(&engine, source);
+        let execution = &batch.batch.executions[batch.batch.source_evaluation_indices[0]];
+        assert_eq!(
+            execution.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert_row(execution);
+        assert_io_unit_packet(&execution.exit);
     }
 }

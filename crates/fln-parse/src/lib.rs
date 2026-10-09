@@ -639,7 +639,7 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
         && (matches!(
             kind,
             Some(TokenKind::Literal(
-                LiteralKind::Str | LiteralKind::Scientific
+                LiteralKind::Str | LiteralKind::Char | LiteralKind::Scientific
             ))
         ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_"))))
 }
@@ -659,6 +659,9 @@ fn bounded_term_leaf(
         )),
         Some(TokenKind::Literal(LiteralKind::Str)) if grammar == DefinitionGrammar::Scalar => Ok(
             Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf]),
+        ),
+        Some(TokenKind::Literal(LiteralKind::Char)) if grammar == DefinitionGrammar::Scalar => Ok(
+            Syntax::node(Name::str(Name::anonymous(), "char"), vec![leaf]),
         ),
         Some(TokenKind::Literal(LiteralKind::Scientific))
             if grammar == DefinitionGrammar::Scalar =>

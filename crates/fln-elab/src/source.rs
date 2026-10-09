@@ -11,6 +11,7 @@ mod application;
 mod binders;
 mod calc;
 mod cdot;
+mod character;
 mod codegen;
 mod coercions;
 mod collections;
@@ -641,6 +642,9 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(literal) = self.character_literal(syntax)? {
+            return Ok(literal);
+        }
         if let Some(literal) = self.numeric_literal(syntax, expected)? {
             return Ok(literal);
         }
