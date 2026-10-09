@@ -244,7 +244,22 @@ impl Context {
     }
 
     pub(super) fn do_action(&mut self, action: Typed) -> Result<Typed, NatDefinitionElabError> {
-        let monad = self.do_monad(&action.type_)?;
+        let mut monad = self.do_monad(&action.type_)?;
+        if monad.is_none()
+            && let Some(original) = self.known_type(&action.value)?
+        {
+            // Finishing an application can normalize a function-backed monad
+            // to its explicit state/world binder. Recover the value's own
+            // type before selecting Bind, as monadic coercions already do.
+            // Reduce abbreviations only: an ordinary monad definition must
+            // remain available to the usual type and instance checks.
+            let original = self.whnf_with_transparency(
+                &original,
+                UnificationTransparency::Abbreviations,
+                true,
+            )?;
+            monad = self.do_monad(&original)?;
+        }
         let function = self.do_operation(true, monad)?;
         let function = self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
         let function = self.coerce_function(function)?;
