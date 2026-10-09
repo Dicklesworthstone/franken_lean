@@ -65,13 +65,9 @@ fn module_error(error: fln::source_check::modules::SourceModuleCheckError) -> Fa
     Failure::new(class, &error.to_string(), authority, exit)
 }
 
-fn value_error(error: SourceValueProjectionError) -> Failure {
-    match error {
-        SourceValueProjectionError::Shaped(fln::ClosedShapedValueError::TooLarge { .. }) => {
-            Failure::resource(error.to_string())
-        }
-        _ => internal(&error.to_string()),
-    }
+fn evaluation_error(error: source_evaluation::Error) -> Failure {
+    let (class, authority, exit) = error.disposition();
+    Failure::new(class, &error.to_string(), authority, exit)
 }
 
 fn append(output: &mut String, text: &str) -> Result<(), Failure> {
@@ -268,7 +264,21 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
             }
             previous = Some(command);
             let (class, detail, usage) = match &execution.exit {
-                fln::VmExit::Returned(_) => continue,
+                fln::VmExit::Returned(_) => {
+                    source_evaluation::check(execution).map_err(|error| {
+                        let (class, authority, exit) = error.disposition();
+                        Failure::new(
+                            class,
+                            &format!(
+                                "module `{}`, command {command}: {error}",
+                                module.module.to_display_string()
+                            ),
+                            authority,
+                            exit,
+                        )
+                    })?;
+                    continue;
+                }
                 fln::VmExit::Panicked { message, usage } => {
                     ("program-panic", message.to_string(), usage)
                 }
@@ -467,8 +477,8 @@ fn render_commands(
                         .ok_or_else(|| {
                             internal("source program evaluation escaped the execution table")
                         })?;
-                let value = closed_source_cli_value(&execution.runtime_type, &execution.exit)
-                    .map_err(value_error)?
+                let value = source_evaluation::value(execution)
+                    .map_err(evaluation_error)?
                     .ok_or_else(|| Failure::new("capability", &format!(
                         "module `{module}`, command {command}: raw result is not a supported closed Nat, String, Bool, Float, Float32, or nested List value",
                     ), false, CAPABILITY_NOT_IMPLEMENTED_EXIT))?;
@@ -574,15 +584,17 @@ mod tests {
 
     #[test]
     fn a_result_projection_limit_is_not_a_program_rejection_or_internal_fault() {
-        let error = value_error(SourceValueProjectionError::Shaped(
-            fln::ClosedShapedValueError::TooLarge { limit: 17 },
+        let error = evaluation_error(source_evaluation::Error::Value(
+            SourceValueProjectionError::Shaped(fln::ClosedShapedValueError::TooLarge { limit: 17 }),
         ));
         assert_eq!(
             (error.class, error.authority, error.exit),
             ("resource", false, 3)
         );
-        let mismatch = value_error(SourceValueProjectionError::Shaped(
-            fln::ClosedShapedValueError::Representation { expected: "List" },
+        let mismatch = evaluation_error(source_evaluation::Error::Value(
+            SourceValueProjectionError::Shaped(fln::ClosedShapedValueError::Representation {
+                expected: "List",
+            }),
         ));
         assert_eq!(
             (mismatch.class, mismatch.authority, mismatch.exit),

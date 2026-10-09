@@ -11,6 +11,7 @@
 
 mod lake_build;
 mod source_check;
+mod source_evaluation;
 
 use fln_core::diag::{
     DIAGNOSTIC_PROJECTION_SCHEMA, DIAGNOSTIC_SOUND_BEHAVIOR_NOTE_NAME, DiagnosticChannel,
@@ -10935,6 +10936,8 @@ struct SourceSuccess<'a> {
 
 #[derive(Debug)]
 enum SourceFinalValue {
+    /// The pin does not print the unit result of an explicitly evaluated IO action.
+    IoUnit,
     Float(fln::ClosedFloatValue),
     Nat(String),
     String(String),
@@ -10952,6 +10955,7 @@ struct SourceEvaluationResult {
 impl SourceFinalValue {
     const fn kind(&self) -> &'static str {
         match self {
+            Self::IoUnit => "unit",
             Self::Float(fln::ClosedFloatValue::Float(_)) => "float",
             Self::Float(fln::ClosedFloatValue::Float32(_)) => "float32",
             Self::Nat(_) => "nat",
@@ -10963,6 +10967,7 @@ impl SourceFinalValue {
 
     fn json(&self) -> String {
         match self {
+            Self::IoUnit => "null".to_owned(),
             Self::Float(value) => {
                 let decimal = value.to_string();
                 if matches!(decimal.as_str(), "NaN" | "inf" | "-inf") {
@@ -11015,6 +11020,7 @@ const LEAN_EVAL_LIST_WIDTH: usize = 120;
 impl std::fmt::Display for SourceFinalValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IoUnit => formatter.write_str("()"),
             Self::Float(value) => write!(formatter, "{value}"),
             Self::Nat(value) => write!(formatter, "{value}"),
             Self::String(value) => formatter.write_str(&lean_string_quote(value)),
@@ -11236,6 +11242,9 @@ fn lean_evaluation_line(
     command: usize,
     value: &SourceFinalValue,
 ) -> Result<String, MultiplexerOutput> {
+    if matches!(value, SourceFinalValue::IoUnit) {
+        return Ok(String::new());
+    }
     let line = value.to_string();
     if matches!(value, SourceFinalValue::List(_)) && line.chars().count() > LEAN_EVAL_LIST_WIDTH {
         return Err(source_failure(
@@ -11325,11 +11334,13 @@ fn source_uses_mixed_lean_commands(source: &[u8]) -> bool {
 
 fn source_execution_exit_failure(
     command_index: usize,
-    exit: &fln::VmExit,
+    execution: &fln::DefinitionExecution,
     presentation: SourcePresentation,
 ) -> Option<MultiplexerOutput> {
-    match exit {
-        fln::VmExit::Returned(_) => None,
+    match &execution.exit {
+        fln::VmExit::Returned(_) => source_evaluation::check(execution)
+            .err()
+            .map(|error| error.failure(command_index, presentation)),
         fln::VmExit::Panicked { message, usage } => Some(source_terminal(
             "program-panic",
             &format!("source command {command_index} panicked: {message}"),
@@ -11392,11 +11403,9 @@ fn render_lean_source_module_commands(
                 );
             }
             previous_command = Some(command_index);
-            if let Some(failure) = source_execution_exit_failure(
-                command_index,
-                &execution.exit,
-                SourcePresentation::Lean,
-            ) {
+            if let Some(failure) =
+                source_execution_exit_failure(command_index, execution, SourcePresentation::Lean)
+            {
                 return failure;
             }
         }
@@ -11434,7 +11443,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
         }
         previous_execution_command = Some(command_index);
         if let Some(failure) =
-            source_execution_exit_failure(command_index, &execution.exit, SourcePresentation::Lean)
+            source_execution_exit_failure(command_index, execution, SourcePresentation::Lean)
         {
             return failure;
         }
@@ -11496,8 +11505,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 }
                 evaluation_output_position += 1;
-                let value = match closed_source_cli_value(&execution.runtime_type, &execution.exit)
-                {
+                let value = match source_evaluation::value(execution) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return source_failure(
@@ -11510,15 +11518,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                             1,
                         );
                     }
-                    Err(error) => {
-                        return source_failure(
-                            "internal-fault",
-                            &error.to_string(),
-                            false,
-                            SourcePresentation::Lean,
-                            4,
-                        );
-                    }
+                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
                 match lean_evaluation_line(command_index, &value) {
                     Ok(line) => stdout.push_str(&line),
@@ -12079,7 +12079,11 @@ where
     };
     for (index, execution) in completed.executions.iter().enumerate() {
         match &execution.exit {
-            fln::VmExit::Returned(_) => {}
+            fln::VmExit::Returned(_) => {
+                if let Err(error) = source_evaluation::check(execution) {
+                    return error.failure(index, presentation);
+                }
+            }
             fln::VmExit::Panicked { message, usage } => {
                 return source_terminal(
                     "program-panic",
@@ -12133,7 +12137,7 @@ where
                 4,
             );
         };
-        let value = match closed_source_cli_value(&execution.runtime_type, &execution.exit) {
+        let value = match source_evaluation::value(execution) {
             Ok(Some(value)) => value,
             Ok(None) => {
                 return source_failure(
@@ -12146,15 +12150,7 @@ where
                     1,
                 );
             }
-            Err(error) => {
-                return source_failure(
-                    "internal-fault",
-                    &error.to_string(),
-                    false,
-                    presentation,
-                    4,
-                );
-            }
+            Err(error) => return error.failure(index, presentation),
         };
         let Some(&command) = completed.source_execution_command_indices.get(index) else {
             return source_failure(
@@ -12198,28 +12194,19 @@ where
             4,
         );
     };
-    let final_value =
-        match closed_source_cli_value(&final_execution.runtime_type, &final_execution.exit) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                return source_failure(
-                    "execution",
-                    "final command did not produce a closed Nat, String, or Bool value",
-                    true,
-                    presentation,
-                    1,
-                );
-            }
-            Err(error) => {
-                return source_failure(
-                    "internal-fault",
-                    &error.to_string(),
-                    false,
-                    presentation,
-                    4,
-                );
-            }
-        };
+    let final_value = match source_evaluation::value(final_execution) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return source_failure(
+                "execution",
+                "final command did not produce a closed Nat, String, or Bool value",
+                true,
+                presentation,
+                1,
+            );
+        }
+        Err(error) => return error.failure(commands - 1, presentation),
+    };
     let encoded_olean_snapshot = if emit_olean_snapshot.is_some() {
         let environment = completed.engine.environment();
         let constant_count = environment.len();
