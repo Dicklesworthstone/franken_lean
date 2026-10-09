@@ -1486,6 +1486,49 @@ fn grouped_term_syntax(
     })
 }
 
+/// Finish the pin's empty tuple or an ordinary grouped term. Keeping this
+/// decision outside the term driver preserves its small native-stack bound.
+#[inline(never)]
+fn finish_parenthesized_frame(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut frame: BoundedTermFrame,
+    grammar: DefinitionGrammar,
+    close: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let open = frame
+        .open
+        .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, close),
+            expected: NatDefinitionExpectation::RecordField,
+        })?;
+    if grammar == DefinitionGrammar::Scalar
+        && frame.record.is_none()
+        && frame.ascription.is_none()
+        && frame.prefix.is_none()
+        && frame.negation.is_none()
+        && frame.application.is_empty()
+        && frame.operands.is_empty()
+        && frame.operators.is_empty()
+    {
+        return Ok((
+            Syntax::node(
+                parser_kind(&["Term", "tuple"]),
+                vec![
+                    hygienic_lparen(leaves.leaf(open)?),
+                    null_node(vec![]),
+                    leaves.leaf(close)?,
+                ],
+            ),
+            open,
+        ));
+    }
+    let ascription = frame.ascription.take();
+    let inner = finish_bounded_frame(view, tokens, frame, grammar, close)?;
+    grouped_term_syntax(leaves, tokens, open, ascription, inner, close).map(|syntax| (syntax, open))
+}
+
 // Keep sequence initialization off the ordinary term driver's large debug
 // frame. It must retain the existing small-stack bound for tactic arguments
 // and quantifier bodies as well as for the newly supported branch sequences.
@@ -2110,18 +2153,11 @@ fn bounded_term_frames(
                         expected: NatDefinitionExpectation::EndOfCommand,
                     });
                 }
-                let mut frame = frames
+                let frame = frames
                     .pop()
                     .expect("a closing parenthesis has an inner frame");
-                let open = frame
-                    .open
-                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, index),
-                        expected: NatDefinitionExpectation::RecordField,
-                    })?;
-                let ascription = frame.ascription.take();
-                let inner = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                let grouped = grouped_term_syntax(leaves, tokens, open, ascription, inner, index)?;
+                let (grouped, open) =
+                    finish_parenthesized_frame(leaves, view, tokens, frame, grammar, index)?;
                 frames
                     .last_mut()
                     .expect("the parent term frame remains live")

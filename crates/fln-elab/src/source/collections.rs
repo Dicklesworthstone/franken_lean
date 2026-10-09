@@ -47,7 +47,9 @@ fn cons(head: Syntax, tail: Syntax) -> Syntax {
 
 pub(super) fn is_notation(syntax: &Syntax) -> bool {
     syntax.kind().is_some_and(|kind| {
-        kind == &Name::from_components(["term[_]"]) || kind == &Name::from_components(["term_::_"])
+        kind == &Name::from_components(["term[_]"])
+            || kind == &Name::from_components(["term_::_"])
+            || kind == &parser_kind(&["Term", "tuple"])
     })
 }
 
@@ -68,6 +70,38 @@ impl Context {
         };
         if args.len() != 3 {
             return Err(failure(SourceInferenceError::Scope));
+        }
+        if kind == &parser_kind(&["Term", "tuple"]) {
+            let opener = expect_node(
+                &args[0],
+                &parser_kind(&["Term", "hygienicLParen"]),
+                2,
+                "empty tuple hygienic opener",
+            )?;
+            expect_atom(&opener[0], "(", "empty tuple opener")?;
+            let hygiene = expect_node(
+                &opener[1],
+                &Name::from_components(["hygieneInfo"]),
+                1,
+                "empty tuple hygiene information",
+            )?;
+            if !matches!(hygiene, [Syntax::Ident { val, .. }] if val.is_anonymous()) {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            if !expect_null_args(&args[1], "empty tuple optional body")?.is_empty() {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            expect_atom(&args[2], ")", "empty tuple closer")?;
+            // The pinned expandTuple macro chooses Unit.unit, whose universe
+            // is fixed. A generic PUnit.unit would accept additional types.
+            // Root qualification preserves that macro reference under local
+            // binders and namespaces; ordinary constant checking still applies.
+            return Ok(Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::default(),
+                val: Name::from_components(["_root_", "Unit", "unit"]),
+                preresolved: Vec::new(),
+            });
         }
         let literal = kind == &Name::from_components(["term[_]"]);
         let mut args = std::mem::take(args);
@@ -125,6 +159,67 @@ mod tests {
     }
     fn number(n: &str) -> Syntax {
         Syntax::node(Name::from_components(["num"]), vec![atom(n)])
+    }
+
+    fn empty_tuple() -> Syntax {
+        let hygiene = Syntax::node(
+            Name::from_components(["hygieneInfo"]),
+            vec![Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::default(),
+                val: Name::anonymous(),
+                preresolved: Vec::new(),
+            }],
+        );
+        Syntax::node(
+            parser_kind(&["Term", "tuple"]),
+            vec![
+                Syntax::node(
+                    parser_kind(&["Term", "hygienicLParen"]),
+                    vec![atom("("), hygiene],
+                ),
+                null(vec![]),
+                atom(")"),
+            ],
+        )
+    }
+
+    #[test]
+    fn empty_tuple_expands_to_the_fixed_global_unit_constant() {
+        let expanded = context()
+            .expand_collection_node(empty_tuple(), false)
+            .unwrap();
+        assert!(matches!(&expanded, Syntax::Ident { val, .. }
+            if val == &Name::from_components(["_root_", "Unit", "unit"])));
+    }
+
+    #[test]
+    fn empty_tuple_expansion_cannot_discard_a_body_or_malformed_delimiters() {
+        for replacement in [number("42"), null(vec![number("42")])] {
+            let mut tuple = empty_tuple();
+            let Syntax::Node { args, .. } = &mut tuple else {
+                unreachable!();
+            };
+            args[1] = replacement;
+            assert!(context().expand_collection_node(tuple, false).is_err());
+        }
+        for index in [0, 2] {
+            let mut tuple = empty_tuple();
+            let Syntax::Node { args, .. } = &mut tuple else {
+                unreachable!();
+            };
+            args[index] = atom("not a delimiter");
+            assert!(context().expand_collection_node(tuple, false).is_err());
+        }
+        let mut tuple = empty_tuple();
+        let Syntax::Node { args, .. } = &mut tuple else {
+            unreachable!();
+        };
+        let Syntax::Node { args, .. } = &mut args[0] else {
+            unreachable!();
+        };
+        args[1] = null(vec![]);
+        assert!(context().expand_collection_node(tuple, false).is_err());
     }
 
     #[test]
