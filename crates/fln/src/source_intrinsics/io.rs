@@ -7,6 +7,7 @@
 use super::*;
 
 mod model;
+pub(crate) mod primitives;
 
 /// Recognize the pinned IO aliases and opaque state carrier. No IO primitive
 /// implementation is selected here; effectful externs retain their own gates.

@@ -12,6 +12,7 @@ mod evaluation;
 mod floats;
 mod global;
 mod indexed;
+mod io;
 mod mutual;
 mod nat;
 mod partial;
@@ -53,6 +54,7 @@ pub(super) struct Preparation<'a> {
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
     specializations: specialize::Store,
     st: st::Store,
+    io: io::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -122,6 +124,7 @@ impl<'a> Preparation<'a> {
             interfaces: Vec::new(),
             specializations: specialize::Store::default(),
             st: st::Store::default(),
+            io: io::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
@@ -399,6 +402,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(action) = self.io_call(&head, &args)? {
+                            tasks.push(Task::Visit(action));
+                            continue;
+                        }
                         if let Some(projected) = self.projection_call(&head, &args)? {
                             tasks.push(Task::Visit(projected));
                             continue;
@@ -667,6 +674,10 @@ impl<'a> Preparation<'a> {
                             if !self.environment.contains(name) && !self.has_private_callable(name)
                             {
                                 values.push(expr.clone());
+                                continue;
+                            }
+                            if let Some(action) = self.io_call(&expr, &[])? {
+                                tasks.push(Task::Visit(action));
                                 continue;
                             }
                             if let Some(constructor) = self.specialize_constructor(&expr, &[])? {

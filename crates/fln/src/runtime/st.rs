@@ -84,58 +84,6 @@ impl Operation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn primitive_cache_never_accepts_display_equal_structural_names() {
-        let environment = Environment::new();
-        let mut preparation = Preparation::new(&environment, IngressLimits::default());
-        for operation in [
-            Operation::New,
-            Operation::Get,
-            Operation::Set,
-            Operation::Swap,
-        ] {
-            let canonical = operation.source_name();
-            assert_eq!(Operation::from_name(&canonical), Some(operation));
-            // The contract owner installs one binding per actual structural
-            // source name. A later similarly rendered name must never bypass
-            // recognition merely because that binding is already cached.
-            preparation.st_bind_primitive(operation).unwrap();
-            let label = canonical.to_display_string();
-            let parts: Vec<_> = label.split('.').collect();
-            for boundary in 1..parts.len() {
-                let left = parts[..boundary].join(".");
-                let right = parts[boundary..].join(".");
-                let alternate = Name::from_components([left.as_str(), right.as_str()]);
-                if alternate == canonical {
-                    continue;
-                }
-                assert_eq!(alternate.to_display_string(), label);
-                assert_eq!(Operation::from_name(&alternate), None);
-                assert!(
-                    preparation
-                        .st_call(&Expr::const_(alternate, vec![]), &[])
-                        .unwrap()
-                        .is_none()
-                );
-            }
-            let alternate = Name::from_components([label.as_str()]);
-            assert_ne!(alternate, canonical);
-            assert_eq!(alternate.to_display_string(), label);
-            assert_eq!(Operation::from_name(&alternate), None);
-            assert!(
-                preparation
-                    .st_call(&Expr::const_(alternate, vec![]), &[])
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    }
-}
-
 fn world_type() -> Expr {
     Expr::const_(name("_fln_runtime_st_world"), vec![])
 }
@@ -565,5 +513,57 @@ impl Preparation<'_> {
             );
         }
         Ok(Some(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitive_cache_never_accepts_display_equal_structural_names() {
+        let environment = Environment::new();
+        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+        for operation in [
+            Operation::New,
+            Operation::Get,
+            Operation::Set,
+            Operation::Swap,
+        ] {
+            let canonical = operation.source_name();
+            assert_eq!(Operation::from_name(&canonical), Some(operation));
+            // The contract owner installs one binding per actual structural
+            // source name. A later similarly rendered name must never bypass
+            // recognition merely because that binding is already cached.
+            preparation.st_bind_primitive(operation).unwrap();
+            let label = canonical.to_display_string();
+            let parts: Vec<_> = label.split('.').collect();
+            for boundary in 1..parts.len() {
+                let left = parts[..boundary].join(".");
+                let right = parts[boundary..].join(".");
+                let alternate = Name::from_components([left.as_str(), right.as_str()]);
+                if alternate == canonical {
+                    continue;
+                }
+                assert_eq!(alternate.to_display_string(), label);
+                assert_eq!(Operation::from_name(&alternate), None);
+                assert!(
+                    preparation
+                        .st_call(&Expr::const_(alternate, vec![]), &[])
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let alternate = Name::from_components([label.as_str()]);
+            assert_ne!(alternate, canonical);
+            assert_eq!(alternate.to_display_string(), label);
+            assert_eq!(Operation::from_name(&alternate), None);
+            assert!(
+                preparation
+                    .st_call(&Expr::const_(alternate, vec![]), &[])
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

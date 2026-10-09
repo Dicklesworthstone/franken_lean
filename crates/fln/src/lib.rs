@@ -9370,7 +9370,10 @@ fn executable_dependencies(
             scalar_constructors.push(binding);
             continue;
         }
-        let intrinsic = match preparation.st_intrinsic_binding(&name) {
+        let intrinsic = match preparation
+            .st_intrinsic_binding(&name)
+            .or_else(|| preparation.io_intrinsic_binding(&name))
+        {
             Some(binding) => Some(binding),
             None => executable_intrinsic_binding_cached(
                 environment,
