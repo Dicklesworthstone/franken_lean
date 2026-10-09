@@ -12,6 +12,14 @@
 mod lake_build;
 mod source_check;
 mod source_evaluation;
+mod stdout_capture;
+
+/// Install the binary's once-only panic router before starting workers. JSON
+/// execution workers render caught panics themselves; other threads retain
+/// the previously installed hook. Library callers choose their own policy.
+pub fn install_json_execution_panic_hook() {
+    stdout_capture::install_panic_hook();
+}
 
 use fln_core::diag::{
     DIAGNOSTIC_PROJECTION_SCHEMA, DIAGNOSTIC_SOUND_BEHAVIOR_NOTE_NAME, DiagnosticChannel,
@@ -2397,6 +2405,17 @@ fn flbc_failure(
 }
 
 fn execute_flbc_bytes_with_sidecar(
+    bytes: &[u8],
+    max_bytes: usize,
+    sidecar: Option<&fln::FlbcProductSidecarV1>,
+    json: bool,
+) -> MultiplexerOutput {
+    stdout_capture::json(json, FLBC_RUN_SCHEMA, || {
+        execute_flbc_bytes_with_sidecar_uncaptured(bytes, max_bytes, sidecar, json)
+    })
+}
+
+fn execute_flbc_bytes_with_sidecar_uncaptured(
     bytes: &[u8],
     max_bytes: usize,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
@@ -11749,6 +11768,22 @@ fn olean_write_error_disposition(error: &fln::OleanWriteError) -> (&'static str,
 }
 
 fn execute_source_bytes_with_publisher_and_presentation<P, E>(
+    sources: Vec<Vec<u8>>,
+    module_plan: Option<SourceModulePlan>,
+    publication: SourcePublication,
+    presentation: SourcePresentation,
+    publish: P,
+) -> MultiplexerOutput
+where
+    P: FnMut(&[u8], &Path) -> Result<(), E>,
+    E: SourcePublicationFailure,
+{
+    stdout_capture::json(presentation.json(), SOURCE_RUN_SCHEMA, || {
+        execute_source_bytes_uncaptured(sources, module_plan, publication, presentation, publish)
+    })
+}
+
+fn execute_source_bytes_uncaptured<P, E>(
     sources: Vec<Vec<u8>>,
     module_plan: Option<SourceModulePlan>,
     publication: SourcePublication,

@@ -41,6 +41,7 @@ mod source_nat_add_binding_tests;
 mod source_records;
 #[cfg(test)]
 mod source_seed_names;
+pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError};
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
 pub use fln_checker::admit::{

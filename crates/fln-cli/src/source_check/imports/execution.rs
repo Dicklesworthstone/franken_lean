@@ -101,6 +101,8 @@ pub(in crate::source_check) fn run(
         .name("fln-imported-source-run".to_owned())
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
+            crate::stdout_capture::optional_json(
+                matches!(presentation, Presentation::Fln { json: true }), SCHEMA, || {
             let headers = sources
                 .iter()
                 .map(|source| parse_source_header(source))
@@ -222,6 +224,7 @@ pub(in crate::source_check) fn run(
                         Err(error) => failure(error, presentation),
                     }
                 }
+            })
             })
         });
     match worker {

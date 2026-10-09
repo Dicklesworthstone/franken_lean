@@ -1481,6 +1481,9 @@ pub enum VmRefusal {
     NativeStdoutResult {
         bytes_written: usize,
     },
+    NativeStdoutCapture {
+        error: fln_rt::obj::StdoutCaptureError,
+    },
     MalformedClosure {
         reason: &'static str,
     },
@@ -1663,6 +1666,12 @@ impl fmt::Display for VmRefusal {
                 write!(
                     f,
                     "native stdout returned an unsupported result after fwrite reported {bytes_written} bytes"
+                )
+            }
+            Self::NativeStdoutCapture { error } => {
+                write!(
+                    f,
+                    "stdout memory capture refused before the current write: {error:?}"
                 )
             }
             Self::MalformedClosure { reason } => {
@@ -2671,10 +2680,7 @@ fn run(
                     let value = match execute_stdio_apply(&closure, &args) {
                         Ok(value) => value,
                         Err(refusal) => {
-                            return Ok(VmExit::Refused {
-                                refusal,
-                                usage: usage(steps, peak_stack_depth),
-                            });
+                            return stdio_apply_failure(refusal, steps, peak_stack_depth);
                         }
                     };
                     if tail {
@@ -2884,10 +2890,11 @@ fn run(
                                     let result = match result {
                                         Ok(result) => result,
                                         Err(refusal) => {
-                                            return Ok(VmExit::Refused {
+                                            return stdio_apply_failure(
                                                 refusal,
-                                                usage: usage(steps, peak_stack_depth),
-                                            });
+                                                steps,
+                                                peak_stack_depth,
+                                            );
                                         }
                                     };
                                     set_register(
@@ -3043,6 +3050,37 @@ fn validate_stdio_apply(
     Ok(())
 }
 
+fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmExit, Stop> {
+    if let VmRefusal::NativeStdoutCapture { error } = &refusal {
+        use fln_rt::obj::StdoutCaptureError;
+        return Err(match error {
+            StdoutCaptureError::Limit { limit, requested } => Stop::Inconclusive(
+                Inconclusive::resource(ResourceUsage {
+                    reason: ResourceReason::Memory {
+                        limit_bytes: *limit as u64,
+                    },
+                    allowed: *limit as u64,
+                    observed: *requested as u64,
+                })
+                .with_progress("stdout capture escaped-byte budget"),
+            ),
+            StdoutCaptureError::Allocation => Stop::Inconclusive(
+                Inconclusive::dependency_unavailable("host allocation for stdout capture"),
+            ),
+            StdoutCaptureError::InvalidStdout | StdoutCaptureError::ScopeUnavailable => {
+                Stop::InternalFault(InternalFault::new(
+                    "STDOUT-CAPTURE-SCOPE",
+                    "validated stdout capture lost its scope contract",
+                ))
+            }
+        });
+    }
+    Ok(VmExit::Refused {
+        refusal,
+        usage: usage(steps, peak),
+    })
+}
+
 fn execute_stdio_apply(closure: &Obj, args: &[Obj]) -> Result<Obj, VmRefusal> {
     let [text, world] = args else {
         return Err(VmRefusal::NativeStdoutContract {
@@ -3064,6 +3102,7 @@ fn execute_stdio_apply(closure: &Obj, args: &[Obj]) -> Result<Obj, VmRefusal> {
         .try_stdio_put_str(text, world)
         .map_err(|error| match error {
             StdioPutStrError::InvalidCallback => VmRefusal::UnsupportedNativeClosure,
+            StdioPutStrError::Capture(error) => VmRefusal::NativeStdoutCapture { error },
             StdioPutStrError::InvalidString => VmRefusal::InvalidStringObject,
             StdioPutStrError::InvalidWorld => {
                 type_mismatch("native stdout putStr", 1, "world scalar 0", world)

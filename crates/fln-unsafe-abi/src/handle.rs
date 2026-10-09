@@ -25,6 +25,8 @@ use crate::rc::{self, Header};
 use crate::shadow;
 use crate::tagged;
 
+pub mod stdout_capture;
+
 /// Boxed-convention function types for the callable-closure constructors: every
 /// parameter and the result are `lean_object*`, per the pin's `m_fun` contract
 /// (`lean.h:211-217`; apply arms `apply.cpp:101-460`).
@@ -70,6 +72,7 @@ pub enum StdioPutStrError {
     InvalidCallback,
     InvalidString,
     InvalidWorld,
+    Capture(stdout_capture::StdoutCaptureError),
     UnrepresentableWrite { errno: i32, bytes_written: usize },
     MalformedResult { bytes_written: usize },
 }
@@ -826,6 +829,23 @@ impl Obj {
         }
         if !canonical_stdio_string(text) {
             return Err(StdioPutStrError::InvalidString);
+        }
+        if !self.is_stdio_put_str_closure() {
+            return Err(StdioPutStrError::InvalidCallback);
+        }
+        if stdout_capture::write_if_captured(self, text).map_err(StdioPutStrError::Capture)? {
+            return Ok(Obj::mk_ctor(
+                0,
+                vec![
+                    Obj::mk_nat(1),
+                    Obj::mk_nat(0),
+                    Obj::mk_nat(0),
+                    Obj::mk_nat(0),
+                    Obj::mk_string(""),
+                    Obj::mk_string(""),
+                ],
+                &[],
+            ));
         }
         // SAFETY: the observer checks the native callback and Handle before
         // the primitive; canonical_stdio_string established the String law.
