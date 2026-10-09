@@ -52,6 +52,9 @@ fn repeated_polymorphic_prerequisites_infer_their_own_universes() {
     );
 }
 
+/// The pin resumes from `low` for both prerequisites once `Allowed Type` fails. With
+/// `pp.explicit`, `#print result` at v4.32.0 is `@inferInstance Root (@root Nat Nat low low allowed)`,
+/// and `#eval result.first` prints 7.
 #[test]
 fn cached_polymorphic_answers_backtrack_across_universe_assignments() {
     checked(
@@ -68,7 +71,7 @@ class Root where
   second : Nat
 instance root.{u,v} {A : Type u} {B : Type v} [first : Carrier A] [second : Carrier B] [valid : Allowed B] : Root := Root.mk first.value second.value
 def result : Root := inferInstance
-theorem firstValue : result.first = 99 := by rfl
+theorem firstValue : result.first = 7 := by rfl
 theorem secondValue : result.second = 7 := by rfl"#,
     );
 }
