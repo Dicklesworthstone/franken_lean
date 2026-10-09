@@ -11588,3 +11588,231 @@ fn float_to_string_results_compose_with_owned_strings_and_reclaim_stopped_result
             && event.kind != shadow::EventKind::ForeignPointer
     }));
 }
+
+// Array updates deliberately retain an alias to the input across each owned
+// extern call. The result tuple makes a shared-input mutation observable.
+fn array_updates_program(row: &str, first: Instruction, second: Instruction) -> ValidatedProgram {
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: "alpha".into(),
+        },
+        Instruction::String {
+            dst: r(1),
+            value: "beta".into(),
+        },
+        Instruction::String {
+            dst: r(2),
+            value: "gamma".into(),
+        },
+        Instruction::Array {
+            dst: r(3),
+            items: vec![r(0), r(1), r(2)],
+        },
+        Instruction::Copy {
+            dst: r(4),
+            src: r(3),
+        },
+        first,
+        second,
+    ];
+    let arguments = match row {
+        "extern:Array.pop" => vec![r(3)],
+        "extern:Array.set" | "extern:Array.uset" => vec![r(3), r(5), r(2)],
+        _ => vec![r(3), r(5), r(6)],
+    };
+    code.push(intrinsic(r(7), row, arguments));
+    code.push(Instruction::Ctor {
+        dst: r(8),
+        tag: 0,
+        fields: vec![r(4), r(7)],
+        scalar_bytes: Vec::new(),
+    });
+    code.push(Instruction::Return { src: r(8) });
+    validated(vec![function(0, 0, 9, code)])
+}
+
+fn array_update_strings(array: &Obj) -> Vec<String> {
+    let (size, _) = array.array_view();
+    (0..size)
+        .map(|index| {
+            let child = array.array_child(index);
+            let (size, _, _, bytes) = child.try_string_view().expect("string array cell");
+            String::from_utf8(bytes[..size - 1].to_vec()).expect("UTF-8 cell")
+        })
+        .collect()
+}
+
+#[test]
+fn array_updates_preserve_shared_inputs_and_owned_heap_results() {
+    let _guard = lock();
+    for (row, expected) in [
+        ("extern:Array.pop", vec!["alpha", "beta"]),
+        ("extern:Array.set", vec!["gamma", "beta", "gamma"]),
+        ("extern:Array.uset", vec!["gamma", "beta", "gamma"]),
+        ("extern:Array.swap", vec!["gamma", "beta", "alpha"]),
+        (
+            "extern:Array.swapIfInBounds",
+            vec!["gamma", "beta", "alpha"],
+        ),
+    ] {
+        let first = if row == "extern:Array.uset" {
+            boxed_scalar(r(5), 0u64.to_ne_bytes().to_vec())
+        } else {
+            Instruction::Nat {
+                dst: r(5),
+                value: 0,
+            }
+        };
+        let program = array_updates_program(
+            row,
+            first,
+            Instruction::Nat {
+                dst: r(6),
+                value: 2,
+            },
+        );
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        let original = completed.value.ctor_child(0);
+        let updated = completed.value.ctor_child(1);
+        assert_eq!(
+            array_update_strings(&original),
+            ["alpha", "beta", "gamma"],
+            "{row}"
+        );
+        assert_eq!(array_update_strings(&updated), expected, "{row}");
+        let survivor = updated.array_child(0);
+        drop(completed);
+        drop(original);
+        drop(updated);
+        assert!(
+            survivor.try_string_view().is_some(),
+            "{row}: dangling returned cell"
+        );
+        assert_eq!(survivor.header().rc, 1, "{row}: leaked heap reference");
+    }
+}
+
+#[test]
+fn array_updates_refuse_erased_bad_bounds_without_truncating_nats() {
+    let _guard = lock();
+    for row in ["extern:Array.set", "extern:Array.swap", "extern:Array.uset"] {
+        for huge in [false, true] {
+            let first = if row == "extern:Array.uset" {
+                boxed_scalar(
+                    r(5),
+                    (if huge { u64::MAX } else { 3u64 }).to_ne_bytes().to_vec(),
+                )
+            } else if huge {
+                Instruction::NatBig {
+                    dst: r(5),
+                    limbs_le: vec![0, 1],
+                }
+            } else {
+                Instruction::Nat {
+                    dst: r(5),
+                    value: 3,
+                }
+            };
+            let program = array_updates_program(
+                row,
+                first,
+                Instruction::Nat {
+                    dst: r(6),
+                    value: 0,
+                },
+            );
+            match execute(&program, ExecutionLimits::default(), None) {
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ArrayIndexOutOfBounds { size: 3, .. },
+                    ..
+                }) => {}
+                other => panic!("{row} must refuse invalid bounds: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn array_updates_total_swap_and_empty_pop_preserve_values() {
+    let _guard = lock();
+    for (first, second) in [(0, 0), (3, 0), (0, 3)] {
+        let program = array_updates_program(
+            "extern:Array.swapIfInBounds",
+            Instruction::Nat {
+                dst: r(5),
+                value: first,
+            },
+            Instruction::Nat {
+                dst: r(6),
+                value: second,
+            },
+        );
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(
+            array_update_strings(&completed.value.ctor_child(1)),
+            ["alpha", "beta", "gamma"]
+        );
+    }
+    let program = array_updates_program(
+        "extern:Array.swapIfInBounds",
+        Instruction::NatBig {
+            dst: r(5),
+            limbs_le: vec![0, 1],
+        },
+        Instruction::Nat {
+            dst: r(6),
+            value: 0,
+        },
+    );
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(
+        array_update_strings(&completed.value.ctor_child(1)),
+        ["alpha", "beta", "gamma"]
+    );
+    let empty = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Array {
+                dst: r(0),
+                items: Vec::new(),
+            },
+            intrinsic(r(1), "extern:Array.pop", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    assert_eq!(
+        returned(execute(&empty, ExecutionLimits::default(), None))
+            .value
+            .array_view()
+            .0,
+        0
+    );
+}
+
+#[test]
+fn array_updates_swap_covers_every_index_pair() {
+    let _guard = lock();
+    for first in 0..3 {
+        for second in 0..3 {
+            let program = array_updates_program(
+                "extern:Array.swap",
+                Instruction::Nat {
+                    dst: r(5),
+                    value: first,
+                },
+                Instruction::Nat {
+                    dst: r(6),
+                    value: second,
+                },
+            );
+            let first_run = returned(execute(&program, ExecutionLimits::default(), None));
+            let mut expected = vec!["alpha", "beta", "gamma"];
+            expected.swap(first as usize, second as usize);
+            let actual = array_update_strings(&first_run.value.ctor_child(1));
+            assert_eq!(actual, expected);
+        }
+    }
+}
