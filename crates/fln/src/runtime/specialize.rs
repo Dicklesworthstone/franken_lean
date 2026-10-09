@@ -98,6 +98,7 @@ impl Preparation<'_> {
             || self.specializations.constructor_types.contains_key(name)
             || self.st_intrinsic_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
+            || self.stdout_intrinsic_type(name).is_some()
     }
 
     fn definition(&self, name: &Name) -> Option<DefinitionVal> {
@@ -694,6 +695,7 @@ impl Preparation<'_> {
             && let Some(type_) = self
                 .st_intrinsic_type(name)
                 .or_else(|| self.io_intrinsic_type(name))
+                .or_else(|| self.stdout_intrinsic_type(name))
         {
             return Ok(Some(type_));
         }

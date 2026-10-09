@@ -21,6 +21,7 @@ mod proofs;
 mod records;
 mod specialize;
 mod st;
+mod stdout;
 mod transport;
 mod variants;
 
@@ -55,6 +56,7 @@ pub(super) struct Preparation<'a> {
     specializations: specialize::Store,
     st: st::Store,
     io: io::Store,
+    stdout: stdout::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -125,6 +127,7 @@ impl<'a> Preparation<'a> {
             specializations: specialize::Store::default(),
             st: st::Store::default(),
             io: io::Store::default(),
+            stdout: stdout::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
@@ -406,6 +409,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(action) = self.stdout_call(&head, &args)? {
+                            tasks.push(Task::Visit(action));
+                            continue;
+                        }
                         if let Some(projected) = self.projection_call(&head, &args)? {
                             tasks.push(Task::Visit(projected));
                             continue;
@@ -677,6 +684,10 @@ impl<'a> Preparation<'a> {
                                 continue;
                             }
                             if let Some(action) = self.io_call(&expr, &[])? {
+                                tasks.push(Task::Visit(action));
+                                continue;
+                            }
+                            if let Some(action) = self.stdout_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
                                 continue;
                             }

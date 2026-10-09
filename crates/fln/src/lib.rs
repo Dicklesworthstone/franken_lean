@@ -9389,6 +9389,7 @@ fn executable_dependencies(
         let intrinsic = match preparation
             .st_intrinsic_binding(&name)
             .or_else(|| preparation.io_intrinsic_binding(&name))
+            .or_else(|| preparation.stdout_intrinsic_binding(&name))
         {
             Some(binding) => Some(binding),
             None => executable_intrinsic_binding_cached(
