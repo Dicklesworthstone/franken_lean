@@ -2354,7 +2354,9 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     query_term: Some(query_term),
                 })
             }
-            // `private`, `protected`, `noncomputable`, … lead a declaration (`declModifiers`).
+            // `@[…]`, `private`, `protected`, `noncomputable`, … lead a declaration
+            // (`declModifiers`), whose own parser decides which attributes it reads.
+            TokenKind::Symbol(symbol) if symbol == "@[" => source_declaration(source),
             _ if command_scope::modifiers::leads(token) => source_declaration(source),
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
                 Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -3307,6 +3309,32 @@ mod nat_definition_tests {
                 .expect("the evaluation command parses")
                 .kind(),
             SourceCommandKind::Evaluation
+        );
+    }
+
+    #[test]
+    fn an_attribute_leads_the_same_declaration_the_definition_parser_reads() {
+        for (source, kind) in [
+            (
+                "@[simp] theorem t : 1 = 1 := rfl",
+                SourceCommandKind::Definition,
+            ),
+            ("@[simp ←] def f : Nat := 1", SourceCommandKind::Definition),
+            ("@[simp] example : 0 = 0 := rfl", SourceCommandKind::Example),
+        ] {
+            let parsed = parse_source_command(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(parsed.kind(), kind, "{source}");
+            assert_eq!(
+                parsed.syntax(),
+                parse_definition(source.as_bytes()).unwrap().syntax(),
+                "{source}"
+            );
+        }
+        // An attribute the declaration parser does not read is refused where it refuses it.
+        assert_eq!(
+            parse_source_command(b"@[inline] def f : Nat := 1").err(),
+            parse_definition(b"@[inline] def f : Nat := 1").err()
         );
     }
 

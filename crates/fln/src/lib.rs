@@ -6779,10 +6779,25 @@ impl Engine {
                     error: Box::new(EngineExecutionError::Frontend(error)),
                     at: Some(original_offset),
                 })?;
+            // An inline `@[simp]` is registered (or, on an example, refused) only by the
+            // admission path `check_source_files` uses; the paths below would drop it.
+            let has_inline_simp = matches!(
+                parsed.kind(),
+                SourceCommandKind::Definition | SourceCommandKind::Example
+            ) && fln_elab::source::scope::simp::registration(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?
+                .is_some();
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example
-            ) {
+            ) && !has_inline_simp
+            {
                 let is_example = parsed.kind() == SourceCommandKind::Example;
                 if !allow_checks && !is_example {
                     return Err(EngineExecutionError::BatchCommand {
@@ -6842,6 +6857,7 @@ impl Engine {
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || is_instance
+                || has_inline_simp
             {
                 let admission = match engine
                     .admit_source_command_in_scope(

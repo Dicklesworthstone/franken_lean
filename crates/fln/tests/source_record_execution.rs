@@ -212,6 +212,48 @@ fn declaration_only_streams_and_scratch_checks_do_not_fabricate_executions() {
     assert_eq!(batch.source_admissions.len(), 1);
 }
 
+/// The executing stream admits an inline `@[simp]` the way `check_source_files` does: the
+/// lemma is registered, so a later `by simp` can use it, and an attributed example is refused.
+#[test]
+fn inline_simp_lemmas_are_registered_in_an_executing_source_stream() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let completed = base
+        .execute_source_commands_with_checks(
+            b"def wrap (n : Nat) : Nat := n\n@[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp\n#eval wrap 42",
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    value(&completed.batch, "42");
+    assert_eq!(
+        fln_elab::source::scope::simp::read(completed.batch.engine.environment())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        completed
+            .batch
+            .engine
+            .environment()
+            .contains(&Name::from_components(["use"]))
+    );
+    let attributed_example = base.execute_source_commands_with_checks(
+        b"@[simp] example : 0 = 0 := by rfl\n#eval 1",
+        &options,
+        limits(),
+    );
+    assert!(
+        !matches!(attributed_example, Ok(Outcome::Complete(_))),
+        "{attributed_example:?}"
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
 #[test]
 fn single_constructor_inductives_are_usable_in_ordinary_source_files() {
     let batch = engine().execute_source_definitions(&[b"inductive Item where\n  | mk (value : Nat)\ndef get (p : Item) : Nat := match p with | .mk n => n\n#eval get (Item.mk 42)"], &KVMap::new(), limits())
