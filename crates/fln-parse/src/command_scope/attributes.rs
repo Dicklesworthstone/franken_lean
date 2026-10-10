@@ -36,7 +36,26 @@ enum Shape {
     Literal(&'static str, usize),
     Node(Name, Vec<Shape>),
     Null(Vec<Shape>),
+    /// The tokens `start..end`, read by the active `attr` declaration the first one names
+    /// (`fln_parse::extensions`), once the leaves exist.
+    Extension(usize, usize),
 }
+
+/// Attributes the census declares by `syntax … : attr` and this reader reads by hand, with the
+/// pin's trees: where the file has the declaration, these keep this reader's.
+const READ_BY_HAND: [&str; 11] = [
+    "simp",
+    "wf_preprocess",
+    "method_specs_simp",
+    "grind",
+    "grind!",
+    "deprecated",
+    "coe",
+    "suggest_for",
+    "cbv_eval",
+    "ext",
+    "norm_cast",
+];
 
 /// Attribute priorities nest only through parentheses; deeper nesting than this is refused
 /// rather than recursed into on a small host stack.
@@ -395,6 +414,18 @@ impl AttributeReader<'_> {
 
     /// One `attr`, dispatched on the symbol its leading token spells.
     fn attribute(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        // Under a grammar that enters the imports' syntax, an attribute the census declares is
+        // read by its declaration where the file has it, and is `Attr.simple` where it does not.
+        let head = self
+            .tokens
+            .get(self.at)
+            .and_then(|token| self.view.normalized().span_str(token.extent))
+            .unwrap_or_default();
+        match crate::extensions::attribute_syntax(head) {
+            Some(false) => return self.simple(),
+            Some(true) if !READ_BY_HAND.contains(&head) => return self.extension(),
+            _ => {}
+        }
         let keyword_then_ident = |reader: &mut Self, keyword: &'static str| {
             let head = reader.atom(keyword)?;
             let name = reader.take_ident()?;
@@ -408,6 +439,9 @@ impl AttributeReader<'_> {
         }
         if self.word("wf_preprocess") {
             return self.simp_like("wf_preprocess");
+        }
+        if self.word("method_specs_simp") {
+            return self.simp_like("method_specs_simp");
         }
         if self.word("grind") || self.word("grind!") {
             return self.grind();
@@ -502,6 +536,38 @@ impl AttributeReader<'_> {
                 vec![head, Shape::Null(Vec::new()), Shape::Null(Vec::new())],
             ));
         }
+        self.simple()
+    }
+
+    /// The tokens up to the `,` or `]` that ends this attribute at bracket depth zero, for the
+    /// active declaration that names it to read when the leaves exist.
+    fn extension(&mut self) -> Result<Shape, NatDefinitionParseError> {
+        let start = self.at;
+        let mut depth = 0_usize;
+        let mut at = start;
+        while let Some(kind) = self.kind(at) {
+            if let TokenKind::Symbol(symbol) = kind {
+                match symbol.as_str() {
+                    "," | "]" if depth == 0 => break,
+                    "(" | "[" | "{" | "⟨" | "@[" => depth += 1,
+                    ")" | "]" | "}" | "⟩" => {
+                        depth = depth.checked_sub(1).ok_or_else(|| self.bad())?
+                    }
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        if at == start || self.kind(at).is_none() {
+            return Err(self.bad());
+        }
+        self.at = at;
+        Ok(Shape::Extension(start, at))
+    }
+
+    /// `Attr.simple := ident (prio <|> ident)?`, the parser the pin tries for an attribute
+    /// name no keyword parser is indexed under.
+    fn simple(&mut self) -> Result<Shape, NatDefinitionParseError> {
         // Builtin attribute keywords whose own parsers are not read here (`class`, `recursor`,
         // `tactic_tag`, …) must not fall through to `Attr.simple`, which the pin never tries for
         // a symbol-indexed attribute.
@@ -511,7 +577,6 @@ impl AttributeReader<'_> {
                 "recursor",
                 "tactic_tag",
                 "tactic_name",
-                "method_specs_simp",
                 "simproc",
                 "sevalproc",
                 "builtin_simproc",
@@ -642,7 +707,12 @@ fn grind_node(kind: &str, parts: Vec<Shape>) -> Shape {
     Shape::Node(parser_kind(&["Attr", kind]), parts)
 }
 
-fn build(shape: &Shape, leaves: &Leaves) -> Result<Syntax, DefinitionParseError> {
+fn build(
+    shape: &Shape,
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+) -> Result<Syntax, DefinitionParseError> {
     Ok(match shape {
         Shape::Leaf(at) => leaves.leaf(*at)?,
         Shape::Atom(at, text) => Syntax::Atom {
@@ -679,15 +749,23 @@ fn build(shape: &Shape, leaves: &Leaves) -> Result<Syntax, DefinitionParseError>
             kind.clone(),
             parts
                 .iter()
-                .map(|part| build(part, leaves))
+                .map(|part| build(part, leaves, view, tokens))
                 .collect::<Result<_, _>>()?,
         ),
         Shape::Null(parts) => null_node(
             parts
                 .iter()
-                .map(|part| build(part, leaves))
+                .map(|part| build(part, leaves, view, tokens))
                 .collect::<Result<_, _>>()?,
         ),
+        Shape::Extension(start, end) => {
+            crate::extensions::attribute(leaves, view, tokens, *start..*end).ok_or_else(|| {
+                NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, *start),
+                    expected: NatDefinitionExpectation::Attribute,
+                }
+            })?
+        }
     })
 }
 
@@ -703,8 +781,24 @@ pub(crate) fn command_syntax(
         at: 0,
     };
     match reader.command() {
-        Ok(shape) => build(&shape, leaves).map(Some),
+        Ok(shape) => build(&shape, leaves, view, tokens).map(Some),
         Err(_) => Ok(None),
+    }
+}
+
+/// The `grindMod` at token `at`, if one starts there, and the token after it: a `grind` lemma's
+/// (`grindLemma := (Attr.grindMod ppSpace)? term`, `Init/Grind/Interactive.lean`), read as the
+/// attribute's is.
+pub(crate) fn grind_modifier(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    leaves: &Leaves,
+    at: usize,
+) -> Result<(Option<Syntax>, usize), DefinitionParseError> {
+    let mut reader = AttributeReader { view, tokens, at };
+    match reader.grind_modifier()? {
+        Some(shape) => Ok((Some(build(&shape, leaves, view, tokens)?), reader.at)),
+        None => Ok((None, at)),
     }
 }
 
@@ -749,7 +843,7 @@ pub(crate) fn inline_syntax(
     let Some((_, shape)) = read_inline(view, tokens, start)? else {
         return Ok(null_node(Vec::new()));
     };
-    Ok(null_node(vec![build(&shape, leaves)?]))
+    Ok(null_node(vec![build(&shape, leaves, view, tokens)?]))
 }
 
 pub fn parse(source: &[u8]) -> Result<Option<SimpAttribute>, DefinitionParseError> {

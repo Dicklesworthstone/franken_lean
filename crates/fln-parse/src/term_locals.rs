@@ -270,10 +270,8 @@ impl Prefix {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
             }
-            // `letI : C := v` names its local by hygiene, as an anonymous `have` does.
-            if form == Form::Let && assertion.name.is_none() {
-                return Err(refuse(view, tokens, *cursor));
-            }
+            // An anonymous `let : C := v` or `letI : C := v` names its local by hygiene, as an
+            // anonymous `have` does (`letIdLhs`'s `hygieneInfo`).
             if *cursor < end && word(tokens, *cursor, ":") {
                 assertion.colon = Some(*cursor);
                 *cursor += 1;
@@ -308,7 +306,9 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
-            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => true,
+            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
+                true
+            }
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {

@@ -14,6 +14,57 @@ fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinition
     }
 }
 
+/// `Term.tuple`, `"(" [p "," [q "," …]] ")"`. Out of line, off the planner's heap loop frame
+/// (small-stack bound).
+#[inline(never)]
+fn tuple(
+    leaves: &Leaves,
+    open: usize,
+    close: usize,
+    commas: &[usize],
+    elements: Vec<Syntax>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut elements = elements.into_iter();
+    let first = elements.next().expect("a tuple's first element");
+    let mut rest = Vec::with_capacity(commas.len() * 2);
+    for (index, element) in elements.enumerate() {
+        if index > 0 {
+            rest.push(leaves.leaf(commas[index])?);
+        }
+        rest.push(element);
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Term", "tuple"]),
+        vec![
+            hygienic_lparen(leaves.leaf(open)?),
+            null_node(vec![first, leaves.leaf(commas[0])?, null_node(rest)]),
+            leaves.leaf(close)?,
+        ],
+    ))
+}
+
+/// `Term.anonymousCtor`, `"⟨" [p "," …] "⟩"`, out of line as [`tuple`] is.
+#[inline(never)]
+fn anonymous(
+    leaves: &Leaves,
+    open: usize,
+    close: usize,
+    commas: &[usize],
+    elements: Vec<Syntax>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut items = Vec::with_capacity(elements.len() * 2);
+    for (index, element) in elements.into_iter().enumerate() {
+        if index > 0 {
+            items.push(leaves.leaf(commas[index - 1])?);
+        }
+        items.push(element);
+    }
+    Ok(Syntax::node(
+        parser_kind(&["Term", "anonymousCtor"]),
+        vec![leaves.leaf(open)?, null_node(items), leaves.leaf(close)?],
+    ))
+}
+
 pub(crate) fn pattern(
     leaves: &Leaves,
     view: &SourceView,
@@ -23,6 +74,10 @@ pub(crate) fn pattern(
     enum Task {
         Parse(Range<usize>),
         Group(usize, usize),
+        /// `(p, q, …)` (`Term.tuple`) and `⟨p, …⟩` (`Term.anonymousCtor`): the brackets, the
+        /// commas, and the number of elements.
+        Tuple(usize, usize, Vec<usize>, usize),
+        Anonymous(usize, usize, Vec<usize>, usize),
         Application(usize),
         Cons(usize, Vec<usize>),
         List(usize, usize, usize, Vec<usize>),
@@ -30,16 +85,50 @@ pub(crate) fn pattern(
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
     for at in range.clone() {
-        if symbol(tokens, at, "(") || symbol(tokens, at, "[") {
+        if symbol(tokens, at, "(") || symbol(tokens, at, "[") || symbol(tokens, at, "⟨") {
             opens.push(at);
-        } else if symbol(tokens, at, ")") || symbol(tokens, at, "]") {
+        } else if symbol(tokens, at, ")") || symbol(tokens, at, "]") || symbol(tokens, at, "⟩") {
             let open = opens.pop().ok_or_else(|| refusal(view, tokens, at))?;
-            if symbol(tokens, open, "(") != symbol(tokens, at, ")") {
+            let close = if symbol(tokens, open, "(") {
+                ")"
+            } else if symbol(tokens, open, "[") {
+                "]"
+            } else {
+                "⟩"
+            };
+            if !symbol(tokens, at, close) {
                 return Err(refusal(view, tokens, at));
             }
             pairs.insert(open, at);
         }
     }
+    // The elements between `open` and `close`, split at their own commas.
+    let elements = |open: usize, close: usize| {
+        let mut parts = Vec::new();
+        let mut separators = Vec::new();
+        let mut start = open + 1;
+        let mut at = start;
+        while at < close {
+            if let Some(&end) = pairs.get(&at) {
+                at = end + 1;
+            } else if symbol(tokens, at, ",") {
+                if start == at {
+                    return Err(refusal(view, tokens, at));
+                }
+                parts.push(start..at);
+                separators.push(at);
+                start = at + 1;
+                at += 1;
+            } else {
+                at += 1;
+            }
+        }
+        // A list may end in a comma (`[a, b,]`, `sepBy … (allowTrailingSep := true)`).
+        if start < close {
+            parts.push(start..close);
+        }
+        Ok((parts, separators))
+    };
     if !opens.is_empty() {
         return Err(refusal(view, tokens, range.end));
     }
@@ -47,6 +136,14 @@ pub(crate) fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Tuple(open, close, commas, count) => {
+                let elements = values.split_off(values.len() - count);
+                values.push(tuple(leaves, open, close, &commas, elements)?);
+            }
+            Task::Anonymous(open, close, commas, count) => {
+                let elements = values.split_off(values.len() - count);
+                values.push(anonymous(leaves, open, close, &commas, elements)?);
+            }
             Task::Group(open, close) => {
                 let inner = values.pop().expect("planned collection pattern group");
                 values.push(Syntax::node(
@@ -103,7 +200,14 @@ pub(crate) fn pattern(
                 if let Some(&close) = pairs.get(&range.start)
                     && close + 1 == range.end
                 {
-                    if symbol(tokens, range.start, "(") {
+                    let (parts, commas) = elements(range.start, close)?;
+                    if symbol(tokens, range.start, "⟨") {
+                        tasks.push(Task::Anonymous(range.start, close, commas, parts.len()));
+                        tasks.extend(parts.into_iter().rev().map(Task::Parse));
+                    } else if symbol(tokens, range.start, "(") && !commas.is_empty() {
+                        tasks.push(Task::Tuple(range.start, close, commas, parts.len()));
+                        tasks.extend(parts.into_iter().rev().map(Task::Parse));
+                    } else if symbol(tokens, range.start, "(") {
                         tasks.push(Task::Group(range.start, close));
                         tasks.push(Task::Parse(range.start + 1..close));
                     } else {

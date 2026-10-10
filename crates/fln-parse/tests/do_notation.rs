@@ -97,3 +97,37 @@ fn newly_supported_control_syntax_is_retained_for_semantic_checking() {
         parses(source);
     }
 }
+
+/// `letIdDecl := atomic(letIdLhs " := ") term` before `letPatDecl`: a do-block `let` whose name
+/// takes bracketed binders is a local function, as the pin reads it (captured with
+/// `scripts/extract/dump_command_syntax.lean` on 2026-10-09), not a pattern applying the name to
+/// a structure instance; a pattern stays a pattern, and `let some x := e | alt` keeps its term.
+#[test]
+fn do_let_local_functions_take_bracketed_binders() {
+    let kinds = |source: &str| -> Vec<String> {
+        let parsed =
+            parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+        let mut out = Vec::new();
+        let mut pending = vec![parsed.syntax()];
+        while let Some(node) = pending.pop() {
+            if let fln_syntax::tree::Syntax::Node { kind, args, .. } = node {
+                out.push(kind.to_display_string());
+                pending.extend(args.iter().rev());
+            }
+        }
+        out
+    };
+    let has = |source: &str, kind: &str| kinds(source).iter().any(|found| found == kind);
+    let local = "def f : Nat := Id.run do\n  let g {n : Nat} (x : Nat) : Nat := x + n\n  pure 0\n";
+    assert!(has(local, "Lean.Parser.Term.letIdDecl"));
+    assert!(has(local, "Lean.Parser.Term.implicitBinder"));
+    assert!(!has(local, "Lean.Parser.Term.structInst"));
+    let instance = "def f : Nat := Id.run do\n  let k [Inhabited Nat] (z : Nat) := z\n  pure 0\n";
+    assert!(has(instance, "Lean.Parser.Term.instBinder"));
+    let pattern = "def f : Nat := Id.run do\n  let (a, b) := (1, 2)\n  pure a\n";
+    assert!(has(pattern, "Lean.Parser.Term.letPatDecl"));
+    let otherwise =
+        "def f (o : Option Nat) : Nat := Id.run do\n  let some x := o | pure 0\n  pure x\n";
+    assert!(has(otherwise, "Lean.Parser.Term.doLetElse"));
+    assert!(!has(otherwise, "Lean.Parser.Term.letIdDecl"));
+}

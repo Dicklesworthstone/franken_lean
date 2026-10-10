@@ -301,7 +301,9 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
 /// table parsed all five (each keyword was an identifier there); the derived table refuses each
 /// at the token the Reference names, except a word in the seed allowance, which is a declared
 /// divergence until it leaves (`exists` and `from` left it with fln-ffce). The escaped spelling
-/// the Reference accepts parses.
+/// the Reference accepts parses. The last five rows are the witnesses `franken_lean-z8j.1.6.2`
+/// names (`universe`, `scoped`, `local`, `repeat`, `prefix` as declaration names), captured the
+/// same way on 2026-10-09.
 const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def at : Nat := 1",
@@ -322,6 +324,26 @@ const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def h (using : Nat) : Nat := using",
         "1:7: error: unexpected token 'using'; expected '_' or identifier",
+    ),
+    (
+        "theorem universe : True := trivial",
+        "1:7: error: unexpected token 'universe'; expected identifier",
+    ),
+    (
+        "theorem scoped : True := trivial",
+        "1:7: error: unexpected token 'scoped'; expected identifier",
+    ),
+    (
+        "theorem local : True := trivial",
+        "1:7: error: unexpected token 'local'; expected identifier",
+    ),
+    (
+        "theorem repeat : True := trivial",
+        "1:7: error: unexpected token 'repeat'; expected identifier",
+    ),
+    (
+        "theorem prefix : True := trivial",
+        "1:7: error: unexpected token 'prefix'; expected identifier",
     ),
 ];
 

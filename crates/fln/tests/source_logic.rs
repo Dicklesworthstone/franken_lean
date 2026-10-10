@@ -1401,11 +1401,14 @@ fn grind_patterns_are_refused_not_ignored() {
 /// `export` as `Command.export`; the scope layer refuses an attribute command or an `open … in` it
 /// does not model. The pin accepts each of these files; the checker models neither the module
 /// system's `public`, nor `noncomputable` scopes, nor export aliases, nor the `inline` attribute,
-/// nor `open` of selected names, nor syntax and notation declarations, nor conv mode, so it
-/// refuses them rather than reading a plain scope or dropping what it does not read.
+/// nor `open` of selected names, nor conv mode, so it refuses them rather than reading a plain
+/// scope or dropping what it does not read. A syntax or notation declaration it does read (bead
+/// `franken_lean-z8j.1.10`, stage 4): the pin accepts both files below (exit 0, 2026-10-09).
 #[test]
 fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
     check("section\ntheorem plain : True := True.intro\nend\n");
+    check("syntax \"plain_tactic\" : tactic\ntheorem plain : True := True.intro\n");
+    check("infixl:65 \" +++ \" => Nat.add\ntheorem plain : True := True.intro\n");
     let (engine, limits) = engine();
     for source in [
         "public section\ntheorem plain : True := True.intro\nend\n",
@@ -1414,8 +1417,6 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
         "theorem plain : True := True.intro\nexport Nat (succ)\n",
         "def d : Nat := 1\nattribute [inline] d\n",
         "open Nat (succ) in\ntheorem plain : True := True.intro\n",
-        "syntax \"plain_tactic\" : tactic\ntheorem plain : True := True.intro\n",
-        "infixl:65 \" +++ \" => Nat.add\ntheorem plain : True := True.intro\n",
         "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
     ] {
         assert!(
@@ -1681,6 +1682,30 @@ fn a_proof_nested_in_a_tactic_term_closes_only_what_it_proves() {
         "theorem unproved (h : 1 = 1) : 1 = 1 ∧ 2 = 3 := by exact ⟨h, by rfl⟩\n",
         "theorem target (b : Bool) : 0 = 0 := by cases (by cases b)\n",
         "theorem value : 0 = 0 := by\n  have h := (by rfl)\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+/// `axiom` parses as the pin's `Command.axiom`, and the checker admits no axiom of a file's own:
+/// the command is refused, never skipped, so nothing after it can use what it would assert. (The
+/// pin accepts the file.)
+#[test]
+fn a_files_own_axiom_is_refused_not_skipped() {
+    let (engine, limits) = engine();
+    for source in [
+        "axiom unproven : False\ntheorem t : True := True.intro\n",
+        "axiom unproven : False\ntheorem bad : 0 = 1 := False.elim unproven\n",
     ] {
         assert!(
             !matches!(

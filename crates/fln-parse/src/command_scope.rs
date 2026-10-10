@@ -67,15 +67,18 @@ pub enum ScopeCommand {
     Trivia,
 }
 
-/// The scope layer's table: the full implicit-Init table, the same one declaration bodies use.
-/// Every scope keyword this layer recognises (`namespace`, `end`, `open`, `universe`, `scoped`,
-/// `omit`, …) is a token at the pin, so nothing is added by hand; `prelude` is header-only and
-/// lives in `imports`' header table.
-fn table() -> &'static TokenTable {
-    crate::reference_tokens::implicit_init_table()
+/// Lex with the scope layer's table, the one declaration bodies use: the implicit-Init table, or
+/// the entered grammar's (`crate::extensions::with_grammar`). Every scope keyword this layer
+/// recognises (`namespace`, `end`, `open`, `universe`, `scoped`, `omit`, …) is a token at the
+/// pin, so nothing is added by hand; `prelude` is header-only and lives in `imports`' header
+/// table.
+fn lex(view: &SourceView) -> fln_syntax::run::LexRun {
+    crate::extensions::with_token_table(|table| {
+        crate::extensions::interpolate(view.normalized(), table, lex_run(view.normalized(), table))
+    })
 }
-fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    let run = lex_run(view.normalized(), table());
+pub(crate) fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+    let run = lex(view);
     let diagnostics: Vec<_> = run
         .diagnostics()
         .into_iter()
@@ -104,24 +107,13 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
 /// comment, string or identifier escape, which runs on past the command) still refuses the whole
 /// source.
 fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    use fln_syntax::literal::LiteralError;
-    use fln_syntax::run::RunError;
-    use fln_syntax::token::TokenError;
-    let run = lex_run(view.normalized(), table());
+    let run = lex(view);
     let diagnostics: Vec<_> = run
         .events
         .iter()
         .filter_map(|event| match event {
-            Event::Refused {
-                error:
-                    RunError::Token(
-                        TokenError::NotAToken { .. }
-                        | TokenError::Literal(LiteralError::MissingEndOfCharLiteral { .. }),
-                    ),
-                ..
-            }
-            | Event::Token(_)
-            | Event::Trivia(_) => None,
+            Event::Refused { error, .. } if refusal_of_one_token(error) => None,
+            Event::Token(_) | Event::Trivia(_) => None,
             Event::Refused { error, .. } => Some(ParseDiagnostic {
                 message: error.message(),
                 at: view.to_original(error.at()),
@@ -139,6 +131,19 @@ fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionPars
             _ => None,
         })
         .collect())
+}
+/// A refusal of one token that [`partition`] goes past, leaving it to the command that holds it.
+pub(crate) fn refusal_of_one_token(error: &fln_syntax::run::RunError) -> bool {
+    use fln_syntax::literal::LiteralError;
+    use fln_syntax::run::RunError;
+    use fln_syntax::token::TokenError;
+    matches!(
+        error,
+        RunError::Token(
+            TokenError::NotAToken { .. }
+                | TokenError::Literal(LiteralError::MissingEndOfCharLiteral { .. }),
+        )
+    )
 }
 fn control(s: &str) -> bool {
     matches!(
@@ -165,8 +170,16 @@ fn line_command(s: &str) -> bool {
         && (PIN_DOC_CARRIERS.contains(&s)
             || matches!(
                 s,
-                "grind_pattern" | "seal" | "unseal" | "export" | "init_grind_norm"
-            ))
+                "grind_pattern"
+                    | "seal"
+                    | "unseal"
+                    | "export"
+                    | "init_grind_norm"
+                    | "gen_injective_theorems%"
+                    | "init_quot"
+                    | "docs_to_verso"
+            )
+            || crate::extensions::is_command_keyword(s))
 }
 /// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
 fn doc_comment(token: &LexedToken) -> bool {
@@ -287,10 +300,15 @@ fn doc_comment_is_carried(
         return Ok(());
     }
     let next = tokens.get(index + 1);
+    // A carrier the file itself declares (`Init/Meta.lean`'s `macro … "declare_simp_like_tactic"`)
+    // is an identifier under its imports' table: the partition is one pass over the whole file,
+    // before any of its declarations, so it reads the word by its text.
     if next.is_some_and(|next| {
         carries_doc_comment(next)
             || matches!(&next.kind, TokenKind::Symbol(symbol)
                 if PIN_DOC_CARRIERS.contains(&symbol.as_str()))
+            || matches!(&next.kind, TokenKind::Ident(name)
+                if PIN_DOC_CARRIERS.contains(&name.to_display_string().as_str()))
     }) {
         return Ok(());
     }
@@ -785,7 +803,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                         starts.push(view.to_original(token.extent.start()).0);
                     }
                     open_in = false;
-                    current_open = scope_start && (symbol == "open" || symbol == "set_option");
+                    // `Command.in` (`cmd " in " cmd`): after these, a top-level `in` takes
+                    // the next command into this one.
+                    current_open = scope_start
+                        && matches!(
+                            symbol.as_str(),
+                            "open" | "set_option" | "attribute" | "variable" | "omit" | "include"
+                        );
                     prefix_column = inline_start.then(|| column(token));
                 }
                 attribute_prefix = inline_start
@@ -811,6 +835,18 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 None => {}
             }
         }
+    }
+    // Trivia before the first start belongs to its command. A token before it is a command of
+    // its own that this layer does not recognise (`grind_annotated "…"` right after a header),
+    // which is refused where it is parsed, not merged into the command after it.
+    let first_token = tokens
+        .first()
+        .map(|token| view.to_original(token.extent.start()).0);
+    if starts
+        .first()
+        .is_some_and(|&first| first_token.is_some_and(|token| token < first))
+    {
+        starts.insert(0, 0);
     }
     let mut output = Vec::new();
     let mut start = 0;
@@ -1054,6 +1090,33 @@ mod tests {
         }
         assert_eq!(parse(b"def value := 3").unwrap(), None);
     }
+    /// `attribute`, `variable`, `omit` and `include` take the next command after a top-level
+    /// `in` too (`Command.in`), as in `Init/GrindInstances/Ring/SInt.lean`; an `in` inside
+    /// brackets is not that.
+    #[test]
+    fn scope_commands_followed_by_in_take_the_next_command() {
+        let file = "attribute [local instance] f in\ntheorem t : True := trivial\n\
+                    variable (x : Nat) in\ndef y := x\n\
+                    omit [Inhabited Nat] in\ndef z := 1\n\
+                    include x in\ndef w := x\n\
+                    def after := 2\n";
+        let commands = partition(file.as_bytes()).unwrap();
+        let texts: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "attribute [local instance] f in\ntheorem t : True := trivial\n",
+                "variable (x : Nat) in\ndef y := x\n",
+                "omit [Inhabited Nat] in\ndef z := 1\n",
+                "include x in\ndef w := x\n",
+                "def after := 2\n",
+            ]
+        );
+    }
+
     /// `open A in <command>` (`Lean.Parser.Command.in`) is one command whose body is the next
     /// command; the pin's macro elaborates it as `section open A <command> end`.
     #[test]
@@ -1393,23 +1456,26 @@ mod tests {
         ] {
             assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
-        // A command the pin lets a doc lead and this grammar does not parse keeps its doc: the
-        // file partitions, and that one command is refused where it is parsed.
-        let unparsed = "/-- d -/\nmacro \"x\" : term => `(0)\ndef y : Nat := 1\n";
+        // A command the pin lets a doc lead and this grammar does not parse (`elab`: the pin
+        // parses it, 2026-10-09) keeps its doc: the file partitions, and that one command is
+        // refused where it is parsed.
+        let unparsed = "/-- d -/\nelab \"x\" : term => return default\ndef y : Nat := 1\n";
         let commands = partition(unparsed.as_bytes()).unwrap();
         assert_eq!(commands.len(), 2, "{commands:?}");
         assert!(
             std::str::from_utf8(commands[0].1)
                 .unwrap()
-                .starts_with("/-- d -/\nmacro")
+                .starts_with("/-- d -/\nelab")
         );
         assert!(!matches!(
             parse(commands[0].1),
             Ok(Some(ScopeCommand::Trivia))
         ));
         assert!(crate::parse_source_command(commands[0].1).is_err());
-        // A syntax declaration is parsed with its doc (`Command.syntax`).
+        // A syntax declaration is parsed with its doc (`Command.syntax`), and so is a macro
+        // (`Command.macro`).
         assert!(crate::parse_source_command(b"/-- d -/\nscoped syntax \"x\" : term").is_ok());
+        assert!(crate::parse_source_command(b"/-- d -/\nmacro \"x\" : term => `(0)").is_ok());
         // The pin validates a declaration doc's manual links ("Unknown documentation type `f`")
         // and stores a module doc's unvalidated; both verdicts measured 2026-10-07.
         let linked = "/-- see [](lean-manual://f) -/\ndef x := 44\n";

@@ -750,9 +750,12 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
+            // A template's name (macro-scoped) is a global once its scopes are erased; the
+            // exact local scan above was its only local match (`resolve_source_candidates`).
+            let hygienic = name.has_macro_scopes();
             let resolved = self
                 .resolve_source_name(name)?
-                .unwrap_or_else(|| name.clone());
+                .unwrap_or_else(|| name.erase_macro_scopes());
             // The fallback to the name as written must not reach a seed constant the pin
             // does not have: resolution already refused it (`source_unreachable`), and the
             // direct lookup below would otherwise find it anyway.
@@ -762,6 +765,7 @@ impl Context {
                 )));
             }
             if !scope::is_root_qualified(name)
+                && !hygienic
                 && let Some(local) = self.txn.lctx.find_by_user_name(&resolved)
             {
                 return Ok(Typed {

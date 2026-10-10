@@ -6732,7 +6732,10 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
+        // Under an entered grammar (`source_check::grammar`) the file's notations expand first,
+        // as `source_records::parse_scoped_command` expands them.
         let parsed = fln_parse::parse_definition(source)
+            .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         let declaration = match source_records::elaboration_outcome(
@@ -7128,6 +7131,9 @@ impl Engine {
         let mut file_starts = file_starts.iter().copied().peekable();
         let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
         scopes.current.private_module = private_module.cloned();
+        // The syntax a file declares extends the grammar of its commands after it
+        // (`source_check::grammar`). The stream was partitioned before any of it was declared.
+        let mut grammar = source_check::grammar::SourceGrammar::implicit_init();
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
@@ -7144,6 +7150,7 @@ impl Engine {
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
                 Step::Scope(index, transition) => {
+                    grammar.observe(&transition);
                     scopes
                         .check_limits(&transition)
                         .map_err(|(resource, limit)| {
@@ -7172,8 +7179,10 @@ impl Engine {
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
                 scopes.current.private_module = private_module.cloned();
+                grammar = source_check::grammar::SourceGrammar::implicit_init();
             }
-            let control = fln_parse::command_scope::parse(command_source)
+            let control = grammar
+                .enter(|| fln_parse::command_scope::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7288,6 +7297,7 @@ impl Engine {
                     | ScopeCommand::Simp(_)
                     | ScopeCommand::Instance(_)
                     | ScopeCommand::Reducibility(_) => {
+                        grammar.observe(&control);
                         match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
@@ -7317,14 +7327,28 @@ impl Engine {
                 }
                 continue;
             }
+            // A command that declares syntax extends the grammar and runs nothing.
+            if grammar
+                .declare(
+                    command_source,
+                    source_check::grammar::resolver(engine.environment(), &scopes.current),
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?
+            {
+                continue;
+            }
             let scope = if public.is_some() {
-                scopes.command_scope(command_source).map_err(|error| {
-                    EngineExecutionError::BatchCommand {
+                grammar
+                    .enter(|| scopes.command_scope(command_source))
+                    .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(EngineExecutionError::Frontend(error)),
                         at: Some(original_offset),
-                    }
-                })?
+                    })?
             } else {
                 scopes.current.clone()
             };
@@ -7335,14 +7359,15 @@ impl Engine {
                 // Exposed public definitions and complete data bundles are
                 // checked in the export world before entering the private
                 // executable world. Queries continue to observe the latter.
-                let admission = match public
-                    .engine()
-                    .admit_source_command_in_scope(
-                        command_source,
-                        options,
-                        limits.admission(),
-                        &scope,
-                    )
+                let admission = match grammar
+                    .enter(|| {
+                        public.engine().admit_source_command_in_scope(
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                        )
+                    })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -7382,7 +7407,8 @@ impl Engine {
                 });
                 continue;
             }
-            if fln_parse::command_scope::mutual::parse(command_source)
+            if grammar
+                .enter(|| fln_parse::command_scope::mutual::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7395,13 +7421,15 @@ impl Engine {
                 // Keep the whole mutual block on the existing two-checker
                 // admission path. Never publish members sequentially or treat
                 // declarations as VM executions merely to advance the stream.
-                let admission = match engine
-                    .admit_source_command_in_scope(
-                        command_source,
-                        options,
-                        limits.admission(),
-                        &scope,
-                    )
+                let admission = match grammar
+                    .enter(|| {
+                        engine.admit_source_command_in_scope(
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                        )
+                    })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -7421,7 +7449,11 @@ impl Engine {
                 });
                 continue;
             }
-            let parsed = fln_parse::parse_source_command(command_source)
+            let parsed = grammar
+                .enter(|| {
+                    fln_parse::parse_source_command(command_source)
+                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                })
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7509,13 +7541,15 @@ impl Engine {
                 || is_instance
                 || has_inline_simp
             {
-                let admission = match engine
-                    .admit_source_command_in_scope(
-                        command_source,
-                        options,
-                        limits.admission(),
-                        &scope,
-                    )
+                let admission = match grammar
+                    .enter(|| {
+                        engine.admit_source_command_in_scope(
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                        )
+                    })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),

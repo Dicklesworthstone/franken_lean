@@ -121,6 +121,8 @@ pub struct UnknownModule(pub Name);
 struct CensusModule {
     imports: Vec<Name>,
     global_tokens: BTreeSet<String>,
+    /// `scoped` token entries, by the namespace whose `open` (or `namespace`) activates them.
+    scoped_tokens: BTreeMap<Name, BTreeSet<String>>,
 }
 
 /// The token half of the grammar census.
@@ -264,10 +266,28 @@ impl TokenCensus {
                             }
                             entry.global_tokens.insert(token.to_string());
                         }
-                    } else if !scope.starts_with("scoped:") {
+                    } else if let Some(namespace) = scope.strip_prefix("scoped:") {
+                        // Active only where `open` or `namespace` activates the namespace
+                        // (`crate::extensions`); never part of a file's base table.
+                        let namespace =
+                            module_name(namespace).ok_or_else(|| malformed("scoped namespace"))?;
+                        let entry = modules.entry(module).or_default();
+                        let scoped = entry.scoped_tokens.entry(namespace).or_default();
+                        if !scoped.is_empty() {
+                            return Err(CensusError::Duplicate {
+                                line,
+                                what: format!("scoped module-tokens row {scope}"),
+                            });
+                        }
+                        for token in tokens.split(' ') {
+                            if !is_token(token) {
+                                return Err(malformed("a module token is a non-empty token"));
+                            }
+                            scoped.insert(token.to_string());
+                        }
+                    } else {
                         return Err(malformed("a module-tokens scope is global or scoped:<ns>"));
                     }
-                    // Scoped tokens are active only after `open`; no production table uses them.
                 }
                 _ => {}
             }
@@ -331,23 +351,46 @@ impl TokenCensus {
         prelude: bool,
         imports: &[Name],
     ) -> Result<BTreeSet<String>, UnknownModule> {
+        let mut tokens = self.builtin.clone();
+        for module in self.closure(prelude, imports)? {
+            tokens.extend(self.modules[&module].global_tokens.iter().cloned());
+        }
+        Ok(tokens)
+    }
+
+    /// The reflexive-transitive closure of a header's imports, `Init` included without
+    /// `prelude`: the modules whose syntax a file with this header sees.
+    pub fn closure(
+        &self,
+        prelude: bool,
+        imports: &[Name],
+    ) -> Result<BTreeSet<Name>, UnknownModule> {
         let mut roots: Vec<Name> = imports.to_vec();
         if !prelude {
             roots.push(Name::from_components(["Init"]));
         }
         let mut seen = BTreeSet::new();
-        let mut tokens = self.builtin.clone();
         while let Some(module) = roots.pop() {
-            if !seen.insert(module.clone()) {
+            if seen.contains(&module) {
                 continue;
             }
             let Some(entry) = self.modules.get(&module) else {
                 return Err(UnknownModule(module));
             };
-            tokens.extend(entry.global_tokens.iter().cloned());
             roots.extend(entry.imports.iter().cloned());
+            seen.insert(module);
         }
-        Ok(tokens)
+        Ok(seen)
+    }
+
+    /// The `scoped` tokens `module` declares for `namespace`.
+    pub fn scoped_tokens(&self, module: &Name, namespace: &Name) -> impl Iterator<Item = &str> {
+        self.modules
+            .get(module)
+            .and_then(|entry| entry.scoped_tokens.get(namespace))
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
     }
 
     /// [`Self::tokens_for`] as a lexer table.

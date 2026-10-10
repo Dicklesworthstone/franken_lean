@@ -8,7 +8,9 @@
 //! cache the lane is a typed SKIP. The production parser is the drop-in's: the header parser,
 //! then `command_scope::partition` over the body, then each command through
 //! `command_scope::parse` (scope commands) or `parse_source_command`. A scope command's tree is
-//! the one `command_scope::trees` builds for it.
+//! the one `command_scope::trees` builds for it. Each command is parsed under its file's grammar
+//! (`fln_parse::extensions`): the syntax the header's imports declare, with the scoped syntax the
+//! namespaces and `open`s before it have activated.
 //!
 //! Each pin command lands in exactly one class:
 //! - `identical`: the same tree, every leaf at the same file position;
@@ -24,8 +26,10 @@
 //! of identical commands, comes once the count is above zero.
 #![forbid(unsafe_code)]
 
+use fln_core::name::Name;
 use fln_parse::command_scope::imports::parse_source_header;
 use fln_parse::command_scope::{self, ScopeCommand};
+use fln_parse::extensions::{FileGrammar, SyntaxDecl, extension_census, with_grammar};
 use fln_parse::{NatDefinitionParseError, parse_source_command};
 use fln_syntax::pin_syntax::{self, cache_root, fnv1a};
 use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
@@ -175,7 +179,63 @@ struct Outcome {
 }
 
 /// The class of every pin command of one file.
-fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
+/// How the syntax declarations a file makes compare with the census rows of its module: the
+/// translation `FileGrammar::declare` does is checked against the pin's own.
+#[derive(Default)]
+struct DeclarationCheck {
+    census: usize,
+    registered: usize,
+    identical: usize,
+    differing: Vec<String>,
+    unnamed: Vec<String>,
+    refused: BTreeMap<&'static str, usize>,
+    refused_examples: BTreeMap<&'static str, Vec<String>>,
+}
+
+fn check_declarations(
+    module: &Name,
+    declared: &[std::sync::Arc<SyntaxDecl>],
+    check: &mut DeclarationCheck,
+) {
+    let census: BTreeMap<&Name, &SyntaxDecl> = extension_census()
+        .decls()
+        .iter()
+        .filter(|decl| decl.module == *module)
+        .map(|decl| (&decl.decl, decl.as_ref()))
+        .collect();
+    check.census += census.len();
+    for decl in declared {
+        check.registered += 1;
+        match census.get(&decl.decl) {
+            Some(expected) if **expected == **decl => check.identical += 1,
+            // A `local` entry is not exported, so its census row has no category or scope: only
+            // its description is the pin's to compare.
+            Some(expected) if expected.category.is_none() && expected.descr == decl.descr => {
+                check.identical += 1
+            }
+            Some(expected) => check.differing.push(format!(
+                "{} cat={:?} scope={:?} prio={}\n     pin  {}\n     ours {} cat={:?} scope={:?} prio={}",
+                decl.decl.to_display_string(),
+                expected.category.as_ref().map(Name::to_display_string),
+                expected.scope.as_ref().map(Name::to_display_string),
+                expected.priority,
+                expected.descr,
+                decl.descr,
+                decl.category.as_ref().map(Name::to_display_string),
+                decl.scope.as_ref().map(Name::to_display_string),
+                decl.priority,
+            )),
+            None => check.unnamed.push(format!("{}: {}", module.to_display_string(), decl.decl.to_display_string())),
+        }
+    }
+}
+
+fn classify_file(
+    source: &[u8],
+    trees: &pin_syntax::PinTrees,
+    module: Option<Name>,
+    check: &mut DeclarationCheck,
+) -> Vec<Outcome> {
     let commands: Vec<&Syntax> = trees
         .commands
         .iter()
@@ -197,7 +257,14 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
         Err(error) => return whole(format!("file:header:{}", refusal_class(&error))),
     };
     let body_start = header.body_start.0;
-    let ours: BTreeMap<usize, &[u8]> = match command_scope::partition(&source[body_start..]) {
+    let mut grammar = match FileGrammar::new(header.prelude, &header.imports, module.clone()) {
+        Ok(grammar) => grammar,
+        Err(_) => return whole("file:grammar".to_owned()),
+    };
+    let partitioned = with_grammar(&grammar.grammar(), || {
+        command_scope::partition(&source[body_start..])
+    });
+    let ours: BTreeMap<usize, &[u8]> = match partitioned {
         Ok(parts) => parts
             .into_iter()
             .map(|(offset, bytes)| (offset.0 + body_start, bytes))
@@ -225,7 +292,7 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
             return lost;
         }
     };
-    commands
+    let outcomes = commands
         .iter()
         .map(|pin| {
             let Some(start) = first_position(pin) else {
@@ -243,10 +310,17 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
                 },
                 Err(kind) => outcome(format!("tree:{kind}"), start),
             };
-            match command_scope::parse(bytes) {
+            let current = grammar.grammar();
+            match with_grammar(&current, || command_scope::parse(bytes)) {
                 Ok(Some(scope)) => {
                     // The command after an `in` may be one the parser refuses.
-                    return match command_scope::trees::tree(bytes) {
+                    let inner = match &scope {
+                        ScopeCommand::OpenIn { names, .. } => grammar.grammar_opening(names),
+                        _ => current,
+                    };
+                    let tree = with_grammar(&inner, || command_scope::trees::tree(bytes));
+                    grammar.apply(&scope);
+                    return match tree {
                         Ok(Some(syntax)) => compared(&syntax),
                         Ok(None) => outcome(format!("no-tree:{}", scope_name(&scope)), start),
                         Err(error) => outcome(format!("refused:{}", refusal_class(&error)), start),
@@ -257,18 +331,37 @@ fn classify_file(source: &[u8], trees: &pin_syntax::PinTrees) -> Vec<Outcome> {
                 // `open A (x) in …`) is compared through its tree where the parser builds one, as
                 // a declaration the checker refuses is.
                 Err(error) => {
-                    return match command_scope::trees::tree(bytes) {
+                    return match with_grammar(&current, || command_scope::trees::tree(bytes)) {
                         Ok(Some(syntax)) => compared(&syntax),
                         _ => outcome(format!("refused:{}", refusal_class(&error)), start),
                     };
                 }
             }
-            match parse_source_command(bytes) {
+            match with_grammar(&current, || parse_source_command(bytes)) {
                 Err(error) => outcome(format!("refused:{}", refusal_class(&error)), start),
-                Ok(parsed) => compared(parsed.syntax()),
+                Ok(parsed) => {
+                    if let Err(reason) = grammar.declare(parsed.syntax()) {
+                        *check.refused.entry(reason).or_default() += 1;
+                        let shown = check.refused_examples.entry(reason).or_default();
+                        if shown.len() < 6 {
+                            shown.push(
+                                String::from_utf8_lossy(bytes)
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    compared(parsed.syntax())
+                }
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(module) = &module {
+        check_declarations(module, grammar.declared(), check);
+    }
+    outcomes
 }
 
 #[test]
@@ -339,6 +432,7 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
     let mut stoppers: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut identical_files = 0usize;
     let mut total = 0usize;
+    let mut check = DeclarationCheck::default();
     for file in &files {
         let source = std::fs::read(root.join(SOURCES).join(file)).expect("read a source");
         let Ok(dump) = std::fs::read_to_string(cache.join(format!("{:016x}.dump", fnv1a(&source))))
@@ -350,7 +444,10 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
             return;
         };
         let trees = pin_syntax::read(&dump, &source).expect("a cached dump reads");
-        let outcomes = classify_file(&source, &trees);
+        let module = file
+            .strip_suffix(".lean")
+            .map(|path| Name::from_components(path.split('/')));
+        let outcomes = classify_file(&source, &trees, module, &mut check);
         if !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.class == "identical") {
             identical_files += 1;
         }
@@ -400,4 +497,31 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
     for (key, (files, commands)) in stopped.iter().take(30) {
         eprintln!("  stopper {commands} commands in {files} files: {key}");
     }
+    eprintln!(
+        "pin_syntax_frontier_a declarations: {} registered, {} identical to the census, {} \
+         differing, {} absent from it; the census has {} for these modules; refused: {:?}",
+        check.registered,
+        check.identical,
+        check.differing.len(),
+        check.unnamed.len(),
+        check.census,
+        check.refused
+    );
+    for differing in check.differing.iter().take(40) {
+        eprintln!("  differs: {differing}");
+    }
+    for unnamed in check.unnamed.iter().take(12) {
+        eprintln!("  absent: {unnamed}");
+    }
+    for (reason, shown) in &check.refused_examples {
+        eprintln!("  refused ({reason}): {}", shown.join(" || "));
+    }
+    // The translation is the pin's or it registers nothing: a declaration that reads differently
+    // from its census row, or under a name the census lacks, is a translator defect.
+    assert!(
+        check.differing.is_empty() && check.unnamed.is_empty(),
+        "{} declarations differ from their census rows and {} are absent from the census",
+        check.differing.len(),
+        check.unnamed.len()
+    );
 }

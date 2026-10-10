@@ -48,11 +48,27 @@ impl Patterns<'_> {
         refusal(self.view, self.tokens, at)
     }
 
-    /// `rintroPat.one` units, each a name, `_`, `-` or a `⟨…⟩` tuple.
-    fn rintro_units(&self, range: Range<usize>) -> Result<Vec<Syntax>, NatDefinitionParseError> {
+    /// `rintroPat` units: a name, `_`, `-`, a `⟨…⟩` tuple, or a parenthesized group
+    /// ([`Self::rintro_paren`]).
+    fn rintro_units(
+        &self,
+        range: Range<usize>,
+        depth: usize,
+    ) -> Result<Vec<Syntax>, NatDefinitionParseError> {
+        if depth >= PATTERN_NESTING {
+            return Err(self.refuse(range.start));
+        }
         let mut units = Vec::new();
         let mut at = range.start;
         while at < range.end {
+            if is(self.tokens, at, "(") {
+                let close = matching(self.tokens, at)
+                    .filter(|&close| close < range.end)
+                    .ok_or_else(|| self.refuse(at))?;
+                units.push(self.rintro_paren(at, close, depth)?);
+                at = close + 1;
+                continue;
+            }
             let end = if is(self.tokens, at, "⟨") {
                 matching(self.tokens, at)
                     .filter(|&close| close < range.end)
@@ -68,6 +84,51 @@ impl Patterns<'_> {
             at = end;
         }
         Ok(units)
+    }
+
+    /// `(…)` among `rintro`'s units. `rintroPat.binder` (`"(" rintroPat+ (" : " term)? ")"`,
+    /// priority `default+1` over `rcasesPat.paren`) where its contents read so; with a top-level
+    /// `|` only `rcasesPat.paren` reads it (`(h | rfl)`), as the pin's longest match chooses.
+    fn rintro_paren(
+        &self,
+        open: usize,
+        close: usize,
+        depth: usize,
+    ) -> Result<Syntax, NatDefinitionParseError> {
+        let inner = open + 1..close;
+        if !split(self.tokens, inner.clone(), "|").is_empty() {
+            return Ok(Syntax::node(
+                kind(&["rintroPat", "one"]),
+                vec![self.pat(open..close + 1, depth)?],
+            ));
+        }
+        let (patterns, type_) = match split(self.tokens, inner.clone(), ":").first().copied() {
+            Some(colon) if colon > inner.start && colon + 1 < inner.end => (
+                inner.start..colon,
+                null_node(vec![
+                    self.leaves.leaf(colon)?,
+                    bounded_term(
+                        self.leaves,
+                        self.view,
+                        self.tokens,
+                        colon + 1..inner.end,
+                        DefinitionGrammar::Scalar,
+                    )?,
+                ]),
+            ),
+            Some(colon) => return Err(self.refuse(colon)),
+            None if inner.is_empty() => return Err(self.refuse(close)),
+            None => (inner, null_node(Vec::new())),
+        };
+        Ok(Syntax::node(
+            kind(&["rintroPat", "binder"]),
+            vec![
+                self.leaves.leaf(open)?,
+                null_node(self.rintro_units(patterns, depth + 1)?),
+                type_,
+                self.leaves.leaf(close)?,
+            ],
+        ))
     }
 
     /// `rcasesPatLo`: a `Med`, then an optional top-level `: T`.
@@ -185,6 +246,11 @@ impl Patterns<'_> {
         }
         Err(self.refuse(first))
     }
+}
+
+/// The token closing the bracket opened at `open`.
+pub(super) fn closing(tokens: &[LexedToken], open: usize) -> Option<usize> {
+    matching(tokens, open)
 }
 
 /// The token closing the bracket opened at `open`.
@@ -351,7 +417,7 @@ pub(super) fn tactic(
         // (`Init/Ext.lean`).
         "ext" => {
             let colon = split(tokens, body.clone(), ":").first().copied();
-            let units = patterns.rintro_units(body.start..colon.unwrap_or(body.end))?;
+            let units = patterns.rintro_units(body.start..colon.unwrap_or(body.end), 0)?;
             let depth = match colon {
                 Some(colon)
                     if colon + 2 == body.end
@@ -378,7 +444,7 @@ pub(super) fn tactic(
         }
         // `syntax "ext1" (colGt ppSpace rintroPat)* : tactic` (`Init/Ext.lean`).
         "ext1" => {
-            let units = patterns.rintro_units(body.clone())?;
+            let units = patterns.rintro_units(body.clone(), 0)?;
             Ok(Syntax::node(
                 Name::from_components(["Lean", "Elab", "Tactic", "Ext", "tacticExt1___"]),
                 vec![atom, null_node(units)],
@@ -387,7 +453,7 @@ pub(super) fn tactic(
         // `"rintro" (ppSpace colGt rintroPat)+ (" : " term)?`; only `rintroPat.one`.
         "rintro" => {
             let colon = split(tokens, body.clone(), ":").first().copied();
-            let units = patterns.rintro_units(body.start..colon.unwrap_or(body.end))?;
+            let units = patterns.rintro_units(body.start..colon.unwrap_or(body.end), 0)?;
             if units.is_empty() {
                 return Err(refusal(view, tokens, body.start));
             }

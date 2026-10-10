@@ -600,11 +600,15 @@ pub(crate) fn parse_scoped_command(
     {
         return Ok(ScopedCommandSyntax::Mutual(members));
     }
+    // Under an entered grammar (`source_check::grammar`), the file's notations are expanded
+    // before the elaborator reads the tree.
     let parsed = fln_parse::parse_definition(source)
+        .and_then(fln_parse::ParsedDefinition::expanded)
         .map_err(DefinitionFrontendError::Parse)
         .map_err(EngineExecutionError::Frontend)?;
     if fln_elab::source::scope::is_example(parsed.syntax()) {
         let parsed = fln_parse::parse_source_command(source)
+            .and_then(fln_parse::ParsedSourceCommand::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         return Ok(ScopedCommandSyntax::Example(parsed));

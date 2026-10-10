@@ -80,6 +80,26 @@ fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
             .expect("token line")
             .0
 }
+/// The bracket closing the one opened at `open` (a compound opener such as `` `(tactic| `` too),
+/// before `end`.
+fn bracket_close(tokens: &[LexedToken], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().take(end).skip(open) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
 fn later_line(view: &SourceView, tokens: &[LexedToken], a: usize, b: usize) -> bool {
     view.normalized().line_of(tokens[a].extent.start())
         > view.normalized().line_of(tokens[b].extent.start())
@@ -156,7 +176,16 @@ fn plan(
     let mut done = Vec::new();
     let mut do_scopes = DoScopes::default();
     let mut pending_matches: Option<(usize, usize)> = None;
+    // A `by` block inside brackets that is no row's proof (`⟨by intro h; induction l with | …, x⟩`)
+    // is the proof parser's whole: its tactics' `|`s, `with`s and `match`es are not this plan's.
+    let mut proof_end = 0;
+    // Per bracket depth, the binders (`∃ h : p, q`, `∀ x, p`, `Σ x, β x`) whose comma is still to
+    // come: that comma is the binder's own, not one that ends an alternative's body.
+    let mut binder_commas: Vec<usize> = Vec::new();
     for at in range.clone() {
+        if at < proof_end {
+            continue;
+        }
         let depth = delimiters.len();
         let failure = fallback::candidate(tokens, at, depth, lets.last(), active.len());
         do_scopes.before(
@@ -269,7 +298,25 @@ fn plan(
         let TokenKind::Symbol(symbol) = &tokens[at].kind else {
             continue;
         };
+        // A quotation is read whole, as a `by` block is: a tactic quotation's `first` pipes
+        // (`(tactic|⏎  first⏎  | exact …)`) are not this plan's, and a term quotation's `match`
+        // or `if` (`(if $c then …)`) is planned by the quotation's own term.
+        if crate::quotations::opens(symbol)
+            && let Some(close) = bracket_close(tokens, at, range.end)
+        {
+            proof_end = close + 1;
+            continue;
+        }
         let depth = delimiters.len();
+        if matches!(
+            symbol.as_str(),
+            "∃" | "∃!" | "∀" | "forall" | "exists" | "Σ" | "Σ'"
+        ) {
+            if binder_commas.len() <= depth {
+                binder_commas.resize(depth + 1, 0);
+            }
+            binder_commas[depth] += 1;
+        }
         let proof_body = active.last().is_some_and(|p| {
             p.depth == depth
                 && p.alternatives.last().is_some_and(|alt| {
@@ -278,9 +325,23 @@ fn plan(
                         || alt.by_at.is_some_and(|by| at > by)
                 })
         });
+        // A row's tactic proof (`=> by …`), as opposed to its `do` block, which also owns `;`s.
+        let tactic_body = active.last().is_some_and(|p| {
+            p.depth == depth
+                && p.alternatives.last().is_some_and(|alt| {
+                    alt.arrow
+                        .is_some_and(|arrow| is_symbol(tokens, arrow + 1, "by") && at > arrow + 1)
+                        || alt
+                            .by_at
+                            .is_some_and(|by| at > by && is_symbol(tokens, by, "by"))
+                })
+        });
         let mut statement_separator = false;
         // A compound symbol acts as the bracket it contains (`]'` in `xs[i]'h` closes `[`).
         match crate::canonical_bracket(symbol.as_str()) {
+            // In a row's proof (`| 0 => by simp; try omega`), and outside every `do` block (a
+            // quotation's `(tactic| …; try omega)`), `try` is the tactic's.
+            "try" if tactic_body || statement.is_none() => {}
             "try" => {
                 let baseline = statement.ok_or_else(|| refuse(view, tokens, at))?;
                 tries.open(view, tokens, at, depth, baseline, &mut do_scopes, range.end)?;
@@ -418,6 +479,13 @@ fn plan(
                 statement.is_some(),
             )),
             // A `do` owns the `;`s after it as a `by` does (`=> do f x; loop i`).
+            "by" if depth > 0
+                && statement.is_none()
+                && active.last().is_none_or(|p| p.depth != depth)
+                && conditionals.last().is_none_or(|p| p.depth != depth) =>
+            {
+                proof_end = proofs::block_extent(view, tokens, at, range.end)?;
+            }
             "by" | "do" => {
                 if let Some(current) = active.last_mut()
                     && current.depth == depth
@@ -457,7 +525,8 @@ fn plan(
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
             }
-            "(" => delimiters.push(")"),
+            // A syntax quotation closes with `)` (`quotations`).
+            "(" | "`(" | "`(tactic|" | "`(conv|" => delimiters.push(")"),
             "{" | ".{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),
@@ -473,12 +542,23 @@ fn plan(
                 p.depth == depth
                     && p.then_at.is_none()
                     && at == p.start + 2
-                    && matches!(tokens[p.start + 1].kind, TokenKind::Ident(_))
+                    && (matches!(tokens[p.start + 1].kind, TokenKind::Ident(_))
+                        || is_symbol(tokens, p.start + 1, "_"))
             }) => {}
             ":" if lets.last().is_some_and(|(d, enclosing, _, _, _)| {
                 *d == depth && active.len() <= *enclosing
             }) => {}
             ")" | "}" | "]" | "⦄" | "⟩" | "," | ":" => {
+                // The binder's own comma, and its type's `:` before it (`∃ h : p, q`).
+                if binder_commas.get(depth).is_some_and(|&open| open > 0) {
+                    if symbol == "," {
+                        binder_commas[depth] -= 1;
+                        continue;
+                    }
+                    if symbol == ":" {
+                        continue;
+                    }
+                }
                 // Commas before `with`, or before a row's arrow, separate
                 // columns of this match rather than terminate its branch body.
                 if symbol == ","
@@ -487,6 +567,15 @@ fn plan(
                             && (p.with.is_none()
                                 || p.alternatives.last().is_some_and(|a| a.arrow.is_none()))
                     })
+                {
+                    continue;
+                }
+                // A comma before the conditional's `then` is its condition's own (`if ∃ i, p i
+                // then …`): an `if` cannot end before its `then`.
+                if symbol == ","
+                    && conditionals
+                        .last()
+                        .is_some_and(|p| p.depth == depth && p.then_at.is_none())
                 {
                     continue;
                 }
@@ -509,6 +598,8 @@ fn plan(
                 {
                     return Err(refuse(view, tokens, at));
                 }
+                // A binder inside the brackets ended with them.
+                binder_commas.truncate(delimiters.len() + 1);
             }
             "with"
                 if active
@@ -573,8 +664,11 @@ fn plan(
                 if current.depth != depth || current.with.is_none() {
                     return Err(refuse(view, tokens, at));
                 }
+                // A later line's alternative starts at the first one's column; a pipe inside the
+                // line (`| ofNat _, succ _ | -[_+1], 0 => …`) separates that row's groups.
                 if let Some(first) = current.alternatives.first()
                     && later_line(view, tokens, at, first.pipe)
+                    && (at == 0 || later_line(view, tokens, at, at - 1))
                     && column(view, tokens, at) != column(view, tokens, first.pipe)
                 {
                     return Err(refuse(view, tokens, at));
@@ -648,12 +742,45 @@ fn plan(
     done.sort_by_key(|p| std::cmp::Reverse(p.start()));
     Ok(done)
 }
+/// Whether `range` is a list pattern at its own top level: a `[` or a `::` outside every bracket
+/// (`[a, b]`, `x :: l`, and `some [x]`, which the list reader takes whole). List syntax nested in
+/// an anonymous constructor or a tuple (`⟨[]⟩`, `(x, [y])`) is the nested pattern's.
+fn list_pattern(tokens: &[LexedToken], range: Range<usize>) -> bool {
+    let mut depth = 0usize;
+    for at in range {
+        match &tokens[at].kind {
+            TokenKind::Symbol(symbol) if depth == 0 && matches!(symbol.as_str(), "[" | "::") => {
+                return true;
+            }
+            TokenKind::Symbol(symbol)
+                if matches!(symbol.as_str(), "(" | "[" | "{" | "⟨" | "#[") =>
+            {
+                depth += 1;
+            }
+            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⟩") => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn pattern(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    // A syntax quotation (`macro_rules | `(f $x) => …`) is a term, read whole.
+    if let Some((quotation, next)) =
+        crate::quotations::quotation(leaves, view, tokens, range.start, range.end)?
+    {
+        if next != range.end {
+            return Err(refuse(view, tokens, next));
+        }
+        return Ok(quotation);
+    }
     // `x@p` around a list pattern (`l@(x :: _)`): the name, then the pattern it names.
     if range.len() >= 3
         && matches!(tokens[range.start].kind, TokenKind::Ident(_))
@@ -675,10 +802,7 @@ fn pattern(
             ],
         ));
     }
-    if range
-        .clone()
-        .any(|at| is_symbol(tokens, at, "[") || is_symbol(tokens, at, "::"))
-    {
+    if list_pattern(tokens, range.clone()) {
         return collections::pattern(leaves, view, tokens, range);
     }
     enum Task {
@@ -832,6 +956,11 @@ fn pattern(
                 if range.is_empty() {
                     return Err(refuse(view, tokens, range.start));
                 }
+                // A list pattern inside another (`⟨[]⟩`, `⟨a :: l⟩`, `(x, [y])`).
+                if list_pattern(tokens, range.clone()) {
+                    values.push(collections::pattern(leaves, view, tokens, range)?);
+                    continue;
+                }
                 // `namedPattern := ident noWs "@" noWs (ident ":")? term:max`: the name touches
                 // the `@`, which touches one atomic pattern ending the range (`l@(x :: _)`).
                 let touching = |left: usize, right: usize| {
@@ -971,6 +1100,15 @@ fn pattern(
                     } else {
                         leaves.leaf(cursor)?
                     }
+                } else if let Some((notation, end)) = (!dot)
+                    .then(|| {
+                        crate::extensions::leading_term(leaves, view, tokens, cursor, range.end)
+                    })
+                    .flatten()
+                {
+                    // An atom-like notation of the entered grammar (`-[n+1]` under `open Int`).
+                    cursor = end - 1;
+                    notation
                 } else {
                     return Err(refuse(view, tokens, cursor));
                 };
@@ -1194,9 +1332,8 @@ fn let_values(
                 let mut value = values.pop().expect("let continuation follows its values");
                 for binding in bindings.into_iter().rev() {
                     let local_value = values.pop().expect("let value precedes its continuation");
-                    // A pattern, an equations or a hinted recursive binding is not read here.
-                    if binding.pattern.is_some() || binding.equations || binding.termination.is_some()
-                    {
+                    // A binding by equations, or with a termination hint, is not read here.
+                    if binding.equations || binding.termination.is_some() {
                         return Err(refuse(view, tokens, binding.name));
                     }
                     let annotation = match binding.explicit_type {
@@ -1218,19 +1355,34 @@ fn let_values(
                     }
                     let parameters =
                         bounded_binder_syntax(leaves, view, tokens, binding.parameters, grammar)?;
-                    let declaration = Syntax::node(
-                        parser_kind(&["Term", "letIdDecl"]),
-                        vec![
-                            Syntax::node(
-                                parser_kind(&["Term", "letId"]),
-                                vec![leaves.leaf(binding.name)?],
-                            ),
-                            null_node(parameters),
-                            annotation,
-                            leaves.leaf(binding.assignment)?,
-                            local_value,
-                        ],
-                    );
+                    let declaration = match binding.pattern {
+                        // `letPatDecl := term pushNone optType " := " term` (`let ⟨a, b⟩ := p`).
+                        Some(pattern) => Syntax::node(
+                            parser_kind(&["Term", "letPatDecl"]),
+                            vec![
+                                bounded_term_spliced(
+                                    leaves, view, tokens, pattern, grammar, splices, updates,
+                                )?,
+                                null_node(vec![]),
+                                annotation,
+                                leaves.leaf(binding.assignment)?,
+                                local_value,
+                            ],
+                        ),
+                        None => Syntax::node(
+                            parser_kind(&["Term", "letIdDecl"]),
+                            vec![
+                                Syntax::node(
+                                    parser_kind(&["Term", "letId"]),
+                                    vec![leaves.leaf(binding.name)?],
+                                ),
+                                null_node(parameters),
+                                annotation,
+                                leaves.leaf(binding.assignment)?,
+                                local_value,
+                            ],
+                        ),
+                    };
                     // The binding's attributes, never dropped: the elaborator refuses them.
                     let attributes = match binding.attributes {
                         Some(at) => crate::command_scope::attributes::inline_syntax(
@@ -1423,8 +1575,9 @@ fn build_conditional(
             ]),
             None => null_node(vec![]),
         };
-        let syntax =
-            statement_conditional(leaves, view, tokens, &plan, then_at, condition, yes, otherwise)?;
+        let syntax = statement_conditional(
+            leaves, view, tokens, &plan, then_at, condition, yes, otherwise,
+        )?;
         splices.insert(plan.start, (plan.end, syntax));
         return Ok(());
     }
@@ -1538,9 +1691,15 @@ fn term_conditional(
             Name::from_components(["termDepIfThenElse"]),
             vec![
                 leaves.leaf(plan.start)?,
+                // `binderIdent := ident <|> hole`: `_` is the hole.
                 Syntax::node(
                     Name::from_components(["Lean", "binderIdent"]),
-                    vec![leaves.leaf(plan.start + 1)?],
+                    vec![match leaves.leaf(plan.start + 1)? {
+                        hole @ Syntax::Atom { .. } => {
+                            Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
+                        }
+                        name => name,
+                    }],
                 ),
                 leaves.leaf(plan.start + 2)?,
                 condition,
@@ -1639,6 +1798,16 @@ fn build_match(
     } else {
         discriminant_columns.len()
     };
+    // Inside a quotation, the pin reads an antiquotation with no kind straight after `match`
+    // (`match $c with`) as the optional `(generalizing := …)` parameter's, and then misses the
+    // discriminant: a parse error there, so a refusal here. `$c:term` is a discriminant.
+    if let Some((first, _)) = discriminant_columns.first()
+        && crate::quotations::inside()
+        && is_symbol(tokens, first.start, "$")
+        && !(first.start + 3 < first.end && is_symbol(tokens, first.start + 2, ":"))
+    {
+        return Err(refuse(view, tokens, first.start));
+    }
     for (mut range, comma) in discriminant_columns {
         // Preserve the pinned optional binderIdent-colon production instead
         // of misreading `h : e` as a term ascription. Parenthesized

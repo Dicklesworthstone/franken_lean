@@ -13,6 +13,27 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionP
         expected: NatDefinitionExpectation::InductiveConstructor,
     }
 }
+/// `rawIdent` at `at`: an identifier, or a keyword spelled as one (`| return : σ → T`), named by its
+/// text.
+fn raw_ident(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let token = tokens.get(at).ok_or_else(|| refuse(view, tokens, at))?;
+    match &token.kind {
+        TokenKind::Ident(_) => Ok(leaves.leaf(at)?),
+        TokenKind::Symbol(text) if crate::spells_identifier(text) => Ok(Syntax::Ident {
+            info: leaves.leaf(at)?.info(),
+            raw_val: token.extent,
+            val: Name::from_components([text.as_str()]),
+            preresolved: Vec::new(),
+        }),
+        _ => Err(refuse(view, tokens, at)),
+    }
+}
+
 fn ctor(
     leaves: &Leaves,
     view: &SourceView,
@@ -28,18 +49,24 @@ fn ctor(
         null_node(vec![])
     };
     let start = range.start + usize::from(symbol(tokens, range.start, "/--"));
-    if !symbol(tokens, start, "|")
-        || !matches!(
-            tokens.get(start + 1).map(|t| &t.kind),
-            Some(TokenKind::Ident(_))
-        )
-    {
+    if !symbol(tokens, start, "|") {
         return Err(refuse(view, tokens, start));
     }
+    // `declModifiers` after the `|`: a doc comment (`| /-- … -/ first`), then `private` or
+    // `protected`.
+    let inner_doc = symbol(tokens, start + 1, "/--").then_some(start + 1);
+    let mut name = start + 1 + usize::from(inner_doc.is_some());
+    let visibility = ["private", "protected"]
+        .into_iter()
+        .find(|word| symbol(tokens, name, word))
+        .map(|word| (word, name));
+    name += usize::from(visibility.is_some());
+    let modifiers = records::modifiers_with(view, leaves, tokens, inner_doc, visibility)?;
+    let name_syntax = raw_ident(leaves, view, tokens, name)?;
     let (groups, end) = bounded_binders(
         view,
         &tokens[..range.end],
-        start + 2,
+        name + 1,
         DefinitionGrammar::Scalar,
     )?;
     let binders = bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
@@ -49,8 +76,8 @@ fn ctor(
         vec![
             doc,
             leaves.leaf(start)?,
-            records::modifiers(),
-            leaves.leaf(start + 1)?,
+            modifiers,
+            name_syntax,
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
                 vec![null_node(binders), result],

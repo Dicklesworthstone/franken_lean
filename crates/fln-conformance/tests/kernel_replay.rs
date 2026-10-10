@@ -5734,6 +5734,341 @@ fn mathlib_corpus_root() -> PathBuf {
 const DEFAULT_MATHLIB_CORPUS_ROOT: &str = "/data/tmp/mathlib4-corpus";
 const MATHLIB_CORPUS_ROOT_ENV: &str = "FLN_MATHLIB_CORPUS";
 
+/// Where the corpus's materialization receipt is retained, per Reference pin
+/// (`scripts/tribunal/materialize_mathlib_corpus.sh`, bead franken_lean-z8j.1.15).
+/// The script leaves the same receipt in the corpus root as
+/// [`MATHLIB_CORPUS_RECEIPT_IN_ROOT`].
+fn mathlib_corpus_receipt_path(pin: &str) -> PathBuf {
+    fln_conformance::checked_manifest_dir!()
+        .join("evidence/mathlib_corpus")
+        .join(format!("{pin}.json"))
+}
+
+const MATHLIB_CORPUS_RECEIPT_IN_ROOT: &str = ".fln-corpus-receipt.json";
+
+/// The identity and counts a corpus materialization receipt states (schema
+/// `fln-mathlib-corpus/1`).
+#[derive(Debug, Clone, PartialEq)]
+struct MathlibCorpusReceipt {
+    corpus_repository: String,
+    corpus_tag: String,
+    corpus_commit: String,
+    reference_tag: String,
+    library_subpath: String,
+    source_modules: u64,
+    oleans: u64,
+    olean_bytes: u64,
+}
+
+impl MathlibCorpusReceipt {
+    fn from_row(row: &str) -> Result<MathlibCorpusReceipt, String> {
+        fn text(row: &str, key: &str) -> Result<String, String> {
+            let needle = format!("\"{key}\":\"");
+            assert_field_once(row, key, &needle)?;
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing string field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find('"')
+                .ok_or_else(|| format!("unterminated string field `{key}`"))?;
+            let value = &rest[..end];
+            assert_no_escape(key, value)?;
+            assert_string_terminator(key, rest, end)?;
+            Ok(value.to_string())
+        }
+        fn number(row: &str, key: &str) -> Result<u64, String> {
+            let needle = format!("\"{key}\":");
+            assert_field_once(row, key, &needle)?;
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing numeric field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            assert_number_terminator(key, rest, end)?;
+            rest[..end]
+                .parse()
+                .map_err(|_| format!("field `{key}` is not a u64"))
+        }
+        let row = row.trim();
+        let schema = text(row, "schema")?;
+        if schema != "fln-mathlib-corpus/1" {
+            return Err(format!("schema `{schema}` is not `fln-mathlib-corpus/1`"));
+        }
+        Ok(MathlibCorpusReceipt {
+            corpus_repository: text(row, "corpus_repository")?,
+            corpus_tag: text(row, "corpus_tag")?,
+            corpus_commit: text(row, "corpus_commit")?,
+            reference_tag: text(row, "reference_tag")?,
+            library_subpath: text(row, "library_subpath")?,
+            source_modules: number(row, "source_modules")?,
+            oleans: number(row, "oleans")?,
+            olean_bytes: number(row, "olean_bytes")?,
+        })
+    }
+
+    /// The receipt names SUITE.lock's corpus row and Reference pin, and a complete corpus: an
+    /// olean for every source module, at least the whole-Mathlib floor of them, holding bytes.
+    fn validate(&self, corpus_row: &str, pin: &str) -> Result<(), String> {
+        let mut fields = corpus_row.split_whitespace();
+        let (Some("corpus"), Some(repository)) = (fields.next(), fields.next()) else {
+            return Err(format!("`{corpus_row}` is not a corpus row"));
+        };
+        let field = |name: &str| {
+            corpus_row
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (name, stated, pinned) in [
+            (
+                "corpus_repository",
+                &self.corpus_repository,
+                repository.to_string(),
+            ),
+            ("corpus_tag", &self.corpus_tag, field("tag=")),
+            ("corpus_commit", &self.corpus_commit, field("commit=")),
+            ("reference_tag", &self.reference_tag, pin.to_string()),
+        ] {
+            if *stated != pinned {
+                return Err(format!("{name} `{stated}` is not the pinned `{pinned}`"));
+            }
+        }
+        if self.library_subpath != ".lake/build/lib/lean/Mathlib" {
+            return Err(format!(
+                "library_subpath `{}` is not the lanes' `.lake/build/lib/lean/Mathlib`",
+                self.library_subpath
+            ));
+        }
+        if self.oleans != self.source_modules {
+            return Err(format!(
+                "{} oleans for {} source modules: the corpus is not complete",
+                self.oleans, self.source_modules
+            ));
+        }
+        if self.source_modules < WHOLE_MATHLIB_SEED_FLOOR {
+            return Err(format!(
+                "{} modules is below the whole-Mathlib floor of {WHOLE_MATHLIB_SEED_FLOOR}",
+                self.source_modules
+            ));
+        }
+        if self.olean_bytes < self.oleans {
+            return Err(format!(
+                "{} olean bytes for {} oleans: the oleans are empty",
+                self.olean_bytes, self.oleans
+            ));
+        }
+        Ok(())
+    }
+
+    /// A materialized root agrees with this receipt: the copy the script left in it states the
+    /// same corpus, and its built tree holds exactly the oleans the receipt counted.
+    fn check_root(&self, root: &Path) -> Result<(), String> {
+        let copy = fs::read_to_string(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT))
+            .map_err(|error| format!("the root holds no readable receipt: {error}"))?;
+        let copy = MathlibCorpusReceipt::from_row(&copy)
+            .map_err(|reason| format!("the root's receipt does not read: {reason}"))?;
+        if copy != *self {
+            return Err(format!(
+                "the root's receipt {copy:?} is not the retained {self:?}"
+            ));
+        }
+        let OleanInventory { oleans, .. } =
+            walk_olean_inventory(&root.join(&self.library_subpath), Some("Mathlib"))?;
+        if oleans.len() as u64 != self.oleans {
+            return Err(format!(
+                "the built tree holds {} oleans where the receipt counted {}",
+                oleans.len(),
+                self.oleans
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn suite_lock_corpus_row() -> &'static str {
+    const SUITE_LOCK: &str = include_str!("../../../SUITE.lock");
+    SUITE_LOCK
+        .lines()
+        .find(|line| line.starts_with("corpus "))
+        .expect("SUITE.lock must have a corpus row")
+}
+
+#[test]
+fn the_mathlib_corpus_receipt_is_retained_and_bound_to_the_current_pin() {
+    let pin = suite_lock_reference_pin();
+    let path = mathlib_corpus_receipt_path(&pin);
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "no materialization receipt for pin {pin} at {}: {error}. Run \
+             scripts/tribunal/materialize_mathlib_corpus.sh on a measurement host and commit the \
+             receipt it writes",
+            path.display()
+        )
+    });
+    let receipt = MathlibCorpusReceipt::from_row(&text)
+        .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+    receipt
+        .validate(suite_lock_corpus_row(), &pin)
+        .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+}
+
+#[test]
+fn a_tampered_mathlib_corpus_receipt_is_refused() {
+    let pin = suite_lock_reference_pin();
+    let retained = fs::read_to_string(mathlib_corpus_receipt_path(&pin))
+        .expect("the retained receipt (see the_mathlib_corpus_receipt_is_retained_and_bound_to_the_current_pin)");
+    let receipt = MathlibCorpusReceipt::from_row(&retained).expect("the retained receipt reads");
+    let commit = format!("\"corpus_commit\":\"{}\"", receipt.corpus_commit);
+    let oleans = format!("\"oleans\":{}", receipt.oleans);
+    let modules = format!("\"source_modules\":{}", receipt.source_modules);
+    let cases = [
+        (
+            retained.replace(
+                &commit,
+                "\"corpus_commit\":\"0000000000000000000000000000000000000000\"",
+            ),
+            "corpus_commit",
+        ),
+        (
+            retained.replace(
+                &format!("\"reference_tag\":\"{pin}\""),
+                "\"reference_tag\":\"v0.0.0\"",
+            ),
+            "reference_tag",
+        ),
+        (
+            retained.replace(&oleans, &format!("\"oleans\":{}", receipt.oleans - 1)),
+            "not complete",
+        ),
+        (
+            retained
+                .replace(&oleans, "\"oleans\":12")
+                .replace(&modules, "\"source_modules\":12"),
+            "floor",
+        ),
+        (
+            retained.replace("\"fln-mathlib-corpus/1\"", "\"fln-mathlib-corpus/0\""),
+            "schema",
+        ),
+        (
+            retained.replacen(&commit, &format!("{commit},{commit}"), 1),
+            "more than once",
+        ),
+    ];
+    for (tampered, expected) in cases {
+        assert_ne!(
+            tampered, retained,
+            "the tamper for `{expected}` changed nothing"
+        );
+        let refusal = MathlibCorpusReceipt::from_row(&tampered)
+            .and_then(|receipt| receipt.validate(suite_lock_corpus_row(), &pin))
+            .expect_err(expected);
+        assert!(
+            refusal.contains(expected),
+            "`{expected}` refused for another reason: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_materialized_root_that_disagrees_with_its_receipt_is_refused() {
+    let root = write_inventory_fixture(
+        "z8j115-corpus-root-v1",
+        &[
+            MATHLIB_CORPUS_RECEIPT_IN_ROOT,
+            "Mathlib/A.olean",
+            "Mathlib/B/C.olean",
+            "Mathlib/B/D.olean",
+        ],
+    );
+    let receipt = MathlibCorpusReceipt {
+        corpus_repository: "leanprover-community/mathlib4".to_string(),
+        corpus_tag: "v0.0.0".to_string(),
+        corpus_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        reference_tag: "v0.0.0".to_string(),
+        library_subpath: "Mathlib".to_string(),
+        source_modules: 3,
+        oleans: 3,
+        olean_bytes: 3,
+    };
+    let row = |receipt: &MathlibCorpusReceipt| {
+        format!(
+            "{{\"schema\":\"fln-mathlib-corpus/1\",\"corpus_repository\":\"{}\",\"corpus_tag\":\"{}\",\
+             \"corpus_commit\":\"{}\",\"reference_tag\":\"{}\",\"library_subpath\":\"{}\",\
+             \"source_modules\":{},\"oleans\":{},\"olean_bytes\":{}}}\n",
+            receipt.corpus_repository,
+            receipt.corpus_tag,
+            receipt.corpus_commit,
+            receipt.reference_tag,
+            receipt.library_subpath,
+            receipt.source_modules,
+            receipt.oleans,
+            receipt.olean_bytes
+        )
+    };
+    fs::write(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT), row(&receipt))
+        .expect("the root's receipt");
+    receipt
+        .check_root(&root)
+        .unwrap_or_else(|reason| panic!("an agreeing root must be accepted: {reason}"));
+
+    // The retained receipt counts an olean the root's own copy does not.
+    let short = MathlibCorpusReceipt {
+        oleans: 4,
+        source_modules: 4,
+        ..receipt.clone()
+    };
+    let refusal = short
+        .check_root(&root)
+        .expect_err("a receipt the root's copy does not state");
+    assert!(refusal.contains("is not the retained"), "{refusal}");
+    // A copy tampered to match it, over a tree that holds fewer oleans than both count.
+    fs::write(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT), row(&short)).expect("a tampered copy");
+    let refusal = short
+        .check_root(&root)
+        .expect_err("a tree with fewer oleans than counted");
+    assert!(
+        refusal.contains("holds 3 oleans where the receipt counted 4"),
+        "{refusal}"
+    );
+}
+
+/// When the corpus is on this host, it is the one the retained receipt describes.
+#[test]
+fn the_materialized_mathlib_corpus_matches_its_retained_receipt() {
+    match classify_mathlib_corpus_input() {
+        MathlibCorpusInput::Absent { root, .. } => {
+            println!(
+                "{{\"schema\":\"fln-z8j115-corpus-receipt/1\",\"status\":\"skipped_absent_host_input\",\"root\":{}}}",
+                json_string(&root.display().to_string())
+            );
+        }
+        MathlibCorpusInput::Misprovisioned { root, reason } => {
+            panic!(
+                "the corpus root {} is misprovisioned: {reason}",
+                root.display()
+            )
+        }
+        MathlibCorpusInput::Present { root, .. } => {
+            let pin = suite_lock_reference_pin();
+            let path = mathlib_corpus_receipt_path(&pin);
+            let receipt = fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| MathlibCorpusReceipt::from_row(&text))
+                .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+            receipt
+                .check_root(&root)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", root.display()));
+        }
+    }
+}
+
 /// Refuse before an expensive whole-corpus run when its external input cannot
 /// identify itself. This is intentionally stronger than `is_dir()`: a different
 /// Mathlib commit, a symlinked checkout, or a source-only checkout would make a

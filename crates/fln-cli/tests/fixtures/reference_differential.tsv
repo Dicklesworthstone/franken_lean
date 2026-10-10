@@ -22,7 +22,8 @@ crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean	accept	rej
 crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	accept	match	agree	both FrankenLean doors now accept (measured 2026-10-06 at 5a3ff40e)
 crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_fold.lean	accept	accept	match	agree	both FrankenLean doors accept and the output matches the pin, as observed at eb465592 (it moved with main's 2026-10-06 source work; the row had not)
-crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/user_macro.lean	accept	accept	match	agree	a term macro and syntax with its macro_rules, the file's own, expanded where they are used (franken_lean-z8j.1.11); both print 42 and 6
+crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	accept	match	agree	the file's own notation is declared, expanded hygienically and evaluated (franken_lean-z8j.1.10); both print 42
 examples/native_closure_data.lean	accept	accept	match	agree	agrees since fln-ffce renamed the `prefix` binder, a keyword at the pin (it was reserved keyword accepted as identifier, franken_lean-z8j.1.6.2)
 examples/native_collection_notation.lean	accept	accept	match	agree	
 examples/native_collection_runtime.lean	accept	accept	match	agree	
@@ -38,7 +39,7 @@ examples/native_context_generalization.lean	accept	accept	match	agree	agrees aga
 examples/native_decidable_cases.lean	accept	accept	match	agree	an unnamed `by_cases p` now binds a hygienic hypothesis as at the pin (a source `h` no longer reaches it), and the example names its hypothesis `by_cases h : p`; the earlier first error, `scoped` used as a name (18), was renamed with fln-ffce
 examples/native_decision_proofs.lean	reject	accept	n/a	missing-prelude	Reference 2: `not_false` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_decisions.lean	accept	accept	match	agree	
-examples/native_default_simp.lean	accept	check-only	n/a	unsupported	valid Lean since franken_lean-jxw: line 26 unfolds the bare `wrap`; the old `simp [-unwrap, (wrap)]` is a parenthesized term the pin refuses ("Invalid simp theorem: Expected a proposition"), now refused by FrankenLean as well and kept as a refusal fixture in source_default_simp | check-source accepts; the drop-in refuses at the `@[simp]` attribute, which its execution batch does not parse
+examples/native_default_simp.lean	accept	accept	match	agree	valid Lean since franken_lean-jxw: line 26 unfolds the bare `wrap`; the old `simp [-unwrap, (wrap)]` is a parenthesized term the pin refuses ("Invalid simp theorem: Expected a proposition"), now refused by FrankenLean as well and kept as a refusal fixture in source_default_simp; drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated)
 examples/native_dependent_indices.lean	reject	accept	n/a	fln-defect	Reference 5: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
 examples/native_dependent_vector_pipeline.lean	accept	accept	match	agree	
 examples/native_do.lean	reject	reject	n/a	agree	Reference 1: `Pure` has already been declared | agreement by outcome only: FrankenLean still accepts the `Pure` redeclaration and refuses later, at command 6 (native instance search could not resolve all instance arguments) (franken_lean-z8j.1.8)
@@ -52,7 +53,7 @@ examples/native_floats.lean	accept	accept	match	agree
 examples/native_function_child_runtime.lean	accept	accept	match	agree	
 examples/native_function_children.lean	reject	reject	n/a	agree	Reference 24: code generator does not support recursor `Accessible.rec` yet, consider using 'match ... with' and/or structural recursion | both FrankenLean doors now refuse it with the pin's message (franken_lean-z8j.1.6.6); executing it is the frontier lane
 examples/native_global_stages.lean	accept	accept	match	agree	
-examples/native_goal_control.lean	reject	accept	n/a	fln-defect	Reference 39: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
+examples/native_goal_control.lean	reject	reject	n/a	agree	fixed: both doors refuse at the Reference's first error, 39: failed to synthesize instance (native instance search could not resolve all instance arguments; measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated; was fln-defect, franken_lean-z8j.1.6.4)
 examples/native_ground_projections.lean	accept	accept	match	agree	
 examples/native_heterogeneous_equality.lean	accept	accept	match	agree	the contradiction divergence closed with franken_lean-z8j.1.6.1: FrankenLean's contradiction refutes only a head-constructor clash or a closed decidable equation, as the pin's does; the example now injects first, and its old form is a negative fixture in crates/fln/tests
 examples/native_hypothesis_rewriting.lean	accept	accept	match	agree	
@@ -65,7 +66,7 @@ examples/native_indexed_recursion.lean	accept	accept	match	agree
 examples/native_indexed_vectors.lean	accept	accept	match	agree	valid Lean since franken_lean-z8j.1.6.6: the folds are structural recursion through `match`, where the old form applied `Vec.rec` directly, which the pin's code generator refuses and FrankenLean now refuses too (source_codegen_recursors)
 examples/native_induction.lean	accept	accept	match	agree	valid Lean since its Package value is compared at the unfolded type (`(31 : Nat)`): a bare numeral at `packed.carrier` has no OfNat instance at the pin ("failed to synthesize", the class of fln-5efd); the drop-in runs `unpack`'s dependent record eliminator since 58a3347d (fln-lvdh)
 examples/native_induction_specialization.lean	reject	reject	n/a	agree	fixed: both doors reject at the Reference's first error, 6: Type mismatch (a named variable at a promoted parameter; was fln-defect, franken_lean-z8j.1.6)
-examples/native_instance_attributes.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_instance_attributes.lean	accept	accept	match	agree	drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated)
 examples/native_instance_factories.lean	accept	accept	match	agree	
 examples/native_instance_output_search.lean	accept	accept	match	agree	
 examples/native_instances.lean	accept	accept	match	agree	
@@ -75,7 +76,7 @@ examples/native_local_helpers.lean	accept	accept	match	agree
 examples/native_local_proofs.lean	accept	accept	match	agree	agrees since fln-lvdh: its Type-field record compiles in the drop-in door
 examples/native_local_recursion.lean	accept	accept	match	agree	
 examples/native_local_templates.lean	accept	accept	match	agree	
-examples/native_logical_rewriting.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_logical_rewriting.lean	accept	accept	match	agree	drop-in lean accepts as well (measured 2026-10-09; the row had gone stale, the differential being pin-gated)
 examples/native_match_equations.lean	accept	accept	match	agree	
 examples/native_matrix_recursion.lean	reject	reject	n/a	agree	fixed by z8j.1.6 at a later command: both doors reject `constrained` (line 42), the Reference's 44: Type mismatch at Walk's promoted parameter; still accepted: the Reference's first error 2: `Seq` has already been declared (missing-prelude, franken_lean-z8j.1.8) and the errors that follow from it
 examples/native_multistage_callbacks.lean	accept	accept	match	agree	
@@ -86,7 +87,7 @@ examples/native_mutual_groups.lean	accept	accept	match	agree	the parameter-name 
 examples/native_mutual_indexed.lean	reject	reject	n/a	agree	Reference 11: Application type mismatch: The argument | agreement by outcome only: the Reference's first error is inside `map`'s `Forest.rec` application, which FrankenLean's elaborator still accepts (franken_lean-z8j.1.6.3); FrankenLean refuses the same declaration because it applies `Forest.rec` directly (franken_lean-z8j.1.6.6)
 examples/native_nat_recursion.lean	accept	accept	match	agree	
 examples/native_nested_lets.lean	accept	accept	match	agree	
-examples/native_option_decide.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts. Was a false accept naming the seed's instDecidableEqOption, which the Reference does not have; the seed's instance now carries the pin's name Option.instDecidableEq (fln-ew20)
+examples/native_option_decide.lean	accept	accept	match	agree	drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated). Was a false accept naming the seed's instDecidableEqOption, which the Reference does not have; the seed's instance now carries the pin's name Option.instDecidableEq (fln-ew20)
 examples/native_parameterized_recursion.lean	reject	accept	n/a	missing-prelude	Reference 1: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_pattern_functions.lean	accept	accept	match	agree	
 examples/native_pattern_matching.lean	reject	reject	n/a	agree	Reference 37: failed to synthesize instance of type class | FrankenLean: command 13, native instance search could not resolve all instance arguments
@@ -102,17 +103,17 @@ examples/native_quotients.lean	accept	check-only	n/a	unsupported	drop-in lean re
 examples/native_record_defaults.lean	accept	accept	match	agree	
 examples/native_record_runtime.lean	accept	accept	match	agree	
 examples/native_record_values.lean	accept	accept	match	agree	valid Lean since its Package values are compared at the unfolded type (`(23 : Nat)`): a bare numeral at `wrapped.carrier` has no OfNat instance at the pin ("failed to synthesize"), the class of fln-5efd
-examples/native_records.lean	reject	accept	n/a	fln-defect	Reference 7: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4
+examples/native_records.lean	reject	reject	n/a	agree	fixed: both doors refuse at the Reference's first error, 7: failed to synthesize instance (native instance search could not resolve all instance arguments; measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated; was fln-defect, franken_lean-z8j.1.6.4)
 examples/native_recursion.lean	reject	check-only	n/a	fln-defect	Reference 45: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); the earlier first error, `repeat` used as a name (18), was renamed with fln-ffce
 examples/native_recursive_data.lean	accept	accept	match	agree	
-examples/native_refinement.lean	reject	accept	n/a	fln-defect	Reference 26: failed to synthesize instance of type class | instance synthesis succeeds where the Reference fails (franken_lean-z8j.1.6.4); since fln-lvdh the drop-in door accepts too: its compile refusal of a Type-field record had masked this false accept, owned by franken_lean-z8j.1.6.4; the transport at 48 now uses `cases h`, since `subst` on an HEq whose types differ is refused here as at the pin
-examples/native_scoped_instances.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_refinement.lean	reject	reject	n/a	agree	fixed: both doors refuse at the Reference's first error, 26: failed to synthesize instance (native instance search could not resolve all instance arguments; measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated; was fln-defect, franken_lean-z8j.1.6.4); the transport at 48 now uses `cases h`, since `subst` on an HEq whose types differ is refused here as at the pin
+examples/native_scoped_instances.lean	accept	accept	match	agree	drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated)
 examples/native_scopes.lean	accept	accept	match	agree	the drop-in door accepts too and the output matches the pin, as observed at eb465592 (namespaces, sections and `open` reached the drop-in door in 11a87a28; the row had not moved)
-examples/native_section_inductives.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
-examples/native_section_records.lean	accept	check-only	n/a	unsupported	drop-in lean refuses; only fln check-source accepts
+examples/native_section_inductives.lean	accept	accept	match	agree	drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated)
+examples/native_section_records.lean	accept	accept	match	agree	drop-in lean accepts as well, output identical (measured 2026-10-09 at origin/main 1f6e27b6, alone and with the syntax-extension landing; the row had gone stale, the differential being pin-gated)
 examples/native_simp_all.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
 examples/native_simp_hypotheses.lean	accept	accept	match	agree	the simp-at unsolved-goals divergence closed with franken_lean-z8j.1.6.1: the simp set is built once, so a located hypothesis that is rewritten keeps no rule for the rest of the tactic (an unrewritten located hypothesis's rule stays live), as measured at v4.32.0; the example's transport theorem now closes its goal explicitly with the rewritten hypothesis
-examples/native_simpa.lean	accept	check-only	n/a	unsupported	the bare-simpa unsolved-goals divergence closed with franken_lean-z8j.1.6.1: bare simpa simplifies the goal and closes with plain assumption against unsimplified hypotheses, as measured at v4.32.0 (including the no-progress case, which still closes by assumption); the remaining check-only split is the @[simp] attribute command outside the drop-in door's bounded grammar, a pre-existing parser gap unrelated to tactics
+examples/native_simpa.lean	accept	accept	match	agree	drop-in lean accepts as well (measured 2026-10-09; the row had gone stale, the differential being pin-gated); bare simpa per franken_lean-z8j.1.6.1
 examples/native_simplification.lean	accept	accept	match	agree	agrees again: closed arithmetic over class-term numerals is admitted (fln-ffce; had regressed with 75c8f103)
 examples/native_singleton_inference.lean	accept	accept	match	agree	
 examples/native_staged_callbacks.lean	accept	accept	match	agree	

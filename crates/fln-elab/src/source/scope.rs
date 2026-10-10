@@ -363,6 +363,19 @@ impl Context {
         &mut self,
         name: &Name,
     ) -> Result<Result<Option<Name>, Vec<Name>>, NatDefinitionElabError> {
+        // A name a notation's template supplies carries the expansion's macro scopes
+        // (`Name.addMacroScope`). The pin's `resolveName` matches locals by the scoped name,
+        // which no binder of the use site has (the template's own binders were matched exactly
+        // before resolution), and `resolveGlobalName` reads it with the scopes erased: so a
+        // template's `f` means the global `f` even where the use site binds a local `f`.
+        let hygienic = name.has_macro_scopes();
+        let erased;
+        let name = if hygienic {
+            erased = name.erase_macro_scopes();
+            &erased
+        } else {
+            name
+        };
         // The scope is externally supplied through the embeddable API as well.
         // Charge its complete search width before scanning even an empty env.
         for _ in 0..self
@@ -399,7 +412,7 @@ impl Context {
         // exists here: `namespace A` / `def foo : Nat := foo` names `A.foo`, never a
         // root `foo`, and `open P` never makes `foo` mean `P.foo` there.
         let local = |candidate: &Name| {
-            self.txn.lctx.find_by_user_name(candidate).is_some()
+            !hygienic && self.txn.lctx.find_by_user_name(candidate).is_some()
                 || self
                     .recursion
                     .as_ref()
@@ -410,7 +423,7 @@ impl Context {
         // (vendored `src/Lean/Elab/Term.lean`, `resolveName`), so a local, or the
         // declaration's own recursive reference, named at the current namespace or a
         // parent is never one candidate among globals. `_root_.x` names no local.
-        if !is_root_qualified(name) {
+        if !is_root_qualified(name) && !hygienic {
             let mut namespace = self.source_scope.namespace.clone();
             loop {
                 let candidate = namespace.append_core(name);

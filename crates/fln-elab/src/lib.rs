@@ -323,106 +323,12 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
     Ok(Literal::Nat(literal_from_bignat(&value)))
 }
 
-fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
-    let mut value = 0_u32;
-    for byte in bytes {
-        let digit = natural_digit(*byte).ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        value = value
-            .checked_mul(16)
-            .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    }
-    // Pin `decodeQuotedChar` (`Init/Meta/Defs.lean:1096-1105`) feeds the
-    // digits to `Char.ofNat`. Invalid scalars (the UTF-16 surrogates a
-    // four-digit `\u` can name) become `'\0'`, not a decode failure
-    // (`Prelude.lean:2867-2870`). `char::from_u32` is the Rust refusal;
-    // using it here rejected `"\uD800"` while the pin accepted a NUL.
-    Ok(char::from_u32(value).unwrap_or('\0'))
-}
-
+/// `Syntax.isStrLit?`'s value ([`fln_syntax::literal::decode_string`], shared with the parser,
+/// which reads `syntax` declarations' atoms with it).
 fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
-    if spelling.starts_with('r') {
-        let bytes = spelling.as_bytes();
-        let mut opener = 1;
-        while bytes.get(opener) == Some(&b'#') {
-            opener += 1;
-        }
-        if bytes.get(opener) != Some(&b'"') {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        let hashes = opener - 1;
-        let suffix = 1_usize
-            .checked_add(hashes)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        let content_start = opener + 1;
-        let content_stop = spelling
-            .len()
-            .checked_sub(suffix)
-            .filter(|stop| *stop >= content_start)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        if bytes.get(content_stop) != Some(&b'"')
-            || bytes[content_stop + 1..].iter().any(|byte| *byte != b'#')
-        {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        return Ok(Literal::Str(
-            spelling[content_start..content_stop].to_owned(),
-        ));
-    }
-
-    let content = spelling
-        .strip_prefix('"')
-        .and_then(|spelling| spelling.strip_suffix('"'))
-        .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    let mut decoded = String::new();
-    let mut chars = content.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-        let escaped = chars
-            .next()
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        match escaped {
-            '\\' => decoded.push('\\'),
-            '"' => decoded.push('"'),
-            '\'' => decoded.push('\''),
-            'r' => decoded.push('\r'),
-            'n' => decoded.push('\n'),
-            't' => decoded.push('\t'),
-            'x' => {
-                let digits = chars.by_ref().take(2).collect::<String>();
-                if digits.len() != 2 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            'u' => {
-                let digits = chars.by_ref().take(4).collect::<String>();
-                if digits.len() != 4 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
-            // only on a newline after `\`. `stringGapFn` then eats pin
-            // whitespace (`Char.isWhitespace`: space, tab, CR, LF) and
-            // refuses a second newline. Unicode White_Space (NBSP, form
-            // feed, …) is content, not gap.
-            '\n' => loop {
-                match chars.clone().next() {
-                    Some('\n') => return Err(NatDefinitionElabError::InvalidStringLiteral),
-                    Some(whitespace) if fln_syntax::literal::is_whitespace(whitespace) => {
-                        chars.next();
-                    }
-                    _ => break,
-                }
-            },
-            _ => return Err(NatDefinitionElabError::InvalidStringLiteral),
-        }
-    }
-    Ok(Literal::Str(decoded))
+    fln_syntax::literal::decode_string(spelling)
+        .map(Literal::Str)
+        .ok_or(NatDefinitionElabError::InvalidStringLiteral)
 }
 
 fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {

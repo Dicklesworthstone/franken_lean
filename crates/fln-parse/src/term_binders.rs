@@ -17,6 +17,8 @@ pub(super) struct Prefix {
     /// `∀ x ∈ s, p` and `∃ x < n, p` (`Init/BinderPredicates.lean`): the operator and its term.
     predicate: Option<(usize, Syntax)>,
     separator: Option<usize>,
+    /// A record field's `:= private v`: the `private` (`structInstFieldDef`'s optional slot).
+    private: Option<usize>,
     phase: Phase,
 }
 
@@ -109,6 +111,7 @@ impl Prefix {
             annotation: None,
             predicate: None,
             separator: None,
+            private: None,
             phase: Phase::Body,
         };
         prefix.header(leaves, view, tokens, cursor, end)?;
@@ -135,6 +138,7 @@ impl Prefix {
             annotation: None,
             predicate: None,
             separator: None,
+            private: None,
             phase: Phase::Body,
         };
         prefix.header(leaves, view, tokens, cursor, end)?;
@@ -155,6 +159,20 @@ impl Prefix {
 
     pub(super) fn body(&self) -> bool {
         matches!(self.phase, Phase::Body)
+    }
+
+    /// Whether `at` is a record field's `private` right after its `:=`, which the value does not
+    /// read (`structInstFieldDef := " := " optional("private") term`).
+    pub(super) fn reads_private(&self, tokens: &[LexedToken], at: usize) -> bool {
+        self.record_field
+            && self.private.is_none()
+            && at > 0
+            && self.separator == Some(at - 1)
+            && symbol(tokens, at, "private")
+    }
+
+    pub(super) fn take_private(&mut self, at: usize) {
+        self.private = Some(at);
     }
 
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
@@ -206,6 +224,21 @@ impl Prefix {
                     *cursor += 1;
                     return Ok(());
                 }
+                continue;
+            }
+            // Inside a quotation, a binder that is one antiquotation (`fun $x => …`).
+            if self.lambda
+                && let Some((antiquotation, next)) = crate::quotations::antiquotation(
+                    leaves,
+                    view,
+                    tokens,
+                    *cursor,
+                    end,
+                    crate::quotations::Position::FunBinder,
+                )?
+            {
+                self.binders.push(antiquotation);
+                *cursor = next;
                 continue;
             }
             // `funBinder` admits a term (`Lean/Parser/Term.lean`): an anonymous-constructor
@@ -525,7 +558,14 @@ impl Prefix {
                         annotation,
                         Syntax::node(
                             parser_kind(&["Term", "structInstFieldDef"]),
-                            vec![separator, null_node(Vec::new()), body],
+                            vec![
+                                separator,
+                                null_node(match self.private {
+                                    Some(at) => vec![leaves.leaf(at)?],
+                                    None => Vec::new(),
+                                }),
+                                body,
+                            ],
                         ),
                     ]),
                 ],
@@ -656,19 +696,22 @@ pub(super) fn arrow_openers(
         let TokenKind::Symbol(s) = &tokens[at].kind else {
             continue;
         };
-        match s.as_str() {
-            "(" | "{" | "[" | "⦃" | ".{" => {
+        // Every bracket is balanced (`#[]`, `⟨…⟩`, a quotation inside a binder); only a
+        // binder's own bracket can open a dependent arrow.
+        match crate::canonical_bracket(s.as_str()) {
+            opener @ ("(" | "{" | "[" | "⦃" | ".{" | "⟨") => {
+                let binder = matches!(s.as_str(), "(" | "{" | "[" | "⦃" | ".{");
                 let mut next = at + 1;
                 while next < end && name(tokens, next) {
                     next += 1;
                 }
                 let typed = s == "[" || (next > at + 1 && next < end && symbol(tokens, next, ":"));
-                stack.push((at, s.as_str(), typed));
+                stack.push((at, if binder { opener } else { "" }, binder && typed));
             }
-            ")" | "}" | "]" | "⦄" => {
+            closer @ (")" | "}" | "]" | "⦄" | "⟩") => {
                 if let Some((open, opener, typed)) = stack.pop() {
                     let matches = matches!(
-                        (opener, s.as_str()),
+                        (opener, closer),
                         ("(", ")") | ("{", "}") | ("[", "]") | ("⦃", "⦄")
                     );
                     if matches

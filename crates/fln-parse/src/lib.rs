@@ -24,6 +24,7 @@
 pub mod build;
 pub mod category;
 pub mod command_scope;
+pub mod extensions;
 pub mod macro_expand;
 pub mod macro_txn;
 pub mod pratt;
@@ -37,11 +38,13 @@ mod inductive;
 mod levels;
 mod matching;
 mod proofs;
+mod quotations;
 mod record_terms;
 mod records;
 mod term_binders;
 mod term_do;
 mod term_locals;
+mod verso;
 mod where_decls;
 
 use build::{BuildError, Leaves};
@@ -50,7 +53,7 @@ use fln_syntax::literal::LiteralKind;
 use fln_syntax::run::{Event, lex_run};
 pub use fln_syntax::source::BytePos;
 use fln_syntax::source::{ByteSpan, SourceError, SourceInfo, SourceText};
-use fln_syntax::token::{LexedToken, TokenKind, TokenTable};
+use fln_syntax::token::{LexedToken, TokenKind};
 use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
 
@@ -402,11 +405,16 @@ enum BoundedInfix {
     RangeOo,
     RangeOoDots,
     RangeOc,
+    /// An infix notation of the entered grammar (`extensions`): `infixl`/`infixr`/`infix`, or a
+    /// `notation` of the same shape, declared by an imported module.
+    Extension(extensions::ExtensionInfix),
 }
 
 impl BoundedInfix {
     const fn symbol(self) -> &'static str {
         match self {
+            // Its atom is the token read; its kind comes from the grammar (`syntax_kind`).
+            Self::Extension(_) => "",
             Self::Arrow => "->",
             Self::And => "∧",
             Self::AndAscii => "/\\",
@@ -517,6 +525,7 @@ impl BoundedInfix {
 
     const fn precedence(self) -> u8 {
         match self {
+            Self::Extension(operator) => operator.prec,
             Self::Arrow => 25,
             Self::And | Self::AndAscii => 35,
             Self::Or | Self::OrAscii => 30,
@@ -563,6 +572,9 @@ impl BoundedInfix {
     }
 
     const fn is_right_associative(self) -> bool {
+        if let Self::Extension(operator) = self {
+            return operator.is_right_associative();
+        }
         matches!(
             self,
             Self::NatPow
@@ -588,6 +600,9 @@ impl BoundedInfix {
     }
 
     const fn is_non_associative(self) -> bool {
+        if let Self::Extension(operator) = self {
+            return operator.is_non_associative();
+        }
         matches!(
             self,
             Self::ScalarBeq
@@ -622,8 +637,8 @@ impl BoundedInfix {
         // `infix:50 unicode(" ≤ ", " <= ")` (and `≥`): the ASCII spelling is the same
         // syntax, so the pin builds `«term_≤_»` with a `"<="` atom.
         match self {
-            Self::NatDecLe => return Name::str(Name::anonymous(), "term_≤_"),
-            Self::Ge => return Name::str(Name::anonymous(), "term_≥_"),
+            Self::NatDecLe => return ascii_or_unicode("term_≤_", "term_<=_"),
+            Self::Ge => return ascii_or_unicode("term_≥_", "term_>=_"),
             Self::ListIsPrefix | Self::ListIsSuffix | Self::ListIsInfix => {
                 return Name::str(
                     Name::from_components(["List"]),
@@ -653,9 +668,32 @@ struct BoundedInfixToken {
     at: usize,
 }
 
+/// The refusal of a notation use the entered grammar's expansion cannot make (a node without its
+/// operand, a template past the expansion depth): no position of its own, as the expansion is.
+fn expansion_refusal() -> NatDefinitionParseError {
+    NatDefinitionParseError::OutsideSeedGrammar {
+        at: BytePos(0),
+        expected: NatDefinitionExpectation::ScalarValue,
+    }
+}
+
 impl ParsedDefinition {
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
+    }
+
+    /// This definition with the entered grammar's notations expanded
+    /// ([`extensions::expand_active`]): the tree the elaborator reads. Unchanged with no grammar
+    /// entered. An expanded tree's leaves include its templates', so
+    /// [`Self::reconstruct_normalized`] then describes the expansion; the original bytes still
+    /// come from the view.
+    pub fn expanded(mut self) -> Result<ParsedDefinition, NatDefinitionParseError> {
+        if let Some(syntax) =
+            extensions::expand_active(&self.syntax).map_err(|_| expansion_refusal())?
+        {
+            self.syntax = syntax;
+        }
+        Ok(self)
     }
 
     pub fn source_view(&self) -> &SourceView {
@@ -713,6 +751,17 @@ impl ParsedSourceCommand {
 
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
+    }
+
+    /// This command with the entered grammar's notations expanded, as
+    /// [`ParsedDefinition::expanded`]; its query term's text stays the source's.
+    pub fn expanded(mut self) -> Result<ParsedSourceCommand, NatDefinitionParseError> {
+        if let Some(syntax) =
+            extensions::expand_active(&self.syntax).map_err(|_| expansion_refusal())?
+        {
+            self.syntax = syntax;
+        }
+        Ok(self)
     }
 
     pub fn source_view(&self) -> &SourceView {
@@ -798,14 +847,16 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
     Syntax::node(state::null_kind(), args)
 }
 
-/// The production lexer's table for declaration bodies: the pin's table for an ordinary file
+/// Lex a declaration body. Production's table is the pin's table for an ordinary file
 /// (implicit `import Init`), derived from `contracts/REFERENCE_GRAMMAR_CENSUS.txt` by
 /// [`reference_tokens`], with every keyword reserved. It replaced a hand-written
 /// list of about 80 tokens that refused `⟨`, `≤`, `×`, `>` and `$`, carried `|-`, which is no
 /// token at the pin, and let builtin keywords such as `at`, `do` and `from` lex as identifiers
-/// (beads `fln-vokf`, `fln-notation-from-imports-0edr`).
-fn source_module_token_table() -> &'static TokenTable {
-    reference_tokens::production_table()
+/// (beads `fln-vokf`, `fln-notation-from-imports-0edr`). Under an entered grammar
+/// ([`extensions::with_grammar`]) the table is that grammar's: the file's imports and
+/// activated scopes.
+fn lex_source(text: &SourceText) -> fln_syntax::run::LexRun {
+    extensions::with_token_table(|table| extensions::interpolate(text, table, lex_run(text, table)))
 }
 
 /// Whether a bracketed binder at `index` may start a dependent arrow
@@ -913,6 +964,10 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "≈" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equiv),
         "matches" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Matches),
         "$" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Dollar),
+        // An infix notation an active syntax extension declares (`extensions`).
+        symbol if grammar == DefinitionGrammar::Scalar => {
+            extensions::infix(symbol).map(BoundedInfix::Extension)
+        }
         _ => None,
     }
 }
@@ -926,6 +981,124 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
     view.to_original(in_view)
 }
 
+/// `binop%`, `binrel%`, `binrel_no_prop%`, `binop_lazy%`, `leftact%`, `rightact%`: an
+/// identifier and two arguments at `max`; `unop%`: an identifier and one. Their node kinds.
+fn elaborator_operator(symbol: &str) -> Option<(&'static str, usize)> {
+    Some(match symbol {
+        "binop%" => ("binop", 2),
+        "binrel%" => ("binrel", 2),
+        "binrel_no_prop%" => ("binrel_no_prop", 2),
+        "binop_lazy%" => ("binop_lazy", 2),
+        "leftact%" => ("leftact", 2),
+        "rightact%" => ("rightact", 2),
+        "unop%" => ("unop", 1),
+        _ => return None,
+    })
+}
+
+/// One `binop%`-family term from its keyword at `index`: the identifier, then each argument as
+/// one argument-level term (a token, a bracketed group, or inside a quotation an
+/// antiquotation). Returns the node and the token after it. Out of line, as
+/// [`source_declaration`] is.
+#[inline(never)]
+fn elaborator_term(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    index: usize,
+    end: usize,
+    kind: &str,
+    arity: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, at),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
+    if !matches!(
+        tokens.get(index + 1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(index + 1));
+    }
+    let mut args = vec![leaves.leaf(index)?, leaves.leaf(index + 1)?];
+    let mut at = index + 2;
+    for _ in 0..arity {
+        if at >= end {
+            return Err(refuse(at));
+        }
+        let next = argument_end(tokens, at, end).ok_or_else(|| refuse(at))?;
+        args.push(nested_term(leaves, view, tokens, at..next)?);
+        at = next;
+    }
+    Ok((Syntax::node(parser_kind(&["Term", kind]), args), at))
+}
+
+/// Where the argument-level term at `at` ends: after its bracketed group, after an
+/// antiquotation inside a quotation, otherwise after the token.
+fn argument_end(tokens: &[LexedToken], at: usize, end: usize) -> Option<usize> {
+    let symbol = |index: usize| match tokens.get(index).map(|t| &t.kind) {
+        Some(TokenKind::Symbol(symbol)) => Some(symbol.as_str()),
+        _ => None,
+    };
+    match symbol(at) {
+        Some("$") if quotations::inside() => {
+            if matches!(
+                tokens.get(at + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) {
+                let mut next = at + 2;
+                // `$x:k`
+                if symbol(next) == Some(":")
+                    && matches!(
+                        tokens.get(next + 1).map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                    )
+                    && tokens[next - 1].extent.end() == tokens[next].extent.start()
+                {
+                    next += 2;
+                }
+                Some(next)
+            } else {
+                None
+            }
+        }
+        Some(open) if matches!(open, "(" | "[" | "{" | "⟨" | "#[") || quotations::opens(open) => {
+            let mut depth = 0_usize;
+            for index in at..end {
+                match symbol(index) {
+                    Some(s)
+                        if matches!(s, "(" | "[" | "{" | "⟨" | "#[") || quotations::opens(s) =>
+                    {
+                        depth += 1;
+                    }
+                    Some(")" | "]" | "}" | "⟩") => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(index + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => Some(at + 1),
+    }
+}
+
+/// `infix:50 unicode(" ≥ ", " >= ")` reads the ASCII spelling too, and wins over
+/// `infix:50 (priority := low) " >= "`; before a file declares it (`Init/Notation.lean`
+/// declares the ASCII one first), the ASCII notation is the one the pin reads.
+fn ascii_or_unicode(unicode: &str, ascii: &str) -> Name {
+    let unicode = Name::str(Name::anonymous(), unicode);
+    let ascii = Name::str(Name::anonymous(), ascii);
+    if !extensions::is_active_kind(&unicode) && extensions::is_active_kind(&ascii) {
+        ascii
+    } else {
+        unicode
+    }
+}
+
 fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> bool {
     matches!(
         kind,
@@ -934,7 +1107,7 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
         && (matches!(
             kind,
             Some(TokenKind::Literal(
-                LiteralKind::Str | LiteralKind::Char | LiteralKind::Scientific
+                LiteralKind::Str | LiteralKind::Char | LiteralKind::Scientific | LiteralKind::Name
             ))
         ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_" | "∅"))))
 }
@@ -964,6 +1137,16 @@ fn bounded_term_leaf(
             Ok(Syntax::node(
                 Name::str(Name::anonymous(), "scientific"),
                 vec![leaf],
+            ))
+        }
+        // `` `foo ``: `Term.quotedName` over the `name` literal (`Lean/Parser/Term.lean`).
+        Some(TokenKind::Literal(LiteralKind::Name)) if grammar == DefinitionGrammar::Scalar => {
+            Ok(Syntax::node(
+                parser_kind(&["Term", "quotedName"]),
+                vec![Syntax::node(
+                    Name::str(Name::anonymous(), "name"),
+                    vec![leaf],
+                )],
             ))
         }
         Some(TokenKind::Ident(_)) => Ok(leaf),
@@ -1222,10 +1405,13 @@ fn bounded_let_bindings(
     mut body_start: usize,
 ) -> Result<(Vec<LetBindingTokens>, usize), NatDefinitionParseError> {
     let mut let_bindings = Vec::new();
+    // An anonymous `let : T := v` (`letIdLhs`'s `hygieneInfo`) is the term parser's.
     while matches!(
         tokens.get(body_start).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "let"
-    ) {
+    ) && !term_locals::word(tokens, body_start + 1, ":")
+        && !term_locals::word(tokens, body_start + 1, ":=")
+    {
         let keyword = body_start;
         let recursive = term_locals::word(tokens, keyword + 1, "rec").then_some(keyword + 1);
         let after_keyword = keyword + 1 + usize::from(recursive.is_some());
@@ -1642,13 +1828,25 @@ fn finish_bounded_application(
     let cdot_head = terms[0].0.kind() == Some(&parser_kind(&["Term", "cdot"]))
         && terms[0].1 > 0
         && matches!(&tokens[terms[0].1 - 1].kind, TokenKind::Symbol(s) if s == "(");
+    // `app := trailing_parser:leadPrec:maxPrec many1 argArg`: a notation of the entered grammar
+    // at `max` precedence is a head too (`wp⟦x⟧ Q`).
+    let notation_head = grammar == DefinitionGrammar::Scalar
+        && terms[0]
+            .0
+            .kind()
+            .is_some_and(extensions::is_max_prec_notation);
     if !(grammar == DefinitionGrammar::Scalar && (dotted_head(&terms) || cdot_head))
+        && !notation_head
         && !matches!(
             tokens.get(*first_index).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
         )
         && !(grammar == DefinitionGrammar::Scalar
             && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@")))
+        // Inside a quotation, an antiquotation heads an application (`$f $a`).
+        && !(grammar == DefinitionGrammar::Scalar
+            && quotations::inside()
+            && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "$"))
     {
         let at = terms.get(1).map_or(*first_index, |(_, index)| *index);
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -1759,6 +1957,8 @@ fn reduce_bounded_infix(
             Name::from_components([kind]),
             vec![binders, operator.syntax, right],
         )
+    } else if let BoundedInfix::Extension(extension) = operator.operator {
+        extensions::infix_node(extension, left, operator.syntax, right)
     } else {
         Syntax::node(
             operator.operator.syntax_kind(),
@@ -1957,9 +2157,14 @@ fn push_bounded_infix(
     {
         reduce_bounded_infix(view, tokens, frame, grammar)?;
     }
+    // At equal precedence a non-associative operator reads `term:p+1` on both sides. The one before
+    // cannot be continued, and this one cannot take its result, except the arrow, a trailing parser
+    // with no left precedence (`a ⊨ f → b` is `(a ⊨ f) → b`). This one may still nest inside a
+    // right-associative operator's `term:p` (`q → a ⊨ f` is `q → (a ⊨ f)`).
     if frame.operators.last().is_some_and(|previous| {
         previous.operator.right_precedence() == operator.left_precedence()
-            && (previous.operator.is_non_associative() || operator.is_non_associative())
+            && ((previous.operator.is_non_associative() && operator != BoundedInfix::Arrow)
+                || (operator.is_non_associative() && !previous.operator.is_right_associative()))
     }) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, index),
@@ -2096,6 +2301,7 @@ fn prefix_precedence(token: &LexedToken) -> u8 {
     match &token.kind {
         TokenKind::Symbol(symbol) if symbol == "-" => 75,
         TokenKind::Symbol(symbol) if symbol == "~~~" => 100,
+        TokenKind::Symbol(symbol) => extensions::prefix(symbol).map_or(40, |(_, rbp)| rbp),
         _ => 40,
     }
 }
@@ -2116,10 +2322,12 @@ fn finish_negation_frame(
     let TokenKind::Symbol(symbol) = &tokens[prefix].kind else {
         unreachable!("a prefix operator is a symbol");
     };
-    let syntax = Syntax::node(
-        Name::str(Name::anonymous(), format!("term{symbol}_")),
-        vec![leaves.leaf(prefix)?, body],
+    // A prefix notation of the entered grammar (`extensions`) has its declared kind.
+    let kind = extensions::prefix(symbol).map_or_else(
+        || Name::str(Name::anonymous(), format!("term{symbol}_")),
+        |(kind, _)| kind,
     );
+    let syntax = Syntax::node(kind, vec![leaves.leaf(prefix)?, body]);
     frames
         .last_mut()
         .expect("negation has a parent")
@@ -2323,6 +2531,46 @@ fn push_bitvec_literal(
         at,
     ));
     Ok(width_end)
+}
+
+/// `nat_lit n` (`rawNatLit`): the keyword and its numeral, one argument. Out of line, off the term
+/// driver's frame.
+#[inline(never)]
+fn push_raw_nat_lit(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    leaves: &Leaves,
+    frames: &mut [BoundedTermFrame],
+    index: usize,
+    end: usize,
+) -> Result<usize, NatDefinitionParseError> {
+    if index + 1 >= end
+        || !matches!(
+            &tokens[index + 1].kind,
+            TokenKind::Literal(LiteralKind::Nat)
+        )
+    {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::ScalarValue,
+        });
+    }
+    let literal = Syntax::node(
+        Name::from_components(["rawNatLit"]),
+        vec![
+            leaves.leaf(index)?,
+            Syntax::node(
+                Name::str(Name::anonymous(), "num"),
+                vec![leaves.leaf(index + 1)?],
+            ),
+        ],
+    );
+    frames
+        .last_mut()
+        .expect("an application frame")
+        .application
+        .push((literal, index));
+    Ok(index + 2)
 }
 
 /// A postfix operator (`x⁻¹`, `«term_⁻¹»`) over the application's last argument. Out of line,
@@ -2637,7 +2885,45 @@ fn bounded_term(
     range: std::ops::Range<usize>,
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.get(range.start).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "open")
+    {
+        return open_term(leaves, view, tokens, range, grammar);
+    }
     matching::parse(leaves, view, tokens, range, grammar)
+}
+
+/// `Term.open := "open " openDecl withOpenDecl(" in " term)`: the declaration up to the `in`, then
+/// the term after it. Out of line, off every ordinary term's frame.
+#[inline(never)]
+fn open_term(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, at),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
+    let in_at = (range.start + 1..range.end)
+        .find(|&at| matches!(&tokens[at].kind, TokenKind::Symbol(s) if s == "in"))
+        .filter(|&at| at + 1 < range.end)
+        .ok_or_else(|| refuse(range.start))?;
+    let declaration =
+        command_scope::trees::open_declaration(leaves, tokens, range.start + 1, in_at)?
+            .ok_or_else(|| refuse(range.start + 1))?;
+    let body = bounded_term(leaves, view, tokens, in_at + 1..range.end, grammar)?;
+    Ok(Syntax::node(
+        parser_kind(&["Term", "open"]),
+        vec![
+            leaves.leaf(range.start)?,
+            declaration,
+            leaves.leaf(in_at)?,
+            body,
+        ],
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2710,9 +2996,14 @@ fn grouped_term_syntax(
     tokens: &[LexedToken],
     open: usize,
     ascription: Option<(Syntax, usize)>,
-    inner: Syntax,
+    inner: Option<Syntax>,
     close: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    // Only `(e :)` has no inner term.
+    let missing = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: BytePos(0),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
     Ok(if let Some((value, colon)) = ascription {
         if matches!(&tokens[colon].kind, TokenKind::Symbol(s) if s == ":=") {
             Syntax::node(
@@ -2721,7 +3012,7 @@ fn grouped_term_syntax(
                     leaves.leaf(open)?,
                     value,
                     leaves.leaf(colon)?,
-                    inner,
+                    inner.ok_or_else(missing)?,
                     leaves.leaf(close)?,
                 ],
             )
@@ -2732,7 +3023,7 @@ fn grouped_term_syntax(
                     hygienic_lparen(leaves.leaf(open)?),
                     value,
                     leaves.leaf(colon)?,
-                    null_node(vec![inner]),
+                    null_node(inner.into_iter().collect()),
                     leaves.leaf(close)?,
                 ],
             )
@@ -2742,7 +3033,7 @@ fn grouped_term_syntax(
             parser_kind(&["Term", "paren"]),
             vec![
                 hygienic_lparen(leaves.leaf(open)?),
-                inner,
+                inner.ok_or_else(missing)?,
                 leaves.leaf(close)?,
             ],
         )
@@ -2766,15 +3057,13 @@ fn finish_parenthesized_frame(
             at: original_position(view, tokens, close),
             expected: NatDefinitionExpectation::RecordField,
         })?;
-    if grammar == DefinitionGrammar::Scalar
-        && frame.record.is_none()
-        && frame.ascription.is_none()
+    let empty = frame.record.is_none()
         && frame.prefix.is_none()
         && frame.negation.is_none()
         && frame.application.is_empty()
         && frame.operands.is_empty()
-        && frame.operators.is_empty()
-    {
+        && frame.operators.is_empty();
+    if grammar == DefinitionGrammar::Scalar && empty && frame.ascription.is_none() {
         return Ok((
             Syntax::node(
                 parser_kind(&["Term", "tuple"]),
@@ -2788,7 +3077,17 @@ fn finish_parenthesized_frame(
         ));
     }
     let ascription = frame.ascription.take();
-    let inner = finish_bounded_frame(view, tokens, frame, grammar, close)?;
+    // `(e :)`: `typeAscription`'s type is optional, its slot empty (built out of line, as every
+    // node here is, to keep this frame within the term driver's small-stack bound).
+    let bare = empty
+        && ascription.as_ref().is_some_and(
+            |(_, colon)| matches!(&tokens[*colon].kind, TokenKind::Symbol(s) if s == ":"),
+        );
+    let inner = if bare {
+        None
+    } else {
+        Some(finish_bounded_frame(view, tokens, frame, grammar, close)?)
+    };
     grouped_term_syntax(leaves, tokens, open, ascription, inner, close).map(|syntax| (syntax, open))
 }
 
@@ -2859,6 +3158,15 @@ fn dotted_head(terms: &[(Syntax, usize)]) -> bool {
         })
 }
 
+/// Whether a keyword's text would scan as one identifier (`then`, `return`): where the grammar
+/// reads a `rawIdent`, it names something.
+pub(crate) fn spells_identifier(text: &str) -> bool {
+    fln_syntax::token::scan_ident_extent(text, BytePos(0))
+        .ok()
+        .flatten()
+        == Some(BytePos(text.len()))
+}
+
 /// The `.` or `·` at `index`, pushed onto `frame`'s application; `cursor` is the next token.
 /// Returns whether that next token (an identifier) was consumed too.
 ///
@@ -2927,6 +3235,32 @@ fn dot_term(
         // into a function (`expandCDot?`). The atom keeps the source spelling.
         frame.application.push((cdot(leaves, index)?, index));
         return Ok(false);
+    }
+    // `e.then`: a projection's field is a `rawIdent`, so a keyword spelled as an identifier
+    // names a field here.
+    if !begins
+        && !touches_identifier
+        && cursor < range.end
+        && tokens[index].extent.end() == tokens[cursor].extent.start()
+        && let TokenKind::Symbol(text) = &tokens[cursor].kind
+        && spells_identifier(text)
+    {
+        let (receiver, start) =
+            projection_receiver(view, tokens, frame, index)?.ok_or_else(refusal)?;
+        let field = Syntax::Ident {
+            info: leaves.leaf(cursor)?.info(),
+            raw_val: tokens[cursor].extent,
+            val: Name::from_components([text.as_str()]),
+            preresolved: Vec::new(),
+        };
+        frame.application.push((
+            Syntax::node(
+                parser_kind(&["Term", "proj"]),
+                vec![receiver, leaves.leaf(index)?, field],
+            ),
+            start,
+        ));
+        return Ok(true);
     }
     if !touches_identifier {
         return Err(refusal());
@@ -3174,11 +3508,15 @@ fn bounded_term_layout(
         && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
             if matches!(crate::canonical_bracket(s.as_str()), ")" | "}" | "]" | "⦄" | "⟩" | "," | "=>" | "↦" | ";" | ":=" | "from"))
             || term_locals::word(tokens, index, "from")
-            // A prefix operand (`show ¬k = 0 by …`) is folded before its header closes.
+            // A prefix operand (`show ¬k = 0 by …`) and a binder body (`show ∀ a, p by …`) are
+            // folded before the header closes, as `finish_lambda_frames` folds them.
             || frames
                 .iter()
                 .rev()
-                .find(|frame| frame.negation.is_none())
+                .find(|frame| {
+                    frame.negation.is_none()
+                        && !frame.prefix.as_ref().is_some_and(|prefix| prefix.body())
+                })
                 .and_then(|frame| frame.prefix.as_ref())
                 .is_some_and(|prefix| prefix.closes_header(tokens, index)))
     {
@@ -3392,6 +3730,12 @@ fn bounded_term_token(
         {
             cursor = push_nomatch(view, tokens, leaves, frames, index, range.end)?;
         }
+        // `syntax (name := rawNatLit) "nat_lit " num : term` (`Init/Notation.lean`).
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "nat_lit" =>
+        {
+            cursor = push_raw_nat_lit(view, tokens, leaves, frames, index, range.end)?;
+        }
         // `5#w` (`BitVec.«term__#__»`): a numeral, `#`, and a width, with no space between.
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "#" =>
@@ -3494,7 +3838,9 @@ fn bounded_term_token(
                 && (symbol == "¬"
                     || symbol == "!"
                     || symbol == "~~~"
-                    || (symbol == "-"
+                    // `-`, and a prefix notation of the entered grammar (`extensions`), at the
+                    // start of an operand; elsewhere the same symbol may be an infix.
+                    || ((symbol == "-" || extensions::prefix(symbol).is_some())
                         && frames
                             .last()
                             .is_some_and(|frame| frame.application.is_empty()))) =>
@@ -3510,6 +3856,34 @@ fn bounded_term_token(
                 operators: Vec::new(),
             });
         }
+        // A syntax quotation, and inside one an antiquotation, as an operand
+        // (`quotations`).
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar
+                && (quotations::opens(symbol) || (symbol == "$" && quotations::inside())) =>
+        {
+            let read = match quotations::quotation(leaves, view, tokens, index, range.end)? {
+                Some(read) => read,
+                None => quotations::antiquotation(
+                    leaves,
+                    view,
+                    tokens,
+                    index,
+                    range.end,
+                    quotations::Position::Term,
+                )?
+                .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                })?,
+            };
+            frames
+                .last_mut()
+                .expect("the root term frame remains live")
+                .application
+                .push((read.0, index));
+            return Ok(read.1);
+        }
         kind if is_bounded_term_atom(kind, grammar) => {
             let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
             frames
@@ -3517,6 +3891,37 @@ fn bounded_term_token(
                 .expect("the root term frame remains live")
                 .application
                 .push((term, index));
+        }
+        // A record field's `:= private v`: its `private` goes to the field's own slot.
+        Some(TokenKind::Symbol(symbol))
+            if symbol == "private"
+                && frames.last().is_some_and(|frame| {
+                    frame.application.is_empty()
+                        && matches!(&frame.prefix,
+                            Some(term_locals::Prefix::Binders(prefix))
+                                if prefix.reads_private(tokens, index))
+                }) =>
+        {
+            if let Some(term_locals::Prefix::Binders(prefix)) =
+                frames.last_mut().and_then(|frame| frame.prefix.as_mut())
+            {
+                prefix.take_private(index);
+            }
+        }
+        // `binop% f a b` and its family (`Lean/Parser/Term.lean`): the elaborator-protocol
+        // terms, a function name and its arguments at `max`.
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && elaborator_operator(symbol).is_some() =>
+        {
+            let (kind, arity) = elaborator_operator(symbol).expect("guarded");
+            let (term, next) =
+                elaborator_term(leaves, view, tokens, index, range.end, kind, arity)?;
+            frames
+                .last_mut()
+                .expect("the root term frame remains live")
+                .application
+                .push((term, index));
+            return Ok(next);
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar
@@ -3724,6 +4129,25 @@ fn bounded_term_token(
             if grammar == DefinitionGrammar::Scalar && push_jump_keyword(leaves, frames, index) {
                 return Ok(cursor);
             }
+            // An atom-like notation of the entered grammar (`extensions`), as an operand; as an
+            // application's argument only at `arg` precedence or above.
+            if grammar == DefinitionGrammar::Scalar
+                && let Some((term, end)) =
+                    extensions::leading_term(leaves, view, tokens, index, range.end)
+            {
+                let frame = frames.last_mut().expect("root term frame");
+                if !frame.application.is_empty()
+                    && !matches!(&term, Syntax::Node { kind, .. }
+                        if extensions::is_argument_notation(kind))
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: grammar.value_expectation(),
+                    });
+                }
+                frame.application.push((term, index));
+                return Ok(end);
+            }
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, index),
                 expected: grammar.value_expectation(),
@@ -3756,6 +4180,116 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
 /// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
 pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionParseError> {
     parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
+}
+
+/// A builtin command's tree and its epilogue.
+type BuiltinCommand = Option<(Syntax, ByteSpan)>;
+
+/// The pin's builtin bootstrapping commands (`Lean/Parser/Command.lean`):
+/// `genInjectiveTheorems := "gen_injective_theorems% " ident`, `init_quot := "init_quot"` and
+/// `docs_to_verso := "docs_to_verso " sepBy1(ident, ", ")`, as the pin's trees with their
+/// epilogue; `None` for any other command. The checker refuses them. Out of line, as
+/// [`source_declaration`] is.
+#[inline(never)]
+fn builtin_command(
+    view: &SourceView,
+    tokens: &[LexedToken],
+) -> Result<BuiltinCommand, DefinitionParseError> {
+    let symbol = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+    let shape = if symbol(0, "gen_injective_theorems%") && tokens.len() == 2 && ident(1) {
+        "genInjectiveTheorems"
+    } else if symbol(0, "init_quot") && tokens.len() == 1 {
+        "init_quot"
+    } else if symbol(0, "docs_to_verso")
+        && tokens.len().is_multiple_of(2)
+        && (1..tokens.len()).all(|at| {
+            if at % 2 == 1 {
+                ident(at)
+            } else {
+                symbol(at, ",")
+            }
+        })
+    {
+        "docs_to_verso"
+    } else {
+        return Ok(None);
+    };
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    let mut args = vec![leaves.leaf(0)?];
+    match shape {
+        "genInjectiveTheorems" => args.push(leaves.leaf(1)?),
+        "docs_to_verso" => args.push(null_node(
+            (1..tokens.len())
+                .map(|at| leaves.leaf(at))
+                .collect::<Result<_, _>>()?,
+        )),
+        _ => {}
+    }
+    let epilogue = leaves.attachment().epilogue();
+    Ok(Some((
+        Syntax::node(parser_kind(&["Command", shape]), args),
+        epilogue,
+    )))
+}
+
+/// A whole command read by a `command` declaration of the entered grammar (`extensions`), as the
+/// pin's tree; `None` when none reads it. The checker refuses it. Out of line, as
+/// [`source_declaration`] is.
+#[inline(never)]
+fn extension_command(
+    view: SourceView,
+    tokens: &[LexedToken],
+) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    let Some(syntax) = extensions::command(&leaves, &view, tokens, 0..tokens.len()) else {
+        return Ok(None);
+    };
+    let epilogue = leaves.attachment().epilogue();
+    Ok(Some(ParsedSourceCommand {
+        kind: SourceCommandKind::Definition,
+        source_view: view,
+        syntax,
+        epilogue,
+        query_term: None,
+    }))
+}
+
+/// `addDocString := docComment "add_decl_doc " ident` (`Lean/Parser/Command.lean`), as the pin's
+/// tree; `None` for any other command. The checker refuses it. Out of line, as
+/// [`source_declaration`] is.
+#[inline(never)]
+fn add_decl_doc(source: &[u8]) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = command_scope::tokens(&view)?;
+    let is_add = matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "add_decl_doc")
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+        && tokens.len() == 3;
+    if !is_add {
+        return Ok(None);
+    }
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    let (opener, body) = comment_atoms(&view, &leaves, &tokens, 0, "/--")?;
+    let syntax = Syntax::node(
+        parser_kind(&["Command", "addDocString"]),
+        vec![
+            Syntax::node(parser_kind(&["Command", "docComment"]), vec![opener, body]),
+            leaves.leaf(1)?,
+            leaves.leaf(2)?,
+        ],
+    );
+    let epilogue = leaves.attachment().epilogue();
+    Ok(Some(ParsedSourceCommand {
+        kind: SourceCommandKind::Definition,
+        source_view: view,
+        syntax,
+        epilogue,
+        query_term: None,
+    }))
 }
 
 /// Parse one bounded `def`, `#eval`, or `#check` command.
@@ -4132,7 +4666,7 @@ fn grind_constraints(
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), source_module_token_table());
+    let run = lex_source(view.normalized());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -4154,12 +4688,14 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
         matches!(&token.kind, TokenKind::Symbol(s)
             if matches!(s.as_str(), "syntax" | "/--" | "@[" | "scoped" | "local" | "private"
                 | "protected" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
-                | "recommended_spelling"))
+                | "recommended_spelling" | "declare_syntax_cat" | "macro_rules" | "macro"
+                | "binder_predicate"))
     }) && run.events.iter().any(|event| {
         matches!(event, Event::Token(token)
             if matches!(&token.kind, TokenKind::Symbol(s) if matches!(s.as_str(),
                 "syntax" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
-                    | "recommended_spelling")))
+                    | "recommended_spelling" | "declare_syntax_cat" | "macro_rules" | "macro"
+                    | "binder_predicate")))
     }) && let Some(declaration) = command_scope::syntax_decls::declaration(source)?
     {
         return Ok(declaration);
@@ -4182,6 +4718,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         | "theorem"
                         | "abbrev"
                         | "opaque"
+                        | "axiom"
                         | "example"
                         | "instance"
                         | "structure"
@@ -4294,13 +4831,37 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
             }
             // `@[…]`, `private`, `protected`, `noncomputable`, … lead a declaration
             // (`declModifiers`), whose own parser decides which attributes it reads.
-            TokenKind::Symbol(symbol) if symbol == "@[" || symbol == "/--" => {
-                source_declaration(source)
-            }
+            TokenKind::Symbol(symbol) if symbol == "/--" => match add_decl_doc(source)? {
+                Some(parsed) => Ok(parsed),
+                None => source_declaration(source),
+            },
+            TokenKind::Symbol(symbol) if symbol == "@[" => source_declaration(source),
             _ if command_scope::modifiers::leads(token) => source_declaration(source),
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
+                let at = view.to_original(token.extent.start());
+                // A command the entered grammar declares (`syntax "seal " ident+ : command`).
+                let tokens = run
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Token(token) => Some(token.clone()),
+                        Event::Trivia(_) | Event::Refused { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some((syntax, epilogue)) = builtin_command(&view, &tokens)? {
+                    return Ok(ParsedSourceCommand {
+                        kind: SourceCommandKind::Definition,
+                        source_view: view,
+                        syntax,
+                        epilogue,
+                        query_term: None,
+                    });
+                }
+                if let Some(parsed) = extension_command(view, &tokens)? {
+                    return Ok(parsed);
+                }
                 Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: view.to_original(token.extent.start()),
+                    at,
                     expected: NatDefinitionExpectation::DefinitionKeyword,
                 })
             }
@@ -4696,7 +5257,9 @@ pub(crate) fn module_doc_syntax(
     ))
 }
 
-/// The opener atom (`/--` or `/-!`) and the body atom of the comment token at `index`.
+/// The opener atom (`/--` or `/-!`) and the body of the comment token at `index`: one atom, or,
+/// where the scope sets `doc.verso` (`doc.verso.module` for a module doc), the pin's
+/// `versoCommentBody`, the Verso document then the `-/` atom ([`verso`]).
 #[inline(never)]
 fn comment_atoms(
     view: &SourceView,
@@ -4740,16 +5303,55 @@ fn comment_atoms(
         },
         val: opener_text.into(),
     };
-    let body = Syntax::Atom {
+    let close = end_pos.0 - 2;
+    let verso = extensions::doc_options()
+        .verso(opener_text == "/-!")
+        .then(|| verso::body(text, body_start, close))
+        .flatten();
+    let Some(verso) = verso else {
+        let body = Syntax::Atom {
+            info: SourceInfo::Original {
+                leading: ByteSpan::empty_at(BytePos(body_start)),
+                pos: BytePos(body_start),
+                trailing,
+                end_pos,
+            },
+            val: body.into(),
+        };
+        return Ok((opener, body));
+    };
+    let document = match verso {
+        verso::Body::Blocks(blocks) => blocks,
+        // `versoCommentBodyFn`: the pin keeps a body it cannot parse as one atom.
+        verso::Body::Failure => Syntax::node(
+            Name::from_components(["Lean", "Doc", "Syntax", "parseFailure"]),
+            vec![Syntax::Atom {
+                info: SourceInfo::Original {
+                    leading: ByteSpan::empty_at(BytePos(body_start)),
+                    pos: BytePos(body_start),
+                    trailing: ByteSpan::empty_at(BytePos(close)),
+                    end_pos: BytePos(close),
+                },
+                val: text[body_start..close].into(),
+            }],
+        ),
+    };
+    let closer = Syntax::Atom {
         info: SourceInfo::Original {
-            leading: ByteSpan::empty_at(BytePos(body_start)),
-            pos: BytePos(body_start),
+            leading: ByteSpan::empty_at(BytePos(close)),
+            pos: BytePos(close),
             trailing,
             end_pos,
         },
-        val: body.into(),
+        val: "-/".into(),
     };
-    Ok((opener, body))
+    Ok((
+        opener,
+        Syntax::node(
+            parser_kind(&["Command", "versoCommentBody"]),
+            vec![document, closer],
+        ),
+    ))
 }
 
 /// The declaration's `declModifiers` node: the doc comment before `doc_end`, the attributes
@@ -4791,7 +5393,7 @@ fn parse_definition_with_grammar(
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), source_module_token_table());
+    let run = lex_source(view.normalized());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -4839,7 +5441,7 @@ fn parse_definition_with_grammar(
     let declaration_start = declaration_start + usize::from(instance_scope.is_some());
     if !matches!(
         tokens.get(declaration_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance" | "abbrev" | "opaque"))
+        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "example" | "instance" | "abbrev" | "opaque" | "axiom"))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, declaration_start),
@@ -4851,9 +5453,13 @@ fn parse_definition_with_grammar(
     let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
     let is_example =
         matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "example");
+    // `axiom := "axiom " declId declSig` (`Lean/Parser/Command.lean`): read as an `opaque`
+    // without a value is, its tree the pin's `Command.axiom`.
+    let is_axiom =
+        matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "axiom");
     // `opaque := "opaque " declId declSig (declValSimple)?` (`Lean/Parser/Command.lean`).
-    let is_opaque =
-        matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "opaque");
+    let is_opaque = is_axiom
+        || matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "opaque");
     let mut cursor = declaration_start + 1;
     // `(priority := n)`, never an anonymous instance's first explicit binder `(x : T)`.
     let priority_range = if is_instance
@@ -4959,6 +5565,12 @@ fn parse_definition_with_grammar(
             Some(TokenKind::Symbol(symbol)) if symbol == "where");
     // An `opaque` with no value; one with a value takes only `declValSimple`.
     let bare_opaque = is_opaque && assignment_index == tokens.len();
+    if is_axiom && !bare_opaque {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(&view, &tokens, assignment_index),
+            expected: NatDefinitionExpectation::EndOfCommand,
+        });
+    }
     if is_opaque && (equations || structure_where) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, assignment_index),
@@ -5191,6 +5803,9 @@ fn parse_definition_with_grammar(
             optional_signature,
             declaration_value,
         ];
+        if is_axiom {
+            parts.pop();
+        }
         if !is_theorem && !is_abbrev && !is_opaque {
             parts.push(match deriving_at {
                 Some(at) => records::deriving_clause(&leaves, &view, &tokens, at)?,
@@ -5201,6 +5816,8 @@ fn parse_definition_with_grammar(
             "theorem"
         } else if is_abbrev {
             "abbrev"
+        } else if is_axiom {
+            "axiom"
         } else if is_opaque {
             "opaque"
         } else {
@@ -5239,7 +5856,7 @@ pub fn partition_definition_commands(
 ) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), source_module_token_table());
+    let run = lex_source(view.normalized());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -5305,7 +5922,7 @@ pub fn partition_source_module(
 ) -> Result<PartitionedSourceModule<'_>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_run(view.normalized(), source_module_token_table());
+    let run = lex_source(view.normalized());
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -5314,8 +5931,18 @@ pub fn partition_source_module(
             at: view.to_original(at),
         })
         .collect::<Vec<_>>();
-    if !diagnostics.is_empty() {
-        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    // A token the file declares later (`notation "⟪" n "⟫" => …` before `⟪21⟫`) is not one
+    // yet: past the import header, a refusal of one token is left to the command that holds it,
+    // as `command_scope::partition` leaves it, and that command's parse, with the grammar in
+    // effect there, decides. Anything else, or anything in the header, refuses the source.
+    let mut one_token_refusals = None;
+    for event in &run.events {
+        if let Event::Refused { error, .. } = event {
+            if !command_scope::refusal_of_one_token(error) {
+                return Err(NatDefinitionParseError::Lexical { diagnostics });
+            }
+            one_token_refusals.get_or_insert(error.at());
+        }
     }
 
     let tokens = run
@@ -5367,10 +5994,16 @@ pub fn partition_source_module(
                 }
             }
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
-                break Some(view.to_original(token.extent.start()).0);
+                break Some(token.extent.start());
             }
         }
     };
+    if let Some(first) = one_token_refusals
+        && definition_start.is_none_or(|start| first < start)
+    {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+    let definition_start = definition_start.map(|start| view.to_original(start).0);
 
     let (body_start, mut commands) = if let Some(body_start) = definition_start {
         // A mutual inductive block is one source command and admission unit,
@@ -5700,7 +6333,8 @@ mod nat_definition_tests {
         assert!(empty.imports.is_empty());
         assert!(empty.commands.is_empty());
 
-        let unsupported = partition_source_module(b"axiom answer : Nat")
+        // `#print` parses at the pin and not here.
+        let unsupported = partition_source_module(b"#print answer")
             .expect("the header parser leaves an unsupported body to the command parser");
         assert!(unsupported.imports.is_empty());
         assert_eq!(unsupported.commands.len(), 1);

@@ -1,10 +1,12 @@
 //! A definition's trailing `where` block: `Term.whereDecls`, `"where" >> sepByIndent
-//! letRecDecl "; "` (`Lean/Parser/Term.lean`), in `declValSimple`'s last slot.
+//! letRecDecl "; " >> optional whereFinally` (`Lean/Parser/Term.lean`), in `declValSimple`'s last
+//! slot.
 //!
-//! Each declaration is `name binders [: type] := value`, the `letIdDecl` form of `let rec`;
-//! declarations are separated by a new line at the first declaration's column. The pin
+//! Each declaration is `name binders [: type]` and then `:= value` (`letIdDecl`) or equations
+//! (`letEqnsDecl`), led by its doc comment and attributes; declarations are separated by a new
+//! line at the first declaration's column. A `finally` tactic block may follow them. The pin
 //! elaborates the block as `let rec` declarations scoping over the body
-//! (`Lean.Elab.expandWhereDecls`); equation-style declarations (`| …`) are refused here.
+//! (`Lean.Elab.expandWhereDecls`).
 use super::*;
 
 fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
@@ -58,24 +60,79 @@ pub(super) fn syntax(
     tokens: &[LexedToken],
     keyword: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let starts = declaration_starts(view, tokens, keyword)?;
+    let finally = finally_start(view, tokens, keyword);
+    let declarations_end = finally.unwrap_or(tokens.len());
+    let starts = if declarations_end == keyword + 1 {
+        Vec::new()
+    } else {
+        declaration_starts(view, &tokens[..declarations_end], keyword)?
+    };
     let mut items = Vec::with_capacity(starts.len() * 2);
     for (index, &name) in starts.iter().enumerate() {
-        let end = starts.get(index + 1).copied().unwrap_or(tokens.len());
+        let end = starts.get(index + 1).copied().unwrap_or(declarations_end);
         if index > 0 {
             // `sepByIndent`'s separator: absent when the next declaration is on its own line.
             items.push(null_node(Vec::new()));
         }
         items.push(declaration(leaves, view, tokens, name, end)?);
     }
+    // `allowTrailingSep`: a `finally` at the declarations' column passes the separator's column
+    // check, and the separator stays when no declaration follows it.
+    if let (Some(at), Some(&first)) = (finally, starts.first())
+        && column(view, tokens, at) == column(view, tokens, first)
+    {
+        items.push(null_node(Vec::new()));
+    }
+    // `whereFinally := "finally " optional Tactic.tacticSeqIndentGt manyIndent
+    // whereFinallySubsection`: its tactic block runs to the end; a `| name => tacs` subsection is
+    // not read.
+    let finally = match finally {
+        Some(at) => null_node(vec![Syntax::node(
+            parser_kind(&["Term", "whereFinally"]),
+            vec![
+                leaves.leaf(at)?,
+                null_node(vec![proofs::tactic_sequence(
+                    leaves,
+                    view,
+                    tokens,
+                    at,
+                    at + 1..tokens.len(),
+                )?]),
+                null_node(Vec::new()),
+            ],
+        )]),
+        None => null_node(Vec::new()),
+    };
     Ok(Syntax::node(
         parser_kind(&["Term", "whereDecls"]),
-        vec![
-            leaves.leaf(keyword)?,
-            null_node(items),
-            null_node(Vec::new()),
-        ],
+        vec![leaves.leaf(keyword)?, null_node(items), finally],
     ))
+}
+
+/// The `finally` of the `where` block at `keyword`: straight after the keyword, or starting a line
+/// no deeper than the first declaration (a `do` block's `try … finally` sits deeper).
+fn finally_start(view: &SourceView, tokens: &[LexedToken], keyword: usize) -> Option<usize> {
+    let finally = |at: usize| crate::term_locals::word(tokens, at, "finally");
+    if finally(keyword + 1) {
+        return Some(keyword + 1);
+    }
+    let indent = column(view, tokens, tokens.get(keyword + 1).map(|_| keyword + 1)?);
+    let mut depth = 0usize;
+    for at in keyword + 2..tokens.len() {
+        if depth == 0
+            && finally(at)
+            && line(view, tokens, at) > line(view, tokens, at - 1)
+            && column(view, tokens, at) <= indent
+        {
+            return Some(at);
+        }
+        if opens(tokens, at) {
+            depth += 1;
+        } else if closes(tokens, at) {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    None
 }
 
 /// One `letRecDecl` spanning `start..end`: its doc comment and attributes, then its name.
@@ -102,7 +159,10 @@ fn declaration(
     // `letRecDecl`'s `Termination.suffix`: a `termination_by`/`decreasing_by` at depth 0 ends the
     // declaration's value.
     let (end, suffix) = match crate::termination_start(tokens, name + 1, end) {
-        Some(at) => (at, crate::termination_suffix(leaves, view, tokens, at..end)?),
+        Some(at) => (
+            at,
+            crate::termination_suffix(leaves, view, tokens, at..end)?,
+        ),
         None => (
             end,
             Syntax::node(
@@ -202,6 +262,32 @@ fn declaration(
     Ok(wrap(declaration))
 }
 
+/// `Tactic.letrec := "let " &" rec " letRecDecls` over `range`, a `let rec` the tactic planner
+/// found defined by equations: its one declaration reads as a `where` declaration does.
+#[inline(never)]
+pub(crate) fn rec_tactic(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let declaration = declaration(leaves, view, tokens, range.start + 2, range.end)?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "letrec"]),
+        vec![
+            leaves.leaf(range.start)?,
+            Syntax::Atom {
+                info: leaves.leaf(range.start + 1)?.info(),
+                val: "rec".to_owned(),
+            },
+            Syntax::node(
+                parser_kind(&["Term", "letRecDecls"]),
+                vec![null_node(vec![declaration])],
+            ),
+        ],
+    ))
+}
+
 /// A `letRecDecl` around one `letIdDecl` or `letEqnsDecl`, with its doc comment, attributes and
 /// termination hints.
 fn rec_declaration(declaration: Syntax, doc: Syntax, attributes: Syntax, suffix: Syntax) -> Syntax {
@@ -277,25 +363,26 @@ fn declaration_starts(
     let indent = column(view, tokens, first);
     let mut starts = vec![first];
     let mut pending_name = prefix(first);
-    let mut depth = 0usize;
+    // The first declaration's own `@[` opens its attribute list.
+    let mut depth = usize::from(opens(tokens, first));
     for at in first + 1..tokens.len() {
-        if opens(tokens, at) {
-            depth += 1;
-        } else if closes(tokens, at) {
-            depth = depth.saturating_sub(1);
-        } else if depth == 0
+        // A line at the declarations' column starts one (an `@[` too, before it opens).
+        if depth == 0
             && (matches!(tokens[at].kind, TokenKind::Ident(_)) || prefix(at))
             && line(view, tokens, at) > line(view, tokens, at - 1)
             && column(view, tokens, at) == indent
         {
-            if pending_name {
-                pending_name = prefix(at);
-                continue;
+            if !pending_name {
+                starts.push(at);
             }
-            starts.push(at);
             pending_name = prefix(at);
         } else if depth == 0 && matches!(tokens[at].kind, TokenKind::Ident(_)) {
             pending_name = false;
+        }
+        if opens(tokens, at) {
+            depth += 1;
+        } else if closes(tokens, at) {
+            depth = depth.saturating_sub(1);
         }
     }
     Ok(starts)
@@ -311,14 +398,29 @@ fn struct_field(
     name: usize,
     end: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    // A field defined by equations (`toString | true => "t" | false => "f"`):
-    // `structInstFieldEqns` over the alternatives (`Lean/Parser/Term.lean`).
-    if matches!(tokens.get(name + 1).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "|") {
+    // A field defined by equations (`toString | true => "t" | false => "f"`), after the names it
+    // binds (`IsPlausibleStep it | .yield it' out => …`): `structInstFieldEqns` over the
+    // alternatives (`Lean/Parser/Term.lean`).
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let mut pipe = name + 1;
+    while pipe < end && (matches!(tokens[pipe].kind, TokenKind::Ident(_)) || is(pipe, "_")) {
+        pipe += 1;
+    }
+    if is(pipe, "|") {
+        let mut binders = Vec::new();
+        for at in name + 1..pipe {
+            binders.push(match leaves.leaf(at)? {
+                hole @ Syntax::Atom { .. } => {
+                    Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
+                }
+                binder => binder,
+            });
+        }
         let alternatives = matching::declaration_equations(
             leaves,
             view,
             tokens,
-            name + 1..end,
+            pipe..end,
             DefinitionGrammar::Scalar,
         )?;
         return Ok(Syntax::node(
@@ -329,7 +431,7 @@ fn struct_field(
                     vec![leaves.leaf(name)?, null_node(Vec::new())],
                 ),
                 null_node(vec![
-                    null_node(Vec::new()),
+                    null_node(binders),
                     null_node(Vec::new()),
                     Syntax::node(
                         parser_kind(&["Term", "structInstFieldEqns"]),
@@ -369,6 +471,11 @@ fn struct_field(
             DefinitionGrammar::Scalar,
         )?;
         (prefix, cursor) = prefix.finish_header(leaves, view, tokens, cursor, domain, end)?;
+    }
+    // `:= private v`: the `private` is the field's own (`structInstFieldDef`), not the value's.
+    if prefix.reads_private(tokens, cursor) {
+        prefix.take_private(cursor);
+        cursor += 1;
     }
     if cursor >= end {
         return Err(refuse(view, tokens, end));

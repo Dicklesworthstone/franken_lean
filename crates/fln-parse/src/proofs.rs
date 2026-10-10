@@ -56,6 +56,26 @@ fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinition
     }
 }
 
+/// A `tacticSeq` over exactly `range`, for a syntax extension's `tacticSeq` argument.
+/// The conv tactic of a `(conv| …)` quotation over `range`.
+pub(crate) fn conv_quoted(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    conv::quoted(leaves, view, tokens, range)
+}
+
+pub(crate) fn tactic_seq(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    elimination::sequence(leaves, view, tokens, range)
+}
+
 /// The tactic sequence of a `decreasing_by` clause, `range` after its keyword, bounded as a
 /// proof block is.
 pub(super) fn tactic_sequence(
@@ -72,14 +92,17 @@ pub(super) fn tactic_sequence(
     elimination::sequence(leaves, view, tokens, range)
 }
 
-pub(super) fn parse(
-    leaves: &Leaves,
+/// Where the `by` block at `by` ends, `limit` at most: at a closing bracket or a comma of the
+/// enclosing term (the commas of a `match` header, a row's patterns, `∀`/`∃` binders and the
+/// comma-list tactics are the block's own). Out of line: the scan's state is not live while the
+/// block parses, and the match planner skips a block by it.
+#[inline(never)]
+pub(crate) fn block_extent(
     view: &SourceView,
     tokens: &[LexedToken],
     by: usize,
     limit: usize,
-) -> Result<(Syntax, usize), NatDefinitionParseError> {
-    let _open = OpenProof::enter(view, tokens, by)?;
+) -> Result<usize, NatDefinitionParseError> {
     let mut depth = 0_usize;
     let mut forall_commas = 0_usize;
     // A `match` header's discriminants (`match a, b with`) and a row's patterns (`| 0, _ =>`)
@@ -87,9 +110,10 @@ pub(super) fn parse(
     let mut match_headers = 0_usize;
     let mut matched = false;
     let mut in_patterns = false;
-    // `generalize x = y, z = w`, `exists a, b` and `cases a, b` separate their own arguments by
-    // commas (`generalizeArg,+`, `term,+`, `sepBy1(elimTarget, ", ")`): such a comma stays in the
-    // block until the argument list ends.
+    // `generalize x = y, z = w`, `exists a, b`, `cases a, b`, `rcases a, b with …` and
+    // `obtain p := a, b` separate their own arguments by commas (`generalizeArg,+`, `term,+`,
+    // `sepBy1(elimTarget, ", ")`, `elimTarget,*`): such a comma stays in the block until the
+    // argument list ends.
     let mut comma_tactic = false;
     let source = view.normalized();
     let mut end = by + 1;
@@ -100,9 +124,16 @@ pub(super) fn parse(
                 TokenKind::Symbol(symbol) => symbol == text,
                 _ => false,
             };
-            if ["generalize", "exists", "cases", "induction"]
-                .into_iter()
-                .any(spelled)
+            if [
+                "generalize",
+                "exists",
+                "cases",
+                "induction",
+                "rcases",
+                "obtain",
+            ]
+            .into_iter()
+            .any(spelled)
             {
                 comma_tactic = true;
             } else if [";", "<;>", "|", "=>", "with", "at", "using", "generalizing"]
@@ -144,6 +175,15 @@ pub(super) fn parse(
                 match_headers -= 1;
                 matched = true;
             }
+            // A `let rec`'s equations (`letEqnsDecl`) separate their patterns by commas, as a
+            // `match`'s alternatives do.
+            TokenKind::Ident(name)
+                if depth == 0
+                    && *name == Name::from_components(["rec"])
+                    && matches!(&tokens[end - 1].kind, TokenKind::Symbol(s) if s == "let") =>
+            {
+                matched = true
+            }
             TokenKind::Symbol(symbol) if symbol == "|" && depth == 0 && matched => {
                 in_patterns = true;
             }
@@ -166,6 +206,20 @@ pub(super) fn parse(
     if depth != 0 {
         return Err(refusal(view, tokens, end));
     }
+    Ok(end)
+}
+
+pub(super) fn parse(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    by: usize,
+    limit: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let _open = OpenProof::enter(view, tokens, by)?;
+    let end = block_extent(view, tokens, by, limit)?;
+    let source = view.normalized();
+
     let first = by + 1;
     if first == end {
         let sequence = Syntax::node(
@@ -210,13 +264,33 @@ pub(super) fn parse(
     ))
 }
 
-fn tactic(
+pub(crate) fn tactic(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
+    // A `let rec` by equations, which the planner leaves whole.
+    if crate::term_locals::word(tokens, start, "let")
+        && crate::term_locals::word(tokens, start + 1, "rec")
+    {
+        return crate::where_decls::rec_tactic(leaves, view, tokens, range);
+    }
+    // Inside a quotation, a tactic that is one antiquotation (`(tactic| $t; rfl)`).
+    if let Some((antiquotation, next)) = crate::quotations::antiquotation(
+        leaves,
+        view,
+        tokens,
+        start,
+        range.end,
+        crate::quotations::Position::Tactic,
+    )? {
+        if next != range.end {
+            return Err(refusal(view, tokens, next));
+        }
+        return Ok(antiquotation);
+    }
     let keyword = match &tokens[start].kind {
         TokenKind::Ident(name) => [
             "intro",
@@ -286,14 +360,18 @@ fn tactic(
             "decreasing_tactic",
         ]
         .into_iter()
-        .find(|word| name == &Name::from_components([*word]))
-        .ok_or_else(|| refusal(view, tokens, start))?,
+        .find(|word| name == &Name::from_components([*word])),
         // `suffices` is a keyword token, not an identifier.
-        TokenKind::Symbol(symbol) if symbol == "suffices" => "suffices",
-        TokenKind::Symbol(symbol) if symbol == "exists" => "exists",
+        TokenKind::Symbol(symbol) if symbol == "suffices" => Some("suffices"),
+        TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
         // `syntax (name := «show») "show " term : tactic` (`Init/Tactics.lean`).
-        TokenKind::Symbol(symbol) if symbol == "show" => "show",
-        _ => return Err(refusal(view, tokens, start)),
+        TokenKind::Symbol(symbol) if symbol == "show" => Some("show"),
+        _ => None,
+    };
+    let Some(keyword) = keyword else {
+        // A tactic an active syntax extension declares (`crate::extensions`).
+        return crate::extensions::tactic(leaves, view, tokens, range)
+            .ok_or_else(|| refusal(view, tokens, start));
     };
     // Tactic words are contextual: `def apply ...` must stay a legal identifier.
     // The selected tactic production gives its keyword an atom leaf.
@@ -410,10 +488,14 @@ fn local_tactic(
             }
             args.push(null_node(names));
         }
-        // `intros` is `"intros" (ppSpace colGt (ident <|> hole))*` (`Init/Tactics.lean`).
+        // `intros` is `"intros" (ppSpace colGt (ident <|> hole))*`; `intro`'s arguments are
+        // `term:max`, a bracketed pattern too (`intro ⟨a, b⟩ (k : T)`) (`Init/Tactics.lean`).
         "intro" | "intros" => {
             let mut names = Vec::new();
-            for index in start + 1..range.end {
+            let mut index = start + 1;
+            while index < range.end {
+                let bracket = keyword == "intro"
+                    && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == "⟨" || symbol == "(");
                 if matches!(&tokens[index].kind, TokenKind::Ident(_)) {
                     names.push(leaves.leaf(index)?);
                 } else if matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == "_")
@@ -422,9 +504,22 @@ fn local_tactic(
                         parser_kind(&["Term", "hole"]),
                         vec![leaves.leaf(index)?],
                     ));
+                } else if bracket {
+                    let close = rcases::closing(tokens, index)
+                        .filter(|&close| close < range.end)
+                        .ok_or_else(|| refusal(view, tokens, index))?;
+                    names.push(bounded_term(
+                        leaves,
+                        view,
+                        tokens,
+                        index..close + 1,
+                        DefinitionGrammar::Scalar,
+                    )?);
+                    index = close;
                 } else {
                     return Err(refusal(view, tokens, index));
                 }
+                index += 1;
             }
             args.push(null_node(names));
         }
@@ -470,28 +565,46 @@ fn local_tactic(
                     .collect::<Result<Vec<_>, _>>()?,
             ));
         }
-        // `grind` with its configuration flags only: `"grind" optConfig (&" only")?
-        // (" [" grindParam,* "]")? ("=> " grindSeq)?` (`Init/Grind/Tactics.lean`).
+        // `"grind" optConfig (&" only")? (" [" grindParam,* "]")? ("=> " grindSeq)?`
+        // (`Init/Grind/Tactics.lean`): no `=> grindSeq`.
         "grind" => {
             let (config, end) = config(leaves, view, tokens, start + 1, range.end)?;
-            if end != range.end {
-                return Err(refusal(view, tokens, end));
-            }
-            args.extend([
-                config,
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-            ]);
+            let only = end < range.end
+                && matches!(&tokens[end].kind, TokenKind::Ident(name) if *name == Name::from_components(["only"]));
+            let only_slot = if only {
+                null_node(vec![Syntax::Atom {
+                    info: leaves.leaf(end)?.info(),
+                    val: "only".to_string(),
+                }])
+            } else {
+                null_node(Vec::new())
+            };
+            let open = end + usize::from(only);
+            let parameters = if open < range.end {
+                grind_parameters(leaves, view, tokens, open..range.end)?
+            } else {
+                null_node(Vec::new())
+            };
+            args.extend([config, only_slot, parameters, null_node(Vec::new())]);
         }
+        // `"fail" (ppSpace str)?` (`Init/Tactics.lean`): the optional message is a `str` node in
+        // its slot, which is empty when there is none.
         "fail"
-            if range.end == start + 2
-                && matches!(
-                    &tokens[start + 1].kind,
-                    TokenKind::Literal(LiteralKind::Str)
-                ) =>
+            if range.end == start + 1
+                || range.end == start + 2
+                    && matches!(
+                        &tokens[start + 1].kind,
+                        TokenKind::Literal(LiteralKind::Str)
+                    ) =>
         {
-            args.push(leaves.leaf(start + 1)?);
+            args.push(null_node(if range.end == start + 2 {
+                vec![Syntax::node(
+                    Name::str(Name::anonymous(), "str"),
+                    vec![leaves.leaf(start + 1)?],
+                )]
+            } else {
+                Vec::new()
+            }));
         }
         // `decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the empty
         // configuration is a node of its own in the pin's tree.
@@ -502,10 +615,26 @@ fn local_tactic(
             }
             args.push(config);
         }
-        "assumption" | "solve_by_elim" | "rfl" | "contradiction" | "constructor" | "left"
-        | "right" | "skip" | "fail" | "trivial" | "ac_rfl" | "infer_instance" | "exfalso"
-        | "done" | "subst_eqs" | "get_elem_tactic" | "simp_wf" | "clean_wf"
-        | "decreasing_trivial" | "decreasing_trivial_pre_omega" | "decreasing_tactic"
+        "assumption"
+        | "solve_by_elim"
+        | "rfl"
+        | "contradiction"
+        | "constructor"
+        | "left"
+        | "right"
+        | "skip"
+        | "trivial"
+        | "ac_rfl"
+        | "infer_instance"
+        | "exfalso"
+        | "done"
+        | "subst_eqs"
+        | "get_elem_tactic"
+        | "simp_wf"
+        | "clean_wf"
+        | "decreasing_trivial"
+        | "decreasing_trivial_pre_omega"
+        | "decreasing_tactic"
             if range.end == start + 1 => {}
         // `"rotate_left" (ppSpace num)?` and `rotate_right` (`Init/Tactics.lean`).
         "rotate_left" | "rotate_right"
@@ -744,6 +873,8 @@ fn change(
     range: Range<usize>,
     atom: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    // `"change " term (location)?` (`Init/Tactics.lean`).
+    let (range, location) = locations::split(leaves, view, tokens, range)?;
     if range.len() < 2 {
         return Err(refusal(view, tokens, range.start));
     }
@@ -756,7 +887,7 @@ fn change(
     )?;
     Ok(Syntax::node(
         parser_kind(&["Tactic", "change"]),
-        vec![atom, target, null_node(Vec::new())],
+        vec![atom, target, location],
     ))
 }
 
@@ -820,6 +951,108 @@ fn generalize(
         parser_kind(&["Tactic", "generalize"]),
         vec![keyword, null_node(args), location],
     ))
+}
+
+/// `" [" withoutPosition(grindParam,*) "]"` over `range`, its `[` first and its `]` last
+/// (`Init/Grind/Tactics.lean`).
+#[inline(never)]
+fn grind_parameters(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    if range.len() < 2 || !is(range.start, "[") || !is(range.end - 1, "]") {
+        return Err(refusal(view, tokens, range.start));
+    }
+    // The `]` closes the `[`: nothing follows the list (no `=> grindSeq`).
+    let mut depth = 0usize;
+    for at in range.clone() {
+        if let TokenKind::Symbol(s) = &tokens[at].kind {
+            match crate::canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| refusal(view, tokens, at))?;
+                    if depth == 0 && at + 1 != range.end {
+                        return Err(refusal(view, tokens, at + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let inner = range.start + 1..range.end - 1;
+    let mut items = Vec::new();
+    if !inner.is_empty() {
+        for item in comma_separated(tokens, inner) {
+            if item.is_empty() {
+                return Err(refusal(view, tokens, item.start));
+            }
+            if !items.is_empty() {
+                items.push(leaves.leaf(item.start - 1)?);
+            }
+            items.push(Syntax::node(
+                parser_kind(&["Tactic", "grindParam"]),
+                vec![grind_parameter(leaves, view, tokens, item)?],
+            ));
+        }
+    }
+    Ok(null_node(vec![
+        leaves.leaf(range.start)?,
+        null_node(items),
+        leaves.leaf(range.end - 1)?,
+    ]))
+}
+
+/// `grindParam := grindErase <|> grindLemmaMin <|> grindLemma <|> anchor`
+/// (`Init/Grind/Interactive.lean`): `"-" ident`, `"!" (grindMod)? term`, `(grindMod)? term`; an
+/// anchor is not read.
+fn grind_parameter(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    item: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    if is(item.start, "-") {
+        if item.len() != 2 || !matches!(tokens[item.start + 1].kind, TokenKind::Ident(_)) {
+            return Err(refusal(view, tokens, item.start + 1));
+        }
+        return Ok(Syntax::node(
+            parser_kind(&["Tactic", "grindErase"]),
+            vec![leaves.leaf(item.start)?, leaves.leaf(item.start + 1)?],
+        ));
+    }
+    let min = is(item.start, "!");
+    let (modifier, term_start) = crate::command_scope::attributes::grind_modifier(
+        view,
+        tokens,
+        leaves,
+        item.start + usize::from(min),
+    )?;
+    // A modifier is followed by its lemma.
+    if term_start >= item.end {
+        return Err(refusal(view, tokens, item.end));
+    }
+    let term = bounded_term(
+        leaves,
+        view,
+        tokens,
+        term_start..item.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    let modifier = null_node(modifier.into_iter().collect());
+    Ok(if min {
+        Syntax::node(
+            parser_kind(&["Tactic", "grindLemmaMin"]),
+            vec![leaves.leaf(item.start)?, modifier, term],
+        )
+    } else {
+        Syntax::node(parser_kind(&["Tactic", "grindLemma"]), vec![modifier, term])
+    })
 }
 
 /// `range` split at its commas outside brackets.
@@ -1304,6 +1537,68 @@ fn simpa(
     Ok(parsed)
 }
 
+/// `(discharger)?` at `at` (`Init/Tactics.lean`): `"(" patternIgnore("discharger" <|> "disch") " := "
+/// tacticSeq ")"`, its slot and the token after it.
+#[inline(never)]
+fn discharger(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+    end: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let spelling = ["discharger", "disch"].into_iter().find(|text| {
+        matches!(tokens.get(at + 1).map(|t| &t.kind), Some(TokenKind::Ident(name)) if *name == Name::from_components([*text]))
+    });
+    let (Some(spelling), true, true) = (spelling, is(at, "("), is(at + 2, ":=")) else {
+        return Ok((null_node(Vec::new()), at));
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (index, token) in tokens.iter().enumerate().take(end).skip(at) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let close = close
+        .filter(|&close| close > at + 3)
+        .ok_or_else(|| refusal(view, tokens, at))?;
+    let name = Syntax::Atom {
+        info: leaves.leaf(at + 1)?.info(),
+        val: spelling.to_string(),
+    };
+    Ok((
+        null_node(vec![Syntax::node(
+            parser_kind(&["Tactic", "discharger"]),
+            vec![
+                leaves.leaf(at)?,
+                Syntax::node(
+                    Name::from_components(["patternIgnore"]),
+                    vec![Syntax::node(
+                        Name::from_components(["token", spelling]),
+                        vec![name],
+                    )],
+                ),
+                leaves.leaf(at + 2)?,
+                tactic_seq(leaves, view, tokens, at + 3..close)?,
+                leaves.leaf(close)?,
+            ],
+        )]),
+        close + 1,
+    ))
+}
+
 /// Simplification with either an explicit-only set or the environment's native
 /// simp registry. The optional `only` leaf remains visible in the syntax tree.
 ///
@@ -1318,6 +1613,7 @@ fn simplify(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let (range, location) = locations::split(leaves, view, tokens, range)?;
     let (config, at) = config(leaves, view, tokens, range.start + 1, range.end)?;
+    let (discharger, at) = discharger(leaves, view, tokens, at, range.end)?;
     let has_only = at < range.end
         && matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components(["only"]));
     let only = if has_only {
@@ -1340,9 +1636,20 @@ fn simplify(
         let mut rows = Vec::new();
         let mut start = open + 1;
         let mut depth = 0_usize;
+        // A rule's `∀ a, p` or `∃ a, p` owns the comma after its binders.
+        let mut binders = 0_usize;
+        let bracket = |at: usize| match &tokens[at].kind {
+            TokenKind::Symbol(s) => crate::canonical_bracket(s.as_str()),
+            _ => "",
+        };
         for at in open + 1..range.end {
             let end = at == range.end - 1;
-            if end || depth == 0 && is(at, ",") {
+            if depth == 0 && (is(at, "∀") || is(at, "∃") || is(at, "forall")) {
+                binders += 1;
+            }
+            if depth == 0 && binders > 0 && is(at, ",") {
+                binders -= 1;
+            } else if end || depth == 0 && is(at, ",") {
                 if at == start {
                     if end && (start == open + 1 || !rows.is_empty()) {
                         break;
@@ -1402,9 +1709,9 @@ fn simplify(
                     rows.push(leaves.leaf(at)?);
                 }
                 start = at + 1;
-            } else if is(at, "(") || is(at, ".{") {
+            } else if matches!(bracket(at), "(" | "[" | "{" | ".{" | "⦃" | "⟨") {
                 depth += 1;
-            } else if is(at, ")") || is(at, "}") {
+            } else if matches!(bracket(at), ")" | "]" | "}" | "⦄" | "⟩") {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;
@@ -1421,14 +1728,7 @@ fn simplify(
     };
     Ok(Syntax::node(
         parser_kind(&["Tactic", kind]),
-        vec![
-            keyword,
-            config,
-            null_node(Vec::new()),
-            only,
-            arguments,
-            location,
-        ],
+        vec![keyword, config, discharger, only, arguments, location],
     ))
 }
 
@@ -1693,14 +1993,19 @@ mod local_declaration_tests {
             "have h : := rfl",
             "have h : Nat := by",
             "have 7 := 7",
-            "let := 7",
-            "let : Nat := 7",
             "let n = 7",
-            "have h (x : Nat) := x",
             "have h : 0 = 0 := by\n  exact h",
         ] {
             let source = format!("theorem t : 0 = 0 := by\n  {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        // A local's binders (`letIdBinder`s) and an anonymous `let` (`letIdLhs`'s `hygieneInfo`)
+        // are no malformation: the pin parses each as `letIdDecl` and fails only in elaboration
+        // (unsolved goals, 2026-10-09). Every token is kept.
+        for tail in ["have h (x : Nat) := x", "let := 7", "let : Nat := 7"] {
+            let source = format!("theorem t : 0 = 0 := by\n  {tail}");
+            let parsed = parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
         }
         // A proof nested in the value is a term the pin parses (it fails in elaboration: `rfl`
         // has no relation to close), bounded as any proof in a tactic term.

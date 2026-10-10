@@ -1,7 +1,7 @@
 //! Header-only source import parsing over Vellum's real token stream.
 //! No source is synthesized and the returned body offset names original bytes.
 use super::*;
-use fln_syntax::token::lex_token;
+use fln_syntax::token::{TokenTable, lex_token};
 use fln_syntax::trivia::scan_trivia;
 
 /// One explicit import directive. Modifier positions name the original source

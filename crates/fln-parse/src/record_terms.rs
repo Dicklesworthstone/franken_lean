@@ -205,6 +205,7 @@ pub(super) fn delimiter(
         frames.push(frame(record));
     } else {
         let open = record.open;
+        let plain = record.with_token.is_none() && record.colon.is_none();
         let term = Syntax::node(
             parser_kind(&["Term", "structInst"]),
             vec![
@@ -225,6 +226,12 @@ pub(super) fn delimiter(
                 leaves.leaf(at)?,
             ],
         );
+        let term = match collection_notation(leaves, plain, &term, open, at)? {
+            // The pin keeps both readings: `longestMatchFn`'s `choice`, the notation (added after
+            // the builtin structure instance) first.
+            Some(notation) => Syntax::node(Name::from_components(["choice"]), vec![notation, term]),
+            None => term,
+        };
         frames
             .last_mut()
             .expect("record frame has a parent")
@@ -232,6 +239,94 @@ pub(super) fn delimiter(
             .push((term, open));
     }
     Ok(())
+}
+
+/// `{}` and `{x, y}` read as Init's collection notations too (`syntax "{" "}" : term`, kind
+/// `«term{}»`, and `syntax "{" term,+ "}" : term`, kind `«term{_}»`), when the entered grammar
+/// has them: a structure instance with no source, no type and only abbreviated fields is the
+/// same input.
+fn collection_notation(
+    leaves: &Leaves,
+    plain: bool,
+    structure: &Syntax,
+    open: usize,
+    close: usize,
+) -> Result<Option<Syntax>, NatDefinitionParseError> {
+    if !plain {
+        return Ok(None);
+    }
+    let Syntax::Node { args, .. } = structure else {
+        return Ok(None);
+    };
+    let [_, _, Syntax::Node { args: fields, .. }, ..] = args.as_slice() else {
+        return Ok(None);
+    };
+    let rows = match fields.as_slice() {
+        [Syntax::Node { args: rows, .. }] => rows,
+        _ => return Ok(None),
+    };
+    // Fields separated by commas are the notation's elements; separated by line breaks (the
+    // structure instance's empty separators) they are one application, `{ f⏎ a⏎ b }` read by
+    // `term,+` as `{f a b}`.
+    if rows.len().is_multiple_of(2) && !rows.is_empty() {
+        return Ok(None);
+    }
+    let breaks = rows
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|separator| matches!(separator, Syntax::Node { args, .. } if args.is_empty()))
+        .count();
+    let mut elements = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index % 2 == 1 && breaks > 0 {
+            if !matches!(row, Syntax::Node { args, .. } if args.is_empty()) {
+                return Ok(None);
+            }
+            continue;
+        }
+        match row {
+            Syntax::Atom { .. } => elements.push(row.clone()),
+            // `structInstField (structInstLVal x []) []`: an abbreviated field, the bare name.
+            Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Term", "structInstField"])
+                    && matches!(args.as_slice(), [Syntax::Node { args: value, .. }] | [_, Syntax::Node { args: value, .. }] if value.is_empty()) =>
+            {
+                let Some(Syntax::Node { args: lval, .. }) = args.first() else {
+                    return Ok(None);
+                };
+                match lval.as_slice() {
+                    [name @ Syntax::Ident { .. }, Syntax::Node { args: rest, .. }]
+                        if rest.is_empty() =>
+                    {
+                        elements.push(name.clone());
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    if breaks > 0 {
+        let head = elements.remove(0);
+        elements = vec![Syntax::node(
+            parser_kind(&["Term", "app"]),
+            vec![head, null_node(std::mem::take(&mut elements))],
+        )];
+    }
+    let (kind, children) = if elements.is_empty() {
+        ("term{}", vec![leaves.leaf(open)?, leaves.leaf(close)?])
+    } else {
+        (
+            "term{_}",
+            vec![leaves.leaf(open)?, null_node(elements), leaves.leaf(close)?],
+        )
+    };
+    let kind = Name::from_components([kind]);
+    if !crate::extensions::is_active_kind(&kind) {
+        return Ok(None);
+    }
+    Ok(Some(Syntax::node(kind, children)))
 }
 
 /// The field (or bare frame) that `current` holds, into `record.rows`.

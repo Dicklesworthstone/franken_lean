@@ -51,9 +51,12 @@ fn scope_tree(
         ))
     };
     let node = |kind: &str, args: Vec<Syntax>| Syntax::node(parser_kind(&["Command", kind]), args);
-    // `variable`, `include` and `omit` may end at a top-level `in` before a command
+    // `variable`, `include`, `omit` and `attribute` may end at a top-level `in` before a command
     // (`Command.in`); the head is read up to it.
-    let stop = if matches!(keyword.as_str(), "variable" | "include" | "omit") {
+    let stop = if matches!(
+        keyword.as_str(),
+        "variable" | "include" | "omit" | "attribute"
+    ) {
         let mut depth = 0usize;
         let mut stop = tokens.len();
         for (at, token) in tokens.iter().enumerate().skip(1) {
@@ -126,7 +129,10 @@ fn scope_tree(
         }
         "attribute" => {
             let leaves = leaves()?;
-            return attributes::command_syntax(view, tokens, &leaves);
+            let Some(tree) = attributes::command_syntax(view, &tokens[..stop], &leaves)? else {
+                return Ok(None);
+            };
+            tree
         }
         "open" => return open(source, view, tokens),
         "set_option" => return set_option(source, view, tokens),
@@ -379,6 +385,38 @@ pub(crate) fn open_declaration(
     }))
 }
 
+/// `optionValue := "true" <|> "false" <|> str <|> num` (each a non-reserved symbol or a literal)
+/// at token `at`; `None` for anything else.
+pub(crate) fn option_value(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Option<Syntax>, NatDefinitionParseError> {
+    Ok(Some(match &tokens[at].kind {
+        TokenKind::Ident(name)
+            if *name == Name::from_components(["true"])
+                || *name == Name::from_components(["false"]) =>
+        {
+            Syntax::Atom {
+                info: leaves.leaf(at)?.info(),
+                val: if *name == Name::from_components(["true"]) {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_owned(),
+            }
+        }
+        TokenKind::Literal(LiteralKind::Nat) => {
+            Syntax::node(Name::str(Name::anonymous(), "num"), vec![leaves.leaf(at)?])
+        }
+        TokenKind::Literal(LiteralKind::Str) => {
+            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaves.leaf(at)?])
+        }
+        _ => return Ok(None),
+    }))
+}
+
 /// `set_option ident optionValue`, `optionValue := "true" <|> "false" <|> str <|> num` (each a
 /// non-reserved symbol or a literal), optionally followed by `in <command>`.
 #[inline(never)]
@@ -397,28 +435,8 @@ fn set_option(
         return Ok(None);
     }
     let leaves = Leaves::build(view.normalized(), tokens)?;
-    let value = match &tokens[2].kind {
-        TokenKind::Ident(name)
-            if *name == Name::from_components(["true"])
-                || *name == Name::from_components(["false"]) =>
-        {
-            Syntax::Atom {
-                info: leaves.leaf(2)?.info(),
-                val: if *name == Name::from_components(["true"]) {
-                    "true"
-                } else {
-                    "false"
-                }
-                .to_owned(),
-            }
-        }
-        TokenKind::Literal(LiteralKind::Nat) => {
-            Syntax::node(Name::str(Name::anonymous(), "num"), vec![leaves.leaf(2)?])
-        }
-        TokenKind::Literal(LiteralKind::Str) => {
-            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaves.leaf(2)?])
-        }
-        _ => return Ok(None),
+    let Some(value) = option_value(&leaves, tokens, 2)? else {
+        return Ok(None);
     };
     let command = Syntax::node(
         parser_kind(&["Command", "set_option"]),

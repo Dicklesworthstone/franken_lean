@@ -1,8 +1,10 @@
 //! `conv` blocks (`Init/Conv.lean`): `"conv" (" at " ident)? (" in " (occs)? term)? " => "
 //! convSeq`, where `convSeq` is `sepByIndent conv "; "`. The conv tactics read are the ones the
-//! corpus uses most: `lhs`, `rhs`, `congr`, `arg n`, `enter [n, …]`, `ext x …`, `rw [rules]`,
-//! `simp`, `apply e` and a nested `· convSeq`; any other is refused where it starts. The
-//! elaborator does not run conv mode: it refuses the block.
+//! corpus uses most: the one-keyword ones (`lhs`, `congr`, `whnf`, `left`, `rfl`, …), `arg n`,
+//! `enter [n, …]`, `ext x …`, `intro x …`, `unfold f …`, `delta f …`, `rw [rules]`,
+//! `rewrite`, `simp`, `apply e`, `change e`, `tactic => tacs`, `first | … | …` and a nested
+//! `· convSeq`; any other is refused where it starts. A `(conv| …)` quotation holds one of them.
+//! The elaborator does not run conv mode: it refuses the block.
 use super::*;
 
 fn symbol(tokens: &[LexedToken], at: usize, text: &str) -> bool {
@@ -94,6 +96,19 @@ pub(super) fn tactic(
         conv_kind("conv"),
         vec![keyword, at_slot, in_slot, leaves.leaf(arrow)?, body],
     ))
+}
+
+/// The conv tactic of a `(conv| …)` quotation (`conv.quot`).
+pub(super) fn quoted(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if range.is_empty() {
+        return Err(refusal(view, tokens, range.start));
+    }
+    conv_tactic(leaves, view, tokens, range)
 }
 
 /// `convSeq1Indented := sepByIndent conv "; "`: conv tactics separated by `;` or by a line at the
@@ -196,6 +211,27 @@ fn conv_tactic(
     Ok(chain)
 }
 
+/// The conv tactics that are one keyword (`syntax (name := skip) "skip" : conv`, `Init/Conv.lean`)
+/// and the one-keyword macros (`macro "left" : conv`, kind `convLeft`): spelling, kind.
+const KEYWORDS: [(&str, &str); 16] = [
+    ("lhs", "lhs"),
+    ("rhs", "rhs"),
+    ("congr", "congr"),
+    ("skip", "skip"),
+    ("cbv", "cbv"),
+    ("fun", "fun"),
+    ("whnf", "whnf"),
+    ("zeta", "zeta"),
+    ("reduce", "reduce"),
+    ("simp_match", "simpMatch"),
+    ("rfl", "convRfl"),
+    ("done", "convDone"),
+    ("trace_state", "convTrace_state"),
+    ("args", "convArgs"),
+    ("left", "convLeft"),
+    ("right", "convRight"),
+];
+
 fn conv_operand(
     leaves: &Leaves,
     view: &SourceView,
@@ -218,11 +254,10 @@ fn conv_operand(
     if range.is_empty() {
         return Err(refusal(view, tokens, start));
     }
-    // `syntax (name := skip) "skip" : conv` (`Init/Conv.lean`), and the others' leaves.
-    for name in ["lhs", "rhs", "congr", "skip"] {
-        if word(tokens, start, name) && range.len() == 1 {
-            return Ok(Syntax::node(conv_kind(name), vec![atom(start, name)?]));
-        }
+    if range.len() == 1
+        && let Some(&(name, kind)) = KEYWORDS.iter().find(|(name, _)| word(tokens, start, name))
+    {
+        return Ok(Syntax::node(conv_kind(kind), vec![atom(start, name)?]));
     }
     if word(tokens, start, "arg") && range.len() == 2 && number(start + 1) {
         return Ok(Syntax::node(
@@ -264,22 +299,45 @@ fn conv_operand(
             ],
         ));
     }
-    if word(tokens, start, "ext")
-        && range.len() >= 2
-        && (start + 1..range.end).all(|at| matches!(&tokens[at].kind, TokenKind::Ident(_)))
-    {
-        let names = (start + 1..range.end)
-            .map(|at| {
-                Ok(Syntax::node(
+    // `"ext" (ppSpace colGt binderIdent)*` (`Conv.ext`) and the macro `"intro"` of the same shape
+    // (`convIntro___`), where `binderIdent := ident <|> hole`.
+    for (name, kind) in [("ext", "ext"), ("intro", "convIntro___")] {
+        if word(tokens, start, name) {
+            let mut names = Vec::new();
+            for at in start + 1..range.end {
+                let binder = if symbol(tokens, at, "_") {
+                    Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(at)?])
+                } else if matches!(&tokens[at].kind, TokenKind::Ident(_)) {
+                    leaves.leaf(at)?
+                } else {
+                    return Err(refusal(view, tokens, at));
+                };
+                names.push(Syntax::node(
                     Name::from_components(["Lean", "binderIdent"]),
-                    vec![leaves.leaf(at)?],
-                ))
-            })
-            .collect::<Result<Vec<_>, NatDefinitionParseError>>()?;
-        return Ok(Syntax::node(
-            conv_kind("ext"),
-            vec![atom(start, "ext")?, null_node(names)],
-        ));
+                    vec![binder],
+                ));
+            }
+            return Ok(Syntax::node(
+                conv_kind(kind),
+                vec![atom(start, name)?, null_node(names)],
+            ));
+        }
+    }
+    // `"unfold" (ppSpace colGt ident)+` (`Conv.unfold`) and `"delta"` of the same shape.
+    for name in ["unfold", "delta"] {
+        if word(tokens, start, name) && range.len() > 1 {
+            let mut names = Vec::new();
+            for at in start + 1..range.end {
+                if !matches!(&tokens[at].kind, TokenKind::Ident(_)) {
+                    return Err(refusal(view, tokens, at));
+                }
+                names.push(leaves.leaf(at)?);
+            }
+            return Ok(Syntax::node(
+                conv_kind(name),
+                vec![atom(start, name)?, null_node(names)],
+            ));
+        }
     }
     if word(tokens, start, "rw") {
         // `"rw " optConfig rwRuleSeq` (`Conv.convRw__`): the tactic's rules, with no location.
@@ -307,19 +365,21 @@ fn conv_operand(
             vec![dot, sequence(leaves, view, tokens, start + 1..range.end)?],
         ));
     }
-    // `"apply " term` (`convApply_`).
-    if word(tokens, start, "apply") && range.len() > 1 {
-        let term = bounded_term(
-            leaves,
-            view,
-            tokens,
-            start + 1..range.end,
-            DefinitionGrammar::Scalar,
-        )?;
-        return Ok(Syntax::node(
-            conv_kind("convApply_"),
-            vec![atom(start, "apply")?, term],
-        ));
+    // `"apply " term` (the macro `convApply_`) and `"change " term` (`Conv.change`).
+    for (name, kind) in [("apply", "convApply_"), ("change", "change")] {
+        if word(tokens, start, name) && range.len() > 1 {
+            let term = bounded_term(
+                leaves,
+                view,
+                tokens,
+                start + 1..range.end,
+                DefinitionGrammar::Scalar,
+            )?;
+            return Ok(Syntax::node(
+                conv_kind(kind),
+                vec![atom(start, name)?, term],
+            ));
+        }
     }
     // `simp`'s slots without a location (`Conv.simp`).
     if word(tokens, start, "simp") {
@@ -345,5 +405,130 @@ fn conv_operand(
             ],
         ));
     }
+    // `"tactic" " => " tacticSeq` (`Conv.nestedTactic`) and `"tactic'" " => " tacticSeq`
+    // (`Conv.nestedTacticCore`).
+    for (name, kind) in [("tactic", "nestedTactic"), ("tactic'", "nestedTacticCore")] {
+        if word(tokens, start, name) && symbol(tokens, start + 1, "=>") && range.len() > 2 {
+            return Ok(Syntax::node(
+                conv_kind(kind),
+                vec![
+                    atom(start, name)?,
+                    leaves.leaf(start + 1)?,
+                    tactic_seq(leaves, view, tokens, start + 2..range.end)?,
+                ],
+            ));
+        }
+    }
+    if word(tokens, start, "rewrite") && range.len() > 1 {
+        return rewrite_operand(leaves, view, tokens, range, atom(start, "rewrite")?);
+    }
+    if word(tokens, start, "first") && symbol(tokens, start + 1, "|") {
+        return first_operand(leaves, view, tokens, range, atom(start, "first")?);
+    }
     Err(refusal(view, tokens, start))
+}
+
+/// `"rewrite" optConfig rwRuleSeq` (`Conv.rewrite`), its configuration and rules read, or, in a
+/// quotation, antiquotations of both (`rewrite $c:optConfig $s`, the `rw` macro's template).
+fn rewrite_operand(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let start = range.start;
+    if symbol(tokens, start + 1, "$") {
+        // Only a configuration named as one: an antiquotation with no kind would be read as the
+        // configuration's too, which is not established here.
+        if !(symbol(tokens, start + 3, ":") && word(tokens, start + 4, "optConfig")) {
+            return Err(refusal(view, tokens, start + 1));
+        }
+        let position = crate::quotations::Position::OptConfig;
+        let Some((config, next)) =
+            crate::quotations::antiquotation(leaves, view, tokens, start + 1, range.end, position)?
+        else {
+            return Err(refusal(view, tokens, start + 1));
+        };
+        let position = crate::quotations::Position::RwRuleSeq;
+        let Some((rules, end)) =
+            crate::quotations::antiquotation(leaves, view, tokens, next, range.end, position)?
+        else {
+            return Err(refusal(view, tokens, next));
+        };
+        if end != range.end {
+            return Err(refusal(view, tokens, end));
+        }
+        return Ok(Syntax::node(
+            conv_kind("rewrite"),
+            vec![keyword, config, rules],
+        ));
+    }
+    let rewritten = rewrite(leaves, view, tokens, range, keyword, "rewrite")?;
+    let Syntax::Node { args, .. } = &rewritten else {
+        return Err(refusal(view, tokens, start));
+    };
+    let [keyword, config, rules, location] = args.as_slice() else {
+        return Err(refusal(view, tokens, start));
+    };
+    if !matches!(location, Syntax::Node { args, .. } if args.is_empty()) {
+        return Err(refusal(view, tokens, start));
+    }
+    Ok(Syntax::node(
+        conv_kind("rewrite"),
+        vec![keyword.clone(), config.clone(), rules.clone()],
+    ))
+}
+
+/// `"first " withPosition((ppDedent(ppLine) colGe "| " convSeq)+)` (`Conv.first`): each
+/// alternative a `group` of its `|` and its sequence, or, in a quotation, an antiquotation of one
+/// (`first | $t | skip`).
+fn first_operand(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut pipes = Vec::new();
+    let mut depth = 0usize;
+    for at in range.start + 1..range.end {
+        if depth == 0 && symbol(tokens, at, "|") {
+            pipes.push(at);
+        }
+        if let TokenKind::Symbol(s) = &tokens[at].kind {
+            match crate::canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    let mut alternatives = Vec::new();
+    for (index, &pipe) in pipes.iter().enumerate() {
+        let end = pipes.get(index + 1).copied().unwrap_or(range.end);
+        if pipe + 1 >= end {
+            return Err(refusal(view, tokens, pipe + 1));
+        }
+        let position = crate::quotations::Position::ConvSeq;
+        let body = match crate::quotations::antiquotation(
+            leaves,
+            view,
+            tokens,
+            pipe + 1,
+            end,
+            position,
+        )? {
+            Some((antiquotation, next)) if next == end => antiquotation,
+            _ => sequence(leaves, view, tokens, pipe + 1..end)?,
+        };
+        alternatives.push(Syntax::node(
+            Name::from_components(["group"]),
+            vec![leaves.leaf(pipe)?, body],
+        ));
+    }
+    Ok(Syntax::node(
+        conv_kind("first"),
+        vec![keyword, null_node(alternatives)],
+    ))
 }

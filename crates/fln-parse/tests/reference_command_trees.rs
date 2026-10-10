@@ -2593,6 +2593,683 @@ const TERM_PATTERN_LETS: &[Accepted] = &[
     },
 ];
 
+/// A branch's destructuring `let` (`letPatDecl`, in an `if` branch and in match alternatives,
+/// with and without a type), and a type ascription without its type (`(e :)`, `typeAscription`'s
+/// optional type). Captured 2026-10-09 from one file the pin elaborated without a message, in this
+/// order.
+const BRANCH_PATTERN_LETS_AND_BARE_ASCRIPTIONS: &[Accepted] = &[
+    Accepted {
+        source: "def bp1 (p : Nat × Nat) (b : Bool) : Nat :=\n  if b then\n    let ⟨x, y⟩ := p\n    x + y\n  else 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `bp1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`p] [":" («term_×_» `Nat "×" `Nat)] [] ")") (Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (termIfThenElse "if" `b "then" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letPatDecl (Term.anonymousCtor "⟨" [`x "," `y] "⟩") [] [] ":=" `p)) [] («term_+_» `x "+" `y)) "else" (num "0")) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def bp2 (o : Option (Nat × Nat)) : Nat :=\n  match o with\n  | some q =>\n    let ⟨x, y⟩ := q\n    x + y\n  | none => 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `bp2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`o] [":" (Term.app `Option [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `o)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.app `some [`q])]] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letPatDecl (Term.anonymousCtor "⟨" [`x "," `y] "⟩") [] [] ":=" `q)) [] («term_+_» `x "+" `y))) (Term.matchAlt "|" [[`none]] "=>" (num "0"))])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def bp3 (o : Option (Nat × Nat)) : Nat :=\n  match o with\n  | some q => let ⟨x, y⟩ : Nat × Nat := q; x + y\n  | none => 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `bp3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`o] [":" (Term.app `Option [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `o)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.app `some [`q])]] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letPatDecl (Term.anonymousCtor "⟨" [`x "," `y] "⟩") [] [(Term.typeSpec ":" («term_×_» `Nat "×" `Nat))] ":=" `q)) ";" («term_+_» `x "+" `y))) (Term.matchAlt "|" [[`none]] "=>" (num "0"))])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def ba1 (n : Nat) : Nat := (n + 1 :)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `ba1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ":" [] ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem ba2 (a b : Nat) (h : a = b) : b = a := (h.symm :)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `ba2 []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `h.symm ":" [] ")") (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `intro`'s `term:max` arguments, bracketed patterns included (`intro h ⟨h₁, h₂⟩`,
+/// `intro (k : Fin 1)`); `rintro`'s parenthesized units, `rintroPat.binder` (`(hp hq)`,
+/// `(h : P)`) or, with alternatives, `rcasesPat.paren` (`(h | h)`); a tactic `have`/`let`'s
+/// binders (`have H (k : Nat) : …`, `have (k : Nat) : …`, `let f x y := …`) and `_` as its name.
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const INTRO_PATTERNS_AND_LOCAL_BINDERS: &[Accepted] = &[
+    Accepted {
+        source: "theorem i1 (P Q R : Prop) : (P → Q → R) → (P ∧ Q → R) := by intro h ⟨h₁, h₂⟩; exact h h₁ h₂",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `i1 []) (Command.declSig [(Term.explicitBinder "(" [`P `Q `R] [":" (Term.prop "Prop")] [] ")")] (Term.typeSpec ":" (Term.arrow (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.arrow `P "→" (Term.arrow `Q "→" `R)) ")") "→" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.arrow («term_∧_» `P "∧" `Q) "→" `R) ")")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.intro "intro" [`h (Term.anonymousCtor "⟨" [`h₁ "," `h₂] "⟩")]) ";" (Tactic.exact "exact" (Term.app `h [`h₁ `h₂]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem i2 : ∀ (k : Fin 1), k = k := by\n  intro (k : Fin 1)\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `i2 []) (Command.declSig [] (Term.typeSpec ":" (Term.forall "∀" [(Term.explicitBinder "(" [`k] [":" (Term.app `Fin [(num "1")])] [] ")")] [] "," («term_=_» `k "=" `k)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.intro "intro" [(Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `k ":" [(Term.app `Fin [(num "1")])] ")")]) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem i3 (p : Nat × Nat → Prop) (h : ∀ a b, p (a, b)) : ∀ x, p x := by\n  intro ⟨a, b⟩\n  exact h a b",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `i3 []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.arrow («term_×_» `Nat "×" `Nat) "→" (Term.prop "Prop"))] [] ")") (Term.explicitBinder "(" [`h] [":" (Term.forall "∀" [`a `b] [] "," (Term.app `p [(Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [`a "," [`b]] ")")]))] [] ")")] (Term.typeSpec ":" (Term.forall "∀" [`x] [] "," (Term.app `p [`x])))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.intro "intro" [(Term.anonymousCtor "⟨" [`a "," `b] "⟩")]) [] (Tactic.exact "exact" (Term.app `h [`a `b]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem r1 (a b : Nat) : a = 0 ∨ a = b → a = a := by\n  rintro (h | h) <;> rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `r1 []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" (Term.arrow («term_∨_» («term_=_» `a "=" (num "0")) "∨" («term_=_» `a "=" `b)) "→" («term_=_» `a "=" `a)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.«tactic_<;>_» (Tactic.rintro "rintro" [(Tactic.rintroPat.one (Tactic.rcasesPat.paren "(" (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `h) "|" (Tactic.rcasesPat.one `h)]) []) ")"))] []) "<;>" (Tactic.tacticRfl "rfl"))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem r2 (P Q : Prop) : P ∧ Q ∨ Q ∧ P → Q := by\n  rintro (⟨-, hq⟩ | ⟨hq, -⟩) <;> exact hq",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `r2 []) (Command.declSig [(Term.explicitBinder "(" [`P `Q] [":" (Term.prop "Prop")] [] ")")] (Term.typeSpec ":" (Term.arrow («term_∨_» («term_∧_» `P "∧" `Q) "∨" («term_∧_» `Q "∧" `P)) "→" `Q))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.«tactic_<;>_» (Tactic.rintro "rintro" [(Tactic.rintroPat.one (Tactic.rcasesPat.paren "(" (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.clear "-")]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `hq)]) [])] "⟩") "|" (Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `hq)]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.clear "-")]) [])] "⟩")]) []) ")"))] []) "<;>" (Tactic.exact "exact" `hq))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem r3 (P : Prop) : P → P := by\n  rintro (h : P)\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `r3 []) (Command.declSig [(Term.explicitBinder "(" [`P] [":" (Term.prop "Prop")] [] ")")] (Term.typeSpec ":" (Term.arrow `P "→" `P))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.rintro "rintro" [(Tactic.rintroPat.binder "(" [(Tactic.rintroPat.one (Tactic.rcasesPat.one `h))] [":" `P] ")")] []) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem r4 (P Q : Prop) : P → Q → P := by\n  rintro (hp hq)\n  exact hp",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `r4 []) (Command.declSig [(Term.explicitBinder "(" [`P `Q] [":" (Term.prop "Prop")] [] ")")] (Term.typeSpec ":" (Term.arrow `P "→" (Term.arrow `Q "→" `P)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.rintro "rintro" [(Tactic.rintroPat.binder "(" [(Tactic.rintroPat.one (Tactic.rcasesPat.one `hp)) (Tactic.rintroPat.one (Tactic.rcasesPat.one `hq))] [] ")")] []) [] (Tactic.exact "exact" `hp)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h1 (n : Nat) : n + 0 = n := by\n  have H (k : Nat) : k + 0 = k := Nat.add_zero k\n  exact H n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h1 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `n "+" (num "0")) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `H) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» («term_+_» `k "+" (num "0")) "=" `k))] ":=" (Term.app `Nat.add_zero [`k])))) [] (Tactic.exact "exact" (Term.app `H [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h2 (n : Nat) : n + 0 = n := by\n  have (k : Nat) : k + 0 = k := Nat.add_zero k\n  exact this n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `n "+" (num "0")) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» («term_+_» `k "+" (num "0")) "=" `k))] ":=" (Term.app `Nat.add_zero [`k])))) [] (Tactic.exact "exact" (Term.app `this [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h3 (n : Nat) : n + 0 = n := by\n  have H {k : Nat} (j : Nat) : k + j = j + k := Nat.add_comm k j\n  exact Nat.add_zero n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h3 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `n "+" (num "0")) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `H) [(Term.implicitBinder "{" [`k] [":" `Nat] "}") (Term.explicitBinder "(" [`j] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» («term_+_» `k "+" `j) "=" («term_+_» `j "+" `k)))] ":=" (Term.app `Nat.add_comm [`k `j])))) [] (Tactic.exact "exact" (Term.app `Nat.add_zero [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h4 (n : Nat) : 0 < 2 ^ n := by\n  have _ := Nat.two_pow_pos n\n  exact Nat.two_pow_pos n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h4 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_<_» (num "0") "<" («term_^_» (num "2") "^" `n)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (Term.hole "_")) [] [] ":=" (Term.app `Nat.two_pow_pos [`n])))) [] (Tactic.exact "exact" (Term.app `Nat.two_pow_pos [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h5 (n : Nat) : 0 < 2 ^ n := by\n  have _ : 0 < 2 ^ n := Nat.two_pow_pos n\n  exact Nat.two_pow_pos n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h5 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_<_» (num "0") "<" («term_^_» (num "2") "^" `n)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (Term.hole "_")) [] [(Term.typeSpec ":" («term_<_» (num "0") "<" («term_^_» (num "2") "^" `n)))] ":=" (Term.app `Nat.two_pow_pos [`n])))) [] (Tactic.exact "exact" (Term.app `Nat.two_pow_pos [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h7 (n : Nat) : n = n := by\n  let f (k : Nat) := k + 1\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h7 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticLet__ "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `f) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [] ":=" («term_+_» `k "+" (num "1"))))) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem h8 (n : Nat) : n = n := by\n  let f x y := x + y + n\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `h8 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticLet__ "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `f) [`x `y] [] ":=" («term_+_» («term_+_» `x "+" `y) "+" `n)))) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// A tactic `let rec` (`Tactic.letrec`: one `letRecDecl`, its doc and attribute slots empty, an
+/// empty termination suffix), and `{ tacs }` (`tacticSeqBracketed`: a whole `by`'s `tacticSeq`,
+/// or one item of a sequence). Captured 2026-10-09 from one file the pin elaborated without a
+/// message, in this order.
+const LET_REC_TACTICS_AND_BRACKETED_SEQUENCES: &[Accepted] = &[
+    Accepted {
+        source: "theorem lr1 (n : Nat) : n = n := by\n  let rec go (k : Nat) : k = k := rfl\n  exact go n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `lr1 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» `k "=" `k))] ":=" `rfl)) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `go [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem lr2 (n : Nat) : n = n := by\n  let rec go : ∀ k : Nat, k = k := fun _ => rfl\n  exact go n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `lr2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [] [(Term.typeSpec ":" (Term.forall "∀" [`k] [(Term.typeSpec ":" `Nat)] "," («term_=_» `k "=" `k)))] ":=" (Term.fun "fun" (Term.basicFun [(Term.hole "_")] [] "=>" `rfl)))) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `go [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem lr3 (n : Nat) : n + 0 = n := by\n  let rec go (k : Nat) : k + 0 = k := by\n    simp\n  exact go n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `lr3 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `n "+" (num "0")) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» («term_+_» `k "+" (num "0")) "=" `k))] ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] [] [])]))))) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `go [`n]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b1 (P : Prop) (h : P) : P := by { exact h }",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b1 []) (Command.declSig [(Term.explicitBinder "(" [`P] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `P] [] ")")] (Term.typeSpec ":" `P)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeqBracketed "{" [(Tactic.exact "exact" `h)] "}"))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b2 (P Q : Prop) (h : P) (q : Q) : P ∧ Q := by\n  constructor\n  { exact h }\n  { exact q }",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b2 []) (Command.declSig [(Term.explicitBinder "(" [`P `Q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `P] [] ")") (Term.explicitBinder "(" [`q] [":" `Q] [] ")")] (Term.typeSpec ":" («term_∧_» `P "∧" `Q))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.constructor "constructor") [] (Tactic.tacticSeqBracketed "{" [(Tactic.exact "exact" `h)] "}") [] (Tactic.tacticSeqBracketed "{" [(Tactic.exact "exact" `q)] "}")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b3 (P : Prop) (h : P) : P := by { intros; exact h }",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b3 []) (Command.declSig [(Term.explicitBinder "(" [`P] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `P] [] ")")] (Term.typeSpec ":" `P)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeqBracketed "{" [(Tactic.intros "intros" []) ";" (Tactic.exact "exact" `h)] "}"))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// A `for` whose binder is a pattern (`for ⟨a, b⟩ in l do`, `for (a, _) in l do`: `doForDecl`'s
+/// binder is a term), and a `do` block's `let rec` (`doLetRec`: `group("let" "rec")`, one
+/// `letRecDecl` with empty doc and attribute slots and an empty termination suffix). Captured
+/// 2026-10-09 from one file the pin elaborated without a message, in this order.
+const FOR_PATTERNS_AND_DO_LET_REC: &[Accepted] = &[
+    Accepted {
+        source: "def fp1 (l : List (Nat × Nat)) : Nat := Id.run do\n  let mut s := 0\n  for ⟨a, b⟩ in l do\n    s := s + a + b\n  return s",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `fp1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`l] [":" (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Id.run [(Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLet "let" ["mut"] (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `s) [] [] ":=" (num "0")))) []) (Term.doSeqItem (Term.doFor "for" [(Term.doForDecl [] (Term.anonymousCtor "⟨" [`a "," `b] "⟩") "in" `l)] "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doReassign (Term.letIdDeclNoBinders (Term.letId `s) [] [] ":=" («term_+_» («term_+_» `s "+" `a) "+" `b))) [])])) []) (Term.doSeqItem (Term.doReturn "return" [`s]) [])]))]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def fp2 (l : List (Nat × Nat)) : Nat := Id.run do\n  let mut s := 0\n  for (a, _) in l do\n    s := s + a\n  return s",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `fp2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`l] [":" (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Id.run [(Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLet "let" ["mut"] (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `s) [] [] ":=" (num "0")))) []) (Term.doSeqItem (Term.doFor "for" [(Term.doForDecl [] (Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [`a "," [(Term.hole "_")]] ")") "in" `l)] "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doReassign (Term.letIdDeclNoBinders (Term.letId `s) [] [] ":=" («term_+_» `s "+" `a))) [])])) []) (Term.doSeqItem (Term.doReturn "return" [`s]) [])]))]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def fp3 (l : List Nat) : Nat := Id.run do\n  let mut s := 0\n  for x in l do\n    s := s + x\n  return s",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `fp3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`l] [":" (Term.app `List [`Nat])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Id.run [(Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLet "let" ["mut"] (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `s) [] [] ":=" (num "0")))) []) (Term.doSeqItem (Term.doFor "for" [(Term.doForDecl [] `x "in" `l)] "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doReassign (Term.letIdDeclNoBinders (Term.letId `s) [] [] ":=" («term_+_» `s "+" `x))) [])])) []) (Term.doSeqItem (Term.doReturn "return" [`s]) [])]))]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def dr1 (n : Nat) : Nat := Id.run do\n  let rec go (k : Nat) : Nat := k\n  return go n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `dr1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Id.run [(Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLetRec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" `k)) (Termination.suffix [] []))])) []) (Term.doSeqItem (Term.doReturn "return" [(Term.app `go [`n])]) [])]))]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def dr2 (n : Nat) : Nat := Id.run do\n  let rec go := fun (k : Nat) => k + 1\n  return go n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `dr2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Id.run [(Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLetRec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [] [] ":=" (Term.fun "fun" (Term.basicFun [(Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `k ":" [`Nat] ")")] [] "=>" («term_+_» `k "+" (num "1")))))) (Termination.suffix [] []))])) []) (Term.doSeqItem (Term.doReturn "return" [(Term.app `go [`n])]) [])]))]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def dr3 (n : Nat) : IO Nat := do\n  let rec loop (acc : Nat) : IO Nat := do\n    return acc\n  loop n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `dr3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Nat]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLetRec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `loop) [(Term.explicitBinder "(" [`acc] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Nat]))] ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doReturn "return" [`acc]) [])])))) (Termination.suffix [] []))])) []) (Term.doSeqItem (Term.doExpr (Term.app `loop [`n])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// An `induction … with` alternative whose `=>` ends its line and whose sequence starts on the next
+/// line left of the pipes: `sepByIndent` positions that sequence at its first token, so it takes
+/// the rest of the proof at that column (`… with | ind n ih =>⏎  cases n⏎  · rfl`). Captured
+/// 2026-10-09 from one file the pin elaborated without a message, in this order.
+const OWN_LINE_ALTERNATIVE_BODIES: &[Accepted] = &[
+    Accepted {
+        source: "theorem ia1 (n : Nat) : n + 0 = n := by\n  induction n using Nat.strongRecOn with | ind n ih =>\n  cases n\n  · rfl\n  · rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `ia1 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `n "+" (num "0")) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.induction "induction" [(Tactic.elimTarget [] `n)] ["using" `Nat.strongRecOn] [] [(Tactic.inductionAlts "with" [] [(Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `ind) [`n `ih])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.cases "cases" [(Tactic.elimTarget [] `n)] [] []) [] (Lean.cdot (Lean.cdotTk "·") (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) [] (Lean.cdot (Lean.cdotTk "·") (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))])])])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem ia2 (n : Nat) : 0 + n = n := by\n  induction n with\n  | zero => rfl\n  | succ k ih =>\n    rw [Nat.add_succ, ih]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `ia2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» (num "0") "+" `n) "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.induction "induction" [(Tactic.elimTarget [] `n)] [] [] [(Tactic.inductionAlts "with" [] [(Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `zero) [])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))]) (Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `succ) [`k `ih])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.rwSeq "rw" (Tactic.optConfig []) (Tactic.rwRuleSeq "[" [(Tactic.rwRule [] `Nat.add_succ) "," (Tactic.rwRule [] `ih)] "]") [])]))])])])]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `obtain p := a, b` and `rcases a, b with p` (`term,+`, `elimTarget,*`: the comma stays in the
+/// proof block), and a later row whose patterns share one right-hand side across an inline `|`
+/// (the column rule binds only a pipe that starts its line). Captured 2026-10-09 from one file
+/// the pin elaborated without a message, in this order.
+const COMMA_TARGETS_AND_INLINE_SHARED_ROWS: &[Accepted] = &[
+    Accepted {
+        source: "theorem oc1 (a b : Nat) (ha : ∃ x, a = x) (hb : ∃ y, b = y) : True := by\n  obtain ⟨⟨x, rfl⟩, y, rfl⟩ := ha, hb\n  trivial",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `oc1 []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`ha] [":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `x)] [])) "," («term_=_» `a "=" `x))] [] ")") (Term.explicitBinder "(" [`hb] [":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `y)] [])) "," («term_=_» `b "=" `y))] [] ")")] (Term.typeSpec ":" `True)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.obtain "obtain" [(Tactic.rcasesPatMed [(Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `x)]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `rfl)]) [])] "⟩")]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `y)]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `rfl)]) [])] "⟩")])] [] [":=" [`ha "," `hb]]) [] (Tactic.tacticTrivial "trivial")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem oc2 (a b : Nat) (ha : ∃ x, a = x) (hb : ∃ y, b = y) : True := by\n  rcases ha, hb with ⟨⟨x, h⟩, y, h'⟩\n  trivial",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `oc2 []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`ha] [":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `x)] [])) "," («term_=_» `a "=" `x))] [] ")") (Term.explicitBinder "(" [`hb] [":" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `y)] [])) "," («term_=_» `b "=" `y))] [] ")")] (Term.typeSpec ":" `True)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.rcases "rcases" [(Tactic.elimTarget [] `ha) "," (Tactic.elimTarget [] `hb)] ["with" (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.tuple "⟨" [(Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `x)]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `h)]) [])] "⟩")]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `y)]) []) "," (Tactic.rcasesPatLo (Tactic.rcasesPatMed [(Tactic.rcasesPat.one `h')]) [])] "⟩")]) [])]) [] (Tactic.tacticTrivial "trivial")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def sa1 : Int → Int → Nat\n  | .ofNat _, 0 => 0\n  | .ofNat _, .ofNat (_ + 1) | .negSucc _, 0 => 0\n  | _, _ => 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `sa1 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Int "→" (Term.arrow `Int "→" `Nat)))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `ofNat) [(Term.hole "_")]) "," (num "0")]] "=>" (num "0")) (Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `ofNat) [(Term.hole "_")]) "," (Term.app (Term.dotIdent "." `ofNat) [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» (Term.hole "_") "+" (num "1")) ")")])] "|" [(Term.app (Term.dotIdent "." `negSucc) [(Term.hole "_")]) "," (num "0")]] "=>" (num "0")) (Term.matchAlt "|" [[(Term.hole "_") "," (Term.hole "_")]] "=>" (num "1"))]) (Termination.suffix [] []) [])) []))"#,
+    },
+];
+
+/// A list pattern's elements that are tuples or anonymous constructors (`(a, b) :: t`,
+/// `⟨k, v⟩ :: l`, `(a, b, c) :: _`, beside another column). Captured 2026-10-09 from one file the
+/// pin elaborated without a message, in this order.
+const LIST_PATTERN_TUPLES: &[Accepted] = &[
+    Accepted {
+        source: "def cp1 : List (Nat × Nat) → Nat\n  | [] => 0\n  | (a, b) :: t => a + b + cp1 t",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `cp1 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")]) "→" `Nat))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(«term[_]» "[" [] "]")]] "=>" (num "0")) (Term.matchAlt "|" [[(«term_::_» (Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [`a "," [`b]] ")") "::" `t)]] "=>" («term_+_» («term_+_» `a "+" `b) "+" (Term.app `cp1 [`t])))]) (Termination.suffix [] []) [])) []))"#,
+    },
+    Accepted {
+        source: "def cp2 : List (Nat × Nat) → Nat\n  | [] => 0\n  | ⟨k, v⟩ :: l => k + v + cp2 l",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `cp2 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")]) "→" `Nat))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(«term[_]» "[" [] "]")]] "=>" (num "0")) (Term.matchAlt "|" [[(«term_::_» (Term.anonymousCtor "⟨" [`k "," `v] "⟩") "::" `l)]] "=>" («term_+_» («term_+_» `k "+" `v) "+" (Term.app `cp2 [`l])))]) (Termination.suffix [] []) [])) []))"#,
+    },
+    Accepted {
+        source: "def cp3 : List (Nat × Nat × Nat) → Nat\n  | (a, b, c) :: _ => a + b + c\n  | [] => 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `cp3 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" («term_×_» `Nat "×" `Nat)) ")")]) "→" `Nat))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(«term_::_» (Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [`a "," [`b "," `c]] ")") "::" (Term.hole "_"))]] "=>" («term_+_» («term_+_» `a "+" `b) "+" `c)) (Term.matchAlt "|" [[(«term[_]» "[" [] "]")]] "=>" (num "0"))]) (Termination.suffix [] []) [])) []))"#,
+    },
+    Accepted {
+        source: "def cp4 : Nat → List (Nat × Nat) → Nat\n  | _, [] => 0\n  | a, (k, b) :: _ => a + k + b",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `cp4 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.arrow (Term.app `List [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_×_» `Nat "×" `Nat) ")")]) "→" `Nat)))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(Term.hole "_") "," («term[_]» "[" [] "]")]] "=>" (num "0")) (Term.matchAlt "|" [[`a "," («term_::_» (Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [`k "," [`b]] ")") "::" (Term.hole "_"))]] "=>" («term_+_» («term_+_» `a "+" `k) "+" `b))]) (Termination.suffix [] []) [])) []))"#,
+    },
+];
+
+/// A `by` inside a term whose tactics hold alternatives (`⟨by⏎  cases b with⏎  | false => rfl …,
+/// trivial⟩`): the proof's pipes are the proof parser's, also beside a term `match` the plan
+/// reads. Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const PROOF_PIPES_IN_TERMS: &[Accepted] = &[
+    Accepted {
+        source: "theorem bt1 (a : Nat) (b : Bool) : a = a ∧ True :=\n  ⟨by\n    cases b with\n    | false => rfl\n    | true => rfl, trivial⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `bt1 []) (Command.declSig [(Term.explicitBinder "(" [`a] [":" `Nat] [] ")") (Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] (Term.typeSpec ":" («term_∧_» («term_=_» `a "=" `a) "∧" `True))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.cases "cases" [(Tactic.elimTarget [] `b)] [] [(Tactic.inductionAlts "with" [] [(Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `false) [])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))]) (Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `true) [])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))])])])]))) "," `trivial] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem bt2 (n : Nat) : (match n with | 0 => True | _ + 1 => True) ∧ True :=\n  ⟨by\n    cases n with\n    | zero => trivial\n    | succ k => trivial, trivial⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `bt2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_∧_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" `True) (Term.matchAlt "|" [[(«term_+_» (Term.hole "_") "+" (num "1"))]] "=>" `True)])) ")") "∧" `True))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.cases "cases" [(Tactic.elimTarget [] `n)] [] [(Tactic.inductionAlts "with" [] [(Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `zero) [])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticTrivial "trivial")]))]) (Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `succ) [`k])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticTrivial "trivial")]))])])])]))) "," `trivial] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// Structure fields written as binders: `structImplicitBinder` (`{w : Nat}`), `structExplicitBinder`
+/// (`(n : Nat)`) and `structInstBinder` (`[inst : Inhabited Nat]`), beside a simple field.
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const BINDER_FIELDS: &[Accepted] = &[
+    Accepted {
+        source: "structure PB where\n  {w : Nat}\n  bv : Fin w",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `PB []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structImplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "{" [`w] (Command.declSig [] (Term.typeSpec ":" `Nat)) "}") (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `bv (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `Fin [`w]))]) [])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure PC where\n  (n : Nat)\n  [inst : Inhabited Nat]\n  m : Nat",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `PC []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`n] (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [] ")") (Command.structInstBinder (Command.declModifiers [] [] [] [] [] [] []) "[" [`inst] (Command.declSig [] (Term.typeSpec ":" (Term.app `Inhabited [`Nat]))) "]") (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `m (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [])])] (Command.optDeriving [])))"#,
+    },
+];
+
+/// `change e at h` (`(location)?`), an anonymous tactic `let` (`let : C := v`, `letIdLhs`'s
+/// `hygieneInfo`), and a term `if _ : c` (`termDepIfThenElse`, its `binderIdent` the hole).
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const CHANGE_AT_ANONYMOUS_LET_AND_HOLE_CONDITIONS: &[Accepted] = &[
+    Accepted {
+        source: "theorem tr1 (x : Nat) (h : x + 0 = 1) : x = 1 := by\n  change x = 1 at h\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `tr1 []) (Command.declSig [(Term.explicitBinder "(" [`x] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» («term_+_» `x "+" (num "0")) "=" (num "1"))] [] ")")] (Term.typeSpec ":" («term_=_» `x "=" (num "1")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.change "change" («term_=_» `x "=" (num "1")) [(Tactic.location "at" (Tactic.locationHyp [`h]))]) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem tr2 : True := by\n  let : Inhabited Nat := ⟨0⟩\n  trivial",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `tr2 []) (Command.declSig [] (Term.typeSpec ":" `True)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticLet__ "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [] [(Term.typeSpec ":" (Term.app `Inhabited [`Nat]))] ":=" (Term.anonymousCtor "⟨" [(num "0")] "⟩")))) [] (Tactic.tacticTrivial "trivial")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def tr3 (i n : Nat) : Nat :=\n  if _ : i < n then 1 else 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tr3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`i `n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (termDepIfThenElse "if" (Lean.binderIdent (Term.hole "_")) ":" («term_<_» `i "<" `n) "then" (num "1") "else" (num "0")) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// A term `open … in t` (`Term.open`), as a declaration's value and as its type. Captured 2026-10-09
+/// from one file the pin elaborated without a message, in this order.
+const TERM_OPENS: &[Accepted] = &[
+    Accepted {
+        source: "noncomputable def to1 (p : Prop) : Bool :=\n  open scoped Classical in\n  decide p",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [(Command.noncomputable "noncomputable")] [] []) (Command.definition "def" (Command.declId `to1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")")] [(Term.typeSpec ":" `Bool)]) (Command.declValSimple ":=" (Term.open "open" (Command.openScoped "scoped" [`Classical]) "in" (Term.app `decide [`p])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem to2 (p : Prop) :\n    open Classical in\n    decide p = decide p := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `to2 []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")")] (Term.typeSpec ":" (Term.open "open" (Command.openSimple [`Classical]) "in" («term_=_» (Term.app `decide [`p]) "=" (Term.app `decide [`p]))))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `intro` followed by match alternatives (`Tactic.introMatch`): pipes on their own lines at the
+/// tactic's column, indented right of it, and inline. Captured 2026-10-09 from one file the pin
+/// elaborated without a message, in this order.
+const INTRO_MATCH_ALTERNATIVES: &[Accepted] = &[
+    Accepted {
+        source: "theorem intro_match_rows (o : Option Nat) : o = o := by\n  revert o\n  intro\n  | none => rfl\n  | some _ => rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `intro_match_rows []) (Command.declSig [(Term.explicitBinder "(" [`o] [":" (Term.app `Option [`Nat])] [] ")")] (Term.typeSpec ":" («term_=_» `o "=" `o))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.revert "revert" [`o]) [] (Tactic.introMatch "intro" (Term.matchAlts [(Term.matchAlt "|" [[`none]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) (Term.matchAlt "|" [[(Term.app `some [(Term.hole "_")])]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem intro_match_indented_rows (p q : Prop) (hq : q) : p ∨ q → q := by\n  intro\n    | Or.inl _ => exact hq\n    | Or.inr h => exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `intro_match_indented_rows []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`hq] [":" `q] [] ")")] (Term.typeSpec ":" (Term.arrow («term_∨_» `p "∨" `q) "→" `q))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.introMatch "intro" (Term.matchAlts [(Term.matchAlt "|" [[(Term.app `Or.inl [(Term.hole "_")])]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" `hq)]))) (Term.matchAlt "|" [[(Term.app `Or.inr [`h])]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" `h)])))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem intro_match_inline_rows : ∀ n : Nat, n + 0 = n := by\n  intro | 0 => rfl | _ + 1 => rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `intro_match_inline_rows []) (Command.declSig [] (Term.typeSpec ":" (Term.forall "∀" [`n] [(Term.typeSpec ":" `Nat)] "," («term_=_» («term_+_» `n "+" (num "0")) "=" `n)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.introMatch "intro" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) (Term.matchAlt "|" [[(«term_+_» (Term.hole "_") "+" (num "1"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// The conv tactics that are one keyword (`whnf`, `zeta`, `simp_match`, the macros `left`, `rfl`,
+/// `done`, …), `unfold`/`delta` names, `change e`, and `intro`/`ext` binders including `_` and
+/// none. Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const CONV_KEYWORDS_UNFOLD_AND_INTRO: &[Accepted] = &[
+    Accepted {
+        source: "def convRowsF (n : Nat) : Nat := n + 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `convRowsF []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term_+_» `n "+" (num "1")) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def convRowsG (n : Nat) : Nat := convRowsF n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `convRowsG []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `convRowsF [`n]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem conv_unfold_rows (n : Nat) : convRowsG n = n + 1 := by\n  conv => lhs; unfold convRowsG convRowsF",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_unfold_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsG [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.unfold "unfold" [`convRowsG `convRowsF])])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_unfold_lines_rows (n : Nat) : convRowsG n = n + 1 := by\n  conv =>\n    lhs\n    unfold convRowsG\n    unfold convRowsF",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_unfold_lines_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsG [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") [] (Tactic.Conv.unfold "unfold" [`convRowsG]) [] (Tactic.Conv.unfold "unfold" [`convRowsF])])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_delta_change_rows (n : Nat) : convRowsG n = n + 1 := by\n  conv => left; delta convRowsG; change convRowsF n\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_delta_change_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsG [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.convLeft "left") ";" (Tactic.Conv.delta "delta" [`convRowsG]) ";" (Tactic.Conv.change "change" (Term.app `convRowsF [`n]))]))) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_right_rows (n : Nat) : convRowsF n = n + 1 := by\n  conv => right; rfl\n  try rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_right_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsF [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.convRight "right") ";" (Tactic.Conv.convRfl "rfl")]))) [] (Tactic.tacticTry_ "try" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_args_rows (n : Nat) : convRowsF n = n + 1 := by\n  conv => args; whnf\n  try rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_args_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsF [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.convArgs "args") ";" (Tactic.Conv.whnf "whnf")]))) [] (Tactic.tacticTry_ "try" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_reductions_rows (n : Nat) : convRowsF n = n + 1 := by\n  conv => lhs; zeta; reduce; cbv\n  try rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_reductions_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsF [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.zeta "zeta") ";" (Tactic.Conv.reduce "reduce") ";" (Tactic.Conv.cbv "cbv")]))) [] (Tactic.tacticTry_ "try" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_simp_match_rows (n : Nat) : convRowsF n = n + 1 := by\n  conv => lhs; simp_match\n  try rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_simp_match_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `convRowsF [`n]) "=" («term_+_» `n "+" (num "1"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.simpMatch "simp_match")]))) [] (Tactic.tacticTry_ "try" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_rfl_done_rows (n : Nat) : n = n := by\n  conv => lhs; rfl; done",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_rfl_done_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.convRfl "rfl") ";" (Tactic.Conv.convDone "done")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_intro_ext_rows : (fun n : Nat => n + 0) = (fun n => n) := by\n  conv => lhs; intro _; rw [Nat.add_zero]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_intro_ext_rows []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [(Term.typeSpec ":" `Nat)] "=>" («term_+_» `n "+" (num "0")))) ")") "=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [] "=>" `n)) ")")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.convIntro___ "intro" [(Lean.binderIdent (Term.hole "_"))]) ";" (Tactic.Conv.convRw__ "rw" (Tactic.optConfig []) (Tactic.rwRuleSeq "[" [(Tactic.rwRule [] `Nat.add_zero)] "]"))])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_intro_named_rows : (fun n : Nat => n + 0) = (fun n => n) := by\n  conv => lhs; intro m; rw [Nat.add_zero]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_intro_named_rows []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [(Term.typeSpec ":" `Nat)] "=>" («term_+_» `n "+" (num "0")))) ")") "=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [] "=>" `n)) ")")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.convIntro___ "intro" [(Lean.binderIdent `m)]) ";" (Tactic.Conv.convRw__ "rw" (Tactic.optConfig []) (Tactic.rwRuleSeq "[" [(Tactic.rwRule [] `Nat.add_zero)] "]"))])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_ext_bare_rows : (fun n : Nat => n + 0) = (fun n => n) := by\n  conv => lhs; ext; rw [Nat.add_zero]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_ext_bare_rows []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [(Term.typeSpec ":" `Nat)] "=>" («term_+_» `n "+" (num "0")))) ")") "=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`n] [] "=>" `n)) ")")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.ext "ext" []) ";" (Tactic.Conv.convRw__ "rw" (Tactic.optConfig []) (Tactic.rwRuleSeq "[" [(Tactic.rwRule [] `Nat.add_zero)] "]"))])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem conv_fun_rows (f : Nat → Nat) (h : f = id) : f 1 = 1 := by\n  conv => lhs; fun; rw [h]\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `conv_fun_rows []) (Command.declSig [(Term.explicitBinder "(" [`f] [":" (Term.arrow `Nat "→" `Nat)] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `f "=" `id)] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `f [(num "1")]) "=" (num "1")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.Conv.conv "conv" [] [] "=>" (Tactic.Conv.convSeq (Tactic.Conv.convSeq1Indented [(Tactic.Conv.lhs "lhs") ";" (Tactic.Conv.fun "fun") ";" (Tactic.Conv.convRw__ "rw" (Tactic.optConfig []) (Tactic.rwRuleSeq "[" [(Tactic.rwRule [] `h)] "]"))]))) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// A tactic `let rec` defined by equations (`Tactic.letrec` over a `letEqnsDecl`), with one pattern
+/// and with comma-separated patterns, which stay inside the proof. Captured 2026-10-09 from one
+/// file the pin elaborated without a message, in this order.
+const LET_REC_EQUATIONS: &[Accepted] = &[
+    Accepted {
+        source: "theorem let_rec_equation_rows (m : Nat) : m + 0 = m := by\n  let rec go : ∀ n : Nat, n + 0 = n\n    | 0 => rfl\n    | n + 1 => by simp\n  exact go m",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `let_rec_equation_rows []) (Command.declSig [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `m "+" (num "0")) "=" `m))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letEqnsDecl (Term.letId `go) [] [(Term.typeSpec ":" (Term.forall "∀" [`n] [(Term.typeSpec ":" `Nat)] "," («term_=_» («term_+_» `n "+" (num "0")) "=" `n)))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" `rfl) (Term.matchAlt "|" [[(«term_+_» `n "+" (num "1"))]] "=>" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] [] [])]))))]))) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `go [`m]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem let_rec_equation_pairs_rows (l : List Nat) : l ++ [] = l := by\n  let rec go : ∀ (as : List Nat) (acc : Nat), as ++ [] = as\n    | [], acc => rfl\n    | a::as, acc => by simp\n  exact go l 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `let_rec_equation_pairs_rows []) (Command.declSig [(Term.explicitBinder "(" [`l] [":" (Term.app `List [`Nat])] [] ")")] (Term.typeSpec ":" («term_=_» («term_++_» `l "++" («term[_]» "[" [] "]")) "=" `l))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letEqnsDecl (Term.letId `go) [] [(Term.typeSpec ":" (Term.forall "∀" [(Term.explicitBinder "(" [`as] [":" (Term.app `List [`Nat])] [] ")") (Term.explicitBinder "(" [`acc] [":" `Nat] [] ")")] [] "," («term_=_» («term_++_» `as "++" («term[_]» "[" [] "]")) "=" `as)))] (Term.matchAlts [(Term.matchAlt "|" [[(«term[_]» "[" [] "]") "," `acc]] "=>" `rfl) (Term.matchAlt "|" [[(«term_::_» `a "::" `as) "," `acc]] "=>" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] [] [])]))))]))) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `go [`l (num "0")]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem let_rec_equation_numbers_rows : True := by\n  let rec go : Nat → Nat → Nat\n    | 0, acc => acc\n    | n+1, acc => go n acc\n  trivial",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `let_rec_equation_numbers_rows []) (Command.declSig [] (Term.typeSpec ":" `True)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letEqnsDecl (Term.letId `go) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.arrow `Nat "→" `Nat)))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0") "," `acc]] "=>" `acc) (Term.matchAlt "|" [[(«term_+_» `n "+" (num "1")) "," `acc]] "=>" (Term.app `go [`n `acc]))]))) (Termination.suffix [] []))])) [] (Tactic.tacticTrivial "trivial")]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `nat_lit n` (`rawNatLit`), and an anonymous term `let` (`let : T := v; e`, `let := v; e`) whose
+/// `letId` is `hygieneInfo`, as a declaration's value and nested. Captured 2026-10-09 from one file
+/// the pin elaborated without a message, in this order.
+const RAW_NAT_LITERALS_AND_ANONYMOUS_LETS: &[Accepted] = &[
+    Accepted {
+        source: "def raw_nat_lit_rows : Nat := nat_lit 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `raw_nat_lit_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (rawNatLit "nat_lit" (num "0")) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def raw_nat_lit_argument_rows : Nat := Nat.succ (nat_lit 3)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `raw_nat_lit_argument_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `Nat.succ [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (rawNatLit "nat_lit" (num "3")) ")")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def anonymous_let_typed_rows (cmp : Nat → Nat → Ordering) : Ordering :=\n  let : Ord Nat := ⟨cmp⟩; compare 1 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `anonymous_let_typed_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`cmp] [":" (Term.arrow `Nat "→" (Term.arrow `Nat "→" `Ordering))] [] ")")] [(Term.typeSpec ":" `Ordering)]) (Command.declValSimple ":=" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [] [(Term.typeSpec ":" (Term.app `Ord [`Nat]))] ":=" (Term.anonymousCtor "⟨" [`cmp] "⟩"))) ";" (Term.app `compare [(num "1") (num "2")])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def anonymous_let_untyped_rows : Nat → Nat := fun n => let := n; 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `anonymous_let_untyped_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [`n] [] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [] [] ":=" `n)) ";" (num "2")))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def anonymous_let_nested_rows : Nat → Nat := fun n => let : Nat := n; 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `anonymous_let_nested_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [`n] [] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [] [(Term.typeSpec ":" `Nat)] ":=" `n)) ";" (num "2")))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def anonymous_let_value_rows : Nat := let := 1; 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `anonymous_let_value_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId (hygieneInfo `[anonymous])) [] [] ":=" (num "1"))) ";" (num "2")) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// `where` declarations led by an attribute line (`@[specialize]⏎go …`), the first and a later one;
+/// a structure field that overrides an inherited default with no type (`x := 2`); and `where
+/// finally` (`Term.whereFinally`), alone and after a declaration at its column (`allowTrailingSep`).
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const WHERE_ATTRIBUTES_DEFAULT_OVERRIDES_AND_FINALLY: &[Accepted] = &[
+    Accepted {
+        source: "def where_attribute_line_rows (l : List Nat) : Nat := go l 0\n  where\n  @[specialize]\n  go : List Nat → Nat → Nat\n    | [], acc => acc\n    | a::as, acc => go as (a + acc)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `where_attribute_line_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`l] [":" (Term.app `List [`Nat])] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app `go [`l (num "0")]) (Termination.suffix [] []) [(Term.whereDecls "where" [(Term.letRecDecl [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.specialize "specialize" []))] "]")] (Term.letDecl (Term.letEqnsDecl (Term.letId `go) [] [(Term.typeSpec ":" (Term.arrow (Term.app `List [`Nat]) "→" (Term.arrow `Nat "→" `Nat)))] (Term.matchAlts [(Term.matchAlt "|" [[(«term[_]» "[" [] "]") "," `acc]] "=>" `acc) (Term.matchAlt "|" [[(«term_::_» `a "::" `as) "," `acc]] "=>" (Term.app `go [`as (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `a "+" `acc) ")")]))]))) (Termination.suffix [] []))] [])]) []))"#,
+    },
+    Accepted {
+        source: "def where_attribute_lines_rows (n : Nat) : Nat := go n + aux n\n  where\n  @[inline]\n  go (i : Nat) : Nat := i + 1\n  @[specialize]\n  aux (i : Nat) : Nat := i",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `where_attribute_lines_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term_+_» (Term.app `go [`n]) "+" (Term.app `aux [`n])) (Termination.suffix [] []) [(Term.whereDecls "where" [(Term.letRecDecl [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.simple `inline []))] "]")] (Term.letDecl (Term.letIdDecl (Term.letId `go) [(Term.explicitBinder "(" [`i] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" («term_+_» `i "+" (num "1")))) (Termination.suffix [] [])) [] (Term.letRecDecl [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.specialize "specialize" []))] "]")] (Term.letDecl (Term.letIdDecl (Term.letId `aux) [(Term.explicitBinder "(" [`i] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" `i)) (Termination.suffix [] []))] [])]) []))"#,
+    },
+    Accepted {
+        source: "structure DefaultOverrideRowsBase where\n  x : Nat := 1\n  y : Bool := true",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `DefaultOverrideRowsBase []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `x (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [(Term.binderDefault ":=" (num "1"))]) (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `y (Command.optDeclSig [] [(Term.typeSpec ":" `Bool)]) [(Term.binderDefault ":=" `true)])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure DefaultOverrideRows extends DefaultOverrideRowsBase where\n  x := 2",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `DefaultOverrideRows []) (Command.optDeclSig [] []) [(Command.extends "extends" [(Command.structParent [] `DefaultOverrideRowsBase)] [])] ["where" [] (Command.structFields [(Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `x (Command.optDeclSig [] []) [(Term.binderDefault ":=" (num "2"))])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure DefaultOverrideTypedRows extends DefaultOverrideRowsBase where\n  y := false\n  z : Nat := 3",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `DefaultOverrideTypedRows []) (Command.optDeclSig [] []) [(Command.extends "extends" [(Command.structParent [] `DefaultOverrideRowsBase)] [])] ["where" [] (Command.structFields [(Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `y (Command.optDeclSig [] []) [(Term.binderDefault ":=" `false)]) (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `z (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [(Term.binderDefault ":=" (num "3"))])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "def where_finally_rows (n : Nat) : Fin (n + 1) :=\n  ⟨0, ?_⟩\n  where finally\n  exact Nat.zero_lt_succ n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `where_finally_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ")")]))]) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," (Term.syntheticHole "?" "_")] "⟩") (Termination.suffix [] []) [(Term.whereDecls "where" [] [(Term.whereFinally "finally" [(Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" (Term.app `Nat.zero_lt_succ [`n]))]))] [])])]) []))"#,
+    },
+    Accepted {
+        source: "def where_finally_sequence_rows (n : Nat) : Fin (n + 1) :=\n  ⟨0, ?_⟩\n  where finally\n  have h : 0 < n + 1 := Nat.zero_lt_succ n\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `where_finally_sequence_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ")")]))]) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(num "0") "," (Term.syntheticHole "?" "_")] "⟩") (Termination.suffix [] []) [(Term.whereDecls "where" [] [(Term.whereFinally "finally" [(Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticHave__ "have" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `h) [] [(Term.typeSpec ":" («term_<_» (num "0") "<" («term_+_» `n "+" (num "1"))))] ":=" (Term.app `Nat.zero_lt_succ [`n])))) [] (Tactic.exact "exact" `h)]))] [])])]) []))"#,
+    },
+    Accepted {
+        source: "def where_declarations_finally_rows (n : Nat) : Fin (n + 1) × Nat :=\n  (⟨0, ?_⟩, go n)\n  where\n  go (k : Nat) : Nat := k\n  finally\n  exact Nat.zero_lt_succ n",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `where_declarations_finally_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_×_» (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ")")]) "×" `Nat))]) (Command.declValSimple ":=" (Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [(Term.anonymousCtor "⟨" [(num "0") "," (Term.syntheticHole "?" "_")] "⟩") "," [(Term.app `go [`n])]] ")") (Termination.suffix [] []) [(Term.whereDecls "where" [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `go) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" `k)) (Termination.suffix [] [])) []] [(Term.whereFinally "finally" [(Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" (Term.app `Nat.zero_lt_succ [`n]))]))] [])])]) []))"#,
+    },
+];
+
+/// `@[method_specs_simp]` (`Attr.method_specs_simp`, `simp`'s grammar): bare, reversed, and with a
+/// phase and a priority. Captured 2026-10-09 from one file the pin elaborated without a message, in
+/// this order.
+const METHOD_SPECS_SIMP_ATTRIBUTES: &[Accepted] = &[
+    Accepted {
+        source: "@[method_specs_simp] theorem method_specs_simp_rows (a b : Nat) : Add.add a b = a + b := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.method_specs_simp "method_specs_simp" [] [] []))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `method_specs_simp_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `Add.add [`a `b]) "=" («term_+_» `a "+" `b)))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[method_specs_simp ←] theorem method_specs_simp_reverse_rows (a b : Nat) : a + b = Add.add a b := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.method_specs_simp "method_specs_simp" [] ["←"] []))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `method_specs_simp_reverse_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `a "+" `b) "=" (Term.app `Add.add [`a `b])))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "@[method_specs_simp ↓ 100] theorem method_specs_simp_phase_rows (a b : Nat) : Mul.mul a b = a * b := rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [(Term.attributes "@[" [(Term.attrInstance (Term.attrKind []) (Attr.method_specs_simp "method_specs_simp" [(Tactic.simpPre "↓")] [] [(num "100")]))] "]")] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `method_specs_simp_phase_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» (Term.app `Mul.mul [`a `b]) "=" («term_*_» `a "*" `b)))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `simp` rules that hold their own commas: a nested rule list, an anonymous constructor, and a
+/// `show ∀ a, p` whose binder comma is its own; and `show ∀ a, p by tac`, whose `by` closes the
+/// annotation past the binder body. Captured 2026-10-09 from one file the pin elaborated without a
+/// message, in this order.
+const SIMP_RULE_COMMAS_AND_SHOW_BINDERS: &[Accepted] = &[
+    Accepted {
+        source: "theorem simp_show_forall_by_rows (m : Nat) : (m + 1) + 1 = m + 2 := by\n  simp [show ∀ a, a + 1 + 1 = a + 2 by omega]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_show_forall_by_rows []) (Command.declSig [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `m "+" (num "1")) ")") "+" (num "1")) "=" («term_+_» `m "+" (num "2"))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] ["[" [(Tactic.simpLemma [] [] (Term.show "show" (Term.forall "∀" [`a] [] "," («term_=_» («term_+_» («term_+_» `a "+" (num "1")) "+" (num "1")) "=" («term_+_» `a "+" (num "2")))) (Term.byTactic' "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.omega "omega" (Tactic.optConfig []))])))))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem simp_show_nested_list_rows (x : Nat) (hx : x = 1) : x + 0 = 1 := by\n  simp only [show x + 0 = 1 by simp only [Nat.add_zero, hx]]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_show_nested_list_rows []) (Command.declSig [(Term.explicitBinder "(" [`x] [":" `Nat] [] ")") (Term.explicitBinder "(" [`hx] [":" («term_=_» `x "=" (num "1"))] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `x "+" (num "0")) "=" (num "1")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] ["only"] ["[" [(Tactic.simpLemma [] [] (Term.show "show" («term_=_» («term_+_» `x "+" (num "0")) "=" (num "1")) (Term.byTactic' "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] ["only"] ["[" [(Tactic.simpLemma [] [] `Nat.add_zero) "," (Tactic.simpLemma [] [] `hx)] "]"] [])])))))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem simp_show_forall_from_rows (m : Nat) : m + 0 = m := by\n  simp only [show ∀ a : Nat, a + 0 = a from fun a => Nat.add_zero a]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_show_forall_from_rows []) (Command.declSig [(Term.explicitBinder "(" [`m] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `m "+" (num "0")) "=" `m))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] ["only"] ["[" [(Tactic.simpLemma [] [] (Term.show "show" (Term.forall "∀" [`a] [(Term.typeSpec ":" `Nat)] "," («term_=_» («term_+_» `a "+" (num "0")) "=" `a)) (Term.fromTerm "from" (Term.fun "fun" (Term.basicFun [`a] [] "=>" (Term.app `Nat.add_zero [`a]))))))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem simp_anonymous_constructor_rows (p : Nat × Nat) (h : p = ⟨1, 2⟩) : p.1 = 1 := by\n  simp [h, show (⟨1, 2⟩ : Nat × Nat).1 = 1 from rfl]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_anonymous_constructor_rows []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" («term_×_» `Nat "×" `Nat)] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `p "=" (Term.anonymousCtor "⟨" [(num "1") "," (num "2")] "⟩"))] [] ")")] (Term.typeSpec ":" («term_=_» (Term.proj `p "." (fieldIdx "1")) "=" (num "1")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] ["[" [(Tactic.simpLemma [] [] `h) "," (Tactic.simpLemma [] [] (Term.show "show" («term_=_» (Term.proj (Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.anonymousCtor "⟨" [(num "1") "," (num "2")] "⟩") ":" [(«term_×_» `Nat "×" `Nat)] ")") "." (fieldIdx "1")) "=" (num "1")) (Term.fromTerm "from" `rfl)))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem show_forall_by_rows : ∀ a : Nat, a = a := by\n  exact show ∀ a : Nat, a = a by intro a; rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `show_forall_by_rows []) (Command.declSig [] (Term.typeSpec ":" (Term.forall "∀" [`a] [(Term.typeSpec ":" `Nat)] "," («term_=_» `a "=" `a)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" (Term.show "show" (Term.forall "∀" [`a] [(Term.typeSpec ":" `Nat)] "," («term_=_» `a "=" `a)) (Term.byTactic' "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.intro "intro" [`a]) ";" (Tactic.tacticRfl "rfl")])))))]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// Constructors (`ctor := docComment? "| " declModifiers rawIdent optDeclSig`) named by a keyword
+/// (`| return`), `protected`, and with their doc comment after the `|` (in `declModifiers`).
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const CONSTRUCTOR_NAMES_AND_MODIFIERS: &[Accepted] = &[
+    Accepted {
+        source: "inductive KeywordCtorRows (σ : Type) where\n  /-- pure -/\n  | pure : σ → KeywordCtorRows σ\n  /-- return -/\n  | return : σ → KeywordCtorRows σ\n  | break    : σ → KeywordCtorRows σ",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.inductive "inductive" (Command.declId `KeywordCtorRows []) (Command.optDeclSig [(Term.explicitBinder "(" [`σ] [":" (Term.type "Type" [])] [] ")")] []) ["where"] [(Command.ctor [(Command.docComment "/--" "pure -/")] "|" (Command.declModifiers [] [] [] [] [] [] []) `pure (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `σ "→" (Term.app `KeywordCtorRows [`σ])))])) (Command.ctor [(Command.docComment "/--" "return -/")] "|" (Command.declModifiers [] [] [] [] [] [] []) `return (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `σ "→" (Term.app `KeywordCtorRows [`σ])))])) (Command.ctor [] "|" (Command.declModifiers [] [] [] [] [] [] []) `break (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `σ "→" (Term.app `KeywordCtorRows [`σ])))]))] [] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "inductive ProtectedCtorRows (r : Nat → Nat → Prop) : Nat → Nat → Prop where\n  | protected inl {a c} : r a c → ProtectedCtorRows r a c",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.inductive "inductive" (Command.declId `ProtectedCtorRows []) (Command.optDeclSig [(Term.explicitBinder "(" [`r] [":" (Term.arrow `Nat "→" (Term.arrow `Nat "→" (Term.prop "Prop")))] [] ")")] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.arrow `Nat "→" (Term.prop "Prop"))))]) ["where"] [(Command.ctor [] "|" (Command.declModifiers [] [] [] [(Command.protected "protected")] [] [] []) `inl (Command.optDeclSig [(Term.implicitBinder "{" [`a `c] [] "}")] [(Term.typeSpec ":" (Term.arrow (Term.app `r [`a `c]) "→" (Term.app `ProtectedCtorRows [`r `a `c])))]))] [] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "inductive InnerDocCtorRows : Type where\n  | /-- The first. -/\n    first\n  | /-- The second. -/\n    second (n : Nat)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.inductive "inductive" (Command.declId `InnerDocCtorRows []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.type "Type" []))]) ["where"] [(Command.ctor [] "|" (Command.declModifiers [(Command.docComment "/--" "The first. -/")] [] [] [] [] [] []) `first (Command.optDeclSig [] [])) (Command.ctor [] "|" (Command.declModifiers [(Command.docComment "/--" "The second. -/")] [] [] [] [] [] []) `second (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] []))] [] (Command.optDeriving [])))"#,
+    },
+];
+
+/// A tactic `match`/`cases` alternative whose right-hand side is a hole (`matchRhs := hole <|>
+/// syntheticHole <|> tacticSeq`), on its own line and inline; and a `by` block ended by the `,` of
+/// its anonymous constructor at the tactics' column (`allowTrailingSep`). Captured 2026-10-09 from
+/// one file the pin elaborated without a message, in this order.
+const HOLE_ALTERNATIVES_AND_CONSTRUCTOR_PROOFS: &[Accepted] = &[
+    Accepted {
+        source: "theorem match_hole_alternative_rows (n : Nat) : n = n := by\n  match n with\n  | 0 => ?_\n  | k + 1 => rfl\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `match_hole_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (Term.syntheticHole "?" "_")) (Term.matchAlt "|" [[(«term_+_» `k "+" (num "1"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))])) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem cases_hole_alternative_rows (n : Nat) : n = n := by\n  cases n with\n  | zero => ?_\n  | succ k => rfl\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `cases_hole_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.cases "cases" [(Tactic.elimTarget [] `n)] [] [(Tactic.inductionAlts "with" [] [(Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `zero) [])] ["=>" (Term.syntheticHole "?" "_")]) (Tactic.inductionAlt [(Tactic.inductionAltLHS "|" (group [] `succ) [`k])] ["=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))])])]) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem inline_hole_alternative_rows (n : Nat) : n = n := by\n  match n with | 0 => ?_ | k + 1 => rfl\n  rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `inline_hole_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (Term.syntheticHole "?" "_")) (Term.matchAlt "|" [[(«term_+_» `k "+" (num "1"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))])) [] (Tactic.tacticRfl "rfl")]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem anonymous_constructor_proofs_rows (p q : Prop) (hp : p) (hq : q) : p ∧ q :=\n  ⟨by\n    exact hp\n    , by exact hq⟩",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `anonymous_constructor_proofs_rows []) (Command.declSig [(Term.explicitBinder "(" [`p `q] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`hp] [":" `p] [] ")") (Term.explicitBinder "(" [`hq] [":" `q] [] ")")] (Term.typeSpec ":" («term_∧_» `p "∧" `q))) (Command.declValSimple ":=" (Term.anonymousCtor "⟨" [(Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" `hp) []]))) "," (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.exact "exact" `hq)])))] "⟩") (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `grind` with `only` and its parameter list (`grindParam := grindErase <|> grindLemmaMin <|>
+/// grindLemma <|> anchor`): lemmas, `only`, modifiers (`=`, `←`, `→`, `cases`), and an erasure.
+/// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const GRIND_PARAMETERS: &[Accepted] = &[
+    Accepted {
+        source: "theorem grind_lemma_rows (a b : Nat) (h : a = b) : b = a := by\n  grind [Nat.add_comm]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_lemma_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) [] ["[" [(Tactic.grindParam (Tactic.grindLemma [] `Nat.add_comm))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem grind_lemmas_rows (a b : Nat) (h : a = b) : b = a := by\n  grind [Nat.add_comm, Nat.mul_comm]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_lemmas_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) [] ["[" [(Tactic.grindParam (Tactic.grindLemma [] `Nat.add_comm)) "," (Tactic.grindParam (Tactic.grindLemma [] `Nat.mul_comm))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem grind_only_rows (a b : Nat) (h : a = b) : b = a := by\n  grind only [Nat.add_comm]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_only_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) ["only"] ["[" [(Tactic.grindParam (Tactic.grindLemma [] `Nat.add_comm))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem grind_modifier_rows (a b : Nat) (h : a = b) : b = a := by\n  grind [= Nat.add_comm, ← Nat.mul_comm, → Nat.le_of_lt]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_modifier_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) [] ["[" [(Tactic.grindParam (Tactic.grindLemma [(Attr.grindMod (Attr.grindEq "=" []))] `Nat.add_comm)) "," (Tactic.grindParam (Tactic.grindLemma [(Attr.grindMod (Attr.grindBwd (patternIgnore (token.«←» "←")) []))] `Nat.mul_comm)) "," (Tactic.grindParam (Tactic.grindLemma [(Attr.grindMod (Attr.grindFwd (patternIgnore (token.«→» "→"))))] `Nat.le_of_lt))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem grind_cases_rows (b : Bool) : b = true ∨ b = false := by\n  grind [cases Bool]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_cases_rows []) (Command.declSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] (Term.typeSpec ":" («term_∨_» («term_=_» `b "=" `true) "∨" («term_=_» `b "=" `false)))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) [] ["[" [(Tactic.grindParam (Tactic.grindLemma [(Attr.grindMod (Attr.grindCases "cases"))] `Bool))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem grind_erase_rows (a b : Nat) (h : a = b) : b = a := by\n  grind [-List.length_cons]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `grind_erase_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" `b)] [] ")")] (Term.typeSpec ":" («term_=_» `b "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.grind "grind" (Tactic.optConfig []) [] ["[" [(Tactic.grindParam (Tactic.grindErase "-" `List.length_cons))] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// Inside a syntax quotation, an application headed by an antiquotation (`$f $a`, `$f ($a)`), as a
+/// value and as an equation's pattern (the `app_unexpander` shape). Captured 2026-10-09 from one
+/// file the pin elaborated without a message, in this order.
+const ANTIQUOTATION_HEADS: &[Accepted] = &[
+    Accepted {
+        source: "def antiquotation_head_rows (f a : Lean.Term) : Lean.MacroM Lean.Term := `($f $a)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `antiquotation_head_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`f `a] [":" `Lean.Term] [] ")")] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (Term.app (term.pseudo.antiquot "$" [] `f []) [(term.pseudo.antiquot "$" [] `a [])]) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def antiquotation_head_paren_rows (f a : Lean.Term) : Lean.MacroM Lean.Term := `($f ($a))",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `antiquotation_head_paren_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`f `a] [":" `Lean.Term] [] ")")] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (Term.app (term.pseudo.antiquot "$" [] `f []) [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (term.pseudo.antiquot "$" [] `a []) ")")]) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def antiquotation_head_pattern_rows : Lean.Syntax → Lean.MacroM Lean.Syntax\n  | `($f $a) => `($f $a)\n  | s => pure s",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `antiquotation_head_pattern_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Lean.Syntax "→" (Term.app `Lean.MacroM [`Lean.Syntax])))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(Term.quot "`(" (Term.app (term.pseudo.antiquot "$" [] `f []) [(term.pseudo.antiquot "$" [] `a [])]) ")")]] "=>" (Term.quot "`(" (Term.app (term.pseudo.antiquot "$" [] `f []) [(term.pseudo.antiquot "$" [] `a [])]) ")")) (Term.matchAlt "|" [[`s]] "=>" (Term.app `pure [`s]))]) (Termination.suffix [] []) [])) []))"#,
+    },
+];
+
+/// `if`/`bif` inside a term quotation, plain, with an antiquotation condition and nested: the match
+/// planner leaves a quotation to its own term. Captured 2026-10-09 from one file the pin
+/// elaborated without a message, in this order.
+const QUOTATION_CONDITIONALS: &[Accepted] = &[
+    Accepted {
+        source: "def quotation_if_rows : Lean.MacroM Lean.Term := `(if c then 1 else 2)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `quotation_if_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (termIfThenElse "if" `c "then" (num "1") "else" (num "2")) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def quotation_if_antiquotation_rows (c : Lean.Term) : Lean.MacroM Lean.Term := `(if $c then 1 else 2)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `quotation_if_antiquotation_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`c] [":" `Lean.Term] [] ")")] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (termIfThenElse "if" (term.pseudo.antiquot "$" [] `c []) "then" (num "1") "else" (num "2")) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def quotation_nested_if_rows (c : Lean.Term) : Lean.MacroM Lean.Term := `(f (if $c then 1 else 2))",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `quotation_nested_if_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`c] [":" `Lean.Term] [] ")")] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (Term.app `f [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (termIfThenElse "if" (term.pseudo.antiquot "$" [] `c []) "then" (num "1") "else" (num "2")) ")")]) ")") (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def quotation_bif_rows (c : Lean.Term) : Lean.MacroM Lean.Term := `(bif $c then 1 else 2)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `quotation_bif_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`c] [":" `Lean.Term] [] ")")] [(Term.typeSpec ":" (Term.app `Lean.MacroM [`Lean.Term]))]) (Command.declValSimple ":=" (Term.quot "`(" (boolIfThenElse "bif" (term.pseudo.antiquot "$" [] `c []) "then" (num "1") "else" (num "2")) ")") (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// A `where` field defined by equations after the names it binds (`f x | p => e`), and an
+/// alternative whose body holds a binder's comma and type (`| p => ∃ h : t, q`), on one line and
+/// across lines. Captured 2026-10-09 from one file the pin elaborated without a message, in this
+/// order.
+const FIELD_EQUATIONS_AND_BINDER_BODIES: &[Accepted] = &[
+    Accepted {
+        source: "structure FieldEquationRows where\n  f : Nat → Option Nat → Prop",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `FieldEquationRows []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `f (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" (Term.arrow (Term.app `Option [`Nat]) "→" (Term.prop "Prop"))))]) [])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "def field_equation_binder_rows : FieldEquationRows where\n  f x\n    | .some y => x = y\n    | .none => False",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `field_equation_binder_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" `FieldEquationRows)]) (Command.whereStructInst "where" (Term.structInstFields [(Term.structInstField (Term.structInstLVal `f []) [[`x] [] (Term.structInstFieldEqns [] (Term.matchAlts [(Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `some) [`y])]] "=>" («term_=_» `x "=" `y)) (Term.matchAlt "|" [[(Term.dotIdent "." `none)]] "=>" `False)]))])]) []) []))"#,
+    },
+    Accepted {
+        source: "def field_equation_exists_rows : FieldEquationRows where\n  f x\n    | .some y =>\n      ∃ h : x = y,\n        x = x ∧\n        h = h\n    | .none => False",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `field_equation_exists_rows []) (Command.optDeclSig [] [(Term.typeSpec ":" `FieldEquationRows)]) (Command.whereStructInst "where" (Term.structInstFields [(Term.structInstField (Term.structInstLVal `f []) [[`x] [] (Term.structInstFieldEqns [] (Term.matchAlts [(Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `some) [`y])]] "=>" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `h)] [":" («term_=_» `x "=" `y)])) "," («term_∧_» («term_=_» `x "=" `x) "∧" («term_=_» `h "=" `h)))) (Term.matchAlt "|" [[(Term.dotIdent "." `none)]] "=>" `False)]))])]) []) []))"#,
+    },
+    Accepted {
+        source: "def exists_alternative_rows (x : Nat) : Option Nat → Prop\n  | .some y => ∃ z, x = z ∧ z = y\n  | .none => False",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `exists_alternative_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`x] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.arrow (Term.app `Option [`Nat]) "→" (Term.prop "Prop")))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `some) [`y])]] "=>" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `z)] [])) "," («term_∧_» («term_=_» `x "=" `z) "∧" («term_=_» `z "=" `y)))) (Term.matchAlt "|" [[(Term.dotIdent "." `none)]] "=>" `False)]) (Termination.suffix [] []) [])) []))"#,
+    },
+    Accepted {
+        source: "def exists_typed_alternative_rows (x : Nat) : Option Nat → Prop\n  | .some y =>\n    ∃ h : x = y,\n      h = h\n  | .none => False",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `exists_typed_alternative_rows []) (Command.optDeclSig [(Term.explicitBinder "(" [`x] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.arrow (Term.app `Option [`Nat]) "→" (Term.prop "Prop")))]) (Command.declValEqns (Term.matchAltsWhereDecls (Term.matchAlts [(Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `some) [`y])]] "=>" («term∃_,_» "∃" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `h)] [":" («term_=_» `x "=" `y)])) "," («term_=_» `h "=" `h))) (Term.matchAlt "|" [[(Term.dotIdent "." `none)]] "=>" `False)]) (Termination.suffix [] []) [])) []))"#,
+    },
+];
+
+/// A projection whose field is a keyword spelled as an identifier (`(a).then b`, `rawIdent`), after a
+/// parenthesis and chained. Captured 2026-10-09 from one file the pin elaborated without a message,
+/// in this order.
+const KEYWORD_FIELD_PROJECTIONS: &[Accepted] = &[
+    Accepted {
+        source: "def dtA (a b : Ordering) : Ordering := (a).then b",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `dtA []) (Command.optDeclSig [(Term.explicitBinder "(" [`a `b] [":" `Ordering] [] ")")] [(Term.typeSpec ":" `Ordering)]) (Command.declValSimple ":=" (Term.app (Term.proj (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `a ")") "." `then) [`b]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "theorem dtB : ∀ (o₁ o₂ o₃ : Ordering), (o₁.then o₂).then o₃ = o₁.then (o₂.then o₃) := by decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `dtB []) (Command.declSig [] (Term.typeSpec ":" (Term.forall "∀" [(Term.explicitBinder "(" [`o₁ `o₂ `o₃] [":" `Ordering] [] ")")] [] "," («term_=_» (Term.app (Term.proj (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `o₁.then [`o₂]) ")") "." `then) [`o₃]) "=" (Term.app `o₁.then [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `o₂.then [`o₃]) ")")]))))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// A tactic `if`'s branch holding a `<;>` chain, alone and after another tactic: the `<;>` is the
+/// branch's, not a chain around the `if`. Captured 2026-10-09 from one file the pin elaborated
+/// without a message, in this order.
+const TACTIC_IF_BRANCH_CHAINS: &[Accepted] = &[
+    Accepted {
+        source: "theorem tactic_if_branch_chain_rows (a b : Nat) : a + 0 = a := by\n  if hb : b = 0 then\n    simp <;> simp\n  else\n    simp",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `tactic_if_branch_chain_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `a "+" (num "0")) "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacDepIfThenElse "if" (Lean.binderIdent `hb) ":" («term_=_» `b "=" (num "0")) "then" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.«tactic_<;>_» (Tactic.simp "simp" (Tactic.optConfig []) [] [] [] []) "<;>" (Tactic.simp "simp" (Tactic.optConfig []) [] [] [] []))])) "else" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] [] [])])))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem tactic_if_branch_sequence_chain_rows (a b : Nat) : a + 0 = a := by\n  if hb : b = 0 then\n    subst hb\n    simp <;> simp\n  else\n    simp",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `tactic_if_branch_sequence_chain_rows []) (Command.declSig [(Term.explicitBinder "(" [`a `b] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `a "+" (num "0")) "=" `a))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacDepIfThenElse "if" (Lean.binderIdent `hb) ":" («term_=_» `b "=" (num "0")) "then" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.subst "subst" [`hb]) [] (Tactic.«tactic_<;>_» (Tactic.simp "simp" (Tactic.optConfig []) [] [] [] []) "<;>" (Tactic.simp "simp" (Tactic.optConfig []) [] [] [] []))])) "else" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [] [] [] [])])))]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// `simp`'s discharger slot (`(discharger := tacs)`, `(disch := tacs)`), before `only` and the
+/// rules. Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const SIMP_DISCHARGERS: &[Accepted] = &[
+    Accepted {
+        source: "theorem simp_discharger_rows (a : Nat) (h : a = 0) : a + 0 = 0 := by\n  simp (discharger := assumption) [h]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_discharger_rows []) (Command.declSig [(Term.explicitBinder "(" [`a] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" (num "0"))] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `a "+" (num "0")) "=" (num "0")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [(Tactic.discharger "(" (patternIgnore (token.discharger "discharger")) ":=" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.assumption "assumption")])) ")")] [] ["[" [(Tactic.simpLemma [] [] `h)] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem simp_disch_rows (a : Nat) (h : a = 0) : a + 0 = 0 := by\n  simp (disch := assumption) only [h, Nat.add_zero]",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `simp_disch_rows []) (Command.declSig [(Term.explicitBinder "(" [`a] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_=_» `a "=" (num "0"))] [] ")")] (Term.typeSpec ":" («term_=_» («term_+_» `a "+" (num "0")) "=" (num "0")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simp "simp" (Tactic.optConfig []) [(Tactic.discharger "(" (patternIgnore (token.disch "disch")) ":=" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.assumption "assumption")])) ")")] ["only"] ["[" [(Tactic.simpLemma [] [] `h) "," (Tactic.simpLemma [] [] `Nat.add_zero)] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
+/// A tactic `match` alternative whose pattern groups share one body (`| 0 | 1 => rfl`, one
+/// `matchAlt` with its groups separated by their `|`s), on separate lines, inline, and with a hole
+/// body. Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
+const SHARED_MATCH_ALTERNATIVES: &[Accepted] = &[
+    Accepted {
+        source: "theorem shared_match_alternative_rows (n : Nat) : n = n := by\n  match n with\n  | 0 | 1 => rfl\n  | _ + 2 => rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `shared_match_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")] "|" [(num "1")]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) (Term.matchAlt "|" [[(«term_+_» (Term.hole "_") "+" (num "2"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem shared_inline_match_alternative_rows (n : Nat) : n = n := by\n  match n with | 0 | 1 | _ + 2 => rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `shared_inline_match_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")] "|" [(num "1")] "|" [(«term_+_» (Term.hole "_") "+" (num "2"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem shared_match_hole_alternative_rows (n : Nat) : n = n := by\n  match n with\n  | 0 | 1 => ?_\n  | _ + 2 => rfl\n  all_goals rfl",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `shared_match_hole_alternative_rows []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.match "match" [] [] [(Term.matchDiscr [] `n)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(num "0")] "|" [(num "1")]] "=>" (Term.syntheticHole "?" "_")) (Term.matchAlt "|" [[(«term_+_» (Term.hole "_") "+" (num "2"))]] "=>" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))])) [] (Tactic.allGoals "all_goals" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
 /// `a ≈ b` (`infix:50 " ≈ " => HasEquiv.Equiv`, `term_≈_`).
 const EQUIVALENCES: &[Accepted] = &[Accepted {
     source: "theorem eq1 {α : Type} [HasEquiv α] (a b : α) (h : a ≈ b) : a ≈ b := h",
@@ -2805,12 +3482,10 @@ const LET_REC_TERMINATION: &[Accepted] = &[
 /// A `decreasing_by` in a `let rec` value owns the `;`s after it, as `by` does: `decreasing_by simp_wf;
 /// decreasing_trivial_pre_omega` is one tactic sequence, and the body starts on the next line, never
 /// after that `;`.
-const LET_REC_DECREASING_BLOCK: &[Accepted] = &[
-    Accepted {
-        source: "def lrd1 (as : Array Nat) (p : Nat → Bool) : Option Nat :=\n  let rec loop (j : Nat) :=\n    if h : j < as.size then\n      if p as[j] then some j else loop (j + 1)\n    else none\n    decreasing_by simp_wf; decreasing_trivial_pre_omega\n  loop 0",
-        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `lrd1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`as] [":" (Term.app `Array [`Nat])] [] ")") (Term.explicitBinder "(" [`p] [":" (Term.arrow `Nat "→" `Bool)] [] ")")] [(Term.typeSpec ":" (Term.app `Option [`Nat]))]) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `loop) [(Term.explicitBinder "(" [`j] [":" `Nat] [] ")")] [] ":=" (termDepIfThenElse "if" (Lean.binderIdent `h) ":" («term_<_» `j "<" `as.size) "then" (termIfThenElse "if" (Term.app `p [(«term__[_]» `as "[" `j "]")]) "then" (Term.app `some [`j]) "else" (Term.app `loop [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `j "+" (num "1")) ")")])) "else" `none))) (Termination.suffix [] [(Termination.decreasingBy "decreasing_by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(tacticSimp_wf "simp_wf") ";" (tacticDecreasing_trivial_pre_omega "decreasing_trivial_pre_omega")])))]))]) [] (Term.app `loop [(num "0")])) (Termination.suffix [] []) []) []))"#,
-    },
-];
+const LET_REC_DECREASING_BLOCK: &[Accepted] = &[Accepted {
+    source: "def lrd1 (as : Array Nat) (p : Nat → Bool) : Option Nat :=\n  let rec loop (j : Nat) :=\n    if h : j < as.size then\n      if p as[j] then some j else loop (j + 1)\n    else none\n    decreasing_by simp_wf; decreasing_trivial_pre_omega\n  loop 0",
+    tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `lrd1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`as] [":" (Term.app `Array [`Nat])] [] ")") (Term.explicitBinder "(" [`p] [":" (Term.arrow `Nat "→" `Bool)] [] ")")] [(Term.typeSpec ":" (Term.app `Option [`Nat]))]) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `loop) [(Term.explicitBinder "(" [`j] [":" `Nat] [] ")")] [] ":=" (termDepIfThenElse "if" (Lean.binderIdent `h) ":" («term_<_» `j "<" `as.size) "then" (termIfThenElse "if" (Term.app `p [(«term__[_]» `as "[" `j "]")]) "then" (Term.app `some [`j]) "else" (Term.app `loop [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `j "+" (num "1")) ")")])) "else" `none))) (Termination.suffix [] [(Termination.decreasingBy "decreasing_by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(tacticSimp_wf "simp_wf") ";" (tacticDecreasing_trivial_pre_omega "decreasing_trivial_pre_omega")])))]))]) [] (Term.app `loop [(num "0")])) (Termination.suffix [] []) []) []))"#,
+}];
 
 /// A `by` body followed by a termination hint on a later line: at the tactics' column the hint passes
 /// `sepByIndent`'s `checkColEq`, so the sequence keeps a trailing empty separator
@@ -2924,12 +3599,10 @@ const DOLLAR_PIPELINE: &[Accepted] = &[
 ];
 
 /// A `let rec` declaration's `termination_by` before the `;` that ends the local definition.
-const LET_REC_SEMICOLON_TERMINATION: &[Accepted] = &[
-    Accepted {
-        source: "def n : Nat := let rec f (n : Nat) : Nat := n termination_by n; f 0",
-        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `n []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `f) [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" `n)) (Termination.suffix [(Termination.terminationBy "termination_by" [] [] `n)] []))]) ";" (Term.app `f [(num "0")])) (Termination.suffix [] []) []) []))"#,
-    },
-];
+const LET_REC_SEMICOLON_TERMINATION: &[Accepted] = &[Accepted {
+    source: "def n : Nat := let rec f (n : Nat) : Nat := n termination_by n; f 0",
+    tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `n []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `f) [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)] ":=" `n)) (Termination.suffix [(Termination.terminationBy "termination_by" [] [] `n)] []))]) ";" (Term.app `f [(num "0")])) (Termination.suffix [] []) []) []))"#,
+}];
 
 /// Calculation steps after a first step on the `calc` line: their position is the first later line's
 /// column, at or left of the first step, with or without `_`, and the enclosing tactic line after
@@ -3032,21 +3705,17 @@ const TACTIC_PATTERN_BINDINGS: &[Accepted] = &[
 
 /// A projection touching a named argument projects the whole application: `f (l := 1).1 H` is
 /// `(f (l := 1)).1 H`, a named argument being no term a trailing parser extends.
-const NAMED_ARGUMENT_PROJECTION: &[Accepted] = &[
-    Accepted {
-        source: "def nq (f : (l : Nat) → (Nat → Nat) × Nat) (H : Nat) : Nat := f (l := 1).1 H",
-        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `nq []) (Command.optDeclSig [(Term.explicitBinder "(" [`f] [":" (Term.depArrow (Term.explicitBinder "(" [`l] [":" `Nat] [] ")") "→" («term_×_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.arrow `Nat "→" `Nat) ")") "×" `Nat))] [] ")") (Term.explicitBinder "(" [`H] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app (Term.proj (Term.app `f [(Term.namedArgument "(" `l ":=" (num "1") ")")]) "." (fieldIdx "1")) [`H]) (Termination.suffix [] []) []) []))"#,
-    },
-];
+const NAMED_ARGUMENT_PROJECTION: &[Accepted] = &[Accepted {
+    source: "def nq (f : (l : Nat) → (Nat → Nat) × Nat) (H : Nat) : Nat := f (l := 1).1 H",
+    tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `nq []) (Command.optDeclSig [(Term.explicitBinder "(" [`f] [":" (Term.depArrow (Term.explicitBinder "(" [`l] [":" `Nat] [] ")") "→" («term_×_» (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.arrow `Nat "→" `Nat) ")") "×" `Nat))] [] ")") (Term.explicitBinder "(" [`H] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app (Term.proj (Term.app `f [(Term.namedArgument "(" `l ":=" (num "1") ")")]) "." (fieldIdx "1")) [`H]) (Termination.suffix [] []) []) []))"#,
+}];
 
 /// A `by` in a local's value owns the `;`s after it only until its block ends: the next match
 /// alternative ends it, so the `;` after `| .succ j => (by rfl)` is the local's separator.
-const BY_BLOCK_ENDS_AT_AN_ALTERNATIVE: &[Accepted] = &[
-    Accepted {
-        source: "theorem reflexive2 (n : Nat) : n = n := let rec proof (k : Nat) : k = k := match k with | .zero => by rfl | .succ j => (by rfl); proof n",
-        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `reflexive2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `proof) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» `k "=" `k))] ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `k)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.dotIdent "." `zero)]] "=>" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))) (Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `succ) [`j])]] "=>" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) ")"))])))) (Termination.suffix [] []))]) ";" (Term.app `proof [`n])) (Termination.suffix [] []) [])))"#,
-    },
-];
+const BY_BLOCK_ENDS_AT_AN_ALTERNATIVE: &[Accepted] = &[Accepted {
+    source: "theorem reflexive2 (n : Nat) : n = n := let rec proof (k : Nat) : k = k := match k with | .zero => by rfl | .succ j => (by rfl); proof n",
+    tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `reflexive2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.letrec (group "let" "rec") (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letIdDecl (Term.letId `proof) [(Term.explicitBinder "(" [`k] [":" `Nat] [] ")")] [(Term.typeSpec ":" («term_=_» `k "=" `k))] ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `k)] "with" (Term.matchAlts [(Term.matchAlt "|" [[(Term.dotIdent "." `zero)]] "=>" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")])))) (Term.matchAlt "|" [[(Term.app (Term.dotIdent "." `succ) [`j])]] "=>" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticRfl "rfl")]))) ")"))])))) (Termination.suffix [] []))]) ";" (Term.app `proof [`n])) (Termination.suffix [] []) [])))"#,
+}];
 
 /// Subtypes: a binder, an optional type, `//` and the predicate.
 const SUBTYPES: &[Accepted] = &[
@@ -4407,6 +5076,230 @@ fn with_only_eliminations_produce_the_pins_trees() {
 #[test]
 fn term_pattern_lets_produce_the_pins_trees() {
     for row in TERM_PATTERN_LETS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn branch_pattern_lets_and_bare_ascriptions_produce_the_pins_trees() {
+    for row in BRANCH_PATTERN_LETS_AND_BARE_ASCRIPTIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn intro_patterns_and_local_binders_produce_the_pins_trees() {
+    for row in INTRO_PATTERNS_AND_LOCAL_BINDERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn let_rec_tactics_and_bracketed_sequences_produce_the_pins_trees() {
+    for row in LET_REC_TACTICS_AND_BRACKETED_SEQUENCES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn for_patterns_and_do_let_rec_produce_the_pins_trees() {
+    for row in FOR_PATTERNS_AND_DO_LET_REC {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn own_line_alternative_bodies_produce_the_pins_trees() {
+    for row in OWN_LINE_ALTERNATIVE_BODIES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn comma_targets_and_inline_shared_rows_produce_the_pins_trees() {
+    for row in COMMA_TARGETS_AND_INLINE_SHARED_ROWS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn list_pattern_tuples_produce_the_pins_trees() {
+    for row in LIST_PATTERN_TUPLES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn proof_pipes_in_terms_produce_the_pins_trees() {
+    for row in PROOF_PIPES_IN_TERMS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn binder_fields_produce_the_pins_trees() {
+    for row in BINDER_FIELDS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn change_at_anonymous_let_and_hole_conditions_produce_the_pins_trees() {
+    for row in CHANGE_AT_ANONYMOUS_LET_AND_HOLE_CONDITIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn term_opens_produce_the_pins_trees() {
+    for row in TERM_OPENS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn intro_match_alternatives_match_the_pin() {
+    for row in INTRO_MATCH_ALTERNATIVES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn conv_keywords_unfold_and_intro_match_the_pin() {
+    for row in CONV_KEYWORDS_UNFOLD_AND_INTRO {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn let_rec_equations_match_the_pin() {
+    for row in LET_REC_EQUATIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn raw_nat_literals_and_anonymous_lets_match_the_pin() {
+    for row in RAW_NAT_LITERALS_AND_ANONYMOUS_LETS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn where_attributes_default_overrides_and_finally_match_the_pin() {
+    for row in WHERE_ATTRIBUTES_DEFAULT_OVERRIDES_AND_FINALLY {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn method_specs_simp_attributes_match_the_pin() {
+    for row in METHOD_SPECS_SIMP_ATTRIBUTES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn simp_rule_commas_and_show_binders_match_the_pin() {
+    for row in SIMP_RULE_COMMAS_AND_SHOW_BINDERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn constructor_names_and_modifiers_match_the_pin() {
+    for row in CONSTRUCTOR_NAMES_AND_MODIFIERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn hole_alternatives_and_constructor_proofs_match_the_pin() {
+    for row in HOLE_ALTERNATIVES_AND_CONSTRUCTOR_PROOFS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn grind_parameters_match_the_pin() {
+    for row in GRIND_PARAMETERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn antiquotation_heads_match_the_pin() {
+    for row in ANTIQUOTATION_HEADS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn quotation_conditionals_match_the_pin() {
+    for row in QUOTATION_CONDITIONALS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn field_equations_and_binder_bodies_match_the_pin() {
+    for row in FIELD_EQUATIONS_AND_BINDER_BODIES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn keyword_field_projections_match_the_pin() {
+    for row in KEYWORD_FIELD_PROJECTIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn tactic_if_branch_chains_match_the_pin() {
+    for row in TACTIC_IF_BRANCH_CHAINS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn simp_dischargers_match_the_pin() {
+    for row in SIMP_DISCHARGERS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn shared_match_alternatives_match_the_pin() {
+    for row in SHARED_MATCH_ALTERNATIVES {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

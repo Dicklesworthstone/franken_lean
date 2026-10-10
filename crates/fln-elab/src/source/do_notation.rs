@@ -334,10 +334,10 @@ impl Context {
         if (syntax.kind() == Some(&parser_kind(&["Term", "doIdDecl"]))
             || syntax.kind() == Some(&parser_kind(&["Term", "doPatDecl"])))
             && matches!(&syntax, Syntax::Node { args, .. }
-                if args.get(3).is_some_and(|element| {
-                    element.kind() == Some(&parser_kind(&["Term", "doIf"]))
-                        || element.kind() == Some(&parser_kind(&["Term", "doMatch"]))
-                }))
+            if args.get(3).is_some_and(|element| {
+                element.kind() == Some(&parser_kind(&["Term", "doIf"]))
+                    || element.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+            }))
         {
             if pattern {
                 return Err(invalid());

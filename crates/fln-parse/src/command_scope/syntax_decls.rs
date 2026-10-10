@@ -457,11 +457,29 @@ pub(crate) fn declaration(
         .into_iter()
         .find(|word| symbol(attributes_end, word));
     let keyword = attributes_end + usize::from(modifier.is_some());
+    if symbol(keyword, "declare_syntax_cat") {
+        if attributes_end != doc || modifier.is_some() {
+            return Ok(None);
+        }
+        return category(view, tokens, doc, keyword);
+    }
     let mixfix = ["infix", "infixl", "infixr", "prefix", "postfix"]
         .into_iter()
         .find(|word| symbol(keyword, word));
     if mixfix.is_some() || symbol(keyword, "notation") || symbol(keyword, "recommended_spelling") {
         return notation(view, tokens, doc, attributes_end, modifier, keyword, mixfix);
+    }
+    if symbol(keyword, "binder_predicate") {
+        if matches!(modifier, Some("private" | "protected")) {
+            return Ok(None);
+        }
+        return binder_predicate(view, tokens, doc, attributes_end, modifier, keyword);
+    }
+    if symbol(keyword, "macro_rules") || symbol(keyword, "macro") {
+        if matches!(modifier, Some("private" | "protected")) {
+            return Ok(None);
+        }
+        return macro_command(view, tokens, doc, attributes_end, modifier, keyword);
     }
     if !symbol(keyword, "syntax") {
         return Ok(None);
@@ -554,6 +572,269 @@ pub(crate) fn declaration(
                 null_node(items),
                 leaves.leaf(colon)?,
                 leaves.leaf(colon + 1)?,
+            ],
+        )
+    };
+    let epilogue = leaves.attachment().epilogue();
+    Ok(Some(ParsedSourceCommand {
+        kind: SourceCommandKind::Definition,
+        source_view: view,
+        syntax,
+        epilogue,
+        query_term: None,
+    }))
+}
+
+/// `binderPredicate := docComment? attributes? attrKind? "binder_predicate" optNamedName
+/// optNamedPrio ident macroArg* " => " term` (`Lean/Parser/Syntax.lean`), as the pin's tree. The
+/// checker refuses it.
+#[inline(never)]
+fn binder_predicate(
+    view: SourceView,
+    tokens: Vec<LexedToken>,
+    doc: usize,
+    attributes_end: usize,
+    modifier: Option<&str>,
+    keyword: usize,
+) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    let doc_slot = if doc == 1 {
+        crate::doc_comment_syntax(&view, &leaves, &tokens, 0)?
+    } else {
+        null_node(Vec::new())
+    };
+    let attributes = attributes::inline_syntax(&view, &leaves, &tokens, doc)?;
+    let kind_slot = match modifier {
+        Some(word) => null_node(vec![Syntax::node(
+            parser_kind(&["Term", word]),
+            vec![leaves.leaf(attributes_end)?],
+        )]),
+        None => null_node(Vec::new()),
+    };
+    // `optional Term.attrKind`: the kind always parses, so the slot holds it.
+    let attr_kind = null_node(vec![Syntax::node(
+        parser_kind(&["Term", "attrKind"]),
+        vec![kind_slot],
+    )]);
+    let mut reader = Reader {
+        view: &view,
+        tokens: &tokens,
+        leaves: &leaves,
+        at: keyword + 1,
+        end: tokens.len(),
+        depth: 0,
+    };
+    let name = reader.named("name", "namedName")?;
+    let prio = reader.named("priority", "namedPrio")?;
+    if !reader.ident(reader.at) {
+        return Err(reader.bad());
+    }
+    let variable = reader.take()?;
+    let arrow = (reader.at..tokens.len())
+        .find(|&at| reader.symbol(at, "=>"))
+        .ok_or_else(|| reader.bad())?;
+    reader.end = arrow;
+    let mut arguments = Vec::new();
+    while reader.at < arrow {
+        let binder = if reader.ident(reader.at)
+            && reader.symbol(reader.at + 1, ":")
+            && tokens[reader.at].extent.end() == tokens[reader.at + 1].extent.start()
+        {
+            let name = reader.take()?;
+            let colon = reader.take()?;
+            null_node(vec![name, colon])
+        } else {
+            null_node(Vec::new())
+        };
+        let item = reader.stx(ARG)?.0;
+        arguments.push(Syntax::node(
+            parser_kind(&["Command", "macroArg"]),
+            vec![binder, item],
+        ));
+    }
+    let value = crate::nested_term(&leaves, &view, &tokens, arrow + 1..tokens.len())?;
+    let syntax = Syntax::node(
+        parser_kind(&["Command", "binderPredicate"]),
+        vec![
+            doc_slot,
+            attributes,
+            attr_kind,
+            leaves.leaf(keyword)?,
+            null_node(name.into_iter().collect()),
+            null_node(prio.into_iter().collect()),
+            variable,
+            null_node(arguments),
+            leaves.leaf(arrow)?,
+            value,
+        ],
+    );
+    let epilogue = leaves.attachment().epilogue();
+    Ok(Some(ParsedSourceCommand {
+        kind: SourceCommandKind::Definition,
+        source_view: view,
+        syntax,
+        epilogue,
+        query_term: None,
+    }))
+}
+
+/// A `macro_rules` or `macro` command from its keyword at `keyword`, as the pin's tree
+/// (`Lean/Parser/Syntax.lean`):
+///
+/// ```text
+/// macro_rules := docComment? attributes? attrKind "macro_rules" optKind Term.matchAlts
+/// macro       := docComment? attributes? attrKind "macro" optPrecedence optNamedName
+///                optNamedPrio many1(macroArg) macroTail
+/// optKind     := (" (" "kind" ":=" ident ")")?
+/// macroArg    := (atomic(ident checkNoWsBefore ":"))? syntaxParser(argPrec)
+/// macroTail   := atomic(" : " ident) " => " macroRhs        macroRhs := term
+/// ```
+///
+/// The alternatives' patterns and the right-hand sides are terms, read with their quotations
+/// (`quotations`). The checker refuses the command.
+#[inline(never)]
+fn macro_command(
+    view: SourceView,
+    tokens: Vec<LexedToken>,
+    doc: usize,
+    attributes_end: usize,
+    modifier: Option<&str>,
+    keyword: usize,
+) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    let doc_slot = if doc == 1 {
+        crate::doc_comment_syntax(&view, &leaves, &tokens, 0)?
+    } else {
+        null_node(Vec::new())
+    };
+    let attributes = attributes::inline_syntax(&view, &leaves, &tokens, doc)?;
+    let kind_slot = match modifier {
+        Some(word) => null_node(vec![Syntax::node(
+            parser_kind(&["Term", word]),
+            vec![leaves.leaf(attributes_end)?],
+        )]),
+        None => null_node(Vec::new()),
+    };
+    let attr_kind = Syntax::node(parser_kind(&["Term", "attrKind"]), vec![kind_slot]);
+    let mut reader = Reader {
+        view: &view,
+        tokens: &tokens,
+        leaves: &leaves,
+        at: keyword + 1,
+        end: tokens.len(),
+        depth: 0,
+    };
+    let syntax = if reader.symbol(keyword, "macro_rules") {
+        let opt_kind = if reader.symbol(reader.at, "(") && reader.word(reader.at + 1, "kind") {
+            let open = reader.take()?;
+            let word = reader.atom("kind")?;
+            let assign = reader.expect(":=")?;
+            if !reader.ident(reader.at) {
+                return Err(reader.bad());
+            }
+            let name = reader.take()?;
+            let close = reader.expect(")")?;
+            null_node(vec![open, word, assign, name, close])
+        } else {
+            null_node(Vec::new())
+        };
+        if !reader.symbol(reader.at, "|") {
+            return Err(reader.bad());
+        }
+        let alternatives = crate::matching::declaration_equations(
+            &leaves,
+            &view,
+            &tokens,
+            reader.at..tokens.len(),
+            DefinitionGrammar::Scalar,
+        )?;
+        Syntax::node(
+            parser_kind(&["Command", "macro_rules"]),
+            vec![
+                doc_slot,
+                attributes,
+                attr_kind,
+                leaves.leaf(keyword)?,
+                opt_kind,
+                alternatives,
+            ],
+        )
+    } else {
+        let precedence = if reader.symbol(reader.at, ":") {
+            null_node(vec![reader.precedence()?])
+        } else {
+            null_node(Vec::new())
+        };
+        let name = reader.named("name", "namedName")?;
+        let prio = reader.named("priority", "namedPrio")?;
+        // `macroTail` starts at the first ` : cat =>` outside brackets.
+        let mut depth = 0_usize;
+        let mut tail = None;
+        for (at, token) in tokens.iter().enumerate().skip(reader.at) {
+            match &token.kind {
+                TokenKind::Symbol(symbol) if matches!(symbol.as_str(), "(" | "[" | "{") => {
+                    depth += 1;
+                }
+                TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}") => {
+                    depth = depth.checked_sub(1).ok_or_else(|| reader.bad())?;
+                }
+                TokenKind::Symbol(symbol)
+                    if symbol == ":"
+                        && depth == 0
+                        && reader.ident(at + 1)
+                        && reader.symbol(at + 2, "=>") =>
+                {
+                    tail = Some(at);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let tail = tail.ok_or_else(|| reader.bad())?;
+        reader.end = tail;
+        let mut arguments = Vec::new();
+        while reader.at < tail {
+            // `x:` binds the item that follows, the `:` touching the name.
+            let binder = if reader.ident(reader.at)
+                && reader.symbol(reader.at + 1, ":")
+                && tokens[reader.at].extent.end() == tokens[reader.at + 1].extent.start()
+            {
+                let name = reader.take()?;
+                let colon = reader.take()?;
+                null_node(vec![name, colon])
+            } else {
+                null_node(Vec::new())
+            };
+            let item = reader.stx(ARG)?.0;
+            arguments.push(Syntax::node(
+                parser_kind(&["Command", "macroArg"]),
+                vec![binder, item],
+            ));
+        }
+        if arguments.is_empty() {
+            return Err(reader.bad());
+        }
+        let value = crate::nested_term(&leaves, &view, &tokens, tail + 3..tokens.len())?;
+        Syntax::node(
+            parser_kind(&["Command", "macro"]),
+            vec![
+                doc_slot,
+                attributes,
+                attr_kind,
+                leaves.leaf(keyword)?,
+                precedence,
+                null_node(name.into_iter().collect()),
+                null_node(prio.into_iter().collect()),
+                null_node(arguments),
+                Syntax::node(
+                    parser_kind(&["Command", "macroTail"]),
+                    vec![
+                        leaves.leaf(tail)?,
+                        leaves.leaf(tail + 1)?,
+                        leaves.leaf(tail + 2)?,
+                        Syntax::node(parser_kind(&["Command", "macroRhs"]), vec![value]),
+                    ],
+                ),
             ],
         )
     };
@@ -668,11 +949,14 @@ fn notation(
     let value = crate::nested_term(&leaves, &view, &tokens, arrow + 1..tokens.len())?;
     let syntax = match mixfix {
         Some(word) => {
-            // `precedence` is not optional here, and the one item is the notation's atom.
+            // `precedence` is not optional here, and the one item is the notation's atom: a string,
+            // or both spellings of one (`unicode(" ≤ ", " <= ")`, Init/Notation.lean).
             let (Some(precedence), [item]) = (precedence, items.as_slice()) else {
                 return Err(reader.bad());
             };
-            if !matches!(item, Syntax::Node { kind, .. } if *kind == Name::str(Name::anonymous(), "str"))
+            if !matches!(item, Syntax::Node { kind, .. }
+                if *kind == Name::str(Name::anonymous(), "str")
+                    || *kind == parser_kind(&["Syntax", "unicodeAtom"]))
             {
                 return Err(reader.bad());
             }
@@ -708,6 +992,63 @@ fn notation(
             ],
         ),
     };
+    finish(view, &leaves, syntax)
+}
+
+/// `syntaxCat := docComment? "declare_syntax_cat " ident catBehavior`, with
+/// `catBehavior := (" (" &"behavior" " := " (catBehaviorBoth <|> catBehaviorSymbol) ")")?`
+/// (`Lean/Parser/Syntax.lean`), as the pin's tree. The checker refuses it.
+#[inline(never)]
+fn category(
+    view: SourceView,
+    tokens: Vec<LexedToken>,
+    doc: usize,
+    keyword: usize,
+) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    let doc_slot = if doc == 1 {
+        crate::doc_comment_syntax(&view, &leaves, &tokens, 0)?
+    } else {
+        null_node(Vec::new())
+    };
+    let mut reader = Reader {
+        view: &view,
+        tokens: &tokens,
+        leaves: &leaves,
+        at: keyword + 1,
+        end: tokens.len(),
+        depth: 0,
+    };
+    if !reader.ident(reader.at) {
+        return Err(reader.bad());
+    }
+    let name = reader.take()?;
+    let behavior = if reader.symbol(reader.at, "(") && reader.word(reader.at + 1, "behavior") {
+        let open = reader.take()?;
+        let word = reader.atom("behavior")?;
+        let assign = reader.expect(":=")?;
+        let value = ["both", "symbol"]
+            .into_iter()
+            .find(|value| reader.word(reader.at, value))
+            .ok_or_else(|| reader.bad())?;
+        let kind = if value == "both" {
+            "catBehaviorBoth"
+        } else {
+            "catBehaviorSymbol"
+        };
+        let value = Syntax::node(parser_kind(&["Command", kind]), vec![reader.atom(value)?]);
+        let close = reader.expect(")")?;
+        null_node(vec![open, word, assign, value, close])
+    } else {
+        null_node(Vec::new())
+    };
+    if reader.at != reader.end {
+        return Err(reader.bad());
+    }
+    let syntax = Syntax::node(
+        parser_kind(&["Command", "syntaxCat"]),
+        vec![doc_slot, leaves.leaf(keyword)?, name, behavior],
+    );
     finish(view, &leaves, syntax)
 }
 

@@ -39,6 +39,17 @@ fn binder_name(syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
         Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous() => {
             Ok(val.clone())
         }
+        // A binder a notation's template introduces carries the expansion's macro scopes: atomic
+        // once they are erased, and kept scoped, so only the template's own references (which
+        // carry the same scopes) name it.
+        Syntax::Ident { val, .. }
+            if val.has_macro_scopes() && {
+                let erased = val.erase_macro_scopes();
+                !erased.is_anonymous() && erased.parent().is_anonymous()
+            } =>
+        {
+            Ok(val.clone())
+        }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "hole"]) => {
             let [hole] = args.as_slice() else {
                 return Err(invalid());

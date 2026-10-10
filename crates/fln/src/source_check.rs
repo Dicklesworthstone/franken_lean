@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+pub(crate) mod grammar;
 pub mod inspect;
 mod instance_attributes;
 pub mod modules;
@@ -432,7 +433,9 @@ impl Engine {
             let file_base = engine.environment.clone();
             let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
             scopes.current.private_module = private_module.cloned();
-            let commands = partition_commands(source, file, count)?;
+            // The syntax this file declares extends the grammar of what follows it.
+            let mut grammar = grammar::SourceGrammar::implicit_init();
+            let commands = grammar.enter(|| partition_commands(source, file, count))?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
                 return Err(SourceCheckError::Limit {
                     resource: "commands",
@@ -448,6 +451,7 @@ impl Engine {
                 let (start, command) = match step {
                     SourceStep::Command(command) => command,
                     SourceStep::Scope(start, transition) => {
+                        grammar.observe(&transition);
                         scopes
                             .check_limits(&transition)
                             .map_err(|(resource, limit)| SourceCheckError::Limit {
@@ -464,7 +468,8 @@ impl Engine {
                         continue;
                     }
                 };
-                let control = parse_control_command(command, start, file, count)?;
+                let control =
+                    grammar.enter(|| parse_control_command(command, start, file, count))?;
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
@@ -513,6 +518,7 @@ impl Engine {
                         }
                         Err(control) => control,
                     };
+                    grammar.observe(&control);
                     match apply_module_control_command(
                         &mut engine,
                         &mut scopes,
@@ -530,9 +536,20 @@ impl Engine {
                     count += 1;
                     continue;
                 }
+                // A command that declares syntax extends the grammar and admits nothing.
+                if grammar
+                    .declare(
+                        command,
+                        grammar::resolver(engine.environment(), &scopes.current),
+                    )
+                    .map_err(|error| command_error(file, count, start, error))?
+                {
+                    count += 1;
+                    continue;
+                }
                 let scope = if public.is_some() {
-                    scopes
-                        .command_scope(command)
+                    grammar
+                        .enter(|| scopes.command_scope(command))
                         .map_err(EngineExecutionError::Frontend)
                         .map_err(|error| command_error(file, count, start, error))?
                 } else {
@@ -544,8 +561,15 @@ impl Engine {
                 } else {
                     &engine
                 };
-                let result = predecessor
-                    .admit_source_command_in_scope(command, options, limits.admission, &scope)
+                let result = grammar
+                    .enter(|| {
+                        predecessor.admit_source_command_in_scope(
+                            command,
+                            options,
+                            limits.admission,
+                            &scope,
+                        )
+                    })
                     .map_err(|error| command_error(file, count, start, error))?;
                 let admitted = match result {
                     Outcome::Complete(admitted) => admitted,
@@ -623,11 +647,12 @@ impl Engine {
 pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError> {
     let mut count = 0;
     for (file, source) in sources.iter().enumerate() {
-        for (mut start, mut command) in partition_commands(source, file, count)? {
+        let mut grammar = grammar::SourceGrammar::implicit_init();
+        for (mut start, mut command) in grammar.enter(|| partition_commands(source, file, count))? {
             // `open A in <command>`: the inner command is parsed as the checked path parses
             // it, at its own offset; the open itself is one command with it.
             loop {
-                match parse_control_command(command, start, file, count)? {
+                match grammar.enter(|| parse_control_command(command, start, file, count))? {
                     Some(fln_parse::command_scope::ScopeCommand::Trivia) => {}
                     Some(
                         fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
@@ -638,10 +663,21 @@ pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError>
                         command = &command[body..];
                         continue;
                     }
-                    Some(_) => count += 1,
+                    Some(scope) => {
+                        grammar.observe(&scope);
+                        count += 1;
+                    }
                     None => {
-                        crate::source_records::parse_scoped_command(command)
+                        // A syntax declaration is registered, not parsed as a declaration;
+                        // with no environment yet, its precheck is the checked path's.
+                        let declared = grammar
+                            .declare(command, |_| grammar::Resolution::Unchecked)
                             .map_err(|error| command_error(file, count, start, error))?;
+                        if !declared {
+                            grammar
+                                .enter(|| crate::source_records::parse_scoped_command(command))
+                                .map_err(|error| command_error(file, count, start, error))?;
+                        }
                         count += 1;
                     }
                 }
