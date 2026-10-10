@@ -28,6 +28,14 @@ use crate::tagged;
 pub mod fs;
 pub mod stdout_capture;
 
+/// Flush native writes to the process stdout before a host publishes through
+/// its own stdout buffer. Thread-local stream overrides and other files are
+/// untouched. An error retains any bytes the OS already accepted; no action is
+/// repeated and no logical IO result or declaration authority is produced.
+pub fn flush_native_stdout() -> std::io::Result<()> {
+    crate::stdio::flush_native_stdout()
+}
+
 /// Boxed-convention function types for the callable-closure constructors: every
 /// parameter and the result are `lean_object*`, per the pin's `m_fun` contract
 /// (`lean.h:211-217`; apply arms `apply.cpp:101-460`).

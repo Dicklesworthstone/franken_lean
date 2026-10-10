@@ -189,6 +189,29 @@ pub(crate) fn errno() -> c_int {
     }
 }
 
+/// Synchronize the process stdout used by native `fwrite` with a host writer
+/// which will subsequently publish through the same file descriptor.
+///
+/// This does not create a native stream, select a thread-local override, or
+/// flush unrelated files. Individual Lean writes retain their pinned buffering
+/// semantics. A failed flush reports the operating system error without
+/// constructing a logical `IO.Result` or retrying an already completed action.
+pub(crate) fn flush_native_stdout() -> std::io::Result<()> {
+    initialize_io_signals();
+    // SAFETY: glibc's process stdout is live for the process lifetime. fflush
+    // acquires its FILE lock internally; no borrowed object or raw pointer
+    // escapes, and errno is read before another native operation can change it.
+    // UNSAFE-LEDGER: FLN-UL-0659
+    #[allow(unsafe_code)]
+    unsafe {
+        if fflush(stdout) == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(errno()))
+        }
+    }
+}
+
 // ---------------------------------------------------------------- handle
 
 /// `io_handle_finalizer` (`io.cpp:93-100`): fclose with errors deliberately

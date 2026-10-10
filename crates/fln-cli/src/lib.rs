@@ -10,9 +10,12 @@
 #![forbid(unsafe_code)]
 
 mod lake_build;
+mod output;
 mod source_check;
 mod source_evaluation;
 mod stdout_capture;
+
+pub use output::write_output;
 
 /// Install the binary's once-only panic router before starting workers. JSON
 /// execution workers render caught panics themselves; other threads retain
