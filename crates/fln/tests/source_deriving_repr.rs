@@ -222,7 +222,7 @@ theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain
                 "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
                 "inductive Recursive where\n | node (next : Recursive)\nderiving Repr",
                 "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
-                "structure Partial where\n n : Nat\nderiving Repr, DecidableEq",
+                "structure Partial where\n n : Nat\nderiving Repr, UnknownHandler",
             ] {
                 assert!(
                     base.check_source_files(

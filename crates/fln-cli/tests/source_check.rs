@@ -125,6 +125,77 @@ fn check_then_refuse_suffixes(prefix: &str, expected: &[&str], refusals: &[(&str
 }
 
 #[test]
+fn installed_beq_deriving_checks_recursive_data_and_executes() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving BEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  theorem same : (xs == xs) = true := by rfl\n\
+                  theorem changed : (xs == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : (xs == Chain.nil) = true := by rfl", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving BEq",
+                Some("failed to generate BEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs == xs then 42 else 0\n#eval if xs == Chain.nil then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
+fn installed_decidable_eq_deriving_checks_proofs_and_executes_recursive_decisions() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving DecidableEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  def ys : Chain Nat := Chain.cons 7 (Chain.cons 8 Chain.nil)\n\
+                  theorem same : xs = xs := by decide\n\
+                  theorem changed : Not (xs = ys) := by decide";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : xs = ys := by decide", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving DecidableEq",
+                Some("failed to generate DecidableEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, DecidableEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs = xs then 42 else 0\n#eval if xs = ys then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
 fn installed_structural_hints_check_selected_parameters_and_execute() {
     let source = "def tally (acc n : Nat) : Nat := match n with\n\
                   | .zero => acc\n| .succ k => tally (acc + 1) k\n\

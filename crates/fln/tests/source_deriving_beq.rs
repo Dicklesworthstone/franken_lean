@@ -276,7 +276,7 @@ fn false_equalities_missing_field_instances_and_incomplete_batches_are_rejected(
         "structure Box where\n value : Nat\nderiving BEq\ntheorem bad : (Box.mk 7 == Box.mk 8) = true := by rfl",
         "structure Missing where\n run : Nat -> Nat\nderiving BEq",
         "structure Dependent where\n carrier : Type\n value : carrier\nderiving BEq",
-        "structure Point where\n value : Nat\nderiving BEq, DecidableEq",
+        "structure Point where\n value : Nat\nderiving BEq, UnknownHandler",
     ] {
         assert!(
             base.check_source_files(
