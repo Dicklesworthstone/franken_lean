@@ -26,6 +26,7 @@ mod specialize;
 mod st;
 mod stdout;
 mod string_bootstrap;
+mod string_bytes;
 mod string_from_list;
 mod string_push;
 mod transport;
@@ -72,6 +73,7 @@ pub(super) struct Preparation<'a> {
     fs: fs::Store,
     stdout: stdout::Store,
     string_bootstrap: string_bootstrap::Store,
+    string_bytes: string_bytes::Store,
     string_push: string_push::Store,
     string_from_list: string_from_list::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
@@ -157,6 +159,7 @@ impl<'a> Preparation<'a> {
             fs: fs::Store::default(),
             stdout: stdout::Store::default(),
             string_bootstrap: string_bootstrap::Store::default(),
+            string_bytes: string_bytes::Store::default(),
             string_push: string_push::Store::default(),
             string_from_list: string_from_list::Store::default(),
             data_shapes: std::collections::HashMap::new(),
@@ -522,6 +525,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(value));
                             continue;
                         }
+                        if let Some(value) = self.string_bytes_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(projected) = self.projection_call(&head, &args)? {
                             tasks.push(Task::Visit(projected));
                             continue;
@@ -857,6 +864,10 @@ impl<'a> Preparation<'a> {
                                 continue;
                             }
                             if let Some(value) = self.string_bootstrap_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
+                            if let Some(value) = self.string_bytes_call(&expr, &[])? {
                                 tasks.push(Task::Visit(value));
                                 continue;
                             }

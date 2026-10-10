@@ -1,6 +1,8 @@
 //! Checked logical bytes cross into a private native buffer only at the write.
 use super::*;
 
+mod string;
+
 fn write_environment(raw: &Environment, omit: Option<&str>) -> Environment {
     let environment = fs::WRITE_BYTE_HELPERS
         .into_iter()

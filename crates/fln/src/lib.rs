@@ -10156,6 +10156,7 @@ fn executable_dependencies(
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
             .or_else(|| preparation.string_push_intrinsic_binding(&name))
             .or_else(|| preparation.string_bootstrap_intrinsic_binding(&name))
+            .or_else(|| preparation.string_bytes_intrinsic_binding(&name))
         {
             Some(binding) => Some(binding),
             None => executable_intrinsic_binding_cached(
@@ -10167,7 +10168,13 @@ fn executable_dependencies(
             )?,
         };
         if let Some(binding) = intrinsic {
-            if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)? {
+            if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)?
+                || preparation.string_bytes_intrinsic_alias(
+                    &binding,
+                    &intrinsics,
+                    &mut functions,
+                )?
+            {
                 continue;
             }
             intrinsics
