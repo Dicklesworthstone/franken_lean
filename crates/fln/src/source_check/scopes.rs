@@ -1,6 +1,7 @@
 //! Section lifetimes affect source resolution, not the checked environment. Ending
 //! a section restores lookup/universe state but never removes its declarations.
 use super::*;
+use fln_elab::instances::scoped::ActiveScopes;
 use fln_elab::source::scope::{SourceScope, components};
 use fln_parse::command_scope::ScopeCommand;
 use std::collections::BTreeSet;
@@ -9,10 +10,14 @@ use std::collections::BTreeSet;
 struct Frame {
     label: Option<String>,
     saved: SourceScope,
+    public_instances: ActiveScopes,
 }
 #[derive(Default)]
 pub(crate) struct Scopes {
     pub current: SourceScope,
+    // Public and private journals have different rows and insertion positions.
+    // Each namespace activation must retain the boundary in its own world.
+    public_instances: ActiveScopes,
     stack: Vec<Frame>,
     namespaces: BTreeSet<Name>,
 }
@@ -63,6 +68,15 @@ impl Scopes {
         command: ScopeCommand,
         env: &Environment,
     ) -> Result<(), TransitionError> {
+        self.transition_worlds(command, env, None)
+    }
+
+    pub fn transition_worlds(
+        &mut self,
+        command: ScopeCommand,
+        env: &Environment,
+        public_env: Option<&Environment>,
+    ) -> Result<(), TransitionError> {
         match command {
             ScopeCommand::Namespace(name) => {
                 let parts = components(&name).map_err(|e| TransitionError::Scope(e.to_string()))?;
@@ -78,10 +92,19 @@ impl Scopes {
                         .instance_scopes
                         .activate(env, &self.current.namespace)
                         .map_err(TransitionError::Registry)?;
+                    if let Some(public_env) = public_env {
+                        self.public_instances
+                            .activate(public_env, &self.current.namespace)
+                            .map_err(TransitionError::Registry)?;
+                    }
                 }
             }
-            ScopeCommand::Open(names) => return self.transition_open(names, false, env),
-            ScopeCommand::OpenScoped(names) => return self.transition_open(names, true, env),
+            ScopeCommand::Open(names) => {
+                return self.transition_open(names, false, env, public_env);
+            }
+            ScopeCommand::OpenScoped(names) => {
+                return self.transition_open(names, true, env, public_env);
+            }
             other => self.apply(other).map_err(TransitionError::Scope)?,
         }
         Ok(())
@@ -92,8 +115,10 @@ impl Scopes {
         names: Vec<Name>,
         scoped_only: bool,
         env: &Environment,
+        public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
         let mut next = self.current.clone();
+        let mut public_instances = self.public_instances.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
         for namespace in registry.instance_namespaces() {
@@ -111,13 +136,38 @@ impl Scopes {
                 next.instance_scopes
                     .activate(env, &namespace)
                     .map_err(TransitionError::Registry)?;
+                if let Some(public_env) = public_env {
+                    public_instances
+                        .activate(public_env, &namespace)
+                        .map_err(TransitionError::Registry)?;
+                }
                 if !scoped_only {
                     Self::add_open(&mut next, namespace).map_err(TransitionError::Scope)?;
                 }
             }
         }
         self.current = next;
+        self.public_instances = public_instances;
         Ok(())
+    }
+
+    /// The same lexical state with activation chronology from the public
+    /// journal. Selection only clones a snapshot; it never opens a namespace.
+    pub fn public_scope(&self) -> SourceScope {
+        let mut scope = self.current.clone();
+        scope.instance_scopes = self.public_instances.clone();
+        scope
+    }
+
+    pub fn command_scope(
+        &self,
+        source: &[u8],
+    ) -> Result<SourceScope, fln_elab::NatDefinitionFrontendError> {
+        let mut scope = self.current.for_command_source(source)?;
+        if scope.exports_declaration() {
+            scope.instance_scopes = self.public_instances.clone();
+        }
+        Ok(scope)
     }
 
     /// Namespace lookup is not global-constant lookup. The Reference's
@@ -222,10 +272,14 @@ impl Scopes {
         const MAX_DEPTH: usize = 256;
         const MAX_ITEMS: usize = 4096;
         let added_scopes = match command {
-            ScopeCommand::Namespace(name) | ScopeCommand::Section(Some(name)) => {
-                components(name).map_or(MAX_DEPTH + 1, |parts| parts.len())
+            ScopeCommand::Namespace(name)
+            | ScopeCommand::Section(Some(name))
+            | ScopeCommand::SectionWithModifiers {
+                name: Some(name), ..
+            } => components(name).map_or(MAX_DEPTH + 1, |parts| parts.len()),
+            ScopeCommand::Section(None) | ScopeCommand::SectionWithModifiers { name: None, .. } => {
+                1
             }
-            ScopeCommand::Section(None) => 1,
             _ => 0,
         };
         if self.stack.len().saturating_add(added_scopes) > MAX_DEPTH {
@@ -285,6 +339,7 @@ impl Scopes {
                     self.stack.push(Frame {
                         label: Some(part.clone()),
                         saved: self.current.clone(),
+                        public_instances: self.public_instances.clone(),
                     });
                     if namespace {
                         self.current.namespace = Name::str(self.current.namespace.clone(), part);
@@ -296,7 +351,35 @@ impl Scopes {
                 self.stack.push(Frame {
                     label: None,
                     saved: self.current.clone(),
+                    public_instances: self.public_instances.clone(),
                 });
+            }
+            ScopeCommand::SectionWithModifiers {
+                name,
+                public,
+                expose,
+            } => {
+                let labels = match name {
+                    Some(name) => {
+                        let parts = components(&name).map_err(|e| e.to_string())?;
+                        if parts.is_empty() || parts.iter().any(|part| part == "_root_") {
+                            return Err("invalid section label".into());
+                        }
+                        parts.into_iter().map(Some).collect::<Vec<_>>()
+                    }
+                    None => vec![None],
+                };
+                // The pin pushes each dotted component separately and inherits
+                // the flags before entering the next one (`BuiltinCommand`).
+                for label in labels {
+                    self.stack.push(Frame {
+                        label,
+                        saved: self.current.clone(),
+                        public_instances: self.public_instances.clone(),
+                    });
+                    self.current.public_declarations |= public;
+                    self.current.expose_definitions |= expose;
+                }
             }
             ScopeCommand::End(label) => {
                 let labels: Vec<_> = label
@@ -317,7 +400,9 @@ impl Scopes {
                     return Err("end label does not match the innermost scope(s)".into());
                 }
                 for _ in labels {
-                    self.current = self.stack.pop().expect("validated end depth").saved;
+                    let frame = self.stack.pop().expect("validated end depth");
+                    self.current = frame.saved;
+                    self.public_instances = frame.public_instances;
                 }
             }
             ScopeCommand::Open(names) => {
@@ -478,6 +563,80 @@ mod tests {
         open(&mut scopes, &["A", "B"]);
         scopes.apply(ScopeCommand::End(None)).unwrap();
         assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn public_exposure_defaults_follow_each_dotted_section_frame() {
+        let mut scopes = Scopes::default();
+        scopes.current.private_module = Some(n("Main"));
+        let original = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: Some(n("Outer.Inner")),
+                public: true,
+                expose: true,
+            })
+            .unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        assert!(scopes.current.namespace.is_anonymous());
+        let private = scopes
+            .current
+            .for_command_source(b"private def identity (a : Type) (x : a) : a := x")
+            .unwrap();
+        assert!(!private.public_declarations);
+        assert!(scopes.current.public_declarations);
+        scopes.apply(ScopeCommand::End(Some(n("Inner")))).unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        scopes.apply(ScopeCommand::Namespace(n("Local"))).unwrap();
+        assert!(scopes.current.public_declarations);
+        scopes.apply(ScopeCommand::End(Some(n("Local")))).unwrap();
+        scopes.apply(ScopeCommand::End(Some(n("Outer")))).unwrap();
+        assert_eq!(scopes.current, original);
+    }
+
+    #[test]
+    fn nested_exposure_section_inherits_public_visibility_then_restores_it() {
+        let mut scopes = Scopes::default();
+        let original = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: None,
+                public: true,
+                expose: false,
+            })
+            .unwrap();
+        let public = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: None,
+                public: false,
+                expose: true,
+            })
+            .unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        scopes.apply(ScopeCommand::End(None)).unwrap();
+        assert_eq!(scopes.current, public);
+        scopes.apply(ScopeCommand::End(None)).unwrap();
+        assert_eq!(scopes.current, original);
+    }
+
+    #[test]
+    fn modified_sections_charge_the_same_depth_bound_as_plain_sections() {
+        let mut scopes = Scopes::default();
+        for _ in 0..255 {
+            scopes.apply(ScopeCommand::Section(None)).unwrap();
+        }
+        let command = ScopeCommand::SectionWithModifiers {
+            name: Some(n("A.B")),
+            public: true,
+            expose: true,
+        };
+        assert_eq!(scopes.check_limits(&command), Err(("scope depth", 256)));
+        assert!(!scopes.current.public_declarations);
+        assert!(!scopes.current.expose_definitions);
     }
 
     #[test]

@@ -127,6 +127,27 @@ impl ImportContexts {
         modules: &[SourceModuleInput<'_>],
         meter: &mut Meter,
     ) -> Result<Vec<Step>, SourceModuleCheckError> {
+        self.order_in(index, plan, modules, meter, false)
+    }
+
+    pub(super) fn public_order(
+        &self,
+        index: usize,
+        plan: &graph::Plan,
+        modules: &[SourceModuleInput<'_>],
+        meter: &mut Meter,
+    ) -> Result<Vec<Step>, SourceModuleCheckError> {
+        self.order_in(index, plan, modules, meter, true)
+    }
+
+    fn order_in(
+        &self,
+        index: usize,
+        plan: &graph::Plan,
+        modules: &[SourceModuleInput<'_>],
+        meter: &mut Meter,
+        public_root: bool,
+    ) -> Result<Vec<Step>, SourceModuleCheckError> {
         meter.work(modules.len())?;
         let local: BTreeMap<_, _> = modules
             .iter()
@@ -159,7 +180,7 @@ impl ImportContexts {
                 continue;
             }
             let imports = if let Some(&source) = local.get(&name) {
-                if source != index {
+                if source != index || public_root {
                     plan.visible_imports(source)
                 } else {
                     &plan.headers[source].imports

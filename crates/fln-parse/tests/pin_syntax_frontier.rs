@@ -152,7 +152,7 @@ fn refusal_class(error: &NatDefinitionParseError) -> String {
 fn scope_name(command: &ScopeCommand) -> &'static str {
     match command {
         ScopeCommand::Namespace(_) => "namespace",
-        ScopeCommand::Section(_) => "section",
+        ScopeCommand::Section(_) | ScopeCommand::SectionWithModifiers { .. } => "section",
         ScopeCommand::End(_) => "end",
         ScopeCommand::Open(_) | ScopeCommand::OpenScoped(_) | ScopeCommand::OpenIn { .. } => "open",
         ScopeCommand::Universe(_) => "universe",

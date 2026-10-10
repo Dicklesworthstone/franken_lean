@@ -148,12 +148,17 @@ impl Context {
             Name::str(namespace.clone(), text)
         };
         let mut user_name = candidate(None);
-        let mut name = self.source_scope.private_name(&user_name);
+        let mut name = self.source_scope.visible_name(&user_name);
         let mut next = 1;
-        while self.txn.env.contains(&name) || self.txn.env.contains(&user_name) {
+        while self.txn.env.contains(&user_name)
+            || self
+                .txn
+                .env
+                .contains(&self.source_scope.private_name(&user_name))
+        {
             self.tick()?;
             user_name = candidate(Some(next));
-            name = self.source_scope.private_name(&user_name);
+            name = self.source_scope.visible_name(&user_name);
             next += 1;
         }
         Ok(name)

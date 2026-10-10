@@ -96,11 +96,10 @@ pub(super) fn module(
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     };
-    let environment = prefix.checked.checked.engine.environment();
     // Replaying controls against the final environment moves every scoped
     // activation after later global registrations and loses checked variables.
     // The successful prefix (including a cache hit) owns the exact lexical state.
-    let scope = prefix.checked.checked.scope.clone();
+    let mut scope = prefix.checked.checked.scope.clone();
     let mut observation = None;
     if let Some((command_index, (_, command))) = selected {
         let control = fln_parse::command_scope::parse(command).map_err(|error| {
@@ -123,6 +122,35 @@ pub(super) fn module(
                     },
                 }
             })?;
+            scope = scope.for_declaration(parsed.syntax()).map_err(|error| {
+                SourceModuleCheckError::Source {
+                    module: entry.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: command_index,
+                        offset: prefix_end,
+                        error: Box::new(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Elaborate(error),
+                        )),
+                    },
+                }
+            })?;
+            let environment = if scope.exports_declaration() {
+                scope.instance_scopes = prefix
+                    .checked
+                    .public_scope
+                    .as_ref()
+                    .ok_or_else(|| {
+                        scope_error("checked public scope prefix is unavailable for inspection")
+                    })?
+                    .instance_scopes
+                    .clone();
+                prefix.checked.public_environment.as_ref().ok_or_else(|| {
+                    scope_error("checked public source prefix is unavailable for inspection")
+                })?
+            } else {
+                prefix.checked.checked.engine.environment()
+            };
             // A CR removed by CRLF normalization has no parser coordinate.
             if let Some(position) = parsed
                 .source_view()

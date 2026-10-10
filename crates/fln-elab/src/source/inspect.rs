@@ -79,7 +79,8 @@ pub fn declaration(
     offset: usize,
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope);
     // There will be no final declaration admission to discharge earlier rigid
     // equations. Check them when generated instead of deferring to that door.
     context.attempt_depth = 1;

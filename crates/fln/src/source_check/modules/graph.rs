@@ -165,6 +165,25 @@ impl Plan {
         modules: &[SourceModuleInput<'_>],
         meter: &mut Meter,
     ) -> Result<Vec<usize>, SourceModuleCheckError> {
+        self.dependencies_in(module, modules, meter, false)
+    }
+
+    pub(super) fn public_dependencies_of(
+        &self,
+        module: usize,
+        modules: &[SourceModuleInput<'_>],
+        meter: &mut Meter,
+    ) -> Result<Vec<usize>, SourceModuleCheckError> {
+        self.dependencies_in(module, modules, meter, true)
+    }
+
+    fn dependencies_in(
+        &self,
+        module: usize,
+        modules: &[SourceModuleInput<'_>],
+        meter: &mut Meter,
+        public_root: bool,
+    ) -> Result<Vec<usize>, SourceModuleCheckError> {
         // Ordinary imports in a module-system file are private. Check those
         // dependencies in the file itself without exposing them to consumers.
         meter.work(self.dependencies.len())?;
@@ -173,7 +192,7 @@ impl Plan {
             .iter()
             .enumerate()
             .map(|(index, imports)| {
-                if index != module && self.headers[index].module_system {
+                if (index != module || public_root) && self.headers[index].module_system {
                     self.exported_dependencies[index].clone()
                 } else {
                     imports.clone()

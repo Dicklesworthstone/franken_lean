@@ -3807,7 +3807,8 @@ fn definition_scoped(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope);
     definition_in_context(syntax, &mut context)
 }
 
@@ -3841,6 +3842,9 @@ fn definition_in_context_named(
         match index {
             0 => doc_comment_slot(modifier)?,
             1 => {}
+            2 => {
+                scope::visibility::modifier(modifier)?;
+            }
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }

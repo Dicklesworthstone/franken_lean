@@ -207,7 +207,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
 /// declarations' reducibility, including when the file executes on Golem.
 pub(crate) fn apply_control_command(
     engine: &mut Engine,
-    scopes: &mut scopes::Scopes,
+    scope: &mut fln_elab::source::scope::SourceScope,
     file_base: &Environment,
     control: fln_parse::command_scope::ScopeCommand,
     kernel: Budget,
@@ -222,10 +222,10 @@ pub(crate) fn apply_control_command(
                     &syntax,
                     engine.environment(),
                     kernel,
-                    &scopes.current,
+                    scope,
                 ))
                 .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
-            scopes.current.variables = match variables {
+            scope.variables = match variables {
                 Outcome::Complete(variables) => variables,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -234,7 +234,7 @@ pub(crate) fn apply_control_command(
         ScopeCommand::Instance(attribute) => {
             engine.environment = instance_attributes::apply(
                 engine.environment(),
-                &scopes.current,
+                scope,
                 attribute,
                 file,
                 command,
@@ -242,21 +242,15 @@ pub(crate) fn apply_control_command(
             )?;
         }
         ScopeCommand::Reducibility(attribute) => {
-            engine.environment = reducibility::apply(
-                engine.environment(),
-                file_base,
-                &scopes.current,
-                attribute,
-                position,
-            )?;
+            engine.environment =
+                reducibility::apply(engine.environment(), file_base, scope, attribute, position)?;
         }
         ScopeCommand::Simp(attribute) => {
             // Resolve in the lexical scope, but retain exact declaration
             // identities. A later failure discards every earlier update.
             let mut environment = engine.environment.clone();
             for requested in attribute.declarations {
-                let name = scopes
-                    .current
+                let name = scope
                     .resolve(&requested, |name| environment.contains(name))
                     .map_err(|error| SourceCheckError::Scope {
                         file,
@@ -290,14 +284,94 @@ pub(crate) fn apply_control_command(
             }
             engine.environment = environment;
         }
-        other => {
-            scopes
-                .check_limits(&other)
-                .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
-            scopes
-                .transition(other, engine.environment())
-                .map_err(|error| error.into_source(file, command, offset))?;
+        _ => {
+            return Err(SourceCheckError::Scope {
+                file,
+                command,
+                offset,
+                message: "lexical controls require the source scope driver".into(),
+            });
         }
+    }
+    Ok(Outcome::Complete(()))
+}
+
+/// Public section controls use the same exported world as public declarations.
+/// Their successful native journal suffix is replayed into the private world;
+/// a private section's attributes and local variables never enter that receipt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_module_control_command(
+    engine: &mut Engine,
+    scopes: &mut scopes::Scopes,
+    file_base: &Environment,
+    control: fln_parse::command_scope::ScopeCommand,
+    kernel: Budget,
+    position: (usize, usize, usize),
+    public: Option<&mut modules::visibility::PublicWorld<'_>>,
+    options: &KVMap,
+) -> Result<Outcome<()>, SourceCheckError> {
+    use fln_parse::command_scope::ScopeCommand;
+
+    if !matches!(
+        control,
+        ScopeCommand::Variable(_)
+            | ScopeCommand::Instance(_)
+            | ScopeCommand::Reducibility(_)
+            | ScopeCommand::Simp(_)
+    ) {
+        scopes
+            .check_limits(&control)
+            .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
+        let (file, command, offset) = position;
+        let transitioned = if let Some(public) = public.as_ref() {
+            scopes.transition_worlds(
+                control,
+                engine.environment(),
+                Some(public.engine().environment()),
+            )
+        } else {
+            scopes.transition(control, engine.environment())
+        };
+        transitioned.map_err(|error| error.into_source(file, command, offset))?;
+        return Ok(Outcome::Complete(()));
+    }
+    let Some(public) = public.filter(|_| scopes.current.exports_declaration()) else {
+        return apply_control_command(
+            engine,
+            &mut scopes.current,
+            file_base,
+            control,
+            kernel,
+            position,
+        );
+    };
+    let mut scope = scopes.public_scope();
+    let mut next = public.engine().clone();
+    match apply_control_command(
+        &mut next,
+        &mut scope,
+        public.file_base(),
+        control,
+        kernel,
+        position,
+    )? {
+        Outcome::Complete(()) => {}
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    }
+    let (file, command, offset) = position;
+    match public
+        .publish(engine, next, Vec::new(), &scope, options)
+        .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+    {
+        Outcome::Complete(next) => {
+            *engine = next;
+            // Variable declarations are the only material control with a
+            // lexical effect. Preserve the private journal's activation anchor.
+            scopes.current.variables = scope.variables;
+        }
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     }
     Ok(Outcome::Complete(()))
 }
@@ -314,7 +388,7 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
-        self.check_source_files_recording(sources, options, limits, None, None)
+        self.check_source_files_recording(sources, options, limits, None, None, None)
     }
 
     // Module imports record only the candidates that survived ordinary admission.
@@ -326,6 +400,7 @@ impl Engine {
         limits: SourceCheckLimits,
         mut declarations: Option<&mut Vec<Declaration>>,
         private_module: Option<&Name>,
+        mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         if sources.is_empty() {
             return Err(SourceCheckError::EmptyInput);
@@ -380,7 +455,11 @@ impl Engine {
                                 limit,
                             })?;
                         scopes
-                            .transition(transition, engine.environment())
+                            .transition_worlds(
+                                transition,
+                                engine.environment(),
+                                public.as_ref().map(|world| world.engine().environment()),
+                            )
                             .map_err(|error| error.into_source(file, count, start.0))?;
                         continue;
                     }
@@ -434,13 +513,15 @@ impl Engine {
                         }
                         Err(control) => control,
                     };
-                    match apply_control_command(
+                    match apply_module_control_command(
                         &mut engine,
                         &mut scopes,
                         &file_base,
                         control,
                         limits.admission.kernel,
                         (file, count, start.0),
+                        public.as_deref_mut(),
+                        options,
                     )? {
                         Outcome::Complete(()) => {}
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -449,13 +530,22 @@ impl Engine {
                     count += 1;
                     continue;
                 }
-                let result = engine
-                    .admit_source_command_in_scope(
-                        command,
-                        options,
-                        limits.admission,
-                        &scopes.current,
-                    )
+                let scope = if public.is_some() {
+                    scopes
+                        .command_scope(command)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| command_error(file, count, start, error))?
+                } else {
+                    scopes.current.clone()
+                };
+                let exported = scope.exports_declaration() && public.is_some();
+                let predecessor = if exported {
+                    public.as_ref().expect("public module receipt").engine()
+                } else {
+                    &engine
+                };
+                let result = predecessor
+                    .admit_source_command_in_scope(command, options, limits.admission, &scope)
                     .map_err(|error| command_error(file, count, start, error))?;
                 let admitted = match result {
                     Outcome::Complete(admitted) => admitted,
@@ -473,8 +563,34 @@ impl Engine {
                         journal.push(row.declaration.clone());
                     }
                 }
-                engine = admitted.engine;
+                engine = if exported {
+                    match public
+                        .as_deref_mut()
+                        .expect("public module receipt")
+                        .publish(
+                            &engine,
+                            admitted.engine,
+                            admitted
+                                .admissions
+                                .iter()
+                                .map(|row| row.declaration.clone())
+                                .collect(),
+                            &scope,
+                            options,
+                        )
+                        .map_err(|error| command_error(file, count, start, error))?
+                    {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                } else {
+                    admitted.engine
+                };
                 count += 1;
+            }
+            if let Some(public) = public.as_deref_mut() {
+                public.retain_scope(scopes.public_scope());
             }
             final_scope = scopes.current;
         }

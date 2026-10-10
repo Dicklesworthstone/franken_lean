@@ -123,3 +123,98 @@ pub(crate) fn scan(tokens: &[LexedToken], start: usize) -> Modifiers {
     }
     Modifiers { slots, end: at }
 }
+
+/// Visibility at an unfinished declaration or material control's head. This is a query hint only:
+/// no signature, body, modifier effect, or declaration has been validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclarationPrefix {
+    pub public: Option<bool>,
+    pub is_example: bool,
+}
+
+/// Read only the declaration prefix, reusing the ordinary parser's attribute
+/// grammar and fixed modifier slots. Variable/attribute controls inherit the
+/// section's visibility too. The body may end at an incomplete name or binder.
+/// Query/lexical scope commands and unrecognized heads return `None`; a keyword
+/// in a body, string, comment, or escaped identifier never supplies visibility.
+pub fn prefix(source: &[u8]) -> Result<Option<DeclarationPrefix>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = super::tokens(&view)?;
+    let (_, attributes_end, declaration_start) =
+        crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
+    let Some(TokenKind::Symbol(kind)) = tokens.get(declaration_start).map(|token| &token.kind)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        kind.as_str(),
+        "def"
+            | "theorem"
+            | "abbrev"
+            | "opaque"
+            | "example"
+            | "instance"
+            | "structure"
+            | "class"
+            | "inductive"
+            | "axiom"
+            | "variable"
+            | "attribute"
+    ) {
+        return Ok(None);
+    }
+    let modifiers = scan(&tokens, attributes_end);
+    Ok(Some(DeclarationPrefix {
+        public: modifiers.slots[0].map(|at| keyword(&tokens[at]) == Some("public")),
+        is_example: kind == "example",
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_visibility_reads_modifiers_without_requiring_a_finished_body() {
+        for (source, public) in [
+            (
+                "@[expose] public def use (A : Type) (x : A) : A :=",
+                Some(true),
+            ),
+            (
+                "/-- API -/\nprivate def use (A : Type) (x : A) : A :=",
+                Some(false),
+            ),
+            ("def use (A : Type) (x : A) : A :=", None),
+            ("@[expose] public def use (", Some(true)),
+            ("variable (x :", None),
+            ("attribute [instance]", None),
+        ] {
+            assert_eq!(
+                prefix(source.as_bytes()).unwrap(),
+                Some(DeclarationPrefix {
+                    public,
+                    is_example: false
+                }),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            prefix(b"example (P : Prop) : P :=").unwrap(),
+            Some(DeclarationPrefix {
+                public: None,
+                is_example: true
+            })
+        );
+        for source in [
+            "#check",
+            "#eval",
+            "@[expose] public section",
+            "«public» def use :=",
+            "-- public def hidden :=\n#check",
+        ] {
+            assert_eq!(prefix(source.as_bytes()).unwrap(), None, "{source}");
+        }
+    }
+}

@@ -373,16 +373,8 @@ fn header<'a>(
         2,
         "inductive declaration",
     )?;
-    let modifiers = expect_node(
-        &root[0],
-        &parser_kind(&["Command", "declModifiers"]),
-        7,
-        "inductive modifiers",
-    )?;
-    super::doc_comment_slot(&modifiers[0])?;
-    for part in &modifiers[1..] {
-        expect_empty_null(part, "absent inductive modifiers")?;
-    }
+    scope::visibility::data_modifiers(&root[0])?;
+    let scope = scope.for_declaration(syntax)?;
     let parts = expect_node(
         &root[1],
         &parser_kind(&["Command", "inductive"]),
@@ -426,7 +418,7 @@ fn header<'a>(
     if ctors.len() > budget.max_binders {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
-    let mut context = Context::scoped(env, kernel, scope);
+    let mut context = Context::scoped(env, kernel, &scope);
     let short_name = name.clone();
     let name = context.enter_declaration(name)?;
     if env.contains(&name) {

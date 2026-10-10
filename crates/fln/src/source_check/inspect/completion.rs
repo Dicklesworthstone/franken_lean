@@ -156,7 +156,57 @@ impl SourceModuleSession {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let environment = checked.checked.checked.engine.environment();
+        // Temporary scope commands wrap one declaration without changing its
+        // visibility. Read their headers only: a public body under `open … in`
+        // or `set_option … in` must not expose the private completion world.
+        let mut command_prefix = &source[prefix_end..range.start];
+        let mut wrappers = 0usize;
+        loop {
+            let Some(body) = fln_parse::command_scope::wrapper_body(command_prefix)
+                .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
+            else {
+                break;
+            };
+            wrappers += 1;
+            if wrappers > limits.max_commands {
+                return Err(limit("completion commands", limits.max_commands));
+            }
+            command_prefix = &command_prefix[body..];
+        }
+        let scope = checked
+            .checked
+            .checked
+            .scope
+            .for_command_prefix(command_prefix)
+            .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?;
+        let scope = if scope.exports_declaration() {
+            checked
+                .checked
+                .public_scope
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid(
+                        entry,
+                        prefix_end,
+                        "checked public completion scope is unavailable",
+                    )
+                })?
+                .for_command_prefix(command_prefix)
+                .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
+        } else {
+            scope
+        };
+        let environment = if scope.exports_declaration() {
+            checked.checked.public_environment.as_ref().ok_or_else(|| {
+                invalid(
+                    entry,
+                    prefix_end,
+                    "checked public completion prefix is unavailable",
+                )
+            })?
+        } else {
+            checked.checked.checked.engine.environment()
+        };
         let absolute_filter = filter.strip_prefix("_root_.");
         let matching = absolute_filter.unwrap_or(&filter);
         let mut names = BTreeMap::new();

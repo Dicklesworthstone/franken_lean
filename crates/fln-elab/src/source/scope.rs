@@ -4,9 +4,11 @@ use super::*;
 pub mod options;
 pub mod simp;
 pub mod variables;
+pub(super) mod visibility;
 use crate::aliases::AliasTable;
 use crate::protected_names::ProtectedNames;
 use fln_core::name::LeafView;
+pub use visibility::command_scope;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceScope {
@@ -15,6 +17,13 @@ pub struct SourceScope {
     /// actual source module identity, not a namespace opened by the user.
     /// Private names follow the pin's `mkPrivateNameCore` encoding.
     pub private_module: Option<Name>,
+    /// The enclosing public section's default, or the effective visibility of
+    /// a single declaration after [`Self::for_declaration`]. Module identity is
+    /// retained independently so private aliases still resolve locally.
+    pub public_declarations: bool,
+    /// `@[expose] section`'s inherited definition-body default. A declaration's
+    /// own `expose`/`no_expose` attributes override this on its effective clone.
+    pub expose_definitions: bool,
     pub opened: Vec<Name>,
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
@@ -38,6 +47,7 @@ pub enum ScopeError {
     /// `protected` on an atomic name in the root namespace (the pin's `mkDeclName`).
     ProtectedOutsideNamespace,
     PrivateShadowsPublic(Name),
+    PublicShadowsPrivate(Name),
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +70,11 @@ impl std::fmt::Display for ScopeError {
             Self::PrivateShadowsPublic(name) => write!(
                 f,
                 "private declaration `{}` conflicts with an existing public declaration",
+                name.to_display_string()
+            ),
+            Self::PublicShadowsPrivate(name) => write!(
+                f,
+                "public declaration `{}` conflicts with an existing private declaration",
                 name.to_display_string()
             ),
             Self::Ambiguous(name, candidates) => {
@@ -138,7 +153,16 @@ fn settle(name: &Name, found: Vec<Name>) -> Result<Option<Name>, ScopeError> {
 impl SourceScope {
     pub fn declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         self.user_declaration_name(name)
-            .map(|name| self.private_name(&name))
+            .map(|name| self.visible_name(&name))
+    }
+
+    /// Apply effective visibility to an already qualified generated name.
+    pub(super) fn visible_name(&self, name: &Name) -> Name {
+        if self.public_declarations {
+            name.clone()
+        } else {
+            self.private_name(name)
+        }
     }
 
     pub(super) fn private_name(&self, name: &Name) -> Name {
@@ -443,9 +467,14 @@ impl Context {
             .source_scope
             .user_declaration_name(name)
             .map_err(error)?;
-        if self.source_scope.private_module.is_some() && self.txn.env.contains(&user_name) {
+        if self.source_scope.private_module.is_some()
+            && !self.source_scope.public_declarations
+            && self.txn.env.contains(&user_name)
+        {
             return Err(error(ScopeError::PrivateShadowsPublic(user_name)));
         }
+        self.source_scope
+            .check_public_name(&user_name, &self.txn.env)?;
         let name = self.source_scope.declaration_name(name).map_err(error)?;
         self.source_scope.namespace = user_name.parent();
         Ok(name)
@@ -616,6 +645,8 @@ mod tests {
         let scope = SourceScope {
             namespace: n("Outer"),
             private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
             opened: vec![n("O")],
             universes: vec![],
             variables: variables::SectionVariables::default(),
@@ -802,6 +833,8 @@ mod tests {
         let protected = ProtectedNames::read(&env).unwrap();
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
             private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
             universes: vec![],
@@ -872,6 +905,8 @@ mod tests {
     fn namespace_prefixes_root_escapes_and_ambiguous_opens_have_distinct_rules() {
         let scope = SourceScope {
             private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
             universes: vec![],

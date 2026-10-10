@@ -2,9 +2,9 @@
 //!
 //! [`super::parse`] reads what a scope command does to the environment; this module reads how the
 //! pin's parser builds it. The two accept the same commands except where the checker does not
-//! model what the tree says: a `section` with a header (`public`, `noncomputable`, `meta`,
-//! `@[expose]`) has a tree here, and [`parse_source_command`] hands it to the checker as a command
-//! it does not read, which refuses it.
+//! model what the tree says: `noncomputable` and `meta` sections retain their trees
+//! for explicit refusal. Public and exposure section flags have both a typed
+//! command and the original pin-shaped syntax tree.
 use super::*;
 
 /// The pin's tree for a scope command (`namespace`, `section`, `end`, `open`, `universe`,
@@ -132,7 +132,7 @@ fn scope_tree(
         "set_option" => return set_option(source, view, tokens),
         _ => {
             let leaves = leaves()?;
-            return Ok(section(&leaves, tokens)?.map(|(tree, _)| tree));
+            return Ok(section(view, &leaves, tokens)?.map(|(tree, _)| tree));
         }
     };
     if stop < tokens.len() {
@@ -145,35 +145,80 @@ fn scope_tree(
 /// `section`: `sectionHeader "section" (ident)?`, with `sectionHeader := ("@[" "expose" "]")?
 /// ("public")? ("noncomputable")? ("meta")?`, each optional slot a node of its own. Also returns
 /// whether the header is not empty.
-#[inline(never)]
-fn section(
-    leaves: &Leaves,
-    tokens: &[LexedToken],
-) -> Result<Option<(Syntax, bool)>, DefinitionParseError> {
-    let word = |at: usize, text: &str| match tokens.get(at).map(|t| &t.kind) {
-        Some(TokenKind::Symbol(s)) => s == text,
-        Some(TokenKind::Ident(name)) => *name == Name::from_components([text]),
-        _ => false,
+struct SectionParts {
+    expose: bool,
+    slots: [Option<usize>; 3],
+    keyword: usize,
+    name: Option<usize>,
+}
+
+fn section_parts(view: &SourceView, tokens: &[LexedToken]) -> Option<SectionParts> {
+    let word = |at: usize, text: &str| {
+        tokens
+            .get(at)
+            .is_some_and(|token| view.normalized().span_str(token.extent) == Some(text))
     };
     let mut at = 0;
     let expose = word(0, "@[") && word(1, "expose") && word(2, "]");
     if expose {
         at = 3;
     }
-    let mut slots = Vec::new();
-    for keyword in ["public", "noncomputable", "meta"] {
-        slots.push(word(at, keyword).then_some(at));
+    let mut slots = [None; 3];
+    for (slot, keyword) in slots.iter_mut().zip(["public", "noncomputable", "meta"]) {
+        *slot = word(at, keyword).then_some(at);
         if word(at, keyword) {
             at += 1;
         }
     }
     if !matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "section") {
-        return Ok(None);
+        return None;
     }
     let name = match tokens.len() - at {
         1 => None,
         2 if matches!(&tokens[at + 1].kind, TokenKind::Ident(_)) => Some(at + 1),
-        _ => return Ok(None),
+        _ => return None,
+    };
+    Some(SectionParts {
+        expose,
+        slots,
+        keyword: at,
+        name,
+    })
+}
+
+/// Recognize the supported lexical section flags from the same scan used to
+/// build its exact syntax tree. Unsupported scope effects keep their tree and
+/// are refused by the ordinary source-command path.
+pub(super) fn modified_section(view: &SourceView, tokens: &[LexedToken]) -> Option<ScopeCommand> {
+    let parts = section_parts(view, tokens)?;
+    if parts.keyword == 0 || parts.slots[1].is_some() || parts.slots[2].is_some() {
+        return None;
+    }
+    let name = parts.name.map(|at| match &tokens[at].kind {
+        TokenKind::Ident(name) => name.clone(),
+        _ => unreachable!("section_parts validated the name"),
+    });
+    Some(ScopeCommand::SectionWithModifiers {
+        name,
+        public: parts.slots[0].is_some(),
+        expose: parts.expose,
+    })
+}
+
+#[inline(never)]
+fn section(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+) -> Result<Option<(Syntax, bool)>, DefinitionParseError> {
+    let Some(SectionParts {
+        expose,
+        slots,
+        keyword: at,
+        name,
+    }) = section_parts(view, tokens)
+    else {
+        return Ok(None);
     };
     let atom = |at: usize, text: &str| -> Result<Syntax, DefinitionParseError> {
         Ok(Syntax::Atom {
@@ -209,10 +254,9 @@ fn section(
     )))
 }
 
-/// A scope command as its tree, for `parse_source_command`, which reaches it for a `section` with
-/// a header (`public section`, `noncomputable section`, …): [`super::parse`] does not read one as
-/// a scope, and the checker models neither the module system's visibility nor `noncomputable`
-/// scopes, so it refuses the command. `None` for a command with no such tree.
+/// A scope command as its tree for `parse_source_command`. The typed scope door
+/// consumes public/expose section flags; other header effects retain this exact
+/// tree so the checker can refuse them. `None` for a command with no such tree.
 pub(crate) fn unread(source: &[u8]) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);

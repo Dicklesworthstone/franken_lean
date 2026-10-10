@@ -64,7 +64,8 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record declaration",
     )?;
-    empty_modifiers(&root[0])?;
+    scope::visibility::data_modifiers(&root[0])?;
+    let scope = scope.for_declaration(syntax)?;
     let parts = expect_node(
         &root[1],
         &parser_kind(&["Command", "structure"]),
@@ -109,7 +110,7 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record signature",
     )?;
-    let mut context = Context::scoped(environment, kernel, scope);
+    let mut context = Context::scoped(environment, kernel, &scope);
     let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;

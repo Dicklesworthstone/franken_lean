@@ -7022,7 +7022,15 @@ impl Engine {
                 self.empty_source_command_execution(options),
             ));
         }
-        self.execute_source_command_stream(partitioned.commands, options, limits, true, &[], None)
+        self.execute_source_command_stream(
+            partitioned.commands,
+            options,
+            limits,
+            true,
+            &[],
+            None,
+            None,
+        )
     }
 
     fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
@@ -7047,6 +7055,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_source_command_stream(
         &self,
         commands: Vec<(fln_parse::BytePos, &[u8])>,
@@ -7055,6 +7064,7 @@ impl Engine {
         allow_checks: bool,
         file_starts: &[usize],
         private_module: Option<&Name>,
+        mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -7144,7 +7154,11 @@ impl Engine {
                             )
                         })?;
                     scopes
-                        .transition(transition, engine.environment())
+                        .transition_worlds(
+                            transition,
+                            engine.environment(),
+                            public.as_ref().map(|world| world.engine().environment()),
+                        )
                         .map_err(|error| {
                             scope_error(index, fln_parse::BytePos(0), error.message())
                         })?;
@@ -7262,6 +7276,7 @@ impl Engine {
                     }
                     ScopeCommand::Namespace(_)
                     | ScopeCommand::Section(_)
+                    | ScopeCommand::SectionWithModifiers { .. }
                     | ScopeCommand::End(_)
                     | ScopeCommand::Open(_)
                     | ScopeCommand::OpenScoped(_)
@@ -7273,13 +7288,15 @@ impl Engine {
                     | ScopeCommand::Simp(_)
                     | ScopeCommand::Instance(_)
                     | ScopeCommand::Reducibility(_) => {
-                        match source_check::apply_control_command(
+                        match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
                             &file_base,
                             control,
                             limits.kernel,
                             (0, command_index, original_offset.0),
+                            public.as_deref_mut(),
+                            options,
                         )
                         .map_err(|error| {
                             EngineExecutionError::BatchCommand {
@@ -7300,8 +7317,71 @@ impl Engine {
                 }
                 continue;
             }
-            let scope = scopes.current.clone();
+            let scope = if public.is_some() {
+                scopes.command_scope(command_source).map_err(|error| {
+                    EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    }
+                })?
+            } else {
+                scopes.current.clone()
+            };
             let scoped = scope != fln_elab::source::scope::SourceScope::default();
+            if scope.exports_declaration()
+                && let Some(public) = public.as_deref_mut()
+            {
+                // Exposed public definitions and complete data bundles are
+                // checked in the export world before entering the private
+                // executable world. Queries continue to observe the latter.
+                let admission = match public
+                    .engine()
+                    .admit_source_command_in_scope(
+                        command_source,
+                        options,
+                        limits.admission(),
+                        &scope,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                engine = match public
+                    .publish(
+                        &engine,
+                        admission.engine.clone(),
+                        admission
+                            .admissions
+                            .iter()
+                            .map(|row| row.declaration.clone())
+                            .collect(),
+                        &scope,
+                        options,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                for row in &admission.admissions {
+                    scopes.admitted(&row.declaration);
+                }
+                source_admissions.push(SourceCommandAdmission {
+                    command_index,
+                    admission,
+                });
+                continue;
+            }
             if fln_parse::command_scope::mutual::parse(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -7599,6 +7679,9 @@ impl Engine {
             })?;
         execution_indices.extend_from_slice(&execution_command_indices);
         let result_logical_root = engine.logical_root(options);
+        if let Some(public) = public {
+            public.retain_scope(scopes.public_scope());
+        }
         Ok(Outcome::Complete(SourceCommandBatchExecution {
             scope: scopes.current,
             batch: DefinitionBatchExecution {
@@ -7977,6 +8060,7 @@ impl Engine {
                 limits,
                 true,
                 &[],
+                None,
                 None,
             )? {
                 Outcome::Complete(completed) => completed,
@@ -8409,6 +8493,7 @@ impl Engine {
                 policy.allow_scratch_checks(),
                 &file_starts,
                 None,
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -8527,6 +8612,7 @@ impl Engine {
                 limits,
                 false,
                 file_starts,
+                None,
                 None,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
@@ -14756,7 +14842,7 @@ mod tests {
                 olean_with_imports(constants, &fixture_imports(imports)),
             )
         };
-        let mut set = vec![
+        let mut set = [
             module(
                 "Fixture.A",
                 &[

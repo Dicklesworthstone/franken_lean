@@ -311,7 +311,7 @@ fn public_import_row_order_controls_instances_independently_of_earlier_private_r
         ),
     ] {
         let wrapper = format!(
-            "module\nprelude\n{imports}\ndef localChoice : Token := Pick.value\ndef localProof (P : Token -> Prop) (h : P Token.{inside}) : P localChoice := h"
+            "module\nprelude\n{imports}\ndef localChoice : Token := Pick.value\ndef localProof (P : Token -> Prop) (h : P Token.{inside}) : P localChoice := h\n@[expose] public def exportedChoice : Token := Pick.value\ndef publicChoiceProof (P : Token -> Prop) (h : P Token.{outside}) : P exportedChoice := h"
         );
         let main = format!(
             "prelude\nimport Wrapper\ndef chosen : Token := Pick.value\ndef choiceProof (P : Token -> Prop) (h : P Token.{outside}) : P chosen := h"
@@ -401,6 +401,171 @@ fn changing_public_import_visibility_invalidates_cached_consumers_and_recovers()
         .into_complete()
         .unwrap();
     assert_eq!(recovered.reused_modules, 3);
+    assert_eq!(
+        recovered.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+}
+
+#[test]
+fn public_data_and_exposed_definitions_export_checked_bodies_and_generated_members() {
+    let api = "module\nprelude\npublic inductive Bit where\n| off\n| on\npublic structure Envelope where\n  payload : Bit\n@[expose] public def selected : Envelope := Envelope.mk Bit.on\nprivate def secret : Bit := Bit.off\ndef localCheck : Bit := secret";
+    let main = "prelude\nimport Api\ndef observed : Bit := Envelope.payload selected\ndef correct (P : Bit -> Prop) (h : P Bit.on) : P observed := h";
+    let files = [("Main", main), ("Api", api)];
+    for result in check_in_both_import_contexts(&files) {
+        let result = result.unwrap().into_complete().unwrap();
+        let env = result.checked.engine.environment();
+        for name in [
+            "Bit",
+            "Bit.on",
+            "Bit.rec",
+            "Envelope",
+            "Envelope.mk",
+            "Envelope.payload",
+            "selected",
+            "correct",
+        ] {
+            assert!(env.contains(&n(name)), "missing public member {name}");
+        }
+        assert!(!env.contains(&private("Api", "secret")));
+        assert!(!env.contains(&private("Api", "localCheck")));
+    }
+    for name in ["secret", "localCheck"] {
+        let main = format!("prelude\nimport Api\ndef stolen : Bit := {name}");
+        for result in check_in_both_import_contexts(&[("Main", &main), ("Api", api)]) {
+            assert!(
+                matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+            );
+        }
+    }
+}
+
+#[test]
+fn public_signatures_bodies_and_section_variables_cannot_use_private_dependencies() {
+    let base = "prelude\ninductive Bit where\n| off\n| on";
+    let secret =
+        "prelude\nimport Base\ninductive Secret where\n| make\ndef hiddenBit : Bit := Bit.on";
+    for declaration in [
+        "@[expose] public def stolen : Bit := hiddenBit",
+        "@[expose] public def stolen : Secret := Secret.make",
+        "public structure Leaked where\n  value : Secret",
+        "def localValue : Bit := hiddenBit\n@[expose] public def stolen : Bit := localValue",
+        "variable (x : Secret)\n@[expose] public def stolen := x",
+        "inductive Local where\n| make\n@[expose] public def stolen : Local := Local.make",
+    ] {
+        let api = format!("module\nprelude\nimport Secret\npublic import Base\n{declaration}");
+        for result in check_in_both_import_contexts(&[
+            ("Main", "prelude\nimport Api"),
+            ("Api", &api),
+            ("Base", base),
+            ("Secret", secret),
+        ]) {
+            assert!(
+                matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Api")),
+                "{declaration}"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_classes_export_metadata_without_lending_private_instance_dictionaries() {
+    let api = "module\nprelude\npublic inductive Bit where\n| off\n| on\npublic class Pick where\n  value : Bit\ninstance hiddenChoice : Pick := Pick.mk Bit.off\ndef localChoice : Bit := Pick.value\n@[expose] public def choose [p : Pick] : Bit := Pick.value";
+    let main = "prelude\nimport Api\ninstance myChoice : Pick := Pick.mk Bit.on\ndef observed : Bit := choose\ndef correct (P : Bit -> Prop) (h : P Bit.on) : P observed := h";
+    for result in check_in_both_import_contexts(&[("Main", main), ("Api", api)]) {
+        let result = result.unwrap().into_complete().unwrap();
+        let env = result.checked.engine.environment();
+        assert!(env.contains(&n("correct")));
+        assert!(!env.contains(&private("Api", "hiddenChoice")));
+    }
+    for result in check_in_both_import_contexts(&[
+        ("Main", "prelude\nimport Api\ndef stolen : Bit := choose"),
+        ("Api", api),
+    ]) {
+        assert!(
+            matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+        );
+    }
+    let invalid = format!("{api}\n@[expose] public def stolen : Bit := Pick.value");
+    for result in
+        check_in_both_import_contexts(&[("Main", "prelude\nimport Api"), ("Api", &invalid)])
+    {
+        assert!(
+            matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Api"))
+        );
+    }
+}
+
+#[test]
+fn exposed_public_sections_restore_visibility_and_private_names_cannot_collide() {
+    let api = "module\nprelude\n@[expose] public section\ninductive Bit where\n| off\n| on\ndef first : Bit := Bit.on\nprivate def secret : Bit := Bit.off\nsection Inner\ndef second : Bit := first\nend Inner\nend\ndef hiddenAfter : Bit := secret";
+    let main = "prelude\nimport Api\ndef observed : Bit := second\ndef correct (P : Bit -> Prop) (h : P Bit.on) : P observed := h";
+    for result in check_in_both_import_contexts(&[("Main", main), ("Api", api)]) {
+        let result = result.unwrap().into_complete().unwrap();
+        let env = result.checked.engine.environment();
+        assert!(env.contains(&n("first")) && env.contains(&n("second")));
+        assert!(!env.contains(&private("Api", "secret")));
+        assert!(!env.contains(&private("Api", "hiddenAfter")));
+    }
+    for body in [
+        "def duplicate.{u} {A : Sort u} (x : A) : A := x\n@[expose] public def duplicate.{u} {A : Sort u} (x : A) : A := x",
+        "@[expose] public def duplicate.{u} {A : Sort u} (x : A) : A := x\nprivate def duplicate.{u} {A : Sort u} (x : A) : A := x",
+        "public def hiddenBody.{u} {A : Sort u} (x : A) : A := x",
+        "@[expose] public section\n@[no_expose] def hiddenBody.{u} {A : Sort u} (x : A) : A := x",
+    ] {
+        let source = format!("module\nprelude\n{body}");
+        for result in check_in_both_import_contexts(&[("Main", &source)]) {
+            assert!(
+                matches!(result, Err(SourceModuleCheckError::Source { .. })),
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_declaration_visibility_changes_invalidate_cached_consumers_atomically() {
+    let mut session = SourceModuleSession::new(
+        Engine::builder().build_empty(),
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let names = [n("Main"), n("Api")];
+    let api = "module\nprelude\n@[expose] public def identity.{u} {A : Sort u} (x : A) : A := x";
+    let main = "prelude\nimport Api\ndef use.{u} {A : Sort u} (x : A) : A := identity x";
+    let mut files = [
+        SourceModuleInput {
+            name: &names[0],
+            source: main.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: api.as_bytes(),
+        },
+    ];
+    let cold = session
+        .check(&files, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warm = session
+        .check(&files, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((cold.elaborated_modules, warm.reused_modules), (2, 2));
+    files[1].source = PRIVATE_ID.as_bytes();
+    assert!(
+        matches!(session.check(&files, &names[0]), Err(SourceModuleCheckError::Source { module, .. }) if module == names[0])
+    );
+    files[1].source = api.as_bytes();
+    let recovered = session
+        .check(&files, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(recovered.reused_modules, 2);
     assert_eq!(
         recovered.checked.checked.result_logical_root,
         cold.checked.checked.result_logical_root

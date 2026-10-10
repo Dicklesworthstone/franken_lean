@@ -15,6 +15,13 @@ pub mod variables;
 pub enum ScopeCommand {
     Namespace(Name),
     Section(Option<Name>),
+    /// The pin's `sectionHeader` public and exposure defaults. These are lexical
+    /// flags restored by the matching `end`, not declaration modifiers to drop.
+    SectionWithModifiers {
+        name: Option<Name>,
+        public: bool,
+        expose: bool,
+    },
     End(Option<Name>),
     Open(Vec<Name>),
     OpenScoped(Vec<Name>),
@@ -414,6 +421,11 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if matches!(keyword.as_str(), "public" | "@[")
+        && let Some(section) = trees::modified_section(&view, &tokens)
+    {
+        return Ok(Some(section));
+    }
     if keyword == "variable" {
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
@@ -484,6 +496,37 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         _ => return Err(bad(1)),
     };
     Ok(Some(command))
+}
+
+/// The body boundary of a temporary command scope. This query reads only an
+/// actual `open`/`set_option`/`#guard_msgs` header containing `in`; other heads
+/// may be unfinished and are never sent through their scope/declaration parser.
+pub fn wrapper_body(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let symbol = |index: usize, expected: &str| {
+        matches!(tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == expected)
+    };
+    if !(symbol(0, "open")
+        || symbol(0, "set_option")
+        || symbol(0, "#guard_msgs")
+        || (symbol(0, "/--") && symbol(1, "#guard_msgs")))
+        || !tokens
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "in"))
+    {
+        return Ok(None);
+    }
+    Ok(match parse(source)? {
+        Some(
+            ScopeCommand::OpenIn { body, .. }
+            | ScopeCommand::SetOptionIn { body, .. }
+            | ScopeCommand::GuardMsgs { body, .. },
+        ) => Some(body),
+        _ => None,
+    })
 }
 
 /// `set_option`'s operands, as the pin's `«set_option»` reads them: an identifier, then
@@ -726,7 +769,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // A command keyword after the prefix is its command's (`@[inherit_doc f]` then
             // `infixr:100 …` on the next line).
             let continues_prefix = (attribute_prefix
-                && (declaration(symbol) || prefix || line_command(symbol)))
+                && (declaration(symbol) || prefix || line_command(symbol) || symbol == "section"))
                 || (after_class && declaration(symbol));
             if depth == 0 && current_open && symbol == "in" {
                 open_in = true;
@@ -746,7 +789,10 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     prefix_column = inline_start.then(|| column(token));
                 }
                 attribute_prefix = inline_start
-                    || (continues_prefix && !declaration(symbol) && !line_command(symbol));
+                    || (continues_prefix
+                        && !declaration(symbol)
+                        && !line_command(symbol)
+                        && symbol != "section");
                 // `[doc] #guard_msgs … in <command>`: the guarded command belongs to it, whether
                 // the guard starts its command or continues its doc comment's.
                 if symbol == "#guard_msgs" {
@@ -779,6 +825,27 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapper_queries_parse_only_temporary_scope_headers() {
+        for source in [
+            "variable (x :",
+            "attribute [instance]",
+            "open",
+            "set_option maxRecDepth",
+            "@[expose] public def use (A : Type) : A := let x := Type in",
+        ] {
+            assert_eq!(wrapper_body(source.as_bytes()).unwrap(), None, "{source}");
+        }
+        for source in [
+            "open Chosen in @[expose] public def use (A : Type) : A :=",
+            "set_option maxRecDepth 256 in @[expose] public def use (",
+            "/-- note -/\r\n#guard_msgs in @[expose] public def use (",
+        ] {
+            let body = wrapper_body(source.as_bytes()).unwrap().unwrap();
+            assert!(source[body..].starts_with("@[expose] public def"));
+        }
+    }
+
     #[test]
     fn scoped_openings_preserve_structural_names_without_becoming_name_opens() {
         let source = "-- 😀\r\nopen scoped A.«B.C» D";
@@ -859,6 +926,111 @@ mod tests {
             parse(b"/- only trivia -/").unwrap(),
             Some(ScopeCommand::Trivia)
         );
+    }
+
+    #[test]
+    fn public_and_exposure_sections_keep_flags_and_multiline_command_boundaries() {
+        for (source, public, expose, name) in [
+            ("public section", true, false, None),
+            ("@[expose] section", false, true, None),
+            (
+                "@[expose] public section «A.B».C",
+                true,
+                true,
+                Some(Name::from_components(["A.B", "C"])),
+            ),
+        ] {
+            assert_eq!(
+                parse(source.as_bytes()).unwrap(),
+                Some(ScopeCommand::SectionWithModifiers {
+                    name,
+                    public,
+                    expose,
+                }),
+                "{source}"
+            );
+        }
+        let source = b"-- header\r\n@[expose]\r\npublic\r\nsection A.B\r\ndef identity (a : Type) (x : a) : a := x\r\nend B\r\nend A\r\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            parse(commands[0].1).unwrap(),
+            Some(ScopeCommand::SectionWithModifiers {
+                name: Some(Name::from_components(["A", "B"])),
+                public: true,
+                expose: true,
+            })
+        );
+        let mut joined = Vec::new();
+        for (offset, bytes) in commands {
+            assert_eq!(offset.0, joined.len());
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, source);
+    }
+
+    #[test]
+    fn unsupported_or_escaped_section_modifiers_are_never_consumed_as_scope_flags() {
+        for source in [
+            "public noncomputable section",
+            "@[expose] public meta section",
+            "public @[expose] section",
+            "@[local expose] public section",
+            "@[«expose»] public section",
+            "@[expose] «public» section",
+            "@[expose, simp] public section",
+        ] {
+            assert_eq!(parse(source.as_bytes()).unwrap(), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn public_section_tree_keeps_pinned_slots_and_original_leaves() {
+        let source = "-- preface\n@[expose] public section API";
+        let tree = trees::tree(source.as_bytes()).unwrap().unwrap();
+        let Syntax::Node { kind, args, .. } = &tree else {
+            panic!("section tree");
+        };
+        assert_eq!(kind, &parser_kind(&["Command", "section"]));
+        let Syntax::Node {
+            kind, args: header, ..
+        } = &args[0]
+        else {
+            panic!("section header");
+        };
+        assert_eq!(kind, &parser_kind(&["Command", "sectionHeader"]));
+        let slot_lengths = header
+            .iter()
+            .map(|slot| match slot {
+                Syntax::Node { kind, args, .. } if kind == &Name::from_components(["null"]) => {
+                    args.len()
+                }
+                _ => panic!("optional header slot"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(slot_lengths, [3, 1, 0, 0]);
+        let mut stack = vec![&tree];
+        let mut leaves = Vec::new();
+        while let Some(node) = stack.pop() {
+            match node {
+                Syntax::Node { args, .. } => stack.extend(args.iter().rev()),
+                Syntax::Atom { info, val } => {
+                    let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = info else {
+                        panic!("original atom positions");
+                    };
+                    assert_eq!(&source[pos.0..end_pos.0], val);
+                    leaves.push(val.as_str());
+                }
+                Syntax::Ident { info, .. } => {
+                    let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = info else {
+                        panic!("original name positions");
+                    };
+                    leaves.push(&source[pos.0..end_pos.0]);
+                }
+                Syntax::Missing => panic!("complete section syntax"),
+            }
+        }
+        assert_eq!(leaves, ["@[", "expose", "]", "public", "section", "API"]);
     }
     #[test]
     fn malformed_scope_commands_are_not_partially_accepted() {

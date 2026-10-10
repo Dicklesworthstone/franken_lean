@@ -73,26 +73,19 @@ pub fn registration(
         7,
         "declaration modifiers",
     )?;
-    let attributes = match expect_null_args(&modifiers[1], "inline attributes")? {
-        [] => return Ok(None),
-        [attributes] => expect_node(
-            attributes,
-            &parser_kind(&["Term", "attributes"]),
-            3,
-            "inline attributes",
-        )?,
-        _ => {
+    let mut simp = None;
+    for attribute in super::visibility::attributes(&modifiers[1])? {
+        if super::visibility::exposure_attribute(attribute)?.is_some() {
+            continue;
+        }
+        if simp.replace(attribute).is_some() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "one simp attribute",
+                expected: "one simp attribute beside exposure attributes",
             });
         }
-    };
-    expect_atom(&attributes[0], "@[", "attribute opener")?;
-    expect_atom(&attributes[2], "]", "attribute closer")?;
-    let [attribute] = expect_null_args(&attributes[1], "attribute list")? else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "one simp attribute",
-        });
+    }
+    let Some(attribute) = simp else {
+        return Ok(None);
     };
     let instance = expect_node(
         attribute,

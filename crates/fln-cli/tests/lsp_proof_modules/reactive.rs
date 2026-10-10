@@ -60,6 +60,55 @@ fn both_servers_recheck_and_repair_importers_before_the_next_request() {
 }
 
 #[test]
+fn both_servers_invalidate_and_restore_consumers_when_an_exposed_api_becomes_private() {
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let root = scratch();
+        let api = uri(&root.join("Api.lean"));
+        let main = uri(&root.join("Main.lean"));
+        let public = "module\nprelude\npublic inductive Token where | left | right\n@[expose] public def chosen : Token := Token.left";
+        let private = "module\nprelude\npublic inductive Token where | left | right\nprivate def chosen : Token := Token.left";
+        let messages = run(
+            binary,
+            args,
+            &[
+                open(&api, public),
+                open(
+                    &main,
+                    "prelude\nimport Api\ndef verifies (P : Token -> Prop) (h : P Token.left) : P chosen := h",
+                ),
+                change(&api, 2, private),
+                wait(&main, 1, 181),
+                change(&api, 3, public),
+                wait(&main, 1, 182),
+            ],
+        );
+        assert!(errors(&messages, &api).is_empty(), "{messages:#?}");
+        assert_eq!(errors(&messages, &main).len(), 1, "{messages:#?}");
+        assert_eq!(successes_for(&messages, &main).len(), 2, "{messages:#?}");
+        let failed = messages
+            .iter()
+            .position(|message| {
+                message.contains("publishDiagnostics")
+                    && message.contains(&q(&main))
+                    && message.contains("\"diagnostics\":[{")
+            })
+            .unwrap();
+        assert!(failed < response_index(&messages, 181));
+        let restored = messages
+            .iter()
+            .rposition(|message| message.contains("sourceCheck") && message.contains(&q(&main)))
+            .unwrap();
+        assert!(
+            response_index(&messages, 181) < restored && restored < response_index(&messages, 182)
+        );
+        assert!(messages[response_index(&messages, 182)].contains("\"result\":{}"));
+    }
+}
+
+#[test]
 fn transitive_diamond_consumers_refresh_once_without_rechecking_unrelated_files() {
     let root = scratch();
     let base = uri(&root.join("Base.lean"));

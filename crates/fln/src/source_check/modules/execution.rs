@@ -348,6 +348,28 @@ impl imported::SourceOleanImport {
                 };
             }
             let module = modules[index];
+            let public_imports = if plan.headers[index].module_system {
+                match visibility::imports(
+                    &self.contexts.complete,
+                    Some(&self.contexts),
+                    index,
+                    &plan,
+                    modules,
+                    |dependency| &exports[&dependency],
+                    options,
+                    &mut meter,
+                    cancellation,
+                )? {
+                    Outcome::Complete((engine, _)) => Some(engine),
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            } else {
+                None
+            };
+            let mut public = public_imports.map(|engine| {
+                visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
+            });
             let body = commands(module.name, module.source, &plan.headers[index])?;
             let completed = if body.is_empty() {
                 let mut completed = engine.empty_source_command_execution(options);
@@ -364,6 +386,7 @@ impl imported::SourceOleanImport {
                         true,
                         &[],
                         plan.headers[index].module_system.then_some(module.name),
+                        public.as_mut(),
                     )
                     .map_err(|error| source_error(module.name, error))?
                 {
@@ -377,25 +400,23 @@ impl imported::SourceOleanImport {
                     "source-program/after-module",
                 )));
             }
+            let public_export = public.map(visibility::PublicWorld::finish).transpose()?;
             if index != plan.entry {
-                let declarations = declarations(&completed, &mut meter)?;
                 exports.insert(
                     index,
-                    replay::Export::capture(
-                        module.name,
-                        engine.environment(),
-                        if plan.headers[index].module_system {
-                            engine.environment()
-                        } else {
-                            completed.batch.engine.environment()
-                        },
-                        if plan.headers[index].module_system {
-                            Vec::new()
-                        } else {
-                            declarations
-                        },
-                        &mut meter,
-                    )?,
+                    match public_export {
+                        Some(export) => export,
+                        None => {
+                            let declarations = declarations(&completed, &mut meter)?;
+                            replay::Export::capture(
+                                module.name,
+                                engine.environment(),
+                                completed.batch.engine.environment(),
+                                declarations,
+                                &mut meter,
+                            )?
+                        }
+                    },
                 );
             }
             completed_modules.push(SourceModuleExecution {

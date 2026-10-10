@@ -264,6 +264,119 @@ fn queries_check_the_current_unsaved_import_closure() {
 }
 
 #[test]
+fn public_goals_and_hover_use_the_checked_exported_prefix_even_on_cache_hits() {
+    let uri = "untitled:PublicModuleGoals.lean";
+    let prefix = "module\nprelude\ndef hidden (A : Type) (x : A) : A := x\n@[expose] public def identity (A : Type) (x : A) : A := x\n";
+    let pending = format!("{prefix}@[expose] public def use (A : Type) (x : A) : A := by");
+    let complete = format!("{pending}\n  exact identity A x");
+    let invalid = format!("{pending}\n  exact hidden A x");
+    let private =
+        format!("{prefix}private def use (A : Type) (x : A) : A := by\n  exact hidden A x");
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let messages = run(
+            binary,
+            args,
+            vec![
+                open(uri, &pending),
+                query("public-goal", "$/lean/plainGoal", uri, 4, 999),
+                query("warm-public-goal", "$/lean/plainGoal", uri, 4, 999),
+                change(uri, 2, &complete),
+                query("public-hover", "textDocument/hover", uri, 5, 8),
+                change(uri, 3, &invalid),
+                query("private-leak", "textDocument/hover", uri, 5, 8),
+                change(uri, 4, &private),
+                query("private-hover", "textDocument/hover", uri, 5, 8),
+                change(uri, 5, &complete),
+                query("recovered-public-hover", "textDocument/hover", uri, 5, 8),
+            ],
+        );
+        for id in ["public-goal", "warm-public-goal"] {
+            assert!(
+                reply(&messages, id).contains("A : Type\\nx : A\\n⊢ A"),
+                "{messages:#?}"
+            );
+        }
+        for id in ["public-hover", "recovered-public-hover"] {
+            let hover = reply(&messages, id);
+            assert!(hover.contains("identity :"), "{messages:#?}");
+            assert!(!hover.contains("_private"), "{hover}");
+        }
+        assert!(
+            reply(&messages, "private-leak").contains("\"code\":-32803"),
+            "{messages:#?}"
+        );
+        assert!(
+            reply(&messages, "private-hover").contains("hidden"),
+            "{messages:#?}"
+        );
+        assert!(
+            !reply(&messages, "private-hover").contains("\"code\":-32803"),
+            "{messages:#?}"
+        );
+    }
+}
+
+#[test]
+fn module_queries_restore_each_worlds_scoped_instance_chronology_on_cache_hits() {
+    let base_uri = "file:///tmp/ScopeGoalBase.lean";
+    let hidden_uri = "file:///tmp/ScopeGoalHidden.lean";
+    let uri = "file:///tmp/ScopeGoalMain.lean";
+    let base = "prelude\ninductive Token where\n | first\n | second\n | third\nclass Pick where\n value : Token\ninstance fallback : Pick := Pick.mk Token.first\nnamespace Chosen\ndef dictionary : Pick := Pick.mk Token.second\nattribute [scoped instance] dictionary\nend Chosen";
+    let hidden = "prelude\nimport ScopeGoalBase\ninstance hidden : Pick := Pick.mk Token.third";
+    let prefix = "module\nprelude\npublic import ScopeGoalBase\nimport ScopeGoalHidden\nopen scoped Chosen\n@[expose] public section\ndef later : Pick := Pick.mk Token.first\nattribute [instance] later\nend\nprivate def localChoice : Pick := Pick.mk Token.third\nattribute [instance] localChoice\n";
+    let public = format!(
+        "{prefix}@[expose] public def verified (P : Token -> Prop) (h : P Token.first) : P Pick.value := by\n  exact h"
+    );
+    let private = format!(
+        "{prefix}private def verified (P : Token -> Prop) (h : P Token.third) : P Pick.value := by\n  exact h"
+    );
+    let invalid = format!(
+        "{prefix}@[expose] public def verified (P : Token -> Prop) (h : P Token.third) : P Pick.value := by\n  exact h"
+    );
+    let body_line = prefix.lines().count() + 1;
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let messages = run(
+            binary,
+            args,
+            vec![
+                open(base_uri, base),
+                open(hidden_uri, hidden),
+                open(uri, &public),
+                query("public-scoped", "$/lean/plainGoal", uri, body_line, 999),
+                query("warm-scoped", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 2, &private),
+                query("private-scoped", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 3, &invalid),
+                query("wrong-scoped", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 4, &public),
+                query("recovered-scoped", "$/lean/plainGoal", uri, body_line, 999),
+            ],
+        );
+        for id in [
+            "public-scoped",
+            "warm-scoped",
+            "private-scoped",
+            "recovered-scoped",
+        ] {
+            assert!(
+                reply(&messages, id).contains("\"goals\":[]"),
+                "{id}: {messages:#?}"
+            );
+        }
+        assert!(
+            reply(&messages, "wrong-scoped").contains("\"code\":-32803"),
+            "{messages:#?}"
+        );
+    }
+}
+
+#[test]
 fn mutual_import_goals_use_current_editor_text_and_recover_after_a_bad_group() {
     let data_uri = "file:///tmp/MutualGoalData.lean";
     let main_uri = "file:///tmp/MutualGoalMain.lean";

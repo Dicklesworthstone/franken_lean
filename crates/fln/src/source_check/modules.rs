@@ -16,6 +16,7 @@ pub mod imported;
 pub mod persisted;
 mod replay;
 pub mod reuse;
+pub(crate) mod visibility;
 pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
@@ -80,6 +81,13 @@ pub struct SourceModuleCheck {
     pub module_order: Vec<Name>,
     /// Declarations actually replayed in this invocation, not cache-hit work.
     pub replayed_declarations: usize,
+    /// The exact checked exported prefix for semantic observations inside a
+    /// public declaration. Kept only by native module checking; callers cannot
+    /// supply or replace this provenance with a filtered environment.
+    pub(crate) public_environment: Option<Environment>,
+    /// Lexical activation positions from that same exported journal, including
+    /// namespace/open events before later registrations and restored sections.
+    pub(crate) public_scope: Option<fln_elab::source::scope::SourceScope>,
 }
 
 #[derive(Debug)]

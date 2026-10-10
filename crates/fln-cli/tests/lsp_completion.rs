@@ -277,3 +277,71 @@ fn both_front_doors_use_unsaved_imports_and_do_not_fall_back_after_overlay_inval
         assert!(!has_item(&messages, 53, "library_unsaved"));
     }
 }
+
+#[test]
+fn public_completion_uses_exported_imports_without_parsing_the_unfinished_body() {
+    let fixture = Fixture::new();
+    let secret = fixture.uri("Secret.lean");
+    let api = fixture.uri("Api.lean");
+    let main = fixture.uri("Main.lean");
+    let imports = "module\nprelude\nimport Secret\npublic import Api\n";
+    let public = format!("{imports}@[expose] public def use (A : Type) (x : A) : A := hid");
+    let visible = format!("{imports}@[expose] public def use (A : Type) (x : A) : A := vis");
+    let private = format!("{imports}private def use (A : Type) (x : A) : A := hid");
+    let section =
+        format!("{imports}@[expose] public section\ndef use (A : Type) (x : A) : A := hid");
+    let query = format!("{imports}@[expose] public section\n#check hid");
+    let wrapped = format!(
+        "{imports}set_option maxRecDepth 256 in @[expose] public def use (A : Type) (x : A) : A := hid"
+    );
+    let wrapped_private = format!(
+        "{imports}set_option maxRecDepth 256 in private def use (A : Type) (x : A) : A := hid"
+    );
+    let variable = format!("{imports}variable (x : hid");
+    let public_variable = format!("{imports}public section\nvariable (x : hid");
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(
+                    &secret,
+                    "prelude\ndef hiddenValue (A : Type) (x : A) : A := x",
+                ),
+                open(
+                    &api,
+                    "prelude\ndef visibleValue (A : Type) (x : A) : A := x",
+                ),
+                open(&main, &public),
+                request(80, &main, &public, public.len()),
+                change(&main, 2, &visible),
+                request(81, &main, &visible, visible.len()),
+                change(&main, 3, &private),
+                request(82, &main, &private, private.len()),
+                change(&main, 4, &section),
+                request(83, &main, &section, section.len()),
+                change(&main, 5, &query),
+                request(84, &main, &query, query.len()),
+                change(&main, 6, &wrapped),
+                request(85, &main, &wrapped, wrapped.len()),
+                change(&main, 7, &wrapped_private),
+                request(86, &main, &wrapped_private, wrapped_private.len()),
+                change(&main, 8, &variable),
+                request(87, &main, &variable, variable.len()),
+                change(&main, 9, &public_variable),
+                request(88, &main, &public_variable, public_variable.len()),
+            ],
+        );
+        for id in [80, 83, 85, 88] {
+            assert!(!has_item(&messages, id, "hiddenValue"), "{messages:#?}");
+            assert!(
+                response(&messages, id).contains("\"items\":[]"),
+                "{messages:#?}"
+            );
+        }
+        assert!(has_item(&messages, 81, "visibleValue"), "{messages:#?}");
+        for id in [82, 84, 86, 87] {
+            assert!(has_item(&messages, id, "hiddenValue"), "{messages:#?}");
+        }
+    }
+}
