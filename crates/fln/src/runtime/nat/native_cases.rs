@@ -16,14 +16,10 @@ fn admit(engine: Engine, declaration: Declaration) -> Engine {
 }
 
 fn minimal_engine() -> Engine {
-    let mut engine = Engine::from_environment(Environment::new());
-    for declaration in [
+    admit(
+        Engine::from_environment(Environment::new()),
         fln_elab::seed::nat_inductive_seed_declaration(),
-        fln_elab::seed::nat_pred_seed_declaration(),
-    ] {
-        engine = admit(engine, declaration);
-    }
-    engine
+    )
 }
 
 fn execute(engine: &Engine, source: &str, expected: &str) {
@@ -62,6 +58,7 @@ fn execute(engine: &Engine, source: &str, expected: &str) {
 fn nat_recursion_needs_no_public_equality_or_boolean_family() {
     let engine = minimal_engine();
     assert!(!engine.environment().contains(&name("Nat.beq")));
+    assert!(!engine.environment().contains(&name("Nat.pred")));
     assert!(!engine.environment().contains(&name("Bool")));
     for (source, expected) in [
         ("#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => 99) 0", "42"),
@@ -78,6 +75,113 @@ fn nat_recursion_needs_no_public_equality_or_boolean_family() {
     ] {
         execute(&engine, source, expected);
     }
+}
+
+#[test]
+fn source_predecessor_implementations_do_not_control_structural_recursion() {
+    let mut engine = minimal_engine();
+    for declaration in [
+        fln_elab::seed::eq_seed_declaration(),
+        fln_elab::seed::rfl_seed_declaration(),
+    ] {
+        engine = admit(engine, declaration);
+    }
+    let unary = |label: &str, result| {
+        let nat = scalar(ValueType::Nat).unwrap();
+        DefinitionVal {
+            base: ConstantVal {
+                name: name(label),
+                level_params: vec![],
+                type_: Expr::forall_e(name("n"), nat.clone(), nat.clone(), BinderInfo::Default),
+            },
+            value: Expr::lam(name("n"), nat, literal(result), BinderInfo::Default),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name(label)],
+        }
+    };
+    engine = admit(engine, Declaration::Defn(unary("Nat.pred", 42)));
+    let mut companion = unary("Nat.pred._unsafe_rec", 99);
+    companion.safety = DefinitionSafety::Partial;
+    engine = admit(engine, Declaration::Mutual(vec![companion]));
+
+    let check_logical_and_structural = |engine: &Engine| {
+        engine
+            .check_source_files(
+                &[b"theorem logicalPred : Nat.pred 5 = 42 := rfl\ntheorem logicalStep : (@Nat.rec (fun _ => Nat) 42 (fun n ih => n) 5) = 4 := rfl"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits().admission()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        execute(
+            engine,
+            "#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => n) 5",
+            "4",
+        );
+        execute(
+            engine,
+            "#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => ih) 5",
+            "42",
+        );
+    };
+    check_logical_and_structural(&engine);
+    execute(&engine, "#eval Nat.pred 5", "99");
+    execute(&engine, "#eval (let prev := Nat.pred; prev 5)", "99");
+
+    engine = admit(engine, Declaration::Defn(unary("otherPredecessor", 7)));
+    let replaced = Engine::from_environment(
+        fln_elab::implemented_by::register(
+            engine.environment(),
+            &name("Nat.pred"),
+            &name("otherPredecessor"),
+        )
+        .unwrap(),
+    );
+    check_logical_and_structural(&replaced);
+    execute(&replaced, "#eval Nat.pred 5", "7");
+    execute(&replaced, "#eval (let prev := Nat.pred; prev 5)", "7");
+
+    let foreign = Engine::from_environment(
+        fln_elab::externs::register(
+            engine.environment(),
+            &name("Nat.pred"),
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: name("all"),
+                symbol: "unavailable_foreign_predecessor".to_owned(),
+            }],
+        )
+        .unwrap(),
+    );
+    check_logical_and_structural(&foreign);
+    let error = foreign
+        .execute_source_definition(
+            b"def directPred : Nat := Nat.pred 5",
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("a direct public predecessor retains its explicit unsupported extern");
+    assert!(matches!(
+        error,
+        EngineExecutionError::Ingress(IngressError::UnsupportedNode { .. })
+    ));
+
+    let collision = admit(
+        minimal_engine(),
+        Declaration::Defn(unary("_fln_runtime_nat_recursor_pred", 17)),
+    );
+    let error = collision
+        .execute_source_definition(
+            b"def directRec : Nat := @Nat.rec (fun _ => Nat) 42 (fun n ih => n) 5",
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("a logical declaration cannot impersonate the structural predecessor");
+    assert!(matches!(
+        error,
+        EngineExecutionError::Ingress(IngressError::UnsupportedNode { .. })
+    ));
 }
 
 fn equality_with_companion() -> Engine {

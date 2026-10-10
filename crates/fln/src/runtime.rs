@@ -60,6 +60,7 @@ pub(super) struct Preparation<'a> {
     next_local: u64,
     next_nat: u64,
     nat_family_checked: bool,
+    nat_primitives: [Option<IntrinsicBinding>; 2],
     value_types: ExecutableValueTypes,
     proposition_queries: proofs::query::Store,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
@@ -143,6 +144,7 @@ impl<'a> Preparation<'a> {
             next_local: 0,
             next_nat: 0,
             nat_family_checked: false,
+            nat_primitives: [None, None],
             value_types: ExecutableValueTypes::bounded_source(environment),
             proposition_queries: proofs::query::Store::default(),
             interfaces: Vec::new(),
@@ -627,15 +629,8 @@ impl<'a> Preparation<'a> {
                             });
                             continue;
                         }
-                        if matches!(head.node(), ExprNode::Const { name: n, levels }
-                            if n == &name("Nat.succ") && levels.is_empty())
-                            && args.len() == 1
-                        {
-                            self.check_nat_family()?;
-                            tasks.push(Task::Visit(Expr::app(
-                                Expr::app(Expr::const_(name("Nat.add"), vec![]), args[0].clone()),
-                                nat::literal(1),
-                            )));
+                        if let Some(successor) = self.nat_successor_call(&head, &args)? {
+                            tasks.push(Task::Visit(successor));
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
@@ -828,6 +823,10 @@ impl<'a> Preparation<'a> {
                             if !self.environment.contains(name) && !self.has_private_callable(name)
                             {
                                 values.push(expr.clone());
+                                continue;
+                            }
+                            if let Some(successor) = self.nat_successor_call(&expr, &[])? {
+                                tasks.push(Task::Visit(successor));
                                 continue;
                             }
                             if let Some(action) = self.io_call(&expr, &[])? {

@@ -6,6 +6,8 @@ use fln_core::expr::{FVarId, NatLit};
 #[cfg(test)]
 use fln_core::level::Level;
 
+mod successor;
+
 pub(super) struct Recursion {
     pub lambda: Expr,
     pub parameters: Vec<ValueType>,
@@ -42,6 +44,7 @@ fn variable(index: usize) -> Result<Expr, IngressError> {
     Expr::bvar(index).map_err(|_| unsupported("Nat recursor binder scope"))
 }
 
+#[cfg(test)]
 fn call(spelling: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments
         .into_iter()
@@ -225,7 +228,7 @@ impl Preparation<'_> {
             .ok_or_else(|| unsupported("Nat recursor identity"))?;
         let marker = FVarId(Name::num(name("_fln_runtime_nat_ih"), id));
         let major = variable(extra)?;
-        let predecessor = call("Nat.pred", [major.clone()]);
+        let predecessor = self.nat_predecessor(major.clone())?;
         let hypothesis = Expr::app(variable(extra + 1)?, predecessor.clone());
         step = self.minor_apply(step, predecessor)?;
         step = self.minor_apply(step, Expr::fvar(marker.clone()))?;
@@ -430,3 +433,6 @@ mod strict;
 
 #[cfg(test)]
 mod native_cases;
+
+#[cfg(test)]
+mod native_constructors;

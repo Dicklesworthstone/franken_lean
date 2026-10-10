@@ -10149,7 +10149,8 @@ fn executable_dependencies(
             continue;
         }
         let intrinsic = match preparation
-            .st_intrinsic_binding(&name)
+            .nat_primitive_intrinsic_binding(&name)
+            .or_else(|| preparation.st_intrinsic_binding(&name))
             .or_else(|| preparation.io_intrinsic_binding(&name))
             .or_else(|| preparation.fs_intrinsic_binding(&name))
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
@@ -10166,6 +10167,9 @@ fn executable_dependencies(
             )?,
         };
         if let Some(binding) = intrinsic {
+            if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)? {
+                continue;
+            }
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {

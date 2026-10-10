@@ -149,6 +149,7 @@ impl Preparation<'_> {
         self.is_partial_stage(name)
             || self.specializations.definitions.contains_key(name)
             || self.specializations.constructor_types.contains_key(name)
+            || self.nat_primitive_intrinsic_type(name).is_some()
             || self.st_intrinsic_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
             || self.fs_intrinsic_type(name).is_some()
@@ -831,7 +832,8 @@ impl Preparation<'_> {
         }
         if levels.is_empty()
             && let Some(type_) = self
-                .st_intrinsic_type(name)
+                .nat_primitive_intrinsic_type(name)
+                .or_else(|| self.st_intrinsic_type(name))
                 .or_else(|| self.io_intrinsic_type(name))
                 .or_else(|| self.fs_intrinsic_type(name))
                 .or_else(|| self.stdout_intrinsic_type(name))
