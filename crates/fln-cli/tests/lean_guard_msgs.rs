@@ -3,14 +3,18 @@
 //! The expected exit codes and stdout are the pinned v4.32.0's on the same files (measured
 //! 2026-10-09):
 //! - A matching `info:` passes silently, including a multi-line doc and a string value.
+//! - A matching `#check` passes silently too. On ten `#check` shapes, from `1` to `@Nat.rec`'s
+//!   full telescope, this door's line is byte-identical to the pin's.
 //! - An unguarded `#eval` around a guarded one still prints.
 //! - An empty guard around a silent `def` passes.
-//! - A mismatch is an error, exit 1.
+//! - A mismatch over `#eval` is an error, exit 1.
 //!
 //! What this engine does not reproduce is refused with exit 5, never judged:
 //! - an expectation with `error:`, `warning:` or `trace:` (their text is not the pin's here);
 //! - a `(…)` spec (it changes which messages are checked);
-//! - a guard over `#check` or an IO action.
+//! - a guard over an IO action;
+//! - a mismatch over `#check`. Its rendering is not proven to be the pin's in general, so a
+//!   difference may be this door's; the pin would report an error.
 #![forbid(unsafe_code)]
 use std::{
     path::Path,
@@ -50,6 +54,11 @@ fn a_matching_guard_is_silent_and_its_neighbours_still_print() {
         "/--\ninfo: 4\n-/\n#guard_msgs in\n#eval 2 + 2\n",
         "/-- info: \"ab\" -/\n#guard_msgs in\n#eval \"ab\"\n",
         "#guard_msgs in\ndef x : Nat := 1\n",
+        "/-- info: 1 : Nat -/\n#guard_msgs in\n#check 1\n",
+        "/-- info: fun x => x + 1 : Nat → Nat -/\n#guard_msgs in\n#check (fun (x : Nat) => x + 1)\n",
+        // The pin's suite (`tests/elab/fieldNamesWithMinus.lean`): a name that is not an
+        // identifier prints escaped, `«i-love-lisp»`.
+        "structure Minus where\n  «i-love-lisp» : Bool\n/-- info: Minus.«i-love-lisp» (self : Minus) : Bool -/\n#guard_msgs in\n#check Minus.«i-love-lisp»\n",
     ] {
         let output = lean(program);
         assert_eq!(output.status.code(), Some(0), "{program}\n{output:?}");
@@ -83,7 +92,7 @@ fn what_this_engine_cannot_reproduce_is_refused_never_judged() {
             "/-- info: 4 -/\n#guard_msgs (drop warning) in\n#eval 2 + 2\n",
             "specification",
         ),
-        ("/-- info: 1 : Nat -/\n#guard_msgs in\n#check 1\n", "#check"),
+        ("/-- info: 1 : Int -/\n#guard_msgs in\n#check 1\n", "#check"),
     ] {
         let output = lean(program);
         assert_eq!(output.status.code(), Some(5), "{program}\n{output:?}");

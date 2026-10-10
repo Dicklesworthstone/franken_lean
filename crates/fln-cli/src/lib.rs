@@ -11488,10 +11488,11 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     let mut check_output_position = 0_usize;
     // `#guard_msgs` (bead `fln-guard-msgs-lls1`): a guarded command's messages are collected
     // as the pin's `messageToString` renders them and judged below, never printed.
-    let mut guarded: std::collections::BTreeMap<usize, Vec<String>> = completed
+    // Each guard's messages, and whether a `#check` rendering is among them.
+    let mut guarded: std::collections::BTreeMap<usize, (Vec<String>, bool)> = completed
         .guards
         .iter()
-        .map(|guard| (guard.command_index, Vec::new()))
+        .map(|guard| (guard.command_index, (Vec::new(), false)))
         .collect();
     for output in &completed.outputs {
         let command_index = match output {
@@ -11560,7 +11561,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
-                if let Some(messages) = guarded.get_mut(&command_index) {
+                if let Some((messages, _)) = guarded.get_mut(&command_index) {
                     // An IO action's output was written while it ran, not returned here.
                     if matches!(value, SourceFinalValue::IoUnit) {
                         return source_failure(
@@ -11620,19 +11621,6 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     continue;
                 }
-                // `#check`'s line is not yet the pin's pretty-printed message in general.
-                if guarded.contains_key(&command_index) {
-                    return source_failure(
-                        "capability",
-                        &format!(
-                            "check command {command_index}: `#guard_msgs` over `#check` is not \
-                             implemented"
-                        ),
-                        false,
-                        SourcePresentation::Lean,
-                        CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                    );
-                }
                 let line = match render_lean_source_check_line(
                     check,
                     completed.batch.engine.environment(),
@@ -11640,6 +11628,12 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     Ok(line) => line,
                     Err(error) => return error,
                 };
+                // A guarded `#check` contributes the line this door prints for it.
+                if let Some((messages, from_check)) = guarded.get_mut(&command_index) {
+                    messages.push(guard_message("info", line.trim_end_matches('\n')));
+                    *from_check = true;
+                    continue;
+                }
                 stdout.push_str(&line);
             }
         }
@@ -11648,10 +11642,27 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     // ASCII-trimmed, compared with the expected text after `WhitespaceMode.normalized`
     // (line breaks become spaces). A pass prints nothing; a failure is the pin's error.
     for guard in &completed.guards {
-        let messages = guarded.remove(&guard.command_index).unwrap_or_default();
+        let (messages, from_check) = guarded.remove(&guard.command_index).unwrap_or_default();
         let joined = messages.join("---\n");
         let produced = joined.trim_ascii();
         if guard.expected.replace('\n', " ") != produced.replace('\n', " ") {
+            // This door's `#check` line is the pin's on the shapes measured, but its pretty
+            // printer is not proven equal to the pin's in general: a mismatch there may be
+            // this rendering, so it is a non-answer, never a rejection.
+            if from_check {
+                return source_failure(
+                    "capability",
+                    &format!(
+                        "command {}: `#guard_msgs` over `#check` produced a message that differs \
+                         from the docstring, and this door's `#check` rendering is not proven to be \
+                         the pin's:\n\n{produced}",
+                        guard.command_index
+                    ),
+                    false,
+                    SourcePresentation::Lean,
+                    CAPABILITY_NOT_IMPLEMENTED_EXIT,
+                );
+            }
             return source_failure(
                 "guard-msgs",
                 &format!(
