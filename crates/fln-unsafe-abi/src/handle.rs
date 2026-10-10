@@ -660,7 +660,7 @@ impl Obj {
         }
     }
 
-    /// Fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    /// Borrow an sarray view `(elem_size, size, capacity, live-bytes)`.
     ///
     /// Returns `None` when the handle is not a scalar array, `m_other`
     /// (element size) is 0, `m_size` is past `m_capacity`, or
@@ -670,25 +670,47 @@ impl Obj {
     /// `m_size` and `m_capacity` past the minted allocation remains
     /// outside this check (same residual as [`try_array_view`]): the
     /// test plants `m_size` only, so Drop still frees with the real
-    /// `m_capacity`.
-    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+    /// `m_capacity`. The immutable slice borrows this owning handle; there is
+    /// no allocation or reference transfer, and no spare capacity is exposed.
+    /// Callers can check a byte allowance before scanning or copying data.
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_sarray(1, b"borrowed");
+    ///     value.try_borrow_sarray_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed");
+    /// ```
+    pub fn try_borrow_sarray_view(&self) -> Option<(u8, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_SCALAR_ARRAY) {
             return None;
         }
         // SAFETY: tag is TAG_SCALAR_ARRAY, so the object is a
         // LeanSarrayObject. `m_size <= m_capacity` is the inline-buffer
         // law: the minted data area is `m_capacity * elem_size` bytes.
-        // Copying `m_size * elem_size` after that check and the overflow
-        // check cannot run past the header's own capacity claim.
+        // Reading `m_size * elem_size` after that check and the overflow
+        // check cannot run past the header's own capacity claim. The owning
+        // &self keeps that immutable allocation live for the returned borrow.
         unsafe {
             let (elem, size, cap, data) = object::sarray_fields(self.0);
             if elem == 0 || size > cap {
                 return None;
             }
             let nbytes = size.checked_mul(usize::from(elem))?;
-            let copy = core::slice::from_raw_parts(data, nbytes).to_vec();
-            Some((elem, size, cap, copy))
+            let bytes = core::slice::from_raw_parts(data, nbytes);
+            Some((elem, size, cap, bytes))
         }
+    }
+
+    /// Copy a fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    ///
+    /// Uses [`Self::try_borrow_sarray_view`]'s category and layout checks.
+    /// Bounded consumers should use that borrowed view before allocating;
+    /// this convenience observer retains its original owned-copy behavior.
+    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+        self.try_borrow_sarray_view()
+            .map(|(elem, size, cap, bytes)| (elem, size, cap, bytes.to_vec()))
     }
 
     #[cfg(test)]
@@ -1364,3 +1386,6 @@ mod stdio_tests;
 
 #[cfg(test)]
 mod stdio_input_tests;
+
+#[cfg(test)]
+mod sarray_view_tests;

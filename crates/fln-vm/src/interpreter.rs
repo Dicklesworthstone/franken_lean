@@ -65,6 +65,9 @@ mod string_fold;
 mod strings;
 mod tail_calls;
 
+#[cfg(test)]
+mod string_from_bytes_tests;
+
 /// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
 /// instruction allowance, not the Reference's allocation-linked heartbeat
 /// option. A value of zero permits no work in that dimension; the first
@@ -811,6 +814,7 @@ enum IntrinsicImplementation {
     ISizeToInt,
     ISizeToWidth,
     StringAppend,
+    StringOfByteArray,
     StringAtEnd,
     StringCompare,
     StringDecEq,
@@ -1168,6 +1172,7 @@ impl IntrinsicImplementation {
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
             "extern:String.append" => Self::StringAppend,
+            "extern:String.ofByteArray" => Self::StringOfByteArray,
             "extern:String.atEnd" | "extern:String.Pos.Raw.atEnd" => Self::StringAtEnd,
             "extern:String.compare" => Self::StringCompare,
             "extern:String.decEq" => Self::StringDecEq,
@@ -1867,6 +1872,7 @@ enum IntrinsicFailure {
     NatMagnitudeLimit { allowed: u64, observed: u64 },
     FileReadResource(FileReadError),
     StringResource(strings::ResourceError),
+    StringFromBytesResource(strings::ResourceError),
 }
 
 impl From<VmRefusal> for IntrinsicFailure {
@@ -2672,6 +2678,9 @@ fn run(
                         }
                         Err(IntrinsicFailure::StringResource(error)) => {
                             return Err(strings::resource_exhausted(error, &location.to_string()));
+                        }
+                        Err(IntrinsicFailure::StringFromBytesResource(error)) => {
+                            return Err(string_from_bytes_exhausted(error, &location.to_string()));
                         }
                     }
                 }
@@ -6036,6 +6045,14 @@ fn invoke_intrinsic(
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
         }
+        IntrinsicImplementation::StringOfByteArray => {
+            // The census retains the constructor's UTF-8 proof as its second
+            // logical argument. That proof is erased before this one-argument
+            // native ABI call. The generated borrowed/owned ownership rule
+            // remains in force; a fresh String preserves every input alias.
+            expect_arity(row, args, 1)?;
+            string_from_byte_array(&args[0], MAX_STRING_FROM_BYTES)
+        }
         IntrinsicImplementation::StringAtEnd => {
             expect_arity(row, args, 2)?;
             let byte_len = string_bytes(&args[0], "String.atEnd", 0)?.len();
@@ -6854,6 +6871,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatShiftRight
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::StringOfByteArray
         | IntrinsicImplementation::StringAtEnd
         | IntrinsicImplementation::StringCompare
         | IntrinsicImplementation::StringDecEq
@@ -7653,6 +7671,61 @@ fn extract_utf8(bytes: &[u8], begin: Option<usize>, end: Option<usize>) -> Optio
 
 fn mk_byte_array(bytes: &[u8]) -> Obj {
     Obj::mk_sarray(1, bytes)
+}
+
+// A Golem conversion-output ceiling, independent of Lean heartbeats. Check
+// it on the borrowed native payload before scanning UTF-8 or copying bytes.
+const MAX_STRING_FROM_BYTES: usize = 16 * 1024 * 1024;
+
+fn string_from_byte_array(
+    value: &Obj,
+    max_bytes: usize,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    if value_kind(value) != ValueKind::ScalarArray {
+        return Err(type_mismatch("String.ofByteArray", 0, "ByteArray", value).into());
+    }
+    let Some((1, _, _, bytes)) = value.try_borrow_sarray_view() else {
+        return Err(VmRefusal::InvalidByteArrayObject.into());
+    };
+    if bytes.len() > max_bytes {
+        return Err(IntrinsicFailure::StringFromBytesResource(
+            strings::ResourceError::OutputLimit {
+                allowed: max_bytes as u64,
+                observed: bytes.len() as u64,
+            },
+        ));
+    }
+    // Trusted source ingress checks the logical validity proof. A malformed
+    // direct FLBC caller still cannot mint a lossy or noncanonical String.
+    let text = std::str::from_utf8(bytes).map_err(|_| VmRefusal::InvalidStringObject)?;
+    let mut output = String::new();
+    output.try_reserve_exact(text.len()).map_err(|_| {
+        IntrinsicFailure::StringFromBytesResource(strings::ResourceError::Allocation {
+            requested: text.len(),
+        })
+    })?;
+    output.push_str(text);
+    Ok(IntrinsicResult::owned(Obj::mk_string(&output)))
+}
+
+fn string_from_bytes_exhausted(error: strings::ResourceError, location: &str) -> Stop {
+    match error {
+        strings::ResourceError::OutputLimit { allowed, observed } => Stop::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::Memory {
+                    limit_bytes: allowed,
+                },
+                allowed,
+                observed,
+            })
+            .with_progress(format!("String.ofByteArray output at {location}")),
+        ),
+        strings::ResourceError::Allocation { requested } => {
+            Stop::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                "host buffer allocation for String.ofByteArray: requested {requested} bytes at {location}"
+            )))
+        }
+    }
 }
 
 /// The bytes of a Marrow `ByteArray`: a scalar array whose element size is
