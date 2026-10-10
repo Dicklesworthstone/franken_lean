@@ -10174,12 +10174,17 @@ fn executable_dependencies(
             intrinsics.push(binding);
             continue;
         }
-        let definition = preparation.executable_definition(&name)?;
-        let Some(definition) = definition else {
-            continue;
-        };
-        let Some(mut signature) = preparation.signature(&definition, true)? else {
-            continue;
+        let mut signature = match preparation.partial_stage_signature(&name)? {
+            Some(signature) => signature,
+            None => {
+                let Some(definition) = preparation.executable_definition(&name)? else {
+                    continue;
+                };
+                let Some(signature) = preparation.signature(&definition, true)? else {
+                    continue;
+                };
+                signature
+            }
         };
         signature.body = preparation.expression(&signature.body)?;
         let observed = functions.len().saturating_add(1);

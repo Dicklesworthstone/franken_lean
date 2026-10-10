@@ -3,6 +3,9 @@
 //! spine is not eta-expanded across its strict, closure-producing body.
 mod applications;
 mod callbacks;
+mod partial;
+
+pub(super) use partial::Store as PartialStages;
 
 use super::*;
 
@@ -58,6 +61,9 @@ impl Preparation<'_> {
     ) -> Result<Option<Expr>, IngressError> {
         if let Some(replacement) = self.implemented_by_call(head, args)? {
             return Ok(Some(replacement));
+        }
+        if let Some(staged) = self.partial_stage_call(head, args)? {
+            return Ok(Some(staged));
         }
         if let Some(specialized) = self.specialize_staged_callback(head, args)? {
             return Ok(Some(specialized));

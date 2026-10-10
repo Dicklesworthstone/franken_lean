@@ -253,7 +253,11 @@ impl Preparation<'_> {
             self.tick()?;
             type_ = match frame {
                 TypeFrame::Apply(argument) => {
-                    let normal = self.normalize_type(&type_)?;
+                    // Recover only the next domain/codomain. Normalizing every
+                    // descendant here also unfolds value indices and predicate
+                    // bodies that proof erasure will discard, once per argument.
+                    // Ground layout decisions normalize their selected type.
+                    let normal = self.type_head(&type_)?;
                     let ExprNode::ForallE { body, .. } = normal.node() else {
                         return Ok(None);
                     };
@@ -646,6 +650,91 @@ instance computed : Action computedToken := { call := fun n => n }
             );
         }
         assert!(prep.projection_slot(&t, &name("Missing"), 0).is_err());
+    }
+
+    #[test]
+    fn application_type_inference_does_not_normalize_irrelevant_proof_indices() {
+        let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(admission)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let nat = Expr::const_(name("Nat"), vec![]);
+        let successor = Expr::const_(name("Nat.succ"), vec![]);
+        let equality = |value: Expr| {
+            [nat.clone(), value.clone(), value].into_iter().fold(
+                Expr::const_(name("Eq"), vec![Level::succ(Level::zero()).unwrap()]),
+                Expr::app,
+            )
+        };
+        let mut index = nat::literal(0);
+        for _ in 0..256 {
+            index = Expr::app(successor.clone(), index);
+        }
+        let predicate = equality(index);
+        let function_type = Expr::forall_e(
+            name("proof"),
+            predicate.clone(),
+            nat.clone(),
+            BinderInfo::Default,
+        );
+        // These are valid local assumptions h : predicate and f : predicate -> Nat.
+        // The result type of f h does not depend on normalizing the proof's index.
+        let context = [predicate, function_type.clone()];
+        let application = Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap());
+        let limits = IngressLimits {
+            max_nodes: 128,
+            ..IngressLimits::default()
+        };
+        let mut prep = Preparation::new(&engine.environment, limits);
+        assert_eq!(
+            prep.projection_receiver_type(&application, &context)
+                .unwrap(),
+            Some(nat.clone())
+        );
+        // The control traverses the same telescope's irrelevant descendants.
+        // It establishes that the finite budget really excludes that work.
+        let mut full = Preparation::new(&engine.environment, limits);
+        assert!(matches!(
+            full.normalize_type(&function_type),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: 128,
+                observed: 129,
+            })
+        ));
+
+        // Opening only the outer binder must still substitute its argument in
+        // a dependent result, and actual exhaustion must remain a refusal.
+        let dependent = Expr::forall_e(
+            name("n"),
+            nat.clone(),
+            equality(Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        let argument = nat::literal(42);
+        let application = Expr::app(Expr::bvar(0).unwrap(), argument.clone());
+        let mut prep = Preparation::new(&engine.environment, limits);
+        assert_eq!(
+            prep.projection_receiver_type(&application, &[dependent.clone()])
+                .unwrap(),
+            Some(equality(argument))
+        );
+        let mut exhausted = Preparation::new(
+            &engine.environment,
+            IngressLimits {
+                max_nodes: 0,
+                ..limits
+            },
+        );
+        assert!(matches!(
+            exhausted.projection_receiver_type(&application, &[dependent]),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: 0,
+                observed: 1,
+            })
+        ));
     }
 
     #[test]

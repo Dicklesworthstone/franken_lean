@@ -19,6 +19,7 @@ pub(super) fn erased_value() -> Expr {
 
 enum Frame {
     Visit(Expr, Option<Expr>),
+    Remember((Expr, Option<Expr>), usize),
     Keep(Expr),
     Apply(usize, Vec<Option<Expr>>),
     Lambda(Name, Expr, BinderInfo),
@@ -226,10 +227,29 @@ impl Preparation<'_> {
         let mut context = Vec::new();
         let mut work = vec![Frame::Visit(input.clone(), expected)];
         let mut values = Vec::new();
+        // Closed inputs and closed expected types cannot depend on the caller's
+        // lexical telescope. Reuse only completed closed output, keeping each
+        // original occurrence in place: this shares analysis, never execution.
+        // Exact syntax keys preserve the same work for shared and independently
+        // allocated trees. A fresh table per pass cannot outlive later private
+        // definition registration, and failed/partial work is never inserted.
+        let mut closed = std::collections::HashMap::<(Expr, Option<Expr>), Expr>::new();
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
                 Frame::Visit(expr, expected) => {
+                    if specialize::closed(&expr) && expected.as_ref().is_none_or(specialize::closed)
+                    {
+                        self.tick()?;
+                        let key = (expr.clone(), expected.clone());
+                        if let Some(value) = closed.get(&key) {
+                            reserve(&mut values, self.limits.max_nodes)?;
+                            values.push(value.clone());
+                            continue;
+                        }
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Remember(key, values.len()));
+                    }
                     let expected = match expected {
                         Some(type_) => Some(type_),
                         // Typed parents classify proof-producing binders. Do
@@ -295,10 +315,11 @@ impl Preparation<'_> {
                                 // Preserve motives and type arguments verbatim.
                                 // They are inputs to checked-family recognition,
                                 // not runtime proof computations.
-                                let static_type = match &domain {
-                                    Some(domain) => self.type_parameter(domain)?,
-                                    None => false,
+                                let static_sort = match &domain {
+                                    Some(domain) => self.type_parameter_sort(domain)?,
+                                    None => None,
                                 };
+                                let static_type = static_sort.is_some();
                                 if local_callbacks {
                                     // The checked local telescope is available here,
                                     // before proof erasure removes its dependent domains.
@@ -324,11 +345,22 @@ impl Preparation<'_> {
                                     // receiver telescope is still available.
                                     // Closed concrete carrier arguments stay
                                     // intact for constructor callback adapters.
-                                    Frame::Keep(if arg.has_loose_bvars() {
-                                        self.erase_type_argument(arg, &context)?
-                                    } else {
-                                        arg.clone()
-                                    })
+                                    // A checked Prop/predicate parameter is logical
+                                    // metadata. Its captured value indices do not
+                                    // need runtime carrier discovery; traversing
+                                    // them repeatedly also expands shared dictionary
+                                    // syntax that specialization will discard.
+                                    // Type-valued motives still use their original
+                                    // context to erase returned proof dependencies.
+                                    Frame::Keep(
+                                        if arg.has_loose_bvars()
+                                            && !static_sort.as_ref().is_some_and(Level::is_zero)
+                                        {
+                                            self.erase_type_argument(arg, &context)?
+                                        } else {
+                                            arg.clone()
+                                        },
+                                    )
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
                                 });
@@ -425,6 +457,30 @@ impl Preparation<'_> {
                             reserve(&mut values, self.limits.max_nodes)?;
                             values.push(expr);
                         }
+                    }
+                }
+                Frame::Remember(key, position) => {
+                    if values.len() != position.saturating_add(1) {
+                        return Err(unsupported("closed proof erasure result"));
+                    }
+                    let value = &values[position];
+                    if specialize::closed(value) {
+                        self.tick()?;
+                        let observed = closed.len().saturating_add(1);
+                        if observed > self.limits.max_nodes {
+                            return Err(IngressError::ResourceLimit {
+                                resource: IngressResource::Nodes,
+                                limit: self.limits.max_nodes,
+                                observed,
+                            });
+                        }
+                        closed
+                            .try_reserve(1)
+                            .map_err(|_| IngressError::AllocationFailure {
+                                resource: IngressResource::Nodes,
+                                requested: observed,
+                            })?;
+                        closed.insert(key, value.clone());
                     }
                 }
                 Frame::Keep(expr) => {

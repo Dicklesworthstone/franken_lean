@@ -129,7 +129,8 @@ impl Preparation<'_> {
     /// eligible for callable preparation without logical declarations. This is
     /// only a dispatch filter: ordinary signature and contract checks still run.
     pub(super) fn has_private_callable(&self, name: &Name) -> bool {
-        self.specializations.definitions.contains_key(name)
+        self.is_partial_stage(name)
+            || self.specializations.definitions.contains_key(name)
             || self.specializations.constructor_types.contains_key(name)
             || self.st_intrinsic_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
@@ -272,13 +273,23 @@ impl Preparation<'_> {
         args.get(args.len() - 1 - (parameters + index)).cloned()
     }
     pub(super) fn type_parameter(&mut self, type_: &Expr) -> Result<bool, IngressError> {
+        Ok(self.type_parameter_sort(type_)?.is_some())
+    }
+
+    /// A type parameter or type-valued function is classified from its admitted
+    /// domain alone. The terminal universe also distinguishes propositions and
+    /// predicates, whose supplied bodies remain inert logical metadata.
+    pub(super) fn type_parameter_sort(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<Option<Level>, IngressError> {
         let mut type_ = self.type_head(type_)?;
         loop {
             self.tick()?;
             match type_.node() {
-                ExprNode::Sort { .. } => return Ok(true),
+                ExprNode::Sort { level } => return Ok(Some(level.clone())),
                 ExprNode::ForallE { body, .. } => type_ = self.type_head(body)?,
-                _ => return Ok(false),
+                _ => return Ok(None),
             }
         }
     }
@@ -753,6 +764,11 @@ impl Preparation<'_> {
         };
         self.tick()?;
         if levels.is_empty()
+            && let Some(type_) = self.partial_stage_type(name)
+        {
+            return Ok(Some(type_));
+        }
+        if levels.is_empty()
             && let Some(type_) = self
                 .st_intrinsic_type(name)
                 .or_else(|| self.io_intrinsic_type(name))
@@ -817,6 +833,11 @@ impl Preparation<'_> {
         args: &[Expr],
         concrete_remaining: Option<&Expr>,
     ) -> Result<Option<Expr>, IngressError> {
+        // These private entries are emitted only at their real prefix arity.
+        // Their remaining Pi is a returned closure, not missing arguments.
+        if matches!(head.node(), ExprNode::Const { name, .. } if self.is_partial_stage(name)) {
+            return Ok(None);
+        }
         let Some(mut type_) = self.callable_type(head)? else {
             return Ok(None);
         };

@@ -315,22 +315,16 @@ fn nonreturning_partial_prefix_is_not_delayed_until_its_callback_is_used() {
             .engine;
     }
     let root = engine.logical_root(&options);
-    let error = engine
+    let mut bounded = limits;
+    bounded.vm.max_steps = 200;
+    let execution = engine
         .execute_source_definitions(
             &[b"#eval let ignored : Nat -> Nat := makeStrict 0; 42"],
             &options,
-            limits,
+            bounded,
         )
-        .expect_err("a nonreturning partial prefix cannot produce an unused callback");
-    let EngineExecutionError::BatchCommand { error, .. } = error else {
-        panic!("unexpected refusal: {error:?}");
-    };
-    assert!(matches!(
-        *error,
-        EngineExecutionError::Ingress(IngressError::UnsupportedNode {
-            kind: "partial function-producing stage"
-        })
-    ));
+        .unwrap();
+    assert!(matches!(execution, Outcome::Inconclusive(_)));
     assert_eq!(engine.logical_root(&options), root);
     let retry = engine
         .execute_source_definitions(&[b"#eval 42"], &options, limits)
