@@ -150,19 +150,74 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
         let imported = Engine::from_environment(Environment::new()).import_olean_modules_for_source(&inputs, &[module], &options, admission).unwrap().into_complete().unwrap();
         assert!(imported.modules.iter().any(|report| report.module == name("Init.Data.String.Bootstrap") && report.externs > 0));
         let externs = fln_elab::externs::ExternTable::read(imported.engine.environment()).unwrap();
-        for (declaration, symbol) in [("String.Internal.append", "lean_string_append"), ("String.Internal.length", "lean_string_length")] {
+        for (declaration, symbol) in [
+            ("String.Internal.append", "lean_string_append"),
+            ("String.Internal.length", "lean_string_length"),
+            ("String.utf8ByteSize", "lean_string_utf8_byte_size"),
+            ("String.Internal.posOf", "lean_string_posof"),
+            ("String.Internal.offsetOfPos", "lean_string_offsetofpos"),
+            ("String.Internal.extract", "lean_string_utf8_extract"),
+            ("String.Internal.next", "lean_string_utf8_next"),
+            ("String.Internal.pushn", "lean_string_pushn"),
+        ] {
             assert_eq!(externs.get(&name(declaration)), Some([fln_elab::externs::ExternEntry::Standard { backend: name("all"), symbol: symbol.to_owned() }].as_slice()), "the real artifact supplies execution metadata");
         }
         let original_root = imported.engine.logical_root(&options);
-        let source = "prelude\nimport Init.Data.String.Bootstrap\n#eval String.Internal.append \"λ\" \"é😀\"\n#eval String.Internal.append \"\" \"\"\n#eval String.Internal.append \"x\" \"\"\n#eval String.Internal.append \"\" \"é\"\n#eval String.Internal.length \"é😀a\"\n#eval String.Internal.length \"\"\n#eval Nat.add 20 22\n#eval Nat.div 43 5\n";
+        let source = r#"prelude
+import Init.Data.String.Bootstrap
+#eval String.Internal.append "λ" "é😀"
+#eval String.Internal.append "" ""
+#eval String.Internal.append "x" ""
+#eval String.Internal.append "" "é"
+#eval String.Internal.length "é😀a"
+#eval String.Internal.length ""
+#eval Nat.add 20 22
+#eval Nat.div 43 5
+#eval String.utf8ByteSize "é😀a"
+#eval String.Pos.Raw.byteIdx (String.Internal.posOf "aλ😀z" '😀')
+#eval String.Internal.offsetOfPos "aλ😀z" (String.Internal.posOf "aλ😀z" '😀')
+#eval String.Internal.extract "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)
+#eval String.Pos.Raw.byteIdx (String.Internal.next "aλ😀z" (String.Pos.Raw.mk 1))
+#eval String.Internal.pushn "x" 'λ' 3
+#eval let clip := String.Internal.extract "aλ😀z" (String.Pos.Raw.mk 1); clip (String.Pos.Raw.mk 3)
+#eval let pad := String.Internal.pushn "x" '🦀'; pad 2
+#eval let seek := String.Internal.posOf; String.Pos.Raw.byteIdx (seek "aλ😀z" 'q')
+#eval String.Internal.pushn "unchanged" 'λ' 0
+"#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
         let limits = SourceProgramLimits::new(EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)));
         let run = || imported.execute_source_modules(&modules, &entry, &options, limits, None).unwrap().into_complete().unwrap();
         let first = run();
         let executions = &first.modules[0].commands.batch.executions;
-        assert_eq!(executions.iter().map(|execution| fln::closed_vm_value(&execution.exit).unwrap()).collect::<Vec<_>>(), [Some(ClosedVmValue::String("λé😀".to_owned())), Some(ClosedVmValue::String(String::new())), Some(ClosedVmValue::String("x".to_owned())), Some(ClosedVmValue::String("é".to_owned())), Some(ClosedVmValue::Scalar(3)), Some(ClosedVmValue::Scalar(0)), Some(ClosedVmValue::Scalar(42)), Some(ClosedVmValue::Scalar(8))]);
+        assert_eq!(executions.iter().map(|execution| fln::closed_vm_value(&execution.exit).unwrap()).collect::<Vec<_>>(), [Some(ClosedVmValue::String("λé😀".to_owned())), Some(ClosedVmValue::String(String::new())), Some(ClosedVmValue::String("x".to_owned())), Some(ClosedVmValue::String("é".to_owned())), Some(ClosedVmValue::Scalar(3)), Some(ClosedVmValue::Scalar(0)), Some(ClosedVmValue::Scalar(42)), Some(ClosedVmValue::Scalar(8)),
+            Some(ClosedVmValue::Scalar(7)), Some(ClosedVmValue::Scalar(3)),
+            Some(ClosedVmValue::Scalar(2)), Some(ClosedVmValue::String("λ😀".to_owned())),
+            Some(ClosedVmValue::Scalar(3)), Some(ClosedVmValue::String("xλλλ".to_owned())),
+            Some(ClosedVmValue::String("λ".to_owned())), Some(ClosedVmValue::String("x🦀🦀".to_owned())),
+            Some(ClosedVmValue::Scalar(8)), Some(ClosedVmValue::String("unchanged".to_owned())),
+        ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
+        // Replay the actual bytes emitted after both imported-module and
+        // source-declaration admission, without rebuilding any compiler state.
+        let mut string_rows = std::collections::BTreeSet::new();
+        for execution in executions {
+            assert_eq!(execution.checker.ground, fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType);
+            let decoded = fln_comp::flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
+            assert_eq!(fln_comp::flbc::encode_canonical(&decoded, Default::default()).unwrap(), execution.flbc_artifact);
+            for instruction in decoded.functions().iter().flat_map(|function| &function.code) {
+                if let fln_comp::flbc::Instruction::Intrinsic { row, .. } = instruction
+                    && row.starts_with("extern:String.")
+                {
+                    string_rows.insert(row.clone());
+                }
+            }
+            let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default()).unwrap().into_complete().unwrap();
+            assert_eq!(fln::closed_vm_value(&replay).unwrap(), fln::closed_vm_value(&execution.exit).unwrap());
+        }
+        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn"] {
+            assert!(string_rows.contains(&format!("extern:String.{operation}")), "the admitted source must select {operation}'s actual native row");
+        }
         let mut tight = limits;
         tight.execution.ingress.max_nodes = 1;
         assert!(imported.execute_source_modules(&modules, &entry, &options, tight, None).is_err());

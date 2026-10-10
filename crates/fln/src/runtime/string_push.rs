@@ -88,13 +88,12 @@ impl Preparation<'_> {
         Ok((shape.projection(constructor), constructor.fields.clone()))
     }
 
-    fn string_push_bind(&mut self) -> Result<[Name; 4], IngressError> {
+    /// Reuse the ordinary checked Char representation across native String
+    /// adapters. Callers establish their own complete source contract first;
+    /// deriving these field views registers no native operation by itself.
+    pub(super) fn native_character_projections(&mut self) -> Result<[Name; 4], IngressError> {
         if let Some(projections) = &self.string_push.projections {
             return Ok(projections.clone());
-        }
-        let primitive = name(PRIMITIVE);
-        if self.environment.contains(&primitive) {
-            return Err(unsupported("String.push primitive name collision"));
         }
         let (character, character_fields) = self.string_push_record(c("Char"), 2)?;
         if character_fields != [c("UInt32"), proofs::erased_type()] {
@@ -105,6 +104,20 @@ impl Preparation<'_> {
         let (finite, finite_fields) = self.string_push_record(bits_fields[0].clone(), 2)?;
         if finite_fields != [c("Nat"), proofs::erased_type()] {
             return Err(unsupported("String.push logical finite-word fields"));
+        }
+        let projections = [character, word, bits, finite];
+        self.string_push.projections = Some(projections.clone());
+        Ok(projections)
+    }
+
+    fn string_push_bind(&mut self) -> Result<[Name; 4], IngressError> {
+        let projections = self.native_character_projections()?;
+        if self.string_push.primitive.is_some() {
+            return Ok(projections);
+        }
+        let primitive = name(PRIMITIVE);
+        if self.environment.contains(&primitive) {
+            return Err(unsupported("String.push primitive name collision"));
         }
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
@@ -132,8 +145,6 @@ impl Preparation<'_> {
             },
             function(&[c("String"), c("Nat")], c("String")),
         ));
-        let projections = [character, word, bits, finite];
-        self.string_push.projections = Some(projections.clone());
         Ok(projections)
     }
 

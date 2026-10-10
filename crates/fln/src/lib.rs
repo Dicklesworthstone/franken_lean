@@ -10154,6 +10154,7 @@ fn executable_dependencies(
             .or_else(|| preparation.fs_intrinsic_binding(&name))
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
             .or_else(|| preparation.string_push_intrinsic_binding(&name))
+            .or_else(|| preparation.string_bootstrap_intrinsic_binding(&name))
         {
             Some(binding) => Some(binding),
             None => executable_intrinsic_binding_cached(

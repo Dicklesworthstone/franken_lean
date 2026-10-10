@@ -137,6 +137,7 @@ impl Preparation<'_> {
             || self.fs_intrinsic_type(name).is_some()
             || self.stdout_intrinsic_type(name).is_some()
             || self.string_push_intrinsic_type(name).is_some()
+            || self.string_bootstrap_intrinsic_type(name).is_some()
     }
 
     fn definition(&self, name: &Name) -> Option<DefinitionVal> {
@@ -775,6 +776,7 @@ impl Preparation<'_> {
                 .or_else(|| self.fs_intrinsic_type(name))
                 .or_else(|| self.stdout_intrinsic_type(name))
                 .or_else(|| self.string_push_intrinsic_type(name))
+                .or_else(|| self.string_bootstrap_intrinsic_type(name))
         {
             return Ok(Some(type_));
         }

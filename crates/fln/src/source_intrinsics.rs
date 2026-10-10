@@ -11,6 +11,7 @@ use std::collections::HashSet;
 pub(super) mod io;
 pub(super) mod st;
 mod string_append;
+pub(super) mod string_bootstrap;
 mod string_internal;
 mod string_length;
 pub(super) mod string_push;
