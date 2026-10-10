@@ -542,7 +542,7 @@ impl<'a> Printer<'a> {
                     ..
                 } = body.node()
                 {
-                    let shown = binder_name(name);
+                    let shown = self.bound_name(name, inner);
                     binders.push(shown.clone());
                     self.names.push(shown);
                     body = inner;
@@ -753,20 +753,53 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// One group of binders for a dependent `∀`/`→`, as the pin groups them.
-    fn binder_group(&self, info: BinderInfo, names: &[String], type_: &str) -> String {
+    /// One group of binders for a dependent `∀`/`→`, as the pin groups them. `hidden`
+    /// omits an instance binder's name: the pin does when the name is not accessible and
+    /// the body does not use it.
+    fn binder_group(
+        &self,
+        info: BinderInfo,
+        names: &[String],
+        type_: &str,
+        hidden: bool,
+    ) -> String {
         match info {
             BinderInfo::Implicit => format!("{{{} : {type_}}}", names.join(" ")),
             BinderInfo::StrictImplicit => format!("⦃{} : {type_}⦄", names.join(" ")),
-            BinderInfo::InstImplicit => {
-                if names.iter().all(|name| name.ends_with('✝')) {
-                    format!("[{type_}]")
-                } else {
-                    format!("[{} : {type_}]", names.join(" "))
-                }
-            }
+            BinderInfo::InstImplicit if hidden => format!("[{type_}]"),
+            BinderInfo::InstImplicit => format!("[{} : {type_}]", names.join(" ")),
             BinderInfo::Default => format!("({} : {type_})", names.join(" ")),
         }
+    }
+
+    /// The name the pin's delaborator gives a bound binder (`getUnusedName`, vendored
+    /// `PrettyPrinter/Delaborator/Basic.lean:289-312`). An anonymous binder is `a` and a
+    /// macro-scoped name loses its scopes. A name already in scope is kept when `body` does
+    /// not refer to the binder it would shadow (`pp.safeShadowing`); otherwise it takes the
+    /// first free `_i` suffix (`LocalContext.getUnusedName`). This engine's generated
+    /// `_fln…` names record no base name, so they keep printing as `x✝`.
+    fn bound_name(&self, name: &Name, body: &Expr) -> String {
+        let base = if name.is_anonymous() {
+            "a".to_owned()
+        } else if name.has_macro_scopes() {
+            escaped_name(&name.erase_macro_scopes())
+        } else if accessible(name) {
+            escaped_name(name)
+        } else {
+            return binder_name(name);
+        };
+        let depth = self.names.len();
+        let shadows_a_used_binder = self.names.iter().enumerate().any(|(position, shown)| {
+            *shown == base
+                && body.has_loose_bvar(u32::try_from(depth - position).unwrap_or(u32::MAX))
+        });
+        if !shadows_a_used_binder {
+            return base;
+        }
+        (1u64..)
+            .map(|i| format!("{base}_{i}"))
+            .find(|candidate| !self.names.contains(candidate))
+            .unwrap_or(base)
     }
 
     fn pi(&mut self, e: &Expr, outer: u32) -> Printed {
@@ -783,7 +816,8 @@ impl<'a> Printer<'a> {
         // A non-dependent explicit binder is an arrow (or an implication).
         if !dependent && *binder_info == BinderInfo::Default {
             let domain = self.expr(binder_type, ARROW_PREC + 1)?;
-            self.names.push(binder_name(name));
+            let shown = self.bound_name(name, body);
+            self.names.push(shown);
             let codomain = self.expr(body, ARROW_PREC);
             self.names.pop();
             return Ok(parens(
@@ -812,7 +846,8 @@ impl<'a> Printer<'a> {
                 break self.pi(current, ARROW_PREC);
             }
             let type_text = self.expr(binder_type, 0)?;
-            let mut names = vec![binder_name(name)];
+            let hidden = !dependent && !accessible(name);
+            let mut names = vec![self.bound_name(name, body)];
             self.names.push(names[0].clone());
             let mut next = body;
             // The pin groups a following binder with the same kind and the same type.
@@ -831,7 +866,7 @@ impl<'a> Printer<'a> {
                 if !same || proposition && *binder_info == BinderInfo::InstImplicit {
                     break;
                 }
-                let shown = binder_name(other);
+                let shown = self.bound_name(other, other_body);
                 names.push(shown.clone());
                 self.names.push(shown);
                 next = other_body;
@@ -839,7 +874,7 @@ impl<'a> Printer<'a> {
             if proposition && *binder_info == BinderInfo::Default {
                 groups.push(format!("({} : {type_text})", names.join(" ")));
             } else {
-                groups.push(self.binder_group(*binder_info, &names, &type_text));
+                groups.push(self.binder_group(*binder_info, &names, &type_text, hidden));
             }
             current = next;
             if proposition {
@@ -903,7 +938,8 @@ impl<'a> Printer<'a> {
                 self.names.push(shown);
                 next = other_body;
             }
-            groups.push(self.binder_group(*binder_info, &names, &type_text));
+            let hidden = !accessible(binder);
+            groups.push(self.binder_group(*binder_info, &names, &type_text, hidden));
             current = next;
         }
         let rest = self.expr(current, 0);
@@ -969,5 +1005,54 @@ mod tests {
         );
         assert_eq!(escaped_part("i-love-lisp", false), "«i-love-lisp»");
         assert_eq!(escaped_part("ok", true), "«ok»");
+    }
+
+    /// Bound binder names as the pin's `getUnusedName` gives them. The pin prints
+    /// `@G.rec : {a : Nat} → {motive : (a_1 : Nat) → G a a_1 → Sort u_1} → …` for
+    /// `inductive G : Nat → Nat → Type | mk (n : Nat) : G n 0`, whose binders are both the
+    /// arrow's `a._@._internal._hyg.0`; `fun (x : Nat) (x : Nat) => …` keeps both names
+    /// unless the body uses the outer one.
+    #[test]
+    fn bound_names_lose_their_scopes_and_avoid_shadowing_a_used_binder() {
+        let env = Environment::new();
+        let nat = || Expr::const_(name(&["Nat"]), Vec::new());
+        let var = |i| Expr::bvar(i).unwrap();
+        let arrow = Name::num(name(&["a", "_@", "_internal", "_hyg"]), 0);
+        let g = Expr::app(
+            Expr::app(Expr::const_(name(&["G"]), Vec::new()), var(1)),
+            var(0),
+        );
+        let telescope = Expr::forall_e(
+            arrow.clone(),
+            nat(),
+            Expr::forall_e(arrow, nat(), g, BinderInfo::Default),
+            BinderInfo::Implicit,
+        );
+        let mut printer = Printer::new(&env);
+        assert_eq!(
+            printer.expr(&telescope, 0).unwrap(),
+            "{a : Nat} → (a_1 : Nat) → G a a_1"
+        );
+        let anonymous = Expr::forall_e(
+            Name::anonymous(),
+            nat(),
+            Expr::app(Expr::const_(name(&["P"]), Vec::new()), var(0)),
+            BinderInfo::Default,
+        );
+        assert_eq!(printer.expr(&anonymous, 0).unwrap(), "(a : Nat) → P a");
+        let x = || name(&["x"]);
+        let shadowing = |body: Expr| {
+            Expr::lam(
+                x(),
+                nat(),
+                Expr::lam(x(), nat(), body, BinderInfo::Default),
+                BinderInfo::Default,
+            )
+        };
+        assert_eq!(printer.expr(&shadowing(var(0)), 0).unwrap(), "fun x x => x");
+        assert_eq!(
+            printer.expr(&shadowing(var(1)), 0).unwrap(),
+            "fun x x_1 => x"
+        );
     }
 }

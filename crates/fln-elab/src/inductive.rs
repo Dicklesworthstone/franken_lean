@@ -5,6 +5,7 @@
 //! infers positivity from a flag or publishes a candidate into an environment.
 mod mutual;
 pub use mutual::mutual_inductive_declaration;
+pub(crate) use mutual::mutual_inductive_with_promoted_parameters;
 
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fresh, fv};
@@ -74,11 +75,43 @@ impl From<RecordError> for InductiveError {
     }
 }
 
+/// `Name.appendAfter name "_ih"` (vendored `Init/Meta/Defs.lean`), the name the kernel
+/// gives a recursor's induction hypothesis. The suffix lands on the base name before any
+/// macro scopes: an arrow field `a._@._internal._hyg.0` has `a_ih._@._internal._hyg.0`.
 fn append_ih(name: &Name) -> Name {
-    match name.leaf_view() {
-        LeafView::Str(text) => Name::str(name.parent().clone(), format!("{text}_ih")),
-        _ => Name::str(name.clone(), "_ih"),
+    fn append(base: &Name) -> Name {
+        match base.leaf_view() {
+            LeafView::Str(text) => Name::str(base.parent(), format!("{text}_ih")),
+            _ => Name::str(base.clone(), "_ih"),
+        }
     }
+    if !name.has_macro_scopes() {
+        return append(name);
+    }
+    // The components from the leaf back to the `_@` separator, leaf first.
+    let mut scopes: Vec<Result<String, u64>> = Vec::new();
+    let mut cursor = name.clone();
+    let base = loop {
+        let parent = cursor.parent();
+        match cursor.leaf_view() {
+            LeafView::Str(text) => {
+                scopes.push(Ok(text.to_owned()));
+                if text == "_@" {
+                    break parent;
+                }
+            }
+            LeafView::Num(value) => scopes.push(Err(value)),
+            LeafView::Anonymous => return append(name),
+        }
+        cursor = parent;
+    };
+    scopes
+        .into_iter()
+        .rev()
+        .fold(append(&base), |name, part| match part {
+            Ok(text) => Name::str(name, text),
+            Err(value) => Name::num(name, value),
+        })
 }
 
 /// A recursive field can be a dependent function returning this family. Its

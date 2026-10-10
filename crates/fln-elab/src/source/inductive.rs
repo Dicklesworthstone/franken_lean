@@ -78,13 +78,13 @@ fn rename(
     Ok(term)
 }
 
-/// The argument lists of the outermost applications of `family` in `term`,
-/// as `forEachWhere (stopWhenVisited := true)` visits them: an occurrence's
-/// own arguments are not searched further.
+/// The argument lists of the outermost applications of any of `families` in
+/// `term`, as `forEachWhere (stopWhenVisited := true)` visits them: an
+/// occurrence's own arguments are not searched further.
 fn family_occurrences(
     context: &mut Context,
     term: &Expr,
-    family: &FVarId,
+    families: &[FVarId],
 ) -> Result<Vec<Vec<Expr>>, NatDefinitionElabError> {
     let mut found = Vec::new();
     let mut work = vec![term.clone()];
@@ -100,7 +100,7 @@ fn family_occurrences(
             arguments.push(a.clone());
             head = f;
         }
-        if matches!(head.node(), ExprNode::FVar { id } if id == family) {
+        if matches!(head.node(), ExprNode::FVar { id } if families.contains(id)) {
             arguments.reverse();
             found.push(arguments);
             continue;
@@ -133,28 +133,30 @@ fn family_occurrences(
     Ok(found)
 }
 
-/// How many leading indices the Reference promotes to parameters
-/// (`fixedIndicesToParams`, vendored Lean/Elab/MutualInductive.lean:509-608).
+/// One family of a block, as index promotion reads it: its indices, its
+/// provisional local and its elaborated constructors.
+struct PromotionFamily<'a> {
+    indices: &'a [LocalDecl],
+    id: &'a FVarId,
+    constructors: &'a [ConstructorSpec],
+}
+
+/// Which of a family's indices are fixed (`computeFixedIndexBitMask`).
 ///
 /// Index `j` is fixed when every constructor binds it as its own field `j` and
 /// returns that field verbatim as result index `j`, and every occurrence of
-/// the family in a field type passes the constructor's own result argument at
-/// that position. A prefix of fixed indices is promoted while each
-/// constructor's field domain is definitionally equal to the index's domain.
-/// Promotion is on by default in the pin (`inductive.autoPromoteIndices`) and
-/// changes the declaration: its parameter count, recursor and field counts.
-fn promotable_indices(
+/// any family of the block in a field type passes the constructor's own result
+/// argument at that position.
+fn fixed_indices(
     context: &mut Context,
-    base: &LocalContext,
     parameters: &[LocalDecl],
-    indices: &[LocalDecl],
-    family: &FVarId,
-    constructors: &[ConstructorSpec],
-) -> Result<usize, NatDefinitionElabError> {
+    family: &PromotionFamily<'_>,
+    block: &[FVarId],
+) -> Result<Vec<bool>, NatDefinitionElabError> {
     let first = parameters.len();
-    let arity = first + indices.len();
-    let mut fixed = vec![true; indices.len()];
-    for ctor in constructors {
+    let arity = first + family.indices.len();
+    let mut fixed = vec![true; family.indices.len()];
+    for ctor in family.constructors {
         context.tick()?;
         let mut type_args: Vec<Expr> = parameters
             .iter()
@@ -174,7 +176,7 @@ fn promotable_indices(
         }
         for field in &ctor.fields {
             let type_ = context.instantiate(&field.type_)?;
-            for arguments in family_occurrences(context, &type_, family)? {
+            for arguments in family_occurrences(context, &type_, block)? {
                 for i in first..arity {
                     if arguments.get(i) != type_args.get(i) {
                         fixed[i - first] = false;
@@ -183,23 +185,70 @@ fn promotable_indices(
             }
         }
     }
+    Ok(fixed)
+}
+
+/// How many leading indices the Reference promotes to parameters
+/// (`fixedIndicesToParams`, vendored Lean/Elab/MutualInductive.lean:509-608).
+///
+/// A prefix of indices fixed in every family of the block is promoted while
+/// every other family's index and every constructor's field at that position
+/// have a domain definitionally equal to the first family's index. The
+/// promoted parameters are the first family's indices. Promotion is on by
+/// default in the pin (`inductive.autoPromoteIndices`) and changes the
+/// declaration: its parameter count, recursor and field counts.
+fn promotable_indices(
+    context: &mut Context,
+    base: &LocalContext,
+    parameters: &[LocalDecl],
+    families: &[PromotionFamily<'_>],
+) -> Result<usize, NatDefinitionElabError> {
+    let block: Vec<FVarId> = families.iter().map(|f| f.id.clone()).collect();
+    let mut masks = Vec::with_capacity(families.len());
+    for family in families {
+        masks.push(fixed_indices(context, parameters, family, &block)?);
+    }
+    let Some(lead) = families.first() else {
+        return Ok(0);
+    };
     let saved = context.txn.lctx.clone();
     context.txn.lctx = base.clone();
-    let mut replacements: Vec<Vec<(FVarId, Expr)>> = vec![Vec::new(); constructors.len()];
+    // Per family, its own promoted indices renamed onto the lead's; per
+    // family and constructor, its promoted fields renamed the same way.
+    let mut indices: Vec<Vec<(FVarId, Expr)>> = vec![Vec::new(); families.len()];
+    let mut fields: Vec<Vec<Vec<(FVarId, Expr)>>> = families
+        .iter()
+        .map(|f| vec![Vec::new(); f.constructors.len()])
+        .collect();
     let mut promoted = 0;
     let result = loop {
-        if promoted == indices.len() || !fixed[promoted] {
+        if !masks
+            .iter()
+            .all(|mask| mask.get(promoted).copied().unwrap_or(false))
+        {
             break Ok(promoted);
         }
-        let index = &indices[promoted];
+        let index = &lead.indices[promoted];
         let domain = context.instantiate(&index.type_)?;
         let mut agree = true;
-        for (ctor, replacements) in constructors.iter().zip(&replacements) {
-            let field = context.instantiate(&ctor.fields[promoted].type_)?;
-            let field = rename(context, field, replacements)?;
-            if field != domain && !context.defeq_guarded(&field, &domain)? {
-                agree = false;
-                break;
+        'families: for (position, (family, (renamed, fields))) in
+            families.iter().zip(indices.iter().zip(&fields)).enumerate()
+        {
+            if position > 0 {
+                let other = context.instantiate(&family.indices[promoted].type_)?;
+                let other = rename(context, other, renamed)?;
+                if other != domain && !context.defeq_guarded(&other, &domain)? {
+                    agree = false;
+                    break;
+                }
+            }
+            for (ctor, replacements) in family.constructors.iter().zip(fields) {
+                let field = context.instantiate(&ctor.fields[promoted].type_)?;
+                let field = rename(context, field, replacements)?;
+                if field != domain && !context.defeq_guarded(&field, &domain)? {
+                    agree = false;
+                    break 'families;
+                }
             }
         }
         if !agree {
@@ -211,16 +260,64 @@ fn promotable_indices(
             domain,
             index.binder_info,
         );
-        for (ctor, replacements) in constructors.iter().zip(&mut replacements) {
-            replacements.push((
-                ctor.fields[promoted].id.clone(),
+        for ((family, renamed), fields) in families.iter().zip(&mut indices).zip(&mut fields) {
+            renamed.push((
+                family.indices[promoted].id.clone(),
                 Expr::fvar(index.id.clone()),
             ));
+            for (ctor, replacements) in family.constructors.iter().zip(fields) {
+                replacements.push((
+                    ctor.fields[promoted].id.clone(),
+                    Expr::fvar(index.id.clone()),
+                ));
+            }
         }
         promoted += 1;
     };
     context.txn.lctx = saved;
     result
+}
+
+/// Regroup a family's constructors after promotion: each constructor's first
+/// `promoted.len()` fields become its own binders for the promoted parameters
+/// (the returned telescopes, as `inductive_with_promoted_parameters` reads
+/// them), and its remaining fields and result indices are renamed onto them.
+fn promote_constructors(
+    context: &mut Context,
+    promoted: &[LocalDecl],
+    constructors: &mut [ConstructorSpec],
+    mut field_universes: Option<&mut [Vec<Level>]>,
+) -> Result<Vec<Vec<LocalDecl>>, NatDefinitionElabError> {
+    let count = promoted.len();
+    let mut own_binders = vec![Vec::new(); constructors.len()];
+    for (position, (ctor, own)) in constructors.iter_mut().zip(&mut own_binders).enumerate() {
+        let mut replacements = Vec::new();
+        let fields = ctor.fields.split_off(count);
+        for (field, index) in ctor.fields.iter().zip(promoted) {
+            let mut binder = field.clone();
+            binder.id = index.id.clone();
+            let type_ = context.instantiate(&field.type_)?;
+            binder.type_ = rename(context, type_, &replacements)?;
+            own.push(binder);
+            replacements.push((field.id.clone(), Expr::fvar(index.id.clone())));
+        }
+        ctor.fields = fields;
+        for field in &mut ctor.fields {
+            let type_ = context.instantiate(&field.type_)?;
+            field.type_ = rename(context, type_, &replacements)?;
+        }
+        let result_indices = ctor.result_indices.split_off(count);
+        ctor.result_indices = Vec::with_capacity(result_indices.len());
+        for index in result_indices {
+            let index = context.instantiate(&index)?;
+            ctor.result_indices
+                .push(rename(context, index, &replacements)?);
+        }
+        if let Some(universes) = field_universes.as_deref_mut() {
+            universes[position].drain(..count);
+        }
+    }
+    Ok(own_binders)
 }
 
 /// Source ascriptions are retained as identity lets until checked_type checks
@@ -459,42 +556,21 @@ pub(super) fn elaborate_inductive_scoped(
         &mut context,
         &base,
         &parameters,
-        &indices,
-        &self_id,
-        &constructors,
+        &[PromotionFamily {
+            indices: &indices,
+            id: &self_id,
+            constructors: &constructors,
+        }],
     )?;
     let mut promoted = vec![Vec::new(); constructors.len()];
     if count > 0 {
         let promoted_indices: Vec<LocalDecl> = indices.drain(..count).collect();
-        for ((ctor, own), universes) in constructors
-            .iter_mut()
-            .zip(&mut promoted)
-            .zip(&mut field_universes)
-        {
-            let mut replacements = Vec::new();
-            let fields = ctor.fields.split_off(count);
-            for (field, index) in ctor.fields.iter().zip(&promoted_indices) {
-                let mut binder = field.clone();
-                binder.id = index.id.clone();
-                let type_ = context.instantiate(&field.type_)?;
-                binder.type_ = rename(&mut context, type_, &replacements)?;
-                own.push(binder);
-                replacements.push((field.id.clone(), Expr::fvar(index.id.clone())));
-            }
-            ctor.fields = fields;
-            for field in &mut ctor.fields {
-                let type_ = context.instantiate(&field.type_)?;
-                field.type_ = rename(&mut context, type_, &replacements)?;
-            }
-            let result_indices = ctor.result_indices.split_off(count);
-            ctor.result_indices = Vec::with_capacity(result_indices.len());
-            for index in result_indices {
-                let index = context.instantiate(&index)?;
-                ctor.result_indices
-                    .push(rename(&mut context, index, &replacements)?);
-            }
-            universes.drain(..count);
-        }
+        promoted = promote_constructors(
+            &mut context,
+            &promoted_indices,
+            &mut constructors,
+            Some(&mut field_universes),
+        )?;
         parameters.extend(promoted_indices);
     }
     let result_level = explicit.unwrap_or(inferred);

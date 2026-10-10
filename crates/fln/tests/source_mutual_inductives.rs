@@ -131,6 +131,141 @@ fn indexed_and_function_recursive_families_reach_both_checkers() {
         admit(&source, &SourceScope::default());
     }
 }
+/// The pin promotes a prefix of indices fixed in every member to parameters
+/// (`fixedIndicesToParams` over the block). Measured at the pin (lean v4.32.0, 2026-10-09):
+/// `#print Forest` says `number of parameters: 1`, and the stored types begin
+/// `Forest : (a._@._internal._hyg.0 : Nat) → …` (default), `Forest.rec : {a._@._internal._hyg.0 : Nat} → …`
+/// (implicit) and `Forest.nil : (n : Nat) → …`. A member constructor whose result index is
+/// not its own field (`Tree.zero : Tree 0`) keeps every index an index: `number of
+/// parameters: 0`.
+#[test]
+fn a_block_promotes_the_indices_fixed_in_every_member_as_the_pin_does() {
+    use fln_core::expr::{BinderInfo, ExprNode};
+    use fln_env::constants::ConstantInfo;
+    let arrow = Name::num(Name::from_components(["a", "_@", "_internal", "_hyg"]), 0);
+    let forest = "inductive Forest : Nat -> Type where | nil (n : Nat) : Forest n | cons (n : Nat) (t : Tree n) (xs : Forest n) : Forest n";
+    let e = admit(
+        &[
+            "inductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n",
+            forest,
+        ],
+        &SourceScope::default(),
+    );
+    let first_binder = |constant: &str| {
+        let info = e.environment().find(&n(constant)).unwrap();
+        let ExprNode::ForallE {
+            binder_name,
+            binder_info,
+            ..
+        } = info.constant_val().type_.node()
+        else {
+            panic!("{constant} has no leading binder");
+        };
+        (binder_name.clone(), *binder_info)
+    };
+    for family in ["Tree", "Forest"] {
+        let Some(ConstantInfo::Induct(info)) = e.environment().find(&n(family)) else {
+            panic!("{family}");
+        };
+        assert_eq!((info.num_params, info.num_indices), (1, 0), "{family}");
+        assert_eq!(first_binder(family), (arrow.clone(), BinderInfo::Default));
+        let Some(ConstantInfo::Rec(rec)) = e.environment().find(&n(&format!("{family}.rec")))
+        else {
+            panic!("{family}.rec");
+        };
+        assert_eq!(
+            (
+                rec.num_params,
+                rec.num_indices,
+                rec.num_motives,
+                rec.num_minors
+            ),
+            (1, 0, 2, 4)
+        );
+        assert_eq!(
+            first_binder(&format!("{family}.rec")),
+            (arrow.clone(), BinderInfo::Implicit)
+        );
+    }
+    for (ctor, fields) in [
+        ("Tree.leaf", 1),
+        ("Tree.node", 1),
+        ("Forest.nil", 0),
+        ("Forest.cons", 2),
+    ] {
+        let Some(ConstantInfo::Ctor(info)) = e.environment().find(&n(ctor)) else {
+            panic!("{ctor}");
+        };
+        assert_eq!((info.num_params, info.num_fields), (1, fields), "{ctor}");
+        assert_eq!(first_binder(ctor), (n("n"), BinderInfo::Default), "{ctor}");
+    }
+    let e = admit(
+        &[
+            "inductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n | zero : Tree 0",
+            forest,
+        ],
+        &SourceScope::default(),
+    );
+    for family in ["Tree", "Forest"] {
+        let Some(ConstantInfo::Induct(info)) = e.environment().find(&n(family)) else {
+            panic!("{family}");
+        };
+        assert_eq!((info.num_params, info.num_indices), (0, 1), "{family}");
+    }
+}
+/// An arrow field is named `a._@._internal._hyg.0`, as the pin's `elabArrow` names it, and
+/// its induction hypothesis is `Name.appendAfter`'s `a_ih._@._internal._hyg.0`: the
+/// suffix lands before the macro scopes. The kernel regenerates the recursor and compares
+/// it exactly, so a wrong name is refused (`BlockMismatch`). The pin accepts this block and
+/// prints `@Even.rec : ∀ {motive_1 : (a : Nat) → Even a → Prop} … (∀ (n : Nat) (a : Odd n),
+/// motive_2 n a → motive_1 (n + 1) ⋯) → …`.
+#[test]
+fn arrow_fields_and_their_hypotheses_carry_the_pins_hygienic_names() {
+    use fln_core::expr::ExprNode;
+    let e = admit(
+        &[
+            "inductive Even : Nat -> Prop where | zero : Even 0 | succ (n : Nat) : Odd n -> Even (n + 1)",
+            "inductive Odd : Nat -> Prop where | succ (n : Nat) : Even n -> Odd (n + 1)",
+        ],
+        &SourceScope::default(),
+    );
+    check(
+        &e,
+        "theorem two : Even 2 := Even.succ 1 (Odd.succ 0 Even.zero)",
+    );
+    let hygienic =
+        |base: &str| Name::num(Name::from_components([base, "_@", "_internal", "_hyg"]), 0);
+    // `Even.rec`'s second minor: `(n : Nat) → (a : Odd n) → motive_2 n a → …`.
+    let mut type_ = e
+        .environment()
+        .find(&n("Even.rec"))
+        .unwrap()
+        .constant_val()
+        .type_
+        .clone();
+    let mut binders = Vec::new();
+    while let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        ..
+    } = type_.node()
+    {
+        binders.push((binder_name.clone(), binder_type.clone()));
+        type_ = body.clone();
+    }
+    let minor = &binders[3].1;
+    let mut names = Vec::new();
+    let mut inner = minor.clone();
+    while let ExprNode::ForallE {
+        binder_name, body, ..
+    } = inner.node()
+    {
+        names.push(binder_name.clone());
+        inner = body.clone();
+    }
+    assert_eq!(names, [n("n"), hygienic("a"), hygienic("a_ih")]);
+}
 #[test]
 fn namespaces_three_families_and_empty_members_share_one_block() {
     let scope = SourceScope {

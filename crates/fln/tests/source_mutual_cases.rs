@@ -87,12 +87,24 @@ fn computed_scrutinees_and_named_equations_preserve_case_identity() {
 }
 #[test]
 fn indexed_mutual_matches_keep_destination_indices_in_the_motive() {
+    // `F.first`, whose first field is not its index, keeps the block's index an index
+    // (the pin: `number of parameters: 1`, `A` alone), and the pin accepts this program.
+    check(
+        &[
+            "inductive T (A : Type) : A -> Type where | node (x : A) (children : F A x) : T A x",
+            "inductive F (A : Type) : A -> Type where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x | first (y : A) (x : A) : F A x",
+        ],
+        "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node y children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node y children => y\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
+    );
+    // Without it the pin promotes `x` (`number of parameters: 2`), so `T.node` has one
+    // field: it refuses `node y children` ("Too many variable names provided") and `.node y
+    // children` (Type mismatch), and accepts this program.
     check(
         &[
             "inductive T (A : Type) : A -> Type where | node (x : A) (children : F A x) : T A x",
             "inductive F (A : Type) : A -> Type where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x",
         ],
-        "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node y children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node y children => y\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
+        "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node _ children => x\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
     );
 }
 #[test]

@@ -2995,9 +2995,16 @@ impl Context {
                                 .value
                                 .lift_loose(0, 1)
                                 .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            // The pin's `elabArrow` (vendored Lean/Elab/Binders.lean:299-303)
+                            // names the binder `a` under the reserved macro scope:
+                            // `a._@._internal._hyg.0`. It shows when an index is promoted to a
+                            // parameter (`@F.rec : {a : Nat} → …`).
                             let term = Typed {
                                 value: Expr::forall_e(
-                                    Name::anonymous(),
+                                    Name::num(
+                                        Name::from_components(["a", "_@", "_internal", "_hyg"]),
+                                        0,
+                                    ),
                                     left.value,
                                     body,
                                     BinderInfo::Default,

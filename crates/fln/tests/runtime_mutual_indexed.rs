@@ -30,30 +30,53 @@ fn run(source: &str, expected: &str) -> u64 {
     );
     value.usage.steps
 }
+/// Every constructor of this block takes `(n : Nat)` first and returns it, so the pin
+/// promotes the index to a parameter (`#print Forest`: `number of parameters: 1`). Its
+/// recursors take `n` first, and the minors and motives no longer bind it:
+/// `@Forest.rec : {a : Nat} → {motive_1 : Tree a → Sort u_1} → … → motive_2 (Forest.nil a) → …`.
 const DATA: &str = "mutual\ninductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n\ninductive Forest : Nat -> Type where | nil (n : Nat) : Forest n | cons (n : Nat) (t : Tree n) (xs : Forest n) : Forest n\nend\n";
-const MOTIVES: &str = "(fun (n : Nat) (t : Tree n) => Nat) (fun (n : Nat) (xs : Forest n) => Nat)";
-const SUM: &str = "(fun (n : Nat) (x : Nat) => x) (fun (n : Nat) (xs : Forest n) (ih : Nat) => ih) (fun (n : Nat) => 0) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT + ihF)";
+const MOTIVES: &str = "(fun (t : Tree n) => Nat) (fun (xs : Forest n) => Nat)";
+const SUM: &str = "(fun (x : Nat) => x) (fun (xs : Forest n) (ih : Nat) => ih) 0 (fun (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT + ihF)";
 const VALUE: &str = "Forest.cons 7 (Tree.leaf 7 40) (Forest.cons 7 (Tree.node 7 (Forest.cons 7 (Tree.leaf 7 2) (Forest.nil 7))) (Forest.nil 7))";
 #[test]
 fn indexed_mutual_values_are_constructed_and_matched() {
+    // The promoted index is a parameter position, so only `_` may stand there: the pin
+    // refuses `.nil k` with "Type mismatch: Forest.nil k has type Forest k but is
+    // expected to have type Forest n", and prints 42 for this program.
     run(
         &format!(
-            "{DATA}def first (n : Nat) (xs : Forest n) : Nat := match xs with | .nil k => 0 | .cons k t rest => match t with | .leaf j x => x | .node j ys => 0\n#eval first 7 (Forest.cons 7 (Tree.leaf 7 42) (Forest.nil 7))"
+            "{DATA}def first (n : Nat) (xs : Forest n) : Nat := match xs with | .nil _ => 0 | .cons _ t rest => match t with | .leaf _ x => x | .node _ ys => 0\n#eval first 7 (Forest.cons 7 (Tree.leaf 7 42) (Forest.nil 7))"
         ),
         "42",
     );
 }
 #[test]
+fn a_named_variable_at_a_promoted_index_is_refused() {
+    let error = engine()
+        .execute_source_definitions(
+            &[format!("{DATA}def first (n : Nat) (xs : Forest n) : Nat := match xs with | .nil k => 0 | .cons k t rest => 1\n#eval first 7 (Forest.nil 7)").as_bytes()],
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("the pin refuses `.nil k` at a promoted index");
+    assert!(
+        format!("{error:?}").contains("Match(InaccessibleParameter)"),
+        "{error:?}"
+    );
+}
+#[test]
 fn indexed_mutual_folds_execute_from_either_member() {
+    // At the pin both definitions elaborate (`noncomputable`), and the kernel reduces each
+    // application to 42 (`example : total 7 (…) = 42 := rfl`).
     run(
         &format!(
-            "{DATA}def total (n : Nat) (xs : Forest n) : Nat := @Forest.rec {MOTIVES} {SUM} n xs\n#eval total 7 ({VALUE})"
+            "{DATA}def total (n : Nat) (xs : Forest n) : Nat := @Forest.rec n {MOTIVES} {SUM} xs\n#eval total 7 ({VALUE})"
         ),
         "42",
     );
     run(
         &format!(
-            "{DATA}def total (n : Nat) (t : Tree n) : Nat := @Tree.rec {MOTIVES} {SUM} n t\n#eval total 7 (Tree.node 7 ({VALUE}))"
+            "{DATA}def total (n : Nat) (t : Tree n) : Nat := @Tree.rec n {MOTIVES} {SUM} t\n#eval total 7 (Tree.node 7 ({VALUE}))"
         ),
         "42",
     );
@@ -134,9 +157,9 @@ inductive Forest (A : Type u) : Nat -> Type u where
   | cons (n : Nat) (t : Tree A n) (rest : Forest A n) : Forest A n
 end
 def first {A : Type u} (fallback : A) (n : Nat) (t : Tree A n) : A :=
-  @Tree.rec A (fun n t => A) (fun n xs => A)
-    (fun n value h => value) (fun n child ih => ih)
-    (fun n => fallback) (fun n t rest ihT ihF => ihT) n t
+  @Tree.rec A n (fun t => A) (fun xs => A)
+    (fun value h => value) (fun child ih => ih)
+    fallback (fun t rest ihT ihF => ihT) t
 #eval first 0 1 (Tree.node 1 (Forest.cons 1 (Tree.leaf 1 37 (Eq.refl 1)) (Forest.nil 1))) + String.length (first "" 2 (Tree.node 2 (Forest.cons 2 (Tree.leaf 2 "hello" (Eq.refl 2)) (Forest.nil 2))))"#,
         "42",
     );
@@ -144,12 +167,11 @@ def first {A : Type u} (fallback : A) (n : Nat) (t : Tree A n) : A :=
 
 #[test]
 fn mutual_motives_return_owned_indexed_objects_that_escape_the_fold() {
-    let motives =
-        "(fun (n : Nat) (t : Tree n) => Tree n) (fun (n : Nat) (xs : Forest n) => Forest n)";
-    let minors = "(fun (n : Nat) (x : Nat) => Tree.leaf n (x + delta)) (fun (n : Nat) (xs : Forest n) (ih : Forest n) => Tree.node n ih) (fun (n : Nat) => Forest.nil n) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Tree n) (ihF : Forest n) => Forest.cons n ihT ihF)";
+    let motives = "(fun (t : Tree n) => Tree n) (fun (xs : Forest n) => Forest n)";
+    let minors = "(fun (x : Nat) => Tree.leaf n (x + delta)) (fun (xs : Forest n) (ih : Forest n) => Tree.node n ih) (Forest.nil n) (fun (t : Tree n) (xs : Forest n) (ihT : Tree n) (ihF : Forest n) => Forest.cons n ihT ihF)";
     run(
         &format!(
-            "{DATA}def map (delta : Nat) (n : Nat) (xs : Forest n) : Forest n := @Forest.rec {motives} {minors} n xs\ndef sum (n : Nat) (xs : Forest n) : Nat := @Forest.rec {MOTIVES} {SUM} n xs\n#eval sum 7 (map 1 7 (Forest.cons 7 (Tree.node 7 (Forest.cons 7 (Tree.leaf 7 39) (Forest.nil 7))) (Forest.cons 7 (Tree.leaf 7 1) (Forest.nil 7))))"
+            "{DATA}def map (delta : Nat) (n : Nat) (xs : Forest n) : Forest n := @Forest.rec n {motives} {minors} xs\ndef sum (n : Nat) (xs : Forest n) : Nat := @Forest.rec n {MOTIVES} {SUM} xs\n#eval sum 7 (map 1 7 (Forest.cons 7 (Tree.node 7 (Forest.cons 7 (Tree.leaf 7 39) (Forest.nil 7))) (Forest.cons 7 (Tree.leaf 7 1) (Forest.nil 7))))"
         ),
         "42",
     );
@@ -158,23 +180,40 @@ fn mutual_motives_return_owned_indexed_objects_that_escape_the_fold() {
 #[test]
 fn repeated_mutual_hypotheses_are_shared_and_unused_peers_stay_lazy() {
     let build = "def build (depth : Nat) : Tree 7 := match depth with | .zero => Tree.leaf 7 1 | .succ k => let child : Tree 7 := build k; Tree.node 7 (Forest.cons 7 child (Forest.cons 7 child (Forest.nil 7)))\n";
-    let minors = "(fun (n : Nat) (x : Nat) => x) (fun (n : Nat) (xs : Forest n) (ih : Nat) => ih) (fun (n : Nat) => 0) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT + ihT)";
+    let minors = "(fun (x : Nat) => x) (fun (xs : Forest n) (ih : Nat) => ih) 0 (fun (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT + ihT)";
     let steps = run(
         &format!(
-            "{DATA}{build}def double (n : Nat) (t : Tree n) : Nat := @Tree.rec {MOTIVES} {minors} n t\n#eval double 7 (build 24)"
+            "{DATA}{build}def double (n : Nat) (t : Tree n) : Nat := @Tree.rec n {MOTIVES} {minors} t\n#eval double 7 (build 24)"
         ),
         "16777216",
     );
     assert!(steps < 10_000, "repeated IH expanded: {steps}");
+    // The unused hypothesis `ihF` folds a sibling leaf whose minor costs `work 400`.
+    // (With the index promoted, `Forest.nil`'s minor is a value, evaluated once at the
+    // call, so the work sits under a leaf instead. `work` is not tail recursive, so it
+    // stays under the front door's 1,000-frame ceiling.)
     let work = "def work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1\n";
-    let minors = "(fun (n : Nat) (x : Nat) => x) (fun (n : Nat) (xs : Forest n) (ih : Nat) => ih) (fun (n : Nat) => work 2000) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT)";
-    let steps = run(
-        &format!(
-            "{DATA}{work}def first (n : Nat) (t : Tree n) : Nat := @Tree.rec {MOTIVES} {minors} n t\n#eval first 7 (Tree.node 7 (Forest.cons 7 (Tree.leaf 7 42) (Forest.nil 7)))"
-        ),
+    let value = "Tree.node 7 (Forest.cons 7 (Tree.leaf 7 42) (Forest.cons 7 (Tree.leaf 7 400) (Forest.nil 7)))";
+    let fold = |cons: &str, expected: &str| {
+        run(
+            &format!(
+                "{DATA}{work}def first (n : Nat) (t : Tree n) : Nat := @Tree.rec n {MOTIVES} (fun (x : Nat) => work x) (fun (xs : Forest n) (ih : Nat) => ih) 0 ({cons}) t\n#eval first 7 ({value})"
+            ),
+            expected,
+        )
+    };
+    let unused = fold(
+        "fun (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT",
         "42",
     );
-    assert!(steps < 700, "unused sibling forced: {steps}");
+    let forced = fold(
+        "fun (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => ihT + ihF",
+        "442",
+    );
+    assert!(
+        unused + 400 < forced,
+        "unused sibling forced: {unused} vs {forced}"
+    );
 }
 
 #[test]
@@ -211,11 +250,19 @@ end
 #[test]
 fn case_indices_remain_strict_without_any_induction_hypotheses() {
     let work = "def work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1\n";
-    let minors = "(fun (n : Nat) (x : Nat) => x) (fun (n : Nat) (xs : Forest n) (ih : Nat) => 42) (fun (n : Nat) => 42) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => 42)";
+    // `Tree.zero : Tree 0` keeps the index from being promoted (the pin's `#print Tree`:
+    // `number of parameters: 0`), so `work n` stays a case index. The pin reduces this
+    // application at `work 3` to 42 by `rfl`. (A promoted index is a parameter, which a
+    // constructor does not store.)
+    let data = "mutual\ninductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n | zero : Tree 0\ninductive Forest : Nat -> Type where | nil (n : Nat) : Forest n | cons (n : Nat) (t : Tree n) (xs : Forest n) : Forest n\nend\n";
+    let rest = "(fun (n : Nat) (t : Tree n) => Nat) (fun (n : Nat) (xs : Forest n) => Nat) (fun (n : Nat) (x : Nat) => x) (fun (n : Nat) (xs : Forest n) (ih : Nat) => 42) 42 (fun (n : Nat) => 42) (fun (n : Nat) (t : Tree n) (xs : Forest n) (ihT : Nat) (ihF : Nat) => 42)";
     let mut case = Vec::new();
     let mut direct = Vec::new();
     for n in [0, 60] {
-        case.push(run(&format!("{DATA}{work}#eval @Tree.rec {MOTIVES} {minors} (work {n}) (Tree.leaf (work {n}) 42)"), "42"));
+        case.push(run(
+            &format!("{data}{work}#eval @Tree.rec {rest} (work {n}) (Tree.leaf (work {n}) 42)"),
+            "42",
+        ));
         direct.push(run(
             &format!("{work}#eval let index : Nat := work {n}; 42"),
             "42",
@@ -255,7 +302,7 @@ fn group_resource_stops_recover_identical_artifacts_and_logical_roots() {
     let options = KVMap::new();
     let root = base.logical_root(&options);
     let defs = format!(
-        "{DATA}def sum (n : Nat) (xs : Forest n) : Nat := @Forest.rec {MOTIVES} {SUM} n xs\n"
+        "{DATA}def sum (n : Nat) (xs : Forest n) : Nat := @Forest.rec n {MOTIVES} {SUM} xs\n"
     );
     let source = format!("{defs}def result : Nat := sum 7 ({VALUE})");
     for bounded in [
@@ -328,7 +375,9 @@ fn changing_runtime_layouts_are_still_refused() {
     let base = engine();
     let options = KVMap::new();
     for source in [
-        "mutual\ninductive A : Type -> Type 1 where | leaf (T : Type) (value : T) : A T | node (T : Type) (b : B T) : A T\ninductive B : Type -> Type 1 where | node (T : Type) (a : A T) : B T\nend\ndef read (x : A Nat) : Nat := match x with | .leaf T value => 42 | .node T b => 42\n#eval read (A.leaf Nat 42)",
+        // `A.other : A Nat` keeps `T` an index (the pin: `number of parameters: 0`), so the
+        // field `value : T` changes layout with it. The pin prints `true`.
+        "mutual\ninductive A : Type -> Type 1 where | leaf (T : Type) (value : T) : A T | node (T : Type) (b : B T) : A T | other : A Nat\ninductive B : Type -> Type 1 where | node (T : Type) (a : A T) : B T\nend\ndef read (x : A Nat) : Bool := match x with | .leaf _ value => true | .node _ b => true | .other => true\n#eval read (A.leaf Nat 42)",
         "mutual\ninductive A : Type 1 where | node (f : (T : Type) -> T -> B)\ninductive B : Type 1 where | leaf | node (a : A)\nend\ndef ignore (a : A) : Nat := 42\n#eval ignore (A.node (fun T v => B.leaf))",
     ] {
         // Refusal must be in preparation, not a vacuous parser/kernel failure.
@@ -346,6 +395,17 @@ fn changing_runtime_layouts_are_still_refused() {
             "{source}"
         );
     }
+}
+
+/// Without `A.other` the pin promotes `T` to a parameter (`number of parameters: 1`), and a
+/// parameter does not change a constructor's layout: this program runs, and the pin prints
+/// 42 too. Only `_` may stand at the parameter position.
+#[test]
+fn a_promoted_type_index_has_a_uniform_layout() {
+    run(
+        "mutual\ninductive A : Type -> Type 1 where | leaf (T : Type) (value : T) : A T | node (T : Type) (b : B T) : A T\ninductive B : Type -> Type 1 where | node (T : Type) (a : A T) : B T\nend\ndef read (x : A Nat) : Nat := match x with | .leaf _ value => 42 | .node _ b => 42\n#eval read (A.leaf Nat 42)",
+        "42",
+    );
 }
 
 #[test]
@@ -375,29 +435,26 @@ def first (n : Nat) (xs : Forest (Nat.succ n)) : Nat :=
     );
 }
 
+/// Function-valued results staged through nested matches on indexed mutual families. This
+/// test expected the ingress refusal `LambdaResultType`; the program has executed since
+/// before bead `franken_lean-z8j.1.6.3`'s index promotion (measured at `1f6e27b6`), and the
+/// pin prints 42 for both forms below.
 #[test]
-fn recursively_staged_nested_results_still_require_explicit_abi_adaptation() {
-    let choose = "def choose (offset : Nat) (n : Nat) (xs : Forest n) : Nat -> Nat := match xs with | .nil k => fun x => offset + x | .cons k t rest => match t with | .leaf j value => fun x => value + offset + x | .node j children => fun x => offset + x\n";
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
-    base.check_source_files(
-        &[format!("{DATA}{choose}").as_bytes()],
-        &options,
-        fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
-    )
-    .unwrap()
-    .into_complete()
-    .unwrap();
-    let source = format!(
-        "{DATA}{choose}#eval let f : Nat -> Nat := choose 10 7 (Forest.cons 7 (Tree.leaf 7 30) (Forest.nil 7)); f 2"
+fn recursively_staged_nested_results_run_as_at_the_pin() {
+    // `Tree.zero : Tree 0` keeps the index unpromoted (the pin: `number of parameters: 0`),
+    // so named index variables are generalized.
+    let unpromoted = "mutual\ninductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n | zero : Tree 0\ninductive Forest : Nat -> Type where | nil (n : Nat) : Forest n | cons (n : Nat) (t : Tree n) (xs : Forest n) : Forest n\nend\ndef choose (offset : Nat) (n : Nat) (xs : Forest n) : Nat -> Nat := match xs with | .nil k => fun x => offset + x | .cons k t rest => match t with | .leaf j value => fun x => value + offset + x | .node j children => fun x => offset + x | .zero => fun x => x\n";
+    // Over the promoted block only `_` may stand at the parameter position (`.nil k` is the
+    // pin's Type mismatch).
+    let promoted = format!(
+        "{DATA}def choose (offset : Nat) (n : Nat) (xs : Forest n) : Nat -> Nat := match xs with | .nil _ => fun x => offset + x | .cons _ t rest => match t with | .leaf _ value => fun x => value + offset + x | .node _ children => fun x => offset + x\n"
     );
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .unwrap_err();
-    assert!(
-        matches!(error, fln::EngineExecutionError::BatchCommand { error, .. }
-        if matches!(*error, fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::LambdaResultType { .. })))
-    );
-    assert_eq!(base.logical_root(&options), root);
+    for defs in [unpromoted.to_owned(), promoted] {
+        run(
+            &format!(
+                "{defs}#eval let f : Nat -> Nat := choose 10 7 (Forest.cons 7 (Tree.leaf 7 30) (Forest.nil 7)); f 2"
+            ),
+            "42",
+        );
+    }
 }
