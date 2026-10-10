@@ -483,7 +483,6 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "examples/native_induction_specialization.lean",
     "examples/native_matrix_recursion.lean",
     "examples/native_parameterized_recursion.lean",
-    "examples/native_pattern_matrices.lean",
     "examples/native_quotients.lean",
     "examples/native_recursion.lean",
     "examples/native_simp_hypotheses.lean",

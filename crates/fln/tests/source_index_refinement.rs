@@ -764,13 +764,15 @@ fn source_matches_connect_repeated_indices_and_field_names() {
 
 #[test]
 fn source_matches_refine_nonlocal_discriminants_and_nested_terms() {
+    // The index fields are `_`: a named one against a fixed index is the pin's "Type mismatch"
+    // (2026-10-10; source_pattern_typing.rs).
     check(&format!(
         "{VEC}\
         def second (xs : Vec Nat 2) : Nat := match xs with\n\
-          | .cons k x rest => match rest with\n\
-            | .cons j y tail => y\n\
+          | .cons _ x rest => match rest with\n\
+            | .cons _ y tail => y\n\
         def keep (xs : Vec Nat 1) : Vec Nat 1 := xs\n\
-        def head (xs : Vec Nat 1) : Nat := match keep xs with | .cons k x rest => x\n\
+        def head (xs : Vec Nat 1) : Nat := match keep xs with | .cons _ x rest => x\n\
         theorem second_ok : second (Vec.cons 1 5 (Vec.cons 0 9 Vec.nil)) = 9 := by rfl\n\
         theorem head_ok : head (Vec.cons 0 12 Vec.nil) = 12 := by rfl"
     ));
@@ -823,10 +825,12 @@ fn source_refinement_preserves_parameters_shared_with_indices() {
 
 #[test]
 fn source_refinement_infers_results_and_accepts_function_valued_branches() {
+    // The index fields are `_`: a named one against the fixed `1` is the pin's "Type mismatch"
+    // (2026-10-10; source_pattern_typing.rs).
     check(&format!(
         "{VEC}\
-        def head (xs : Vec Nat 1) := match xs with | .cons k x rest => x\n\
-        def shifted (xs : Vec Nat 1) : Nat -> Nat := match xs with | .cons k x rest => fun delta => x + delta\n\
+        def head (xs : Vec Nat 1) := match xs with | .cons _ x rest => x\n\
+        def shifted (xs : Vec Nat 1) : Nat -> Nat := match xs with | .cons _ x rest => fun delta => x + delta\n\
         theorem head_ok : head (Vec.cons 0 3 Vec.nil) = 3 := by rfl\n\
         theorem shift_ok : shifted (Vec.cons 0 3 Vec.nil) 8 = 11 := by rfl"
     ));
@@ -939,7 +943,8 @@ fn constrained_match_resource_exhaustion_is_not_a_language_rejection() {
         .unwrap()
         .engine;
     let root = engine.logical_root(&KVMap::new());
-    let source = b"def head (xs : Vec Nat 1) : Nat := match xs with | .cons k x rest => x";
+    // `_` in the index field: named, the pin refuses it ("Type mismatch", 2026-10-10).
+    let source = b"def head (xs : Vec Nat 1) : Nat := match xs with | .cons _ x rest => x";
     let mut small = limits;
     small.kernel.steps = 1;
     match engine.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(small)) {

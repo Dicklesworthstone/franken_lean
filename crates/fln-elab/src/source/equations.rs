@@ -72,6 +72,7 @@ impl Context {
         parameters: &mut Vec<LocalDecl>,
     ) -> Result<(Syntax, Expr), NatDefinitionElabError> {
         let arity = self.equation_arity(alternatives)?;
+        let start = parameters.len();
         let mut explicit = 0;
         let mut result_type = declared_type.clone();
         let mut discriminants = Vec::new();
@@ -123,6 +124,20 @@ impl Context {
                 pending.extend(args);
             }
         }
+        // The pin elaborates the equations as a match on the explicit parameters
+        // (`expandMatchAltsIntoMatch`), so their patterns are typed as a match's are.
+        let columns: Vec<(Expr, Expr)> = parameters[start..]
+            .iter()
+            .filter(|decl| decl.binder_info == BinderInfo::Default)
+            .map(|decl| (Expr::fvar(decl.id.clone()), decl.type_.clone()))
+            .collect();
+        let rows = expect_node(
+            alternatives,
+            &parser_kind(&["Term", "matchAlts"]),
+            1,
+            "equation alternatives",
+        )?;
+        self.check_pattern_typing(&columns, expect_null_args(&rows[0], "equation rows")?)?;
         let body = Syntax::node(
             parser_kind(&["Term", "match"]),
             vec![

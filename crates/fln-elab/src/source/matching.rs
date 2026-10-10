@@ -70,6 +70,8 @@ pub(super) struct MatchParts<'a> {
     pub(super) equation: Option<&'a Syntax>,
     alternatives: &'a [Syntax],
     pub(super) generated: bool,
+    /// A `match` as written in the source, not one a sugar or the compiler produced.
+    written: bool,
     conditional: Option<ConditionalParts<'a>>,
 }
 #[derive(Clone, Copy)]
@@ -266,6 +268,7 @@ impl Context {
                 equation: None,
                 alternatives: &[],
                 generated: true,
+                written: false,
                 conditional: Some(ConditionalParts {
                     binding,
                     yes: &rest[2],
@@ -298,6 +301,7 @@ impl Context {
                 equation: None,
                 alternatives: &[],
                 generated: true,
+                written: false,
                 conditional: Some(ConditionalParts {
                     binding,
                     yes: &parts[4],
@@ -355,6 +359,8 @@ impl Context {
             equation,
             alternatives,
             generated,
+            written: matches!(&parts[0], Syntax::Atom { info, .. }
+                if matches!(info, fln_syntax::source::SourceInfo::Original { .. })),
             conditional: None,
         })
     }
@@ -455,6 +461,14 @@ impl Context {
             } else {
                 return Err(error(MatchError::ExpectedCondition));
             }
+        }
+        // A match as written is refused where the pin refuses its patterns' types; the lowering
+        // below would solve index equations the pin leaves alone (`pattern_typing`).
+        if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
+            self.check_pattern_typing(
+                &[(major.value.clone(), major.type_.clone())],
+                parts.alternatives,
+            )?;
         }
         // Keep the existing direct/index-polymorphic path, including recursive
         // call lowering. Only the precise index-shape refusal selects the

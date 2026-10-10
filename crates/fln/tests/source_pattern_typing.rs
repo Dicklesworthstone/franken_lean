@@ -1,0 +1,150 @@
+//! A match's patterns are typed as the pin types them (bead `franken_lean-z8j.1.6.3`): a named
+//! pattern variable is rigid, `_` is not, a top-level pattern whose type does not unify is
+//! refined only along a path to a free variable, and a nested pattern is never refined.
+//!
+//! Every program's verdict was taken from the pinned `lean` (v4.32.0) on 2026-10-10 first, each
+//! on its own file; `set_option trace.Elab.match true` showed the refinement steps cited.
+#![forbid(unsafe_code)]
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckError, SourceCheckLimits};
+
+fn check(source: &str) -> Result<(), SourceCheckError> {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .map(|outcome| {
+            outcome.into_complete().unwrap();
+        })
+}
+
+fn accepted(source: &str) {
+    check(source).unwrap_or_else(|error| panic!("the pin accepts:\n{source}\n{error:?}"));
+}
+
+/// Refused for the pin's reason: a type mismatch of a pattern, not some other gap.
+fn mismatched(source: &str) {
+    match check(source) {
+        Ok(()) => panic!("the pin refuses this program (Type mismatch):\n{source}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("TypeMismatch"),
+            "{source}\n{error:?}"
+        ),
+    }
+}
+
+const VEC: &str = "inductive Vec (A : Type) : Nat → Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (x : A) (xs : Vec A n) : Vec A (n + 1)\n";
+const F: &str = "inductive F : Nat → Type where\n  | nil (n : Nat) : F n\n  | cons (n : Nat) (t : F n) : F (n + 1)\n";
+
+/// `k + 1 =?= 2` with `k` rigid fails, and no path leads from the literal `2` (nor from
+/// `Nat.succ 1`, which `whnfD` folds to it) to a variable; `_` unifies (`?m := 1`).
+#[test]
+fn a_named_field_against_a_literal_index_is_a_mismatch() {
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat 2) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat (Nat.succ 1)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}def f (xs : Vec Nat 2) : Nat := match xs with | .cons _ x _ => x\n"
+    ));
+    // As equations too (the pin elaborates them as a match on the parameters).
+    mismatched(&format!(
+        "{VEC}def f : Vec Nat 2 → Nat\n  | .cons k x _ => x\n"
+    ));
+}
+
+/// `Nat.succ n` reaches the variable `n`, which becomes a discriminant (traced: `index to
+/// include: n`). `n + 1` unfolds to `Nat.succ (n.add 0)`, and the index taken from the
+/// discriminant's type is `n.add 0`, already a discriminant on the retry (traced twice), so
+/// the first error stands.
+#[test]
+fn a_refinement_path_needs_a_variable_in_the_discriminants_own_type() {
+    accepted(&format!(
+        "{VEC}def f (n : Nat) (xs : Vec Nat (Nat.succ n)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (n : Nat) (xs : Vec Nat (n + 1)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+}
+
+/// A variable index is refined; so is a literal one when the pattern's own index is a named
+/// field (traced: `index to include: 3`).
+#[test]
+fn a_variable_on_either_side_refines() {
+    accepted(&format!(
+        "{VEC}def f (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => n | .cons k x _ => x + k + n\n"
+    ));
+    accepted(&format!(
+        "{F}def g (n : Nat) (xs : F n) : Nat := match xs with | .nil k => k | .cons k t => k\n"
+    ));
+    accepted(&format!(
+        "{F}def g (xs : F 3) : Nat := match xs with | .nil k => k | .cons k t => k\n"
+    ));
+}
+
+/// A nested pattern is an argument, never refined: against `Vec Nat k` (`k` named) or
+/// `Vec Nat 1` (after `?m := 1`) a constructor of another index is the pin's
+/// `Application type mismatch`.
+#[test]
+fn a_nested_pattern_is_never_refined() {
+    mismatched(&format!(
+        "{VEC}def f (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x .nil => x | .cons k x (.cons j y _) => y\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat 2) : Nat := match xs with | .cons _ x (.cons j y _) => y\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat 2) : Nat := match xs with | .cons k x (.cons j y _) => y\n"
+    ));
+}
+
+/// Two discriminants share `n`: after the first row refines it, a named field in both
+/// columns asks `j + 1 =?= k + 1` of two rigid locals, and the path found leads into `n`
+/// itself, already a discriminant. One named column is fine.
+#[test]
+fn shared_indices_admit_one_named_column() {
+    mismatched(&format!(
+        "{VEC}def f (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with | .nil, .nil => 0 | .cons k x _, .cons j y _ => x + y\n"
+    ));
+    accepted(&format!(
+        "{VEC}def f (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with | .nil, .nil => 0 | .cons k x _, .cons _ y _ => x + y\n"
+    ));
+    accepted(&format!(
+        "{VEC}def f (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with | .nil, .nil => 0 | .cons _ x _, .cons j y _ => x + y\n"
+    ));
+    accepted(&format!(
+        "{VEC}def f (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with | .nil, .nil => 0 | .cons _ x _, .cons _ y _ => x + y\n"
+    ));
+}
+
+/// An earlier scalar column fixes the index to `Nat.succ k` with `k` rigid: a named field
+/// after it asks `j + 1 =?= k + 1` of two pattern variables, and the path found leads into `n`.
+#[test]
+fn an_earlier_columns_pattern_fixes_the_index_rigidly() {
+    mismatched(&format!(
+        "{VEC}def first (n : Nat) (xs : Vec Nat n) : Nat := match n, xs with | .zero, .nil => 0 | .succ k, .cons j x tail => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}def first (n : Nat) (xs : Vec Nat n) : Nat := match n, xs with | .zero, .nil => 0 | .succ k, .cons _ x tail => x\n"
+    ));
+}
+
+/// In equations a named first column is a rigid variable, which `.nil`'s index cannot meet:
+/// the refinement's index is that column itself.
+#[test]
+fn an_equations_named_index_column_is_rigid() {
+    accepted(&format!(
+        "{VEC}def f : (n : Nat) → Vec Nat n → Nat\n  | _, .nil => 0\n  | _, .cons k x _ => x + k\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f : (n : Nat) → Vec Nat n → Nat\n  | n, .nil => 0\n  | n, .cons k x _ => x + k\n"
+    ));
+}

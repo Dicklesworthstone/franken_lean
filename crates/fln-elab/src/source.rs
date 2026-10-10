@@ -39,6 +39,7 @@ mod matching;
 mod numeric;
 mod operators;
 mod overload;
+mod pattern_typing;
 mod patterns;
 mod record;
 mod record_terms;
@@ -479,6 +480,10 @@ struct Context {
     inaccessible_columns: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
+    // A written match the pattern-matrix compiler lowered, by its last input's binder: the
+    // inputs in order and the alternatives' patterns, typed as the pin types them once that
+    // binder is in scope (`pattern_typing`).
+    pattern_typing_checks: std::collections::HashMap<Name, (Vec<Name>, Vec<Syntax>)>,
     // The instance registry, re-read only when it can have changed: every
     // numeric literal, operator and coercion asks it.
     registry_cache: crate::instances::RegistryCache,
@@ -548,6 +553,7 @@ impl Context {
             matrix_rows: std::collections::HashSet::new(),
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
+            pattern_typing_checks: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
@@ -3201,6 +3207,22 @@ impl Context {
                                     value.type_.clone(),
                                     value.value.clone(),
                                 );
+                            }
+                            // Every input of a lowered written match is in scope now.
+                            if let Some((inputs, alternatives)) =
+                                self.pattern_typing_checks.remove(&name)
+                            {
+                                let discriminants = inputs
+                                    .iter()
+                                    .map(|input| {
+                                        self.txn.lctx.find_by_user_name(input).and_then(|decl| {
+                                            Some((decl.value.clone()?, decl.type_.clone()))
+                                        })
+                                    })
+                                    .collect::<Option<Vec<_>>>();
+                                if let Some(discriminants) = discriminants {
+                                    self.check_pattern_typing(&discriminants, &alternatives)?;
+                                }
                             }
                             tasks.push(Task::LetBody(saved, id, name, value, opaque, inline));
                             tasks.push(Task::Visit(body, expected, true));

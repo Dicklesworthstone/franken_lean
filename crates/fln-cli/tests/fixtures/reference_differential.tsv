@@ -91,7 +91,7 @@ examples/native_option_decide.lean	accept	accept	match	agree	drop-in lean accept
 examples/native_parameterized_recursion.lean	reject	accept	n/a	missing-prelude	Reference 1: `Seq` has already been declared | user file redefines an Init declaration FrankenLean lacks (franken_lean-z8j.1.8)
 examples/native_pattern_functions.lean	accept	accept	match	agree	
 examples/native_pattern_matching.lean	reject	reject	n/a	agree	Reference 37: failed to synthesize instance of type class | FrankenLean: command 13, native instance search could not resolve all instance arguments
-examples/native_pattern_matrices.lean	reject	accept	n/a	fln-defect	Reference 28: Type mismatch | elaboration accepts a term the Reference rejects (franken_lean-z8j.1.6.3)
+examples/native_pattern_matrices.lean	reject	reject	n/a	agree	fixed: both doors refuse at the Reference's first error, 28: Type mismatch: `second`'s named fields where the discriminant fixes the index to the literal 2 (the pin's pattern typing, franken_lean-z8j.1.6.3; FrankenLean reports the nested `.cons j y rest` against `Vec Nat k`, which the pin postpones behind the outer pattern)
 examples/native_proof_data.lean	accept	accept	match	agree	
 examples/native_proof_erasure.lean	accept	accept	match	agree	
 examples/native_proof_indices.lean	accept	accept	match	agree	

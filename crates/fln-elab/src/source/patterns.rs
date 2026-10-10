@@ -806,6 +806,35 @@ impl Context {
             subjects.push(fresh.clone());
             inputs.push((fresh, self.copy_pattern_syntax(&parts[1])?));
         }
+        // A match as written is typed as the pin types its patterns once every input is bound
+        // (`pattern_typing`); the bodies play no part, so only the pattern rows are kept.
+        if !recursive_root
+            && matches!(&parts[0], Syntax::Atom { info, .. } if matches!(info, SourceInfo::Original { .. }))
+            && let Some((last, _)) = inputs.last()
+        {
+            let mut patterns = Vec::new();
+            for alt in alts {
+                self.tick()?;
+                let parts =
+                    expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
+                patterns.push(Syntax::node(
+                    parser_kind(&["Term", "matchAlt"]),
+                    vec![
+                        parts[0].clone(),
+                        self.copy_pattern_syntax(&parts[1])?,
+                        parts[2].clone(),
+                        wildcard(),
+                    ],
+                ));
+            }
+            self.pattern_typing_checks.insert(
+                last.clone(),
+                (
+                    inputs.iter().map(|(name, _)| name.clone()).collect(),
+                    patterns,
+                ),
+            );
+        }
         // Structural selection changes the decision-tree split, not argument
         // order or row priority. Original inputs retain their checked bindings.
         let root_column = recursive_column.unwrap_or(0);
