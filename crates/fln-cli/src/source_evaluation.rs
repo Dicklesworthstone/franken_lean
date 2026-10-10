@@ -236,7 +236,7 @@ fn exception_message(
     }
 }
 
-fn raised(
+pub(super) fn raised(
     execution: &fln::DefinitionExecution,
     runtime_type: &fln::Expr,
     exit: fln::VmExit,

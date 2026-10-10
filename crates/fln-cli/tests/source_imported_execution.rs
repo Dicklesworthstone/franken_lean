@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "source_imported_execution/io_printing.rs"]
 mod io_printing;
+#[path = "source_imported_execution/main_run.rs"]
+mod main_run;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -49,6 +51,16 @@ impl Workspace {
             stderr: String::from_utf8(output.stderr).unwrap(),
         }
     }
+}
+
+// These two installed IO fixtures use the same Lean binary and actual import
+// roots. A serial validation can explicitly share verified admission records;
+// ordinary test invocations retain each workspace's private store.
+fn full_io_records(workspace: &Workspace) -> PathBuf {
+    std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_absolute())
+        .unwrap_or_else(|| workspace.0.join("records"))
 }
 
 #[derive(Debug)]

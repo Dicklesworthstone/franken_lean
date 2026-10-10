@@ -296,11 +296,32 @@ impl Loaded {
 
 pub(super) fn load(
     paths: &[PathBuf],
+    sources: Vec<Vec<u8>>,
+    total_bytes: usize,
+    max_bytes: usize,
+) -> Result<Loaded, Failure> {
+    load_with_implicit_init(paths, sources, total_bytes, max_bytes, false)
+}
+
+/// Ordinary Lean execution gives every non-prelude source module an implicit
+/// Init edge. Keep the actual bytes intact for budgets and diagnostic offsets.
+pub(super) fn load_lean(
+    paths: &[PathBuf],
+    sources: Vec<Vec<u8>>,
+    total_bytes: usize,
+    max_bytes: usize,
+) -> Result<Loaded, Failure> {
+    load_with_implicit_init(paths, sources, total_bytes, max_bytes, true)
+}
+
+fn load_with_implicit_init(
+    paths: &[PathBuf],
     mut sources: Vec<Vec<u8>>,
     mut total_bytes: usize,
     max_bytes: usize,
+    implicit_init: bool,
 ) -> Result<Loaded, Failure> {
-    let mut has_headers = false;
+    let mut has_headers = implicit_init;
     for (path, source) in paths.iter().zip(&sources) {
         let header = parse_source_header(source)
             .map_err(|error| Failure::input(format!("{}: {error}", path.display())))?;
@@ -361,7 +382,7 @@ pub(super) fn load(
                 Failure::new(class, &error.to_string(), authority, exit)
             },
         )?;
-        if header.module_system && !header.prelude {
+        if (implicit_init || header.module_system) && !header.prelude {
             header.imports.insert(0, Name::from_components(["Init"]));
         }
         import_rows = import_rows
@@ -809,6 +830,97 @@ fn checked_module_path(
 mod tests {
     use super::*;
     use fln_olean::region::OleanView;
+
+    #[test]
+    fn main_loader_keeps_original_sources_and_implicit_init_edges_per_module() {
+        // This checks filesystem discovery only. The empty local Init module
+        // supplies no declarations and is never used as a native IO fixture.
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory(std::env::temp_dir().join(format!("fln-main-import-{nonce}")));
+        std::fs::create_dir(&directory.0).unwrap();
+        let path = directory.0.join("Main.lean");
+        let init = b"prelude\n".to_vec();
+        let local = b"-- ordinary dependency\n".to_vec();
+        std::fs::write(directory.0.join("Init.lean"), &init).unwrap();
+        std::fs::write(directory.0.join("Local.lean"), &local).unwrap();
+
+        let source = b"-- original UTF-8: \xce\xbb\n".to_vec();
+        std::fs::write(&path, &source).unwrap();
+        let loaded = load_lean(
+            std::slice::from_ref(&path),
+            vec![source.clone()],
+            source.len(),
+            4096,
+        )
+        .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        let Inputs::Modules { names, sources } = loaded.inputs else {
+            panic!("main needs a module graph");
+        };
+        assert_eq!(
+            names,
+            [
+                Name::from_components(["Main"]),
+                Name::from_components(["Init"])
+            ]
+        );
+        assert_eq!(sources, [source.clone(), init.clone()]);
+        assert_eq!(loaded.total_bytes, source.len() + init.len());
+        assert!(loaded.oleans.is_empty());
+        assert!(matches!(
+            load(
+                std::slice::from_ref(&path),
+                vec![source.clone()],
+                source.len(),
+                4096
+            )
+            .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail))
+            .inputs,
+            Inputs::Files(_)
+        ));
+
+        // Prelude applies to this file; its ordinary dependency still imports
+        // Init. No prefix is inserted into either file's byte stream.
+        let source = b"prelude\nimport Local\n".to_vec();
+        std::fs::write(&path, &source).unwrap();
+        let loaded = load_lean(
+            std::slice::from_ref(&path),
+            vec![source.clone()],
+            source.len(),
+            4096,
+        )
+        .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        let Inputs::Modules { names, sources } = loaded.inputs else {
+            panic!("expected graph");
+        };
+        assert_eq!(
+            names,
+            [
+                Name::from_components(["Main"]),
+                Name::from_components(["Local"]),
+                Name::from_components(["Init"])
+            ]
+        );
+        assert_eq!(sources, [source.clone(), local.clone(), init.clone()]);
+        let error = load_lean(
+            &[path],
+            vec![source.clone()],
+            source.len(),
+            source.len() + local.len() + init.len() - 1,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.class, "resource");
+        assert_eq!(error.exit, 3);
+    }
 
     /// The capture ceiling check-source gives the importer must hold the
     /// pinned `Init` closure's extension payloads, or `import Init` is a

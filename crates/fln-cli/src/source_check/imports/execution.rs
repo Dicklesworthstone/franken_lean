@@ -3,7 +3,8 @@
 //! command output through that door's own printer. Neither publishes an artifact.
 use super::*;
 use fln::source_check::modules::execution::{
-    SourceProgramExecution, SourceProgramLimits, preflight_source_program,
+    SourceProgramExecution, SourceProgramLimits, preflight_lean_source_program,
+    preflight_source_program,
 };
 
 const SCHEMA: &str = "fln.source-program/1";
@@ -113,6 +114,7 @@ fn append(output: &mut String, text: &str) -> Result<(), Failure> {
 
 /// A legacy input is left to the existing runner, including its old diagnostics.
 /// Header parsing and admission stay on a worker sized for imported declarations.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::source_check) fn run(
     paths: &[PathBuf],
     max_bytes: usize,
@@ -121,8 +123,21 @@ pub(in crate::source_check) fn run(
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
+    main_arguments: Option<Vec<String>>,
 ) -> Option<MultiplexerOutput> {
-    let sources = read_source_batch(paths, max_bytes).ok()?;
+    let sources = match read_source_batch(paths, max_bytes) {
+        Ok(sources) => sources,
+        Err(error) if main_arguments.is_some() => {
+            return Some(source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                SourcePresentation::Lean,
+                error.exit_code(),
+            ));
+        }
+        Err(_) => return None,
+    };
     let paths = paths.to_vec();
     let worker = std::thread::Builder::new()
         .name("fln-imported-source-run".to_owned())
@@ -130,12 +145,18 @@ pub(in crate::source_check) fn run(
         .spawn(move || {
             crate::stdout_capture::optional_json(
                 matches!(presentation, Presentation::Fln { json: true }), SCHEMA, || {
-            let headers = sources
+            let headers = match sources
                 .iter()
                 .map(|source| parse_source_header(source))
                 .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            if !headers.iter().any(|header| header.prelude || header.module_system || !header.imports.is_empty()) {
+            {
+                Ok(headers) => headers,
+                Err(error) if main_arguments.is_some() => {
+                    return Some(failure(Failure::input(error.to_string()), presentation));
+                }
+                Err(_) => return None,
+            };
+            if main_arguments.is_none() && !headers.iter().any(|header| header.prelude || header.module_system || !header.imports.is_empty()) {
                 return None;
             }
             // Explicit source batches keep their existing caller-ordered route.
@@ -149,7 +170,7 @@ pub(in crate::source_check) fn run(
             // among bounded ancestors. Preserve that route before the import
             // loader (whose explicit module root is the entry's directory).
             // A transitive `prelude` still requires an empty, isolated world.
-            let local = (!headers[0].prelude && !headers[0].module_system)
+            let local = (main_arguments.is_none() && !headers[0].prelude && !headers[0].module_system)
                 .then(|| discover_source_closure(paths[0].clone(), max_bytes));
             match &local {
                 Some(Ok(discovered))
@@ -176,14 +197,18 @@ pub(in crate::source_check) fn run(
                 _ => {}
             }
             let total = sources.iter().map(Vec::len).sum();
-            let loaded = match load(&paths, sources, total, max_bytes) {
+            let loaded = match if main_arguments.is_some() {
+                load_lean(&paths, sources, total, max_bytes)
+            } else {
+                load(&paths, sources, total, max_bytes)
+            } {
                 Ok(loaded) => loaded,
                 Err(error) => return Some(failure(error, presentation)),
             };
             let Inputs::Modules { names, sources } = &loaded.inputs else {
                 return None;
             };
-            let explicit_world = !loaded.oleans.is_empty()
+            let explicit_world = main_arguments.is_some() || !loaded.oleans.is_empty()
                 || sources.iter().any(|source| {
                     parse_source_header(source).is_ok_and(|header| header.prelude || header.module_system)
                 });
@@ -206,7 +231,12 @@ pub(in crate::source_check) fn run(
             ));
             limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
-            if let Err(error) = preflight_source_program(&inputs, limits.modules) {
+            let preflight = if main_arguments.is_some() {
+                preflight_lean_source_program(&inputs, limits.modules)
+            } else {
+                preflight_source_program(&inputs, limits.modules)
+            };
+            if let Err(error) = preflight {
                 return Some(failure(module_error(error), presentation));
             }
             let (imported_engine, base) = match loaded.base_engine(
@@ -232,9 +262,16 @@ pub(in crate::source_check) fn run(
                 imported_engine.environment().contains(&Name::from_components(["Repr"])),
                 imported_engine.environment().contains(&Name::from_components(["ToString"])),
             );
-            let completed = match receipt.execute_source_modules_with_presentation(
-                &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
-            ) {
+            let execution = if main_arguments.is_some() {
+                receipt.execute_lean_source_modules_with_presentation(
+                    &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
+                )
+            } else {
+                receipt.execute_source_modules_with_presentation(
+                    &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
+                )
+            };
+            let completed = match execution {
                 Ok(Outcome::Complete(completed)) => completed,
                 Ok(Outcome::Inconclusive(reason)) => return Some(failure(Failure::new(
                     "inconclusive", &format!("source program did not finish: {reason:?}"), false, 3,
@@ -250,7 +287,15 @@ pub(in crate::source_check) fn run(
                     &names[0],
                     headers[0].prelude && !loaded.reaches(&Name::from_components(["Init"])),
                 ) {
-                    Ok(output) => output,
+                    Ok(output) => match main_arguments.as_ref() {
+                        Some(arguments) => main_output(
+                            &completed,
+                            arguments,
+                            limits.execution,
+                            output,
+                        ),
+                        None => output,
+                    },
                     Err(error) => failure(error, presentation),
                 },
                 Presentation::Fln { json } => {
@@ -383,6 +428,41 @@ fn lean_output(
         ));
     }
     Ok(render_lean_source_commands(&module.commands))
+}
+
+/// A dependency's saved guard messages must succeed before main is selected.
+/// Only batches with guards need this additional presentation pass. The
+/// existing renderer validates its complete command/index tables, so keep the
+/// whole retained batch instead of constructing a partial guard-only view.
+/// Successful dependency output is discarded; no declaration or action reruns.
+fn main_output(
+    program: &SourceProgramExecution,
+    arguments: &[String],
+    limits: fln::EngineExecutionLimits,
+    frontend: MultiplexerOutput,
+) -> MultiplexerOutput {
+    if frontend.exit_code != 0 {
+        return frontend;
+    }
+    let Some((entry, dependencies)) = program.modules.split_last() else {
+        let mut failed = failure(
+            internal("source program did not retain its entry before main"),
+            Presentation::Lean,
+        );
+        failed.stdout = frontend.stdout;
+        return failed;
+    };
+    for dependency in dependencies {
+        if dependency.commands.guards.is_empty() {
+            continue;
+        }
+        let mut presented = render_lean_source_commands(&dependency.commands);
+        if presented.exit_code != 0 {
+            presented.stdout = frontend.stdout;
+            return presented;
+        }
+    }
+    crate::source_main::execute(&entry.commands, arguments, limits, frontend)
 }
 
 fn render(
@@ -716,6 +796,89 @@ mod tests {
                     .starts_with(&format!("lean: {}: ", expected.0))
             );
         }
+    }
+
+    #[test]
+    fn dependency_guards_are_judged_before_main_without_publishing_dependency_output() {
+        std::thread::Builder::new()
+            .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+            .spawn(|| {
+                let limits = fln::EngineExecutionLimits::new(fln::Budget::for_stack_bytes(
+                    SOURCE_RUN_KERNEL_STACK_BYTES,
+                ));
+                let engine = fln::Engine::with_source_seed(limits.admission())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                for expected in [2, 999] {
+                    let dependency = engine
+                        .execute_source_commands_with_checks(
+                            format!("#eval 11\n/-- info: {expected} -/\n#guard_msgs in\n#eval 2\n")
+                                .as_bytes(),
+                            &fln::KVMap::new(),
+                            limits,
+                        )
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                    assert_eq!(dependency.guards.len(), 1);
+                    let judged = render_lean_source_commands(&dependency);
+                    if expected == 2 {
+                        assert_eq!(judged.exit_code, 0, "{}", judged.stderr);
+                        assert_eq!(judged.stdout, "11\n");
+                    } else {
+                        assert_eq!(judged.exit_code, 1);
+                        assert!(judged.stderr.starts_with("lean: guard-msgs:"));
+                    }
+                    // This genuinely checked declaration deliberately has an
+                    // invalid executable signature. Its distinct selection
+                    // error proves whether the saved dependency guard allowed
+                    // the main path to proceed; no synthetic VM result is used.
+                    let commands = engine
+                        .execute_source_commands_with_checks(
+                            b"def main : Nat := 7\n#eval 42\n",
+                            &fln::KVMap::new(),
+                            limits,
+                        )
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                    let program = SourceProgramExecution {
+                        modules: vec![
+                            SourceModuleExecution {
+                                module: Name::from_components(["Dependency"]),
+                                commands: dependency,
+                            },
+                            SourceModuleExecution {
+                                module: Name::from_components(["Main"]),
+                                commands,
+                            },
+                        ],
+                    };
+                    let frontend =
+                        match lean_output(&program, &Name::from_components(["Main"]), false) {
+                            Ok(frontend) => frontend,
+                            Err(error) => {
+                                panic!("retained source commands must finish: {}", error.detail)
+                            }
+                        };
+                    assert_eq!(frontend.exit_code, 0);
+                    assert_eq!(frontend.stdout, "42\n");
+                    let result = main_output(&program, &[], limits, frontend);
+                    assert_eq!(result.exit_code, 1);
+                    assert_eq!(result.stdout, "42\n");
+                    if expected == 2 {
+                        assert!(result.stderr.contains("`main` function must have type"));
+                        assert!(!result.stderr.contains("guard-msgs"));
+                    } else {
+                        assert!(result.stderr.starts_with("lean: guard-msgs:"));
+                        assert!(!result.stderr.contains("`main` function must have type"));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

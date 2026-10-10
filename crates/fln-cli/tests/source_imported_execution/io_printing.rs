@@ -26,7 +26,7 @@ fn lean_io(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(entry)
         .env("LEAN_PATH", lib)
-        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("records"))
+        .env("FLN_IMPORT_REUSE_DIR", full_io_records(workspace))
         .output()
         .expect("run the installed lean");
     let run = Run {

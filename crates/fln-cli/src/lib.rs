@@ -13,6 +13,7 @@ mod lake_build;
 mod output;
 mod source_check;
 mod source_evaluation;
+mod source_main;
 mod stdout_capture;
 
 pub use output::write_output;
@@ -361,6 +362,7 @@ const LEAN_USAGE: &str = concat!(
     "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
     "  lean --stdin [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N]\n",
     "  lean --src-deps [--max-bytes BYTES] PATH\n",
+    "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] --run PATH [ARG...]\n",
     "  lean --help\n",
     "  lean -v | --version\n",
     "  lean -V | --short-version\n",
@@ -400,6 +402,14 @@ const LEAN_USAGE: &str = concat!(
     "FrankenLean extensions stop with exit 3 and do not change elaboration fuel.\n",
     "--src-deps prints validated direct local source imports in source order\n",
     "without elaborating or executing the file.\n",
+    "--run (or -r) checks the source and runs main once in its admitted import\n",
+    "world, including implicit Init for files without prelude. Main accepts\n",
+    "IO Unit, IO PUnit, IO UInt32, or one List String argument followed by one\n",
+    "of those results. Unit and PUnit return status zero; UInt32 supplies the\n",
+    "process status. Options stop at --run: PATH is next, and all remaining\n",
+    "tokens are script arguments. --max-bytes separately bounds their UTF-8\n",
+    "bytes plus one byte per argument. Main text stdout follows frontend\n",
+    "messages in a bounded 16 MiB output; accepted output survives exceptions.\n",
     "-q and --quiet are accepted on source operations; this bounded personality\n",
     "currently has no verbose success messages for them to suppress. --githash\n",
     "prints the exact pinned Reference commit, and --features reports [] because\n",
@@ -582,6 +592,12 @@ enum LeanCommand {
     },
     Source {
         path: PathBuf,
+        max_bytes: usize,
+        vm_limits: fln::VmExecutionLimits,
+    },
+    Run {
+        path: PathBuf,
+        arguments: Result<Vec<String>, source_main::ArgumentsError>,
         max_bytes: usize,
         vm_limits: fln::VmExecutionLimits,
     },
@@ -1973,6 +1989,26 @@ fn parse_lean_command(
         if options && argument == "--" {
             options = false;
             continue;
+        }
+        if options && (argument == "--run" || argument == "-r") {
+            if stdin_source || source_dependencies || path.is_some() {
+                return Err(UsageError(
+                    "--run requires its own source path and cannot be combined with --stdin or --src-deps"
+                        .to_owned(),
+                ));
+            }
+            // The pin stops option processing at --run, before consuming the
+            // file name. Every later token belongs to the script unchanged.
+            let path = arguments
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| UsageError("--run requires a source path".to_owned()))?;
+            return Ok(LeanCommand::Run {
+                path: PathBuf::from(path),
+                arguments: source_main::arguments(arguments, max_bytes),
+                max_bytes,
+                vm_limits: vm_options.limits,
+            });
         }
         if options && vm_options.take(&argument, &mut arguments)? {
             continue;
@@ -14228,6 +14264,12 @@ fn run_lean_with_optional_input(
             max_bytes,
             vm_limits,
         }) => run_lean_source(path, max_bytes, vm_limits),
+        Ok(LeanCommand::Run {
+            path,
+            arguments,
+            max_bytes,
+            vm_limits,
+        }) => source_main::run(path, arguments, max_bytes, vm_limits),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }

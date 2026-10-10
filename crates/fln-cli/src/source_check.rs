@@ -41,6 +41,7 @@ pub(super) fn run_imported(
         jobs,
         posture,
         vm_limits,
+        None,
     )
 }
 
@@ -63,7 +64,37 @@ pub(super) fn run_imported_lean(
         default_import_jobs(),
         ImportPosture::ReuseVerified,
         vm_limits,
+        None,
     )
+}
+
+/// Execute a script in its ordinary Lean import world, then invoke its main.
+/// This route never falls back to the import-free synthetic source seed.
+pub(super) fn run_imported_lean_main(
+    path: &Path,
+    arguments: Vec<String>,
+    max_bytes: usize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run(
+        &[path.to_path_buf()],
+        max_bytes,
+        imports::execution::Presentation::Lean,
+        false,
+        default_import_jobs(),
+        ImportPosture::ReuseVerified,
+        vm_limits,
+        Some(arguments),
+    )
+    .unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the executable source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
 }
 
 /// Remove `--import-posture P` / `--import-posture=P` from an interactive front
