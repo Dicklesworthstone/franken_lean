@@ -217,12 +217,55 @@ theorem chain_yes : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chai
 theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl
 "#);
 
+            // Preserve the former unsupported command as a checked positive,
+            // then execute its comparison over the actual imported library.
+            let combined = checked(base, "structure Partial where\n n : Nat\nderiving Repr, BEq");
+            for generated in [
+                "instReprPartial",
+                "instReprPartial.repr",
+                "instBEqPartial",
+                "instBEqPartial.beq",
+            ] {
+                assert!(
+                    matches!(combined.environment().find(&name(generated)), Some(ConstantInfo::Defn(_))),
+                    "{generated}",
+                );
+            }
+            let execution = combined
+                .execute_source_definitions(
+                    &[b"#eval if Partial.mk 7 == Partial.mk 7 then 42 else 0\n#eval if Partial.mk 7 == Partial.mk 8 then 1 else 0"],
+                    &KVMap::new(),
+                    fln::EngineExecutionLimits::new(admission().kernel),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("derived BEq executes over the actual imported library");
+            assert_eq!(execution.executions.len(), 2);
+            for (execution, expected) in execution.executions.iter().zip(["42", "0"]) {
+                let fln::VmExit::Returned(value) = &execution.exit else {
+                    panic!("imported-library comparison did not return")
+                };
+                assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(expected));
+                let replay = fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &KVMap::new(),
+                    Default::default(),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("the imported comparison's serialized bytecode executes");
+                let fln::VmExit::Returned(value) = replay else {
+                    panic!("imported-library bytecode did not return")
+                };
+                assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(expected));
+            }
+
             for invalid in [
                 "structure Bad where\n  run : Nat → Nat\nderiving Repr",
                 "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
                 "inductive Recursive where\n | node (next : Recursive)\nderiving Repr",
                 "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
-                "structure Partial where\n n : Nat\nderiving Repr, UnknownHandler",
+                "structure Partial where\n n : Nat\nderiving Repr, BEq, UnknownHandler",
             ] {
                 assert!(
                     base.check_source_files(
