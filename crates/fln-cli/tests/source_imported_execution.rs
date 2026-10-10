@@ -1,6 +1,6 @@
-//! The installed FlN raw-result front door over actual admitted import bytes.
-//! Reference `#eval` formatting is a different surface: Init.Prelude alone
-//! does not supply Repr/ToString for these natural-number evaluations.
+//! Installed source execution over actual admitted import bytes.
+//! FlN retains its raw result surface; the Lean door selects checked printers.
+//! Init.Prelude alone does not supply Repr/ToString for natural-number evaluations.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -483,6 +483,85 @@ fn the_lean_door_runs_a_file_that_imports_a_compiled_module() {
     );
 }
 
+/// The actual imported Repr class selects a checked user printer. Its result
+/// reaches presentation as Format: quoted text is not quoted a second time,
+/// line constructors retain trailing newlines, and #guard_msgs sees the text.
+/// These expectations follow the explicit text/line constructors in the source;
+/// this test does not claim a fresh execution of the Reference compiler.
+#[test]
+fn the_lean_door_uses_checked_printers_and_keeps_guard_messages_unquoted() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-checked-printers");
+    let definitions = r#"prelude
+import Init.Data.Repr
+inductive Printed where
+  | value
+instance : Repr Printed where
+  reprPrec _ _ := Std.Format.text "\"already rendered λ\""
+inductive Terminated where
+  | value
+instance : Repr Terminated where
+  reprPrec _ _ := Std.Format.text "already terminated\n"
+inductive Multiline where
+  | value
+instance : Repr Multiline where
+  reprPrec _ _ := Std.Format.append (Std.Format.text "first")
+    (Std.Format.append Std.Format.line (Std.Format.append (Std.Format.text "second")
+      (Std.Format.append Std.Format.line Std.Format.line)))
+"#;
+    let entry = workspace.write(
+        "Printed.lean",
+        format!(
+            "{definitions}#eval true\n#eval (42 : Nat)\n#eval Printed.value\n\
+             /-- info: \"already rendered λ\" -/\n#guard_msgs in\n#eval Printed.value\n\
+             #eval Terminated.value\n#eval Multiline.value\n\
+             /--\ninfo: first\nsecond\n\n-/\n#guard_msgs in\n#eval Multiline.value\n"
+        ),
+    );
+    let printed = lean_door(&workspace, &entry, &lib);
+    assert_eq!(printed.code, 0, "{printed:?}");
+    assert!(printed.stderr.is_empty(), "{printed:?}");
+    assert_eq!(
+        printed.stdout, "true\n42\n\"already rendered λ\"\nalready terminated\nfirst\nsecond\n\n",
+        "{printed:?}"
+    );
+
+    // The record store is reused for the same imported closure. A failed
+    // guarded message still discards an earlier otherwise successful output.
+    let mismatch = workspace.write(
+        "Mismatch.lean",
+        format!(
+            "{definitions}#eval true\n\
+             /-- info: a different message -/\n#guard_msgs in\n#eval Printed.value\n"
+        ),
+    );
+    let refused = lean_door(&workspace, &mismatch, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("Docstring on `#guard_msgs` does not match generated message"),
+        "{refused:?}"
+    );
+    assert!(
+        refused.stderr.contains("info: \"already rendered λ\""),
+        "{refused:?}"
+    );
+
+    // The raw FlN door keeps the original Nat payload even in a world with
+    // actual printer instances; it does not serialize the new Format result.
+    let raw = workspace.write(
+        "Raw.lean",
+        "prelude\nimport Init.Data.Repr\n#eval (42 : Nat)\n",
+    );
+    let raw = workspace.run(&raw, Some(&lib), &["--jobs=1"]);
+    assert!(
+        raw.complete().contains("\"kind\":\"nat\",\"value\":42"),
+        "{raw:?}"
+    );
+}
+
 /// What did not change, and what a missing import now says. No pin is needed:
 /// the search path is an empty directory.
 #[test]
@@ -584,9 +663,13 @@ fn a_prelude_world_without_init_never_prints_an_eval() {
     assert_eq!(refused.code, 5, "{refused:?}");
     assert!(refused.stdout.is_empty(), "{refused:?}");
     assert!(
+        refused.stderr.starts_with("lean: capability: "),
+        "{refused:?}"
+    );
+    assert!(
         refused
             .stderr
-            .starts_with("lean: capability: this prelude file's imports do not reach `Init`"),
+            .contains("#eval requires an existing Repr or ToString instance"),
         "{refused:?}"
     );
 }

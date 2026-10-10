@@ -11791,6 +11791,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     }
 
     let mut stdout = String::new();
+    let mut formatted_output = source_evaluation::FormattedOutputBudget::new(16 * 1024 * 1024);
     let mut previous_output_command = None;
     let mut evaluation_output_position = 0_usize;
     let mut check_output_position = 0_usize;
@@ -11854,6 +11855,21 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 }
                 evaluation_output_position += 1;
+                let formatted = match source_evaluation::formatted(execution) {
+                    Ok(formatted) => formatted,
+                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
+                };
+                if let Some(text) = formatted {
+                    // Repr/ToString already chose and constructed this Format.
+                    // Applying the scalar String printer would quote it again.
+                    let messages = guarded
+                        .get_mut(&command_index)
+                        .map(|(messages, _)| messages);
+                    if let Err(error) = formatted_output.append(&text, &mut stdout, messages) {
+                        return error.failure(command_index, SourcePresentation::Lean);
+                    }
+                    continue;
+                }
                 let value = match source_evaluation::value(execution) {
                     Ok(Some(value)) => value,
                     Ok(None) => {

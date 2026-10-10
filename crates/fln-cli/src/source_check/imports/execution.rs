@@ -18,6 +18,32 @@ pub(in crate::source_check) enum Presentation {
     Lean,
 }
 
+/// Classic imported source historically uses the scalar presentation when
+/// its admitted base has neither printer class. Completing its implicit Init
+/// import remains separate work. Preserve that bounded route before execution;
+/// once Lean printing is selected, no printer failure retries the raw route.
+/// Prelude and module-system inputs always request their actual world's printer.
+fn evaluation_presentation(
+    presentation: Presentation,
+    prelude: bool,
+    module_system: bool,
+    has_repr: bool,
+    has_to_string: bool,
+) -> fln::EvaluationPresentation {
+    match (
+        presentation,
+        prelude,
+        module_system,
+        has_repr,
+        has_to_string,
+    ) {
+        (Presentation::Fln { .. }, ..) | (Presentation::Lean, false, false, false, false) => {
+            fln::EvaluationPresentation::Raw
+        }
+        _ => fln::EvaluationPresentation::Lean,
+    }
+}
+
 fn failure(error: Failure, presentation: Presentation) -> MultiplexerOutput {
     let json = match presentation {
         Presentation::Fln { json } => json,
@@ -183,12 +209,12 @@ pub(in crate::source_check) fn run(
             if let Err(error) = preflight_source_program(&inputs, limits.modules) {
                 return Some(failure(module_error(error), presentation));
             }
-            let base = match loaded.base_engine(
+            let (imported_engine, base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),
                 jobs,
                 posture,
             ) {
-                Ok((_, base)) => base,
+                Ok(base) => base,
                 Err(error) => return Some(failure(error, presentation)),
             };
             let empty;
@@ -199,8 +225,15 @@ pub(in crate::source_check) fn run(
                     &empty
                 }
             };
-            let completed = match receipt.execute_source_modules(
-                &inputs, &names[0], &fln::KVMap::new(), limits, None,
+            let evaluation_presentation = evaluation_presentation(
+                presentation,
+                headers[0].prelude,
+                headers[0].module_system,
+                imported_engine.environment().contains(&Name::from_components(["Repr"])),
+                imported_engine.environment().contains(&Name::from_components(["ToString"])),
+            );
+            let completed = match receipt.execute_source_modules_with_presentation(
+                &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
             ) {
                 Ok(Outcome::Complete(completed)) => completed,
                 Ok(Outcome::Inconclusive(reason)) => return Some(failure(Failure::new(
@@ -313,9 +346,9 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
 /// print is not the entry's.
 /// `without_init`: the entry is a `prelude` file whose imports never reach `Init`. The pin
 /// prints an `#eval` through a `Repr` or `ToString` instance and refuses it without one, which
-/// such a world may lack (`Init.Prelude` declares neither), while this door's printer needs
-/// none. Printing there would accept what the pin refuses. A non-`prelude` file imports `Init`
-/// implicitly at the pin, so its instances exist whatever this closure holds.
+/// such a world may lack (`Init.Prelude` declares neither). Only an execution retaining
+/// the checked instance-directed printer marker can bypass this guard. A non-`prelude`
+/// file imports `Init` implicitly at the pin, so its instances exist whatever this closure holds.
 fn lean_output(
     program: &SourceProgramExecution,
     entry: &Name,
@@ -328,17 +361,23 @@ fn lean_output(
         .filter(|module| &module.module == entry)
         .ok_or_else(|| internal("source program did not retain its entry as the final module"))?;
     if without_init
-        && module
-            .commands
-            .outputs
-            .iter()
-            .any(|output| matches!(output, fln::SourceCommandOutput::Evaluation { .. }))
+        && module.commands.outputs.iter().any(|output| match output {
+            fln::SourceCommandOutput::Evaluation {
+                execution_index, ..
+            } => module
+                .commands
+                .batch
+                .executions
+                .get(*execution_index)
+                .is_none_or(|execution| execution.evaluation_format_width().is_none()),
+            _ => false,
+        })
     {
         return Err(Failure::new(
             "capability",
             "this prelude file's imports do not reach `Init`; the pin prints an #eval through \
              the Repr or ToString instance its world declares and refuses it without one, and \
-             that instance-directed printing is not implemented",
+             no checked instance-directed printer was selected for this evaluation",
             false,
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         ));
@@ -588,6 +627,45 @@ mod tests {
     use fln::source_check::modules::execution::SourceModuleExecution;
 
     #[test]
+    fn presentation_selection_preserves_the_classic_scalar_boundary() {
+        use fln::EvaluationPresentation::{Lean, Raw};
+        let cases = [
+            (false, false, false, false, Raw),
+            (false, false, true, false, Lean),
+            (false, false, false, true, Lean),
+            (false, false, true, true, Lean),
+            (true, false, false, false, Lean),
+            (false, true, false, false, Lean),
+            (true, true, false, false, Lean),
+            (true, true, true, true, Lean),
+        ];
+        for (prelude, module_system, repr, to_string, expected) in cases {
+            assert_eq!(
+                evaluation_presentation(
+                    Presentation::Lean,
+                    prelude,
+                    module_system,
+                    repr,
+                    to_string,
+                ),
+                expected,
+            );
+            for json in [false, true] {
+                assert_eq!(
+                    evaluation_presentation(
+                        Presentation::Fln { json },
+                        prelude,
+                        module_system,
+                        repr,
+                        to_string,
+                    ),
+                    Raw,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_result_projection_limit_is_not_a_program_rejection_or_internal_fault() {
         let error = evaluation_error(source_evaluation::Error::Value(
             SourceValueProjectionError::Shaped(fln::ClosedShapedValueError::TooLarge { limit: 17 }),
@@ -605,6 +683,39 @@ mod tests {
             (mismatch.class, mismatch.authority, mismatch.exit),
             ("internal-fault", false, 4)
         );
+        for (error, expected) in [
+            (
+                fln::source_format::Error::Limit {
+                    resource: "text bytes",
+                    limit: 8,
+                    observed: 9,
+                },
+                ("resource", false, 3),
+            ),
+            (
+                fln::source_format::Error::UnsupportedContract {
+                    family: "Std.Format",
+                },
+                ("capability", false, 5),
+            ),
+            (
+                fln::source_format::Error::Representation {
+                    expected: "Std.Format",
+                },
+                ("internal-fault", false, 4),
+            ),
+        ] {
+            let failed = evaluation_error(source_evaluation::Error::Format(error));
+            assert_eq!((failed.class, failed.authority, failed.exit), expected);
+            let output = failure(failed, Presentation::Lean);
+            assert!(output.stdout.is_empty());
+            assert_eq!(output.exit_code, expected.2);
+            assert!(
+                output
+                    .stderr
+                    .starts_with(&format!("lean: {}: ", expected.0))
+            );
+        }
     }
 
     #[test]
