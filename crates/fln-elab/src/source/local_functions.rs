@@ -13,6 +13,7 @@ pub(super) struct Binding<'a> {
     pub annotation: Option<&'a Syntax>,
     pub value: &'a Syntax,
     pub body: &'a Syntax,
+    pub termination: Option<recursion::StructuralHint<'a>>,
 }
 
 #[derive(Clone)]
@@ -260,6 +261,24 @@ impl Context {
         }
         let marker = if let Some(column) = column {
             let columns = self.recursion_columns(&build.parameters, body)?;
+            if let Some(hint) = &build.binding.termination {
+                let parameter = self.structural_hint_parameter(
+                    hint,
+                    &build.parameters,
+                    build.header_parameters,
+                )?;
+                if !columns
+                    .iter()
+                    .any(|&(candidate, position)| candidate == column && position == parameter)
+                {
+                    // The initial nonrecursive candidate still runs first.
+                    // A surviving self reference may try only the column the
+                    // hint selects, never silently succeed on another one.
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::NotDecreasing,
+                    )));
+                }
+            }
             let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
             self.prepare_recursion(
                 &build.binding.name,
@@ -420,6 +439,7 @@ mod tests {
             annotation: Some(&missing),
             value: &missing,
             body: &missing,
+            termination: None,
         };
         let build = Build {
             binding,

@@ -125,6 +125,40 @@ fn check_then_refuse_suffixes(prefix: &str, expected: &[&str], refusals: &[(&str
 }
 
 #[test]
+fn installed_structural_hints_check_selected_parameters_and_execute() {
+    let source = "def tally (acc n : Nat) : Nat := match n with\n\
+                  | .zero => acc\n| .succ k => tally (acc + 1) k\n\
+                  termination_by structural n\n\
+                  theorem computes : tally 10 32 = 42 := by rfl";
+    check_then_refuse_suffixes(
+        source,
+        &["\"commands\":2", "\"theorems\":1", "\"executed\":false"],
+        &[
+            (
+                "def wrongHint (a b : Nat) : Nat := match a, b with\n\
+                 | _, .zero => a\n| _, .succ k => wrongHint (a + 1) k\n\
+                 termination_by structural a",
+                None,
+            ),
+            (
+                "def wrongType (n : Nat) : Nat := match n with\n\
+                 | .zero => 0\n| .succ k => wrongType k\n\
+                 termination_by structural (n : Bool)",
+                None,
+            ),
+        ],
+    );
+    let program = file(&format!("{source}\n#eval tally 10 32\n"));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
 fn installed_local_recursion_checks_runs_and_replays_without_partial_publication() {
     let text = include_str!("../../../examples/native_local_recursion.lean");
     let source = file(text);

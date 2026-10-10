@@ -32,10 +32,22 @@ pub enum RecursionError {
     },
     ChangedIndex,
     PartialApplication,
+    StructuralMeasureNotParameter,
+    StructuralParameterNotInductive,
+    TerminationBinderCount {
+        bound: usize,
+        available: usize,
+    },
 }
 impl std::fmt::Display for RecursionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::TerminationBinderCount { bound, available } => {
+                return write!(
+                    f,
+                    "{bound} parameters bound in `termination_by`, but the function body only binds {available} parameters"
+                );
+            }
             Self::ResultTypeRequired => "recursive definition requires an explicit result type",
             Self::RootMatchRequired => {
                 "structural recursion requires a body matching a function parameter"
@@ -52,11 +64,97 @@ impl std::fmt::Display for RecursionError {
             Self::PartialApplication => {
                 "recursive function escapes without its structural argument"
             }
+            Self::StructuralMeasureNotParameter => {
+                "the termination measure of a structurally recursive function must be one of its parameters"
+            }
+            Self::StructuralParameterNotInductive => {
+                "cannot use specified measure for structural recursion: its type is not an inductive"
+            }
         })
     }
 }
 fn error(reason: RecursionError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Recursion(reason))
+}
+
+/// The pin's `TerminationBy`: aliases bind only parameters after the declaration
+/// colon. The measure remains source syntax until a surviving recursive call
+/// actually needs it; a nonrecursive declaration does not elaborate its hint.
+#[derive(Clone)]
+pub(super) struct StructuralHint<'a> {
+    aliases: Vec<Option<Name>>,
+    measure: &'a Syntax,
+}
+
+/// Read the supported structural clause, never silently discard a well-founded
+/// measure or a `decreasing_by` proof. Shape checks match `elabTerminationHints`
+/// in the pinned `Lean/Elab/PreDefinition/TerminationHint.lean`.
+pub(super) fn structural_hint(
+    syntax: &Syntax,
+) -> Result<Option<StructuralHint<'_>>, NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Termination", "suffix"]),
+        2,
+        "termination suffix",
+    )?;
+    expect_empty_null(&parts[1], "absent decreasing_by clause")?;
+    let clause = match expect_null_args(&parts[0], "termination clause")? {
+        [] => return Ok(None),
+        [clause] => clause,
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
+    let clause = expect_node(
+        clause,
+        &parser_kind(&["Termination", "terminationBy"]),
+        4,
+        "structural termination clause",
+    )?;
+    expect_atom(&clause[0], "termination_by", "termination keyword")?;
+    let [structural] = expect_null_args(&clause[1], "structural termination marker")? else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "termination_by structural parameter",
+        });
+    };
+    expect_atom(structural, "structural", "structural termination marker")?;
+    let mut aliases = Vec::new();
+    match expect_null_args(&clause[2], "termination parameter aliases")? {
+        [] => {}
+        [binders, arrow] => {
+            expect_atom(arrow, "=>", "termination parameter arrow")?;
+            let binders = expect_null_args(binders, "termination parameters")?;
+            if binders.is_empty() {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "termination parameter before =>",
+                });
+            }
+            for binder in binders {
+                match binder {
+                    Syntax::Ident { val, .. } if !val.is_anonymous() => {
+                        aliases.push(Some(val.clone()));
+                    }
+                    _ => {
+                        let [hole] = expect_node(
+                            binder,
+                            &parser_kind(&["Term", "hole"]),
+                            1,
+                            "termination parameter or underscore",
+                        )?
+                        else {
+                            return Err(failure(SourceInferenceError::Scope));
+                        };
+                        expect_atom(hole, "_", "termination parameter underscore")?;
+                        aliases.push(None);
+                    }
+                }
+            }
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    }
+    Ok(Some(StructuralHint {
+        aliases,
+        measure: &clause[3],
+    }))
 }
 
 #[derive(Clone)]
@@ -86,6 +184,217 @@ pub(super) struct Recursion {
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
+    /// Elaborate the measure in the header-plus-alias scope, as the pin's
+    /// `TerminationMeasure.elab` does. The result must be the actual free
+    /// variable, not merely definitionally equal to one. Restore all speculative
+    /// state and generated identities, retaining only the consumed work.
+    pub(super) fn structural_hint_parameter(
+        &mut self,
+        hint: &StructuralHint<'_>,
+        parameters: &[LocalDecl],
+        header_parameters: usize,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let extra = parameters
+            .get(header_parameters..)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        if hint.aliases.len() > extra.len() {
+            return Err(error(RecursionError::TerminationBinderCount {
+                bound: hint.aliases.len(),
+                available: extra.len(),
+            }));
+        }
+        let snapshot = self.clone();
+        let result = (|| {
+            let mut extra_names = HashMap::new();
+            for (index, parameter) in extra.iter().enumerate() {
+                self.tick()?;
+                extra_names.insert(parameter.id.clone(), hint.aliases.get(index).cloned());
+            }
+            let mut locals = LocalContext::new();
+            for local in snapshot.txn.lctx.decls() {
+                self.tick()?;
+                let mut local = local.clone();
+                if let Some(alias) = extra_names.get(&local.id) {
+                    let Some(alias) = alias else {
+                        // Lambda-body names do not scope over a termination
+                        // clause. Unaliased later parameters are not in its
+                        // context at all, even for tactics such as assumption.
+                        continue;
+                    };
+                    local.user_name = alias.clone().unwrap_or_else(Name::anonymous);
+                }
+                tactics::eliminate::add_local(&mut locals, &local);
+            }
+            self.txn.lctx = locals;
+            self.recursion = None;
+            self.defining = None;
+            self.attempt_depth = self
+                .attempt_depth
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+            let measure = self.term(hint.measure, None)?;
+            let measure = self.finish(measure)?;
+            self.check_structural_measure(&measure)?;
+            // The native source driver retains ascriptions as identity lets
+            // so later reduction cannot erase an unchecked annotation. The
+            // check above has now validated their original, unreduced terms.
+            // Peel only that encoding, as the pin's elaborator emits its inner
+            // expression directly. A source let or reducible application is
+            // still not a structural parameter.
+            let mut value = &measure.value;
+            loop {
+                self.tick()?;
+                match value.node() {
+                    ExprNode::MData { expr, .. } => value = expr,
+                    ExprNode::LetE {
+                        decl_name,
+                        value: inner,
+                        body,
+                        ..
+                    } if decl_name.is_anonymous()
+                        && matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+                    {
+                        value = inner
+                    }
+                    _ => break,
+                }
+            }
+            let ExprNode::FVar { id } = value.node() else {
+                return Err(error(RecursionError::StructuralMeasureNotParameter));
+            };
+            for (position, parameter) in parameters
+                .iter()
+                .take(header_parameters + hint.aliases.len())
+                .enumerate()
+            {
+                self.tick()?;
+                if &parameter.id == id {
+                    self.structural_parameter_domain(parameter)?;
+                    return Ok(position);
+                }
+            }
+            Err(error(RecursionError::StructuralMeasureNotParameter))
+        })();
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        result
+    }
+
+    /// Explicit structural recursion has the pin's `getRecArgInfo` domain
+    /// restriction: an inductive application with distinct variable indices.
+    /// In particular it must not enter native constrained-index recursion just
+    /// because an automatically selected recursor could prove that program.
+    fn structural_parameter_domain(
+        &mut self,
+        parameter: &LocalDecl,
+    ) -> Result<(), NatDefinitionElabError> {
+        let type_ = self.whnf(&parameter.type_)?;
+        let mut head = &type_;
+        let mut arguments = Vec::new();
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, a } => {
+                    arguments.push(a.clone());
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(error(RecursionError::StructuralParameterNotInductive));
+        };
+        let Some(fln_env::constants::ConstantInfo::Induct(family)) = self.txn.env.find(name) else {
+            return Err(error(RecursionError::StructuralParameterNotInductive));
+        };
+        let parameters = family.num_params as usize;
+        if arguments.len() != parameters + family.num_indices as usize {
+            return Err(error(RecursionError::StructuralParameterNotInductive));
+        }
+        arguments.reverse();
+        self.elimination_index_locals(&arguments[parameters..])?;
+        Ok(())
+    }
+
+    /// Check the original measure before its annotation encoding is inspected.
+    /// The axiom's type contains an ordinary checked let initializer and is
+    /// closed over the actual local telescope; nothing is admitted to the
+    /// environment. Every kernel step is charged to the same source budget.
+    fn check_structural_measure(&mut self, measure: &Typed) -> Result<(), NatDefinitionElabError> {
+        let mut type_ = Expr::let_e(
+            Name::anonymous(),
+            measure.type_.clone(),
+            measure.value.clone(),
+            Expr::sort(Level::zero()),
+            false,
+        );
+        for local in self.txn.lctx.clone().decls().iter().rev() {
+            self.tick()?;
+            let domain = self.instantiate(&local.type_)?;
+            let body = type_
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            type_ = if let Some(value) = &local.value {
+                Expr::let_e(
+                    local.user_name.clone(),
+                    domain,
+                    self.instantiate(value)?,
+                    body,
+                    false,
+                )
+            } else {
+                Expr::forall_e(local.user_name.clone(), domain, body, local.binder_info)
+            };
+        }
+        let name = loop {
+            let name = self.fresh_name()?;
+            if !self.txn.env.contains(&name) {
+                break name;
+            }
+        };
+        let declaration = Declaration::Axiom(fln_env::constants::AxiomVal {
+            base: ConstantVal {
+                name,
+                level_params: self.level_params.clone(),
+                type_,
+            },
+            is_unsafe: false,
+        });
+        let remaining = if self.txn.budget.max_heartbeats == 0 {
+            u64::MAX
+        } else {
+            self.txn
+                .budget
+                .max_heartbeats
+                .saturating_sub(self.txn.budget.heartbeats_consumed)
+        };
+        let budget = self
+            .kernel
+            .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
+        let outcome = check(&self.txn.env, &declaration, budget);
+        if let Outcome::Complete(verdict) = &outcome {
+            let consumed = match verdict {
+                Verdict::Accepted { consumption } | Verdict::Rejected { consumption, .. } => {
+                    consumption.steps_used
+                }
+            };
+            self.txn.budget.heartbeats_consumed = self
+                .txn
+                .budget
+                .heartbeats_consumed
+                .checked_add(consumed)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        }
+        match outcome {
+            Outcome::Complete(Verdict::Accepted { .. }) => Ok(()),
+            outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
+                outcome,
+            )))),
+        }
+    }
+
     /// A synthetic argument's selected termination failure must reach the
     /// enclosing candidate driver after tactic alternatives finish. Earlier
     /// diagnostics belong to an outer body; explicit failure restores the
@@ -171,6 +480,8 @@ impl Context {
         parameters: &[LocalDecl],
         syntax: &Syntax,
         expected: Option<Expr>,
+        hint: Option<&StructuralHint<'_>>,
+        header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
         let snapshot = self.clone();
@@ -216,7 +527,11 @@ impl Context {
         let result = (|| {
             let (body, expected, lambdas) =
                 self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
-            let body = self.structural_definition_body(name, &parameters, body, expected)?;
+            let selected = hint
+                .map(|hint| self.structural_hint_parameter(hint, &parameters, header_parameters))
+                .transpose()?;
+            let body =
+                self.structural_definition_body(name, &parameters, body, expected, selected)?;
             self.close_recursive_lambdas(&lambdas, body)
         })();
         if result.is_err() {
@@ -236,6 +551,7 @@ impl Context {
         parameters: &[LocalDecl],
         syntax: &Syntax,
         expected: Option<Expr>,
+        hinted_parameter: Option<usize>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let snapshot = self.clone();
         let (selected, context) = self.contextual_recursive_match(parameters, syntax)?;
@@ -243,6 +559,9 @@ impl Context {
         let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
         let mut first_error = None;
         for (column, decreasing) in columns {
+            if hinted_parameter.is_some_and(|position| position != decreasing) {
+                continue;
+            }
             let mut generalized = HashSet::new();
             loop {
                 let spent = self.txn.budget.heartbeats_consumed;

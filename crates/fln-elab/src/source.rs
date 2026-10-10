@@ -2156,7 +2156,8 @@ impl Context {
                                 .find(|(label, ..)| kind == &Name::from_components(["Std", label]));
                                 if let Some((_, spelling, constant, operands)) = unbounded {
                                     let arity = if operands.is_empty() { 1 } else { 2 };
-                                    let parts = expect_node(syntax, kind, arity, "unbounded range")?;
+                                    let parts =
+                                        expect_node(syntax, kind, arity, "unbounded range")?;
                                     let symbol = if operands.start == 0 { arity - 1 } else { 0 };
                                     expect_atom(&parts[symbol], spelling, "unbounded range")?;
                                     let function = self.constant(&Name::from_components([
@@ -3410,7 +3411,7 @@ impl Context {
         opaque: bool,
         recursive: bool,
     ) -> Result<local_functions::Binding<'a>, NatDefinitionElabError> {
-        let (declaration, separator, body) = if recursive {
+        let (declaration, separator, body, termination) = if recursive {
             let [keywords, declarations, separator, body] = parts else {
                 return Err(failure(SourceInferenceError::Scope));
             };
@@ -3461,16 +3462,8 @@ impl Context {
                 }
             }
             expect_empty_null(&declaration[1], "absent local attributes")?;
-            let termination = expect_node(
-                &declaration[3],
-                &parser_kind(&["Termination", "suffix"]),
-                2,
-                "local termination suffix",
-            )?;
-            for part in termination {
-                expect_empty_null(part, "absent local termination annotation")?;
-            }
-            (&declaration[2], separator, body)
+            let termination = recursion::structural_hint(&declaration[3])?;
+            (&declaration[2], separator, body, termination)
         } else {
             let [keyword, config, declaration, separator, body] = parts else {
                 return Err(failure(SourceInferenceError::Scope));
@@ -3493,7 +3486,7 @@ impl Context {
                 "let config",
             )?;
             expect_empty_null(&config[0], "empty let config")?;
-            (declaration, separator, body)
+            (declaration, separator, body, None)
         };
         let wrapper = expect_node(
             declaration,
@@ -3549,6 +3542,7 @@ impl Context {
             annotation,
             value: &declaration[4],
             body,
+            termination,
         })
     }
 
@@ -4021,15 +4015,7 @@ fn definition_in_context_named(
             expect_atom(&parts[0], ":=", "definition assignment")?;
             (&parts[1], &parts[2], &parts[3])
         };
-    let termination = expect_node(
-        termination,
-        &parser_kind(&["Termination", "suffix"]),
-        2,
-        "termination suffix",
-    )?;
-    for part in termination {
-        expect_empty_null(part, "absent termination clause")?;
-    }
+    let termination = recursion::structural_hint(termination)?;
     // `where` declarations scope over the body as `let rec` declarations, the pin's
     // `expandWhereDecls`; each is its own group here, so a later one may call an
     // earlier one.
@@ -4052,6 +4038,7 @@ fn definition_in_context_named(
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
     }
+    let header_parameters = parameters.len();
     let generated;
     let body = if equations {
         let declared_type = expected
@@ -4065,7 +4052,14 @@ fn definition_in_context_named(
     } else {
         body
     };
-    let mut term = context.definition_body(name, &parameters, body, expected.clone())?;
+    let mut term = context.definition_body(
+        name,
+        &parameters,
+        body,
+        expected.clone(),
+        termination.as_ref(),
+        header_parameters,
+    )?;
     if let Some(expected) = expected {
         term.type_ = expected;
     }
