@@ -3799,6 +3799,112 @@ fn kr109_sequential_and_nested_lets_flatten_and_substitute_innermost_first() {
 }
 
 #[test]
+fn one_pass_telescope_opening_preserves_sparse_locals_and_mixed_lets() {
+    let type_ = || Expr::sort(Level::one());
+    // Repeated display names must not collapse the distinct query-local
+    // identities for A, unused and x. x's domain skips the unused binder.
+    let telescope = |body| {
+        Expr::lam(
+            primary_name("same"),
+            type_(),
+            Expr::lam(
+                primary_name("same"),
+                type_(),
+                Expr::lam(
+                    primary_name("same"),
+                    bvar(1),
+                    body,
+                    BinderInfo::StrictImplicit,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        )
+    };
+    let expected_telescope = |body| {
+        Expr::forall_e(
+            primary_name("same"),
+            type_(),
+            Expr::forall_e(
+                primary_name("same"),
+                type_(),
+                Expr::forall_e(
+                    primary_name("same"),
+                    bvar(1),
+                    body,
+                    BinderInfo::StrictImplicit,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        )
+    };
+    // fun A unused x => x
+    // Only the innermost suffix is needed to open the final body.
+    let sparse = telescope(bvar(0));
+    let sparse_type = expected_telescope(bvar(2));
+
+    // fun A unused x =>
+    //   let alias : A := x
+    //   let B : Type := A
+    //   let dead : Type := unused
+    //   fun (y : B) => alias
+    // The let value/type scopes differ from their bodies. The final lambda
+    // mentions B and alias while skipping dead, and every let then disappears
+    // from the inferred type through ordinary value substitution.
+    let mixed = telescope(Expr::let_e(
+        primary_name("same"),
+        bvar(2),
+        bvar(0),
+        Expr::let_e(
+            primary_name("same"),
+            type_(),
+            bvar(3),
+            Expr::let_e(
+                primary_name("same"),
+                type_(),
+                bvar(3),
+                Expr::lam(primary_name("same"), bvar(1), bvar(3), BinderInfo::Default),
+                false,
+            ),
+            false,
+        ),
+        false,
+    ));
+    let mixed_type = expected_telescope(Expr::forall_e(
+        primary_name("same"),
+        bvar(2),
+        bvar(3),
+        BinderInfo::Default,
+    ));
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    let pristine = context.clone();
+    for (label, term, expected) in [
+        ("sparse suffix", sparse, sparse_type),
+        ("mixed lets", mixed, mixed_type),
+    ] {
+        for mode in let_modes() {
+            let result = complete(infer(
+                &decoded(&term),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(
+                expr_model(&result.type_),
+                expr_model(&decoded(&expected)),
+                "{label}, {mode:?}"
+            );
+            assert!(
+                free_names(&result.type_).is_empty(),
+                "a query-local identity escaped: {label}, {mode:?}"
+            );
+            assert_eq!(context, pristine);
+        }
+    }
+}
+
+#[test]
 fn kr109_a_declared_type_that_is_not_a_sort_is_rejected_at_its_binder() {
     // let x : (fun (a : Sort 0) => a) := Sort 0; Sort 0
     // The annotation is a lambda, whose type is a Pi and not a Sort.
