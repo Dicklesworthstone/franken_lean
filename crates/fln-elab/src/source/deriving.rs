@@ -5,6 +5,7 @@
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
 mod beq;
+mod decidable_eq;
 mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum DerivingError {
     UnsupportedFamily(Name),
     CannotDerive(Name),
     CannotDeriveBEq(Name),
+    CannotDeriveDecidableEq(Name),
     CannotDeriveRepr(Name),
 }
 
@@ -46,6 +48,11 @@ impl std::fmt::Display for DerivingError {
             Self::CannotDeriveBEq(name) => write!(
                 f,
                 "failed to generate BEq instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveDecidableEq(name) => write!(
+                f,
+                "failed to generate DecidableEq instance for {}",
                 name.to_display_string()
             ),
         }
@@ -493,7 +500,9 @@ pub fn elaborate_handler(
     let handler_name = context.resolve_source_name(handler)?;
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
     let is_beq = handler_name.as_ref() == Some(&named("BEq"));
-    if !is_repr && !is_beq && handler_name.as_ref() != Some(&named("Inhabited")) {
+    let is_decidable_eq = handler_name.as_ref() == Some(&named("DecidableEq"));
+    if !is_repr && !is_beq && !is_decidable_eq && handler_name.as_ref() != Some(&named("Inhabited"))
+    {
         return Err(failure(SourceInferenceError::Deriving(
             DerivingError::UnsupportedHandler(handler.clone()),
         )));
@@ -556,6 +565,14 @@ pub fn elaborate_handler(
         return match beq::elaborate(&mut context, family, &parameters, &target) {
             Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
                 DerivingError::CannotDeriveBEq(type_name.clone()),
+            ))),
+            result => result,
+        };
+    }
+    if is_decidable_eq {
+        return match decidable_eq::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveDecidableEq(type_name.clone()),
             ))),
             result => result,
         };
