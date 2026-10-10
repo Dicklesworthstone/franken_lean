@@ -61,6 +61,7 @@ use std::fmt;
 mod array_construction;
 mod arrays;
 mod floats;
+mod string_fold;
 mod strings;
 mod tail_calls;
 
@@ -821,6 +822,7 @@ enum IntrinsicImplementation {
     StringDrop,
     StringDropRight,
     StringExtract,
+    StringInternalFoldl,
     StringInternalIsEmpty,
     StringInternalIsPrefixOf,
     StringNext,
@@ -1179,6 +1181,7 @@ impl IntrinsicImplementation {
             "extern:String.Internal.extract"
             | "extern:String.extract"
             | "extern:String.Pos.Raw.extract" => Self::StringExtract,
+            "extern:String.Internal.foldl" => Self::StringInternalFoldl,
             "extern:String.Internal.isEmpty" => Self::StringInternalIsEmpty,
             "extern:String.Internal.isPrefixOf" => Self::StringInternalIsPrefixOf,
             "extern:String.Internal.next" | "extern:String.next" | "extern:String.Pos.Raw.next" => {
@@ -1801,6 +1804,11 @@ enum ReturnTo {
     CompleteThunk {
         destination: Register,
         thunk: Obj,
+        result_ownership: ResultOwnership,
+    },
+    CompleteStringFold {
+        destination: Register,
+        state: string_fold::State,
         result_ownership: ResultOwnership,
     },
     CompleteManagerlessTask {
@@ -2497,6 +2505,53 @@ fn run(
                             }
                         }
                     }
+                } else if plan.implementation == IntrinsicImplementation::StringInternalFoldl {
+                    match string_fold::start(program, values) {
+                        Ok(string_fold::Step::Complete(value)) => {
+                            let value = match finish_intrinsic_result(
+                                plan.row,
+                                result_ownership,
+                                IntrinsicResult::owned(value),
+                            ) {
+                                Ok(value) => value,
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            };
+                            set_register(current_frame_mut(&mut stack)?, dst, value)?;
+                            advance(current_frame_mut(&mut stack)?)?;
+                        }
+                        Ok(string_fold::Step::Call {
+                            function,
+                            args,
+                            state,
+                        }) => {
+                            advance(current_frame_mut(&mut stack)?)?;
+                            let next_depth = push_call(
+                                program,
+                                &mut stack,
+                                function,
+                                args,
+                                ReturnTo::CompleteStringFold {
+                                    destination: dst,
+                                    state,
+                                    result_ownership,
+                                },
+                                limits.max_stack_depth,
+                                location,
+                            )?;
+                            peak_stack_depth = peak_stack_depth.max(next_depth);
+                        }
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    }
                 } else if plan.implementation.is_managerless_task() {
                     let application =
                         match managerless_task_application(plan.implementation, plan.row, values) {
@@ -3065,6 +3120,58 @@ fn run(
                                 cache_thunk_value(&thunk, &value)?;
                                 set_register(current_frame_mut(&mut stack)?, destination, value)?;
                             }
+                            ReturnTo::CompleteStringFold {
+                                destination,
+                                state,
+                                result_ownership,
+                            } => match string_fold::resume(program, state, value) {
+                                Ok(string_fold::Step::Complete(value)) => {
+                                    let value = match finish_intrinsic_result(
+                                        string_fold::ROW,
+                                        result_ownership,
+                                        IntrinsicResult::owned(value),
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
+                                    set_register(
+                                        current_frame_mut(&mut stack)?,
+                                        destination,
+                                        value,
+                                    )?;
+                                }
+                                Ok(string_fold::Step::Call {
+                                    function,
+                                    args,
+                                    state,
+                                }) => {
+                                    let next_depth = push_call(
+                                        program,
+                                        &mut stack,
+                                        function,
+                                        args,
+                                        ReturnTo::CompleteStringFold {
+                                            destination,
+                                            state,
+                                            result_ownership,
+                                        },
+                                        limits.max_stack_depth,
+                                        location,
+                                    )?;
+                                    peak_stack_depth = peak_stack_depth.max(next_depth);
+                                }
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            },
                             ReturnTo::CompleteManagerlessTask {
                                 destination,
                                 completion,
@@ -6596,6 +6703,7 @@ fn invoke_intrinsic(
         | IntrinsicImplementation::TaskSpawn
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
+        | IntrinsicImplementation::StringInternalFoldl
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }
@@ -7002,6 +7110,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ByteArrayUset
         | IntrinsicImplementation::ByteArrayValidateUtf8
         | IntrinsicImplementation::StringNext
+        | IntrinsicImplementation::StringInternalFoldl
         | IntrinsicImplementation::StringPrev
         | IntrinsicImplementation::StringPush
         | IntrinsicImplementation::StringTrim
