@@ -204,9 +204,22 @@ impl Preparation<'_> {
                         values.push(erased_value());
                         continue;
                     }
+                    // Proof classification and source types use the logical
+                    // declaration. Only a remaining executable value may select
+                    // its implemented_by replacement before any inlining.
+                    if let Some(replacement) = self.implemented_by_call(&expr, &[])? {
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Visit(replacement, expected));
+                        continue;
+                    }
                     match expr.node() {
                         ExprNode::App { .. } => {
                             let (head, args) = self.spine(&expr)?;
+                            if let Some(replacement) = self.implemented_by_call(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(replacement, expected));
+                                continue;
+                            }
                             if let Some(inlined) = self.lazy_conditional(&head, &args)? {
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(Frame::Visit(inlined, expected));

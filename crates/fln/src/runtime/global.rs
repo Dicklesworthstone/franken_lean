@@ -56,6 +56,9 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, args)? {
+            return Ok(Some(replacement));
+        }
         if let Some(specialized) = self.specialize_staged_callback(head, args)? {
             return Ok(Some(specialized));
         }

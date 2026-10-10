@@ -386,6 +386,11 @@ impl Preparation<'_> {
         while let Some(expr) = work.pop() {
             self.tick()?;
             let (head, args) = self.spine(&expr)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && self.has_implementation(name)?
+            {
+                return Ok(false);
+            }
             match head.node() {
                 ExprNode::Lam { .. }
                 | ExprNode::ForallE { .. }
@@ -500,6 +505,11 @@ impl Preparation<'_> {
         loop {
             self.tick()?;
             let (head, args) = self.spine(&value)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && self.has_implementation(name)?
+            {
+                return Ok(None);
+            }
             match head.node() {
                 ExprNode::Const { name, levels } => match self.environment.find(name) {
                     Some(ConstantInfo::Ctor(ctor))

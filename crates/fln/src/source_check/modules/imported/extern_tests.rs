@@ -28,12 +28,12 @@ fn extern_metadata_requires_the_exact_checked_owner_and_unique_module_row() {
     let env = &engine.environment;
     let root = engine.logical_root(&KVMap::new());
     let owned = [env.find(&n("owned")).unwrap().clone()];
-    let mut owners = ExternOwners::new(&owned, 4, 4, 4).unwrap();
+    let mut owners = AttributeOwners::new(&owned, 4, 4, 4).unwrap();
     owners.validate(env, &n("OwnModule"), &n("owned")).unwrap();
     assert!(matches!(
         owners.validate(env, &n("OwnModule"), &n("owned")),
         Err(SourceOleanImportError::Metadata {
-            reason: "duplicate extern attribute for one module declaration",
+            reason: "duplicate attribute for one module declaration",
             ..
         })
     ));
@@ -41,7 +41,7 @@ fn extern_metadata_requires_the_exact_checked_owner_and_unique_module_row() {
         assert!(matches!(
             owners.validate(env, &n("OwnModule"), &declaration),
             Err(SourceOleanImportError::Metadata {
-                reason: "an extern attribute does not belong to this module's checked declarations",
+                reason: "an attribute does not belong to this module's checked declarations",
                 ..
             })
         ));
@@ -52,15 +52,17 @@ fn extern_metadata_requires_the_exact_checked_owner_and_unique_module_row() {
     };
     definition.value = fln_core::expr::Expr::const_(n("Nat.zero"), vec![]);
     assert!(matches!(
-        ExternOwners::new(&different, 1, 4, 4)
-            .unwrap()
-            .validate(env, &n("OwnModule"), &n("owned")),
+        AttributeOwners::new(&different, 1, 4, 4).unwrap().validate(
+            env,
+            &n("OwnModule"),
+            &n("owned")
+        ),
         Err(SourceOleanImportError::Metadata {
-            reason: "an extern owner differs from its active admitted declaration",
+            reason: "an attribute owner differs from its active admitted declaration",
             ..
         })
     ));
-    let mut missing_active = ExternOwners::new(&owned, 1, 4, 4).unwrap();
+    let mut missing_active = AttributeOwners::new(&owned, 1, 4, 4).unwrap();
     assert!(
         missing_active
             .validate(&Environment::new(), &n("OwnModule"), &n("owned"))
@@ -74,8 +76,8 @@ fn extern_owner_allocations_and_registry_limits_remain_resource_nonanswers() {
     let engine = admitted();
     let owned = [engine.environment.find(&n("owned")).unwrap().clone()];
     for error in [
-        ExternOwners::new(&owned, 1, 0, 1).err().unwrap(),
-        ExternOwners::new(&owned, 2, 1, 1).err().unwrap(),
+        AttributeOwners::new(&owned, 1, 0, 1).err().unwrap(),
+        AttributeOwners::new(&owned, 2, 1, 1).err().unwrap(),
         extern_error(
             &n("Module"),
             &n("owned"),
@@ -92,7 +94,7 @@ fn extern_owner_allocations_and_registry_limits_remain_resource_nonanswers() {
     assert!(!malformed.metadata_resource_exhausted());
     let duplicate = [owned[0].clone(), owned[0].clone()];
     assert!(matches!(
-        ExternOwners::new(&duplicate, 1, 2, 1),
+        AttributeOwners::new(&duplicate, 1, 2, 1),
         Err(SourceOleanImportError::Internal(_))
     ));
 }

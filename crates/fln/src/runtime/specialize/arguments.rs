@@ -246,6 +246,9 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, args)? {
+            return Ok(Some(replacement));
+        }
         if let Some(fold) = self.imported_nat_recursion(head, args)? {
             return Ok(Some(fold));
         }

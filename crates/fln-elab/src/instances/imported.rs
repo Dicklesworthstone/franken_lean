@@ -621,6 +621,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain a compatible imported executable replacement. Logical constants
+    /// and the kept class/instance registries remain unchanged.
+    pub fn register_implemented_by(
+        mut self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> Result<Self, crate::implemented_by::ImplementedByError> {
+        self.env = crate::implemented_by::register(&self.env, declaration, implementation)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {

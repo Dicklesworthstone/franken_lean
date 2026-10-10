@@ -12,6 +12,7 @@ mod evaluation;
 mod floats;
 mod fs;
 mod global;
+mod implemented_by;
 mod indexed;
 mod io;
 mod io_result;
@@ -38,6 +39,7 @@ pub(super) struct Preparation<'a> {
     visited: usize,
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
+    implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
@@ -111,6 +113,7 @@ impl<'a> Preparation<'a> {
             limits,
             visited: 0,
             externs: None,
+            implementations: None,
             lambdas: Vec::new(),
             cases: Vec::new(),
             variant_cases: Vec::new(),
@@ -404,6 +407,10 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(replacement) = self.implemented_by_call(&head, &args)? {
+                            tasks.push(Task::Visit(replacement));
+                            continue;
+                        }
                         if let Some(decision) = self.nat_equality_decision(&head, &args)? {
                             tasks.push(Task::Visit(decision));
                             continue;
@@ -626,6 +633,10 @@ impl<'a> Preparation<'a> {
                         } else {
                             Task::Visit(head)
                         });
+                        continue;
+                    }
+                    if let Some(replacement) = self.implemented_by_call(&expr, &[])? {
+                        tasks.push(Task::Visit(replacement));
                         continue;
                     }
                     match expr.node() {

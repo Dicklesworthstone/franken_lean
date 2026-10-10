@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration and extern-attribute journals.
+//! protected-declaration, extern and implemented_by attribute journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -16,8 +16,9 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION, INSTANCE_EXTENSION,
-    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, SIMP_EXTENSION,
+    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
+    SIMP_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
@@ -79,6 +80,14 @@ pub struct AliasEntry {
     pub declaration: Name,
 }
 
+/// The pin's `implementedByAttr`: an explicit executable replacement. Both
+/// names still need checked ownership/type validation before source activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplementedByEntry {
+    pub declaration: Name,
+    pub implementation: Name,
+}
+
 /// The pin's `ReducibilityStatus` (vendored `src/Lean/ReducibilityAttrs.lean`):
 /// which transparency modes may unfold a definition. `ImplicitReducible`
 /// unfolds at `instances` transparency and above; instances carry it.
@@ -112,6 +121,8 @@ pub struct SourceExtensions {
     /// Explicit extern bindings. Consumers must validate their declarations and
     /// selected backend/symbol before granting executable authority.
     pub externs: Vec<ExternAttribute>,
+    /// Executable replacements, separate from the declarations' logical bodies.
+    pub implemented_by: Vec<ImplementedByEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -408,6 +419,7 @@ pub fn decode(
         name(format::PROTECTED_EXTENSION),
         name(format::REDUCIBILITY_EXTENSION),
         name(format::EXTERN_EXTENSION),
+        name(format::IMPLEMENTED_BY_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -461,7 +473,16 @@ pub fn decode(
                 7 => out
                     .externs
                     .push(reader.extern_attribute(&obj, &mut entries_left)?),
-                _ => unreachable!("eight selected extension families"),
+                8 => {
+                    // ParametricAttribute Name exports Name × Name, the same
+                    // extracted Prod shape as aliases, in declaration/target order.
+                    let pair = reader.alias(&obj)?;
+                    out.implemented_by.push(ImplementedByEntry {
+                        declaration: pair.alias,
+                        implementation: pair.declaration,
+                    });
+                }
+                _ => unreachable!("nine selected extension families"),
             }
         }
     }
