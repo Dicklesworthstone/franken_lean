@@ -11632,17 +11632,13 @@ fn render_lean_source_check_line(
     let rendered = match &constant {
         Some((name, type_)) => printer.signature(name, type_),
         // The pin prints the elaborated term, not its source spelling.
+        // The pin lays out the whole `e : type` line at its width, so the two are composed
+        // before rendering.
         None => match &checked.declaration {
             fln::Declaration::Defn(definition) => {
-                printer.expr(&definition.value, 0).and_then(|value| {
-                    printer
-                        .expr(&checked.checked_type, 0)
-                        .map(|type_| format!("{value} : {type_}"))
-                })
+                printer.typed(&definition.value, &checked.checked_type)
             }
-            _ => printer
-                .expr(&checked.checked_type, 0)
-                .map(|type_| format!("{term} : {type_}")),
+            _ => printer.typed_text(term, &checked.checked_type),
         },
     };
     match rendered {

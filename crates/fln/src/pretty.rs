@@ -9,11 +9,18 @@
 //! `∀` for propositions, `fun`, `×`, and the signature form of `#check ident`
 //! (`Nat.succ (n : Nat) : Nat`, `delabConstWithSignature`).
 //!
+//! Lines break where the pin's do: each construct builds the [`format::Format`] the pin's
+//! formatter builds from its syntax (every term node `fill (nest 2 …)`, a line at each
+//! spaced token), rendered by a port of `Std.Format.pretty` at width 120.
+//!
 //! Anything else is reported as unsupported rather than printed differently: a caller
 //! must not show text the pin would not show.
 use super::*;
 use fln_core::expr::NatLit;
 use fln_core::level::LevelView;
+
+pub mod format;
+use format::Format;
 
 /// Why a term could not be printed the pin's way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,12 +190,34 @@ fn spine(e: &Expr) -> (Expr, Vec<Expr>) {
     (head, args)
 }
 
-fn parens(text: String, inner: u32, outer: u32) -> String {
+/// A term laid out as the pin's formatter lays it out.
+type Doc = Result<Format, Unsupported>;
+
+/// The pin's message width (`format.width`, `Std.Format.defWidth`).
+const WIDTH: usize = 120;
+
+/// A term node as the pin's formatter groups it: `fill (nest 2 …)`
+/// (`categoryParser.formatter`, vendored `PrettyPrinter/Formatter.lean`).
+fn node(content: Format) -> Format {
+    content.nest(2).fill()
+}
+
+/// `(…)` around a grouped term when its precedence is below the context's: the `paren`
+/// node, whose `ppDedentIfGrouped` dedents the inner term (vendored `Parser/Term.lean`).
+fn paren_doc(doc: Format, inner: u32, outer: u32) -> Format {
     if inner < outer {
-        format!("({text})")
+        node(Format::text("(").then(doc.nest(-2)).then(Format::text(")")))
     } else {
-        text
+        doc
     }
+}
+
+/// The digits `Nat.toSuperscriptString` writes, `⁰` to `⁹`.
+const SUPERSCRIPTS: &str = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+
+/// A layout on one line, for comparing two terms' text.
+fn flat(doc: &Format) -> String {
+    doc.pretty(usize::MAX / 4)
 }
 
 fn nat_decimal(value: &NatLit) -> String {
@@ -582,13 +611,32 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Print `e` with the pin's `pp.proofs`: a proof inside the printed term that is not
-    /// atomic is `⋯`, unless the term itself is a proof (the delaborator then sets
-    /// `pp.proofs`, vendored `PrettyPrinter/Delaborator/Basic.lean:510-514`).
+    /// `e` as the pin prints it in a message, broken at the pin's width.
     pub fn expr(&mut self, e: &Expr, outer: u32) -> Printed {
+        self.doc(e, outer).map(|doc| doc.pretty(WIDTH))
+    }
+
+    /// `#check e`'s line for a term that is not a constant: `e : type` (`m!"{e} : {type}"`,
+    /// vendored `Elab/BuiltinCommand.lean`), broken at the pin's width.
+    pub fn typed(&mut self, value: &Expr, type_: &Expr) -> Printed {
+        let value = self.doc(value, 0)?;
+        let type_ = self.doc(type_, 0)?;
+        Ok(value.then(Format::text(" : ")).then(type_).pretty(WIDTH))
+    }
+
+    /// The same with the term as written in the source.
+    pub fn typed_text(&mut self, term: &str, type_: &Expr) -> Printed {
+        let type_ = self.doc(type_, 0)?;
+        Ok(Format::text(format!("{term} : ")).then(type_).pretty(WIDTH))
+    }
+
+    /// `e` as the pin's formatter lays it out, with the pin's `pp.proofs`: a proof inside the
+    /// printed term that is not atomic is `⋯`, unless the term itself is a proof (the
+    /// delaborator then sets `pp.proofs`, vendored `PrettyPrinter/Delaborator/Basic.lean:510-514`).
+    pub fn doc(&mut self, e: &Expr, outer: u32) -> Doc {
         if self.nested {
             if !self.proofs && !atomic(e) && self.is_proof(e) {
-                return Ok("⋯".to_owned());
+                return Ok(Format::text("⋯"));
             }
             return self.subterm(e, outer);
         }
@@ -596,10 +644,13 @@ impl<'a> Printer<'a> {
         self.proofs = self.is_proof(e);
         let printed = self.subterm(e, outer);
         self.nested = false;
-        printed
+        // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
+        // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here.
+        let lambda = matches!(e.node(), ExprNode::Lam { .. }) && outer == 0;
+        printed.map(|doc| if lambda { node(doc) } else { doc })
     }
 
-    fn subterm(&mut self, e: &Expr, outer: u32) -> Printed {
+    fn subterm(&mut self, e: &Expr, outer: u32) -> Doc {
         self.tick()?;
         match e.node() {
             ExprNode::BVar { idx } => {
@@ -609,6 +660,7 @@ impl<'a> Printer<'a> {
                     .checked_sub(idx + 1)
                     .and_then(|at| self.names.get(at))
                     .cloned()
+                    .map(Format::text)
                     .ok_or(Unsupported("a loose bound variable"))
             }
             ExprNode::FVar { .. } => Err(Unsupported("a free variable")),
@@ -616,22 +668,25 @@ impl<'a> Printer<'a> {
             ExprNode::Sort { level } => {
                 let text = sort(level)?;
                 let atomic = !text.contains(' ');
+                let doc = Format::text(text);
                 Ok(if atomic {
-                    text
+                    doc
                 } else {
-                    parens(text, MAX_PREC - 1, outer)
+                    paren_doc(doc, MAX_PREC - 1, outer)
                 })
             }
-            ExprNode::Const { name, .. } => Ok(self.constant(name)),
-            ExprNode::Lit { literal } => Ok(match literal {
+            ExprNode::Const { name, .. } => Ok(Format::text(self.constant(name))),
+            ExprNode::Lit { literal } => Ok(Format::text(match literal {
                 Literal::Nat(value) => nat_decimal(value),
                 Literal::Str(text) => string_literal(text),
-            }),
-            ExprNode::MData { expr, .. } => self.expr(expr, outer),
+            })),
+            ExprNode::MData { expr, .. } => self.doc(expr, outer),
             ExprNode::App { .. } => self.application(e, outer),
             ExprNode::ForallE { .. } => self.pi(e, outer),
             ExprNode::Lam { .. } => {
-                let mut binders = Vec::new();
+                // `fun` is ungrouped (`ppAllowUngrouped`): `fun` ++ ppGroup(binders ++ " =>")
+                // ++ line ++ body (vendored `Parser/Term.lean`, `basicFun`).
+                let mut binders = Format::Nil;
                 let mut body = e;
                 let depth = self.names.len();
                 while let ExprNode::Lam {
@@ -642,24 +697,28 @@ impl<'a> Printer<'a> {
                 } = body.node()
                 {
                     let shown = self.bound_name(name, inner);
-                    binders.push(shown.clone());
+                    binders = binders.then(Format::Line).then(Format::text(shown.clone()));
                     self.bind(shown, binder_type);
                     body = inner;
                 }
-                let printed = self.expr(body, 0);
+                let printed = self.doc(body, 0);
                 self.unbind_to(depth);
-                Ok(parens(
-                    format!("fun {} => {}", binders.join(" "), printed?),
-                    0,
-                    outer,
-                ))
+                let fun = Format::text("fun")
+                    .then(node(binders.then(Format::text(" =>"))))
+                    .then(Format::Line)
+                    .then(printed?);
+                Ok(if outer > 0 {
+                    node(Format::text("(").then(fun).then(Format::text(")")))
+                } else {
+                    fun
+                })
             }
             // `let x : T := v; x` is how a type ascription `(v : T)` elaborates here; the
             // pin's term is `v` itself.
             ExprNode::LetE { value, body, .. }
                 if matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
             {
-                self.expr(value, outer)
+                self.doc(value, outer)
             }
             // At the top of the printed term the pin breaks a `let` after its `;` with no
             // indentation; nested inside another construct it indents by the enclosing
@@ -671,22 +730,26 @@ impl<'a> Printer<'a> {
                 body,
                 ..
             } if outer == 0 && self.names.is_empty() => {
-                let value = self.expr(value, 0)?;
+                let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
                 self.bind(shown.clone(), type_);
-                let printed = self.expr(body, 0);
+                let printed = self.doc(body, 0);
                 self.unbind_to(depth);
-                Ok(format!("let {shown} := {value};\n{}", printed?))
+                Ok(Format::text(format!("let {shown} := "))
+                    .then(value)
+                    .then(Format::text(";\n"))
+                    .then(printed?))
             }
             ExprNode::LetE { .. } => Err(Unsupported("a nested let expression")),
-            ExprNode::Proj { idx, expr, .. } => {
-                Ok(format!("{}.{}", self.expr(expr, MAX_PREC)?, idx + 1))
-            }
+            ExprNode::Proj { idx, expr, .. } => Ok(node(
+                self.doc(expr, MAX_PREC)?
+                    .then(Format::text(format!(".{}", idx + 1))),
+            )),
         }
     }
 
-    fn application(&mut self, e: &Expr, outer: u32) -> Printed {
+    fn application(&mut self, e: &Expr, outer: u32) -> Doc {
         let (head, args) = spine(e);
         if let ExprNode::Const { name, .. } = head.node() {
             let text = name.to_display_string();
@@ -696,12 +759,12 @@ impl<'a> Printer<'a> {
                     literal: Literal::Nat(value),
                 } = args[1].node()
             {
-                return Ok(nat_decimal(value));
+                return Ok(Format::text(nat_decimal(value)));
             }
             // `notation:max "¬" p:40 => Not p`.
             if text == "Not" && args.len() == 1 {
-                return Ok(parens(
-                    format!("¬{}", self.expr(&args[0], 40)?),
+                return Ok(paren_doc(
+                    node(Format::text("¬").then(self.doc(&args[0], 40)?)),
                     MAX_PREC,
                     outer,
                 ));
@@ -723,17 +786,21 @@ impl<'a> Printer<'a> {
                         continue;
                     }
                     if name == "List.nil" && tail_args.len() == 1 {
-                        let mut shown = Vec::with_capacity(elements.len());
-                        for element in &elements {
-                            shown.push(self.expr(element, 0)?);
+                        // `"[" sepBy term ", " "]"`: a line after each comma.
+                        let mut shown = Format::Nil;
+                        for (index, element) in elements.iter().enumerate() {
+                            if index > 0 {
+                                shown = shown.then(Format::text(",")).then(Format::Line);
+                            }
+                            shown = shown.then(self.doc(element, 0)?);
                         }
-                        return Ok(format!("[{}]", shown.join(", ")));
+                        return Ok(node(Format::text("[").then(shown).then(Format::text("]"))));
                     }
                     break;
                 }
             }
             if text == "List.nil" && args.len() == 1 {
-                return Ok("[]".to_owned());
+                return Ok(Format::text("[]"));
             }
             if let Some(infix) = INFIXES
                 .iter()
@@ -747,10 +814,15 @@ impl<'a> Printer<'a> {
                 } else {
                     (infix.precedence, infix.precedence + 1)
                 };
-                let lhs = self.expr(&args[args.len() - 2], lhs_prec)?;
-                let rhs = self.expr(&args[args.len() - 1], rhs_prec)?;
-                return Ok(parens(
-                    format!("{lhs} {} {rhs}", infix.symbol),
+                // `infixl:65 " + "`: the token's trailing space is a line.
+                let lhs = self.doc(&args[args.len() - 2], lhs_prec)?;
+                let rhs = self.doc(&args[args.len() - 1], rhs_prec)?;
+                return Ok(paren_doc(
+                    node(
+                        lhs.then(Format::text(format!(" {}", infix.symbol)))
+                            .then(Format::Line)
+                            .then(rhs),
+                    ),
                     infix.precedence,
                     outer,
                 ));
@@ -759,45 +831,54 @@ impl<'a> Printer<'a> {
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
             // explicit argument and has type `C …` (never on a numeric literal).
             if let Some((receiver, field)) = self.field_receiver(name, &infos, &args) {
-                let mut shown = vec![format!("{}.{field}", self.expr(&args[receiver], MAX_PREC)?)];
+                let projection = node(
+                    self.doc(&args[receiver], MAX_PREC)?
+                        .then(Format::text(format!(".{field}"))),
+                );
+                let mut shown = projection;
+                let mut applied = false;
                 for (index, arg) in args.iter().enumerate() {
                     let explicit = infos
                         .get(index)
                         .is_none_or(|info| *info == BinderInfo::Default);
                     if explicit && index != receiver {
-                        shown.push(self.expr(arg, MAX_PREC)?);
+                        shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
+                        applied = true;
                     }
                 }
-                return Ok(if shown.len() == 1 {
-                    shown.remove(0)
+                return Ok(if applied {
+                    paren_doc(node(shown), MAX_PREC - 1, outer)
                 } else {
-                    parens(shown.join(" "), MAX_PREC - 1, outer)
+                    shown
                 });
             }
-            let mut shown = Vec::new();
+            let mut shown = Format::Nil;
+            let mut applied = false;
             for (index, arg) in args.iter().enumerate() {
                 let explicit = infos
                     .get(index)
                     .is_none_or(|info| *info == BinderInfo::Default);
                 if explicit {
-                    shown.push(self.expr(arg, MAX_PREC)?);
+                    shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
+                    applied = true;
                 }
             }
             let text = self.display_name(name);
-            if shown.is_empty() {
-                return Ok(text);
+            if !applied {
+                return Ok(Format::text(text));
             }
-            return Ok(parens(
-                format!("{text} {}", shown.join(" ")),
+            // `app := many1 argument`, each argument after a line (`checkWsBefore`).
+            return Ok(paren_doc(
+                node(Format::text(text).then(shown)),
                 MAX_PREC - 1,
                 outer,
             ));
         }
-        let mut shown = vec![self.expr(&head, MAX_PREC)?];
+        let mut shown = self.doc(&head, MAX_PREC)?;
         for arg in &args {
-            shown.push(self.expr(arg, MAX_PREC)?);
+            shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
         }
-        Ok(parens(shown.join(" "), MAX_PREC - 1, outer))
+        Ok(paren_doc(node(shown), MAX_PREC - 1, outer))
     }
 
     /// The receiver index and field name when `C.f args` prints as `receiver.f`.
@@ -857,20 +938,38 @@ impl<'a> Printer<'a> {
     /// One group of binders for a dependent `∀`/`→`, as the pin groups them. `hidden`
     /// omits an instance binder's name: the pin does when the name is not accessible and
     /// the body does not use it.
+    ///
+    /// Each bracketed binder is `ppGroup` (`fill (nest 2 …)`, vendored
+    /// `Parser/Term/Basic.lean`): names separated by lines, then `" :"`, a line and the type.
     fn binder_group(
         &self,
         info: BinderInfo,
         names: &[String],
-        type_: &str,
+        type_: Format,
         hidden: bool,
-    ) -> String {
-        match info {
-            BinderInfo::Implicit => format!("{{{} : {type_}}}", names.join(" ")),
-            BinderInfo::StrictImplicit => format!("⦃{} : {type_}⦄", names.join(" ")),
-            BinderInfo::InstImplicit if hidden => format!("[{type_}]"),
-            BinderInfo::InstImplicit => format!("[{} : {type_}]", names.join(" ")),
-            BinderInfo::Default => format!("({} : {type_})", names.join(" ")),
+    ) -> Format {
+        let (open, close) = match info {
+            BinderInfo::Implicit => ("{", "}"),
+            BinderInfo::StrictImplicit => ("⦃", "⦄"),
+            BinderInfo::InstImplicit => ("[", "]"),
+            BinderInfo::Default => ("(", ")"),
+        };
+        if info == BinderInfo::InstImplicit && hidden {
+            return node(Format::text(open).then(type_).then(Format::text(close)));
         }
+        let mut doc = Format::text(open);
+        for (index, name) in names.iter().enumerate() {
+            if index > 0 {
+                doc = doc.then(Format::Line);
+            }
+            doc = doc.then(Format::text(name.clone()));
+        }
+        node(
+            doc.then(Format::text(" :"))
+                .then(Format::Line)
+                .then(type_)
+                .then(Format::text(close)),
+        )
     }
 
     /// The name the pin's delaborator gives a bound binder (`getUnusedName`, vendored
@@ -903,7 +1002,45 @@ impl<'a> Printer<'a> {
             .unwrap_or(base)
     }
 
-    fn pi(&mut self, e: &Expr, outer: u32) -> Printed {
+    /// A signature parameter's name: as written, or sanitized when inaccessible. The pin's
+    /// `sanitizeNames` shows a macro-scoped `a` as `a✝`, and repeats of one base as `a✝¹`,
+    /// `a✝²`, ….
+    fn parameter_name(&self, name: &Name) -> String {
+        if accessible(name) || !name.has_macro_scopes() {
+            return binder_name(name);
+        }
+        let stem = format!("{}✝", escaped_name(&name.erase_macro_scopes()));
+        let repeats = self
+            .names
+            .iter()
+            .filter(|shown| {
+                shown
+                    .strip_prefix(stem.as_str())
+                    .is_some_and(|rest| rest.chars().all(|c| SUPERSCRIPTS.contains(c)))
+            })
+            .count();
+        if repeats == 0 {
+            stem
+        } else {
+            let digits: String = repeats
+                .to_string()
+                .chars()
+                .filter_map(|digit| {
+                    digit
+                        .to_digit(10)
+                        .and_then(|d| SUPERSCRIPTS.chars().nth(d as usize))
+                })
+                .collect();
+            format!("{stem}{digits}")
+        }
+    }
+
+    /// A binder type printed flat, to compare it with a neighbour's for grouping.
+    fn flat_type(&mut self, e: &Expr) -> Option<String> {
+        self.doc(e, 0).ok().map(|doc| flat(&doc))
+    }
+
+    fn pi(&mut self, e: &Expr, outer: u32) -> Doc {
         let ExprNode::ForallE {
             binder_name: name,
             binder_type,
@@ -914,16 +1051,22 @@ impl<'a> Printer<'a> {
             unreachable!("pi called on a pi")
         };
         let dependent = body.has_loose_bvar(0);
-        // A non-dependent explicit binder is an arrow (or an implication).
+        // A non-dependent explicit binder is an arrow (or an implication): `arrow` is
+        // `term " → " term`, the token's trailing space a line.
         if !dependent && *binder_info == BinderInfo::Default {
-            let domain = self.expr(binder_type, ARROW_PREC + 1)?;
+            let domain = self.doc(binder_type, ARROW_PREC + 1)?;
             let shown = self.bound_name(name, body);
             let depth = self.names.len();
             self.bind(shown, binder_type);
-            let codomain = self.expr(body, ARROW_PREC);
+            let codomain = self.doc(body, ARROW_PREC);
             self.unbind_to(depth);
-            return Ok(parens(
-                format!("{domain} → {}", codomain?),
+            return Ok(paren_doc(
+                node(
+                    domain
+                        .then(Format::text(" →"))
+                        .then(Format::Line)
+                        .then(codomain?),
+                ),
                 ARROW_PREC,
                 outer,
             ));
@@ -931,7 +1074,7 @@ impl<'a> Printer<'a> {
         let proposition = self.is_prop(e);
         // Group consecutive binders with one type and one binder kind.
         let depth = self.names.len();
-        let mut groups: Vec<String> = Vec::new();
+        let mut groups: Vec<Format> = Vec::new();
         let mut current = e;
         let result = loop {
             let ExprNode::ForallE {
@@ -941,13 +1084,14 @@ impl<'a> Printer<'a> {
                 binder_info,
             } = current.node()
             else {
-                break self.expr(current, ARROW_PREC);
+                break self.doc(current, ARROW_PREC);
             };
             let dependent = body.has_loose_bvar(0);
             if !dependent && *binder_info == BinderInfo::Default {
                 break self.pi(current, ARROW_PREC);
             }
-            let type_text = self.expr(binder_type, 0)?;
+            let type_doc = self.doc(binder_type, 0)?;
+            let type_text = flat(&type_doc);
             let hidden = !dependent && !accessible(name);
             let mut names = vec![self.bound_name(name, body)];
             self.bind(names[0].clone(), binder_type);
@@ -964,7 +1108,7 @@ impl<'a> Printer<'a> {
                     break;
                 }
                 let same = !other_type.has_loose_bvar(0)
-                    && self.expr(other_type, 0).ok() == Some(type_text.clone());
+                    && self.flat_type(other_type) == Some(type_text.clone());
                 if !same || proposition && *binder_info == BinderInfo::InstImplicit {
                     break;
                 }
@@ -973,39 +1117,46 @@ impl<'a> Printer<'a> {
                 self.bind(shown, other_type);
                 next = other_body;
             }
-            if proposition && *binder_info == BinderInfo::Default {
-                groups.push(format!("({} : {type_text})", names.join(" ")));
-            } else {
-                groups.push(self.binder_group(*binder_info, &names, &type_text, hidden));
-            }
+            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden));
             current = next;
             if proposition {
                 // `∀ (x : A) (y : B), p` keeps collecting dependent binders.
                 continue;
             }
-            // `(x : A) → B`: each group is its own arrow.
+            // `(x : A) → B`: `depArrow` is `bracketedBinder " → " term`.
             let rest = self.pi_tail(current);
             self.unbind_to(depth);
-            return Ok(parens(
-                format!("{} → {}", groups.join(" → "), rest?),
+            let group = groups.pop().expect("one binder group");
+            return Ok(paren_doc(
+                node(
+                    group
+                        .then(Format::text(" →"))
+                        .then(Format::Line)
+                        .then(rest?),
+                ),
                 ARROW_PREC,
                 outer,
             ));
         };
         self.unbind_to(depth);
         let body = result?;
+        // `∀` ++ (ppSpace binder)* ++ ", " ++ term (vendored `Parser/Term.lean`, `forall`).
+        let mut doc = Format::text("∀");
+        for group in groups {
+            doc = doc.then(Format::Line).then(group);
+        }
         // A trailing `∀` needs no parentheses as an arrow's codomain (the pin prints
         // `… → ∀ {a : Nat} (t : Q a), motive a t`), only where something tighter encloses it:
         // an arrow's domain or an argument.
-        Ok(parens(
-            format!("∀ {}, {body}", groups.join(" ")),
+        Ok(paren_doc(
+            node(doc.then(Format::text(",")).then(Format::Line).then(body)),
             ARROW_PREC,
             outer,
         ))
     }
 
-    fn pi_tail(&mut self, e: &Expr) -> Printed {
-        self.expr(e, ARROW_PREC)
+    fn pi_tail(&mut self, e: &Expr) -> Doc {
+        self.doc(e, ARROW_PREC)
     }
 
     /// `#check c` for a constant: `c binders : type` (`delabConstWithSignature`), the
@@ -1014,6 +1165,7 @@ impl<'a> Printer<'a> {
         let mut groups = Vec::new();
         let mut current = type_;
         let depth = self.names.len();
+        let mut used: Vec<Name> = Vec::new();
         while let ExprNode::ForallE {
             binder_name: binder,
             binder_type,
@@ -1021,13 +1173,23 @@ impl<'a> Printer<'a> {
             binder_info,
         } = current.node()
         {
-            if !accessible(binder) && *binder_info != BinderInfo::InstImplicit {
+            // `delabParams`: a non-dependent binder whose name is inaccessible or already used
+            // ends the parameters; the rest is the type after the colon. A dependent one stays,
+            // under its sanitized name (`a✝`, `a✝¹`, …).
+            let ends = |name: &Name, body: &Expr, used: &[Name]| {
+                !body.has_loose_bvar(0) && (!accessible(name) || used.contains(name))
+            };
+            if *binder_info != BinderInfo::InstImplicit && ends(binder, body, &used) {
                 break;
             }
-            let type_text = self.expr(binder_type, 0)?;
-            let mut names = vec![binder_name(binder)];
+            used.push(binder.clone());
+            let type_doc = self.doc(binder_type, 0)?;
+            let type_text = flat(&type_doc);
+            let mut names = vec![self.parameter_name(binder)];
             self.bind(names[0].clone(), binder_type);
             let mut next = body;
+            // `shouldGroupWithNext`: same binder style and domain, never an instance, and the
+            // next binder would itself stay a parameter.
             while let ExprNode::ForallE {
                 binder_name: other,
                 binder_type: other_type,
@@ -1036,22 +1198,24 @@ impl<'a> Printer<'a> {
             } = next.node()
             {
                 if other_info != binder_info
-                    || !accessible(other)
+                    || *other_info == BinderInfo::InstImplicit
+                    || ends(other, other_body, &used)
                     || other_type.has_loose_bvar(0)
-                    || self.expr(other_type, 0).ok() != Some(type_text.clone())
+                    || self.flat_type(other_type) != Some(type_text.clone())
                 {
                     break;
                 }
-                let shown = binder_name(other);
+                used.push(other.clone());
+                let shown = self.parameter_name(other);
                 names.push(shown.clone());
                 self.bind(shown, other_type);
                 next = other_body;
             }
             let hidden = !accessible(binder);
-            groups.push(self.binder_group(*binder_info, &names, &type_text, hidden));
+            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden));
             current = next;
         }
-        let rest = self.expr(current, 0);
+        let rest = self.doc(current, 0);
         self.unbind_to(depth);
         // The signature names the constant's universe parameters (`List.map.{u_1, u_2}`).
         let parameters = self
@@ -1072,11 +1236,14 @@ impl<'a> Printer<'a> {
                     .join(", ")
             )
         };
-        Ok(if groups.is_empty() {
-            format!("{head} : {}", rest?)
-        } else {
-            format!("{head} {} : {}", groups.join(" "), rest?)
-        })
+        // `declSigWithId`, formatted as a term (`ppSignature`'s `ppTerm`): one
+        // `fill (nest 2 …)` holding the name, a line before each binder group, then
+        // `typeSpec`'s `" :"`, a line and the type.
+        let mut doc = Format::text(head);
+        for group in groups {
+            doc = doc.then(Format::Line).then(group);
+        }
+        Ok(node(doc.then(Format::text(" :")).then(Format::Line).then(rest?)).pretty(WIDTH))
     }
 }
 

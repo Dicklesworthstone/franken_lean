@@ -64,6 +64,9 @@ fn a_matching_guard_is_silent_and_its_neighbours_still_print() {
         // passes all three guards (exit 0, silent).
         "inductive P : Nat → Prop where\n  | mk (n : Nat) : P n\n/-- info: @P.rec : {a : Nat} → {motive : P a → Sort u_1} → motive ⋯ → (t : P a) → motive t -/\n#guard_msgs in\n#check @P.rec\n",
         "inductive Q : Nat → Prop where\n  | zero : Q 0\n  | succ (n : Nat) : Q n → Q (n + 1)\n/-- info: Q.succ 0 Q.zero : Q (0 + 1) -/\n#guard_msgs in\n#check Q.succ 0 Q.zero\n/-- info: Q.succ : ∀ (n : Nat), Q n → Q (n + 1) -/\n#guard_msgs in\n#check @Q.succ\n",
+        // A wrapped expectation, as the pin breaks it at width 120: `#guard_msgs` turns
+        // newlines into spaces but keeps the indentation, so the breaks must be the pin's.
+        "inductive Vec (A : Type) : Nat → Type | nil : Vec A 0 | cons (n : Nat) (x : A) (xs : Vec A n) : Vec A (n + 1)\n/--\ninfo: @Vec.rec : {A : Type} →\n  {motive : (a : Nat) → Vec A a → Sort u_1} →\n    motive 0 Vec.nil →\n      ((n : Nat) → (x : A) → (xs : Vec A n) → motive n xs → motive (n + 1) (Vec.cons n x xs)) →\n        {a : Nat} → (t : Vec A a) → motive a t\n-/\n#guard_msgs in\n#check @Vec.rec\n",
     ] {
         let output = lean(program);
         assert_eq!(output.status.code(), Some(0), "{program}\n{output:?}");
