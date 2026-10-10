@@ -13,7 +13,8 @@
 # Shared no-admission ground: fln-unsafe-abi cannot name fln-kernel/fln-checker
 # types (FLN-STRUCT-008 prohibited paths + the admission-token tripwire), so no
 # output below is expressible as a kernel-checkable term; `Obj` is an opaque
-# linear handle whose contents only ever surface as plain data copies.
+# linear handle whose contents surface only as plain data copies or immutable
+# payload slices whose lifetime is tied to the owning handle.
 
 schema fln-boundary-api/1
 
@@ -71,6 +72,7 @@ row FLN-BX-0091 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_scalar_u32 |
 row FLN-BX-0092 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_scalar_u64 | (&self, usize) -> Option<u64> | fallible_constructor_scalar_reads_check_width_and_offset; float_intrinsics_refuse_malformed_objects_and_arity | bounded scalar value copy or None; no raw pointer or kernel type escapes
 row FLN-BX-0041 | crates/fln-unsafe-abi/src/handle.rs | fn string_view | (&self) -> (usize, usize, usize, Vec<u8>) | string_facts_utf8 | data copies
 row FLN-BX-0083 | crates/fln-unsafe-abi/src/handle.rs | fn try_string_view | (&self) -> Option<(usize, usize, usize, Vec<u8>)> | try_string_view_refuses_hostile_headers | owned byte copies, or None; no raw pointer, owned authority, or kernel type escapes
+row FLN-BX-0118 | crates/fln-unsafe-abi/src/handle.rs | fn try_borrow_string_view | (&self) -> Option<(usize, usize, usize, &[u8])> | borrowed_string_view_aliases_owned_storage_without_copying; try_string_view_refuses_hostile_headers; compile-fail owning-handle lifetime example | immutable byte slice bound to the owning Obj borrow, or None; no raw pointer, ownership transfer, or kernel authority escapes
 row FLN-BX-0042 | crates/fln-unsafe-abi/src/handle.rs | fn array_view | (&self) -> (usize, usize) | array suites | value copies
 row FLN-BX-0084 | crates/fln-unsafe-abi/src/handle.rs | fn try_array_view | (&self) -> Option<(usize, usize)> | try_array_view_refuses_hostile_headers | value copies, or None; no raw pointer, owned authority, or kernel type escapes
 row FLN-BX-0086 | crates/fln-unsafe-abi/src/handle.rs | fn try_sarray_view | (&self) -> Option<(u8, usize, usize, Vec<u8>)> | try_sarray_view_refuses_hostile_headers | owned byte copies, or None; no raw pointer, owned authority, or kernel type escapes

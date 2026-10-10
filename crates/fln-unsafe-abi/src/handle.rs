@@ -511,23 +511,41 @@ impl Obj {
             && byte_off.checked_add(width).is_some_and(|end| end <= extent)
     }
 
-    /// Fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    /// Borrow a string view `(size, capacity, length, bytes-with-NUL)`.
     ///
     /// Returns `None` when the handle is not a string or the header is
     /// inconsistent (`m_size == 0`, `m_size` past `m_capacity`, missing
-    /// NUL). Product paths that accept untrusted objects must use this;
-    /// [`string_view`] still asserts. Inflating both `m_size` and
-    /// `m_capacity` past the minted allocation remains outside this check
-    /// (same residual as [`try_mpz_view`]): the test plants `m_size` only,
-    /// so Drop still frees with the real `m_capacity`.
-    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+    /// NUL). The returned bytes alias the immutable ABI buffer and remain
+    /// valid only while this handle is borrowed. There is no allocation,
+    /// copy, UTF-8 scan, or ownership transfer: callers can check their byte
+    /// allowance before validating the text or creating an owned copy.
+    /// `length` is the recorded character count, not a verified count.
+    ///
+    /// Inflating both `m_size` and `m_capacity` past the minted allocation
+    /// remains outside this check (same residual as [`Self::try_mpz_view`]):
+    /// the test plants `m_size` only, so Drop still frees with the real
+    /// `m_capacity`.
+    ///
+    /// The byte slice cannot outlive its owning handle:
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_string("borrowed");
+    ///     value.try_borrow_string_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed\0");
+    /// ```
+    pub fn try_borrow_string_view(&self) -> Option<(usize, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_STRING) {
             return None;
         }
         // SAFETY: tag is TAG_STRING, so the object is a LeanStringObject.
         // `m_size <= m_capacity` is the inline-buffer law: the minted
-        // data area is `m_capacity` bytes. Copying `m_size` after that
-        // check cannot run past the header's own capacity claim.
+        // data area is `m_capacity` bytes. Reading `m_size` after that
+        // check cannot run past the header's own capacity claim. The live
+        // owning &self keeps the immutable allocation alive for the slice's
+        // complete lifetime; no raw pointer or unconstrained borrow escapes.
         unsafe {
             let s = self.0.cast::<crate::layout::LeanStringObject>();
             let size = (&raw const (*s).m_size).read();
@@ -537,12 +555,23 @@ impl Obj {
                 return None;
             }
             let data = (&raw const (*s).m_data).cast::<u8>();
-            let copy = core::slice::from_raw_parts(data, size).to_vec();
-            if copy[size - 1] != 0 {
+            let bytes = core::slice::from_raw_parts(data, size);
+            if bytes[size - 1] != 0 {
                 return None;
             }
-            Some((size, cap, len, copy))
+            Some((size, cap, len, bytes))
         }
+    }
+
+    /// Copy a fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    ///
+    /// Uses [`Self::try_borrow_string_view`]'s category, header, and terminator
+    /// checks before allocating the copy. Resource-bounded callers should use
+    /// that borrowed view to check their allowance before copying; this
+    /// convenience observer retains its original owned-byte behavior.
+    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+        self.try_borrow_string_view()
+            .map(|(size, cap, len, bytes)| (size, cap, len, bytes.to_vec()))
     }
 
     /// String salient facts `(size, capacity, length, bytes-with-NUL)`.
