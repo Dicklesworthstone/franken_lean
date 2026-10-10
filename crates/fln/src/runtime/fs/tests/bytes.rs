@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod implemented_by;
 mod write;
 
 fn raw_bytes_environment() -> Option<Environment> {

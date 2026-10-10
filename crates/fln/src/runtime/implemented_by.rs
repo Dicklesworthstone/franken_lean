@@ -50,8 +50,9 @@ impl Preparation<'_> {
     }
 
     /// An attribute authorizes selecting this checked target, not executing an
-    /// opaque inhabitant, unsafe body, unknown extern, or foreign IR. Supported
-    /// partial definitions continue through their existing complete-group gate.
+    /// opaque inhabitant, unsafe body, unknown extern, or foreign IR. Exact
+    /// native contracts may authorize an opaque target; supported partial
+    /// definitions continue through their existing complete-group gate.
     pub(super) fn implementation_target(
         &mut self,
         requested: &Name,
@@ -60,6 +61,44 @@ impl Preparation<'_> {
             return Ok(None);
         };
         self.tick()?;
+        let safe_target = match self.environment.find(&target) {
+            Some(ConstantInfo::Defn(value)) => value.safety != DefinitionSafety::Unsafe,
+            Some(ConstantInfo::Opaque(value)) => !value.is_unsafe,
+            Some(ConstantInfo::Axiom(value)) => !value.is_unsafe,
+            _ => false,
+        };
+        if !safe_target {
+            return Err(unsupported(
+                "implemented_by target has no supported safe or partial executable body",
+            ));
+        }
+        // A replacement retains the target's ordinary execution authority.
+        // Generic intrinsics compare their complete admitted models. File IO
+        // uses a separate checked adapter, including the opaque declaration,
+        // extern ownership, world/result models and binary conversion closure.
+        // Recognizer errors remain refusals; none may fall back to an opaque
+        // default or an ordinary body after a failed native contract.
+        let native = executable_intrinsic_binding_cached(
+            self.environment,
+            &target,
+            &mut self.visited,
+            self.limits,
+            &mut self.externs,
+        )?
+        .is_some()
+            || match source_intrinsics::io::fs::Operation::from_name(&target) {
+                Some(operation) => source_intrinsics::io::fs::primitive_matches(
+                    self.environment,
+                    operation,
+                    &mut self.externs,
+                    &mut self.visited,
+                    self.limits,
+                )?,
+                None => false,
+            };
+        if native {
+            return Ok(Some(target));
+        }
         // `target` is a terminal table entry: this call cannot recurse through
         // another replacement. It applies the existing safe/partial body gate.
         if self.executable_definition(&target)?.is_none() {
@@ -78,14 +117,6 @@ impl Preparation<'_> {
             .externs
             .as_ref()
             .is_some_and(|table| table.get(&target).is_some())
-            && executable_intrinsic_binding_cached(
-                self.environment,
-                &target,
-                &mut self.visited,
-                self.limits,
-                &mut self.externs,
-            )?
-            .is_none()
         {
             return Err(unsupported(
                 "implemented_by target extern has no supported native implementation",
