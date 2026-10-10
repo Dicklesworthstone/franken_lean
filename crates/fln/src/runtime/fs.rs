@@ -28,6 +28,7 @@ pub(super) struct Store {
     read_layout: Option<Layout>,
     bytes_layout: Option<Layout>,
     bytes: Option<bytes::Layout>,
+    write_bytes: Option<bytes::WriteLayout>,
 }
 
 #[derive(Clone)]
@@ -251,6 +252,13 @@ impl Preparation<'_> {
                     vec![layout.handle.clone(), bytes.native_word],
                 )
             }
+            Operation::Write => {
+                let bytes = self.fs_bytes_layout()?;
+                (
+                    vec![ValueType::Abi, ValueType::Abi],
+                    vec![layout.handle.clone(), bytes.packed],
+                )
+            }
         };
         self.fs.bindings.insert(
             private.clone(),
@@ -304,7 +312,9 @@ impl Preparation<'_> {
             // The error-arm placeholder is never projected as a Handle.
             // Only the safe native open producer authorizes this payload.
             Operation::Open => field(layout, 0)?,
-            Operation::PutStr => Expr::const_(layout.error.unit_constructor.clone(), Vec::new()),
+            Operation::PutStr | Operation::Write => {
+                Expr::const_(layout.error.unit_constructor.clone(), Vec::new())
+            }
             // The native producer validates canonical String success. The
             // typed EST.Out constructor inserts an explicit ABI-to-String
             // refinement here, inside the lazy success arm only. Error
@@ -382,7 +392,7 @@ impl Preparation<'_> {
         let primitive = self.fs_bind_primitive(operation, &layout)?;
         let result_type = match operation {
             Operation::Open => c("IO.FS.Handle"),
-            Operation::PutStr => c("Unit"),
+            Operation::PutStr | Operation::Write => c("Unit"),
             Operation::GetLine => c("String"),
             Operation::Read => c("ByteArray"),
         };
@@ -436,6 +446,10 @@ impl Preparation<'_> {
                     vec![b(2)?, self.fs_native_read_count(b(1)?)?],
                 )
             }
+            Operation::Write => (
+                vec![layout.handle.clone(), c("ByteArray")],
+                vec![b(2)?, self.fs_native_write_bytes(b(1)?)?],
+            ),
         };
         let returned = self.fs_result(operation, &layout, &result)?;
         let mut body = Expr::let_e(

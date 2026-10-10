@@ -1,7 +1,7 @@
-//! Exact contracts for the native Handle.mk, putStr and getLine leaves.
+//! Exact contracts for native Handle open, text and binary IO leaves.
 //!
-//! Ordinary writeFile/withFile/bind bodies stay executable source. Only the
-//! decorated opaque declarations can select these effectful native rows.
+//! Ordinary writeFile/writeBinFile/withFile/bind bodies stay executable source.
+//! Only decorated opaque declarations can select these effectful native rows.
 
 use super::*;
 
@@ -9,7 +9,10 @@ mod bytes;
 mod model;
 pub(crate) use bytes::word_matches;
 #[cfg(test)]
-pub(crate) use bytes::{HELPERS as BYTE_HELPERS, assert_pin_layouts as assert_pin_byte_layouts};
+pub(crate) use bytes::{
+    HELPERS as BYTE_HELPERS, WRITE_HELPERS as WRITE_BYTE_HELPERS,
+    assert_pin_layouts as assert_pin_byte_layouts, assert_pin_write_dependencies,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
@@ -17,13 +20,20 @@ pub(crate) enum Operation {
     PutStr,
     GetLine,
     Read,
+    Write,
 }
 
 impl Operation {
     pub(crate) fn from_name(requested: &Name) -> Option<Self> {
-        [Self::Open, Self::PutStr, Self::GetLine, Self::Read]
-            .into_iter()
-            .find(|operation| requested == &operation.source_name())
+        [
+            Self::Open,
+            Self::PutStr,
+            Self::GetLine,
+            Self::Read,
+            Self::Write,
+        ]
+        .into_iter()
+        .find(|operation| requested == &operation.source_name())
     }
 
     pub(crate) fn source_name(self) -> Name {
@@ -36,6 +46,7 @@ impl Operation {
                 Self::PutStr => "putStr",
                 Self::GetLine => "getLine",
                 Self::Read => "read",
+                Self::Write => "write",
             },
         ])
     }
@@ -101,6 +112,9 @@ pub(crate) fn primitive_matches(
     if operation == Operation::Read {
         bytes::contract_matches(environment, externs, visited, limits)?;
     }
+    if operation == Operation::Write {
+        bytes::write_contract_matches(environment, externs, visited, limits)?;
+    }
     let mut comparison = Comparison { visited, limits };
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {
@@ -123,6 +137,7 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
         model::primitive(Operation::PutStr),
         model::primitive(Operation::GetLine),
         model::primitive(Operation::Read),
+        model::primitive(Operation::Write),
     ]) {
         assert!(
             Comparison {

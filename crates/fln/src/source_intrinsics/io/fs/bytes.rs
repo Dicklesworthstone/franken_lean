@@ -1,14 +1,22 @@
-//! Exact data layouts and bounded dependency identity for counted file reads.
+//! Exact data layouts and bounded dependency identity for binary file IO.
 //!
 //! `dependencies.txt` is the complete transitive type/body/recursor-rule and
 //! constructor/mutual-membership closure of the seven helpers listed below,
-//! decoded from SUITE.lock's actual artifacts. Each cached environment digest
-//! binds the complete ConstantInfo, including binder metadata and safety.
+//! decoded from SUITE.lock's actual artifacts. `write_dependencies.txt` adds
+//! the remaining closure of the three native packing helpers used by writes.
+//! Each cached environment digest binds the complete ConstantInfo, including
+//! binder metadata and safety.
 //! These are comparison data, never declarations or an admission shortcut.
 //! The readable layouts additionally document every logical/native boundary.
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("bytes/dependencies.txt");
+const WRITE_DEPENDENCIES: &str = include_str!("bytes/write_dependencies.txt");
+pub(crate) const WRITE_HELPERS: [&str; 3] = [
+    "ByteArray.emptyWithCapacity",
+    "ByteArray.push",
+    "UInt8.ofBitVec",
+];
 pub(crate) const HELPERS: [&str; 7] = [
     "ByteArray.data",
     "Array.size",
@@ -193,6 +201,44 @@ pub(crate) fn word_matches(
     Ok(true)
 }
 
+pub(crate) fn write_contract_matches(
+    environment: &Environment,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    contract_matches(environment, externs, visited, limits)?;
+    if WRITE_DEPENDENCIES.trim().is_empty() {
+        return Err(IngressError::UnsupportedNode {
+            kind: "binary file write requires its exact dependency inventory",
+        });
+    }
+    for line in WRITE_DEPENDENCIES.lines() {
+        charge_catalog_node(visited, limits)?;
+        let (encoded, digest) = line
+            .split_once('\t')
+            .expect("fixed binary write dependency row");
+        let requested = dependency_name(encoded, visited, limits)?;
+        if environment
+            .entry(&requested)
+            .is_none_or(|entry| entry.digest().to_hex() != digest)
+        {
+            return Err(IngressError::UnsupportedNode {
+                kind: "binary file write dependency differs from the exact pinned model",
+            });
+        }
+        check_selected_extern_attribute(environment, &requested, externs, visited, limits)?;
+    }
+    for helper in WRITE_HELPERS {
+        if !extern_attribute_matches(environment, &name(helper), true, externs, visited, limits)? {
+            return Err(IngressError::UnsupportedNode {
+                kind: "binary file write requires each native conversion extern",
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn assert_pin_layouts(environment: &Environment) {
     for expected in layouts() {
@@ -222,7 +268,51 @@ pub(crate) fn assert_pin_layouts(environment: &Environment) {
         })
         .collect();
     assert_eq!(expected.len(), 289);
-    let mut pending: Vec<_> = HELPERS.into_iter().map(name).collect();
+    assert_eq!(
+        actual_dependencies(environment, &HELPERS),
+        expected,
+        "complete actual byte-helper dependency closure"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_pin_write_dependencies(environment: &Environment) {
+    let inventory = |data: &str| -> std::collections::BTreeSet<_> {
+        data.lines()
+            .map(|line| {
+                dependency_name(
+                    line.split_once('\t').unwrap().0,
+                    &mut 0,
+                    IngressLimits::default(),
+                )
+                .unwrap()
+            })
+            .collect()
+    };
+    let read = inventory(DEPENDENCIES);
+    let write = inventory(WRITE_DEPENDENCIES);
+    assert!(!write.is_empty());
+    assert!(
+        read.is_disjoint(&write),
+        "write rows only extend the read inventory"
+    );
+    let actual = actual_dependencies(environment, &WRITE_HELPERS);
+    assert_eq!(
+        actual
+            .difference(&read)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        write,
+        "complete additional actual packing-helper dependency closure"
+    );
+}
+
+#[cfg(test)]
+fn actual_dependencies(
+    environment: &Environment,
+    helpers: &[&str],
+) -> std::collections::BTreeSet<Name> {
+    let mut pending: Vec<_> = helpers.iter().map(|helper| name(helper)).collect();
     let mut actual = std::collections::BTreeSet::new();
     while let Some(label) = pending.pop() {
         if !actual.insert(label.clone()) {
@@ -291,8 +381,5 @@ pub(crate) fn assert_pin_layouts(environment: &Environment) {
             }
         }
     }
-    assert_eq!(
-        actual, expected,
-        "complete actual byte-helper dependency closure"
-    );
+    actual
 }

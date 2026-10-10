@@ -1,10 +1,12 @@
-//! Convert bounded native file buffers to ordinary checked logical records.
+//! Convert between native file buffers and checked logical byte records.
 //!
 //! Packed bytes and native arrays never acquire the source ByteArray/Array
 //! representation. A single native ByteArray.data conversion supplies a
 //! private array, then metered Nat recursion builds exact logical constructors.
 //! The native counted read refuses more than 64 KiB before touching the file;
 //! the conversion additionally obeys the caller's instruction/stack budgets.
+//! Writes fold the logical List in source order into a private packed buffer;
+//! packing stays inside the deferred world action and obeys those same budgets.
 use super::*;
 use fln_vm::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership,
@@ -22,7 +24,7 @@ pub(super) struct Layout {
     pub(super) word: records::Shape,
     word_bits: records::Shape,
     word_fin: records::Shape,
-    packed: Expr,
+    pub(super) packed: Expr,
     native_array: Expr,
     byte_array: records::ShapeConstructor,
     array: records::ShapeConstructor,
@@ -56,6 +58,9 @@ enum Helper {
     ToWord,
     WordOfNat,
     WordToNat,
+    EmptyBytes,
+    PushByte,
+    FromNat,
 }
 
 impl Helper {
@@ -98,8 +103,36 @@ impl Helper {
                 "abi((a: borrowed_arg) -> value)",
             ),
             Self::WordToNat => ("USize.toNat", "defn", 0, 1, "abi((n: value) -> owned_res)"),
+            Self::EmptyBytes => (
+                "ByteArray.emptyWithCapacity",
+                "defn",
+                0,
+                1,
+                "abi((capacity: borrowed_arg) -> owned_res)",
+            ),
+            Self::PushByte => (
+                "ByteArray.push",
+                "defn",
+                0,
+                2,
+                "abi((a: owned_arg, b: value) -> owned_res)",
+            ),
+            Self::FromNat => (
+                "UInt8.ofBitVec",
+                "ctor",
+                0,
+                1,
+                "abi((a: owned_arg) -> value)",
+            ),
         }
     }
+}
+
+#[derive(Clone)]
+pub(super) struct WriteLayout {
+    empty: Name,
+    push: Name,
+    from_nat: Name,
 }
 
 impl Preparation<'_> {
@@ -177,8 +210,9 @@ impl Preparation<'_> {
         if let Some(layout) = &self.fs.bytes {
             return Ok(layout.clone());
         }
-        // Operation::Read has already checked every logical model and the
-        // genuine extern entry of each helper before any layout is published.
+        // Read, Write, or a checked word adapter has already checked every
+        // logical model and the genuine extern entry of each helper before
+        // any layout is published.
         let word = self.io_checked_shape(c("USize"))?;
         let word_constructor = self.io_checked_single_constructor(c("USize"), 1)?;
         let word_bits = self.io_checked_shape(word_constructor.fields[0].clone())?;
@@ -460,5 +494,91 @@ impl Preparation<'_> {
             false,
         );
         Ok(packed_binding)
+    }
+
+    /// Convert a checked ByteArray/Array/List/UInt8 value before the native
+    /// write. The source value stays logical; only this private result has
+    /// the packed byte-array representation expected by Handle.write.
+    pub(super) fn fs_native_write_bytes(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let layout = self.fs_bytes_layout()?;
+        let write = if let Some(write) = self.fs.write_bytes.clone() {
+            write
+        } else {
+            let byte = self.fs_abi_carrier(NATIVE_BYTE, CallableResultOwnership::Scalar)?;
+            let empty = self.fs_bytes_helper(
+                Helper::EmptyBytes,
+                vec![c("Nat")],
+                vec![ValueType::Nat],
+                layout.packed.clone(),
+                ValueType::Abi,
+            )?;
+            let push = self.fs_bytes_helper(
+                Helper::PushByte,
+                vec![layout.packed.clone(), byte.clone()],
+                vec![ValueType::Abi, ValueType::Abi],
+                layout.packed.clone(),
+                ValueType::Abi,
+            )?;
+            let from_nat = self.fs_bytes_helper(
+                Helper::FromNat,
+                vec![c("Nat")],
+                vec![ValueType::Nat],
+                byte,
+                ValueType::Abi,
+            )?;
+            let write = WriteLayout {
+                empty,
+                push,
+                from_nat,
+            };
+            self.fs.write_bytes = Some(write.clone());
+            write
+        };
+        let accumulator = function(std::slice::from_ref(&layout.packed), layout.packed.clone());
+        // Under the cons minor's four binders: #0=packed accumulator, #1=IH,
+        // #2=tail, #3=head. The admitted Fin proof establishes the byte bound;
+        // only its natural-number field reaches the genuine UInt8 constructor.
+        let byte_projection = self.io_checked_shape(c("UInt8"))?.projection(&layout.byte);
+        let bits_projection = self
+            .io_checked_shape(layout.byte.fields[0].clone())?
+            .projection(&layout.bits);
+        let fin_projection = self
+            .io_checked_shape(layout.bits.fields[0].clone())?
+            .projection(&layout.fin);
+        let bits = Expr::proj(byte_projection, 0, b(3)?);
+        let finite = Expr::proj(bits_projection, 0, bits);
+        let natural = Expr::proj(fin_projection, 0, finite);
+        let byte = Expr::app(Expr::const_(write.from_nat, Vec::new()), natural);
+        let pushed = apply(Expr::const_(write.push, Vec::new()), [b(0)?, byte]);
+        let cons = lambda(
+            c("UInt8"),
+            lambda(
+                layout.list.source.clone(),
+                lambda(
+                    accumulator.clone(),
+                    lambda(layout.packed.clone(), Expr::app(b(1)?, pushed)),
+                ),
+            ),
+        );
+        let bytes_projection = self
+            .io_checked_shape(c("ByteArray"))?
+            .projection(&layout.byte_array);
+        let array_projection = self
+            .io_checked_shape(layout.byte_array.fields[0].clone())?
+            .projection(&layout.array);
+        let logical_array = Expr::proj(bytes_projection, 0, value);
+        let list = Expr::proj(array_projection, 0, logical_array);
+        let empty = Expr::app(Expr::const_(write.empty, Vec::new()), nat::literal(0));
+        Ok(apply(
+            Expr::const_(name("List.rec"), vec![Level::one(), Level::zero()]),
+            [
+                c("UInt8"),
+                lambda(layout.list.source, accumulator),
+                lambda(layout.packed, b(0)?),
+                cons,
+                list,
+                empty,
+            ],
+        ))
     }
 }
