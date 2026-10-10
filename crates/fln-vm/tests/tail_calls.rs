@@ -219,6 +219,173 @@ fn deep_exact_closure_tail_calls_keep_captures_and_release_old_frames() {
 }
 
 #[test]
+fn fir_lowering_emits_tail_calls_that_transfer_owned_arguments_without_leaks() {
+    use fln_comp::fir::{
+        self, Binding, Block, BlockId, ClosureTypeDecl, ClosureTypeId, IntrinsicDecl, IntrinsicId,
+        Operation, Terminator, ValueId, ValueType,
+    };
+
+    let _guard = LOCK.lock().unwrap();
+    let value = ValueId::new;
+    let block = BlockId::new;
+    let target = fir::FunctionId::new;
+    for dynamic in [false, true] {
+        let worker = |id, next| {
+            let mut bindings = vec![
+                Binding {
+                    id: value(3),
+                    ty: ValueType::Nat,
+                    operation: Operation::Nat(1),
+                },
+                Binding {
+                    id: value(4),
+                    ty: ValueType::Nat,
+                    operation: Operation::Intrinsic {
+                        intrinsic: IntrinsicId::new(0),
+                        args: vec![value(0), value(3)],
+                    },
+                },
+                Binding {
+                    id: value(5),
+                    ty: ValueType::String,
+                    operation: Operation::String("retire this frame's local".into()),
+                },
+            ];
+            let result = if dynamic {
+                bindings.push(Binding {
+                    id: value(6),
+                    ty: ValueType::Closure(ClosureTypeId::new(0)),
+                    operation: Operation::Closure {
+                        closure_type: ClosureTypeId::new(0),
+                        function: target(next),
+                        captures: vec![value(4)],
+                        capture_ownership: vec![A::Borrowed],
+                    },
+                });
+                bindings.push(Binding {
+                    id: value(7),
+                    ty: ValueType::String,
+                    operation: Operation::Apply {
+                        closure: value(6),
+                        args: vec![value(2), value(1)],
+                        argument_ownership: vec![A::Owned, A::Owned],
+                        result_ownership: R::Owned,
+                    },
+                });
+                value(7)
+            } else {
+                bindings.push(Binding {
+                    id: value(6),
+                    ty: ValueType::String,
+                    operation: Operation::Call {
+                        function: target(next),
+                        args: vec![value(4), value(2), value(1)],
+                    },
+                });
+                value(6)
+            };
+            fir::Function {
+                id: target(id),
+                parameters: vec![ValueType::Nat, ValueType::String, ValueType::String],
+                parameter_ownership: vec![A::Borrowed, A::Owned, A::Owned],
+                result: ValueType::String,
+                result_ownership: R::Owned,
+                blocks: vec![
+                    Block {
+                        id: block(0),
+                        bindings: Vec::new(),
+                        terminator: Terminator::BranchZero {
+                            condition: value(0),
+                            zero: block(2),
+                            nonzero: block(1),
+                        },
+                    },
+                    Block {
+                        id: block(1),
+                        bindings,
+                        terminator: Terminator::Return { value: result },
+                    },
+                    Block {
+                        id: block(2),
+                        bindings: Vec::new(),
+                        terminator: Terminator::Return { value: value(1) },
+                    },
+                ],
+            }
+        };
+        let entry = fir::Function {
+            id: target(0),
+            parameters: Vec::new(),
+            parameter_ownership: Vec::new(),
+            result: ValueType::String,
+            result_ownership: R::Owned,
+            blocks: vec![Block {
+                id: block(0),
+                bindings: vec![
+                    Binding {
+                        id: value(0),
+                        ty: ValueType::Nat,
+                        operation: Operation::Nat(1_001),
+                    },
+                    Binding {
+                        id: value(1),
+                        ty: ValueType::String,
+                        operation: Operation::String("left".into()),
+                    },
+                    Binding {
+                        id: value(2),
+                        ty: ValueType::String,
+                        operation: Operation::String("right".into()),
+                    },
+                    Binding {
+                        id: value(3),
+                        ty: ValueType::String,
+                        operation: Operation::Call {
+                            function: target(1),
+                            args: vec![value(0), value(1), value(2)],
+                        },
+                    },
+                ],
+                terminator: Terminator::Return { value: value(3) },
+            }],
+        };
+        let program = fir::Program::new_with_closures(
+            target(0),
+            Vec::new(),
+            Vec::new(),
+            vec![ClosureTypeDecl {
+                id: ClosureTypeId::new(0),
+                parameters: vec![ValueType::String, ValueType::String],
+                parameter_ownership: vec![A::Owned, A::Owned],
+                result: ValueType::String,
+                result_ownership: R::Owned,
+            }],
+            vec![IntrinsicDecl {
+                id: IntrinsicId::new(0),
+                row: "extern:Nat.sub".into(),
+                arguments: vec![ValueType::Nat, ValueType::Nat],
+                argument_ownership: vec![A::Borrowed, A::Borrowed],
+                result: ValueType::Nat,
+                result_ownership: ResultOwnership::Owned,
+                effect: fir::EffectClass::Pure,
+            }],
+            vec![entry, worker(1, 2), worker(2, 1)],
+        );
+        let validated = fir::validate(program, fir::ValidationLimits::default()).unwrap();
+        let compiled =
+            fir::lower_to_flbc_with_ownership(&validated, OwnershipLimits::default()).unwrap();
+        let bytes = flbc::encode_canonical(compiled.program(), CodecLimits::default()).unwrap();
+        let decoded = flbc::decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        shadow::enable();
+        let result = returned(interpreter::execute(&decoded, limits(1), None));
+        assert_eq!(result.value.string_view().3, b"right\0");
+        assert_eq!(result.usage.peak_stack_depth, 1);
+        drop(result);
+        no_leaks();
+    }
+}
+
+#[test]
 fn tail_calls_inherit_an_ordinary_callers_return_destination() {
     let _guard = LOCK.lock().unwrap();
     let program = owned(&checked(vec![

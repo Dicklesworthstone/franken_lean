@@ -6879,7 +6879,7 @@ mod tests {
         );
         assert!(matches!(
             &lowered.functions()[0].code[2],
-            crate::flbc::Instruction::Call {
+            crate::flbc::Instruction::TailCall {
                 function,
                 argument_ownership,
                 ..
@@ -7214,7 +7214,7 @@ mod tests {
         ));
         assert!(matches!(
             &lowered.functions()[0].code[3],
-            crate::flbc::Instruction::Apply { args, .. } if args.len() == 1
+            crate::flbc::Instruction::TailApply { args, .. } if args.len() == 1
         ));
     }
 
@@ -8233,11 +8233,12 @@ mod tests {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                crate::flbc::Instruction::Apply { args, .. } => Some(args.len()),
+                crate::flbc::Instruction::Apply { args, .. } => Some((false, args.len())),
+                crate::flbc::Instruction::TailApply { args, .. } => Some((true, args.len())),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(partial_widths, [1, 1]);
+        assert_eq!(partial_widths, [(false, 1), (true, 1)]);
 
         std::thread::scope(|scope| {
             let mut joins = Vec::new();
@@ -8311,7 +8312,7 @@ mod tests {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                crate::flbc::Instruction::Apply { args, .. } => Some(args.len()),
+                crate::flbc::Instruction::TailApply { args, .. } => Some(args.len()),
                 _ => None,
             })
             .collect::<Vec<_>>();

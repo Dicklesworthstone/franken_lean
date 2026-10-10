@@ -3471,8 +3471,9 @@ impl LoweringError {
 }
 
 /// Deterministically lower validated target-neutral FIR to independently
-/// validated FLBC. Failure publishes no FLBC wrapper and never falls back
-/// across stages.
+/// validated FLBC. Calls returned directly with the same ownership contract
+/// become terminal calls, before independent ownership insertion. Failure
+/// publishes no FLBC wrapper and never falls back across stages.
 pub fn lower_to_flbc(program: &ValidatedProgram) -> Result<flbc::ValidatedProgram, LoweringError> {
     let mut functions = Vec::new();
     functions
@@ -3528,12 +3529,17 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
             field: "instruction count",
             observed: usize::MAX,
         })?;
-    let instruction_count = lowered_binding_count
-        .checked_add(function.blocks.len())
-        .ok_or(LoweringError::WidthOverflow {
+    let terminator_count = function
+        .blocks
+        .iter()
+        .filter(|block| !has_tail_call(program, function, block))
+        .count();
+    let instruction_count = lowered_binding_count.checked_add(terminator_count).ok_or(
+        LoweringError::WidthOverflow {
             field: "instruction count",
             observed: usize::MAX,
-        })?;
+        },
+    )?;
     let arity =
         u16::try_from(function.parameters.len()).map_err(|_| LoweringError::WidthOverflow {
             field: "arity",
@@ -3567,10 +3573,12 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
                 },
             )?;
         }
-        offset = offset.checked_add(1).ok_or(LoweringError::WidthOverflow {
-            field: "program counter",
-            observed: usize::MAX,
-        })?;
+        if !has_tail_call(program, function, block) {
+            offset = offset.checked_add(1).ok_or(LoweringError::WidthOverflow {
+                field: "program counter",
+                observed: usize::MAX,
+            })?;
+        }
     }
 
     let mut code = Vec::new();
@@ -3580,10 +3588,26 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
             requested: instruction_count,
         })?;
     for block in &function.blocks {
-        for binding in &block.bindings {
+        let tail = has_tail_call(program, function, block);
+        let ordinary_bindings = if tail {
+            &block.bindings[..block.bindings.len() - 1]
+        } else {
+            &block.bindings[..]
+        };
+        for binding in ordinary_bindings {
             lower_binding(program, binding, &mut code)?;
         }
-        code.push(lower_terminator(&block.terminator, &block_starts)?);
+        if tail {
+            let binding = block
+                .bindings
+                .last()
+                .ok_or(LoweringError::InternalInvariant {
+                    reason: "tail call binding disappeared",
+                })?;
+            code.push(lower_tail_call(program, binding)?);
+        } else {
+            code.push(lower_terminator(&block.terminator, &block_starts)?);
+        }
     }
 
     Ok(flbc::Function {
@@ -3594,6 +3618,65 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
         register_count,
         code,
     })
+}
+
+/// A call is terminal only when its result is returned unchanged and with the
+/// caller's result ownership contract. Do this before the ownership pass: that
+/// pass then proves transfers and retirement against the terminal instruction,
+/// including borrowed aliases that must remain live until argument capture.
+fn has_tail_call(program: &Program, function: &Function, block: &Block) -> bool {
+    let Some(binding) = block.bindings.last() else {
+        return false;
+    };
+    if !matches!(block.terminator, Terminator::Return { value } if value == binding.id) {
+        return false;
+    }
+    let result_ownership = match &binding.operation {
+        Operation::Call { function, .. } => function
+            .index()
+            .and_then(|index| program.functions.get(index))
+            .map(|callee| callee.result_ownership),
+        Operation::Apply {
+            result_ownership, ..
+        } => Some(*result_ownership),
+        _ => None,
+    };
+    result_ownership == Some(function.result_ownership)
+}
+
+fn lower_tail_call(
+    program: &Program,
+    binding: &Binding,
+) -> Result<flbc::Instruction, LoweringError> {
+    match lower_single_binding(program, binding)? {
+        flbc::Instruction::Call {
+            function,
+            args,
+            argument_ownership,
+            result_ownership,
+            ..
+        } => Ok(flbc::Instruction::TailCall {
+            function,
+            args,
+            argument_ownership,
+            result_ownership,
+        }),
+        flbc::Instruction::Apply {
+            closure,
+            args,
+            argument_ownership,
+            result_ownership,
+            ..
+        } => Ok(flbc::Instruction::TailApply {
+            closure,
+            args,
+            argument_ownership,
+            result_ownership,
+        }),
+        _ => Err(LoweringError::InternalInvariant {
+            reason: "terminal binding stopped being a call",
+        }),
+    }
 }
 
 const fn lowered_binding_width(binding: &Binding) -> usize {
@@ -4523,7 +4606,7 @@ mod tests {
             .expect("the complete operation fixture is valid");
         let lowered = lower_to_flbc(&validated).expect("mandatory lowering succeeds");
         assert_eq!(lowered.functions().len(), 3);
-        assert_eq!(lowered.functions()[0].code.len(), 14);
+        assert_eq!(lowered.functions()[0].code.len(), 13);
         assert_eq!(lowered.functions()[1].code.len(), 3);
         assert_eq!(lowered.functions()[2].code.len(), 2);
         assert!(matches!(
@@ -4570,7 +4653,7 @@ mod tests {
         ));
         assert!(matches!(
             &lowered.functions()[0].code[12],
-            flbc::Instruction::Apply { args, .. } if args.len() == 1
+            flbc::Instruction::TailApply { args, .. } if args.len() == 1
         ));
 
         let check_system = validate(check_system_program(), ValidationLimits::default())
@@ -4687,6 +4770,69 @@ mod tests {
         assert!(matches!(
             lowered_panic.functions()[0].code[1],
             flbc::Instruction::Panic { message } if message == flbc::Register::new(0)
+        ));
+    }
+
+    #[test]
+    fn terminal_calls_rebase_branch_targets_and_preserve_result_contracts() {
+        let mut program = branch_program();
+        program.functions[0].blocks[1].bindings[0].operation = Operation::Call {
+            function: f(1),
+            args: vec![v(0)],
+        };
+        program.functions[0].blocks[2].bindings[0].operation = Operation::Call {
+            function: f(1),
+            args: vec![v(1)],
+        };
+        program.functions.push(Function {
+            id: f(1),
+            parameters: vec![ValueType::Nat],
+            parameter_ownership: vec![flbc::ArgumentOwnership::Borrowed],
+            result: ValueType::Nat,
+            result_ownership: flbc::CallableResultOwnership::Scalar,
+            blocks: vec![Block {
+                id: b(0),
+                bindings: Vec::new(),
+                terminator: Terminator::Return { value: v(0) },
+            }],
+        });
+        let validated = validate(program.clone(), ValidationLimits::default()).unwrap();
+        let lowered = lower_to_flbc(&validated).unwrap();
+        let code = &lowered.functions()[0].code;
+        assert_eq!(code.len(), 6);
+        assert!(matches!(
+            code[3],
+            flbc::Instruction::JumpIfZero { zero, nonzero, .. }
+                if zero == flbc::Pc::new(4) && nonzero == flbc::Pc::new(5)
+        ));
+        for instruction in &code[4..] {
+            assert!(matches!(
+                instruction,
+                flbc::Instruction::TailCall {
+                    function,
+                    argument_ownership,
+                    result_ownership: flbc::CallableResultOwnership::Scalar,
+                    ..
+                } if *function == flbc::FunctionId::new(1)
+                    && argument_ownership == &[flbc::ArgumentOwnership::Borrowed]
+            ));
+        }
+        lower_to_flbc_with_ownership(&validated, flbc::OwnershipLimits::default())
+            .expect("tail branches must satisfy independent ownership validation");
+
+        // Equal value types do not justify changing a callable's result
+        // ownership. Keep the ordinary call/return adaptation in this case.
+        program.functions[0].result_ownership = flbc::CallableResultOwnership::OwnedOrScalar;
+        let validated = validate(program, ValidationLimits::default()).unwrap();
+        let lowered = lower_to_flbc(&validated).unwrap();
+        assert_eq!(lowered.functions()[0].code.len(), 8);
+        assert!(matches!(
+            lowered.functions()[0].code[4],
+            flbc::Instruction::Call { .. }
+        ));
+        assert!(matches!(
+            lowered.functions()[0].code[5],
+            flbc::Instruction::Return { .. }
         ));
     }
 
@@ -5802,7 +5948,7 @@ mod tests {
         let lowered = lower_to_flbc(&owned_apply).expect("owned Apply lowers to FLBC");
         assert!(matches!(
             &lowered.functions()[0].code[12],
-            flbc::Instruction::Apply {
+            flbc::Instruction::TailApply {
                 closure,
                 args,
                 argument_ownership,

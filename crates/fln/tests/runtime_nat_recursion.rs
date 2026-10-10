@@ -56,6 +56,35 @@ fn changing_accumulators_are_flattened_into_native_closure_arguments() {
         "33",
     );
 }
+
+#[test]
+fn accumulator_recursion_reuses_frames_through_the_source_compiler() {
+    let mut bounded = limits();
+    bounded.vm.max_stack_depth = 8;
+    bounded.vm.max_steps = 4_000_000;
+    let mut depths = Vec::new();
+    for (iterations, expected) in [(10, "57"), (10_000, "50005002")] {
+        let source = format!(
+            "def sum (n acc : Nat) : Nat := match n with | .zero => acc | .succ k => sum k (acc + n)\n#eval sum {iterations} 2"
+        );
+        let run = engine()
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), bounded)
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .expect("tail recursion must finish under a constant frame budget");
+        let execution = run.executions.last().unwrap();
+        let VmExit::Returned(result) = &execution.exit else {
+            panic!("tail recursion did not return")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+            Some(expected)
+        );
+        depths.push(result.usage.peak_stack_depth);
+    }
+    assert_eq!(depths[0], depths[1]);
+}
+
 #[test]
 fn fixed_captures_and_local_helpers_survive_recursive_branch_lifting() {
     execute(
