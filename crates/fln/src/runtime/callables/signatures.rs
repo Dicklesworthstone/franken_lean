@@ -8,6 +8,8 @@
 use super::*;
 use fln_comp::flbc::{ArgumentOwnership, CallableResultOwnership};
 
+pub(super) mod sort;
+
 #[derive(Eq, Hash, PartialEq)]
 struct Key<'a> {
     parameters: &'a [ValueType],

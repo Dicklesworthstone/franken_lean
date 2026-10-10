@@ -7,6 +7,15 @@
 use super::lookup::LambdaIndex;
 use super::*;
 
+mod relevance;
+
+fn can_refine(binding: &LambdaBinding) -> bool {
+    matches!(binding.recursion, LambdaRecursion::NonRecursive)
+        && matches!(binding.result, ValueType::Closure(_))
+        && matches!(binding.lambda.node(), ExprNode::Lam { binder_name, .. }
+            if binder_name.parent().eq(&name("_fln_runtime_local")))
+}
+
 fn push<T>(
     values: &mut Vec<T>,
     value: T,
@@ -61,7 +70,10 @@ impl Preparation<'_> {
         let lambdas = LambdaIndex::new(self)?;
         for function in functions {
             self.tick()?;
-            self.captured_result_in(&function.body, &function.parameters, &lambdas)?;
+            if relevance::contains_candidate(self, &function.body, &function.parameters, &lambdas)?
+            {
+                self.captured_result_in(&function.body, &function.parameters, &lambdas)?;
+            }
         }
         Ok(())
     }
@@ -289,13 +301,10 @@ impl Preparation<'_> {
                 } => {
                     context.truncate(depth);
                     let binding = &self.lambdas[index];
-                    let local = matches!(binding.lambda.node(), ExprNode::Lam { binder_name, .. }
-                        if binder_name.parent().eq(&name("_fln_runtime_local")));
                     let expected = binding.result;
-                    if local
+                    if can_refine(binding)
                         && let Some(actual @ ValueType::Closure(_)) = value
                         && actual != expected
-                        && matches!(expected, ValueType::Closure(_))
                         && self.same_stage_telescope(actual, expected)?
                     {
                         self.lambdas[index].result = actual;

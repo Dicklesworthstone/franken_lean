@@ -385,6 +385,15 @@ impl Preparation<'_> {
         let mut ranks = (0..self.interfaces.len())
             .map(|index| u32::try_from(index).map_err(|_| unsupported("callback rank width")))
             .collect::<Result<Vec<_>, _>>()?;
+        // Retain the preceding structural order across refinement rounds. A
+        // remap usually changes only some nested closure ids, leaving long
+        // sorted runs available to the metered stable merge below.
+        let mut order = Vec::new();
+        for index in 0..signatures.len() {
+            self.tick()?;
+            reserve(&mut order, self.limits.fir.max_closure_types)?;
+            order.push(index);
+        }
         let mut settled = false;
         for _ in 0..=self.interfaces.len() {
             let mut ordered = Vec::new();
@@ -394,25 +403,13 @@ impl Preparation<'_> {
                 reserve(&mut ordered, self.limits.fir.max_closure_types)?;
                 ordered.push((*owner, signature));
             }
-            // Charge the comparison/operand envelope before sorting. The bound
-            // is conservative and deterministic, not wall-clock fuel.
-            let width = ordered.len().max(1).ilog2() as usize + 1;
-            let cells = ordered
-                .iter()
-                .try_fold(0usize, |sum, (_, item)| {
-                    sum.checked_add(item.parameters.len().saturating_add(1))
-                })
-                .and_then(|sum| sum.checked_mul(width))
-                .ok_or_else(|| unsupported("callback sort work overflow"))?;
-            for _ in 0..cells {
-                self.tick()?;
-            }
-            ordered.sort_by(|(_, a), (_, b)| signature_order(a, b));
+            signatures::sort::stable_order(&ordered, &mut order, self.limits, &mut self.visited)?;
             let mut next = vec![0; ranks.len()];
             let mut rank = 0u32;
-            for (index, (owner, signature)) in ordered.iter().enumerate() {
+            for (index, &row) in order.iter().enumerate() {
                 self.tick()?;
-                if index != 0 && signature != &ordered[index - 1].1 {
+                let (owner, signature) = &ordered[row];
+                if index != 0 && signature != &ordered[order[index - 1]].1 {
                     rank = rank
                         .checked_add(1)
                         .ok_or_else(|| unsupported("callback rank width"))?;
@@ -480,6 +477,7 @@ impl Preparation<'_> {
     }
 }
 
+#[cfg(test)]
 fn signature_order(a: &ClosureSignature, b: &ClosureSignature) -> std::cmp::Ordering {
     a.parameters
         .cmp(&b.parameters)
