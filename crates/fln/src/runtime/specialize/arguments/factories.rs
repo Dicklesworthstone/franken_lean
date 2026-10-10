@@ -54,6 +54,13 @@ impl Preparation<'_> {
                         continue;
                     }
                     if let ExprNode::Const { name, levels } = head.node() {
+                        // A logical dictionary body must not supply executable
+                        // fields after implemented_by selected a different
+                        // value. Keep it on the ordinary runtime path instead
+                        // of substituting either body into the type telescope.
+                        if self.has_implementation(name)? {
+                            return Ok(None);
+                        }
                         // A verified primitive is inert as a function value,
                         // whether its logical declaration is an axiom or a
                         // definition. Keep its name in dictionary fields so

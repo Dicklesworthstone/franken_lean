@@ -14,6 +14,8 @@ impl Preparation<'_> {
         requested: &Name,
     ) -> Result<Option<DefinitionVal>, IngressError> {
         self.tick()?;
+        let replacement = self.implementation_target(requested)?;
+        let requested = replacement.as_ref().unwrap_or(requested);
         let logical = match self.environment.find(requested) {
             Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
                 return Ok(Some(definition.clone()));

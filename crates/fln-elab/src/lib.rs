@@ -27,6 +27,7 @@ pub mod dataflow;
 pub mod decision;
 pub mod effects;
 pub mod externs;
+pub mod implemented_by;
 pub mod inductive;
 pub mod info;
 pub mod instances;

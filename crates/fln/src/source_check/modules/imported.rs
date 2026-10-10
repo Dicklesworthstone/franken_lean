@@ -10,6 +10,8 @@ use fln_elab::instances::{self, InstanceRegistryError};
 use fln_olean::region::{OleanView, OpaqueExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "imported/implemented_by.rs"]
+mod implemented_by;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
@@ -63,6 +65,9 @@ pub struct SourceMetadataReport {
     /// Explicit native-call intentions (the pin's `Lean.externAttr`), retained
     /// only for this module's own admitted declarations.
     pub externs: usize,
+    /// Compatible executable replacements, bound to this module's own checked
+    /// declarations and to targets in its actual import closure.
+    pub implemented_by: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -285,6 +290,7 @@ impl Engine {
             metadata::PROTECTED_EXTENSION,
             metadata::REDUCIBILITY_EXTENSION,
             metadata::EXTERN_EXTENSION,
+            metadata::IMPLEMENTED_BY_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -318,6 +324,7 @@ impl Engine {
                 protected: 0,
                 reducibility: 0,
                 externs: 0,
+                implemented_by: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -346,6 +353,7 @@ impl Engine {
                         4 => report.protected = block.entries.len(),
                         5 => report.reducibility = block.entries.len(),
                         6 => report.externs = block.entries.len(),
+                        7 => report.implemented_by = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -364,6 +372,11 @@ impl Engine {
         cancelled!("source-olean/before-metadata-decode");
         let decoded =
             metadata::decode(&blocks, limits.metadata).map_err(SourceOleanImportError::Decode)?;
+        let mut implementation_scopes = implemented_by::Scopes::new(
+            &checked,
+            &decoded.implemented_by,
+            limits.metadata.max_objects,
+        )?;
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
@@ -371,6 +384,7 @@ impl Engine {
         let mut protected = decoded.protected.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
+        let mut implementations = decoded.implemented_by.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
@@ -540,7 +554,7 @@ impl Engine {
             }
             if report.externs != 0 {
                 cancelled!("source-olean/extern-owner-index");
-                let mut owners = ExternOwners::new(
+                let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
                     report.externs,
                     limits.check.max_declarations,
@@ -560,6 +574,36 @@ impl Engine {
                         .map_err(|error| extern_error(&report.module, &row.declaration, error))?;
                 }
             }
+            if report.implemented_by != 0 {
+                cancelled!("source-olean/implemented-by-owner-index");
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.implemented_by,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.implemented_by {
+                    cancelled!("source-olean/implemented-by");
+                    let row = implementations
+                        .next()
+                        .ok_or(SourceOleanImportError::Internal(
+                            "implemented_by count changed during decode",
+                        ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    implementation_scopes.validate(
+                        &checked,
+                        &self.environment,
+                        activation.environment(),
+                        index,
+                        &row,
+                    )?;
+                    activation = activation
+                        .register_implemented_by(&row.declaration, &row.implementation)
+                        .map_err(|error| {
+                            implemented_by::error(&report.module, &row.declaration, error)
+                        })?;
+                }
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -570,6 +614,9 @@ impl Engine {
                 "the activated registries disagree with their kept state",
             )
         })?;
+        // Validate the complete graph once. A later registration can introduce
+        // a cycle through an earlier module; no partial activation escapes it.
+        implemented_by::validate_journal(&engine.environment)?;
         if classes.next().is_some()
             || instances.next().is_some()
             || defaults.next().is_some()
@@ -577,6 +624,7 @@ impl Engine {
             || protected.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
+            || implementations.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
@@ -705,6 +753,11 @@ trait Registrar: Sized {
         declaration: &Name,
         entries: Vec<fln_elab::externs::ExternEntry>,
     ) -> std::result::Result<Self, fln_elab::externs::ExternError>;
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -763,6 +816,13 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
         self.register_extern(declaration, entries)
     }
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+        self.register_implemented_by(declaration, implementation)
+    }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
     }
@@ -796,16 +856,16 @@ fn reducibility_status(
     }
 }
 
-/// Extern attributes cannot be applied to an imported declaration at the pin.
+/// Parametric attributes cannot be applied to an imported declaration at the pin.
 /// Retain the exact checked owner, rather than accepting any ambient name that
 /// happens to have the expected spelling. Both allocations are bounded before
-/// construction; the index exists only for a module with extern rows.
-struct ExternOwners<'a> {
+/// construction; the index exists only for a module with selected attribute rows.
+struct AttributeOwners<'a> {
     declarations: Vec<&'a ConstantInfo>,
     seen: HashSet<Name>,
 }
 
-impl<'a> ExternOwners<'a> {
+impl<'a> AttributeOwners<'a> {
     fn new(
         constants: &'a [ConstantInfo],
         rows: usize,
@@ -814,19 +874,17 @@ impl<'a> ExternOwners<'a> {
     ) -> Result<Self> {
         if constants.len() > max_declarations {
             return Err(SourceOleanImportError::Limit(
-                "extern declaration ownership index",
+                "attribute declaration ownership index",
             ));
         }
         if rows > max_entries {
-            return Err(SourceOleanImportError::Limit(
-                "extern attribute ownership rows",
-            ));
+            return Err(SourceOleanImportError::Limit("attribute ownership rows"));
         }
         let mut declarations = Vec::new();
         declarations
             .try_reserve_exact(constants.len())
             .map_err(|_| {
-                SourceOleanImportError::Limit("extern declaration ownership allocation")
+                SourceOleanImportError::Limit("attribute declaration ownership allocation")
             })?;
         declarations.extend(constants.iter());
         declarations.sort_unstable_by(|left, right| {
@@ -837,12 +895,12 @@ impl<'a> ExternOwners<'a> {
             .any(|pair| pair[0].constant_val().name == pair[1].constant_val().name)
         {
             return Err(SourceOleanImportError::Internal(
-                "checked module repeats an extern owner declaration",
+                "checked module repeats an attribute owner declaration",
             ));
         }
         let mut seen = HashSet::new();
         seen.try_reserve(rows)
-            .map_err(|_| SourceOleanImportError::Limit("extern attribute ownership allocation"))?;
+            .map_err(|_| SourceOleanImportError::Limit("attribute ownership allocation"))?;
         Ok(Self { declarations, seen })
     }
 
@@ -856,17 +914,15 @@ impl<'a> ExternOwners<'a> {
             .declarations
             .binary_search_by(|info| info.constant_val().name.cmp(declaration))
             .map_err(|_| {
-                error("an extern attribute does not belong to this module's checked declarations")
+                error("an attribute does not belong to this module's checked declarations")
             })?;
         if env.find(declaration) != Some(self.declarations[position]) {
             return Err(error(
-                "an extern owner differs from its active admitted declaration",
+                "an attribute owner differs from its active admitted declaration",
             ));
         }
         if !self.seen.insert(declaration.clone()) {
-            return Err(error(
-                "duplicate extern attribute for one module declaration",
-            ));
+            return Err(error("duplicate attribute for one module declaration"));
         }
         Ok(())
     }
@@ -1226,6 +1282,13 @@ pub(super) mod tests {
             entries: Vec<fln_elab::externs::ExternEntry>,
         ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
             fln_elab::externs::register(&self.0, declaration, entries).map(Sequential)
+        }
+        fn register_implemented_by(
+            self,
+            declaration: &Name,
+            implementation: &Name,
+        ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+            fln_elab::implemented_by::register(&self.0, declaration, implementation).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)

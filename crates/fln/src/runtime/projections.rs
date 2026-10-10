@@ -35,6 +35,9 @@ impl Preparation<'_> {
         head: &Expr,
         arguments: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+            return Ok(Some(replacement));
+        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
