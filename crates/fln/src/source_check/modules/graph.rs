@@ -5,6 +5,8 @@ pub(super) struct Plan {
     pub(super) order: Vec<usize>,
     pub(super) entry: usize,
     dependencies: Vec<Vec<usize>>,
+    exported_imports: Vec<Vec<Name>>,
+    exported_dependencies: Vec<Vec<usize>>,
 }
 impl Plan {
     pub(super) fn new(
@@ -58,6 +60,8 @@ impl Plan {
                 })?;
         let mut headers = Vec::new();
         let mut dependencies = Vec::new();
+        let mut exported_imports = Vec::new();
+        let mut exported_dependencies = Vec::new();
         let mut imports = 0usize;
         for module in modules {
             meter.work(1)?;
@@ -68,7 +72,8 @@ impl Plan {
                 }
             })?;
             validate_source_header(module.name, &header)?;
-            if (implicit_init || header.module_system) && !header.prelude {
+            let has_init = (implicit_init || header.module_system) && !header.prelude;
+            if has_init {
                 // The two implicit Import rows have one graph dependency.
                 // Preserve the original explicit rows, including duplicates.
                 header.imports.insert(0, Name::from_components(["Init"]));
@@ -95,6 +100,35 @@ impl Plan {
                     }
                 })?);
             }
+            let visible: Vec<_> = if header.module_system {
+                // Select import rows before resolving graph edges. A private
+                // occurrence of A before `public import B; public import A`
+                // must not move A ahead of B in a consumer's instance order.
+                let mut visible = Vec::new();
+                if has_init {
+                    visible.push(Name::from_components(["Init"]));
+                }
+                visible.extend(
+                    header
+                        .import_specs
+                        .iter()
+                        .filter(|import| import.public_at.is_some())
+                        .map(|import| import.module.clone()),
+                );
+                visible
+            } else {
+                header.imports.clone()
+            };
+            meter.work(visible.len())?;
+            // Every visible row was resolved above. Already admitted external
+            // imports retain their names but have no source graph edge.
+            exported_dependencies.push(
+                visible
+                    .iter()
+                    .filter_map(|name| by_name.get(name).copied())
+                    .collect(),
+            );
+            exported_imports.push(visible);
             headers.push(header);
             dependencies.push(direct);
         }
@@ -112,22 +146,17 @@ impl Plan {
             order,
             entry,
             dependencies,
+            exported_imports,
+            exported_dependencies,
         })
     }
 
     /// Imports visible through this module to its consumers. The pin's
     /// implicit Init rows use Import's default `isExported = true`, even in a
-    /// module-system file; its explicit unmodified imports remain private.
+    /// module-system file; explicitly public imports follow in source order,
+    /// and unmodified imports remain private.
     pub(super) fn visible_imports(&self, module: usize) -> &[Name] {
-        let header = &self.headers[module];
-        if !header.module_system {
-            &header.imports
-        } else if header.prelude {
-            &[]
-        } else {
-            // with_implicit_init always inserts this dependency first.
-            &header.imports[..1]
-        }
+        &self.exported_imports[module]
     }
 
     pub(super) fn dependencies_of(
@@ -145,12 +174,7 @@ impl Plan {
             .enumerate()
             .map(|(index, imports)| {
                 if index != module && self.headers[index].module_system {
-                    let exported = self.visible_imports(index);
-                    imports
-                        .iter()
-                        .copied()
-                        .filter(|dependency| exported.contains(modules[*dependency].name))
-                        .collect()
+                    self.exported_dependencies[index].clone()
                 } else {
                     imports.clone()
                 }

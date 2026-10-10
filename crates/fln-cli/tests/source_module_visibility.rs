@@ -153,11 +153,53 @@ fn installed_module_uses_actual_init_and_prelude_suppresses_it() {
 }
 
 #[test]
+fn installed_public_imports_reexport_the_selected_api_without_private_names() {
+    let p = Project::new();
+    p.write("Api.lean", &format!("prelude\n{ID}"));
+    p.write(
+        "Secret.lean",
+        "prelude\ndef hidden.{u} {A : Sort u} (x : A) : A := x",
+    );
+    p.write(
+        "Wrapper.lean",
+        "module\nprelude\nimport Secret\npublic import Api\ndef localUse.{u} {A : Sort u} (x : A) : A := hidden (identity x)",
+    );
+    p.write("Facade.lean", "module\nprelude\npublic import Wrapper");
+    p.write(
+        "Main.lean",
+        "prelude\nimport Facade\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+    );
+    assert!(p.complete("check-source").contains("\"files\":5"));
+    p.complete("run");
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("Main.lean")
+        .current_dir(&p.0)
+        .env("LEAN_PATH", &p.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    for declaration in ["hidden", "localUse"] {
+        p.write(
+            "Main.lean",
+            &format!("prelude\nimport Facade\ndef stolen.{{u}} {{A : Sort u}} (x : A) : A := {declaration} x"),
+        );
+        p.refused("check-source");
+        p.refused("run");
+    }
+}
+
+#[test]
 fn unsupported_visibility_refuses_before_missing_import_io() {
     let p = Project::new();
     for clause in [
-        "public import Missing",
         "meta import Missing",
+        "public meta import Missing",
         "import all Missing",
     ] {
         p.write(

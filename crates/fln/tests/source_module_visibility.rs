@@ -47,6 +47,27 @@ fn checked(base: &Engine, files: &[(&str, &str)]) -> SourceModuleCheck {
         .unwrap()
 }
 
+fn check_in_both_import_contexts(
+    files: &[(&str, &str)],
+) -> [Result<Outcome<SourceModuleCheck>, SourceModuleCheckError>; 2] {
+    let names: Vec<_> = files.iter().map(|(name, _)| n(name)).collect();
+    let inputs: Vec<_> = files
+        .iter()
+        .zip(&names)
+        .map(|((_, source), name)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    let options = KVMap::new();
+    let initial = Engine::builder().build_empty();
+    let receipt = fln::source_check::modules::imported::SourceOleanImport::empty(&options);
+    [
+        initial.check_source_modules(&inputs, &names[0], &options, limits()),
+        receipt.check_source_modules(&inputs, &names[0], &options, limits(), None),
+    ]
+}
+
 const ID: &str = "def identity.{u} {A : Sort u} (x : A) : A := x";
 const PRIVATE_ID: &str = "module\nprelude\ndef identity.{u} {A : Sort u} (x : A) : A := x";
 
@@ -227,6 +248,166 @@ fn implicit_init_remains_exported_through_a_module_with_other_private_imports() 
 }
 
 #[test]
+fn public_imports_reexport_transitively_without_exposing_private_dependencies_or_declarations() {
+    let files = [
+        (
+            "Main",
+            "prelude\nimport Facade\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        ),
+        ("Facade", "module\nprelude\npublic import Wrapper"),
+        (
+            "Wrapper",
+            "module\nprelude\nimport Secret\npublic import Api\ndef localUse.{u} {A : Sort u} (x : A) : A := hidden (identity x)",
+        ),
+        (
+            "Api",
+            "prelude\ndef identity.{u} {A : Sort u} (x : A) : A := x",
+        ),
+        (
+            "Secret",
+            "prelude\ndef hidden.{u} {A : Sort u} (x : A) : A := x",
+        ),
+    ];
+    for result in check_in_both_import_contexts(&files) {
+        let checked = result.unwrap().into_complete().unwrap();
+        assert_eq!(
+            checked.module_order,
+            [n("Secret"), n("Api"), n("Wrapper"), n("Facade"), n("Main")]
+        );
+        let environment = checked.checked.engine.environment();
+        assert!(environment.contains(&n("identity")));
+        assert!(environment.contains(&n("use")));
+        assert!(!environment.contains(&n("hidden")));
+        assert!(!environment.contains(&private("Wrapper", "localUse")));
+    }
+    for source in [
+        "prelude\nimport Facade\ndef leak.{u} {A : Sort u} (x : A) : A := hidden x",
+        "prelude\nimport Facade\ndef leak.{u} {A : Sort u} (x : A) : A := localUse x",
+    ] {
+        let mut invalid = files;
+        invalid[0].1 = source;
+        for result in check_in_both_import_contexts(&invalid) {
+            assert!(
+                matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+            );
+        }
+    }
+}
+
+#[test]
+fn public_import_row_order_controls_instances_independently_of_earlier_private_rows() {
+    // The module itself sees both import kinds in written order. Its consumer
+    // sees only the public rows, so the equal-priority winning instance differs.
+    for (imports, inside, outside) in [
+        (
+            "import A\npublic import B\npublic import A",
+            "right",
+            "left",
+        ),
+        (
+            "import B\npublic import A\npublic import B",
+            "left",
+            "right",
+        ),
+    ] {
+        let wrapper = format!(
+            "module\nprelude\n{imports}\ndef localChoice : Token := Pick.value\ndef localProof (P : Token -> Prop) (h : P Token.{inside}) : P localChoice := h"
+        );
+        let main = format!(
+            "prelude\nimport Wrapper\ndef chosen : Token := Pick.value\ndef choiceProof (P : Token -> Prop) (h : P Token.{outside}) : P chosen := h"
+        );
+        let files = [
+            ("Main", main.as_str()),
+            ("Wrapper", wrapper.as_str()),
+            (
+                "A",
+                "prelude\nimport Base\ninstance first : Pick := Pick.mk Token.left",
+            ),
+            (
+                "B",
+                "prelude\nimport Base\ninstance second : Pick := Pick.mk Token.right",
+            ),
+            (
+                "Base",
+                "prelude\ninductive Token where\n| left\n| right\nclass Pick where\n  value : Token",
+            ),
+        ];
+        for result in check_in_both_import_contexts(&files) {
+            let checked = result.unwrap().into_complete().unwrap();
+            assert!(
+                checked
+                    .checked
+                    .engine
+                    .environment()
+                    .contains(&n("choiceProof"))
+            );
+        }
+        let wrong = format!(
+            "prelude\nimport Wrapper\ndef chosen : Token := Pick.value\ndef wrongChoice (P : Token -> Prop) (h : P Token.{inside}) : P chosen := h"
+        );
+        let mut invalid = files;
+        invalid[0].1 = &wrong;
+        for result in check_in_both_import_contexts(&invalid) {
+            assert!(
+                matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+            );
+        }
+    }
+}
+
+#[test]
+fn changing_public_import_visibility_invalidates_cached_consumers_and_recovers() {
+    let mut session = SourceModuleSession::new(
+        Engine::builder().build_empty(),
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let names = [n("Main"), n("Wrapper"), n("Api")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"prelude\nimport Wrapper\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"module\nprelude\npublic import Api",
+        },
+        SourceModuleInput {
+            name: &names[2],
+            source: ID.as_bytes(),
+        },
+    ];
+    let cold = session
+        .check(&inputs, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warm = session
+        .check(&inputs, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((cold.elaborated_modules, warm.reused_modules), (3, 3));
+    let mut hidden = inputs;
+    hidden[1].source = b"module\nprelude\nimport Api";
+    assert!(matches!(
+        session.check(&hidden, &names[0]),
+        Err(SourceModuleCheckError::Source { module, .. }) if module == names[0]
+    ));
+    let recovered = session
+        .check(&inputs, &names[0])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(recovered.reused_modules, 3);
+    assert_eq!(
+        recovered.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+}
+
+#[test]
 fn private_names_cannot_shadow_an_imported_public_declaration() {
     let initial = Engine::builder().build_empty();
     let source = format!("module\nprelude\nimport Lib\n{ID}");
@@ -316,8 +497,8 @@ fn cached_module_scopes_and_private_dependency_changes_keep_visibility() {
 fn unsupported_import_modifiers_refuse_at_the_original_modifier_before_lookup() {
     let initial = Engine::builder().build_empty();
     for (clause, modifier) in [
-        ("public import Missing", "public"),
         ("meta import Missing", "meta"),
+        ("public meta import Missing", "meta"),
         ("import all Missing", "all"),
     ] {
         let source = format!("\u{feff}module\r\nprelude\r\n{clause}");

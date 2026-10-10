@@ -118,6 +118,51 @@ fn equal_external_sets_keep_each_modules_own_import_order() {
 }
 
 #[test]
+fn public_source_imports_preserve_external_dictionary_order_and_private_boundaries() {
+    let p = fixture();
+    p.module(
+        "B",
+        &[axiom("onlyB", c("Class"))],
+        &["Core"],
+        vec![(INSTANCE, vec![instance("b", 1000)])],
+    );
+    let receipt = imported(&p);
+    let main = "prelude\nimport Wrapper\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueA";
+    for wrapper in [
+        "module\nprelude\nimport A\npublic import B\npublic import A\ndef localUse [d : Class] : Class := d\ndef localChoice : Family localUse := valueB",
+        "module\nprelude\nimport B\npublic import A\ndef localSecret : Class := onlyB",
+    ] {
+        let checked = checked(&receipt, &[("Wrapper", wrapper), ("Main", main)]);
+        if !wrapper.contains("public import B") {
+            assert!(!checked.checked.engine.environment().contains(&n("onlyB")));
+        }
+        p.write("Wrapper.lean", wrapper);
+        p.write("Main.lean", main);
+        p.success();
+    }
+    let leaking = "prelude\nimport Wrapper\ndef leak : Class := onlyB";
+    let names = [n("Wrapper"), n("Main")];
+    let sources = [
+        "module\nprelude\nimport B\npublic import A\ndef localSecret : Class := onlyB",
+        leaking,
+    ];
+    assert!(matches!(
+        receipt.check_source_modules(
+            &inputs(&names, &sources),
+            &names[1],
+            &KVMap::new(),
+            limits(),
+            None,
+        ),
+        Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main")
+    ));
+    p.write("Main.lean", leaking);
+    let refused = p.run();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+}
+
+#[test]
 fn source_registrations_stay_between_the_external_imports_that_surround_them() {
     let receipt = imported(&fixture());
     for (order, value) in [("Local\nimport B", "valueB"), ("B\nimport Local", "valueA")] {

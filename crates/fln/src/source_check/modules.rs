@@ -20,15 +20,15 @@ pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildEr
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 
-/// Retain unsupported import semantics and refuse at the modifier itself,
-/// before resolving or admitting the requested import.
+/// Public imports preserve their export visibility in the module graph.
+/// Refuse unsupported phase/private-artifact modifiers at their original
+/// position before resolving or admitting the requested import.
 pub fn validate_source_header(
     module: &Name,
     header: &SourceHeader,
 ) -> Result<(), SourceModuleCheckError> {
     for import in &header.import_specs {
         let unsupported = [
-            (import.public_at, "`public import` export visibility"),
             (import.meta_at, "`meta import` execution phases"),
             (import.all_at, "`import all` private import visibility"),
         ];
