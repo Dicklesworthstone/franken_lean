@@ -29,7 +29,7 @@ impl Preparation<'_> {
             || rec.rules.len() != rec.num_minors as usize
             || levels.len() != rec.base.level_params.len()
             || args.len()
-                != rec
+                < rec
                     .rules
                     .len()
                     .saturating_add(rec.num_params as usize)
@@ -45,12 +45,24 @@ impl Preparation<'_> {
         if shape.recursive || shape.constructors.len() != rec.rules.len() {
             return Ok(None);
         }
-        let ExprNode::Lam { body: motive, .. } = args[0].node() else {
-            return Ok(None);
-        };
-        let result = self
-            .value_type(motive)?
+        // A branch can return a function whose later domains contain proofs
+        // about the major or preceding fields. Keep every runtime argument,
+        // erase only its checked proof representation, and remove the motive's
+        // major binder only once its runtime type no longer refers to it.
+        let motive = self
+            .indexed_motive(&args[0], &[], &family)?
             .ok_or_else(|| unsupported("dependent variant recursor result"))?;
+        let arity = rec.rules.len().saturating_add(2);
+        let (args, applied) = args.split_at(arity);
+        let result = if applied.is_empty() {
+            self.value_type(&motive)?
+                .ok_or_else(|| unsupported("dependent variant recursor result"))?
+        } else {
+            let Some(result) = self.saturated_variant_result(&motive, applied.len())? else {
+                return Ok(None);
+            };
+            result
+        };
         let id = self.next_variant;
         self.next_variant = id
             .checked_add(1)
@@ -80,7 +92,16 @@ impl Preparation<'_> {
                 )?;
             }
             reserve(&mut branches, self.limits.max_lambda_bindings)?;
-            let body = self.typed_callable_result(body, motive.clone(), result)?;
+            let body = if applied.is_empty() {
+                self.typed_callable_result(body, motive.clone(), result)?
+            } else {
+                // The major has already selected this minor. Apply its actual
+                // operands one at a time, preserving every producer/argument
+                // stage and evaluating each operand once. The extra depth is
+                // this branch's major binder; operands still use caller scope.
+                self.apply_producer(body, motive.clone(), applied, 1)?
+                    .ok_or_else(|| unsupported("dependent variant recursor application"))?
+            };
             branches.push(Expr::lam(
                 Name::num(case_name.clone(), index as u64),
                 family.clone(),
@@ -102,6 +123,37 @@ impl Preparation<'_> {
             branches,
             result,
         }))
+    }
+
+    /// A fully supplied telescope can join at its data result without casting
+    /// different function stages to a shared callback ABI. A remaining callback
+    /// retains the existing exact-arity path instead.
+    pub(super) fn saturated_variant_result(
+        &mut self,
+        type_: &Expr,
+        count: usize,
+    ) -> Result<Option<ValueType>, IngressError> {
+        let mut result = type_.clone();
+        for _ in 0..count {
+            self.tick()?;
+            let normal = self.type_head(&result)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            if binder_type.has_loose_bvars()
+                || body.has_loose_bvars()
+                || self.value_type(binder_type)?.is_none()
+            {
+                return Ok(None);
+            }
+            result = body.clone();
+        }
+        Ok(self
+            .value_type(&result)?
+            .filter(|result| !matches!(result, ValueType::Closure(_))))
     }
 
     pub(super) fn register_constructor_branch(

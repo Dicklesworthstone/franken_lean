@@ -1,6 +1,10 @@
 //! Native source variants, payload ownership, lazy matches and replay.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, VmExit};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, KVMap,
+    Mode, VmExit,
+};
+use fln_comp::ingress::IngressError;
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
@@ -11,7 +15,10 @@ fn engine() -> Engine {
         .unwrap()
 }
 fn run(source: &str, expected: &str) {
-    let batch = engine()
+    run_with(&engine(), source, expected);
+}
+fn run_with(base: &Engine, source: &str, expected: &str) -> u64 {
+    let batch = base
         .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
         .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
         .into_complete()
@@ -24,6 +31,7 @@ fn run(source: &str, expected: &str) {
         Some(expected),
         "{source}"
     );
+    value.usage.steps
 }
 const RESULT: &str =
     "inductive Result where\n | missing\n | text (s : String)\n | number (n : Nat)\n";
@@ -65,6 +73,115 @@ fn matches_return_owned_variants_and_capture_local_helpers() {
             "{RESULT}{SCORE}def modify (delta : Nat) (r : Result) : Result := let bump (n : Nat) : Nat := n + delta; match r with | .missing => Result.missing | .text s => Result.text (s ++ s) | .number n => Result.number (bump n)\n#eval score (modify 5 (Result.number 37)) + score (modify 0 (Result.text \"\"))"
         ),
         "42",
+    );
+}
+
+#[test]
+fn variant_functions_erase_proof_domains_without_erasing_data_arguments() {
+    // Direct source recursors use the frontier lane. Ordinary source deriving
+    // exercises these generated recursors in the default lane separately.
+    let base = Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let literal = "fun (choice : Choice) => (n : Nat) -> choice = choice -> n = n -> Nat";
+    for motive in [
+        format!("({literal})"),
+        format!("((fun (m : Choice -> Type) => m) ({literal}))"),
+        format!("(let m : Choice -> Type := {literal}; m)"),
+    ] {
+        let source = format!(
+            "inductive Choice where\n | empty\n | offset (value : Nat)\ndef select (choice : Choice) : (n : Nat) -> choice = choice -> n = n -> Nat := @Choice.rec {motive} (fun n choiceProof numberProof => n + 2) (fun value n choiceProof numberProof => value + n) choice\n"
+        );
+        for (choice, input, expected) in [("Choice.empty", 37, "39"), ("Choice.offset 5", 37, "42")]
+        {
+            run_with(
+                &base,
+                &format!("{source}#eval select ({choice}) {input} (by rfl) (by rfl)"),
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn variant_motives_that_select_runtime_representations_are_refused() {
+    let base = Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let source = b"inductive Choice where\n | number\n | text\ndef Selected (choice : Choice) : Type := match choice with | .number => Nat | .text => String\n#eval @Choice.rec Selected (7 : Nat) \"seven\" Choice.number";
+    let mut error = base
+        .execute_source_definitions(&[source], &options, limits())
+        .expect_err("a static motive must not choose a representation from a runtime major");
+    while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
+        error = *inner;
+    }
+    assert!(
+        matches!(
+            error,
+            EngineExecutionError::Ingress(IngressError::UnsupportedNode {
+                kind: "dependent variant recursor result"
+            })
+        ),
+        "the logical declarations must first be admitted: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn fully_applied_variant_functions_keep_stage_work_and_argument_order() {
+    let base = engine();
+    let definitions = r#"
+inductive Choice where
+  | empty
+  | offset (value : Nat)
+def expensive (n : Nat) : Nat := match n with
+  | .zero => 0
+  | .succ k => expensive k
+def use (choice : Choice) (stage before after : Nat) : Nat :=
+  ((match choice with
+    | .empty => fun (x y : Nat) => x * 10 + y
+    | .offset value => fun (x : Nat) => by
+      let spent := expensive stage
+      exact fun (y : Nat) => x * 10 + y + value + spent) : Nat -> Nat -> Nat)
+    (by let spent := expensive before; exact 4)
+    (by let spent := expensive after; exact 2)
+"#;
+    let steps = |expression: &str, expected| {
+        run_with(
+            &base,
+            &format!("{definitions}\n#eval {expression}"),
+            expected,
+        )
+    };
+    // The two branches have the same logical telescope but different actual
+    // stages. Swapping the arguments changes both observable answers.
+    let flat = steps("use Choice.empty 0 0 0", "42");
+    let staged = steps("use (Choice.offset 5) 0 0 0", "47");
+    let work = steps("expensive 20", "0") - steps("expensive 0", "0");
+    assert!(work > 20);
+    for arguments in ["20 0 0", "0 20 0", "0 0 20"] {
+        assert_eq!(
+            steps(&format!("use (Choice.offset 5) {arguments}"), "47") - staged,
+            work,
+            "the selected stage and each actual operand must run exactly once"
+        );
+    }
+    assert_eq!(
+        steps("use (Choice.offset 5) 20 20 20", "47") - staged,
+        3 * work
+    );
+    assert_eq!(
+        steps("use Choice.empty 100000 0 0", "42"),
+        flat,
+        "the unselected function's stage must remain lazy"
     );
 }
 #[test]

@@ -104,7 +104,7 @@ impl Preparation<'_> {
         if let Some(partial) = self.partially_applied_recursor(head, args)? {
             return Ok(Some(partial));
         }
-        let ExprNode::Const { name, .. } = head.node() else {
+        let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
         let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
@@ -149,6 +149,23 @@ impl Preparation<'_> {
             type_ = self.minor_apply(type_, arg.clone())?;
         }
         let type_ = self.erase_runtime_type(&type_)?;
+        if rec.all.len() == 1
+            && rec.num_indices == 0
+            && rec.num_minors >= 2
+            && let Some(shape) = self.recursor_shape(rec, levels, args)?
+            && !shape.recursive
+            && shape.constructors.len() == rec.rules.len()
+            && self
+                .saturated_variant_result(&type_, args.len() - arity)?
+                .is_some()
+        {
+            // Keep a fully supplied variant's operands for its lazy minors.
+            // Selecting a function first would require one fixed closure ABI
+            // even when those minors return the same telescope in different
+            // stages. The variant path applies actual operands in order inside
+            // the selected branch and joins only the final data result.
+            return Ok(None);
+        }
         let mut function = head.clone();
         for argument in &args[..arity] {
             self.tick()?;
