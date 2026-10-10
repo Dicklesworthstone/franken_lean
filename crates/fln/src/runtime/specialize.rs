@@ -7,12 +7,18 @@
 mod arguments;
 mod imported_lists;
 mod imported_nat;
+mod pure;
 mod scope;
 
 use super::*;
 use fln_core::level::Level;
 use fln_env::constants::DefinitionSafety;
 use std::collections::HashMap;
+
+struct NormalizedDefinition {
+    original: DefinitionVal,
+    normalized: DefinitionVal,
+}
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -21,6 +27,10 @@ pub(super) struct Store {
     list_recursion_checked: bool,
     nat_recursion_checked: bool,
     definitions: BTreeMap<Name, DefinitionVal>,
+    normalized_definitions: HashMap<Name, NormalizedDefinition>,
+    pure: pure::Store,
+    factory_values: HashMap<Expr, Expr>,
+    pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
     instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,
     constructor_types: HashMap<Name, Expr>,
@@ -156,24 +166,17 @@ impl Preparation<'_> {
         params: &[Name],
         levels: &[Level],
     ) -> Result<Expr, IngressError> {
-        fln_elab::universe::parameters::instantiate(
-            || self.tick(),
-            || unsupported("runtime universe substitution"),
-            source,
-            params,
-            levels,
-        )
+        pure::universe_instance(self, source, params, levels)
     }
     pub(super) fn substitution(&mut self, body: &Expr, value: &Expr) -> Result<Expr, IngressError> {
-        scope::charge(self, body, scope::Operation::Substitute(value))?;
-        body.subst_loose(0, std::slice::from_ref(value))
-            .map_err(|_| unsupported("runtime substitution scope"))
+        pure::substitution(self, body, value)
     }
     pub(super) fn lift(&mut self, expr: &Expr, amount: u32) -> Result<Expr, IngressError> {
         scope::charge(self, expr, scope::Operation::Lift(amount))?;
         expr.lift_loose(0, amount)
             .map_err(|_| unsupported("runtime specialization scope"))
     }
+
     pub(super) fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
         // A projection whose receiver unfolds to its family's constructor
         // selects that field, as definitional unfolding does (a boxed slot's
@@ -388,6 +391,23 @@ impl Preparation<'_> {
         &mut self,
         definition: &DefinitionVal,
     ) -> Result<DefinitionVal, IngressError> {
+        self.tick()?;
+        // Only canonical ground specializations have a stable source identity
+        // throughout this preparation. Local signatures and modified copies
+        // still take the full path, even if they reuse a familiar name.
+        let cacheable = definition.base.level_params.is_empty()
+            && closed(&definition.base.type_)
+            && closed(&definition.value)
+            && self.specializations.definitions.get(&definition.base.name) == Some(definition);
+        if cacheable
+            && let Some(entry) = self
+                .specializations
+                .normalized_definitions
+                .get(&definition.base.name)
+            && entry.original == *definition
+        {
+            return Ok(entry.normalized.clone());
+        }
         let mut result = definition.clone();
         result.base.type_ = self.erase_runtime_type(&definition.base.type_)?;
         let mut body = self.erase_proofs(&definition.value, Some(definition.base.type_.clone()))?;
@@ -420,6 +440,35 @@ impl Preparation<'_> {
             body = Expr::lam(name, type_, body, info);
         }
         result.value = self.lower_projections(&body)?;
+        if cacheable && closed(&result.base.type_) && closed(&result.value) {
+            self.tick()?;
+            let entries = &mut self.specializations.normalized_definitions;
+            let additional = usize::from(!entries.contains_key(&definition.base.name));
+            let observed = entries.len().saturating_add(additional);
+            if observed > self.limits.fir.max_functions {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ProgramTables,
+                    limit: self.limits.fir.max_functions,
+                    observed,
+                });
+            }
+            entries
+                .try_reserve(additional)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: observed,
+                })?;
+            // Completed layout/closure registrations remain in this
+            // preparation; later discovery rolls back only its own additions.
+            // Keep the canonical logical body untouched for type reduction.
+            entries.insert(
+                definition.base.name.clone(),
+                NormalizedDefinition {
+                    original: definition.clone(),
+                    normalized: result.clone(),
+                },
+            );
+        }
         Ok(result)
     }
     /// Recognize inert closed values without running arbitrary functions.
@@ -1028,6 +1077,9 @@ impl Preparation<'_> {
         Ok(Some(result))
     }
 }
+
+#[cfg(test)]
+mod normalization_tests;
 
 #[cfg(test)]
 mod tests {

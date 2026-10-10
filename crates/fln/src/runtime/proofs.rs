@@ -33,13 +33,7 @@ impl Preparation<'_> {
         source_scalar_constructor_binding(self.environment, &name("Bool.false")).is_some()
     }
 
-    fn push_proof_local(
-        &mut self,
-        locals: &mut Vec<Expr>,
-        type_: Expr,
-    ) -> Result<(), IngressError> {
-        self.tick()?;
-        let observed = locals.len().saturating_add(1);
+    pub(super) fn proof_context_depth(&self, observed: usize) -> Result<(), IngressError> {
         if observed > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
                 resource: IngressResource::ContextDepth,
@@ -47,6 +41,17 @@ impl Preparation<'_> {
                 observed,
             });
         }
+        Ok(())
+    }
+
+    fn push_proof_local(
+        &mut self,
+        locals: &mut Vec<Expr>,
+        type_: Expr,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let observed = locals.len().saturating_add(1);
+        self.proof_context_depth(observed)?;
         locals
             .try_reserve(1)
             .map_err(|_| IngressError::AllocationFailure {
@@ -72,7 +77,16 @@ impl Preparation<'_> {
         input: &Expr,
         context: &[Expr],
     ) -> Result<bool, IngressError> {
-        let mut locals = self.copy_proof_context(context)?;
+        self.proof_context_depth(context.len())?;
+        // An admitted closed type cannot refer to any outer local. Avoid
+        // copying that unrelated telescope for every domain/result query.
+        // Its lexical depth still counts against introduced-binder limits.
+        let omitted_depth = if specialize::closed(input) {
+            context.len()
+        } else {
+            0
+        };
+        let mut locals = self.copy_proof_context(if omitted_depth == 0 { context } else { &[] })?;
         let mut type_ = input.clone();
         loop {
             self.tick()?;
@@ -81,11 +95,16 @@ impl Preparation<'_> {
                 ExprNode::ForallE {
                     binder_type, body, ..
                 } => {
+                    self.proof_context_depth(
+                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
+                    )?;
                     self.push_proof_local(&mut locals, binder_type.clone())?;
                     type_ = body.clone();
                 }
                 _ => {
-                    let Some(sort) = self.projection_receiver_type(&type_, &locals)? else {
+                    let Some(sort) =
+                        self.projection_receiver_type_in(&type_, &locals, omitted_depth)?
+                    else {
                         return Ok(false);
                     };
                     let sort = self.type_head(&sort)?;
@@ -547,3 +566,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod context_tests;

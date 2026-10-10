@@ -139,6 +139,14 @@ impl Preparation<'_> {
         index: u64,
         receiver: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
+        self.tick()?;
+        let key = specialize::closed(receiver).then(|| (family.clone(), index, receiver.clone()));
+        if let Some(value) = key
+            .as_ref()
+            .and_then(|key| self.specializations.executable_projections.get(key))
+        {
+            return Ok(Some(value.clone()));
+        }
         let Some(field) = self.static_projection(family, index, receiver)? else {
             return Ok(None);
         };
@@ -149,7 +157,34 @@ impl Preparation<'_> {
         // receiver supplies the complete lexical context; no runtime receiver
         // is evaluated, duplicated or discarded by this step.
         let field = self.erase_proofs(&field, None)?;
-        self.lower_projections(&field).map(Some)
+        let field = self.lower_projections(&field)?;
+        if let Some(key) = key
+            && specialize::closed(&field)
+        {
+            self.tick()?;
+            let entries = &mut self.specializations.executable_projections;
+            let additional = usize::from(!entries.contains_key(&key));
+            let observed = entries.len().saturating_add(additional);
+            if observed > self.limits.max_nodes {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::Nodes,
+                    limit: self.limits.max_nodes,
+                    observed,
+                });
+            }
+            entries
+                .try_reserve(additional)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::Nodes,
+                    requested: observed,
+                })?;
+            // The key includes even the receiver fields that selection drops.
+            // Only completed, closed preparation is reusable. Runtime field
+            // computations stay in the result at each original occurrence;
+            // later layout discovery cannot roll back this completed prefix.
+            entries.insert(key, field.clone());
+        }
+        Ok(Some(field))
     }
 
     /// Reconstruct a source type using explicit continuations. In particular,
@@ -160,6 +195,25 @@ impl Preparation<'_> {
         source: &Expr,
         context: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        self.projection_receiver_type_in(source, context, 0)
+    }
+
+    /// `omitted_depth` retains the lexical size of an unrelated outer context
+    /// which a closed enclosing query did not copy. No expression in this
+    /// query can refer to those omitted locals, but new binders still count.
+    pub(super) fn projection_receiver_type_in(
+        &mut self,
+        source: &Expr,
+        context: &[Expr],
+        omitted_depth: usize,
+    ) -> Result<Option<Expr>, IngressError> {
+        let depth = omitted_depth.saturating_add(context.len());
+        self.proof_context_depth(depth)?;
+        let (context, omitted_depth) = if specialize::closed(source) {
+            (&[][..], depth)
+        } else {
+            (context, omitted_depth)
+        };
         let mut locals = Vec::new();
         for local in context {
             self.tick()?;
@@ -228,6 +282,9 @@ impl Preparation<'_> {
                     body,
                     binder_info,
                 } => {
+                    self.proof_context_depth(
+                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
+                    )?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(binder_type.clone());
                     let frame =
@@ -238,6 +295,9 @@ impl Preparation<'_> {
                 ExprNode::LetE {
                     type_, value, body, ..
                 } => {
+                    self.proof_context_depth(
+                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
+                    )?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(type_.clone());
                     let frame = TypeFrame::Let(value.clone());
@@ -502,6 +562,9 @@ impl Preparation<'_> {
         pop(&mut values)
     }
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod tests {
