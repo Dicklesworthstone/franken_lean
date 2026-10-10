@@ -105,6 +105,52 @@ impl Preparation<'_> {
         self.erase_type_in(input, &[])
     }
 
+    /// A static type function may capture runtime values only in proof domains,
+    /// for example `fun b => Nat.beq n m = b -> Bool`. Erase its returned TYPE
+    /// under the original lambda context before deciding whether the argument
+    /// is closed enough for specialization. It is never an executable closure.
+    /// Ordinary propositions and proposition-valued predicates keep their
+    /// logical type-plane identity; only returned runtime types are erased.
+    pub(in crate::runtime) fn erase_type_argument(
+        &mut self,
+        input: &Expr,
+        context: &[Expr],
+    ) -> Result<Expr, IngressError> {
+        if !self.proof_erasure_available() {
+            return self.erase_hidden_types(input, context);
+        }
+        let mut locals = self.copy_proof_context(context)?;
+        let mut binders = Vec::new();
+        let mut body = input.clone();
+        loop {
+            self.tick()?;
+            let normal = self.type_head(&body)?;
+            let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body: next,
+                binder_info,
+            } = normal.node()
+            else {
+                if binders.is_empty() || self.proposition_type(&normal, &locals)? {
+                    return self.erase_hidden_types(input, context);
+                }
+                body = self.erase_type_in(&normal, &locals)?;
+                break;
+            };
+            let domain = self.erase_type_in(binder_type, &locals)?;
+            self.push_proof_local(&mut locals, binder_type.clone())?;
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), domain, *binder_info));
+            body = next.clone();
+        }
+        for (name, domain, info) in binders.into_iter().rev() {
+            self.tick()?;
+            body = Expr::lam(name, domain, body, info);
+        }
+        Ok(body)
+    }
+
     fn erase_type_in(&mut self, input: &Expr, context: &[Expr]) -> Result<Expr, IngressError> {
         self.erase_domains(input, context)
     }
@@ -279,7 +325,7 @@ impl Preparation<'_> {
                                     // Closed concrete carrier arguments stay
                                     // intact for constructor callback adapters.
                                     Frame::Keep(if arg.has_loose_bvars() {
-                                        self.erase_hidden_types(arg, &context)?
+                                        self.erase_type_argument(arg, &context)?
                                     } else {
                                         arg.clone()
                                     })

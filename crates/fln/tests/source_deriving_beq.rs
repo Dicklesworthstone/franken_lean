@@ -40,6 +40,35 @@ fn checked(base: &Engine, source: &str) -> Engine {
     .engine
 }
 
+fn execute_and_replay(
+    base: &Engine,
+    source: &str,
+    expected: &[&str],
+    limits: EngineExecutionLimits,
+) {
+    let report = base
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits)
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("bounded execution completes");
+    assert_eq!(report.executions.len(), expected.len());
+    for (execution, expected) in report.executions.iter().zip(expected) {
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("execution did not return: {source}")
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(*expected));
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), Default::default())
+                .unwrap()
+                .into_complete()
+                .expect("the serialized generated comparison is executable");
+        let VmExit::Returned(value) = replay else {
+            panic!("artifact replay did not return")
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(*expected));
+    }
+}
+
 const RECURSIVE: &str = r#"
 namespace Wire
 inductive Chain (A : Type) where
@@ -292,5 +321,92 @@ fn false_equalities_missing_field_instances_and_incomplete_batches_are_rejected(
     checked(
         &base,
         "inductive Retry where\n | ok\nderiving BEq\ntheorem recovered : (Retry.ok == Retry.ok) = true := by rfl",
+    );
+}
+
+#[test]
+fn polymorphic_comparisons_retain_the_caller_supplied_dictionary() {
+    let base = checked(
+        &engine(),
+        r#"
+structure Generic (A : Type) where
+  value : A
+deriving BEq
+def allSame : BEq Nat := { beq := fun a b => true }
+theorem supplied : (@instBEqGeneric.beq Nat allSame (Generic.mk 1) (Generic.mk 2)) = true := by rfl
+theorem ordinary : (Generic.mk 1 == Generic.mk 2) = false := by rfl
+"#,
+    );
+    execute_and_replay(
+        &base,
+        "#eval if @instBEqGeneric.beq Nat allSame (Generic.mk 1) (Generic.mk 2) then 42 else 0\n#eval if Generic.mk 1 == Generic.mk 2 then 1 else 0",
+        &["42", "0"],
+        EngineExecutionLimits::new(limits().kernel),
+    );
+}
+
+#[test]
+fn an_early_false_field_does_not_execute_later_comparisons() {
+    let base = checked(
+        &engine(),
+        r#"
+structure Slow where
+  value : Nat
+def spend (n : Nat) : Bool := match n with | .zero => true | .succ k => spend k
+instance slowComparison : BEq Slow := { beq := fun a b => spend (a.value + b.value) }
+structure Guarded where
+  tag : Nat
+  payload : Slow
+deriving BEq
+"#,
+    );
+    let mut execution_limits = EngineExecutionLimits::new(limits().kernel);
+    execution_limits.vm.max_steps = 5000;
+    execute_and_replay(
+        &base,
+        "#eval if Guarded.mk 0 (Slow.mk 100000) == Guarded.mk 1 (Slow.mk 100000) then 1 else 0",
+        &["0"],
+        execution_limits,
+    );
+    let would_run = base
+        .execute_source_definitions(
+            &[b"#eval if Guarded.mk 0 (Slow.mk 100000) == Guarded.mk 0 (Slow.mk 100000) then 1 else 0"],
+            &KVMap::new(),
+            execution_limits,
+        )
+        .unwrap();
+    let fln::Outcome::Inconclusive(reason) = would_run else {
+        panic!("the late comparison must exceed this VM step budget")
+    };
+    let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } = reason.cause else {
+        panic!("the late comparison must stop for its execution budget")
+    };
+    assert_eq!(usage.reason, fln_core::diag::ResourceReason::ExecutionSteps);
+    assert_eq!(usage.allowed, execution_limits.vm.max_steps);
+    assert!(usage.observed > usage.allowed);
+}
+
+#[test]
+fn field_comparisons_erase_proof_captures_in_type_valued_motives() {
+    let base = checked(
+        &engine(),
+        r#"
+def choose (motive : Bool → Type) (no : motive false) (yes : motive true) (b : Bool) : motive b :=
+  match b with
+  | false => no
+  | true => yes
+def fromDecision : BEq Nat :=
+  { beq := fun a b =>
+      choose (fun v => Nat.beq a b = v → Bool) (fun _ => false) (fun _ => true) (Nat.beq a b) rfl }
+structure Generic (A : Type) where
+  value : A
+deriving BEq
+"#,
+    );
+    execute_and_replay(
+        &base,
+        "#eval if @BEq.beq Nat fromDecision 7 7 then 42 else 0\n#eval if @BEq.beq Nat fromDecision 7 8 then 1 else 0\n#eval if @instBEqGeneric.beq Nat fromDecision (Generic.mk 7) (Generic.mk 7) then 42 else 0\n#eval if @instBEqGeneric.beq Nat fromDecision (Generic.mk 7) (Generic.mk 8) then 1 else 0",
+        &["42", "0", "42", "0"],
+        EngineExecutionLimits::new(limits().kernel),
     );
 }

@@ -132,7 +132,7 @@ impl Preparation<'_> {
                 Some(if closed(argument) {
                     argument.clone()
                 } else {
-                    self.erase_hidden_types(argument, &[])?
+                    self.erase_type_argument(argument, &[])?
                 })
             } else {
                 None
