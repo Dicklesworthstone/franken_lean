@@ -3,6 +3,8 @@
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
 #[cfg(test)]
+mod intrinsic_types;
+#[cfg(test)]
 mod projected;
 mod recursors;
 mod stages;
@@ -342,6 +344,7 @@ impl Preparation<'_> {
     pub(crate) fn finalize_callables(
         &mut self,
         functions: &mut [FunctionBinding],
+        intrinsics: &mut [IntrinsicBinding],
     ) -> Result<Vec<ClosureSignature>, IngressError> {
         if self.interfaces.is_empty() {
             return Ok(Vec::new());
@@ -428,6 +431,17 @@ impl Preparation<'_> {
                 *parameter = remap_type(*parameter, &ranks)?;
             }
             function.result = remap_type(function.result, &ranks)?;
+        }
+        // Native higher-order rows share the canonical callback ABI with
+        // function parameters, lambda captures and object fields. Their
+        // bindings were copied into the catalog before discovery completed.
+        for intrinsic in intrinsics {
+            for argument in &mut intrinsic.arguments {
+                charge_catalog_node(&mut self.visited, self.limits)?;
+                *argument = remap_type(*argument, &ranks)?;
+            }
+            charge_catalog_node(&mut self.visited, self.limits)?;
+            intrinsic.result = remap_type(intrinsic.result, &ranks)?;
         }
         for lambda in &mut self.lambdas {
             for parameter in &mut lambda.parameters {

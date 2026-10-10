@@ -15,7 +15,13 @@ const PRIMITIVE: &str = "_fln_runtime_string_push_abi";
 pub(super) struct Store {
     next_adapter: u64,
     primitive: Option<(IntrinsicBinding, Expr)>,
-    projections: Option<[Name; 4]>,
+    character: Option<CharacterLayout>,
+}
+
+#[derive(Clone)]
+struct CharacterLayout {
+    projections: [Name; 4],
+    constructors: [Name; 4],
 }
 
 fn c(label: &str) -> Expr {
@@ -69,7 +75,7 @@ impl Preparation<'_> {
         &mut self,
         source: Expr,
         fields: usize,
-    ) -> Result<(Name, Vec<Expr>), IngressError> {
+    ) -> Result<(Name, Name, Vec<Expr>), IngressError> {
         let source = self.erase_runtime_type(&source)?;
         if self.value_type(&source)? != Some(ValueType::Constructor) {
             return Err(unsupported(
@@ -85,29 +91,65 @@ impl Preparation<'_> {
         if constructor.tag != 0 || constructor.fields.len() != fields {
             return Err(unsupported("String.push checked character field count"));
         }
-        Ok((shape.projection(constructor), constructor.fields.clone()))
+        Ok((
+            shape.projection(constructor),
+            constructor.name.clone(),
+            constructor.fields.clone(),
+        ))
     }
 
     /// Reuse the ordinary checked Char representation across native String
     /// adapters. Callers establish their own complete source contract first;
     /// deriving these field views registers no native operation by itself.
     pub(super) fn native_character_projections(&mut self) -> Result<[Name; 4], IngressError> {
-        if let Some(projections) = &self.string_push.projections {
-            return Ok(projections.clone());
+        Ok(self.native_character_layout()?.projections)
+    }
+
+    fn native_character_layout(&mut self) -> Result<CharacterLayout, IngressError> {
+        if let Some(character) = &self.string_push.character {
+            return Ok(character.clone());
         }
-        let (character, character_fields) = self.string_push_record(c("Char"), 2)?;
+        let (character, character_ctor, character_fields) =
+            self.string_push_record(c("Char"), 2)?;
         if character_fields != [c("UInt32"), proofs::erased_type()] {
             return Err(unsupported("String.push logical character fields"));
         }
-        let (word, word_fields) = self.string_push_record(character_fields[0].clone(), 1)?;
-        let (bits, bits_fields) = self.string_push_record(word_fields[0].clone(), 1)?;
-        let (finite, finite_fields) = self.string_push_record(bits_fields[0].clone(), 2)?;
+        let (word, word_ctor, word_fields) =
+            self.string_push_record(character_fields[0].clone(), 1)?;
+        let (bits, bits_ctor, bits_fields) = self.string_push_record(word_fields[0].clone(), 1)?;
+        let (finite, finite_ctor, finite_fields) =
+            self.string_push_record(bits_fields[0].clone(), 2)?;
         if finite_fields != [c("Nat"), proofs::erased_type()] {
             return Err(unsupported("String.push logical finite-word fields"));
         }
-        let projections = [character, word, bits, finite];
-        self.string_push.projections = Some(projections.clone());
-        Ok(projections)
+        let character = CharacterLayout {
+            projections: [character, word, bits, finite],
+            constructors: [character_ctor, word_ctor, bits_ctor, finite_ctor],
+        };
+        self.string_push.character = Some(character.clone());
+        Ok(character)
+    }
+
+    /// Native String traversal supplies a validated Unicode scalar. Rebuild
+    /// the source callback's ordinary checked Char representation using those
+    /// exact registered constructors; proof fields keep their usual inert slots.
+    pub(super) fn native_character_from_scalar(
+        &mut self,
+        scalar: Expr,
+    ) -> Result<Expr, IngressError> {
+        let [character, word, bits, finite] = self.native_character_layout()?.constructors;
+        let mut result = Expr::app(
+            Expr::app(Expr::const_(finite, vec![]), scalar),
+            proofs::erased_value(),
+        );
+        for constructor in [bits, word] {
+            self.tick()?;
+            result = Expr::app(Expr::const_(constructor, vec![]), result);
+        }
+        Ok(Expr::app(
+            Expr::app(Expr::const_(character, vec![]), result),
+            proofs::erased_value(),
+        ))
     }
 
     fn string_push_bind(&mut self) -> Result<[Name; 4], IngressError> {

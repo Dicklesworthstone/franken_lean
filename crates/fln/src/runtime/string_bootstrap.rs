@@ -8,14 +8,14 @@
 //! evaluation and first-class/partially applied functions.
 
 use super::*;
-use crate::source_intrinsics::string_bootstrap::{self, Operation};
+use crate::source_intrinsics::string_bootstrap::{self, Domain, Operation};
 use fln_comp::fir::EffectClass;
 use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
 #[derive(Default)]
 pub(super) struct Store {
     next_adapter: u64,
-    primitives: [Option<(IntrinsicBinding, Expr)>; 6],
+    primitives: [Option<(IntrinsicBinding, Expr)>; 8],
     position: Option<(Name, Name)>,
     verified: string_bootstrap::VerifiedDependencies,
 }
@@ -32,6 +32,15 @@ fn function(domains: &[Expr], result: Expr) -> Expr {
 
 fn b(index: u32) -> Result<Expr, IngressError> {
     Expr::bvar(index).map_err(|_| unsupported("String bootstrap adapter binder scope"))
+}
+
+fn native_type(domain: Domain) -> Expr {
+    match domain {
+        Domain::String => c("String"),
+        Domain::Bool => c("Bool"),
+        Domain::StringCallback => function(&[c("String"), c("Nat")], c("String")),
+        Domain::Char | Domain::Position | Domain::Nat => c("Nat"),
+    }
 }
 
 impl Preparation<'_> {
@@ -141,46 +150,45 @@ impl Preparation<'_> {
         {
             return Err(unsupported("String bootstrap generated ownership contract"));
         }
-        let native_domains: Vec<_> = domains
-            .iter()
-            .map(|domain| {
-                if *domain == "String" {
-                    c("String")
-                } else {
-                    c("Nat")
+        let native_domains: Vec<_> = domains.iter().copied().map(native_type).collect();
+        let mut arguments = Vec::new();
+        for (domain, type_) in domains.iter().zip(&native_domains) {
+            self.tick()?;
+            arguments.push(match domain {
+                Domain::String => ValueType::String,
+                Domain::Char | Domain::Position | Domain::Nat => ValueType::Nat,
+                Domain::Bool => ValueType::Bool,
+                Domain::StringCallback => {
+                    let Some(callback @ ValueType::Closure(_)) = self.value_type(type_)? else {
+                        return Err(unsupported("String bootstrap native callback type"));
+                    };
+                    callback
                 }
-            })
-            .collect();
-        let result_string = operation.result() == "String";
-        let result = if result_string {
-            ValueType::String
-        } else {
-            ValueType::Nat
+            });
+        }
+        let result = match operation.result() {
+            Domain::String => ValueType::String,
+            Domain::Nat | Domain::Position => ValueType::Nat,
+            Domain::Bool => {
+                if self.value_type(&c("Bool"))? != Some(ValueType::Bool) {
+                    return Err(unsupported("String bootstrap checked Boolean result"));
+                }
+                ValueType::Bool
+            }
+            Domain::Char | Domain::StringCallback => unreachable!("fixed String bootstrap result"),
         };
         self.string_bootstrap.primitives[operation.index()] = Some((
             IntrinsicBinding {
                 name: primitive,
                 universe_arity: 0,
                 row: row.id.to_owned(),
-                arguments: domains
-                    .iter()
-                    .map(|domain| {
-                        if *domain == "String" {
-                            ValueType::String
-                        } else {
-                            ValueType::Nat
-                        }
-                    })
-                    .collect(),
+                arguments,
                 argument_ownership: vec![ArgumentOwnership::Borrowed; domains.len()],
                 result,
                 result_ownership: ResultOwnership::Owned,
                 effect: EffectClass::Pure,
             },
-            function(
-                &native_domains,
-                c(if result_string { "String" } else { "Nat" }),
-            ),
+            function(&native_domains, native_type(operation.result())),
         ));
         Ok(())
     }
@@ -234,22 +242,38 @@ impl Preparation<'_> {
             self.tick()?;
             let mut argument = b(u32::try_from(domains.len() - index - 1)
                 .map_err(|_| unsupported("String bootstrap adapter arity"))?)?;
-            match *domain {
-                "Char" => {
+            match domain {
+                Domain::Char => {
                     for projection in self.native_character_projections()? {
                         self.tick()?;
                         argument = Expr::proj(projection, 0, argument);
                     }
                 }
-                "String.Pos.Raw" => {
+                Domain::Position => {
                     argument = Expr::proj(self.string_bootstrap_position()?.0, 0, argument);
                 }
-                "String" | "Nat" => {}
-                _ => unreachable!("fixed String bootstrap domain"),
+                Domain::StringCallback => {
+                    // The native fold supplies scalar codepoints, while the
+                    // source function keeps its checked Char parameter. This
+                    // closed wrapper captures that function exactly once;
+                    // accumulator and character remain ordered runtime inputs.
+                    let callback = self.lift(&argument, 2)?;
+                    let character = self.native_character_from_scalar(b(0)?)?;
+                    argument = Expr::app(Expr::app(callback, b(1)?), character);
+                    for type_ in [c("Nat"), c("String")] {
+                        argument = Expr::lam(
+                            self.string_bootstrap_adapter_name()?,
+                            type_,
+                            argument,
+                            BinderInfo::Default,
+                        );
+                    }
+                }
+                Domain::String | Domain::Nat | Domain::Bool => {}
             }
             body = Expr::app(body, argument);
         }
-        if operation.result() == "String.Pos.Raw" {
+        if operation.result() == Domain::Position {
             body = Expr::app(
                 Expr::const_(self.string_bootstrap_position()?.1, Vec::new()),
                 body,
@@ -258,14 +282,17 @@ impl Preparation<'_> {
         for domain in domains.iter().rev() {
             body = Expr::lam(
                 self.string_bootstrap_adapter_name()?,
-                c(domain),
+                domain.source_type(),
                 body,
                 BinderInfo::Default,
             );
         }
         let type_ = function(
-            &domains.iter().map(|domain| c(domain)).collect::<Vec<_>>(),
-            c(operation.result()),
+            &domains
+                .iter()
+                .map(|domain| domain.source_type())
+                .collect::<Vec<_>>(),
+            operation.result().source_type(),
         );
         let wrapper = Expr::let_e(
             self.string_bootstrap_adapter_name()?,

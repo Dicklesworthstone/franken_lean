@@ -159,6 +159,8 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
             ("String.Internal.extract", "lean_string_utf8_extract"),
             ("String.Internal.next", "lean_string_utf8_next"),
             ("String.Internal.pushn", "lean_string_pushn"),
+            ("String.Internal.foldl", "lean_string_foldl"),
+            ("String.Internal.isEmpty", "lean_string_isempty"),
         ] {
             assert_eq!(externs.get(&name(declaration)), Some([fln_elab::externs::ExternEntry::Standard { backend: name("all"), symbol: symbol.to_owned() }].as_slice()), "the real artifact supplies execution metadata");
         }
@@ -183,6 +185,11 @@ import Init.Data.String.Bootstrap
 #eval let pad := String.Internal.pushn "x" '🦀'; pad 2
 #eval let seek := String.Internal.posOf; String.Pos.Raw.byteIdx (seek "aλ😀z" 'q')
 #eval String.Internal.pushn "unchanged" 'λ' 0
+#eval String.Internal.foldl String.push "pre" "λ😀"
+#eval let suffix := "!"; let fold := String.Internal.foldl (fun acc c => String.Internal.append (String.push acc c) suffix) "pre"; fold "aλ"
+#eval String.Internal.foldl String.push "" "Aλ😀é\x00"
+#eval if String.Internal.isEmpty "" then 42 else 0
+#eval let isEmpty := String.Internal.isEmpty; if isEmpty "\x00" then 0 else 42
 "#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
@@ -196,6 +203,10 @@ import Init.Data.String.Bootstrap
             Some(ClosedVmValue::Scalar(3)), Some(ClosedVmValue::String("xλλλ".to_owned())),
             Some(ClosedVmValue::String("λ".to_owned())), Some(ClosedVmValue::String("x🦀🦀".to_owned())),
             Some(ClosedVmValue::Scalar(8)), Some(ClosedVmValue::String("unchanged".to_owned())),
+            Some(ClosedVmValue::String("preλ😀".to_owned())),
+            Some(ClosedVmValue::String("prea!λ!".to_owned())),
+            Some(ClosedVmValue::String("Aλ😀é\0".to_owned())),
+            Some(ClosedVmValue::Scalar(42)), Some(ClosedVmValue::Scalar(42)),
         ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
         // Replay the actual bytes emitted after both imported-module and
@@ -215,7 +226,7 @@ import Init.Data.String.Bootstrap
             let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default()).unwrap().into_complete().unwrap();
             assert_eq!(fln::closed_vm_value(&replay).unwrap(), fln::closed_vm_value(&execution.exit).unwrap());
         }
-        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn"] {
+        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty"] {
             assert!(string_rows.contains(&format!("extern:String.{operation}")), "the admitted source must select {operation}'s actual native row");
         }
         let mut tight = limits;

@@ -1,6 +1,6 @@
-//! Native ABI contracts for the pin's UTF-8 position and repetition helpers.
+//! Native ABI contracts for the pin's String traversal and position helpers.
 //!
-//! Bootstrap's five safe opaques contain Inhabited fallbacks, not executable
+//! Bootstrap's safe opaques contain Inhabited fallbacks, not executable
 //! implementations. Prelude's utf8ByteSize instead exposes the logical byte
 //! array representation. The native operations require their explicit extern
 //! and their complete pinned declaration closure before crossing either boundary.
@@ -12,7 +12,7 @@
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 339;
+const DEPENDENCY_COUNT: usize = 343;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
@@ -33,16 +33,54 @@ pub(crate) enum Operation {
     Extract,
     Next,
     Pushn,
+    Foldl,
+    IsEmpty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Domain {
+    String,
+    Char,
+    Position,
+    Nat,
+    Bool,
+    StringCallback,
+}
+
+impl Domain {
+    pub(crate) fn source_type(self) -> Expr {
+        let c = |label| Expr::const_(name(label), Vec::new());
+        match self {
+            Self::String => c("String"),
+            Self::Char => c("Char"),
+            Self::Position => c("String.Pos.Raw"),
+            Self::Nat => c("Nat"),
+            Self::Bool => c("Bool"),
+            Self::StringCallback => Expr::forall_e(
+                Name::anonymous(),
+                c("String"),
+                Expr::forall_e(
+                    Name::anonymous(),
+                    c("Char"),
+                    c("String"),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        }
+    }
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
         Self::Extract,
         Self::Next,
         Self::Pushn,
+        Self::Foldl,
+        Self::IsEmpty,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -61,6 +99,8 @@ impl Operation {
             Self::Extract => "String.Internal.extract",
             Self::Next => "String.Internal.next",
             Self::Pushn => "String.Internal.pushn",
+            Self::Foldl => "String.Internal.foldl",
+            Self::IsEmpty => "String.Internal.isEmpty",
         }
     }
 
@@ -74,21 +114,29 @@ impl Operation {
             .find(|operation| requested == &operation.source_name())
     }
 
-    pub(crate) fn domains(self) -> &'static [&'static str] {
+    pub(crate) fn domains(self) -> &'static [Domain] {
+        use Domain::{Char, Nat, Position, String, StringCallback};
         match self {
-            Self::ByteSize => &["String"],
-            Self::PosOf => &["String", "Char"],
-            Self::OffsetOfPos | Self::Next => &["String", "String.Pos.Raw"],
-            Self::Extract => &["String", "String.Pos.Raw", "String.Pos.Raw"],
-            Self::Pushn => &["String", "Char", "Nat"],
+            Self::ByteSize | Self::IsEmpty => &[String],
+            Self::PosOf => &[String, Char],
+            Self::OffsetOfPos | Self::Next => &[String, Position],
+            Self::Extract => &[String, Position, Position],
+            Self::Pushn => &[String, Char, Nat],
+            Self::Foldl => &[StringCallback, String, String],
         }
     }
 
-    pub(crate) fn result(self) -> &'static str {
+    #[cfg(test)]
+    pub(crate) fn uses_character(self) -> bool {
+        matches!(self, Self::PosOf | Self::Pushn | Self::Foldl)
+    }
+
+    pub(crate) fn result(self) -> Domain {
         match self {
-            Self::ByteSize | Self::OffsetOfPos => "Nat",
-            Self::PosOf | Self::Next => "String.Pos.Raw",
-            Self::Extract | Self::Pushn => "String",
+            Self::ByteSize | Self::OffsetOfPos => Domain::Nat,
+            Self::PosOf | Self::Next => Domain::Position,
+            Self::Extract | Self::Pushn | Self::Foldl => Domain::String,
+            Self::IsEmpty => Domain::Bool,
         }
     }
 

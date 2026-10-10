@@ -1077,7 +1077,7 @@ mod closure_fields_tests {
             fields.push(prep.constructors.last().unwrap().fields[0]);
         }
         assert_ne!(fields[0], fields[1]);
-        prep.finalize_callables(&mut []).unwrap();
+        prep.finalize_callables(&mut [], &mut []).unwrap();
         assert_eq!(prep.constructors[0].fields[0], fields[1]);
         assert_eq!(prep.constructors[1].fields[0], fields[0]);
     }
@@ -1166,8 +1166,8 @@ mod closure_fields_tests {
             Some(ValueType::Constructor)
         );
         assert_eq!(
-            stopped.finalize_callables(&mut []).unwrap(),
-            clean.finalize_callables(&mut []).unwrap()
+            stopped.finalize_callables(&mut [], &mut []).unwrap(),
+            clean.finalize_callables(&mut [], &mut []).unwrap()
         );
         assert_eq!(stopped.constructors, clean.constructors);
     }

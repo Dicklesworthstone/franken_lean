@@ -144,7 +144,6 @@ fn inventory(operation: Operation) -> BTreeMap<Name, &'static str> {
     for line in DEPENDENCIES.lines() {
         let (mask, encoded, digest) = inventory_row(line);
         assert_ne!(mask, 0);
-        assert_eq!(mask & !0x3f, 0);
         if mask & operation.mask() != 0 {
             let label = dependency_name(encoded, &mut 0, IngressLimits::default()).unwrap();
             assert!(rows.insert(label, digest).is_none());
@@ -155,8 +154,20 @@ fn inventory(operation: Operation) -> BTreeMap<Name, &'static str> {
 
 /// Recompute the complete graph independently of the frozen membership table.
 fn actual_dependencies(environment: &Environment, operation: Operation) -> BTreeSet<Name> {
-    let mut pending = vec![operation.source_name()];
-    if operation.domains().contains(&"Char") {
+    actual_dependencies_from(
+        environment,
+        operation.source_name(),
+        operation.uses_character(),
+    )
+}
+
+fn actual_dependencies_from(
+    environment: &Environment,
+    root: Name,
+    character: bool,
+) -> BTreeSet<Name> {
+    let mut pending = vec![root];
+    if character {
         pending.push(name("Bool"));
     }
     let mut found = BTreeSet::new();
@@ -263,7 +274,7 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         let mut work = 0;
         for (operation, count) in Operation::ALL
             .into_iter()
-            .zip([325, 325, 325, 326, 325, 323])
+            .zip([325, 325, 325, 326, 325, 323, 323, 324])
         {
             let rows = inventory(operation);
             assert_eq!(rows.len(), count);
@@ -341,6 +352,8 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
 #eval let pad := String.Internal.pushn "pre" '😀'; pad 2
 #eval String.Pos.Raw.byteIdx (String.Internal.posOf "λ\x00z" '\x00')
 #eval String.Internal.pushn "unchanged" 'λ' 0
+#eval String.Internal.foldl String.push "pre" "λ😀"
+#eval if String.Internal.isEmpty "" then 42 else 0
 "#;
         let run = || {
             engine
@@ -364,6 +377,8 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
             ClosedVmValue::String("pre😀😀".to_owned()),
             ClosedVmValue::Scalar(2),
             ClosedVmValue::String("unchanged".to_owned()),
+            ClosedVmValue::String("preλ😀".to_owned()),
+            ClosedVmValue::Scalar(42),
         ];
         let first = run();
         let indices = &first.batch.source_evaluation_indices;
@@ -432,6 +447,151 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
             );
         }
         assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn folded_source_callbacks_capture_strings_partially_apply_and_replay_unicode() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let original_root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let source = r#"
+#eval String.Internal.foldl String.push "" "Aλ😀é\x00"
+#eval String.Internal.foldl (fun acc c => String.push (String.push acc c) c) "" "λ😀"
+#eval let suffix := "!"; String.Internal.foldl (fun acc c => String.Internal.append (String.push acc c) suffix) "pre" "aλ"
+#eval let fold := String.Internal.foldl; fold String.push "pre" "λ😀"
+#eval let fold := String.Internal.foldl String.push "pre"; fold "λ😀"
+#eval String.Internal.foldl (fun acc c => String.push acc c) "initial" ""
+#eval let isEmpty := String.Internal.isEmpty; if isEmpty "" then 42 else 0
+#eval let isEmpty := String.Internal.isEmpty; if isEmpty "\x00" then 0 else 42
+#eval if String.Internal.isEmpty "λ😀" then 0 else 42
+"#;
+        let expected = [
+            ClosedVmValue::String("Aλ😀é\0".to_owned()),
+            ClosedVmValue::String("λλ😀😀".to_owned()),
+            ClosedVmValue::String("prea!λ!".to_owned()),
+            ClosedVmValue::String("preλ😀".to_owned()),
+            ClosedVmValue::String("preλ😀".to_owned()),
+            ClosedVmValue::String("initial".to_owned()),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+        ];
+        let execute = || {
+            engine
+                .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+                .unwrap_or_else(|error| panic!("captured/partial native String fold: {error:?}"))
+                .into_complete()
+                .unwrap()
+        };
+        let first = execute();
+        assert_eq!(first.batch.source_evaluation_indices.len(), expected.len());
+        for (&index, expected) in first.batch.source_evaluation_indices.iter().zip(&expected) {
+            let execution = &first.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap().as_ref(),
+                Some(expected)
+            );
+            let decoded =
+                flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&decoded, Default::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(closed_vm_value(&replay).unwrap().as_ref(), Some(expected));
+        }
+        let retry = execute();
+        for &index in &first.batch.source_evaluation_indices {
+            assert_eq!(
+                first.batch.executions[index].flbc_artifact,
+                retry.batch.executions[index].flbc_artifact
+            );
+        }
+        assert_eq!(engine.logical_root(&options), original_root);
+    });
+}
+
+#[test]
+fn empty_source_fold_keeps_all_three_strict_operands_without_calling_the_callback() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let original_root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let source = |callback_cost: u64, initial_cost: u64, input_cost: u64, body_cost: u64| {
+            format!(
+                "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n\
+                 #eval String.Internal.foldl \
+                 (let prepared : Nat := spend {callback_cost}; fun acc c => let visited : Nat := spend {body_cost}; String.push acc c) \
+                 (let prepared : Nat := spend {initial_cost}; \"base\") \
+                 (let prepared : Nat := spend {input_cost}; \"\")\n"
+            )
+        };
+        let execute = |costs: [u64; 4]| {
+            let source = source(costs[0], costs[1], costs[2], costs[3]);
+            let complete = engine
+                .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+                .unwrap_or_else(|error| panic!("strict native String fold {costs:?}: {error:?}"))
+                .into_complete()
+                .unwrap();
+            let index = *complete.batch.source_evaluation_indices.last().unwrap();
+            let execution = &complete.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap(),
+                Some(ClosedVmValue::String("base".to_owned()))
+            );
+            let VmExit::Returned(result) = &execution.exit else {
+                panic!("the empty fold must return its initialized String");
+            };
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::String("base".to_owned()))
+            );
+            result.usage.steps
+        };
+        let idle = execute([0, 0, 0, 0]);
+        assert_eq!(
+            execute([0, 0, 0, 30]),
+            idle,
+            "an empty input never executes the callback body"
+        );
+        for costs in [[30, 0, 0, 0], [0, 30, 0, 0], [0, 0, 30, 0]] {
+            let busy = execute(costs);
+            assert!(
+                busy > idle + 30,
+                "strict source operand disappeared: {costs:?}, {idle} vs {busy}"
+            );
+            let mut bounded = limits;
+            bounded.vm.max_steps = idle;
+            let source = source(costs[0], costs[1], costs[2], costs[3]);
+            assert!(matches!(
+                engine
+                    .execute_source_commands_with_checks(source.as_bytes(), &options, bounded)
+                    .unwrap(),
+                Outcome::Inconclusive(_)
+            ));
+        }
+        assert_eq!(engine.logical_root(&options), original_root);
     });
 }
 
@@ -621,13 +781,19 @@ fn changed_body(operation: Operation, info: ConstantInfo) -> Declaration {
     let c = |label| Expr::const_(name(label), vec![]);
     let answer = Expr::lit(Literal::Nat(NatLit::from_u64(42)));
     let mut body = match operation.result() {
-        "Nat" => answer,
-        "String" => Expr::lit(Literal::Str("counterfeit".to_owned())),
-        "String.Pos.Raw" => Expr::app(c("String.Pos.Raw.mk"), answer),
+        Domain::Nat => answer,
+        Domain::String => Expr::lit(Literal::Str("counterfeit".to_owned())),
+        Domain::Position => Expr::app(c("String.Pos.Raw.mk"), answer),
+        Domain::Bool => c("Bool.true"),
         _ => unreachable!(),
     };
     for domain in operation.domains().iter().rev() {
-        body = Expr::lam(Name::anonymous(), c(domain), body, BinderInfo::Default);
+        body = Expr::lam(
+            Name::anonymous(),
+            domain.source_type(),
+            body,
+            BinderInfo::Default,
+        );
     }
     match info {
         ConstantInfo::Defn(mut value) => {

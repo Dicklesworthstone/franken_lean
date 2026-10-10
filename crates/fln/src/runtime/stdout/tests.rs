@@ -358,7 +358,7 @@ fn compile_transport(
         executable_dependencies(environment, &expression, limits, &mut preparation).unwrap();
     preparation.refine_expression_captures(&expression).unwrap();
     let interfaces = preparation
-        .finalize_callables(&mut catalog.functions)
+        .finalize_callables(&mut catalog.functions, &mut catalog.intrinsics)
         .unwrap();
     let ingress = fln_comp::ingress::lower_closed_expr_at_result(
         &expression,

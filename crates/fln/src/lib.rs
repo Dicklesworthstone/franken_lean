@@ -8853,7 +8853,7 @@ impl Engine {
             .refine_expression_captures(&expression)
             .map_err(EngineExecutionError::Ingress)?;
         let interfaces = preparation
-            .finalize_callables(&mut catalog.functions)
+            .finalize_callables(&mut catalog.functions, &mut catalog.intrinsics)
             .map_err(EngineExecutionError::Ingress)?;
         let ingress = fln_comp::ingress::lower_closed_expr_at_result(
             &expression,

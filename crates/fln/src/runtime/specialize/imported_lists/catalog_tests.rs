@@ -81,7 +81,7 @@ fn decoded_list_length_catalog_compiles_with_ground_addition_dictionaries() {
                 .unwrap();
                 preparation.refine_expression_captures(&prepared).unwrap();
                 let interfaces = preparation
-                    .finalize_callables(&mut catalog.functions)
+                    .finalize_callables(&mut catalog.functions, &mut catalog.intrinsics)
                     .unwrap();
                 let ingress = fln_comp::ingress::lower_closed_expr_at_result(
                     &prepared,
