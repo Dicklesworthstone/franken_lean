@@ -30,6 +30,9 @@ pub(super) struct Store {
     read_layout: Option<Layout>,
     bytes_layout: Option<Layout>,
     directory_layout: Option<Layout>,
+    word: Option<bytes::WordLayout>,
+    word_repr_checked: bool,
+    word_platform_checked: bool,
     bytes: Option<bytes::Layout>,
     write_bytes: Option<bytes::WriteLayout>,
     directory: Option<directory::Layout>,
@@ -255,7 +258,7 @@ impl Preparation<'_> {
                 let bytes = self.fs_bytes_layout()?;
                 (
                     vec![ValueType::Abi, ValueType::Abi],
-                    vec![layout.receiver.clone(), bytes.native_word],
+                    vec![layout.receiver.clone(), bytes.word.native],
                 )
             }
             Operation::Write => {
@@ -450,7 +453,7 @@ impl Preparation<'_> {
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
-                    vec![layout.receiver.clone(), bytes.word.source.clone()],
+                    vec![layout.receiver.clone(), bytes.word.logical.source.clone()],
                     vec![b(2)?, self.fs_native_read_count(b(1)?)?],
                 )
             }

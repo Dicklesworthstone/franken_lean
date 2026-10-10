@@ -10,6 +10,9 @@
 //! The readable layouts additionally document every logical/native boundary.
 use super::*;
 
+mod word;
+pub(crate) use word::word_matches;
+
 const DEPENDENCIES: &str = include_str!("bytes/dependencies.txt");
 const WRITE_DEPENDENCIES: &str = include_str!("bytes/write_dependencies.txt");
 pub(crate) const WRITE_HELPERS: [&str; 3] = [
@@ -140,8 +143,8 @@ pub(crate) fn contract_matches(
     limits: IngressLimits,
 ) -> Result<(), IngressError> {
     // The existing complete bound models bind Nat/LT/OfNat/power and the
-    // logical Fin/BitVec constructors. Read's outer gate also calls this, but
-    // the pure USize.ofNat adapter must establish the same data authority.
+    // logical Fin/BitVec constructors. This is the complete file-buffer
+    // contract; pure word conversions use their independent dependency gate.
     let mut models = stdout::result_models();
     models.extend(stdout::word_bound_models());
     models.extend(layouts());
@@ -182,23 +185,6 @@ pub(crate) fn contract_matches(
         }
     }
     Ok(())
-}
-
-pub(crate) fn word_matches(
-    environment: &Environment,
-    requested: &Name,
-    externs: &mut Option<fln_elab::externs::ExternTable>,
-    visited: &mut usize,
-    limits: IngressLimits,
-) -> Result<bool, IngressError> {
-    if ![name("USize.ofNat"), name("USize.toNat")].contains(requested) {
-        return Ok(false);
-    }
-    if !extern_attribute_matches(environment, requested, true, externs, visited, limits)? {
-        return Ok(false);
-    }
-    contract_matches(environment, externs, visited, limits)?;
-    Ok(true)
 }
 
 pub(crate) fn write_contract_matches(

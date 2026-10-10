@@ -105,6 +105,7 @@ impl Preparation<'_> {
         // Generic intrinsics compare their complete admitted models. File IO
         // uses a separate checked adapter, including the opaque declaration,
         // extern ownership, world/result models and binary conversion closure.
+        // Pure word adapters have their own exact data/dependency contract.
         // Recognizer errors remain refusals; none may fall back to an opaque
         // default or an ordinary body after a failed native contract.
         let native = executable_intrinsic_binding_cached(
@@ -123,7 +124,13 @@ impl Preparation<'_> {
                     &mut self.visited,
                     self.limits,
                 )?,
-                None => false,
+                None => source_intrinsics::io::fs::word_matches(
+                    self.environment,
+                    &target,
+                    &mut self.externs,
+                    &mut self.visited,
+                    self.limits,
+                )?,
             };
         if native {
             return Ok(Some(target));
