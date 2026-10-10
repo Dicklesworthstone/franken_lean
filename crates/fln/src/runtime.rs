@@ -26,6 +26,7 @@ mod specialize;
 mod st;
 mod stdout;
 mod string_bootstrap;
+mod string_from_list;
 mod string_push;
 mod transport;
 mod variants;
@@ -72,6 +73,7 @@ pub(super) struct Preparation<'a> {
     stdout: stdout::Store,
     string_bootstrap: string_bootstrap::Store,
     string_push: string_push::Store,
+    string_from_list: string_from_list::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -156,6 +158,7 @@ impl<'a> Preparation<'a> {
             stdout: stdout::Store::default(),
             string_bootstrap: string_bootstrap::Store::default(),
             string_push: string_push::Store::default(),
+            string_from_list: string_from_list::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
@@ -507,6 +510,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(value) = self.string_from_list_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(value) = self.string_push_call(&head, &args)? {
                             tasks.push(Task::Visit(value));
                             continue;
@@ -839,6 +846,10 @@ impl<'a> Preparation<'a> {
                             }
                             if let Some(action) = self.stdout_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
+                                continue;
+                            }
+                            if let Some(value) = self.string_from_list_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
                                 continue;
                             }
                             if let Some(value) = self.string_push_call(&expr, &[])? {

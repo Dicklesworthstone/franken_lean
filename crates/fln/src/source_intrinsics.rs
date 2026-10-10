@@ -13,6 +13,7 @@ mod nat_div_mod;
 pub(super) mod st;
 mod string_append;
 pub(super) mod string_bootstrap;
+pub(super) mod string_from_list;
 mod string_internal;
 mod string_length;
 pub(super) mod string_push;

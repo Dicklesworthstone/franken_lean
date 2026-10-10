@@ -89,6 +89,19 @@ pub(super) fn proposition_type(
     context: &[Expr],
 ) -> Result<bool, IngressError> {
     preparation.proof_context_depth(context.len())?;
+    if let ExprNode::Const { name, levels } = input.node()
+        && levels.is_empty()
+        && let Some(declaration) = preparation.environment.find(name)
+        && declaration.constant_val().level_params.is_empty()
+        && let ExprNode::Sort { level } = declaration.constant_val().type_.node()
+    {
+        // The admitted environment is immutable and already takes precedence
+        // over compiler-private definitions. This exact monomorphic statement
+        // needs no inference, unfolding, metadata stripping or registry cache.
+        let proposition = level == &Level::zero();
+        preparation.tick()?;
+        return Ok(proposition);
+    }
     if !specialize::closed(input) || matches!(input.node(), ExprNode::Sort { .. }) {
         // An open query must inspect its actual borrowed telescope. A Sort is
         // already classified in one visit and needs neither a key nor a row.

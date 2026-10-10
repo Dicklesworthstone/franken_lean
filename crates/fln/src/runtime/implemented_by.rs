@@ -131,7 +131,14 @@ impl Preparation<'_> {
                     &mut self.visited,
                     self.limits,
                 )?,
-            };
+            }
+            || source_intrinsics::string_from_list::contract_matches(
+                self.environment,
+                &target,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?;
         if native {
             return Ok(Some(target));
         }

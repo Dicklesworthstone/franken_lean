@@ -4,6 +4,10 @@ fn c(label: &str) -> Expr {
     Expr::const_(name(label), Vec::new())
 }
 
+fn metadata(value: Expr) -> Expr {
+    Expr::mdata(KVMap::new(), value)
+}
+
 fn b(index: u32) -> Expr {
     Expr::bvar(index).unwrap()
 }
@@ -33,6 +37,8 @@ fn engine() -> &'static Engine {
             .unwrap()
             .check_source_files(
                 &[br#"
+def queryMonomorphicType : Type := Nat
+def queryMonomorphicProposition : Prop := True
 def querySort (_ : Nat) : Type := Prop
 def queryPredicate : querySort 0 := True
 def queryFamily (A : Type) (_ : Nat) : Prop := True
@@ -72,8 +78,8 @@ fn completed_closed_sort_answers_reuse_exact_syntax_without_copying_contexts() {
     let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
     let context = vec![c("Nat"); 256];
     let cases = [
-        (c("Nat"), false),
-        (c("True"), true),
+        (metadata(c("Nat")), false),
+        (metadata(metadata(c("True"))), true),
         (equality(nat::literal(42)), true),
         (equality(nat::literal(7)), true),
         (pi(c("Nat"), equality(b(0))), true),
@@ -167,7 +173,7 @@ fn open_and_unknown_queries_never_borrow_another_scope_or_publish_a_false_answer
 fn completed_queries_recheck_after_canonical_declarations_and_private_shapes_grow() {
     let engine = engine();
     let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
-    let source = c("True");
+    let source = metadata(c("True"));
     assert!(preparation.proposition_type(&source, &[]).unwrap());
     assert_eq!(
         preparation.proposition_queries.entries[&(source.clone(), 0)]
@@ -338,5 +344,150 @@ fn descriptive_classification_survives_real_closure_layout_rollback() {
     let start = preparation.visited;
     assert!(preparation.proposition_type(&source, &[]).unwrap());
     assert_eq!(preparation.visited, start + 1);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn admitted_monomorphic_sorts_need_one_visit_and_no_context_copy_or_cache_row() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let context = vec![c("Nat"); 256];
+    let other_context = vec![c("String"); context.len()];
+    let limits = IngressLimits {
+        max_nodes: 1,
+        max_application_args: 0,
+        max_context_depth: context.len(),
+        ..IngressLimits::default()
+    };
+    for (source, expected) in [
+        (c("Nat"), false),
+        (c("Bool"), false),
+        (c("String"), false),
+        (c("True"), true),
+        (c("False"), true),
+        (c("queryMonomorphicType"), false),
+        (c("queryMonomorphicProposition"), true),
+    ] {
+        let mut preparation = Preparation::new(&engine.environment, limits);
+        assert_eq!(
+            preparation.proposition_type(&source, &context).unwrap(),
+            expected
+        );
+        assert_eq!(preparation.visited, 1);
+        assert!(preparation.proposition_queries.entries.is_empty());
+        // There is no completed row whose presence could bypass the next
+        // charged visit; the same immutable declaration remains retryable.
+        nodes_error(preparation.proposition_type(&source, &context), 1);
+        assert!(preparation.proposition_queries.entries.is_empty());
+        preparation.visited = 0;
+        assert_eq!(
+            preparation
+                .proposition_type(&source, &other_context)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(preparation.visited, 1);
+        preparation.visited = 0;
+        preparation.limits.max_nodes = 0;
+        nodes_error(preparation.proposition_type(&source, &context), 0);
+        assert!(preparation.proposition_queries.entries.is_empty());
+
+        preparation.visited = 0;
+        preparation.limits = limits;
+        preparation.limits.max_context_depth = context.len() - 1;
+        assert_eq!(
+            preparation.proposition_type(&source, &context),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::ContextDepth,
+                limit: context.len() - 1,
+                observed: context.len(),
+            })
+        );
+        assert_eq!(preparation.visited, 0);
+        assert!(preparation.proposition_queries.entries.is_empty());
+    }
+    assert_eq!(context, vec![c("Nat"); 256]);
+    assert_eq!(other_context, vec![c("String"); 256]);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn admitted_sort_shortcut_does_not_reinterpret_values_unknown_names_or_universe_arities() {
+    let engine = engine();
+    for source in [
+        c("Nat.zero"),
+        c("Bool.true"),
+        c("True.intro"),
+        c("Nat.add"),
+        c("queryFamily"),
+        c("unknownQueryType"),
+        c("PUnit"),
+        Expr::const_(name("True"), vec![Level::zero()]),
+        Expr::const_(name("PUnit"), vec![Level::zero(), Level::one()]),
+    ] {
+        let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+        assert!(!preparation.proposition_type(&source, &[]).unwrap());
+        assert!(preparation.visited > 1, "{source:?}");
+        assert!(preparation.proposition_queries.entries.is_empty());
+    }
+
+    // The very same polymorphic family inhabits Prop or Type after its
+    // actual universe substitution. Its raw Sort parameter is not a verdict.
+    let family = engine
+        .environment
+        .find(&name("PUnit"))
+        .unwrap()
+        .constant_val();
+    assert_eq!(family.level_params.len(), 1);
+    assert!(matches!(family.type_.node(), ExprNode::Sort { .. }));
+    for (level, expected) in [(Level::zero(), true), (Level::one(), false)] {
+        let source = Expr::const_(name("PUnit"), vec![level]);
+        let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+        assert_eq!(
+            preparation.proposition_type(&source, &[]).unwrap(),
+            expected
+        );
+        assert!(preparation.visited > 1);
+        assert_eq!(
+            preparation.proposition_queries.entries[&(source, 0)].proposition,
+            expected
+        );
+    }
+
+    // Metadata and a nonliteral declared type keep the ordinary inference
+    // path, including their completed memo rows and reduction refusals.
+    for source in [metadata(c("True")), c("queryPredicate")] {
+        let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+        assert!(preparation.proposition_type(&source, &[]).unwrap());
+        assert!(preparation.visited > 1);
+        assert!(preparation.proposition_queries.entries[&(source, 0)].proposition);
+    }
+}
+
+#[test]
+fn admitted_sort_statements_remain_independent_of_private_registry_growth_and_rollback() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let initial = Generation::current(&preparation);
+    preparation
+        .specialize_call(&c("queryFamily"), &[c("Nat")])
+        .unwrap()
+        .unwrap();
+    assert!(Generation::current(&preparation).definitions > initial.definitions);
+    let holder = Expr::app(c("QueryHolder"), c("Nat"));
+    assert!(preparation.record_shape(&holder).unwrap().is_some());
+    assert!(Generation::current(&preparation).shapes > initial.shapes);
+    assert_eq!(preparation.value_type(&c("QueryBad")).unwrap(), None);
+    let rows = preparation.proposition_queries.entries.len();
+    for (source, expected) in [(c("Nat"), false), (c("True"), true)] {
+        let start = preparation.visited;
+        assert_eq!(
+            preparation.proposition_type(&source, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(preparation.visited, start + 1);
+        assert_eq!(preparation.proposition_queries.entries.len(), rows);
+    }
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
