@@ -159,6 +159,94 @@ fn alpha_type(expr: &Expr) -> Expr {
 }
 
 #[test]
+fn admitted_string_quote_executes_escaping_callbacks_and_replays_native_bytecode() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let engine = &imported.engine;
+            let options = KVMap::new();
+            let original_root = engine.logical_root(&options);
+            // Init/Data/Repr.lean: String.quote composes the opaque empty test
+            // and fold with the ordinary Char.quoteCore body. Control bytes
+            // additionally exercise its checked Nat.div/mod and hexadecimal
+            // digit helpers; no printer-specific native shortcut is involved.
+            let source = r#"
+#eval String.quote ""
+#eval String.quote "λ😀é'"
+#eval String.quote "\n\t\"\\"
+#eval String.quote "\x00\x01\x1f\x7f"
+"#;
+            let expected = [
+                "\"\"",
+                "\"λ😀é'\"",
+                "\"\\n\\t\\\"\\\\\"",
+                "\"\\x00\\x01\\x1f\\x7f\"",
+            ];
+            let execute = || {
+                engine
+                    .execute_source_definitions(
+                        &[source.as_bytes()],
+                        &options,
+                        fln::EngineExecutionLimits::new(admission().kernel),
+                    )
+                    .expect("actual String.quote compiles within the default native ingress budget")
+                    .into_complete()
+                    .expect("actual String.quote executes its source callback natively")
+            };
+            let first = execute();
+            assert_eq!(first.executions.len(), expected.len());
+            let mut rows = std::collections::BTreeSet::new();
+            for (execution, expected) in first.executions.iter().zip(expected) {
+                let expected = Some(fln::ClosedVmValue::String(expected.to_owned()));
+                assert_eq!(
+                    execution.checker.ground,
+                    fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                );
+                assert_eq!(fln::closed_vm_value(&execution.exit).unwrap(), expected);
+                let decoded =
+                    fln_comp::flbc::decode_canonical(&execution.flbc_artifact, Default::default())
+                        .unwrap();
+                assert_eq!(
+                    fln_comp::flbc::encode_canonical(&decoded, Default::default()).unwrap(),
+                    execution.flbc_artifact
+                );
+                for instruction in decoded
+                    .functions()
+                    .iter()
+                    .flat_map(|function| &function.code)
+                {
+                    if let fln_comp::flbc::Instruction::Intrinsic { row, .. } = instruction {
+                        rows.insert(row.clone());
+                    }
+                }
+                let replay = fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &options,
+                    Default::default(),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("canonical quoted-string bytecode executes independently of source state");
+                assert_eq!(fln::closed_vm_value(&replay).unwrap(), expected);
+            }
+            for operation in ["foldl", "isEmpty", "append"] {
+                assert!(rows.contains(&format!("extern:String.Internal.{operation}")));
+            }
+            let repeated = execute();
+            for (first, repeated) in first.executions.iter().zip(&repeated.executions) {
+                assert_eq!(first.flbc_artifact, repeated.flbc_artifact);
+            }
+            assert_eq!(engine.logical_root(&options), original_root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn repr_helpers_are_checked_and_match_reference_statements_and_module_replay() {
     std::thread::Builder::new()
         .stack_size(STACK)

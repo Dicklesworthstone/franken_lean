@@ -5,6 +5,7 @@
 //! beta reduction introduces strict lets: it never duplicates or drops an
 //! action. Both the original theorem checking and FIR validation remain intact.
 mod arguments;
+mod heads;
 mod imported_lists;
 mod imported_nat;
 mod pure;
@@ -29,6 +30,7 @@ pub(super) struct Store {
     definitions: BTreeMap<Name, DefinitionVal>,
     normalized_definitions: HashMap<Name, NormalizedDefinition>,
     pure: pure::Store,
+    heads: heads::Store,
     factory_values: HashMap<Expr, Expr>,
     pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
     instances: HashMap<arguments::InstanceKey, Name>,
@@ -178,6 +180,10 @@ impl Preparation<'_> {
     }
 
     pub(super) fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
+        heads::type_head(self, source)
+    }
+
+    fn reduce_type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
         // A projection whose receiver unfolds to its family's constructor
         // selects that field, as definitional unfolding does (a boxed slot's
         // type `p.carrier` names a concrete type). Pending projections are
