@@ -4269,11 +4269,11 @@ fn typed_local_core_closures_execute_nat_and_string_captures_with_balanced_owner
     shadow::enable();
     let nat = returned(execute(&nat_program, ExecutionLimits::default(), None));
     assert_eq!(nat.value.unbox(), 42);
-    assert_eq!(nat.usage.peak_stack_depth, 2);
+    assert_eq!(nat.usage.peak_stack_depth, 1);
     drop(nat);
     let string = returned(execute(&string_program, ExecutionLimits::default(), None));
     assert_eq!(string_contents(&string.value), "core-golem");
-    assert_eq!(string.usage.peak_stack_depth, 2);
+    assert_eq!(string.usage.peak_stack_depth, 1);
     drop(string);
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "local closure execution releases every ABI object");
@@ -4758,7 +4758,9 @@ fn typed_core_partial_and_overapplication_execute_on_golem_and_marrow() {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                Instruction::Apply { args, .. } => Some(args.len()),
+                Instruction::Apply { args, .. } | Instruction::TailApply { args, .. } => {
+                    Some(args.len())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5042,11 +5044,11 @@ fn self_recursive_core_closures_return_acyclic_environments_and_stop_typed() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected recursive depth exhaustion, got {other:?}"),
+            other => panic!("expected recursive execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected recursive Inconclusive, got {other:?}"),
     }
@@ -5267,11 +5269,11 @@ fn mutual_recursive_core_closures_return_peers_and_stop_typed_without_cycles() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected mutual recursion depth exhaustion, got {other:?}"),
+            other => panic!("expected mutual recursion execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected mutual recursion Inconclusive, got {other:?}"),
     }

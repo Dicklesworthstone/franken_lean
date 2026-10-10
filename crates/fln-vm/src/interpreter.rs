@@ -1757,6 +1757,23 @@ impl fmt::Display for StepLocation {
     }
 }
 
+/// Keep checkpoint context borrowed until a stop actually needs its text.
+#[derive(Clone, Copy)]
+struct CheckSystemLocation<'a> {
+    step: StepLocation,
+    module_name: &'a str,
+}
+
+impl fmt::Display for CheckSystemLocation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} Lean.Core.checkSystem module {}",
+            self.step, self.module_name
+        )
+    }
+}
+
 struct Frame {
     function: FunctionId,
     pc: usize,
@@ -2095,7 +2112,7 @@ fn run(
                 ),
             ))
         })?;
-        let instruction = function.code.get(frame.pc).cloned().ok_or_else(|| {
+        let instruction = function.code.get(frame.pc).ok_or_else(|| {
             Stop::InternalFault(InternalFault::new(
                 "FLBC-VALIDATED-PC",
                 format!(
@@ -2105,8 +2122,12 @@ fn run(
                 ),
             ))
         })?;
+        let pending_return;
         let instruction = match frame.pending_tail_return {
-            Some(src) => Instruction::Return { src },
+            Some(src) => {
+                pending_return = Instruction::Return { src };
+                &pending_return
+            }
             None => instruction,
         };
         let cache_site = CacheSite {
@@ -2119,7 +2140,7 @@ fn run(
         };
 
         let dynamic_check_system_module =
-            if let Instruction::CheckSystemValue { module_name } = &instruction {
+            if let Instruction::CheckSystemValue { module_name } = instruction {
                 Some(string_value(
                     register(frame, *module_name)?,
                     "Lean.Core.checkSystem",
@@ -2128,27 +2149,32 @@ fn run(
             } else {
                 None
             };
-        let check_system_location = match (&instruction, &dynamic_check_system_module) {
-            (Instruction::CheckSystem { module_name }, _) => Some(format!(
-                "{location} Lean.Core.checkSystem module {module_name}"
-            )),
-            (Instruction::CheckSystemValue { .. }, Some(Ok(module_name))) => Some(format!(
-                "{location} Lean.Core.checkSystem module {module_name}"
-            )),
+        let check_system_location = match (instruction, &dynamic_check_system_module) {
+            (Instruction::CheckSystem { module_name }, _)
+            | (Instruction::CheckSystemValue { .. }, Some(Ok(module_name))) => {
+                Some(CheckSystemLocation {
+                    step: location,
+                    module_name,
+                })
+            }
             _ => None,
         };
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             let poll_location = check_system_location
-                .clone()
+                .map(|context| context.to_string())
                 .unwrap_or_else(|| location.to_string());
             return Err(Stop::Inconclusive(
                 Inconclusive::cancelled(&poll_location).with_progress(&poll_location),
             ));
         }
-        if let Some(check_location) = check_system_location.as_deref()
+        if let Some(check_location) = check_system_location
             && let Some((consumed, limit)) = heartbeat_context.exhaustion()
         {
-            return Err(heartbeat_exhausted(consumed, limit, check_location));
+            return Err(heartbeat_exhausted(
+                consumed,
+                limit,
+                &check_location.to_string(),
+            ));
         }
         let observed_steps = steps.checked_add(1).ok_or_else(|| {
             Stop::InternalFault(InternalFault::new(
@@ -2167,8 +2193,11 @@ fn run(
 
         // Share all argument/closure checks with ordinary calls. Only the
         // final dispatch differs; no tail form may bypass a checked contract.
-        let (instruction, tail) = tail_calls::ordinary_call(instruction);
-        match instruction {
+        let tail = matches!(
+            instruction,
+            Instruction::TailCall { .. } | Instruction::TailApply { .. }
+        );
+        match *instruction {
             Instruction::Nat { dst, value } => {
                 let value = usize::try_from(value).map_err(|_| {
                     Stop::InternalFault(InternalFault::new(
@@ -2179,7 +2208,7 @@ fn run(
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_nat(value))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::NatBig { dst, limbs_le } => {
+            Instruction::NatBig { dst, ref limbs_le } => {
                 let observed = u64::try_from(limbs_le.len())
                     .unwrap_or(u64::MAX)
                     .saturating_mul(8);
@@ -2198,12 +2227,12 @@ fn run(
                 set_register(
                     current_frame_mut(&mut stack)?,
                     dst,
-                    Obj::mk_mpz(&limbs_le, false),
+                    Obj::mk_mpz(limbs_le, false),
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::String { dst, value } => {
-                set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_string(&value))?;
+            Instruction::String { dst, ref value } => {
+                set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_string(value))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Copy { dst, src } => {
@@ -2225,14 +2254,14 @@ fn run(
             Instruction::Ctor {
                 dst,
                 tag,
-                fields,
-                scalar_bytes,
+                ref fields,
+                ref scalar_bytes,
             } => {
                 let values = clone_registers(current_frame(&stack)?, fields.iter().copied())?;
                 set_register(
                     current_frame_mut(&mut stack)?,
                     dst,
-                    Obj::mk_ctor(tag, values, &scalar_bytes),
+                    Obj::mk_ctor(tag, values, scalar_bytes),
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
@@ -2317,43 +2346,41 @@ fn run(
                 set_register(current_frame_mut(&mut stack)?, dst, projected)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::Array { dst, items } => {
+            Instruction::Array { dst, ref items } => {
                 let values = clone_registers(current_frame(&stack)?, items.iter().copied())?;
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_array(values))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Intrinsic {
                 dst,
-                row,
-                args,
-                argument_ownership,
+                ref row,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
                 let cached_plan = inline_caches.as_deref_mut().and_then(|caches| {
-                    caches.intrinsic_hit(cache_site, &row, &argument_ownership, result_ownership)
+                    caches.intrinsic_hit(cache_site, row, argument_ownership, result_ownership)
                 });
                 let plan = match cached_plan {
                     Some(plan) => plan,
                     None => {
-                        let plan = match resolve_intrinsic_plan(
-                            &row,
-                            &argument_ownership,
-                            result_ownership,
-                        ) {
-                            Ok(plan) => plan,
-                            Err(refusal) => {
-                                return Ok(VmExit::Refused {
-                                    refusal,
-                                    usage: usage(steps, peak_stack_depth),
-                                });
-                            }
-                        };
+                        let plan =
+                            match resolve_intrinsic_plan(row, argument_ownership, result_ownership)
+                            {
+                                Ok(plan) => plan,
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            };
                         if let Some(caches) = inline_caches.as_deref_mut() {
                             caches.record_intrinsic(
                                 IntrinsicCacheKey::new(
                                     cache_site,
                                     plan.row,
-                                    &argument_ownership,
+                                    argument_ownership,
                                     result_ownership,
                                 ),
                                 plan,
@@ -2364,8 +2391,8 @@ fn run(
                 };
                 let values = transfer_intrinsic_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 if plan.implementation == IntrinsicImplementation::ThunkGet {
                     let thunk = match delayed_thunk_operand(values) {
@@ -2586,19 +2613,31 @@ fn run(
                 }
             }
             Instruction::Call {
-                dst,
                 function,
-                args,
-                argument_ownership,
+                ref args,
+                ref argument_ownership,
+                result_ownership,
+                ..
+            }
+            | Instruction::TailCall {
+                function,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
+                let dst = if let Instruction::Call { dst, .. } = *instruction {
+                    dst
+                } else {
+                    // Never read or written: an exact tail call has no destination.
+                    Register::new(0)
+                };
                 let callee = program.function(function).ok_or_else(|| {
                     Stop::InternalFault(InternalFault::new(
                         "FLBC-VALIDATED-TARGET",
                         format!("validated call target {} disappeared", function.get()),
                     ))
                 })?;
-                if callee.parameter_ownership != argument_ownership {
+                if callee.parameter_ownership.as_slice() != argument_ownership.as_slice() {
                     return Err(Stop::InternalFault(InternalFault::new(
                         "FLBC-CALL-OWNERSHIP",
                         format!(
@@ -2619,8 +2658,8 @@ fn run(
                 }
                 let values = transfer_call_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 if tail {
                     tail_calls::replace_frame(program, &mut stack, function, values)?;
@@ -2641,8 +2680,8 @@ fn run(
             Instruction::Closure {
                 dst,
                 function,
-                captures,
-                capture_ownership,
+                ref captures,
+                ref capture_ownership,
             } => {
                 let callee = program.function(function).ok_or_else(|| {
                     Stop::InternalFault(InternalFault::new(
@@ -2656,7 +2695,7 @@ fn run(
                         "validated closure capture count exceeds the target parameter contract",
                     )));
                 };
-                if expected != capture_ownership {
+                if expected != capture_ownership.as_slice() {
                     return Err(Stop::InternalFault(InternalFault::new(
                         "FLBC-CLOSURE-OWNERSHIP",
                         format!(
@@ -2673,20 +2712,33 @@ fn run(
                 }
                 let captures = transfer_closure_captures(
                     current_frame_mut(&mut stack)?,
-                    &captures,
-                    &capture_ownership,
+                    captures,
+                    capture_ownership,
                 )?;
                 let closure = make_golem_closure(program, function, captures)?;
                 set_register(current_frame_mut(&mut stack)?, dst, closure)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Apply {
-                dst,
                 closure,
-                args,
-                argument_ownership,
+                ref args,
+                ref argument_ownership,
+                result_ownership,
+                ..
+            }
+            | Instruction::TailApply {
+                closure,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
+                let dst = if let Instruction::Apply { dst, .. } = *instruction {
+                    dst
+                } else {
+                    // Non-exact applications reuse the already validated closure
+                    // slot after all original operands have been transferred.
+                    closure
+                };
                 let closure = clone_register(current_frame(&stack)?, closure)?;
                 // Native callbacks never enter the Golem function-id cache.
                 // The public source Stream contains Golem wrappers; only a
@@ -2695,7 +2747,7 @@ fn run(
                 if reading || closure.is_stdio_put_str_closure() {
                     if let Err(refusal) = validate_stdio_apply(
                         args.len(),
-                        &argument_ownership,
+                        argument_ownership,
                         result_ownership,
                         reading,
                     ) {
@@ -2706,8 +2758,8 @@ fn run(
                     }
                     let args = transfer_apply_arguments(
                         current_frame_mut(&mut stack)?,
-                        &args,
-                        &argument_ownership,
+                        args,
+                        argument_ownership,
                     )?;
                     let value = match execute_stdio_apply(&closure, &args, reading) {
                         Ok(value) => value,
@@ -2728,7 +2780,7 @@ fn run(
                     program,
                     &closure,
                     args.len(),
-                    &argument_ownership,
+                    argument_ownership,
                     result_ownership,
                     cache_site,
                     inline_caches.as_deref_mut(),
@@ -2743,8 +2795,8 @@ fn run(
                 };
                 let args = transfer_apply_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 match finish_apply(plan, args, Some(argument_ownership)) {
                     PreparedApply::Partial { function, captures } => {
@@ -2794,12 +2846,6 @@ fn run(
                         peak_stack_depth = peak_stack_depth.max(next_depth);
                     }
                 }
-            }
-            Instruction::TailCall { .. } | Instruction::TailApply { .. } => {
-                return Err(Stop::InternalFault(InternalFault::new(
-                    "FLBC-TAIL-DISPATCH",
-                    "tail instruction was not normalized for checked dispatch",
-                )));
             }
             Instruction::Jump { target } => {
                 current_frame_mut(&mut stack)?.pc =
@@ -3255,7 +3301,7 @@ fn prepare_internal_apply_many(
         Some(&argument_ownership),
         None,
     )?;
-    Ok(finish_apply(plan, arguments, Some(argument_ownership)))
+    Ok(finish_apply(plan, arguments, Some(&argument_ownership)))
 }
 
 fn prepare_owned_apply(
@@ -3272,7 +3318,7 @@ fn prepare_owned_apply(
         Some(&argument_ownership),
         Some(result_ownership),
     )?;
-    Ok(finish_apply(plan, args, Some(argument_ownership)))
+    Ok(finish_apply(plan, args, Some(&argument_ownership)))
 }
 
 fn plan_apply(
@@ -3456,7 +3502,7 @@ fn validate_inspected_apply(
 fn finish_apply(
     plan: ApplyPlan,
     args: Vec<Obj>,
-    argument_ownership: Option<Vec<ArgumentOwnership>>,
+    argument_ownership: Option<&[ArgumentOwnership]>,
 ) -> PreparedApply {
     let ApplyPlan {
         function,
@@ -3471,7 +3517,7 @@ fn finish_apply(
     let mut args = args.into_iter();
     captures.extend(args.by_ref().take(required));
     let remainder_ownership = argument_ownership
-        .map(|ownership| ownership.into_iter().skip(required).collect())
+        .map(|ownership| ownership.iter().copied().skip(required).collect())
         .unwrap_or_default();
     PreparedApply::Call {
         function,
