@@ -1954,13 +1954,15 @@ fn frontier_guarded(
 /// What an unwind out of a module check means: the host refused an allocation,
 /// or one of our invariants broke. A panic is never a verdict.
 fn frontier_unwound(payload: Box<dyn std::any::Any + Send>) -> OleanCheckError {
+    olean_unwound(payload, "a frontier module check panicked")
+}
+
+fn olean_unwound(payload: Box<dyn std::any::Any + Send>, detail: &'static str) -> OleanCheckError {
     match payload.downcast::<HostAllocationFailure>() {
         Ok(failure) => OleanCheckError::HostMemory {
             requested: failure.requested,
         },
-        Err(_) => OleanCheckError::InternalInvariant {
-            detail: "a frontier module check panicked",
-        },
+        Err(_) => OleanCheckError::InternalInvariant { detail },
     }
 }
 
@@ -1994,6 +1996,11 @@ pub struct OleanFrontierRow {
     /// other module check in flight, under the original limits. No more than one
     /// retry is made, and neither attempt is an additional module row.
     pub memory_retry: Option<OleanFrontierMemoryRetry>,
+    /// An initial parallel decode refused host memory and was repeated once
+    /// after every decoder worker exited. A successful decode is only input to
+    /// the council: its result here does not imply this row was accepted.
+    /// Decode times are separate from the checking time in `elapsed`.
+    pub decode_memory_retry: Option<OleanDecodeMemoryRetry>,
 }
 
 /// The first attempt of a module checked again in isolation. Its final attempt
@@ -2002,6 +2009,19 @@ pub struct OleanFrontierRow {
 pub struct OleanFrontierMemoryRetry {
     pub first_refusal: Inconclusive,
     pub first_elapsed: std::time::Duration,
+}
+
+/// Both attempts of an initial decode retried without another decoder running.
+/// The same bytes and limits are used again; successfully decoded sibling
+/// artifacts remain available for import planning.
+#[derive(Debug)]
+pub struct OleanDecodeMemoryRetry {
+    pub first_error: OleanCheckError,
+    pub first_elapsed: std::time::Duration,
+    pub retry_elapsed: std::time::Duration,
+    /// `Ok(())` means the artifact decoded. Declarations still need the ordinary
+    /// K1 and independent-checker judgments before they can be admitted.
+    pub retry_result: Result<(), OleanCheckError>,
 }
 
 /// What a frontier observer is told: `Started` just before a module's
@@ -3241,67 +3261,228 @@ fn decode_olean_module_input(
     decode_olean_module_input_with(module, limits, CheckerReading::Read)
 }
 
-/// Decode every module of a set, `jobs.threads` at once, each result at its
-/// module's index.
+struct OleanModuleDecode {
+    result: Result<DecodedOlean, OleanCheckError>,
+    memory_retry: Option<OleanDecodeMemoryRetry>,
+}
+
+struct TimedOleanDecode {
+    result: Result<DecodedOlean, OleanCheckError>,
+    elapsed: std::time::Duration,
+}
+
+fn guarded_olean_decode(
+    decode: impl FnOnce() -> Result<DecodedOlean, OleanCheckError>,
+) -> TimedOleanDecode {
+    let started = std::time::Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
+        .unwrap_or_else(|payload| Err(olean_unwound(payload, "an .olean module decode panicked")));
+    TimedOleanDecode {
+        result,
+        elapsed: started.elapsed(),
+    }
+}
+
+/// Decode every module of a set, initially `jobs.threads` at once, each result
+/// at its module's input index. The first host-memory refusal closes parallel
+/// dispatch. After those workers exit, retry each memory-refused decode that
+/// overlapped another once, then decode any unstarted modules one at a time.
 ///
-/// A module's decode reads only its own parts, so the results do not depend on the
-/// thread count or on which worker took which module; only the wall time does. The
-/// outer `Err` is a failure to start a worker, never a property of an artifact.
+/// This ends the parallel workers and releases transient decoding state.
+/// Successful sibling artifacts remain, so it does not promise the memory
+/// footprint of a fresh serial run. Explicit budgets and artifact errors are
+/// never retried. The outer `Err` denotes orchestration failure; module errors
+/// stay at their input index.
 fn decode_olean_module_inputs(
     modules: &[OleanModuleInput<'_>],
     limits: OleanCheckLimits,
     reading: CheckerReading,
     jobs: OleanFrontierJobs,
-) -> Result<Vec<Result<DecodedOlean, OleanCheckError>>, OleanCheckError> {
-    let threads = jobs.threads.get().min(modules.len());
+) -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+    decode_olean_module_inputs_using(modules.len(), jobs, &|index| {
+        decode_olean_module_input_with(&modules[index], limits, reading)
+    })
+}
+
+/// Keep fault injection at the decoder boundary, so tests exercise the same
+/// dispatch, unwinding, retry and collection paths as real artifact reads.
+fn decode_olean_module_inputs_using(
+    count: usize,
+    jobs: OleanFrontierJobs,
+    decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
+) -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+    let allocation = |_| OleanCheckError::AllocationFailure {
+        resource: ".olean decoder work records",
+        requested: count,
+    };
+    let mut results = Vec::new();
+    results.try_reserve_exact(count).map_err(allocation)?;
+    let threads = jobs.threads.get().min(count);
     if threads <= 1 {
-        return Ok(modules
-            .iter()
-            .map(|module| decode_olean_module_input_with(module, limits, reading))
-            .collect());
+        for index in 0..count {
+            results.push(OleanModuleDecode {
+                result: guarded_olean_decode(|| decode(index)).result,
+                memory_retry: None,
+            });
+        }
+        return Ok(results);
     }
     /// The decoder is iterative; this only has to hold its ordinary frames.
     const MIN_DECODE_STACK_BYTES: usize = 8 << 20;
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<DecodedOlean, OleanCheckError>>>> = modules
-        .iter()
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
+    let stack_bytes = jobs.worker_stack_bytes.max(MIN_DECODE_STACK_BYTES);
+    struct Dispatch {
+        next: usize,
+        running: Vec<usize>,
+        overlapped: Vec<bool>,
+        completed: Vec<Option<TimedOleanDecode>>,
+        memory_refused: bool,
+    }
+    let mut running = Vec::new();
+    running.try_reserve_exact(threads).map_err(allocation)?;
+    let mut overlapped = Vec::new();
+    overlapped.try_reserve_exact(count).map_err(allocation)?;
+    overlapped.resize(count, false);
+    let mut completed = Vec::new();
+    completed.try_reserve_exact(count).map_err(allocation)?;
+    completed.resize_with(count, || None);
+    let dispatch = std::sync::Mutex::new(Dispatch {
+        next: 0,
+        running,
+        overlapped,
+        completed,
+        memory_refused: false,
+    });
+    let lock_failure = |_| OleanCheckError::InternalInvariant {
+        detail: "the .olean decode dispatcher was poisoned",
+    };
     std::thread::scope(|scope| -> Result<(), OleanCheckError> {
+        let mut workers = Vec::new();
+        workers.try_reserve_exact(threads).map_err(allocation)?;
         for worker in 0..threads {
-            let (next, slots) = (&next, &slots);
-            std::thread::Builder::new()
-                .name(format!("fln-olean-decode-{worker}"))
-                .stack_size(jobs.worker_stack_bytes.max(MIN_DECODE_STACK_BYTES))
-                .spawn_scoped(scope, move || {
-                    loop {
-                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(module) = modules.get(index) else {
-                            return;
-                        };
-                        let result = decode_olean_module_input_with(module, limits, reading);
-                        if let Ok(mut slot) = slots[index].lock() {
-                            *slot = Some(result);
+            let dispatch = &dispatch;
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("fln-olean-decode-{worker}"))
+                    .stack_size(stack_bytes)
+                    .spawn_scoped(scope, move || -> Result<(), OleanCheckError> {
+                        loop {
+                            let index = {
+                                let mut state = dispatch.lock().map_err(lock_failure)?;
+                                if state.memory_refused || state.next == count {
+                                    return Ok(());
+                                }
+                                let index = state.next;
+                                state.next += 1;
+                                if !state.running.is_empty() {
+                                    state.overlapped[index] = true;
+                                    // The earlier worker overlaps too, even if it
+                                    // was alone when it first claimed its module.
+                                    for at in 0..state.running.len() {
+                                        let other = state.running[at];
+                                        state.overlapped[other] = true;
+                                    }
+                                }
+                                state.running.push(index);
+                                index
+                            };
+                            let attempt = guarded_olean_decode(|| decode(index));
+                            let mut state = dispatch.lock().map_err(lock_failure)?;
+                            if attempt
+                                .result
+                                .as_ref()
+                                .is_err_and(olean_host_memory_refusal)
+                            {
+                                // Claim and stop share this lock: no fresh job can
+                                // slip into the parallel pool after this refusal.
+                                state.memory_refused = true;
+                            }
+                            let at = state
+                                .running
+                                .iter()
+                                .position(|active| *active == index)
+                                .ok_or(OleanCheckError::InternalInvariant {
+                                    detail: "a finished .olean decode was not running",
+                                })?;
+                            state.running.swap_remove(at);
+                            state.completed[index] = Some(attempt);
                         }
-                    }
-                })
-                .map_err(|_| OleanCheckError::InternalInvariant {
-                    detail: "could not start an .olean decode worker thread",
-                })?;
+                    })
+                    .map_err(|_| OleanCheckError::InternalInvariant {
+                        detail: "could not start an .olean decode worker thread",
+                    })?,
+            );
+        }
+        for worker in workers {
+            worker.join().map_err(|payload| {
+                olean_unwound(payload, "an .olean decode dispatcher worker panicked")
+            })??;
         }
         Ok(())
     })?;
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .ok()
-                .flatten()
-                .ok_or(OleanCheckError::InternalInvariant {
-                    detail: "an .olean decode worker left a module undecoded",
+    let mut state = dispatch
+        .into_inner()
+        .map_err(|_| OleanCheckError::InternalInvariant {
+            detail: "the .olean decode dispatcher was poisoned",
+        })?;
+    let needs_isolation = state.next < count
+        || state.completed.iter().enumerate().any(|(index, attempt)| {
+            state.overlapped[index]
+                && attempt.as_ref().is_some_and(|attempt| {
+                    attempt
+                        .result
+                        .as_ref()
+                        .is_err_and(olean_host_memory_refusal)
                 })
-        })
-        .collect()
+        });
+    let finish = move || -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+        for index in 0..count {
+            let first = match state.completed[index].take() {
+                Some(first) => first,
+                None if index >= state.next => guarded_olean_decode(|| decode(index)),
+                None => {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "an .olean decode worker left a claimed module undecoded",
+                    });
+                }
+            };
+            let (result, memory_retry) = match first.result {
+                Err(error) if state.overlapped[index] && olean_host_memory_refusal(&error) => {
+                    let retry = guarded_olean_decode(|| decode(index));
+                    let memory_retry = OleanDecodeMemoryRetry {
+                        first_error: error,
+                        first_elapsed: first.elapsed,
+                        retry_elapsed: retry.elapsed,
+                        retry_result: retry.result.as_ref().map(|_| ()).map_err(Clone::clone),
+                    };
+                    (retry.result, Some(memory_retry))
+                }
+                result => (result, None),
+            };
+            results.push(OleanModuleDecode {
+                result,
+                memory_retry,
+            });
+        }
+        Ok(results)
+    };
+    if !needs_isolation {
+        return finish();
+    }
+    // The whole first pool has joined. Retrying on one new worker preserves the
+    // original decoder stack allowance; the host may cache exited thread stacks.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("fln-olean-decode-isolated".to_owned())
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, finish)
+            .map_err(|_| OleanCheckError::InternalInvariant {
+                detail: "could not start an isolated .olean decode worker thread",
+            })?
+            .join()
+            .map_err(|payload| {
+                olean_unwound(payload, "an isolated .olean decode worker panicked")
+            })?
+    })
 }
 
 fn decode_olean_module_input_with(
@@ -4671,8 +4852,11 @@ impl Engine {
     /// once after those workers finish, under the same limits. Only that retry's
     /// verdict is settled; both attempts remain in its row. The retry does not
     /// raise budgets or assume any declaration. Other resource stops are final.
-    /// This does not bound unrelated host memory use or retry the initial parallel
-    /// decoding pass; it is not a claim of resource-independent verdicts.
+    /// The initial decode pass follows the same once-only retry rule, stops
+    /// parallel dispatch at the first host-memory refusal and completes unstarted
+    /// decodes serially. Its attempts are recorded separately from the council's.
+    /// Retained artifacts and unrelated host memory remain; this is not a claim
+    /// of resource-independent verdicts.
     /// `Decided` events arrive in row order; `Started` and `Retrying` events arrive
     /// as modules are dispatched, which above one thread is not row order.
     pub fn check_olean_frontier_scheduled(
@@ -4683,14 +4867,19 @@ impl Engine {
         jobs: OleanFrontierJobs,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
     ) -> Result<OleanFrontier, OleanCheckError> {
-        self.check_olean_frontier_using(modules, limits, jobs, on_event, &|job| {
-            self.frontier_check_module(job, options, limits)
-        })
+        self.check_olean_frontier_using(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            &|job| self.frontier_check_module(job, options, limits),
+            &|index| decode_olean_module_input_with(&modules[index], limits, CheckerReading::Read),
+        )
     }
 
-    /// The scheduler's checking operation is private so its fault tests can
-    /// refuse a real job at the worker boundary without installing a global
-    /// allocator or changing any successful declaration-admission path.
+    /// The scheduler's decoding and checking operations are private so fault
+    /// tests can refuse a real job at its worker boundary without installing a
+    /// global allocator or changing any successful declaration-admission path.
     fn check_olean_frontier_using(
         &self,
         modules: &[OleanModuleInput<'_>],
@@ -4698,12 +4887,23 @@ impl Engine {
         jobs: OleanFrontierJobs,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         check: &(dyn Fn(FrontierJob) -> FrontierDone + Sync),
+        decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
     ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
+        let mut decode_memory_retries = Vec::new();
+        decode_memory_retries
+            .try_reserve_exact(modules.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean decode retry records",
+                requested: modules.len(),
+            })?;
         let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> =
-            decode_olean_module_inputs(modules, limits, CheckerReading::Read, jobs)?
+            decode_olean_module_inputs_using(modules.len(), jobs, decode)?
                 .into_iter()
-                .map(Some)
+                .map(|entry| {
+                    decode_memory_retries.push(entry.memory_retry);
+                    Some(entry.result)
+                })
                 .collect();
 
         let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); modules.len()];
@@ -4900,28 +5100,31 @@ impl Engine {
                         });
                     }
                 };
-            let record = |done: FrontierDone,
-                          running: &mut Vec<bool>,
-                          decided: &mut Vec<bool>,
-                          accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
-                          engines: &mut FrontierEngines,
-                          pending_rows: &mut Vec<Option<OleanFrontierRow>>,
-                          memory_retry: Option<OleanFrontierMemoryRetry>| {
-                running[done.index] = false;
-                decided[done.index] = true;
-                accepted[done.index] = done.accepted.map(std::sync::Arc::new);
-                engines.keep(done.index, done.engine);
-                pending_rows[done.index] = Some(OleanFrontierRow {
-                    name: modules[done.index].name.clone(),
-                    verdict: done.verdict,
-                    elapsed: done.elapsed.saturating_add(
-                        memory_retry
-                            .as_ref()
-                            .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
-                    ),
-                    memory_retry,
-                });
-            };
+            let record =
+                |done: FrontierDone,
+                 running: &mut Vec<bool>,
+                 decided: &mut Vec<bool>,
+                 accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                 engines: &mut FrontierEngines,
+                 pending_rows: &mut Vec<Option<OleanFrontierRow>>,
+                 memory_retry: Option<OleanFrontierMemoryRetry>,
+                 decode_memory_retry: Option<OleanDecodeMemoryRetry>| {
+                    running[done.index] = false;
+                    decided[done.index] = true;
+                    accepted[done.index] = done.accepted.map(std::sync::Arc::new);
+                    engines.keep(done.index, done.engine);
+                    pending_rows[done.index] = Some(OleanFrontierRow {
+                        name: modules[done.index].name.clone(),
+                        verdict: done.verdict,
+                        elapsed: done.elapsed.saturating_add(
+                            memory_retry
+                                .as_ref()
+                                .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
+                        ),
+                        memory_retry,
+                        decode_memory_retry,
+                    });
+                };
             loop {
                 // Decide every module that needs no council, and collect the ready.
                 let mut ready = Vec::new();
@@ -4972,6 +5175,7 @@ impl Engine {
                         verdict,
                         elapsed: std::time::Duration::ZERO,
                         memory_retry: None,
+                        decode_memory_retry: decode_memory_retries[index].take(),
                     });
                     on_event(OleanFrontierEvent::Settled {
                         position: position[index] + 1,
@@ -5093,6 +5297,7 @@ impl Engine {
                             &mut engines,
                             &mut pending_rows,
                             None,
+                            decode_memory_retries[index].take(),
                         );
                         settle(index, &pending_rows, on_event);
                         break;
@@ -5168,6 +5373,7 @@ impl Engine {
                     &mut engines,
                     &mut pending_rows,
                     memory_retries[index].take(),
+                    decode_memory_retries[index].take(),
                 );
                 settle(index, &pending_rows, on_event);
             }
@@ -5792,7 +5998,7 @@ impl Engine {
             .iter()
             .zip(decode_olean_module_inputs(modules, limits, reading, jobs)?)
         {
-            decoded.push(Some((module.name.clone(), artifact?)));
+            decoded.push(Some((module.name.clone(), artifact.result?)));
         }
 
         // The per-module companion guard (see `decode_olean_module_artifacts`)
@@ -14185,6 +14391,13 @@ mod tests {
                     }
                     engine.frontier_check_module(job, &options, limits)
                 },
+                &|index| {
+                    super::decode_olean_module_input_with(
+                        &inputs[index],
+                        limits,
+                        super::CheckerReading::Read,
+                    )
+                },
             )
             .expect("a memory refusal is a module result, not a scheduler failure");
         assert_eq!(
@@ -14374,6 +14587,419 @@ mod tests {
         for error in other_errors {
             assert!(!super::olean_host_memory_refusal(&error), "{error:?}");
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DecodeRetryControl {
+        Accept,
+        RefuseAgain,
+        InvalidProof,
+        MalformedArtifact,
+        FirstBudget,
+        FirstPanic,
+        RetryPanic,
+    }
+
+    /// Real bytes, both readers, import planning and the full council. Only
+    /// worker-boundary failures are planted; no decoded value is substituted.
+    fn run_initial_decode_memory_retry(control: DecodeRetryControl) {
+        use super::{OleanFrontierEvent, OleanModuleVerdict};
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        let mut set = vec![
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[fixture_theorem(
+                    "Fixture.h",
+                    if matches!(control, DecodeRetryControl::InvalidProof) {
+                        Expr::sort(Level::zero())
+                    } else {
+                        fixture_constant("Fixture.p")
+                    },
+                )],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[fixture_theorem("Fixture.q", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.D",
+                &[fixture_theorem(
+                    "Fixture.child",
+                    fixture_constant("Fixture.h"),
+                )],
+                &["Fixture.B", "Fixture.C"],
+            ),
+        ];
+        if matches!(control, DecodeRetryControl::MalformedArtifact) {
+            set[1].1[0] ^= u8::MAX;
+        }
+        // Input order disagrees with import order; B and A are the two initial
+        // workers, and D/C have not started when both refuse memory.
+        let inputs: Vec<_> = [1, 0, 3, 2]
+            .into_iter()
+            .map(|index| OleanModuleInput {
+                name: &set[index].0,
+                artifact: &set[index].1,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect();
+        let limits = OleanCheckLimits::new(
+            set.iter().map(|(_, bytes)| bytes.len()).sum(),
+            test_budget(),
+        );
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let active = AtomicUsize::new(0);
+        let rendezvous = Barrier::new(2);
+        let attempts = Mutex::new(vec![0_usize; inputs.len()]);
+        let calls = Mutex::new(Vec::new());
+        let transient = Mutex::new(Vec::new());
+        let mut settled = BTreeSet::new();
+        let mut checked = BTreeSet::new();
+        let mut decided = Vec::new();
+        struct Active<'a>(&'a AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let frontier = engine
+            .check_olean_frontier_using(
+                &inputs,
+                limits,
+                fixture_jobs(2),
+                &mut |event| match event {
+                    OleanFrontierEvent::Started { module, .. } => {
+                        checked.insert(module.clone());
+                    }
+                    OleanFrontierEvent::Settled { row, .. } => {
+                        assert!(settled.insert(row.name.clone()));
+                    }
+                    OleanFrontierEvent::Decided { row, .. } => decided.push(row.name.clone()),
+                    OleanFrontierEvent::Retrying { .. } => {
+                        panic!("these council checks do not refuse memory")
+                    }
+                },
+                &|job| engine.frontier_check_module(job, &options, limits),
+                &|index| {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = Active(&active);
+                    let attempt = {
+                        let mut attempts = attempts.lock().expect("attempt counts");
+                        attempts[index] += 1;
+                        attempts[index]
+                    };
+                    calls.lock().expect("decode calls").push((index, attempt));
+                    if index < 2 && attempt == 1 {
+                        let allocation = Arc::new(());
+                        transient
+                            .lock()
+                            .expect("transient decode state")
+                            .push(Arc::downgrade(&allocation));
+                        // Allocate a real decoded artifact before the planted
+                        // failure. Its owned terms must be dropped before retry.
+                        let _decoded = super::decode_olean_module_input_with(
+                            &inputs[index],
+                            limits,
+                            super::CheckerReading::Read,
+                        );
+                        rendezvous.wait();
+                        if index == 0 {
+                            match control {
+                                DecodeRetryControl::FirstBudget => {
+                                    return Err(OleanCheckError::ModuleDecode {
+                                        module: inputs[index].name.clone(),
+                                        error: OleanDecodeError::Declaration(
+                                            OleanDeclarationError::Budget {
+                                                visited: 6,
+                                                budget: 5,
+                                            },
+                                        ),
+                                    });
+                                }
+                                DecodeRetryControl::FirstPanic => {
+                                    panic!("decoder invariant fixture")
+                                }
+                                _ => std::panic::panic_any(super::HostAllocationFailure {
+                                    requested: 4096,
+                                }),
+                            }
+                        }
+                        return Err(OleanCheckError::ModuleDecode {
+                            module: inputs[index].name.clone(),
+                            error: OleanDecodeError::Declaration(
+                                OleanDeclarationError::AllocationRefused { requested: 8192 },
+                            ),
+                        });
+                    }
+                    let isolated = std::thread::current()
+                        .name()
+                        .is_some_and(|name| name == "fln-olean-decode-isolated");
+                    if attempt > 1 || isolated {
+                        assert!(isolated, "a retry runs on the isolated decoder");
+                        assert_eq!(
+                            active.load(Ordering::SeqCst),
+                            1,
+                            "retries and unstarted decodes run alone"
+                        );
+                        assert!(
+                            transient
+                                .lock()
+                                .expect("transient decode state")
+                                .iter()
+                                .all(|allocation| allocation.upgrade().is_none()),
+                            "first-attempt state must be released before retry"
+                        );
+                    } else {
+                        // A non-memory first error does not close dispatch. A fresh
+                        // job may be claimed before the sibling reports its OOM.
+                        assert!(matches!(
+                            control,
+                            DecodeRetryControl::FirstBudget | DecodeRetryControl::FirstPanic
+                        ));
+                    }
+                    if index == 0 {
+                        match control {
+                            DecodeRetryControl::RefuseAgain => {
+                                return Err(OleanCheckError::HostMemory { requested: 4096 });
+                            }
+                            DecodeRetryControl::RetryPanic => {
+                                panic!("isolated decoder invariant fixture")
+                            }
+                            _ => {}
+                        }
+                    }
+                    super::decode_olean_module_input_with(
+                        &inputs[index],
+                        limits,
+                        super::CheckerReading::Read,
+                    )
+                },
+            )
+            .expect("decode refusal is a module result, not a dispatcher failure");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(frontier.rows.len(), set.len());
+        assert_eq!(settled.len(), set.len());
+        let mut unique = decided.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), set.len());
+        let row = |name: &str| {
+            frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture_name(name))
+                .expect("fixture row")
+        };
+        let repeated_b = !matches!(
+            control,
+            DecodeRetryControl::FirstBudget | DecodeRetryControl::FirstPanic
+        );
+        assert_eq!(
+            *attempts.lock().expect("attempt counts"),
+            [if repeated_b { 2 } else { 1 }, 2, 1, 1]
+        );
+        let calls = calls.into_inner().expect("decode calls");
+        if repeated_b {
+            assert_eq!(
+                &calls[2..],
+                [(0, 2), (1, 2), (2, 1), (3, 1)],
+                "drain, retry in input order, then finish unstarted modules serially"
+            );
+        } else {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(_, attempt)| *attempt == 2)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [(1, 2)]
+            );
+        }
+        assert!(frontier.rows.iter().all(|row| row.memory_retry.is_none()));
+        assert!(
+            row("Fixture.A")
+                .decode_memory_retry
+                .as_ref()
+                .is_some_and(|retry| retry.retry_result.is_ok())
+        );
+        assert_eq!(row("Fixture.B").decode_memory_retry.is_some(), repeated_b);
+        for name in ["Fixture.C", "Fixture.D"] {
+            assert!(row(name).decode_memory_retry.is_none());
+        }
+        let result = frontier
+            .engine
+            .as_ref()
+            .expect("accepted fixture declarations merge");
+        if matches!(control, DecodeRetryControl::Accept) {
+            assert!(
+                frontier
+                    .rows
+                    .iter()
+                    .all(|row| matches!(row.verdict, OleanModuleVerdict::Accepted { .. }))
+            );
+            assert_eq!(
+                decided,
+                set.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+            );
+            assert!(
+                row("Fixture.B")
+                    .decode_memory_retry
+                    .as_ref()
+                    .expect("B decode retry")
+                    .retry_result
+                    .is_ok()
+            );
+            let baseline = engine
+                .check_olean_frontier(&inputs, &options, limits)
+                .expect("serial fixture frontier");
+            assert_eq!(
+                result.logical_root(&options),
+                baseline
+                    .engine
+                    .expect("baseline merge")
+                    .logical_root(&options)
+            );
+            assert_eq!(checked.len(), inputs.len());
+            return;
+        }
+        assert!(
+            result
+                .environment()
+                .find(&fixture_name("Fixture.h"))
+                .is_none()
+        );
+        assert!(
+            result
+                .environment()
+                .find(&fixture_name("Fixture.child"))
+                .is_none()
+        );
+        assert!(
+            matches!(&row("Fixture.D").verdict, OleanModuleVerdict::Blocked { by } if *by == fixture_name("Fixture.B"))
+        );
+        assert!(!checked.contains(&fixture_name("Fixture.D")));
+        match control {
+            DecodeRetryControl::RefuseAgain => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.B")
+                        .decode_memory_retry
+                        .as_ref()
+                        .expect("B retry")
+                        .retry_result,
+                    Err(OleanCheckError::HostMemory { .. })
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::InvalidProof => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(OleanCheckError::Admission(_))
+                ));
+                assert!(
+                    row("Fixture.B")
+                        .decode_memory_retry
+                        .as_ref()
+                        .expect("B retry")
+                        .retry_result
+                        .is_ok()
+                );
+                assert!(
+                    checked.contains(&fixture_name("Fixture.B")),
+                    "successful decode must still reach the council"
+                );
+            }
+            DecodeRetryControl::MalformedArtifact => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(OleanCheckError::ModuleDecode { .. })
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::FirstBudget => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::FirstPanic | DecodeRetryControl::RetryPanic => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::InternalFault(_)
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::Accept => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_restores_the_import_graph_and_rechecks_every_declaration() {
+        run_initial_decode_memory_retry(DecodeRetryControl::Accept);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_stops_after_one_refusal_and_blocks_importers() {
+        run_initial_decode_memory_retry(DecodeRetryControl::RefuseAgain);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_cannot_admit_an_invalid_proof() {
+        run_initial_decode_memory_retry(DecodeRetryControl::InvalidProof);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_redecodes_and_refuses_malformed_bytes() {
+        run_initial_decode_memory_retry(DecodeRetryControl::MalformedArtifact);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_does_not_retry_explicit_budgets_or_panics() {
+        run_initial_decode_memory_retry(DecodeRetryControl::FirstBudget);
+        run_initial_decode_memory_retry(DecodeRetryControl::FirstPanic);
+        run_initial_decode_memory_retry(DecodeRetryControl::RetryPanic);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_does_not_repeat_an_already_isolated_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let results = super::decode_olean_module_inputs_using(1, fixture_jobs(4), &|_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(super::HostAllocationFailure { requested: 4096 })
+        })
+        .expect("an isolated allocation refusal is a module result");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            results[0].result,
+            Err(OleanCheckError::HostMemory { requested: 4096 })
+        ));
+        assert!(results[0].memory_retry.is_none());
     }
 
     /// The scheduled door's answer is the serial door's, value for value.

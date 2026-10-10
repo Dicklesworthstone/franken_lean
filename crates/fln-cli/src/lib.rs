@@ -294,6 +294,10 @@ const USAGE: &str = concat!(
     "N modules at once, each against its own import closure. A host-memory\n",
     "refusal during concurrent checking is retried once with no other module\n",
     "check in flight, under the same limits; its row records both attempts.\n",
+    "The initial decoder also retries concurrent memory refusals once, after\n",
+    "joining its workers, and finishes unstarted decodes serially. Its rows\n",
+    "record separate decodeAttempts; a decoded artifact still needs council\n",
+    "acceptance. Successfully decoded siblings remain in memory.\n",
     "Other resource stops are not retried. --progress reports \"retrying\"\n",
     "before that isolated attempt. With --continue,\n",
     "further ROOT directories join the module set, so a library checks together\n",
@@ -9482,6 +9486,15 @@ struct FrontierRowFields {
     detail: BoundedText,
     blocked_by: String,
     memory_retry: Option<(u128, BoundedText)>,
+    decode_memory_retry: Option<FrontierDecodeRetryFields>,
+}
+
+struct FrontierDecodeRetryFields {
+    first_elapsed_ms: u128,
+    first_error: BoundedText,
+    retry_elapsed_ms: u128,
+    retry_class: Option<&'static str>,
+    retry_error: BoundedText,
 }
 
 impl FrontierRowFields {
@@ -9518,6 +9531,31 @@ impl FrontierRowFields {
                 self.elapsed_ms.saturating_sub(*first_elapsed_ms),
             ));
         }
+        if let Some(retry) = &self.decode_memory_retry {
+            members.push_str(&format!(
+                concat!(
+                    ",\"decodeAttempts\":[{{\"attempt\":1,\"isolated\":false,",
+                    "\"result\":\"error\",\"class\":\"resource\",\"elapsedMs\":{},",
+                    "\"detail\":{},\"detailTruncated\":{}}},",
+                    "{{\"attempt\":2,\"isolated\":true,\"result\":{},\"class\":{},",
+                    "\"elapsedMs\":{},\"detail\":{},\"detailTruncated\":{}}}]"
+                ),
+                retry.first_elapsed_ms,
+                json_string(retry.first_error.text()),
+                retry.first_error.truncated(),
+                json_string(if retry.retry_class.is_some() {
+                    "error"
+                } else {
+                    "decoded"
+                }),
+                retry
+                    .retry_class
+                    .map_or_else(|| "null".to_owned(), json_string),
+                retry.retry_elapsed_ms,
+                json_string(retry.retry_error.text()),
+                retry.retry_error.truncated(),
+            ));
+        }
         members
     }
 }
@@ -9550,6 +9588,22 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
                 retry.first_elapsed.as_millis(),
                 BoundedText::new(format!("{:?}", retry.first_refusal)),
             )
+        }),
+        decode_memory_retry: row.decode_memory_retry.as_ref().map(|retry| {
+            let (retry_class, retry_error) = match &retry.retry_result {
+                Ok(()) => (None, String::new()),
+                Err(error) => (
+                    Some(check_olean_error_disposition(error).0),
+                    error.to_string(),
+                ),
+            };
+            FrontierDecodeRetryFields {
+                first_elapsed_ms: retry.first_elapsed.as_millis(),
+                first_error: BoundedText::new(retry.first_error.to_string()),
+                retry_elapsed_ms: retry.retry_elapsed.as_millis(),
+                retry_class,
+                retry_error: BoundedText::new(retry_error),
+            }
         }),
     }
 }
@@ -9594,6 +9648,24 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
                 "    isolated retry after host-memory refusal in {first_elapsed_ms} ms: {}",
                 first_refusal.text(),
             ));
+        }
+        if let Some(retry) = &fields.decode_memory_retry {
+            lines.push(format!(
+                "    isolated decode retry after host-memory refusal in {} ms: {}",
+                retry.first_elapsed_ms,
+                retry.first_error.text(),
+            ));
+            lines.push(match retry.retry_class {
+                None => format!(
+                    "    retry decoded in {} ms; council verdict: {verdict}",
+                    retry.retry_elapsed_ms
+                ),
+                Some(class) => format!(
+                    "    decode retry {class} in {} ms: {}",
+                    retry.retry_elapsed_ms,
+                    retry.retry_error.text()
+                ),
+            });
         }
     }
     let total = frontier.rows.len();
@@ -16071,6 +16143,7 @@ mod tests {
                 first_refusal: fln::Inconclusive::dependency_unavailable("host memory: fixture"),
                 first_elapsed: std::time::Duration::from_millis(10),
             }),
+            decode_memory_retry: None,
         };
         for (verdict, expected_exit, expected_count) in [
             (
@@ -16117,6 +16190,111 @@ mod tests {
                 .json_members()
                 .contains("attempts")
         );
+    }
+
+    #[test]
+    fn check_olean_frontier_reports_decode_retries_without_promoting_decoding_to_acceptance() {
+        use fln::{OleanCheckError, OleanModuleVerdict};
+        let name = fln::Name::from_components(["DecodeRetryFixture"]);
+        for (retry_result, verdict, exit_code, result_text, count_text) in [
+            (
+                Ok(()),
+                OleanModuleVerdict::Accepted { declarations: 2 },
+                0,
+                "decoded",
+                "\"accepted\":1",
+            ),
+            (
+                Ok(()),
+                OleanModuleVerdict::Failed(OleanCheckError::MissingConstants {
+                    declaration: name.clone(),
+                    names: vec![fln::Name::from_components(["Missing"])],
+                }),
+                1,
+                "decoded",
+                "\"failed\":1",
+            ),
+            (
+                Ok(()),
+                OleanModuleVerdict::Blocked {
+                    by: fln::Name::from_components(["Parent"]),
+                },
+                1,
+                "decoded",
+                "\"blocked\":1",
+            ),
+            (
+                Err(OleanCheckError::HostMemory { requested: 8192 }),
+                OleanModuleVerdict::Inconclusive(fln::Inconclusive::dependency_unavailable(
+                    "host memory: again",
+                )),
+                3,
+                "error",
+                "\"inconclusive\":1",
+            ),
+            (
+                Err(OleanCheckError::InternalInvariant {
+                    detail: "decoder invariant fixture",
+                }),
+                OleanModuleVerdict::InternalFault(fln::InternalFault::new(
+                    "decode",
+                    "decoder invariant fixture",
+                )),
+                4,
+                "error",
+                "\"internalFault\":1",
+            ),
+        ] {
+            let frontier = fln::OleanFrontier {
+                engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
+                rows: vec![fln::OleanFrontierRow {
+                    name: name.clone(),
+                    verdict,
+                    elapsed: std::time::Duration::from_millis(7),
+                    memory_retry: None,
+                    decode_memory_retry: Some(fln::OleanDecodeMemoryRetry {
+                        first_error: OleanCheckError::HostMemory { requested: 4096 },
+                        first_elapsed: std::time::Duration::from_millis(10),
+                        retry_elapsed: std::time::Duration::from_millis(20),
+                        retry_result,
+                    }),
+                }],
+            };
+            let output = super::render_check_olean_frontier(&frontier, true);
+            assert_eq!(output.exit_code, exit_code);
+            assert!(output.stdout.contains("\"modules\":1"));
+            assert!(output.stdout.contains(count_text));
+            assert!(
+                output.stdout.contains("\"elapsedMs\":7"),
+                "checking time excludes initial decoding"
+            );
+            assert!(output.stdout.contains("\"decodeAttempts\":[{\"attempt\":1,\"isolated\":false,\"result\":\"error\",\"class\":\"resource\",\"elapsedMs\":10"));
+            assert!(output.stdout.contains(&format!(
+                "\"attempt\":2,\"isolated\":true,\"result\":\"{result_text}\""
+            )));
+            assert!(output.stdout.contains("\"elapsedMs\":20"));
+            assert!(
+                !output.stdout.contains("\"attempts\":"),
+                "no council retry was performed"
+            );
+            if exit_code != 0 {
+                assert!(output.stdout.contains("\"accepted\":0"));
+            }
+            let human = super::render_check_olean_frontier(&frontier, false);
+            assert_eq!(human.exit_code, exit_code);
+            assert!(
+                human
+                    .stdout
+                    .contains("isolated decode retry after host-memory refusal in 10 ms")
+            );
+            if result_text == "decoded" {
+                assert!(
+                    human
+                        .stdout
+                        .contains("retry decoded in 20 ms; council verdict:")
+                );
+            }
+        }
     }
 
     #[test]
