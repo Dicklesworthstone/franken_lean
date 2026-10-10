@@ -63,6 +63,41 @@ impl Preparation<'_> {
         Ok(matches!(domain.node(), ExprNode::Sort { level } if level.is_zero()))
     }
 
+    /// The admitted parameter type can identify a predicate without inspecting
+    /// or evaluating the supplied predicate value. Preserve its full telescope
+    /// and its Prop result; a decision procedure is a separate runtime argument.
+    /// Original binder domains keep genuine type/value dependencies open, and
+    /// unknown universes never become evidence for a Prop-valued parameter.
+    fn erased_proposition_argument(&mut self, domain: &Expr) -> Result<Option<Expr>, IngressError> {
+        let mut type_ = domain.clone();
+        let mut binders = Vec::new();
+        loop {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            if let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = normal.node()
+            {
+                reserve(&mut binders, self.limits.max_context_depth)?;
+                binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                type_ = body.clone();
+            } else if self.proposition_parameter(&normal)? {
+                break;
+            } else {
+                return Ok(None);
+            }
+        }
+        let mut value = erased_proposition();
+        for (name, domain, info) in binders.into_iter().rev() {
+            self.tick()?;
+            value = Expr::lam(name, domain, value, info);
+        }
+        Ok(closed(&value).then_some(value))
+    }
+
     pub(super) fn forget_constructor_type(&mut self, name: &Name) {
         self.specializations.constructor_types.remove(name);
     }
@@ -660,8 +695,8 @@ impl Preparation<'_> {
             // dropping an action. This also exposes mutual-match minor
             // premises hidden behind the elaborator's local helper lambdas.
             // A call that *returns* a function must still use the strict let.
-            if self.proposition_parameter(binder_type)? {
-                head = self.substitution(body, &erased_proposition())?;
+            if let Some(proposition) = self.erased_proposition_argument(binder_type)? {
+                head = self.substitution(body, &proposition)?;
                 consumed += 1;
                 continue;
             }

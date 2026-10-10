@@ -126,8 +126,9 @@ impl Preparation<'_> {
             // global specialization, even when this caller supplies a literal.
             // Closed static arguments with independent domains need no lift
             // when substituted under the retained runtime binders.
-            let proposition = self.proposition_parameter(binder_type)?;
-            let type_argument = !proposition && self.type_parameter(binder_type)?;
+            let proposition = self.erased_proposition_argument(binder_type)?;
+            let is_proposition = proposition.is_some();
+            let type_argument = !is_proposition && self.type_parameter(binder_type)?;
             let runtime_type = if type_argument {
                 Some(if closed(argument) {
                     argument.clone()
@@ -137,8 +138,8 @@ impl Preparation<'_> {
             } else {
                 None
             };
-            let selected = if proposition {
-                Some(erased_proposition())
+            let selected = if is_proposition {
+                proposition
             } else if binder_type.has_loose_bvars() {
                 None
             } else if let Some(type_) = runtime_type {
@@ -157,7 +158,7 @@ impl Preparation<'_> {
                 // dictionary factories retain their original cache identity.
                 static_arguments.push((
                     index,
-                    if proposition || type_argument {
+                    if is_proposition || type_argument {
                         selected
                     } else {
                         argument.clone()
