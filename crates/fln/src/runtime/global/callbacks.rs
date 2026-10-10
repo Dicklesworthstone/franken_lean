@@ -3,6 +3,8 @@
 //! Every other supplied operand keeps one strict binding in source order.
 use super::*;
 
+mod computed;
+
 impl Preparation<'_> {
     /// Typed identity lets can hide a literal consumer or callback after
     /// dictionary projection. Expose only lambda construction, its aliases,
@@ -574,3 +576,6 @@ mod tests;
 
 #[cfg(test)]
 mod uses_tests;
+
+#[cfg(test)]
+mod computed_tests;

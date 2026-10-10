@@ -68,6 +68,9 @@ impl Preparation<'_> {
         if let Some(specialized) = self.specialize_staged_callback(head, args)? {
             return Ok(Some(specialized));
         }
+        if let Some(specialized) = self.specialize_computed_callback(head, args)? {
+            return Ok(Some(specialized));
+        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
