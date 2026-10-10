@@ -4005,6 +4005,7 @@ fn definition_in_context_named(
     }
     let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
     let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));
+    let is_abbrev = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","abbrev"]));
     let instance_parts;
     let definition = if is_instance {
         let parts = instance_command::parts(&declaration[1])?;
@@ -4032,17 +4033,22 @@ fn definition_in_context_named(
         ];
         &instance_parts[..]
     } else {
+        // An abbreviation has the definition's optional signature and value,
+        // but no deriving slot (Lean.Parser.Command.abbrev at the pin).
+        let (kind, keyword, arity) = if is_theorem {
+            ("theorem", "theorem", 4)
+        } else if is_abbrev {
+            ("abbrev", "abbrev", 4)
+        } else {
+            ("definition", "def", 5)
+        };
         let parts = expect_node(
             &declaration[1],
-            &parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
-            if is_theorem { 4 } else { 5 },
+            &parser_kind(&["Command", kind]),
+            arity,
             "named declaration",
         )?;
-        expect_atom(
-            &parts[0],
-            if is_theorem { "theorem" } else { "def" },
-            "declaration keyword",
-        )?;
+        expect_atom(&parts[0], keyword, "declaration keyword")?;
         parts
     };
     let id = expect_node(
@@ -4211,7 +4217,7 @@ fn definition_in_context_named(
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
-    if !is_theorem && !is_instance {
+    if !is_theorem && !is_instance && !is_abbrev {
         expect_empty_null(&definition[4], "absent definition clauses")?;
     }
     if is_instance {
@@ -4331,7 +4337,11 @@ fn definition_in_context_named(
         Ok(Declaration::Defn(DefinitionVal {
             base,
             value: term.value,
-            hints: ReducibilityHints::Regular(1),
+            hints: if is_abbrev {
+                ReducibilityHints::Abbrev
+            } else {
+                ReducibilityHints::Regular(1)
+            },
             safety: DefinitionSafety::Safe,
             all: vec![name.clone()],
         }))
