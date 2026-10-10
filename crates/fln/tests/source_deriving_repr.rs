@@ -199,12 +199,30 @@ fn repr_helpers_are_checked_and_match_reference_statements_and_module_replay() {
             let again = checked(base, &source);
             assert_eq!(result.logical_root(&KVMap::new()), again.logical_root(&KVMap::new()));
 
+            // Multiple deriving handlers share the same checked command batch.
+            // Exercise BEq against the actual imported classes and recursors,
+            // including a structurally recursive helper, beyond the source seed.
+            checked(base, r#"
+structure Comparable (A : Type) where
+  value : A
+  proof : True
+deriving Repr, BEq
+theorem comparable_yes : (Comparable.mk 7 True.intro == Comparable.mk 7 True.intro) = true := by rfl
+theorem comparable_no : (Comparable.mk 7 True.intro == Comparable.mk 8 True.intro) = false := by rfl
+inductive Chain (A : Type) where
+  | nil
+  | cons (head : A) (tail : Chain A)
+deriving BEq
+theorem chain_yes : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain.cons 9 Chain.nil)) = true := by rfl
+theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl
+"#);
+
             for invalid in [
                 "structure Bad where\n  run : Nat → Nat\nderiving Repr",
                 "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
                 "inductive Recursive where\n | node (next : Recursive)\nderiving Repr",
                 "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
-                "structure Partial where\n n : Nat\nderiving Repr, BEq",
+                "structure Partial where\n n : Nat\nderiving Repr, DecidableEq",
             ] {
                 assert!(
                     base.check_source_files(

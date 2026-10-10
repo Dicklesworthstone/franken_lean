@@ -4,6 +4,7 @@
 //! hypotheses, then assuming inhabited parameters and retaining only used ones.
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
+mod beq;
 mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +12,7 @@ pub enum DerivingError {
     UnsupportedHandler(Name),
     UnsupportedFamily(Name),
     CannotDerive(Name),
+    CannotDeriveBEq(Name),
     CannotDeriveRepr(Name),
 }
 
@@ -39,6 +41,11 @@ impl std::fmt::Display for DerivingError {
             Self::CannotDeriveRepr(name) => write!(
                 f,
                 "failed to generate Repr instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveBEq(name) => write!(
+                f,
+                "failed to generate BEq instance for {}",
                 name.to_display_string()
             ),
         }
@@ -485,7 +492,8 @@ pub fn elaborate_handler(
     let mut context = Context::scoped(environment, kernel, scope);
     let handler_name = context.resolve_source_name(handler)?;
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
-    if !is_repr && handler_name.as_ref() != Some(&named("Inhabited")) {
+    let is_beq = handler_name.as_ref() == Some(&named("BEq"));
+    if !is_repr && !is_beq && handler_name.as_ref() != Some(&named("Inhabited")) {
         return Err(failure(SourceInferenceError::Deriving(
             DerivingError::UnsupportedHandler(handler.clone()),
         )));
@@ -543,6 +551,14 @@ pub fn elaborate_handler(
                 .expect("inserted parameter")
                 .clone(),
         );
+    }
+    if is_beq {
+        return match beq::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveBEq(type_name.clone()),
+            ))),
+            result => result,
+        };
     }
     if is_repr {
         return match repr::elaborate(&mut context, family, &parameters, &target, is_record) {
