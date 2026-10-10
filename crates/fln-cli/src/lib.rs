@@ -11743,6 +11743,7 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
     match error {
         fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
         fln::EngineExecutionError::AllocationFailure { .. }
+        | fln::EngineExecutionError::SourceScopeLimit { .. }
         | fln::EngineExecutionError::SourceModuleLimit { .. }
         | fln::EngineExecutionError::SourceImportLimit { .. }
         | fln::EngineExecutionError::SourceDependencyPresentationLimit { .. }

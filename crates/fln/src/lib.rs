@@ -6536,7 +6536,7 @@ impl Engine {
                 self.empty_source_command_execution(options),
             ));
         }
-        self.execute_source_command_stream(partitioned.commands, options, limits, true)
+        self.execute_source_command_stream(partitioned.commands, options, limits, true, &[])
     }
 
     fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
@@ -6566,6 +6566,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
         allow_checks: bool,
+        file_starts: &[usize],
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -6625,6 +6626,8 @@ impl Engine {
             Command(usize, fln_parse::BytePos, &'s [u8]),
             Scope(usize, fln_parse::command_scope::ScopeCommand),
         }
+        let mut file_base = engine.environment.clone();
+        let mut file_starts = file_starts.iter().copied().peekable();
         let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
@@ -6659,6 +6662,15 @@ impl Engine {
                     continue;
                 }
             };
+            // Flattened source sets retain declaration order, but a new file
+            // starts a fresh lexical scope and cannot change a predecessor's
+            // reducibility. Consume each boundary once: `open ... in` and
+            // `set_option ... in` revisit their command index during expansion.
+            if file_starts.peek() == Some(&command_index) {
+                file_starts.next();
+                file_base = engine.environment.clone();
+                scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+            }
             let control = fln_parse::command_scope::parse(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -6766,33 +6778,36 @@ impl Engine {
                     | ScopeCommand::Open(_)
                     | ScopeCommand::OpenScoped(_)
                     | ScopeCommand::SetOption { .. }
-                    | ScopeCommand::Universe(_) => {
-                        scopes.check_limits(&control).map_err(|(resource, limit)| {
-                            scope_error(
-                                command_index,
-                                original_offset,
-                                format!("{resource} limit {limit} exceeded"),
-                            )
-                        })?;
-                        scopes
-                            .transition(control, engine.environment())
-                            .map_err(|error| {
-                                scope_error(command_index, original_offset, error.message())
-                            })?;
-                    }
-                    ScopeCommand::Variable(_)
+                    | ScopeCommand::Universe(_)
+                    | ScopeCommand::Variable(_)
                     | ScopeCommand::Include(_)
                     | ScopeCommand::Omit(_)
                     | ScopeCommand::Simp(_)
                     | ScopeCommand::Instance(_)
                     | ScopeCommand::Reducibility(_) => {
-                        return Err(EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(EngineExecutionError::UnsupportedDeclaration {
-                                kind: "section variable or attribute command",
-                            }),
-                            at: Some(original_offset),
-                        });
+                        match source_check::apply_control_command(
+                            &mut engine,
+                            &mut scopes,
+                            &file_base,
+                            control,
+                            limits.kernel,
+                            (0, command_index, original_offset.0),
+                        )
+                        .map_err(|error| {
+                            EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error.into_execution_error()),
+                                at: Some(original_offset),
+                            }
+                        })? {
+                            Outcome::Complete(()) => {}
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        }
                     }
                 }
                 continue;
@@ -7175,7 +7190,7 @@ impl Engine {
         let definition_prefix = if commands.is_empty() {
             None
         } else {
-            match self.execute_source_commands(commands, options, limits)? {
+            match self.execute_source_commands(commands, options, limits, &[])? {
                 Outcome::Complete(completed) => Some(completed),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -7472,6 +7487,7 @@ impl Engine {
                 options,
                 limits,
                 true,
+                &[],
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -7604,6 +7620,13 @@ impl Engine {
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         let mut commands = Vec::new();
+        let mut file_starts = Vec::new();
+        file_starts.try_reserve_exact(sources.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source file boundary table",
+                requested: sources.len(),
+            }
+        })?;
         for source in sources {
             let partitioned = fln_parse::partition_source_module(source).map_err(|error| {
                 EngineExecutionError::BatchCommand {
@@ -7632,9 +7655,12 @@ impl Engine {
                     resource: "definition command table",
                     requested,
                 })?;
+            if !commands.is_empty() && !partitioned.commands.is_empty() {
+                file_starts.push(commands.len());
+            }
             commands.extend(partitioned.commands);
         }
-        self.execute_source_commands(commands, options, limits)
+        self.execute_source_commands(commands, options, limits, &file_starts)
     }
 
     /// Execute an exact, caller-named closed source-module import graph.
@@ -7854,7 +7880,17 @@ impl Engine {
                 resource: "source command ownership table",
                 requested: command_count,
             })?;
+        let mut file_starts = Vec::new();
+        file_starts.try_reserve_exact(order.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source module boundary table",
+                requested: order.len(),
+            }
+        })?;
         for &index in &order {
+            if !commands.is_empty() && !parsed[index].commands.is_empty() {
+                file_starts.push(commands.len());
+            }
             commands.extend(parsed[index].commands.iter().copied());
             command_owners.extend(std::iter::repeat_n(index, parsed[index].commands.len()));
         }
@@ -7881,6 +7917,7 @@ impl Engine {
                 options,
                 limits,
                 policy.allow_scratch_checks(),
+                &file_starts,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -7990,9 +8027,16 @@ impl Engine {
         commands: Vec<(fln_parse::BytePos, &[u8])>,
         options: &KVMap,
         limits: EngineExecutionLimits,
+        file_starts: &[usize],
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         Ok(
-            match self.execute_source_command_stream(commands, options, limits, false)? {
+            match self.execute_source_command_stream(
+                commands,
+                options,
+                limits,
+                false,
+                file_starts,
+            )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
                 Outcome::Complete(completed) => match completed.guards.first() {
@@ -11017,6 +11061,11 @@ pub enum EngineExecutionError {
     ScopeTransition {
         message: String,
     },
+    /// Bounded lexical or metadata work stopped before the command completed.
+    SourceScopeLimit {
+        resource: &'static str,
+        limit: usize,
+    },
     TerminalCheckDefinitionPrefix {
         index: usize,
     },
@@ -11084,6 +11133,9 @@ impl fmt::Display for EngineExecutionError {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
             Self::NotImplemented { feature } => write!(formatter, "not implemented: {feature}"),
             Self::ScopeTransition { message } => formatter.write_str(message),
+            Self::SourceScopeLimit { resource, limit } => {
+                write!(formatter, "source command exceeds {resource} limit {limit}")
+            }
             Self::SourceModuleLimit { observed, limit } => write!(
                 formatter,
                 "source set contains {observed} modules; planning limit is {limit}"

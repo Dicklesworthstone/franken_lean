@@ -352,7 +352,7 @@ impl imported::SourceOleanImport {
                 engine.empty_source_command_execution(options)
             } else {
                 match engine
-                    .execute_source_command_stream(body, options, limits.execution, true)
+                    .execute_source_command_stream(body, options, limits.execution, true, &[])
                     .map_err(|error| source_error(module.name, error))?
                 {
                     Outcome::Complete(completed) => completed,

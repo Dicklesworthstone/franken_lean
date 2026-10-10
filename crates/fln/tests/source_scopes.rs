@@ -1,6 +1,9 @@
 //! File scopes use the real parser, native elaborator, and both checking engines.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, KVMap,
+    SourceCheckLimits, SourceCommandBatchExecution, VmExit,
+};
 use fln_core::name::Name;
 use fln_elab::instances::InstanceRegistry;
 
@@ -26,6 +29,242 @@ fn checked(base: &Engine, source: &str) -> Engine {
     .into_complete()
     .expect("both checkers must answer")
     .engine
+}
+
+fn executed(base: &Engine, source: &str) -> SourceCommandBatchExecution {
+    base.execute_source_commands_with_checks(
+        source.as_bytes(),
+        &KVMap::new(),
+        EngineExecutionLimits::new(limits().kernel),
+    )
+    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+    .into_complete()
+    .expect("source controls and execution must complete")
+}
+
+fn evaluated(completed: &SourceCommandBatchExecution) -> Vec<usize> {
+    completed
+        .batch
+        .source_evaluation_indices
+        .iter()
+        .map(|&index| {
+            let exit = &completed.batch.executions[index].exit;
+            let VmExit::Returned(returned) = exit else {
+                panic!("expected a Nat return, got {exit:?}");
+            };
+            fln_vm::interpreter::nat_decimal(&returned.value)
+                .unwrap_or_else(|| panic!("expected a Nat result, got {exit:?}"))
+                .parse()
+                .expect("these fixtures return small natural numbers")
+        })
+        .collect()
+}
+
+#[test]
+fn executable_files_apply_the_same_attributes_and_sections_as_check_only_files() {
+    let base = engine();
+    // Every file is accepted by the pinned Reference in reference_differential.tsv.
+    // The runtime previously stopped at its first section-variable or standalone
+    // attribute command even though check-source implemented the command.
+    for source in [
+        include_str!("../../../examples/native_instance_attributes.lean"),
+        include_str!("../../../examples/native_scoped_instances.lean"),
+        include_str!("../../../examples/native_default_simp.lean"),
+        include_str!("../../../examples/native_section_records.lean"),
+        include_str!("../../../examples/native_section_inductives.lean"),
+    ] {
+        let checked = checked(&base, source);
+        let completed = executed(&base, source);
+        assert_eq!(
+            completed.batch.engine.logical_root(&KVMap::new()),
+            checked.logical_root(&KVMap::new()),
+            "both paths must retain the same declarations and metadata: {source}"
+        );
+    }
+}
+
+#[test]
+fn section_variables_generalize_runtime_definitions_and_restore_after_end() {
+    let base = engine();
+    let source = "section\nvariable {A : Type} (x : A)\ndef identity := x\nend\n#eval identity 41\nsection\nvariable (n : Nat) (h : n = n)\ninclude h\ntheorem withProof : n = n := by exact h\nomit h\ntheorem withoutProof : n = n := by rfl\nend\n#eval identity 42";
+    let completed = executed(&base, source);
+    assert_eq!(evaluated(&completed), [41, 42]);
+    assert!(!completed.batch.engine.environment().contains(&n("x")));
+    assert!(!completed.batch.engine.environment().contains(&n("h")));
+    checked(
+        &completed.batch.engine,
+        "theorem useIncluded : withProof 7 rfl = rfl := by rfl\ntheorem useOmitted : withoutProof 7 = rfl := by rfl",
+    );
+    assert!(
+        base.execute_source_commands_with_checks(
+            b"section\nvariable (x : Nat)\nend\n#eval x",
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn scoped_instance_activation_changes_runtime_values_and_ends_with_the_section() {
+    let completed = executed(
+        &engine(),
+        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef fallbackSelection : Selection := Selection.mk 1\nattribute [instance] fallbackSelection\nnamespace Alternative\ndef dictionary : Selection := Selection.mk 7\nattribute [scoped instance] dictionary\nend Alternative\n#eval (selected : Nat)\nsection\nopen scoped Alternative\n#eval (selected : Nat)\nend\n#eval (selected : Nat)",
+    );
+    assert_eq!(evaluated(&completed), [1, 7, 1]);
+    assert_eq!(completed.batch.source_evaluation_indices.len(), 3);
+}
+
+#[test]
+fn executable_attribute_failure_exposes_no_prefix_and_keeps_file_ownership() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def choice : Inhabited Nat := Inhabited.mk 7\nattribute [instance] choice Missing\n#eval (default : Nat)",
+        "def wrap (n : Nat) := n\ntheorem unwrap (n : Nat) : wrap n = n := by rfl\nattribute [simp] unwrap Missing",
+        "def alias := Nat\nattribute [reducible] alias Missing\n#eval (31 : alias)",
+    ] {
+        assert!(
+            base.execute_source_commands_with_checks(
+                source.as_bytes(),
+                &KVMap::new(),
+                EngineExecutionLimits::new(limits().kernel),
+            )
+            .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    let own_file = executed(
+        &base,
+        "def alias := Nat\nattribute [reducible] alias\n#eval (31 : alias)",
+    );
+    assert_eq!(evaluated(&own_file), [31]);
+    let predecessor = executed(&base, "def alias := Nat").batch.engine;
+    let error = predecessor
+        .execute_source_commands_with_checks(
+            b"attribute [reducible] alias",
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("has not been defined in this file")
+    );
+    assert_eq!(evaluated(&executed(&base, "#eval 42")), [42]);
+}
+
+#[test]
+fn executable_scope_limits_remain_resource_stops() {
+    let base = engine();
+    let source = "section\n".repeat(257);
+    let error = base
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        EngineExecutionError::BatchCommand { index: 256, error, .. }
+            if matches!(error.as_ref(), EngineExecutionError::SourceScopeLimit {
+                resource: "scope depth", limit: 256,
+            })
+    ));
+    let classified = fln::source_check::SourceCheckError::Command {
+        file: 0,
+        command: 256,
+        offset: 256 * "section\n".len(),
+        error: Box::new(error),
+    };
+    assert_eq!(classified.disposition(), ("resource", false, 3));
+}
+
+#[test]
+fn flattened_source_files_restore_scope_and_protect_predecessor_reducibility() {
+    let base = engine();
+    let execution_limits = EngineExecutionLimits::new(limits().kernel);
+    let completed = base
+        .execute_source_definitions(
+            &[
+                b"namespace First\nvariable (x : Nat)\ndef identity := x",
+                b"def answer : Nat := First.identity 42",
+            ],
+            &KVMap::new(),
+            execution_limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(completed.engine.environment().contains(&n("answer")));
+    assert!(!completed.engine.environment().contains(&n("First.answer")));
+    let opened = base
+        .execute_source_definitions(
+            &[
+                b"namespace Local\ndef value : Nat := 7\nend Local",
+                b"open Local in def chosen : Nat := value",
+            ],
+            &KVMap::new(),
+            execution_limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    // Expanding the first command of the next file revisits that command's
+    // index. Resetting its scope a second time would lose `open Local`.
+    checked(&opened.engine, "theorem chosen_ok : chosen = 7 := by rfl");
+    for sources in [
+        [
+            b"variable (x : Nat)".as_slice(),
+            b"def leaked := x".as_slice(),
+        ],
+        [
+            b"def alias := Nat".as_slice(),
+            b"attribute [reducible] alias".as_slice(),
+        ],
+    ] {
+        assert!(
+            base.execute_source_definitions(&sources, &KVMap::new(), execution_limits)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn source_module_execution_preserves_file_boundaries_for_control_commands() {
+    let base = engine();
+    let first = n("First");
+    let main = n("Main");
+    let modules = [
+        fln::SourceModuleInput {
+            name: &first,
+            source: b"namespace Library\nvariable (x : Nat)\ndef identity := x",
+        },
+        fln::SourceModuleInput {
+            name: &main,
+            source: b"import First\ndef answer : Nat := Library.identity 42",
+        },
+    ];
+    let completed = base
+        .execute_source_modules(
+            &modules,
+            &main,
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(completed.engine.environment().contains(&n("answer")));
+    assert!(
+        !completed
+            .engine
+            .environment()
+            .contains(&n("Library.answer"))
+    );
 }
 #[test]
 fn nested_namespaces_reopen_and_resolve_relative_and_absolute_names() {

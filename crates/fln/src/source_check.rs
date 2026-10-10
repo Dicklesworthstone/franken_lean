@@ -85,6 +85,19 @@ impl std::fmt::Display for SourceCheckError {
 impl std::error::Error for SourceCheckError {}
 
 impl SourceCheckError {
+    /// Reuse the same command effects in the execution stream without turning
+    /// a resource stop into a source rejection or discarding a typed cause.
+    pub(crate) fn into_execution_error(self) -> EngineExecutionError {
+        match self {
+            Self::Scope { message, .. } => EngineExecutionError::ScopeTransition { message },
+            Self::EmptyInput => EngineExecutionError::EmptyBatch,
+            Self::Limit { resource, limit } => {
+                EngineExecutionError::SourceScopeLimit { resource, limit }
+            }
+            Self::Command { error, .. } => *error,
+        }
+    }
+
     /// Wire classification preserves frontend, compiler and codec resource
     /// stops as nonanswers, including commands executed in imported worlds.
     pub fn disposition(&self) -> (&'static str, bool, u8) {
@@ -106,7 +119,8 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         | EngineExecutionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
         EngineExecutionError::CheckerBridge { .. }
         | EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
-        EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),
+        EngineExecutionError::AllocationFailure { .. }
+        | EngineExecutionError::SourceScopeLimit { .. } => ("resource", false, 3),
         EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
             ("resource", false, 3)
         }
@@ -184,6 +198,108 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::NotImplemented { .. } => ("capability", false, 5),
         _ => ("input", false, 1),
     }
+}
+
+/// The non-expanding source controls have identical meaning in check-only and
+/// executable files. Every metadata command publishes a whole successor only
+/// after its names and registrations succeed; variables live solely in the
+/// lexical scope. `file_base` prevents attributes from rewriting imported
+/// declarations' reducibility, including when the file executes on Golem.
+pub(crate) fn apply_control_command(
+    engine: &mut Engine,
+    scopes: &mut scopes::Scopes,
+    file_base: &Environment,
+    control: fln_parse::command_scope::ScopeCommand,
+    kernel: Budget,
+    position @ (file, command, offset): (usize, usize, usize),
+) -> Result<Outcome<()>, SourceCheckError> {
+    use fln_parse::command_scope::ScopeCommand;
+
+    match control {
+        ScopeCommand::Variable(syntax) => {
+            let variables =
+                source_records::elaboration_outcome(fln_elab::source::scope::variables::declare(
+                    &syntax,
+                    engine.environment(),
+                    kernel,
+                    &scopes.current,
+                ))
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
+            scopes.current.variables = match variables {
+                Outcome::Complete(variables) => variables,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        }
+        ScopeCommand::Instance(attribute) => {
+            engine.environment = instance_attributes::apply(
+                engine.environment(),
+                &scopes.current,
+                attribute,
+                file,
+                command,
+                offset,
+            )?;
+        }
+        ScopeCommand::Reducibility(attribute) => {
+            engine.environment = reducibility::apply(
+                engine.environment(),
+                file_base,
+                &scopes.current,
+                attribute,
+                position,
+            )?;
+        }
+        ScopeCommand::Simp(attribute) => {
+            // Resolve in the lexical scope, but retain exact declaration
+            // identities. A later failure discards every earlier update.
+            let mut environment = engine.environment.clone();
+            for requested in attribute.declarations {
+                let name = scopes
+                    .current
+                    .resolve(&requested, |name| environment.contains(name))
+                    .map_err(|error| SourceCheckError::Scope {
+                        file,
+                        command,
+                        offset,
+                        message: error.to_string(),
+                    })?
+                    .ok_or_else(|| SourceCheckError::Scope {
+                        file,
+                        command,
+                        offset,
+                        message: format!(
+                            "unknown simp declaration `{}`",
+                            requested.to_display_string()
+                        ),
+                    })?;
+                environment =
+                    fln_elab::source::scope::simp::update(&environment, &name, attribute.rule)
+                        .map_err(|error| {
+                            command_error(
+                                file,
+                                command,
+                                fln_parse::BytePos(offset),
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::SimpSet(error),
+                                    ),
+                                )),
+                            )
+                        })?;
+            }
+            engine.environment = environment;
+        }
+        other => {
+            scopes
+                .check_limits(&other)
+                .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
+            scopes
+                .transition(other, engine.environment())
+                .map_err(|error| error.into_source(file, command, offset))?;
+        }
+    }
+    Ok(Outcome::Complete(()))
 }
 
 impl Engine {
@@ -316,109 +432,18 @@ impl Engine {
                         }
                         Err(control) => control,
                     };
-                    if let fln_parse::command_scope::ScopeCommand::Variable(syntax) = control {
-                        let variables = source_records::elaboration_outcome(
-                            fln_elab::source::scope::variables::declare(
-                                &syntax,
-                                engine.environment(),
-                                limits.admission.kernel,
-                                &scopes.current,
-                            ),
-                        )
-                        .map_err(|error| command_error(file, count, start, error))?;
-                        scopes.current.variables = match variables {
-                            Outcome::Complete(variables) => variables,
-                            Outcome::Inconclusive(reason) => {
-                                return Ok(Outcome::Inconclusive(reason));
-                            }
-                            Outcome::InternalFault(fault) => {
-                                return Ok(Outcome::InternalFault(fault));
-                            }
-                        };
-                        count += 1;
-                        continue;
+                    match apply_control_command(
+                        &mut engine,
+                        &mut scopes,
+                        &file_base,
+                        control,
+                        limits.admission.kernel,
+                        (file, count, start.0),
+                    )? {
+                        Outcome::Complete(()) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
-                    if let fln_parse::command_scope::ScopeCommand::Instance(attribute) = control {
-                        engine.environment = instance_attributes::apply(
-                            engine.environment(),
-                            &scopes.current,
-                            attribute,
-                            file,
-                            count,
-                            start.0,
-                        )?;
-                        count += 1;
-                        continue;
-                    }
-                    if let fln_parse::command_scope::ScopeCommand::Reducibility(attribute) = control
-                    {
-                        engine.environment = reducibility::apply(
-                            engine.environment(),
-                            &file_base,
-                            &scopes.current,
-                            attribute,
-                            (file, count, start.0),
-                        )?;
-                        count += 1;
-                        continue;
-                    }
-                    if let fln_parse::command_scope::ScopeCommand::Simp(attribute) = control {
-                        // Attribute resolution uses the current source scope,
-                        // but the journal records exact declaration identities.
-                        // Publish the entire command only after every name and
-                        // registration succeeds; late failure exposes no prefix.
-                        let mut environment = engine.environment.clone();
-                        for requested in attribute.declarations {
-                            let name = scopes
-                                .current
-                                .resolve(&requested, |name| environment.contains(name))
-                                .map_err(|error| SourceCheckError::Scope {
-                                    file,
-                                    command: count,
-                                    offset: start.0,
-                                    message: error.to_string(),
-                                })?
-                                .ok_or_else(|| SourceCheckError::Scope {
-                                    file,
-                                    command: count,
-                                    offset: start.0,
-                                    message: format!(
-                                        "unknown simp declaration `{}`",
-                                        requested.to_display_string()
-                                    ),
-                                })?;
-                            environment = fln_elab::source::scope::simp::update(
-                                &environment,
-                                &name,
-                                attribute.rule,
-                            )
-                            .map_err(|error| {
-                                SourceCheckError::Command {
-                                    file,
-                                    command: count,
-                                    offset: start.0,
-                                    error: Box::new(EngineExecutionError::Frontend(
-                                        DefinitionFrontendError::Elaborate(
-                                            fln_elab::NatDefinitionElabError::Inference(
-                                                fln_elab::source::SourceInferenceError::SimpSet(
-                                                    error,
-                                                ),
-                                            ),
-                                        ),
-                                    )),
-                                }
-                            })?;
-                        }
-                        engine.environment = environment;
-                        count += 1;
-                        continue;
-                    }
-                    scopes
-                        .check_limits(&control)
-                        .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
-                    scopes
-                        .transition(control, engine.environment())
-                        .map_err(|error| error.into_source(file, count, start.0))?;
                     count += 1;
                     continue;
                 }
