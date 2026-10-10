@@ -200,21 +200,25 @@ fn repr_helpers_are_checked_and_match_reference_statements_and_module_replay() {
             assert_eq!(result.logical_root(&KVMap::new()), again.logical_root(&KVMap::new()));
 
             // Multiple deriving handlers share the same checked command batch.
-            // Exercise BEq against the actual imported classes and recursors,
+            // Exercise both equality handlers against actual imported classes and recursors,
             // including a structurally recursive helper, beyond the source seed.
             checked(base, r#"
 structure Comparable (A : Type) where
   value : A
   proof : True
-deriving Repr, BEq
+deriving Repr, BEq, DecidableEq
 theorem comparable_yes : (Comparable.mk 7 True.intro == Comparable.mk 7 True.intro) = true := by rfl
 theorem comparable_no : (Comparable.mk 7 True.intro == Comparable.mk 8 True.intro) = false := by rfl
+theorem comparable_eq : Comparable.mk 7 True.intro = Comparable.mk 7 True.intro := by decide
+theorem comparable_ne : Not (Comparable.mk 7 True.intro = Comparable.mk 8 True.intro) := by decide
 inductive Chain (A : Type) where
   | nil
   | cons (head : A) (tail : Chain A)
-deriving BEq
+deriving BEq, DecidableEq
 theorem chain_yes : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain.cons 9 Chain.nil)) = true := by rfl
 theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl
+theorem chain_eq : Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Chain.cons 9 Chain.nil) := by decide
+theorem chain_ne : Not (Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Chain.cons 8 Chain.nil)) := by decide
 "#);
 
             // Preserve the former unsupported command as a checked positive,
@@ -306,7 +310,7 @@ theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain
 
             // The same checked expansion must use private core names in a
             // module-system file, including the generated printer helper.
-            let private_source = b"module\nprelude\nimport Init.Data.Repr\nnamespace Wire\nstructure Box where\n value : Nat\nderiving Repr\ndef printer : Repr Box := inferInstance\ndef helper : Box -> Nat -> Std.Format := instReprBox.repr\nend Wire";
+            let private_source = b"module\nprelude\nimport Init.Data.Repr\nnamespace Wire\nstructure Box where\n value : Nat\nderiving Repr, DecidableEq\ndef printer : Repr Box := inferInstance\ndef helper : Box -> Nat -> Std.Format := instReprBox.repr\ninductive Chain where\n | nil\n | cons (head : Nat) (tail : Chain)\nderiving DecidableEq\ndef dictionary : DecidableEq Chain := inferInstance\ntheorem same : Chain.cons 7 Chain.nil = Chain.cons 7 Chain.nil := by decide\ntheorem different : Not (Chain.cons 7 Chain.nil = Chain.cons 8 Chain.nil) := by decide\nend Wire";
             let private_input = SourceModuleInput { name: &library, source: private_source };
             let local = imported
                 .check_source_modules(
@@ -319,7 +323,7 @@ theorem chain_no : (Chain.cons 7 (Chain.cons 9 Chain.nil) == Chain.cons 7 (Chain
                 .unwrap()
                 .into_complete()
                 .unwrap();
-            for generated in ["Wire.instReprBox", "Wire.instReprBox.repr", "Wire.printer", "Wire.helper"] {
+            for generated in ["Wire.instReprBox", "Wire.instReprBox.repr", "Wire.printer", "Wire.helper", "Wire.instDecidableEqBox", "Wire.instDecidableEqChain", "Wire.instDecidableEqChain.decEq", "Wire.dictionary", "Wire.same", "Wire.different"] {
                 let private = Name::num(name("_private.Library"), 0).append_core(&name(generated));
                 assert!(local.checked.engine.environment().contains(&private), "{generated}");
                 assert!(!local.checked.engine.environment().contains(&name(generated)), "{generated}");

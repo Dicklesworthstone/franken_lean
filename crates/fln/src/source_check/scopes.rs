@@ -242,6 +242,9 @@ impl Scopes {
             parent = parent.parent();
         }
     }
+    pub(super) fn observe_syntax(&mut self, declaration: &Name) {
+        self.observe(declaration);
+    }
     pub fn admitted(&mut self, declaration: &Declaration) {
         match declaration {
             Declaration::Axiom(v) => self.observe(&v.base.name),

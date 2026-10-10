@@ -6,6 +6,9 @@
 //! file: the paths enter it around every parse ([`SourceGrammar::enter`]), advance it on every
 //! scope command ([`SourceGrammar::observe`]), and hand it every command first
 //! ([`SourceGrammar::declare`]), which registers a syntax-declaring one in place of admitting it.
+//! Native source module boundaries record exact descriptions and quoted templates in an
+//! ordered environment journal. Import replay reconstructs a fresh grammar from only the
+//! module's predecessors; local declarations and scope activation never become exports.
 //! A notation's uses are then expanded before elaboration (`ParsedDefinition::expanded`), with
 //! the hygiene the pin's `macro_rules` gives them (fln-elab resolves a template's macro-scoped
 //! name as a global).
@@ -29,7 +32,7 @@
 //! only where it is used). A `macro` this does not translate (a `do` block, a sequence of
 //! tactics, a splice) registers its syntax without a rule, `elab` is not read, and a second rule
 //! for one kind removes the first (the pin tries the newest first): in each case the uses reach
-//! the elaborator unexpanded and are refused there. The imports' own syntax (Init's notations, as the grammar census lists them)
+//! the elaborator unexpanded and are refused there. Artifact imports' own syntax (Init's notations, as the grammar census lists them)
 //! is not entered: their expansions are not in the census, so their uses would reach the
 //! elaborator unexpanded too, and terms the hand grammar reads, such as `{}`, would become the
 //! pin's `choice` between a notation and a structure instance.
@@ -42,6 +45,9 @@ use fln_parse::command_scope::ScopeCommand;
 use fln_parse::extensions::{FileGrammar, NotationRule, with_grammar};
 use fln_syntax::tree::{Preresolved, Syntax};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+mod journal;
 
 /// Tactic kinds that bind names (the pin's binder reads the identifier as written, never its
 /// pre-resolution): a tactic template holding one is not prechecked here.
@@ -97,17 +103,103 @@ const BINDING: [&str; 15] = [
 
 pub(crate) struct SourceGrammar {
     file: FileGrammar,
+    rule_sources: BTreeMap<Name, Arc<[u8]>>,
+    module_system: bool,
+    declared_syntax: bool,
 }
 
 impl SourceGrammar {
-    /// The grammar at the top of a file that imports only `Init`, as every file the source
-    /// paths check does: Init's tokens, and only the syntax the file itself declares
-    /// ([`FileGrammar::own_syntax_only`]), since only the file's notations are expanded here.
+    /// The seed grammar: Init's tokens and the file's own declarations, without
+    /// the census's parser registrations whose executable expansions are absent.
     pub(crate) fn implicit_init() -> SourceGrammar {
         SourceGrammar {
             file: FileGrammar::new(false, &[], Some(Name::anonymous()))
                 .expect("invariant: the grammar census describes Init")
                 .own_syntax_only(),
+            rule_sources: BTreeMap::new(),
+            module_system: false,
+            declared_syntax: false,
+        }
+    }
+
+    /// Native source imports carry exact descriptions and templates in the
+    /// environment journal. No unknown `.olean` extension is interpreted here.
+    pub(crate) fn for_environment(
+        environment: &Environment,
+        module: Option<&Name>,
+        module_system: bool,
+    ) -> Result<Self, EngineExecutionError> {
+        let mut grammar = Self::for_module(module, module_system);
+        if module_system && journal::present(environment) {
+            return Err(Self::module_phase_refusal());
+        }
+        journal::load(environment, &mut grammar.file)?;
+        Ok(grammar)
+    }
+
+    pub(crate) fn for_module(module: Option<&Name>, module_system: bool) -> Self {
+        Self {
+            file: FileGrammar::new(
+                false,
+                &[],
+                Some(module.cloned().unwrap_or_else(Name::anonymous)),
+            )
+            .expect("invariant: the grammar census describes Init")
+            .own_syntax_only(),
+            rule_sources: BTreeMap::new(),
+            module_system,
+            declared_syntax: false,
+        }
+    }
+
+    fn module_phase_refusal() -> EngineExecutionError {
+        EngineExecutionError::NotImplemented {
+            feature: "native source grammar imports/exports with module-system visibility and meta phases",
+        }
+    }
+
+    pub(crate) fn import_native(
+        &mut self,
+        module: &fln_parse::extensions::NativeSyntaxModule,
+    ) -> Result<(), EngineExecutionError> {
+        if self.module_system && !module.is_empty() {
+            return Err(Self::module_phase_refusal());
+        }
+        self.file
+            .import_native(module)
+            .map_err(|feature| EngineExecutionError::NotImplemented { feature })
+    }
+
+    pub(crate) fn export_native(
+        &self,
+    ) -> Result<fln_parse::extensions::NativeSyntaxModule, EngineExecutionError> {
+        let exported = self
+            .file
+            .export_native()
+            .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
+        if self.module_system && !exported.is_empty() {
+            return Err(Self::module_phase_refusal());
+        }
+        Ok(exported)
+    }
+
+    /// Publish only at a successfully completed source-module boundary. The
+    /// existing module journal replay and exact session cache then retain it.
+    pub(crate) fn record(
+        &self,
+        environment: &Environment,
+    ) -> Result<Environment, EngineExecutionError> {
+        journal::publish(
+            environment,
+            &self.export_native()?,
+            &self.rule_sources,
+            self.declared_syntax,
+        )
+    }
+
+    pub(crate) fn extend_scopes(&self, scopes: &mut super::scopes::Scopes) {
+        for name in self.file.native_namespace_anchors() {
+            scopes.observe_syntax(&name);
         }
     }
 
@@ -161,6 +253,19 @@ impl SourceGrammar {
         }
         for (kind, template) in templates {
             self.file.set_rule_template(&kind, template);
+            // Raw identifier spans address the parser's normalized view,
+            // including inside multiline CRLF quotations.
+            self.rule_sources.insert(
+                kind,
+                Arc::from(parsed.source_view().normalized().as_bytes()),
+            );
+        }
+        self.declared_syntax = true;
+        if self.module_system {
+            // Module-system syntax declarations create public meta definitions.
+            // Their extra module-use/phase provenance is not yet represented by
+            // the native quoted-template journal.
+            return Err(Self::module_phase_refusal());
         }
         Ok(true)
     }

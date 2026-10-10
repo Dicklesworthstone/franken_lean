@@ -389,11 +389,12 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
-        self.check_source_files_recording(sources, options, limits, None, None, None)
+        self.check_source_files_recording(sources, options, limits, None, None, None, None)
     }
 
     // Module imports record only the candidates that survived ordinary admission.
     // The optional recorder is private and never returned on a failed batch.
+    #[allow(clippy::too_many_arguments)]
     fn check_source_files_recording(
         &self,
         sources: &[&[u8]],
@@ -401,6 +402,7 @@ impl Engine {
         limits: SourceCheckLimits,
         mut declarations: Option<&mut Vec<Declaration>>,
         private_module: Option<&Name>,
+        source_module: Option<&Name>,
         mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         if sources.is_empty() {
@@ -434,7 +436,13 @@ impl Engine {
             let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
             scopes.current.private_module = private_module.cloned();
             // The syntax this file declares extends the grammar of what follows it.
-            let mut grammar = grammar::SourceGrammar::implicit_init();
+            let mut grammar = grammar::SourceGrammar::for_environment(
+                engine.environment(),
+                source_module,
+                private_module.is_some(),
+            )
+            .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
+            grammar.extend_scopes(&mut scopes);
             let commands = grammar.enter(|| partition_commands(source, file, count))?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
                 return Err(SourceCheckError::Limit {
@@ -544,6 +552,7 @@ impl Engine {
                     )
                     .map_err(|error| command_error(file, count, start, error))?
                 {
+                    grammar.extend_scopes(&mut scopes);
                     count += 1;
                     continue;
                 }
@@ -610,6 +619,11 @@ impl Engine {
             }
             if let Some(public) = public.as_deref_mut() {
                 public.retain_scope(scopes.public_scope());
+            }
+            if source_module.is_some() {
+                engine.environment = grammar.record(engine.environment()).map_err(|error| {
+                    command_error(file, count, fln_parse::BytePos(source.len()), error)
+                })?;
             }
             final_scope = scopes.current;
         }

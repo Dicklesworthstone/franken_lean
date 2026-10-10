@@ -206,7 +206,7 @@ impl Plan {
     }
 }
 
-fn validate_name(name: &Name, meter: &mut Meter) -> Result<(), SourceModuleCheckError> {
+pub(super) fn validate_name(name: &Name, meter: &mut Meter) -> Result<(), SourceModuleCheckError> {
     let mut cursor = name.clone();
     let mut depth = 0usize;
     let mut bytes = 0usize;
@@ -240,7 +240,7 @@ fn validate_name(name: &Name, meter: &mut Meter) -> Result<(), SourceModuleCheck
 }
 
 /// Iterative DFS preserves direct-import order without recursive host stack use.
-fn postorder(
+pub(super) fn postorder(
     root: usize,
     dependencies: &[Vec<usize>],
     modules: &[SourceModuleInput<'_>],

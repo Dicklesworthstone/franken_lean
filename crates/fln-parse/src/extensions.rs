@@ -73,6 +73,9 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+mod modules;
+pub use modules::NativeSyntaxModule;
+
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
 /// fields in declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -743,7 +746,7 @@ pub struct ActiveGrammar {
     infix_kinds: Vec<Vec<Name>>,
     /// Leading `tactic` declarations by the text of their first atom, highest priority first.
     tactics: BTreeMap<String, Vec<usize>>,
-    /// Leading `term` declarations that read as an atom: at `arg` precedence or above, from a
+    /// Leading `term` declarations that read as an atom: at `lead` precedence or above, from a
     /// first atom to a last one (`syntax "⌜" term "⌝"`, `notation "-[" n "+1]"`, `notation "⊤"`),
     /// or, at `lead` or above, from a first atom to one argument (`prefix:max "√" => f`,
     /// `syntax "dbl " term:max : term`).
@@ -910,9 +913,12 @@ impl ActiveGrammar {
                 }
                 (Some(category), true, descr @ Descr::Node { prec, body, .. })
                     if *category == term
-                        && ((*prec >= 1023 && ends_with_atom(body, 0))
-                            || (*prec >= 1022 && symbol_then_argument(body))) =>
+                        && *prec >= LEAD_PREC
+                        && (ends_with_atom(body, 0) || symbol_then_argument(body)) =>
                 {
+                    // A named syntax abbreviation keeps `lead` as the default precedence even
+                    // when its resolved description ends in an atom (`elabSyntax`). Its node
+                    // still obeys the separate application and category precedence checks.
                     // A head that is a builtin token may also start a builtin term parser
                     // (`{` the structure instance, beside `«term{_}»`), which the pin runs too and
                     // which is not run here: such a notation is left to the hand grammar.
@@ -1094,6 +1100,11 @@ pub struct FileGrammar {
     module: Option<Name>,
     base_tokens: BTreeSet<String>,
     imported: Vec<Arc<SyntaxDecl>>,
+    /// Native source imports have both descriptions and expansions. They remain
+    /// active when `own_syntax_only` omits the census's expansion-less parsers.
+    native_imported: Vec<Arc<SyntaxDecl>>,
+    native_scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
+    native_abbreviations: BTreeSet<Name>,
     scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
     scoped_tokens: BTreeMap<Name, BTreeSet<String>>,
     /// The file's own `scoped` declarations, by namespace, indices into `declared`.
@@ -1104,6 +1115,9 @@ pub struct FileGrammar {
     /// fresh-name loop checks the environment for them).
     constants: BTreeSet<Name>,
     declared: Vec<Arc<SyntaxDecl>>,
+    local_declared: BTreeSet<Name>,
+    declared_categories: BTreeMap<Name, IdentBehavior>,
+    native_export_refusal: Option<&'static str>,
     /// Tokens declared other than by a parser: a declared category's quotation opener.
     declared_tokens: BTreeSet<String>,
     /// Bumped by every declaration, so a cached grammar never outlives one.
@@ -1176,6 +1190,9 @@ impl FileGrammar {
             module,
             base_tokens: tokens.tokens_for(prelude, imports)?,
             imported,
+            native_imported: Vec::new(),
+            native_scoped: BTreeMap::new(),
+            native_abbreviations: BTreeSet::new(),
             scoped,
             scoped_tokens,
             scoped_declared: BTreeMap::new(),
@@ -1183,6 +1200,9 @@ impl FileGrammar {
             abbreviations,
             constants,
             declared: Vec::new(),
+            local_declared: BTreeSet::new(),
+            declared_categories: BTreeMap::new(),
+            native_export_refusal: None,
             declared_tokens: BTreeSet::new(),
             generation: 0,
             rules: Arc::new(BTreeMap::new()),
@@ -1226,7 +1246,9 @@ impl FileGrammar {
 
     /// Whether `namespace` carries scoped syntax, imported or this file's.
     fn has_scoped(&self, namespace: &Name) -> bool {
-        self.scoped.contains_key(namespace) || self.scoped_declared.contains_key(namespace)
+        self.scoped.contains_key(namespace)
+            || self.native_scoped.contains_key(namespace)
+            || self.scoped_declared.contains_key(namespace)
     }
 
     /// `resolveNamespace` (`Lean/ResolveName.lean`) over the namespaces with scoped syntax.
@@ -1293,7 +1315,7 @@ impl FileGrammar {
                     self.push(namespace, true);
                 }
             }
-            ScopeCommand::Section(name) => {
+            ScopeCommand::Section(name) | ScopeCommand::SectionWithModifiers { name, .. } => {
                 let count = name
                     .as_ref()
                     .map_or(1, |name| components(name).len().max(1));
@@ -1354,6 +1376,7 @@ impl FileGrammar {
         } else {
             Vec::new()
         };
+        decls.extend(self.native_imported.iter().cloned());
         let own =
             |index: usize, tokens: &mut BTreeSet<String>, decls: &mut Vec<Arc<SyntaxDecl>>| {
                 let decl = &self.declared[index];
@@ -1371,6 +1394,12 @@ impl FileGrammar {
                         }
                         if let Some(scoped) = self.scoped_tokens.get(namespace) {
                             tokens.extend(scoped.iter().cloned());
+                        }
+                    }
+                    if let Some(scoped) = self.native_scoped.get(namespace) {
+                        for decl in scoped {
+                            decl.descr.collect_tokens(&mut tokens);
+                            decls.push(Arc::clone(decl));
                         }
                     }
                     for &index in self.scoped_declared.get(namespace).into_iter().flatten() {
@@ -1631,9 +1660,15 @@ impl FileGrammar {
     /// removes the rule, and the kind's uses are refused unexpanded rather than read by an older
     /// rule. Rules for other kinds are not this file's to read here.
     fn declare_macro_rules(&mut self, args: &[Syntax]) {
-        let [_, _, _, _, opt_kind, alternatives] = args else {
+        let [_, _, attr_kind, _, opt_kind, alternatives] = args else {
             return;
         };
+        if attr_kind_of(attr_kind) != Ok(AttrKind::Global) {
+            // The current single-rule expander has no independent scoped rule
+            // stack. Do not export a local/scoped override as a global macro.
+            self.native_export_refusal =
+                Some("source module export of scoped or local macro_rules");
+        }
         let target = node_args(alternatives)
             .and_then(<[Syntax]>::first)
             .and_then(null_args)
@@ -1678,6 +1713,12 @@ impl FileGrammar {
                     },
                 ))
             });
+        if kind.as_ref().is_some_and(|kind| {
+            self.constants.contains(kind) && !self.declared.iter().any(|decl| decl.decl == *kind)
+        }) {
+            self.native_export_refusal =
+                Some("source module export of macro_rules for imported syntax");
+        }
         let Some(kind) = kind.filter(|kind| self.declared.iter().any(|decl| decl.decl == *kind))
         else {
             return;
@@ -1751,6 +1792,7 @@ impl FileGrammar {
             LeafView::Str(suffix) => suffix.to_string(),
             _ => return Err("a category name"),
         };
+        self.declared_categories.insert(name.clone(), behavior);
         self.categories.insert(name, behavior);
         self.declared_tokens.insert(format!("`({suffix}|"));
         self.generation += 1;
@@ -1760,7 +1802,7 @@ impl FileGrammar {
     fn declare_abbreviation(&mut self, args: &[Syntax]) -> Result<Arc<SyntaxDecl>, &'static str> {
         // `elabSyntaxAbbrev`: `syntax x := items` is the description
         // `nodeWithAntiquot "x" (ns ++ x) items`, with no category.
-        let [_, _, _, name, _, items] = args else {
+        let [_, visibility, _, name, _, items] = args else {
             return Err("a syntax abbreviation's shape");
         };
         let name = ident_name(name).ok_or("an abbreviation name")?;
@@ -1775,6 +1817,13 @@ impl FileGrammar {
         let mut trailing = None;
         let (descr, _) = self.process_seq(&items, &context, &mut trailing)?;
         let decl_name = self.top().namespace.append_core(&name);
+        if null_args(visibility).is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| kind_is(value, &["Lean", "Parser", "Command", "private"]))
+        }) {
+            self.local_declared.insert(decl_name.clone());
+        }
         let descr =
             Descr::NodeWithAntiquot(name.to_display_string(), decl_name.clone(), Box::new(descr));
         self.abbreviations.insert(decl_name.clone(), descr.clone());
@@ -1840,7 +1889,9 @@ impl FileGrammar {
                     .module
                     .clone()
                     .ok_or("a local declaration with no module name")?;
-                (private_name(&module, &full_name), None)
+                let kind = private_name(&module, &full_name);
+                self.local_declared.insert(kind.clone());
+                (kind, None)
             }
         };
         let descr = match trailing {
@@ -3582,14 +3633,31 @@ impl Run<'_> {
             Descr::Cat(category, prec) => {
                 let stop = self.term_end(at, end, *prec, follow)?;
                 let syntax = match simple(category).as_deref() {
-                    Some("term") => crate::bounded_term(
-                        self.leaves,
-                        self.view,
-                        self.tokens,
-                        at..stop,
-                        DefinitionGrammar::Scalar,
-                    )
-                    .ok()?,
+                    Some("term") => {
+                        let syntax = crate::bounded_term(
+                            self.leaves,
+                            self.view,
+                            self.tokens,
+                            at..stop,
+                            DefinitionGrammar::Scalar,
+                        )
+                        .ok()?;
+                        // `leadingNode` checks the category's requested minimum precedence.
+                        // A one-token extension can fit `term_end` without meeting it; a
+                        // parenthesized extension instead has the builtin parenthesis root.
+                        if let Some(kind) = syntax.kind()
+                            && active().is_some_and(|grammar| {
+                                grammar.terms.values().flatten().any(|&index| {
+                                    matches!(&grammar.decls[index].descr,
+                                        Descr::Node { kind: declared, prec: node_prec, .. }
+                                            if declared == kind && node_prec < prec)
+                                })
+                            })
+                        {
+                            return None;
+                        }
+                        syntax
+                    }
                     Some("tactic") => {
                         crate::proofs::tactic(self.leaves, self.view, self.tokens, at..stop).ok()?
                     }

@@ -233,15 +233,15 @@ pub(super) fn run(
                     Err(imports::Failure::new(class, &error.to_string(), authority, exit))
                 }
             };
-            if let Err(error) = loaded.preflight() {
+            let mut limits = fln::SourceCheckLimits::new(admission);
+            limits.max_bytes = max_bytes;
+            if let Err(error) = loaded.preflight(limits) {
                 return failed(error.class, &error.detail, error.authority, json, error.exit);
             }
             let (engine, olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            let mut limits = fln::SourceCheckLimits::new(admission);
-            limits.max_bytes = max_bytes;
             let result = match loaded.check(&engine, olean_base.as_ref(), limits) {
                 Ok(fln::Outcome::Complete(result)) => result,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source check exhausted its configured resources", false, json, 3),

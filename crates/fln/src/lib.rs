@@ -7033,6 +7033,7 @@ impl Engine {
             &[],
             None,
             None,
+            None,
         )
     }
 
@@ -7067,6 +7068,7 @@ impl Engine {
         allow_checks: bool,
         file_starts: &[usize],
         private_module: Option<&Name>,
+        source_module: Option<&Name>,
         mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
@@ -7133,7 +7135,12 @@ impl Engine {
         scopes.current.private_module = private_module.cloned();
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
-        let mut grammar = source_check::grammar::SourceGrammar::implicit_init();
+        let mut grammar = source_check::grammar::SourceGrammar::for_environment(
+            engine.environment(),
+            source_module,
+            private_module.is_some(),
+        )?;
+        grammar.extend_scopes(&mut scopes);
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
@@ -7179,7 +7186,12 @@ impl Engine {
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
                 scopes.current.private_module = private_module.cloned();
-                grammar = source_check::grammar::SourceGrammar::implicit_init();
+                grammar = source_check::grammar::SourceGrammar::for_environment(
+                    engine.environment(),
+                    source_module,
+                    private_module.is_some(),
+                )?;
+                grammar.extend_scopes(&mut scopes);
             }
             let control = grammar
                 .enter(|| fln_parse::command_scope::parse(command_source))
@@ -7339,6 +7351,7 @@ impl Engine {
                     at: Some(original_offset),
                 })?
             {
+                grammar.extend_scopes(&mut scopes);
                 continue;
             }
             let scope = if public.is_some() {
@@ -7694,6 +7707,9 @@ impl Engine {
                 requested: execution_command_indices.len(),
             })?;
         execution_indices.extend_from_slice(&execution_command_indices);
+        if source_module.is_some() {
+            engine.environment = grammar.record(engine.environment())?;
+        }
         let result_logical_root = engine.logical_root(options);
         if let Some(public) = public {
             public.retain_scope(scopes.public_scope());
@@ -8076,6 +8092,7 @@ impl Engine {
                 limits,
                 true,
                 &[],
+                None,
                 None,
                 None,
             )? {
@@ -8510,6 +8527,7 @@ impl Engine {
                 &file_starts,
                 None,
                 None,
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -8628,6 +8646,7 @@ impl Engine {
                 limits,
                 false,
                 file_starts,
+                None,
                 None,
                 None,
             )? {

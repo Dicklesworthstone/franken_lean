@@ -5,6 +5,8 @@
 use super::*;
 use crate::{EngineExecutionLimits, SourceCommandBatchExecution};
 
+mod preflight;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceProgramLimits {
     pub execution: EngineExecutionLimits,
@@ -102,67 +104,7 @@ pub fn preflight_source_program(
     modules: &[SourceModuleInput<'_>],
     limits: SourceModuleCheckLimits,
 ) -> Result<(), SourceModuleCheckError> {
-    if modules.len() > limits.max_modules {
-        return Err(SourceModuleCheckError::Limit {
-            resource: "modules",
-            limit: limits.max_modules,
-        });
-    }
-    let mut bytes = 0usize;
-    let mut count = 0usize;
-    for module in modules {
-        bytes = bytes
-            .checked_add(module.source.len())
-            .filter(|n| *n <= limits.source.max_bytes)
-            .ok_or(SourceModuleCheckError::Limit {
-                resource: "source bytes",
-                limit: limits.source.max_bytes,
-            })?;
-        let header =
-            parse_source_header(module.source).map_err(|error| SourceModuleCheckError::Header {
-                module: module.name.clone(),
-                error,
-            })?;
-        validate_source_header(module.name, &header)?;
-        for (index, (mut at, mut bytes)) in commands(module.name, module.source, &header)?
-            .into_iter()
-            .enumerate()
-        {
-            count = count
-                .checked_add(1)
-                .filter(|n| *n <= limits.source.max_commands)
-                .ok_or(SourceModuleCheckError::Limit {
-                    resource: "source commands",
-                    limit: limits.source.max_commands,
-                })?;
-            loop {
-                match fln_parse::command_scope::parse(bytes)
-                    .map_err(|error| parse_error(module.name, index, at, error))?
-                {
-                    Some(
-                        fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. },
-                    ) => {
-                        at.0 += body;
-                        bytes = &bytes[body..];
-                    }
-                    Some(_) => break,
-                    None => {
-                        if fln_parse::command_scope::mutual::parse(bytes)
-                            .map_err(|error| parse_error(module.name, index, at, error))?
-                            .is_none()
-                        {
-                            fln_parse::parse_source_command(bytes)
-                                .map_err(|error| parse_error(module.name, index, at, error))?;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    preflight::check(modules, limits, false)
 }
 
 fn declarations(
@@ -294,7 +236,7 @@ impl imported::SourceOleanImport {
                 "source-program/before-plan",
             )));
         }
-        preflight_source_program(modules, limits.modules)?;
+        preflight::check(modules, limits.modules, implicit_init)?;
         let mut meter = Meter {
             work: 0,
             bytes: 0,
@@ -348,6 +290,16 @@ impl imported::SourceOleanImport {
                 };
             }
             let module = modules[index];
+            // Empty forwarding modules still import a grammar world. Enforce
+            // its phase boundary before bypassing the command stream.
+            if plan.headers[index].module_system {
+                grammar::SourceGrammar::for_environment(
+                    engine.environment(),
+                    Some(module.name),
+                    true,
+                )
+                .map_err(|error| source_error(module.name, error))?;
+            }
             let public_imports = if plan.headers[index].module_system {
                 match visibility::imports(
                     &self.contexts.complete,
@@ -386,6 +338,7 @@ impl imported::SourceOleanImport {
                         true,
                         &[],
                         plan.headers[index].module_system.then_some(module.name),
+                        Some(module.name),
                         public.as_mut(),
                     )
                     .map_err(|error| source_error(module.name, error))?

@@ -559,6 +559,24 @@ pub(super) fn run_collecting(
                 };
                 replayed_declarations += export.declarations.len();
             }
+            // Header-only modules and persisted hits still import a grammar
+            // world; neither may bypass its visibility and phase boundary.
+            if plan.headers[index].module_system {
+                grammar::SourceGrammar::for_environment(
+                    imported.environment(),
+                    Some(module.name),
+                    true,
+                )
+                .map_err(|error| SourceModuleCheckError::Source {
+                    module: module.name.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: 0,
+                        offset: plan.headers[index].body_start.0,
+                        error: Box::new(error),
+                    },
+                })?;
+            }
             let after_steps_work = meter.work;
             let after_steps_bytes = meter.bytes;
             let mut lookup = ModuleRecordLookup::NotConsulted;
@@ -710,6 +728,7 @@ pub(super) fn run_collecting(
                         source_limits,
                         Some(&mut declarations),
                         header.module_system.then_some(module.name),
+                        Some(module.name),
                         public.as_mut(),
                     )
                 }

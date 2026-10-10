@@ -192,9 +192,10 @@ impl Loaded {
         }
     }
 
-    /// Refuse unparseable source before any import is admitted, with the error
-    /// [`Self::check`] would report (`fln::source_check::preflight_source_files`).
-    pub(super) fn preflight(&self) -> Result<(), Failure> {
+    /// Refuse unparseable source before admitting imports. Native source modules
+    /// replay their dependency grammars before parsing consumers, just as the
+    /// actual checker does; independent files keep their separate grammars.
+    pub(super) fn preflight(&self, limits: fln::SourceCheckLimits) -> Result<(), Failure> {
         match &self.inputs {
             Inputs::Files(sources) => {
                 let inputs: Vec<_> = sources.iter().map(Vec::as_slice).collect();
@@ -209,18 +210,24 @@ impl Loaded {
                 })
             }
             Inputs::Modules { names, sources } => {
-                for (name, source) in names.iter().zip(sources) {
-                    fln::source_check::preflight_source_module(name, source).map_err(|error| {
-                        let (class, authority, exit) = error.disposition();
-                        Failure {
-                            class,
-                            authority,
-                            exit,
-                            detail: error.to_string(),
-                        }
-                    })?;
-                }
-                Ok(())
+                let inputs: Vec<_> = names
+                    .iter()
+                    .zip(sources)
+                    .map(|(name, source)| SourceModuleInput { name, source })
+                    .collect();
+                fln::source_check::modules::execution::preflight_source_program(
+                    &inputs,
+                    SourceModuleCheckLimits::new(limits),
+                )
+                .map_err(|error| {
+                    let (class, authority, exit) = error.disposition();
+                    Failure {
+                        class,
+                        authority,
+                        exit,
+                        detail: error.to_string(),
+                    }
+                })
             }
         }
     }
