@@ -10289,6 +10289,12 @@ fn executable_intrinsic_binding_cached(
         externs,
         visited_nodes,
         limits,
+    )? || source_intrinsics::imported_string_append_matches(
+        environment,
+        name,
+        externs,
+        visited_nodes,
+        limits,
     )? || source_intrinsics::imported_string_length_matches(
         environment,
         name,
